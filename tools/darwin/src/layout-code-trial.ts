@@ -57,6 +57,27 @@ async function verifyTree(root: string, manifest: Manifest): Promise<void> {
   if (expected.size) throw new Error(`missing source file: ${expected.values().next().value}`);
 }
 
+function verifyGitBlobs(repo: string, revision: string, source: string): void {
+  const files: Array<{ path: string; oid: string }> = [];
+  function collect(root: string, rev: string, prefix: string): void {
+    const entries = git(root, "ls-tree", "-r", "-z", rev).toString("utf8").split("\0").filter(Boolean);
+    for (const entry of entries) {
+      const match = /^(100644|100755|160000) (?:blob|commit) ([a-f0-9]{40,64})\t([^\r\n]+)$/.exec(entry);
+      if (!match) throw new Error("unsupported archived Git tree entry");
+      const [, mode, oid, path] = match;
+      if (mode === "160000") collect(join(root, path), oid, prefix ? prefix + "/" + path : path);
+      else files.push({ path: join(source, prefix, path), oid });
+    }
+  }
+  collect(repo, revision, "");
+  const hashes = execFileSync("git", ["hash-object", "--no-filters", "--stdin-paths"], {
+    input: files.map(file => file.path).join("\n") + "\n", encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+  }).trimEnd().split("\n");
+  if (hashes.length !== files.length || files.some((file, index) => file.oid !== hashes[index])) {
+    throw new Error("archived source differs from the pinned Git blobs");
+  }
+}
+
 export interface LiveRole { service: string; imageId: string; containerId: string; }
 export function inspectLayoutContainers(raw: unknown, project: string, expectedImage: string, bothImages: readonly string[], memory: number): LiveRole[] {
   id(expectedImage);
@@ -168,8 +189,7 @@ export function assertSettledDelivery(value: unknown): void {
   const counts = object(object(report.phase_counters, "client counters").process_cumulative, "cumulative client counts");
   const completed = counts.completed_rows; const ambiguous = counts.ambiguous_rows; const delta = output.rows;
   if (![completed, ambiguous, delta].every(n => Number.isSafeInteger(n) && Number(n) >= 0)
-    || !Number.isSafeInteger(Number(completed) + Number(ambiguous)) || Number(delta) < Number(completed)
-    || Number(delta) > Number(completed) + Number(ambiguous) || output.settled !== true
+    || Number(ambiguous) !== 0 || delta !== completed || output.settled !== true
     || reconciliation.status !== "within_bound" || reconciliation.settled !== true
     || reconciliation.scope !== "process_cumulative_client_rows_vs_this_cells_new_ingestion_commits_including_warmup"
     || reconciliation.completed_rows !== completed || reconciliation.ambiguous_rows !== ambiguous || reconciliation.delta_rows !== delta) {
@@ -203,13 +223,38 @@ export function comparableRunConfig(raw: unknown, runRoot: string): JsonObject {
   return config;
 }
 
-interface Capture { project: string; runRoot: string; config: JsonObject; configPath: string; configHash: string; controller: string; controllerHash: string; roles: LiveRole[]; }
+interface Admission { runRoot: string; config: JsonObject; configPath: string; configHash: string; controller: string; controllerHash: string; }
+interface Capture extends Admission { project: string; roles: LiveRole[]; }
+type Result = Awaited<ReturnType<typeof readReconciledOatResult>>;
+interface Finished { result: Result; evidence: unknown; capture: Capture; }
+
+export async function assertFreshRunRoot(root: string): Promise<void> {
+  if (!isAbsolute(root) || resolve(root) !== root || await realpath(root) !== root) throw new Error("run root must be an absolute real path");
+  for (const name of ["state", "snapshots", "results.parquet", "site"]) {
+    try {
+      await lstat(join(root, name));
+      throw new Error("run-owned output already exists: " + name);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+}
+
+export function assertDisjointRunRoots(first: string, second: string): void {
+  if (first === second || first.startsWith(second + "/") || second.startsWith(first + "/")) throw new Error("arm roots overlap");
+}
 export class LayoutCodeTrial {
   readonly #home: string;
   readonly #source: Record<Arm, string>;
   readonly #expected: Record<Arm, Manifest>;
   #images?: Record<Arm, string>;
+  #buildStarted = false;
+  readonly #admissionStarted = new Set<Arm>();
+  readonly #captureStarted = new Set<Arm>();
+  readonly #admissions = new Map<Arm, Admission>();
   readonly #captures = new Map<Arm, Capture>();
+  readonly #rechecked = new Set<Arm>();
+  readonly #finished = new Map<Arm, Finished>();
   private constructor(home: string, source: Record<Arm, string>, expected: Record<Arm, Manifest>) {
     this.#home = home; this.#source = source; this.#expected = expected;
   }
@@ -224,28 +269,35 @@ export class LayoutCodeTrial {
     if (!parentLayout.equals(baseLayout) || baseLayout.equals(replacement) || names !== LAYOUT) {
       throw new Error("reviewed production-only patch does not apply to the pinned baseline");
     }
-    const manifest: SnapshotManifest = await snapshot(repo, home);
+    const sourceHome = join(home, "layout-trial");
+    const manifest: SnapshotManifest = await snapshot(repo, sourceHome);
     if (manifest.commit !== BASE) throw new Error("layout source must be the exact pinned baseline");
     const all: Manifest = { ...manifest.files, ...manifest.submoduleFiles };
     if (!all[LAYOUT] || all[LAYOUT].sha256 !== digest(baseLayout) || !all[DOCKERFILE]) throw new Error("trusted source manifest mismatch");
-    const baseline = join(home, "trusted", "src");
-    const candidate = join(home, "trusted", "candidate-src");
+    const baseline = join(sourceHome, "trusted", "src");
+    const candidate = join(sourceHome, "trusted", "candidate-src");
     await verifyTree(baseline, all);
+    verifyGitBlobs(repo, BASE, baseline);
     await cp(baseline, candidate, { recursive: true, errorOnExist: true, force: false });
     await writeFile(join(candidate, LAYOUT), replacement);
     const candidateManifest: Manifest = { ...all, [LAYOUT]: { ...all[LAYOUT], sha256: digest(replacement) } };
     await verifyTree(candidate, candidateManifest);
     return new LayoutCodeTrial(home, { baseline, candidate }, { baseline: all, candidate: candidateManifest });
   }
+  sourceManifests(): Record<Arm, string> {
+    const fingerprint = (manifest: Manifest) => digest(Buffer.from(JSON.stringify(Object.entries(manifest).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))));
+    return { baseline: fingerprint(this.#expected.baseline), candidate: fingerprint(this.#expected.candidate) };
+  }
   async build(): Promise<Readonly<Record<Arm, string>>> {
-    if (this.#images) throw new Error("collector images are already built");
+    if (this.#buildStarted) throw new Error("collector image build was already started");
+    this.#buildStarted = true;
     const env = { HOME: this.#home, PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8" };
     const images = {} as Record<Arm, string>;
     for (const arm of ["baseline", "candidate"] as const) await verifyTree(this.#source[arm], this.#expected[arm]);
     for (const arm of ["baseline", "candidate"] as const) {
       const root = this.#source[arm];
       await verifyTree(root, this.#expected[arm]);
-      const iid = join(this.#home, "trusted", `${arm}.iid`);
+      const iid = join(this.#home, "layout-trial", "trusted", `${arm}.iid`);
       const builder = "layout-" + randomUUID();
       execFileSync("docker", ["buildx", "create", "--name", builder, "--driver", "docker-container"], { env, stdio: "inherit" });
       try {
@@ -263,68 +315,109 @@ export class LayoutCodeTrial {
     this.#images = Object.freeze(images);
     return this.#images;
   }
-  async capture(arm: Arm, project: string, configPath: string, runRoot: string, controller: string): Promise<void> {
-    if (!this.#images || this.#captures.has(arm) || !/^[a-z0-9][a-z0-9_-]+$/.test(project)) throw new Error("invalid or duplicate arm capture");
-    if (!isAbsolute(configPath) || !isAbsolute(controller) || relative(runRoot, configPath) !== "config.json") throw new Error("invalid trusted run paths");
+  #verifyRuntime(): void {
+    const runtime = join(this.#home, "trusted", "runtime");
+    const output = (...args: string[]) => git(runtime, ...args).toString("utf8").trimEnd();
+    if (output("rev-parse", "--show-toplevel") !== runtime || output("rev-parse", "HEAD") !== BASE
+      || output("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+      || output("submodule", "status", "--recursive").split("\n").some(line => line && !line.startsWith(" "))) {
+      throw new Error("trusted controller runtime is not clean at the pinned baseline");
+    }
+  }
+  async admitArm(arm: Arm, configPath: string, runRoot: string, controller: string): Promise<void> {
+    if (!this.#images || this.#admissionStarted.has(arm) || (arm === "candidate" && !this.#finished.has("baseline"))) {
+      throw new Error("arms require separate images and sequential settled execution");
+    }
+    this.#admissionStarted.add(arm);
+    if (!runRoot.startsWith(join(this.#home, "data") + "/")
+      || controller !== join(this.#home, "trusted", "runtime", "target", "release", "arrowcol-oat-rust")) throw new Error("run and controller must belong to the trusted home");
+    this.#verifyRuntime();
+    await assertFreshRunRoot(runRoot);
+    if (!isAbsolute(configPath) || !isAbsolute(controller) || relative(runRoot, configPath) !== "config.json"
+      || await realpath(configPath) !== configPath || await realpath(controller) !== controller) throw new Error("invalid trusted run paths");
     const configBytes = await readFile(configPath);
     const config = comparableRunConfig(JSON.parse(configBytes.toString("utf8")), runRoot);
-    const memory = Number(object(object(config.platform, "platform").local, "local").collector_memory_limit_bytes);
+    const admission = { runRoot, config, configPath, configHash: digest(configBytes), controller, controllerHash: digest(await readFile(controller)) };
+    const first = this.#admissions.get("baseline");
+    if (arm === "candidate" && first) {
+      assertDisjointRunRoots(first.runRoot, runRoot);
+      if (!isDeepStrictEqual(first.config, config) || first.controllerHash !== admission.controllerHash) throw new Error("arm settings or controller differ");
+    }
+    this.#admissions.set(arm, admission);
+  }
+  async #live(arm: Arm, project: string, admission: Admission): Promise<LiveRole[]> {
+    if (!this.#images || !/^[a-z0-9][a-z0-9_-]+$/.test(project)) throw new Error("invalid Compose project");
+    if (digest(await readFile(admission.configPath)) !== admission.configHash || digest(await readFile(admission.controller)) !== admission.controllerHash) {
+      throw new Error("run config or controller changed after admission");
+    }
+    const memory = Number(object(object(admission.config.platform, "platform").local, "local").collector_memory_limit_bytes);
     const env = { HOME: this.#home, PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8" };
-    const lines = execFileSync("docker", ["ps", "--no-trunc", "--quiet", "--filter", `label=com.docker.compose.project=${project}`], { env, encoding: "utf8" }).trim();
+    const lines = execFileSync("docker", ["ps", "--no-trunc", "--quiet", "--filter", "label=com.docker.compose.project=" + project], { env, encoding: "utf8" }).trim();
     const ids = lines ? lines.split("\n") : [];
     if (!ids.length || ids.some(value => !/^[a-f0-9]{64}$/.test(value))) throw new Error("live Compose container IDs are unavailable");
     const raw = JSON.parse(execFileSync("docker", ["inspect", ...ids], { env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })) as unknown;
-    const roles = inspectLayoutContainers(raw, project, this.#images[arm], [this.#images.baseline, this.#images.candidate], memory);
-    this.#captures.set(arm, { project, runRoot, config, configPath, configHash: digest(configBytes), controller, controllerHash: digest(await readFile(controller)), roles });
+    return inspectLayoutContainers(raw, project, this.#images[arm], [this.#images.baseline, this.#images.candidate], memory);
   }
-  async compareReconciledArms(): Promise<{ baseline: Awaited<ReturnType<typeof readReconciledOatResult>>; candidate: Awaited<ReturnType<typeof readReconciledOatResult>> }> {
-    const baseline = this.#captures.get("baseline");
-    const candidate = this.#captures.get("candidate");
-    const stableRoles = (capture: Capture) => capture.roles.filter(role => role.service !== "dataflow-1").map(({ service, imageId }) => ({ service, imageId }));
-    if (!baseline || !candidate || !this.#images || baseline.project === candidate.project || baseline.controllerHash !== candidate.controllerHash
-      || !isDeepStrictEqual(baseline.config, candidate.config) || !isDeepStrictEqual(stableRoles(baseline), stableRoles(candidate))) {
-      throw new Error("arm settings, controller or non-collector roles differ");
+  async capture(arm: Arm, project: string): Promise<void> {
+    const admission = this.#admissions.get(arm);
+    if (!admission || this.#captureStarted.has(arm)) throw new Error("arm was not admitted or was already captured");
+    this.#captureStarted.add(arm);
+    this.#captures.set(arm, { ...admission, project, roles: await this.#live(arm, project, admission) });
+  }
+  async recheckLive(arm: Arm): Promise<void> {
+    const capture = this.#captures.get(arm);
+    if (!capture || this.#rechecked.has(arm)) throw new Error("arm was not captured or was already rechecked");
+    if (!isDeepStrictEqual(capture.roles, await this.#live(arm, capture.project, capture))) throw new Error("live Compose role or container changed during the cell");
+    this.#rechecked.add(arm);
+  }
+  async finishArm(arm: Arm): Promise<void> {
+    const capture = this.#captures.get(arm);
+    if (!capture || !this.#rechecked.has(arm) || this.#finished.has(arm)) throw new Error("arm live roles were not rechecked or already finished");
+    this.#verifyRuntime();
+    if (digest(await readFile(capture.configPath)) !== capture.configHash || digest(await readFile(capture.controller)) !== capture.controllerHash) {
+      throw new Error("run config or controller changed after capture");
     }
+    const tunables = object(capture.config.tunables, "tunables");
+    const defaults = object(object(tunables.parquet_writer, "parquet writer").defaults, "writer defaults");
+    if (defaults.compression !== "zstd" || !Number.isSafeInteger(defaults.compression_level)) throw new Error("unsupported frozen compression");
+    const path = join(capture.runRoot, "results.parquet");
+    const bytes = await readFile(path);
+    if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("invalid result size");
+    const result = await readReconciledOatResult(path, join(capture.runRoot, "snapshots"), "sqlserver_active_sessions", BASE, Number(defaults.compression_level));
+    if (digest(await readFile(path)) !== digest(bytes)) throw new Error("OAT result changed during reconciliation");
+    const table = tableFromIPC(readParquet(bytes).intoIPCStream());
+    if (table.numRows !== 1) throw new Error("invalid OAT evidence rows");
+    const row = table.toArray()[0];
+    if (typeof row.evidence_json !== "string") throw new Error("missing OAT evidence");
+    const evidence = JSON.parse(row.evidence_json) as unknown;
+    const platform = object(capture.config.platform, "platform");
+    if (typeof platform.compose_project !== "string" || capture.project !== scopedProject(platform.compose_project, result.cellRunId)) {
+      throw new Error("live Compose project does not match the reconciled cell");
+    }
+    assertCollectorShutdown(evidence, capture.roles.find(role => role.service === "dataflow-1")!.containerId);
+    assertSettledDelivery(evidence);
     const env = { HOME: this.#home, PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8" };
-    async function read(capture: Capture) {
-      if (digest(await readFile(capture.configPath)) !== capture.configHash || digest(await readFile(capture.controller)) !== capture.controllerHash) {
-        throw new Error("run config or controller changed after capture");
-      }
-      const tunables = object(capture.config.tunables, "tunables");
-      const defaults = object(object(tunables.parquet_writer, "parquet writer").defaults, "writer defaults");
-      if (defaults.compression !== "zstd" || !Number.isSafeInteger(defaults.compression_level)) throw new Error("unsupported frozen compression");
-      const path = join(capture.runRoot, "results.parquet");
-      const bytes = await readFile(path);
-      if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("invalid result size");
-      const result = await readReconciledOatResult(path, join(capture.runRoot, "snapshots"), "sqlserver_active_sessions", BASE, Number(defaults.compression_level));
-      if (digest(await readFile(path)) !== digest(bytes)) throw new Error("OAT result changed during reconciliation");
-      const table = tableFromIPC(readParquet(bytes).intoIPCStream());
-      if (table.numRows !== 1) throw new Error("invalid OAT evidence rows");
-      const row = table.toArray()[0];
-      if (typeof row.evidence_json !== "string") throw new Error("missing OAT evidence");
-      const evidence = JSON.parse(row.evidence_json) as unknown;
-      const platform = object(capture.config.platform, "platform");
-      if (typeof platform.compose_project !== "string" || capture.project !== scopedProject(platform.compose_project, result.cellRunId)) {
-        throw new Error("live Compose project does not match the reconciled cell");
-      }
-      assertCollectorShutdown(evidence, capture.roles.find(role => role.service === "dataflow-1")!.containerId);
-      assertSettledDelivery(evidence);
-      for (const command of [["ps", "--all", "--quiet"], ["network", "ls", "--quiet"], ["volume", "ls", "--quiet"]]) {
-        const remaining = execFileSync("docker", [...command, "--filter", "label=com.docker.compose.project=" + capture.project], { env, encoding: "utf8" }).trim();
-        if (remaining) throw new Error("run-owned Docker cleanup is unsettled");
-      }
-      try {
-        await lstat(join(capture.runRoot, "state", result.cellRunId));
-        throw new Error("run-owned state remains after cleanup");
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
-      return { result, evidence };
+    for (const command of [["ps", "--all", "--quiet"], ["network", "ls", "--quiet"], ["volume", "ls", "--quiet"]]) {
+      const remaining = execFileSync("docker", [...command, "--filter", "label=com.docker.compose.project=" + capture.project], { env, encoding: "utf8" }).trim();
+      if (remaining) throw new Error("run-owned Docker cleanup is unsettled");
     }
-    const left = await read(baseline);
-    const right = await read(candidate);
-    compareLayoutReadbacks(left.evidence, right.evidence);
-    compareOatImages(left.evidence, right.evidence, this.#images, baseline.roles, candidate.roles);
-    return { baseline: left.result, candidate: right.result };
+    try {
+      await lstat(join(capture.runRoot, "state", result.cellRunId));
+      throw new Error("run-owned state remains after cleanup");
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    this.#finished.set(arm, { result, evidence, capture });
+  }
+  compareReconciledArms(): { baseline: Result; candidate: Result; images: Readonly<Record<Arm, string>>; sourceManifests: Record<Arm, string> } {
+    const baseline = this.#finished.get("baseline");
+    const candidate = this.#finished.get("candidate");
+    const stableRoles = (capture: Capture) => capture.roles.filter(role => role.service !== "dataflow-1").map(({ service, imageId }) => ({ service, imageId }));
+    if (!baseline || !candidate || !this.#images || baseline.capture.project === candidate.capture.project
+      || baseline.capture.controllerHash !== candidate.capture.controllerHash || !isDeepStrictEqual(baseline.capture.config, candidate.capture.config)
+      || !isDeepStrictEqual(stableRoles(baseline.capture), stableRoles(candidate.capture))) throw new Error("arm settings, controller or non-collector roles differ");
+    compareLayoutReadbacks(baseline.evidence, candidate.evidence);
+    compareOatImages(baseline.evidence, candidate.evidence, this.#images, baseline.capture.roles, candidate.capture.roles);
+    return { baseline: baseline.result, candidate: candidate.result, images: this.#images, sourceManifests: this.sourceManifests() };
   }
 }

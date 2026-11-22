@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { LayoutCodeTrial, assertCollectorShutdown, assertSettledDelivery, comparableRunConfig, compareLayoutReadbacks, compareOatImages, inspectLayoutContainers, scopedProject } from "./layout-code-trial.js";
+import { LayoutCodeTrial, assertCollectorShutdown, assertSettledDelivery, assertFreshRunRoot, assertDisjointRunRoots, comparableRunConfig, compareLayoutReadbacks, compareOatImages, inspectLayoutContainers, scopedProject } from "./layout-code-trial.js";
 
 const baseline = `sha256:${"a".repeat(64)}`;
 const candidate = `sha256:${"b".repeat(64)}`;
@@ -112,13 +112,26 @@ test("requires observed drain of the captured collector and binds the cell proje
 });
 
 test("refuses unsettled and inconsistent client acknowledgment evidence", () => {
-  const data = { reconciliation: { status: "within_bound", settled: true, scope: "process_cumulative_client_rows_vs_this_cells_new_ingestion_commits_including_warmup", completed_rows: 10, ambiguous_rows: 2, delta_rows: 11 },
-    durable_commits: { run_cumulative_output: { rows: 11, settled: true } }, client_phase_reports: [{ phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 2 } } }] };
+  const data = { reconciliation: { status: "within_bound", settled: true, scope: "process_cumulative_client_rows_vs_this_cells_new_ingestion_commits_including_warmup", completed_rows: 10, ambiguous_rows: 0, delta_rows: 10 },
+    durable_commits: { run_cumulative_output: { rows: 10, settled: true } }, client_phase_reports: [{ phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 0 } } }] };
   assertSettledDelivery(data);
   for (const change of [
     (v: typeof data) => { v.durable_commits.run_cumulative_output.settled = false; },
     (v: typeof data) => { v.reconciliation.status = "unsettled"; },
     (v: typeof data) => { v.durable_commits.run_cumulative_output.rows = 13; v.reconciliation.delta_rows = 13; },
+    (v: typeof data) => { v.client_phase_reports[0].phase_counters.process_cumulative.ambiguous_rows = 1; v.reconciliation.ambiguous_rows = 1; },
     (v: typeof data) => { v.client_phase_reports[0].phase_counters.process_cumulative.completed_rows = 9; },
   ]) { const bad = structuredClone(data); change(bad); assert.throws(() => assertSettledDelivery(bad)); }
+});
+
+test("requires fresh disjoint run roots before execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "layout-fresh-"));
+  try {
+    await assertFreshRunRoot(root);
+    await writeFile(join(root, "results.parquet"), "stale");
+    await assert.rejects(assertFreshRunRoot(root), /already exists/);
+    assert.throws(() => assertDisjointRunRoots(root, root));
+    assert.throws(() => assertDisjointRunRoots(root, join(root, "nested")));
+    assert.doesNotThrow(() => assertDisjointRunRoots(root, root + "-other"));
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
