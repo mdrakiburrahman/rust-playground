@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { createWriteStream, openSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
-import { cpuList } from "./physics-observer.js";
+import { allowedCpus, cgroupDirectory, cpuList, processStartTime } from "./physics-observer.js";
 
 function integer(value: string | undefined, name: string, max: number): number {
   if (!value || !/^[1-9][0-9]*$/.test(value) || Number(value) > max) throw new Error(`invalid ${name}`);
@@ -36,7 +36,7 @@ async function sha256(path: string): Promise<string> {
   return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
-function run(command: string, args: string[], log: string): { done: Promise<number>; stop: () => void } {
+function run(command: string, args: string[], log: string): { pid: number | undefined; done: Promise<number>; stop: (signal?: NodeJS.Signals) => void } {
   const output = createWriteStream(log, { fd: openSync(log, "wx") });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ARROWCOL_CLIENT_") && key !== "ARROWCOL_OAT_RUN_ID"));
   const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -52,11 +52,42 @@ function run(command: string, args: string[], log: string): { done: Promise<numb
       output.end(() => accept(code ?? -1));
     });
   });
-  return { done, stop: () => {
+  return { pid: child.pid, done, stop: (signal = "SIGTERM") => {
     if (ended || timer !== null) return;
-    child.kill("SIGTERM");
+    child.kill(signal);
     timer = setTimeout(() => { if (!ended) child.kill("SIGKILL"); }, 1000);
   } };
+}
+
+async function readback(pid: number | undefined, expectedSha256: string, cpus: number[]): Promise<Record<string, unknown>> {
+  if (pid === undefined) throw new Error("probe process has no PID");
+  const start = processStartTime(await readFile(`/proc/${pid}/stat`, "utf8"));
+  if (await sha256(`/proc/${pid}/exe`) !== expectedSha256) throw new Error("probe executable identity mismatch");
+  const threads = [];
+  for (const tid of await readdir(`/proc/${pid}/task`)) {
+    try {
+      const affinity = allowedCpus(await readFile(`/proc/${pid}/task/${tid}/status`, "utf8"));
+      if (affinity !== cpus.join(",")) throw new Error("probe effective CPU allocation mismatch");
+      threads.push({ tid, affinity });
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  if (threads.length === 0 || processStartTime(await readFile(`/proc/${pid}/stat`, "utf8")) !== start) {
+    throw new Error("probe process identity changed");
+  }
+  const placement = await readFile(`/proc/${pid}/cgroup`, "utf8");
+  const directory = cgroupDirectory(placement, await readFile("/proc/self/mountinfo", "utf8"));
+  let quota: string | null = null;
+  let quotaReason: string | null = directory === null ? "target cgroup v2 mount is unavailable" : null;
+  if (directory !== null) {
+    try { quota = await readFile(join(directory, "cpu.max"), "utf8"); }
+    catch (error) {
+      if (!(error instanceof Error)) throw error;
+      quotaReason = error.message;
+    }
+  }
+  return { pid, start_ticks: start, threads, cgroup: placement, quota, quota_unavailable_reason: quotaReason };
 }
 
 async function main(): Promise<void> {
@@ -95,6 +126,14 @@ async function main(): Promise<void> {
     "--duration-secs", String(seconds + warmup + 660), "--runtime-threads", String(sinkCpus.length),
   ], join(output, "sink.log"));
   let clientProcess: ReturnType<typeof run> | null = null;
+  let interrupted = false;
+  const interrupt = (): void => {
+    interrupted = true;
+    clientProcess?.stop();
+    sinkProcess.stop();
+  };
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", interrupt);
   let sinkExit: number | null = null;
   let sinkFailure: unknown = null;
   void sinkProcess.done.then(code => { sinkExit = code; }, error => { sinkFailure = error; });
@@ -102,6 +141,7 @@ async function main(): Promise<void> {
     let ready: Record<string, unknown> | null = null;
     const deadline = Date.now() + 30_000;
     while (ready === null) {
+      if (interrupted) throw new Error("null sink probe interrupted");
       if (sinkExit !== null || sinkFailure !== null) throw new Error("null sink exited before readiness");
       if (Date.now() > deadline) throw new Error("null sink readiness timed out");
       try {
@@ -113,6 +153,8 @@ async function main(): Promise<void> {
       }
     }
     if (typeof ready.endpoint !== "string" || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/.test(ready.endpoint)) throw new Error("invalid loopback sink endpoint");
+    if (ready.pid !== sinkProcess.pid) throw new Error("sink ready PID differs from owned process");
+    const sinkReadback = await readback(sinkProcess.pid, hashes.sink, sinkCpus);
     const clientLog = join(output, "client.log");
     clientProcess = run("taskset", ["-c", clientCpus.join(","), client, ...args,
       "--endpoint", ready.endpoint, "--schedule-file", schedulePath,
@@ -123,10 +165,12 @@ async function main(): Promise<void> {
     void clientProcess.done.then(code => { clientExit = code; }, error => { clientFailure = error; });
     const prepareDeadline = Date.now() + 600_000;
     while (!(await readFile(clientLog, "utf8")).split("\n").some(line => line.startsWith("OAT_CLIENT_READY "))) {
+      if (interrupted) throw new Error("null sink probe interrupted");
       if (clientExit !== null || clientFailure !== null) throw new Error("client exited before corpus preparation completed");
       if (Date.now() > prepareDeadline) throw new Error("client preparation timed out");
       await new Promise<void>(accept => setTimeout(accept, 100));
     }
+    const clientReadback = await readback(clientProcess.pid, hashes.client, clientCpus);
     const start = Date.now() + 1000;
     await writeFile(schedulePath, `${start}\n`, { flag: "wx" });
     const timeout = setTimeout(() => { clientProcess?.stop(); }, (seconds + warmup + 35) * 1000);
@@ -139,6 +183,24 @@ async function main(): Promise<void> {
     const terminal = snapshots.filter(snapshot => snapshot.phase === "completed");
     if (terminal.length !== 1) throw new Error("expected exactly one completed client receipt");
     const metrics = terminal[0]!;
+    if (!Array.isArray(metrics.workers)) throw new Error("client worker counters missing");
+    let totalCompletedRows = 0;
+    for (const worker of metrics.workers) {
+      const counters = object(worker, "client worker");
+      for (const counter of ["rejected_streams", "retried_streams", "given_up_streams", "ambiguous_streams", "error_rows", "cancelled_rows"]) {
+        if (counters[counter] !== 0) throw new Error(`null sink proof requires zero ${counter}`);
+      }
+      if (typeof counters.completed_rows !== "number" || !Number.isSafeInteger(counters.completed_rows)) throw new Error("invalid lifetime completed row count");
+      totalCompletedRows += counters.completed_rows;
+    }
+    sinkProcess.stop("SIGINT");
+    if (await sinkProcess.done !== 0) throw new Error("null sink failed graceful shutdown");
+    const sinkTerminals = (await readFile(join(output, "sink.log"), "utf8")).split("\n")
+      .filter(line => line.startsWith("FLIGHT_NULL_SINK_COMPLETED "))
+      .map(line => object(JSON.parse(line.slice("FLIGHT_NULL_SINK_COMPLETED ".length)), "sink completion"));
+    if (sinkTerminals.length !== 1 || sinkTerminals[0]!.decoded_completed_rows !== totalCompletedRows) {
+      throw new Error("null sink decoded lifetime rows do not reconcile with client admission rows");
+    }
     const manifest = object(metrics.logical_batch_manifest, "logical manifest");
     if (manifest.complete !== true || manifest.truncated !== false) throw new Error("logical replay manifest is incomplete");
     const preparation = object(metrics.preparation, "preparation");
@@ -152,6 +214,9 @@ async function main(): Promise<void> {
     await writeFile(join(output, "receipt.json"), `${JSON.stringify({
       scope: "client_to_loopback_decode_discard_sink_not_collector_durability", host: hostname(), source_revision: revision,
       binaries: hashes, client_cpus: clientCpus, sink_cpus: sinkCpus, seconds, warmup_seconds: warmup,
+      effective_allocations: { client: clientReadback, sink: sinkReadback },
+      decoded_lifetime_rows: totalCompletedRows,
+      decoded_row_scope: "sink/client_reconciled_lifetime_rows_including_warmup_and_drain_not_measurement_window_or_durability",
       config_sha256: createHash("sha256").update(configBytes).digest("hex"),
       payload_corpus_sha256: preparation.payload_corpus_sha256,
       offered_rows_per_second: window.offered_rows / seconds,
@@ -160,6 +225,8 @@ async function main(): Promise<void> {
       client_metrics: metrics,
     }, null, 2)}\n`, { flag: "wx" });
   } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", interrupt);
     clientProcess?.stop();
     sinkProcess.stop();
     await Promise.allSettled([sinkProcess.done, ...(clientProcess ? [clientProcess.done] : [])]);

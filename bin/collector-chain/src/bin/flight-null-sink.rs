@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -117,12 +117,28 @@ async fn run(args: Args) -> Result<()> {
     let incoming = stream::unfold(listener, |listener| async {
         Some((listener.accept().await.map(|(socket, _)| socket), listener))
     });
+    let shutdown_failed = Arc::new(AtomicBool::new(false));
+    let signal_failed = Arc::clone(&shutdown_failed);
     tonic::transport::Server::builder()
         .initial_stream_window_size(args.stream_window_bytes)
         .initial_connection_window_size(args.connection_window_bytes)
         .add_service(service)
-        .serve_with_incoming_shutdown(incoming, tokio::time::sleep(Duration::from_secs(args.duration_secs)))
+        .serve_with_incoming_shutdown(incoming, async move {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(args.duration_secs)) => {}
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        signal_failed.store(true, Ordering::Relaxed);
+                        eprintln!("null sink shutdown signal failed: {error}");
+                    }
+                }
+            }
+        })
         .await?;
+    anyhow::ensure!(
+        !shutdown_failed.load(Ordering::Relaxed),
+        "null sink shutdown signal failed"
+    );
     println!(
         "FLIGHT_NULL_SINK_COMPLETED {}",
         json!({
