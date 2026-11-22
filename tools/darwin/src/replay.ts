@@ -177,7 +177,7 @@ export async function replayCompressionPair(
       await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"), stackBytes);
       if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
       const result = await readReconciledOatResult(
-        join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producer.revision, level,
+        join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producer.revision, level, seedClient.data_profile,
       );
       const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
       if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");

@@ -1,6 +1,7 @@
 //! Bounded, startup-prepared DMV workload and persistent Flight senders.
 
 use super::*;
+use arrow_array::Array;
 use arrow_flight::encode::DictionaryHandling;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
@@ -17,6 +18,10 @@ use tokio::task::JoinSet;
 const MAX_LOGICAL_BATCH_RECORDS: usize = 1_000_000;
 const MAX_LOGICAL_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_OAT_CLIENT_METRICS_LINE_BYTES: usize = 1_048_576;
+const PAYLOAD_HASH_VERSION: u64 = 2;
+const PAYLOAD_HASH_DOMAIN: &[u8] = b"arrowcol.payload_corpus.logical.v2\0";
+const HASH_FIELD: u8 = 0x11;
+const HASH_ROW: u8 = 0x21;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -966,7 +971,7 @@ impl PreparedClient {
         let mut encoding_seconds = 0.0;
         let mut generation_cpu_seconds = cpu_started.map(|_| 0.0);
         let mut encoding_cpu_seconds = cpu_started.map(|_| 0.0);
-        let mut payload_hasher = options.payload_customer_id.as_ref().map(|_| Sha256::new());
+        let mut payload_hasher = new_payload_hasher(options.data_profile, copies, table_count)?;
         for copy in 0..copies {
             let mut batches = Vec::new();
             for (table, version) in tables.iter().zip(&versions) {
@@ -975,9 +980,15 @@ impl PreparedClient {
                     let generation_start = Instant::now();
                     let cpu_start = thread_cpu_seconds()?;
                     let batch = synthetic_batch(table, client_id, length, offset, copy, &options)?;
-                    if let Some(hasher) = payload_hasher.as_mut() {
-                        hash_payload_batch(hasher, table, &batch, copy, offset)?;
-                    }
+                    hash_payload_batch(
+                        &mut payload_hasher,
+                        table,
+                        &batch,
+                        copy,
+                        offset,
+                        rows,
+                        options.data_profile,
+                    )?;
                     generation_seconds += generation_start.elapsed().as_secs_f64();
                     if let Some((total, (end, start))) = generation_cpu_seconds
                         .as_mut()
@@ -1027,6 +1038,9 @@ impl PreparedClient {
             channels.push(worker);
         }
         let mut preparation = serde_json::json!({
+            "data_profile": options.data_profile,
+            "payload_corpus_hash_version": PAYLOAD_HASH_VERSION,
+            "payload_corpus_hash_scope": payload_hash_scope(options.data_profile),
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
             "corpus_uncompressed_flight_data_bytes": raw_arrow_bytes_total,
             "corpus_configured_ipc_compression_flight_data_bytes": encoded_bytes,
@@ -1050,9 +1064,7 @@ impl PreparedClient {
             "generator_rows_per_second": rows as f64 * table_count as f64 * copies as f64 / generation_seconds.max(f64::MIN_POSITIVE),
             "steady_state_generation": options.data_profile == DataProfile::Realistic,
         });
-        if let Some(hasher) = payload_hasher {
-            preparation["payload_corpus_sha256"] = serde_json::json!(format!("{:x}", hasher.finalize()));
-        }
+        preparation["payload_corpus_sha256"] = serde_json::json!(finish_payload_hasher(payload_hasher));
         Ok(Arc::new(Self {
             counters: (0..options.workers).map(|_| Counters::default()).collect(),
             worker_next: (0..options.workers).map(|_| AtomicU64::new(0)).collect(),
@@ -1272,6 +1284,7 @@ impl PreparedClient {
         let mut manifest = if self.options.data_profile == DataProfile::Diagnostic {
             serde_json::json!({
                 "schema": "arrowcol.logical_batch_manifest.v1",
+                "data_profile": self.options.data_profile,
                 "identity_status": "diagnostic_only",
                 "eligible_for_identity_reconciliation": false,
                 "complete": false,
@@ -1283,6 +1296,7 @@ impl PreparedClient {
         } else {
             serde_json::json!({
                 "schema": "arrowcol.logical_batch_manifest.v1",
+                "data_profile": self.options.data_profile,
                 "version": 1,
                 "identity_status": "identity_bearing",
                 "eligible_for_identity_reconciliation": true,
@@ -1313,7 +1327,8 @@ impl PreparedClient {
         };
         if let Some(hash) = self.preparation.get("payload_corpus_sha256") {
             manifest["payload_corpus_sha256"] = hash.clone();
-            manifest["payload_corpus_hash_scope"] = serde_json::json!("arrow-ipc-v1-excluding-endpoint_url");
+            manifest["payload_corpus_hash_version"] = serde_json::json!(PAYLOAD_HASH_VERSION);
+            manifest["payload_corpus_hash_scope"] = serde_json::json!(payload_hash_scope(self.options.data_profile));
         }
         if self.manifest_capacity_reached.load(Ordering::Relaxed) {
             let reason = self.remember_first_terminal_failure("record_capacity_reached")?;
@@ -2322,17 +2337,130 @@ fn synthetic_guid(seed: u64, pod_ordinal: u32, worker: usize, column: usize, row
     uuid::Uuid::from_u128(value).to_string()
 }
 
-struct PayloadHashWriter<'a>(&'a mut Sha256);
-
-impl std::io::Write for PayloadHashWriter<'_> {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0.update(data);
-        Ok(data.len())
+fn payload_hash_scope(profile: DataProfile) -> &'static str {
+    match profile {
+        DataProfile::Diagnostic => "arrow-logical-v2-all-columns",
+        DataProfile::Realistic => "arrow-logical-v2-excluding-endpoint_url",
     }
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+fn payload_profile_name(profile: DataProfile) -> &'static str {
+    match profile {
+        DataProfile::Diagnostic => "diagnostic",
+        DataProfile::Realistic => "realistic",
     }
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {
+    hasher.update(u64::try_from(bytes.len())?.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_u64(hasher: &mut Sha256, value: usize) -> Result<()> {
+    hasher.update(u64::try_from(value)?.to_le_bytes());
+    Ok(())
+}
+
+fn new_payload_hasher(profile: DataProfile, copies: usize, tables: usize) -> Result<Sha256> {
+    let mut hasher = Sha256::new();
+    hasher.update(PAYLOAD_HASH_DOMAIN);
+    hasher.update(PAYLOAD_HASH_VERSION.to_le_bytes());
+    hash_bytes(&mut hasher, payload_profile_name(profile).as_bytes())?;
+    hash_u64(&mut hasher, copies)?;
+    hash_u64(&mut hasher, tables)?;
+    Ok(hasher)
+}
+
+fn hash_data_type(hasher: &mut Sha256, data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Utf8 => hash_bytes(hasher, b"utf8")?,
+        DataType::Boolean => hash_bytes(hasher, b"bool")?,
+        DataType::UInt8 => hash_bytes(hasher, b"u8")?,
+        DataType::Int16 => hash_bytes(hasher, b"i16")?,
+        DataType::Int32 => hash_bytes(hasher, b"i32")?,
+        DataType::Int64 => hash_bytes(hasher, b"i64")?,
+        DataType::Float64 => hash_bytes(hasher, b"f64")?,
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            hash_bytes(hasher, b"timestamp_us")?;
+            if let Some(timezone) = timezone {
+                hasher.update([1]);
+                hash_bytes(hasher, timezone.as_bytes())?;
+            } else {
+                hasher.update([0]);
+            }
+        }
+        other => bail!("unsupported synthetic payload hash type {other}"),
+    }
+    Ok(())
+}
+
+fn hash_array_value(hasher: &mut Sha256, array: &dyn Array, data_type: &DataType, row: usize) -> Result<()> {
+    if array.is_null(row) {
+        hasher.update([0]);
+        return Ok(());
+    }
+    hasher.update([1]);
+    match data_type {
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("payload string column type mismatch")?;
+            hash_bytes(hasher, values.value(row).as_bytes())?;
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("payload boolean column type mismatch")?;
+            hasher.update([u8::from(values.value(row))]);
+        }
+        DataType::UInt8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .context("payload u8 column type mismatch")?;
+            hasher.update([values.value(row)]);
+        }
+        DataType::Int16 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .context("payload i16 column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        DataType::Int32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context("payload i32 column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("payload i64 column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .context("payload f64 column type mismatch")?;
+            hasher.update(values.value(row).to_bits().to_le_bytes());
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("payload timestamp column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        other => bail!("unsupported synthetic payload hash type {other}"),
+    }
+    Ok(())
 }
 
 fn hash_payload_batch(
@@ -2341,29 +2469,55 @@ fn hash_payload_batch(
     batch: &RecordBatch,
     copy: usize,
     offset: usize,
+    total_rows: usize,
+    profile: DataProfile,
 ) -> Result<()> {
-    let table_name = format!(
-        "{}.{}.{}",
-        table.identity.catalog(),
-        table.identity.schema(),
-        table.identity.table()
+    ensure!(
+        batch.schema().as_ref() == table.schema.as_ref(),
+        "payload batch schema changed"
     );
-    hasher.update(u64::try_from(table_name.len())?.to_le_bytes());
-    hasher.update(table_name.as_bytes());
-    hasher.update(u64::try_from(copy)?.to_le_bytes());
-    hasher.update(u64::try_from(offset)?.to_le_bytes());
-    let indices = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, field)| (field.name() != "endpoint_url").then_some(index))
-        .collect::<Vec<_>>();
-    let payload = batch.project(&indices)?;
-    let mut writer = arrow_ipc::writer::StreamWriter::try_new(PayloadHashWriter(hasher), &payload.schema())?;
-    writer.write(&payload)?;
-    writer.finish()?;
+    ensure!(
+        offset
+            .checked_add(batch.num_rows())
+            .is_some_and(|end| end <= total_rows),
+        "payload batch exceeds table row count"
+    );
+    let fields = batch.schema().fields();
+    let include_field =
+        |field: &arrow_schema::Field| profile != DataProfile::Realistic || field.name() != "endpoint_url";
+    let field_count = fields.iter().filter(|field| include_field(field)).count();
+    if offset == 0 {
+        hasher.update([0x10]);
+        hash_u64(hasher, copy)?;
+        hash_bytes(hasher, table.identity.catalog().as_bytes())?;
+        hash_bytes(hasher, table.identity.schema().as_bytes())?;
+        hash_bytes(hasher, table.identity.table().as_bytes())?;
+        hash_u64(hasher, total_rows)?;
+        hash_u64(hasher, field_count)?;
+        for (index, field) in fields.iter().enumerate().filter(|(_, field)| include_field(field)) {
+            hasher.update([HASH_FIELD]);
+            hash_u64(hasher, index)?;
+            hash_bytes(hasher, field.name().as_bytes())?;
+            hash_data_type(hasher, field.data_type())?;
+            hasher.update([u8::from(field.is_nullable())]);
+        }
+    }
+    for row in 0..batch.num_rows() {
+        hasher.update([HASH_ROW]);
+        hash_u64(hasher, offset + row)?;
+        for (index, field) in fields.iter().enumerate().filter(|(_, field)| include_field(field)) {
+            hash_array_value(hasher, batch.column(index).as_ref(), field.data_type(), row)?;
+        }
+    }
+    if offset + batch.num_rows() == total_rows {
+        hasher.update([0x12]);
+    }
     Ok(())
+}
+
+fn finish_payload_hasher(mut hasher: Sha256) -> String {
+    hasher.update([0xff]);
+    format!("{:x}", hasher.finalize())
 }
 
 fn synthetic_batch(
@@ -3027,6 +3181,71 @@ mod tests {
             .resolve(100, 1)
     }
 
+    fn hash_test_batches(
+        table: &DmvTable,
+        profile: DataProfile,
+        copy: usize,
+        batches: &[RecordBatch],
+    ) -> Result<String> {
+        let total_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let mut hasher = new_payload_hasher(profile, copy + 1, 1)?;
+        let mut offset = 0;
+        for batch in batches {
+            hash_payload_batch(&mut hasher, table, batch, copy, offset, total_rows, profile)?;
+            offset += batch.num_rows();
+        }
+        Ok(finish_payload_hasher(hasher))
+    }
+
+    #[test]
+    fn logical_corpus_hash_ignores_batch_splits_and_detects_order_or_value_changes() -> Result<()> {
+        let options = options()?;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let batch = synthetic_batch(&table, "logical-hash", 7, 0, 0, &options)?;
+        let whole = hash_test_batches(&table, DataProfile::Diagnostic, 0, &[batch.clone()])?;
+        let ragged = [batch.slice(0, 2), batch.slice(2, 1), batch.slice(3, 4)];
+        assert_eq!(whole, hash_test_batches(&table, DataProfile::Diagnostic, 0, &ragged)?);
+        let reordered = [batch.slice(3, 4), batch.slice(0, 3)];
+        assert_ne!(
+            whole,
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &reordered)?
+        );
+        let column = table.schema.index_of("replica_server_name")?;
+        let values = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("replica_server_name is not a string")?;
+        let changed_values = StringArray::from_iter((0..batch.num_rows()).map(|row| {
+            if row == 3 {
+                Some("changed-middle-value")
+            } else if values.is_null(row) {
+                None
+            } else {
+                Some(values.value(row))
+            }
+        }));
+        let mut columns = batch.columns().to_vec();
+        columns[column] = Arc::new(changed_values);
+        let changed = RecordBatch::try_new(batch.schema(), columns)?;
+        assert_ne!(
+            whole,
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[changed])?
+        );
+        assert_ne!(whole, hash_test_batches(&table, DataProfile::Diagnostic, 1, &[batch])?);
+        Ok(())
+    }
+
+    #[test]
+    fn logical_corpus_hash_covers_all_public_generator_schemas() -> Result<()> {
+        let options = options()?;
+        for table in tables()? {
+            let batch = synthetic_batch(&table, "all-public-schemas", 3, 0, 0, &options)?;
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[batch])?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn fixed_business_payload_retains_distinct_delivery_identities() -> Result<()> {
         let mut options = options()?;
@@ -3046,11 +3265,14 @@ mod tests {
         let a = batch_with_logical_identity(&first, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), 0, 0)?;
         let b = batch_with_logical_identity(&second, uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(4), 0, 0)?;
         assert_ne!(a.column_by_name("endpoint_url"), b.column_by_name("endpoint_url"));
-        let mut a_hash = Sha256::new();
-        let mut b_hash = Sha256::new();
-        hash_payload_batch(&mut a_hash, &table, &a, 0, 0)?;
-        hash_payload_batch(&mut b_hash, &table, &b, 0, 0)?;
-        assert_eq!(a_hash.finalize(), b_hash.finalize());
+        assert_eq!(
+            hash_test_batches(&table, DataProfile::Realistic, 0, &[a.clone()])?,
+            hash_test_batches(&table, DataProfile::Realistic, 0, &[b.clone()])?
+        );
+        assert_ne!(
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[a])?,
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[b])?
+        );
         options.payload_customer_id = None;
         assert_ne!(
             synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?,

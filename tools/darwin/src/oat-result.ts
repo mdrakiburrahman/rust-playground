@@ -18,44 +18,63 @@ function imageId(value: unknown): string {
   return value;
 }
 
+export type ClientDataProfile = "diagnostic" | "realistic";
+
 export interface ClientEvidence {
+  profile: ClientDataProfile;
+  identityEligibleForReconciliation: boolean;
   payloadCorpusSha256: string;
   cpu: { coreEquivalents: number | null; sampleStartUnixMs: number | null; sampleEndUnixMs: number | null; unavailableReason: string | null };
 }
 
-export function extractClientEvidence(raw: unknown): ClientEvidence {
+export function extractClientEvidence(raw: unknown, requestedProfile: ClientDataProfile): ClientEvidence {
+  if (requestedProfile !== "diagnostic" && requestedProfile !== "realistic") throw new Error("requested client data profile is invalid");
   const report = object(raw, "client report");
   const phase = object(report.phase_counters, "client phase counters");
   const preparation = object(phase.preparation, "client preparation");
   const manifest = object(phase.payload_manifest, "payload manifest");
   const hash = preparation.payload_corpus_sha256;
+  const expectedScope = requestedProfile === "diagnostic"
+    ? "arrow-logical-v2-all-columns"
+    : "arrow-logical-v2-excluding-endpoint_url";
+  const identityEligible = requestedProfile === "realistic";
+  const expectedStatus = identityEligible ? "identity_bearing" : "diagnostic_only";
   if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash)
-    || manifest.payload_corpus_sha256 !== hash || manifest.payload_corpus_hash_scope !== "arrow-ipc-v1-excluding-endpoint_url"
-    || manifest.identity_status !== "identity_bearing" || manifest.complete !== true) {
+    || preparation.data_profile !== requestedProfile || preparation.steady_state_generation !== identityEligible
+    || preparation.payload_corpus_hash_version !== 2 || preparation.payload_corpus_hash_scope !== expectedScope
+    || manifest.payload_corpus_sha256 !== hash || manifest.data_profile !== requestedProfile
+    || manifest.payload_corpus_hash_version !== 2 || manifest.payload_corpus_hash_scope !== expectedScope
+    || manifest.identity_status !== expectedStatus || manifest.eligible_for_identity_reconciliation !== identityEligible
+    || manifest.complete !== identityEligible || manifest.truncated !== false) {
     throw new Error("client payload corpus evidence is unavailable or inconsistent");
   }
+  const clientEvidence = {
+    profile: requestedProfile,
+    identityEligibleForReconciliation: identityEligible,
+    payloadCorpusSha256: hash,
+  };
   const window = object(phase.measurement_window, "client measurement window");
   if (window.client_resources == null) {
-    return { payloadCorpusSha256: hash, cpu: { coreEquivalents: null, sampleStartUnixMs: null, sampleEndUnixMs: null, unavailableReason: "client CPU resource evidence unavailable" } };
+    return { ...clientEvidence, cpu: { coreEquivalents: null, sampleStartUnixMs: null, sampleEndUnixMs: null, unavailableReason: "client CPU resource evidence unavailable" } };
   }
   const resources = object(window.client_resources, "client resources");
   const cpu = resources.cpu_core_equivalents;
   if (cpu == null) {
-    return { payloadCorpusSha256: hash, cpu: { coreEquivalents: null, sampleStartUnixMs: null, sampleEndUnixMs: null, unavailableReason: "client process CPU samples unavailable" } };
+    return { ...clientEvidence, cpu: { coreEquivalents: null, sampleStartUnixMs: null, sampleEndUnixMs: null, unavailableReason: "client process CPU samples unavailable" } };
   }
   if (typeof cpu !== "number" || !Number.isFinite(cpu) || cpu < 0
     || !Number.isSafeInteger(resources.start_sample_unix_ms) || !Number.isSafeInteger(resources.end_sample_unix_ms)
     || Number(resources.start_sample_unix_ms) >= Number(resources.end_sample_unix_ms)) {
     throw new Error("client CPU evidence is invalid");
   }
-  return { payloadCorpusSha256: hash, cpu: {
+  return { ...clientEvidence, cpu: {
     coreEquivalents: cpu, sampleStartUnixMs: Number(resources.start_sample_unix_ms),
     sampleEndUnixMs: Number(resources.end_sample_unix_ms), unavailableReason: null,
   } };
 }
 
 export async function readReconciledOatResult(
-  resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number,
+  resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number, requestedProfile: ClientDataProfile,
 ): Promise<{ measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number; cellRunId: string; snapshotReconciled: true }> {
   const bytes = await readFile(resultsPath);
   if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("OAT result is empty or too large");
@@ -91,7 +110,7 @@ export async function readReconciledOatResult(
     throw new Error("expected one client image receipt");
   }
   const client = object(object(evidence.client_phase_reports[0], "client report").execution_image, "client image");
-  const clientEvidence = extractClientEvidence(evidence.client_phase_reports[0]);
+  const clientEvidence = extractClientEvidence(evidence.client_phase_reports[0], requestedProfile);
   if (client.source !== "docker_container_inspect") throw new Error("client image provenance is unavailable");
   images.push(`client:${imageId(client.image_id)}`);
   images.sort();
