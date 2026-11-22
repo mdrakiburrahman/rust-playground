@@ -12,7 +12,7 @@ import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
 import { readDeltaAddWindow } from './aks-delta-preservation.js';
-import { startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
+import { createKubeletNodeResourceReader, startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
 import {
   applyCandidateImageManifest, assertScaledRuntimeObservation, assertTrustedImageStatement, collectorShapes,
   effectiveWorkloadConfig, planScaledClientPool, planScaledClientPoolRestore, renderScaledCollector,
@@ -53,8 +53,8 @@ function boundedTimeoutSeconds(timeout: number): number {
   return Math.min(timeout, remaining);
 }
 
-const stageAwareRunTree: typeof run_tree = (args, timeout, cwd, env, onStderr, maxOutputBytes) =>
-  invokeTree(args, boundedTimeoutSeconds(timeout), cwd, env, onStderr, maxOutputBytes);
+const stageAwareRunTree: typeof run_tree = (args, timeout, cwd, env, onStderr, maxOutputBytes, signal) =>
+  invokeTree(args, boundedTimeoutSeconds(timeout), cwd, env, onStderr, maxOutputBytes, signal);
 
 async function runStage<T>(name: string, timeoutMs: number, action: () => Promise<T>): Promise<T> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error(name + ' stage timeout is invalid.');
@@ -102,8 +102,8 @@ function checkResult(result: Awaited<ReturnType<typeof run_tree>>, label: string
   return result.stdout.trim();
 }
 
-async function command(args: string[], label: string, timeout = 120): Promise<string> {
-  return checkResult(await invokeTree(args, boundedTimeoutSeconds(timeout), ROOT), label);
+async function command(args: string[], label: string, timeout = 120, signal?: AbortSignal): Promise<string> {
+  return checkResult(await invokeTree(args, boundedTimeoutSeconds(timeout), ROOT, undefined, undefined, undefined, signal), label);
 }
 
 function parseJson(text: string, label: string): unknown {
@@ -120,13 +120,13 @@ function argNumber(value: unknown, label: string): number {
   return value;
 }
 
-async function kubectl(config: Config, args: string[], label: string, timeout = 120): Promise<string> {
-  return command(['kubectl', '--context', config.cluster, ...args], label, timeout);
+async function kubectl(config: Config, args: string[], label: string, timeout = 120, signal?: AbortSignal): Promise<string> {
+  return command(['kubectl', '--context', config.cluster, ...args], label, timeout, signal);
 }
 
-async function getObject(config: Config, resource: string, namespace: string, name: string): Promise<JsonObject | undefined> {
+async function getObject(config: Config, resource: string, namespace: string, name: string, signal?: AbortSignal): Promise<JsonObject | undefined> {
   const output = await kubectl(config, ['get', resource, name, '-n', namespace, '-o', 'json', '--ignore-not-found'],
-    `Read ${resource}/${name}`);
+    `Read ${resource}/${name}`, 120, signal);
   if (!output) return undefined;
   return requireRecord(parseJson(output, `${resource}/${name}`), `${resource}/${name}`);
 }
@@ -607,7 +607,7 @@ interface BenchmarkReport {
   namespace_removed: boolean;
   run_fic_removed: boolean;
   workload_pools_at_zero: boolean;
-  node_resources?: NodeResourceObservation;
+  node_observation?: NodeResourceObservation;
   scaled_profile?: {
     client_count: number;
     collector_shape: CollectorShape;
@@ -1023,7 +1023,8 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   if (scaled) {
     const hash = createHash('sha256');
     for (const path of ['projects/arrowcol-oat/aks-direct-benchmark.ts', 'projects/arrowcol-oat/aks-scaled-profile.ts',
-      'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep', 'projects/arrowcol-oat/publish-images.ts']) {
+      'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep', 'projects/arrowcol-oat/publish-images.ts',
+      'infra/azure/bootstrap.ts']) {
       hash.update(path + '\0').update(await readFile(resolve(ROOT, path))).update('\0');
     }
     scaledSourcesSha = hash.digest('hex');
@@ -1176,11 +1177,13 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
             ...placement.clients.map(client => ({ pod_uid: client.podUid, pod_name: client.podName, node_name: client.nodeName, role: 'client' as const, container_name: 'generator' })),
           ],
           measurement_start_unix_ms: measurementStart, measurement_end_unix_ms: measurementEnd,
-          execute: async (target, sampleCommand) => {
-            const current = await getObject(config, 'pod', namespace, target.pod_name);
+          read_node: createKubeletNodeResourceReader((path, signal) =>
+            kubectl(config, ['get', '--raw', path], 'Read measured node Kubelet totals', 5, signal)),
+          execute: async (target, sampleCommand, signal) => {
+            const current = await getObject(config, 'pod', namespace, target.pod_name, signal);
             if (!current || requireRecord(current.metadata, 'Observed pod metadata').uid !== target.pod_uid) throw new Error('Observed pod UID changed.');
             return kubectl(config, ['exec', '-n', namespace, target.pod_name, '-c', target.container_name, '--', 'sh', '-c', sampleCommand],
-              'Capture target pod resource sample', 30);
+              'Capture target pod resource sample', 5, signal);
           },
         });
       }
@@ -1217,7 +1220,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
             end: measurementEnd, completedRows: Number(rowCounts[0]![1]), workers: Number(effective.workers),
             streamsPerWorker: Number(effective['streams-per-worker']) });
           await writePrivateFile(join(runDir, jobName + '.measurement.json'), JSON.stringify(summary, null, 2) + '\n');
-          clientResults.push({ job_name: jobName, client_id: clientId, pod_ordinal: client.index, measurement_start_unix_ms: measurementStart,
+          clientResults.push({ job_name: jobName, client_id: clientId, pod_ordinal: client.podOrdinal, measurement_start_unix_ms: measurementStart,
             measurement_end_unix_ms: measurementEnd, client_completed_rows: Number(rowCounts[0]![1]),
             pod_uid: clientPlacement.podUid, final_measurement_summary: summary, succeeded: true, restart_count: 0 });
         }
@@ -1339,7 +1342,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     namespace_removed: namespaceRemoved,
     run_fic_removed: ficRemoved,
     workload_pools_at_zero: poolsAtZero,
-    ...(nodeResources ? { node_resources: nodeResources } : {}),
+    ...(nodeResources ? { node_observation: nodeResources } : {}),
     ...(options.scaled && scaled && placement && clientPoolPlan ? { scaled_profile: {
       client_count: options.scaled.clientCount, collector_shape: options.scaled.collectorShape,
       collector_pool: scaled.poolName, hardware: collectorShapes[options.scaled.collectorShape],

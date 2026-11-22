@@ -42,6 +42,8 @@ export interface EffectiveWorkloadConfig {
   clientCount: number;
   generatorArgs: string[];
   performanceConfig: Record<string, string>;
+  dataIdentities: { clientId: string; podOrdinal: number }[];
+  historicalDataIdentityEligible: boolean;
   sha256: string;
 }
 
@@ -60,7 +62,7 @@ const clientDefaults: Record<string, string> = {
   'connect-timeout-ms': '30000', 'request-timeout-ms': '30000', 'tcp-nodelay': 'true',
   'tcp-keepalive-ms': '60000', 'tcp-keepalive-interval-ms': '0', 'tcp-keepalive-retries': '0',
   'endpoint-concurrency-limit': '256', 'endpoint-buffer-size': '1024', 'connect-retries': '0',
-  'retry-backoff-ms': '100', 'rate-limit-rps': '0', pilot: 'false',
+  'retry-backoff-ms': '100', 'rate-limit-rps': '0', 'pod-ordinal': '0', pilot: 'false',
 };
 const distributionFlags = ['string-length-distribution', 'value-variation', 'guid-uniqueness'];
 const controlFlags = ['endpoint', 'client-id', 'table', 'rows', 'concurrency', 'edge-secret-file',
@@ -134,6 +136,7 @@ export interface ScaledClientJob {
   name: string;
   clientId: string;
   index: number;
+  podOrdinal: number;
 }
 
 export interface ScaledClientReadiness {
@@ -180,6 +183,10 @@ export function summarizeScaledClientWindow(logs: string, binding: {
     schema_version: 1, pod_uid: binding.podUid, client_id: binding.clientId,
     measurement_start_unix_ms: binding.start, measurement_end_unix_ms: binding.end,
     completed_rows: binding.completedRows, completion_semantics: 'client_admission_response_not_delta_commit',
+    send_to_commit_latency_us: { p50: null, p95: null, p99: null, samples: null,
+      unavailable_reason: 'No actual send-to-Delta-version join; admission percentiles are not subtracted from commit percentiles.' },
+    storage_commit_duration_us: { p50: null, p95: null, p99: null, samples: null,
+      unavailable_reason: 'Delta Add reconciliation proves committed rows, not storage commit duration.' },
     configured_workers: binding.workers, configured_streams_per_worker: binding.streamsPerWorker,
     configured_transport_slots: binding.workers * binding.streamsPerWorker,
     slot_occupancy: null, slot_occupancy_unavailable_reason: 'Client receipts do not sample active slot occupancy.',
@@ -305,8 +312,9 @@ export function scaledClientJobs(runId: string, clientCount: number): ScaledClie
     const ordinal = String(index).padStart(2, '0');
     return {
       name: `direct-load-${runHex}-client-${ordinal}`,
-      clientId: `direct-e64-${runHex}-client-${ordinal}`,
+      clientId: clientCount === 1 ? 'direct-e64-confirmwide' : `direct-e64-client-${String(index).padStart(4, '0')}`,
       index,
+      podOrdinal: offset,
     };
   });
 }
@@ -438,8 +446,8 @@ export function renderScaledProfileManifest(source: string, runId: string, clien
       cloned.setIn(['spec', 'template', 'metadata', 'labels', clientIndexLabel], String(job.index));
       cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'args', clientIdIndexes[0]!], job.clientId);
       const pinned = resolvedClientConfig(requireRecord(cloned.toJSON(), 'Cloned Job'));
-      pinned['pod-ordinal'] = String(job.index);
-      pinned['schedule-timeout-secs'] = '900';
+      pinned['pod-ordinal'] = String(job.podOrdinal);
+      if (clientCount > 1) pinned['schedule-timeout-secs'] = '900';
       cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'args'],
         Object.entries(pinned).filter(([flag]) => flag !== 'pilot').flatMap(([flag, value]) => ['--' + flag, value]));
       cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'env'],
@@ -611,6 +619,8 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
   });
   if (loadJobs.length < 1 || loadJobs.length > MAX_SCALED_CLIENTS) throw new Error('Effective workload must contain 1 to 8 load Jobs.');
   const clientIds = new Set<string>();
+  const podOrdinals = new Set<number>();
+  const dataIdentities: { clientId: string; podOrdinal: number }[] = [];
   let effectiveArgs: string[] | undefined;
   let performanceConfig: Record<string, string> | undefined;
   for (const loadJob of loadJobs) {
@@ -626,6 +636,12 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
       throw new Error('Effective workload client IDs must be present and unique.');
     }
     clientIds.add(args[clientIdFlags[0]! + 1] as string);
+    const podOrdinal = Number(resolved['pod-ordinal']);
+    if (!Number.isSafeInteger(podOrdinal) || podOrdinal < 0 || podOrdinal > 0xffffffff || podOrdinals.has(podOrdinal)) {
+      throw new Error('Effective workload pod ordinals must be valid and distinct.');
+    }
+    podOrdinals.add(podOrdinal);
+    dataIdentities.push({ clientId: resolved['client-id']!, podOrdinal });
     const clientIdIndex = clientIdFlags[0]!;
     const argsWithoutClientId = args.filter((_value, index) => index !== clientIdIndex && index !== clientIdIndex + 1 &&
       args[index - index % 2] !== '--pod-ordinal');
@@ -643,16 +659,22 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
   if (valueOf('--warmup-secs') !== '60' || valueOf('--duration-secs') !== '600') {
     throw new Error('Scaled workload provenance requires a 60-second warmup and a shared 600-second window.');
   }
+  dataIdentities.sort((left, right) => left.podOrdinal - right.podOrdinal || left.clientId.localeCompare(right.clientId));
+  const historicalDataIdentityEligible = dataIdentities.length === 1 &&
+    dataIdentities[0]!.clientId === 'direct-e64-confirmwide' && dataIdentities[0]!.podOrdinal === 0;
   const contract = {
     schemaVersion: 1 as const,
     profile: performanceConfig!['data-profile'] === 'diagnostic' && performanceConfig!['ipc-compression'] === 'none' &&
-      performanceConfig!['grpc-send-compression'] === 'none' && performanceConfig!['grpc-accept-compression'] === 'none'
+      performanceConfig!['grpc-send-compression'] === 'none' && performanceConfig!['grpc-accept-compression'] === 'none' &&
+      historicalDataIdentityEligible
       ? 'diagnostic-replay' as const : 'non-parity' as const,
     dataProfile: performanceConfig!['data-profile'] as 'diagnostic' | 'realistic',
     ipcCompression: performanceConfig!['ipc-compression'] as 'none' | 'lz4_frame' | 'zstd',
     clientCount: loadJobs.length,
     generatorArgs: effectiveArgs!,
     performanceConfig: performanceConfig!,
+    dataIdentities,
+    historicalDataIdentityEligible,
   };
   return { ...contract, sha256: createHash('sha256').update(JSON.stringify(contract)).digest('hex') };
 }

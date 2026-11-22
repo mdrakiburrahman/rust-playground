@@ -40,6 +40,8 @@ test('client summary binds final half-open-window counters and preserves latency
   assert.equal(summary.pod_uid, binding.podUid);
   assert.equal(summary.configured_transport_slots, 16);
   assert.equal(summary.completed_rows_per_stream, null);
+  assert.equal(summary.send_to_commit_latency_us.p99, null);
+  assert.match(summary.send_to_commit_latency_us.unavailable_reason, /No actual send-to-Delta-version join/);
   assert.equal(summary.measurement?.completed_streams, null);
   assert.equal(summary.measurement?.configured_ipc_flight_data_bytes, 100);
   assert.deepEqual(summary.measurement?.send_latency_us, { scope: 'attempts_grouped_by_fresh_send_timestamp_in_half_open_window',
@@ -161,6 +163,32 @@ test('workload provenance hashes every tunable and rejects uneven client argumen
   assert.equal(threeClients.clientCount, 3);
   assert.notEqual(threeClients.sha256, oneClient.sha256);
   assert.throws(() => effectiveWorkloadConfig(scaled.replace('            - \"65536\"', '            - \"32768\"')), /equivalent workload arguments/);
+});
+
+test('diagnostic input IDs and ordinals are stable across run UUIDs and are bound to parity eligibility', async () => {
+  const template = (await readFile(resolve(process.cwd(), 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml'), 'utf8'))
+    .replaceAll('BENCHDURATIONSECS', '600');
+  const otherRunId = '11111111-1111-4111-8111-111111111111';
+  for (const count of [1, 8]) {
+    const first = renderScaledProfileManifest(template.replaceAll('BENCHRUNUUID', runId), runId, count);
+    const second = renderScaledProfileManifest(template.replaceAll('BENCHRUNUUID', otherRunId), otherRunId, count);
+    const jobs = (manifest: string) => resources(manifest).filter(resource => resource.kind === 'Job' &&
+      String(record(resource.metadata).name).startsWith('direct-load-'));
+    assert.equal(JSON.stringify(jobs(first).map(loadArgs)), JSON.stringify(jobs(second).map(loadArgs)));
+    assert.notEqual(record(jobs(first)[0]!.metadata).name, record(jobs(second)[0]!.metadata).name);
+    const config = effectiveWorkloadConfig(first);
+    assert.equal(config.sha256, effectiveWorkloadConfig(second).sha256);
+    assert.ok(config.dataIdentities.every(identity => identity.clientId.length === 'direct-e64-confirmwide'.length));
+    assert.equal(config.historicalDataIdentityEligible, count === 1);
+    assert.equal(config.profile, count === 1 ? 'diagnostic-replay' : 'non-parity');
+    if (count === 1) {
+      assert.deepEqual(config.dataIdentities, [{ clientId: 'direct-e64-confirmwide', podOrdinal: 0 }]);
+      assert.equal(config.sha256, effectiveWorkloadConfig(template).sha256);
+      const changed = first.replaceAll('direct-e64-confirmwide', 'direct-e64-not-parity');
+      assert.notEqual(config.sha256, effectiveWorkloadConfig(changed).sha256);
+      assert.equal(effectiveWorkloadConfig(changed).profile, 'non-parity');
+    }
+  }
 });
 
 test('readiness fails closed for failed clients and remains false until every client is ready', () => {

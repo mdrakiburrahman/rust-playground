@@ -266,9 +266,10 @@ export function write_private(filename: string, values: Record<string, string>):
 }
 export interface ProcessResult { returncode: number; stdout: string; stderr: string }
 export async function run_tree(command: string[], timeout: number, cwd?: string,
-  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void, maxOutputBytes?: number): Promise<ProcessResult> {
+  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void, maxOutputBytes?: number, signal?: AbortSignal): Promise<ProcessResult> {
   if (maxOutputBytes !== undefined && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1))
     throw new Failure('maxOutputBytes must be a positive safe integer before command admission.');
+  if (signal?.aborted) throw new Failure('Command aborted before admission.');
   return new Promise((resolve, reject) => {
     const child = spawn(command[0], command.slice(1), { detached: true, cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', failure: Failure | undefined, outputBytes = 0, overflow = false;
@@ -280,6 +281,7 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
       } }
     };
     const interrupt = () => kill('Command interrupted; outcome unknown and process group killed. Authority stays blocking; no automatic clear.');
+    const abort = () => kill('Command aborted; outcome unknown and process group killed. Authority stays blocking; no automatic clear.');
     const timer = setTimeout(() => kill('Command timed out; outcome unknown and process group killed. Authority stays blocking; no automatic clear.'), timeout * 1000);
     process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
     const accept = (data: Buffer): boolean => {
@@ -299,9 +301,14 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
       stderr += chunk;
       onStderr?.(chunk);
     });
-    const cleanup = () => { clearTimeout(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt); };
+    const cleanup = () => {
+      clearTimeout(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
+      signal?.removeEventListener('abort', abort);
+    };
     child.once('error', error => { cleanup(); reject(new Failure('Command could not start.', { cause: error })); });
     child.once('close', code => { cleanup(); if (failure) reject(failure); else resolve({ returncode: code ?? -1, stdout, stderr }); });
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }
 type Headers = Record<string, string>;

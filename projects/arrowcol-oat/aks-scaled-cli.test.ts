@@ -10,6 +10,7 @@ import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { main, renderManifest, type BenchmarkDependencies } from './aks-direct-benchmark.js';
 import { collectorShapes, effectiveWorkloadConfig, renderScaledProfileManifest } from './aks-scaled-profile.js';
 import { clientRepository, imageBuilds, repositories } from './publish-images.js';
+import { POD_RESOURCE_SAMPLE_COMMAND } from './aks-node-observation.js';
 
 const azureEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   key.startsWith('AZURE_') || key.startsWith('ARROWCOL_AZURE_')));
@@ -66,6 +67,7 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
   let schedule = 0;
   let clientNodes = 0;
   let pendingClient = true;
+  const observationAbort = new AbortController();
   const named = (name: string) => resources.find(value => value.metadata?.name === name);
   const loadJobs = () => resources.filter(value => value.kind === 'Job' && value.metadata.name.startsWith('direct-load-'));
   const pool = () => ({ enableAutoScaling: true, minCount: 0, maxCount: clientMax, count: clientNodes, vmSize: 'Standard_D64ds_v6' });
@@ -101,14 +103,16 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
       assert.equal(options.measurement_end_unix_ms - options.measurement_start_unix_ms, 600_000);
       assert.equal(schedule, 0);
       events.push('observer-start');
-      return { async stop() { events.push('observer-stop'); return {
-        schema_version: 1, source: 'pod_procfs_cgroup_v2', scope: 'target_pods_aggregated_by_node_and_role',
-        sample_interval_ms: 10000, measurement_start_unix_ms: options.measurement_start_unix_ms,
-        measurement_end_unix_ms: options.measurement_end_unix_ms, nodes: [], pods: [],
+      const sample = options.execute(options.targets[0]!, POD_RESOURCE_SAMPLE_COMMAND, observationAbort.signal);
+      return { async stop() { await sample; events.push('observer-stop'); return {
+        schema_version: 2, source: 'pod_procfs_cgroup_v2', scope: 'target_pods_aggregated_by_node_and_role',
+        node_total_source: 'unavailable', node_total_unavailable_reason: 'offline_mock_not_measured',
+        sample_interval_ms: 10000, sample_timeout_ms: 5000, measurement_start_unix_ms: options.measurement_start_unix_ms,
+        measurement_end_unix_ms: options.measurement_end_unix_ms, nodes: [], node_totals: [], pods: [],
         unavailable_reason: 'offline_mock_not_measured',
       }; } };
     },
-    runTree: async args => {
+    runTree: async (args, _timeout, _cwd, _env, _stderr, _maxBytes, signal) => {
       commands.push(args);
       const ok = (value: unknown = '') => ({ returncode: 0, stdout: typeof value === 'string' ? value : JSON.stringify(value), stderr: '' });
       const failed = () => ({ returncode: 1, stdout: '', stderr: 'deterministic partial startup failure' });
@@ -167,6 +171,11 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
         if (args[1] === 'aks' && args.includes('show')) return ok({ agentPoolProfiles: [{ vnetSubnetId: '/fixture/subnet' }] });
       }
       if (args[0] === 'kubectl') {
+        if (args.includes('exec')) {
+          assert.equal(signal, observationAbort.signal);
+          events.push('abortable-observer-read');
+          return ok('{}');
+        }
         if (args.includes('apply')) {
           if (args.some(value => value.startsWith('--dry-run'))) return ok();
           resources = parseAllDocuments(await readFile(arg(args, '-f'), 'utf8')).map(document => document.toJSON()).filter(Boolean);
@@ -307,6 +316,8 @@ test('actual opt-in CLI renders and runs all clients, binds candidate pods/large
     assert.ok(f.events.lastIndexOf('client-window-log') < f.events.indexOf('namespace-delete'));
     assert.equal(report.scaled_profile.placement.clients.length, 2);
     assert.equal(report.scaled_profile.trusted_build_provenance_verified, true);
+    assert.equal(report.node_observation.schema_version, 2);
+    assert.ok(f.events.includes('abortable-observer-read'));
     assert.deepEqual(report.scaled_profile.hardware, collectorShapes.e192);
     assert.deepEqual(f.state(), { namespace: undefined, collectorPool: undefined, clientMax: 1, clientNodes: 0 });
     assert.ok(f.events.indexOf('observer-start') < f.events.indexOf('schedule'));

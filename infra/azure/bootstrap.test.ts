@@ -62,6 +62,15 @@ async function custody(record = makeRecord()): Promise<b.ResetRecord> {
   return record;
 }
 
+test('abortable command reads reject before admission and kill their owned process group in flight', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(realRun([process.execPath, '-e', 'setInterval(() => {}, 10000)'], 2,
+    undefined, undefined, undefined, 1024, controller.signal), /aborted before admission/);
+  await assert.rejects(realRun([process.execPath, '-e', 'setInterval(() => {}, 10000)'], 2,
+    undefined, undefined, undefined, 1024, AbortSignal.timeout(50)), /Command aborted;.*process group killed/);
+});
+
 test('default configuration is deterministic and generated values contain no subscription', () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB });
   assert.equal(c.sandbox, 'stamp-1');
