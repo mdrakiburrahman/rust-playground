@@ -7,6 +7,7 @@ Usage:
   tools/darwin-runner/run.sh prepare [run-id]
   tools/darwin-runner/run.sh version
   tools/darwin-runner/run.sh dry-run <tracked-config.yaml>
+  tools/darwin-runner/run.sh bridge-test
   DARWIN_DEADLINE_UTC=<fixed-UTC> tools/darwin-runner/run.sh evolve <tracked-config.yaml> <experiment> <run-id>
   tools/darwin-runner/run.sh cleanup <run-id>
 USAGE
@@ -72,7 +73,7 @@ docker_cli_package=${pins[6]}
 age_package=${pins[7]}
 
 image_digest=$(cd "$script_dir" &&
-  sha256sum tools.lock.json Dockerfile install-tools.sh candidate-exec.sh run-darwin.sh |
+  sha256sum tools.lock.json Dockerfile install-tools.sh candidate-exec.sh run-darwin.sh dispatch-contract.ts bridge-listener.ts bridge-fixture-worker.ts |
   sha256sum | cut -c1-16)
 controller_image="rust-playground/darwin-controller:$image_digest"
 candidate_image="rust-playground/darwin-candidate:$image_digest"
@@ -251,9 +252,14 @@ case "$action" in
       darwin dry-run "/workspace/$1"
     ' runner "$config_rel"
     ;;
+  bridge-test)
+    [[ $# -eq 0 ]] || usage
+    build_images
+    "$script_dir/bridge-container-test.sh" "$controller_image" "$candidate_image"
+    ;;
   evolve)
     [[ $# -eq 3 ]] || usage
-    echo "native Darwin Docker-provider evolution is blocked: the pinned bundle lacks python_on_whales; no credential or inference was used" >&2
+    echo "native Darwin evolution is blocked: passthrough does not isolate the evaluator from controller privileges or credentials; no credential or inference was used" >&2
     exit 2
     ;;
   *)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "native Darwin Docker-provider evolution is blocked: the pinned bundle lacks python_on_whales; no credential or inference was used" >&2
+echo "native Darwin evolution is blocked: passthrough does not isolate the evaluator from controller privileges or credentials; no credential or inference was used" >&2
 exit 2
