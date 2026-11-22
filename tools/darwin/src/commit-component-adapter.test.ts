@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rename, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -255,6 +255,13 @@ test("known pinned fixture and external oracle A-A", { skip: !runAa, timeout: 1_
       } finally {
         await truncate(parquet, size);
       }
+      const missing = `${parquet}.temporarily-missing`;
+      await rename(parquet, missing);
+      try {
+        await assert.rejects(reconcileStoppedCommitTable(tablePath, snapshot), /physical files/);
+      } finally {
+        await rename(missing, parquet);
+      }
       const hashes = snapshot.tables.table.row_hashes;
       const key = Object.keys(hashes)[0]!;
       const value = hashes[key]!;
@@ -265,7 +272,7 @@ test("known pinned fixture and external oracle A-A", { skip: !runAa, timeout: 1_
         hashes[key] = value;
       }
       exercisedTampering = true;
-      console.log("COMMIT_NEGATIVE rejected altered transaction, physical bytes and missing row");
+      console.log("COMMIT_NEGATIVE rejected altered transaction, physical bytes, missing file and missing row hash");
     }
     return summary;
   };
