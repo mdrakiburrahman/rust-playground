@@ -118,6 +118,7 @@ export async function readReconciledOatResult(
   measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
+  parityTelemetry: JsonObject | null;
   cellRunId: string; snapshotReconciled: true;
 }> {
   if (requestedProfile === "diagnostic") {
@@ -162,6 +163,7 @@ export async function readReconciledOatResult(
   }
   const images = processes.map(process => {
     if (typeof process.component !== "string" || process.log_complete !== true) throw new Error("incomplete OAT process evidence");
+    if (parity && process.source_revision !== sourceRevision) throw new Error("live process source revision differs from the parity producer");
     return `${process.component}:${imageId(process.image_id)}`;
   });
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
@@ -206,6 +208,18 @@ export async function readReconciledOatResult(
   return {
     measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows,
+    parityTelemetry: parity ? {
+      backlog: evidence.backlog ?? null,
+      backlog_budgets: object(object(object(parity.config, "parity config").tunables, "tunables").collector, "collector").batching,
+      effective_readback: { before_admission: evidence.parity_admission_readback,
+        collector: collector.effective_config, writer: collector.writer_policy_overrides,
+        table_layout: collector.layout_table_policies, client: object(evidence.client_phase_reports[0], "client report").consumer_effective_config },
+      admission_waits: null, admission_waits_unavailable_reason: "stage telemetry not integrated",
+      commit_substages: null, commit_substages_unavailable_reason: "stage telemetry not integrated",
+      client_send_stalls: null, client_send_stalls_unavailable_reason: "stage telemetry not integrated",
+      client_image_source_revision: client.source_revision ?? null,
+      client_image_source_revision_unavailable_reason: client.source_revision == null ? "client image has no source revision label" : null,
+    } : null,
     cellRunId: row.run_id, snapshotReconciled: true,
   };
 }

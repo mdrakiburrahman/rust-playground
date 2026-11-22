@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { CoverageUnavailableError } from "./metrics-adapter.js";
+import { replayParityArm } from "./parity-replay.js";
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
 import { prepareReplayRuntime, replayCompressionPair } from "./replay.js";
@@ -82,6 +83,16 @@ async function main(args: string[]): Promise<void> {
   if (command === "prepare") {
     const prepared = await prepareReplayRuntime(repo, home, Number(option(args, "--controller-stack-bytes")));
     console.log(`Prepared release OAT controller SHA-256 ${prepared.binaryHash}.`);
+    return;
+  }
+  if (command === "parity") {
+    const receipt = await replayParityArm(
+      repo, home, Number(option(args, "--workers")), option(args, "--bind-host"), option(args, "--endpoint-host"),
+      Number(option(args, "--controller-stack-bytes")),
+    );
+    console.log("@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
+    console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "historical-parity", valid: 0,
+      combined_score: 0, accepted: false, reason: "single local parity arm", receipt })}`);
     return;
   }
   if (command !== "preflight" && command !== "evaluate") throw new Error("unsupported operation");

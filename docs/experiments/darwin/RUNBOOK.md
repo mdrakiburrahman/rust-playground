@@ -1,6 +1,7 @@
 # ArrowCol Darwin evaluator
 
-The current implementation supports a config-only compression smoke replay. It
+The current implementation supports a config-only compression smoke replay and
+individual local historical-parity arms. It
 does not yet qualify candidates, run Darwin, promote changes, or evaluate code
 lanes. A failed or unsupported lane never scores as a winner.
 
@@ -38,7 +39,19 @@ historical comparable AKS headline guard is 38.17 B/row.
 | Local profile | Purpose |
 | --- | --- |
 | `candidate.oat.json` | V9 Realistic seed; its unique per-row identity is high entropy. |
-| `historical-parity.oat.json` | Diagnostic client with historical AKS batching, commit and CPU-worker settings, on the same hourly-partitioned table. Config validation is not a runtime readback. The compression replay does not yet support this profile. |
+| `historical-parity.oat.json` | Diagnostic client with historical AKS batching, commit and CPU-worker settings, on the same hourly-partitioned table. The compression replay does not yet support this profile. |
+
+| Parity step | Command |
+| --- | --- |
+| Snapshot current committed producer | `npx --no-install tsx tools/darwin/src/main.ts setup --home "$PWD/.darwin/parity"` |
+| One ladder arm | `.darwin/parity/trusted/bin/harness parity --workers <1\|2\|4\|8\|16> --bind-host <docker-bridge-ip> --endpoint-host <docker-bridge-ip> --controller-stack-bytes 33554432` |
+
+Each arm builds the trusted controller and footer inspector, checks host
+headroom immediately before launch, verifies collector and client readback
+before arming, and checks table readback and stopped active-file footers.
+An individual arm is diagnostic and cannot qualify a winner. Preserve each
+receipt and compare identical image and corpus identities before interpreting
+a ladder or A/A. A failed arm retains its lock until owned-cell recovery.
 
 Confirm Realistic codec, dictionary and compression winners on historical
 parity at AKS-like file sizes (approximately 2 million rows/file) before
@@ -76,7 +89,8 @@ The client uses the fixed business customer ID `direct-e64-confirmwide` while
 delivery and row identities remain unique per run. Its manifest hashes the
 generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
 must report the same hash. This contract applies to the Realistic seed only;
-Diagnostic parity requires the pending profile-aware digest and extractor.
+Diagnostic parity hashes all business columns but cannot reconcile unique
+delivery identities.
 Client process CPU is reported separately from
 collector samples, with its own sampling interval or an unavailable reason.
 The hourly ingestion-partitioned table is checked against catalog metadata

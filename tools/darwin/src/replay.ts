@@ -79,10 +79,11 @@ async function prepareRuntime(repo: string, home: string, manifest: SnapshotMani
   return runtime;
 }
 
-async function runOat(runtime: string, configPath: string, home: string, toolDir: string, logPath: string, stackBytes: number): Promise<void> {
+export async function runOat(runtime: string, configPath: string, home: string, toolDir: string, logPath: string, stackBytes: number, parity = false): Promise<void> {
   const log = await open(logPath, "wx");
   try {
     const env = cleanEnv(home, stackBytes);
+    if (parity) env.OAT_DARWIN_PARITY_PRECHECK = "1";
     env.PATH = `${toolDir}:${env.PATH}`;
     const child = spawn(process.execPath, ["--import", "tsx", "projects/arrowcol-oat/cli.ts",
       "--config", configPath, "--mode", "local", "--no-viewer"], {
@@ -103,7 +104,7 @@ async function runOat(runtime: string, configPath: string, home: string, toolDir
   } finally { await log.close(); }
 }
 
-async function sha256(path: string): Promise<string> {
+export async function sha256(path: string): Promise<string> {
   return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
