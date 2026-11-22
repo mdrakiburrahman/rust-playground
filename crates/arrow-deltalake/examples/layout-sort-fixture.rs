@@ -228,13 +228,13 @@ fn high_water_kib() -> Result<u64> {
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     ensure!(
-        args.len() == 3 && (args[1] == "parity" || args[1] == "stress"),
-        "usage: layout-sort-fixture parity|stress iterations"
+        args.len() == 3 && (args[1] == "parity" || args[1] == "nulls" || args[1] == "stress"),
+        "usage: layout-sort-fixture parity|nulls|stress iterations"
     );
     let iterations: usize = args[2].parse()?;
     ensure!((1..=100).contains(&iterations), "iterations must be 1..=100");
     let stress = args[1] == "stress";
-    let batches = corpus(stress)?;
+    let batches = corpus(args[1] != "parity")?;
     let input_bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
     let policy = LayoutPolicy {
         sort_columns: if stress {
