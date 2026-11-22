@@ -62,9 +62,8 @@ node_sha=${pins[4]}
 docker_cli_package=${pins[5]}
 age_package=${pins[6]}
 
-image_digest=$(sha256sum \
-  "$lock" "$script_dir/Dockerfile" "$script_dir/install-tools.sh" \
-  "$script_dir/candidate-exec.sh" "$script_dir/run-darwin.sh" |
+image_digest=$(cd "$script_dir" &&
+  sha256sum tools.lock.json Dockerfile install-tools.sh candidate-exec.sh run-darwin.sh |
   sha256sum | cut -c1-16)
 controller_image="rust-playground/darwin-controller:$image_digest"
 candidate_image="rust-playground/darwin-candidate:$image_digest"
