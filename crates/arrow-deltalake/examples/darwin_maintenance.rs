@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
 use arrow_deltalake::maintenance::{
     Granularity, MaintenanceControl, MaintenanceErrorKind, NegativeProbeConfig, OptimizeConfig, Outcome,
-    PassProbeInventory, ProbeOperation, VacuumConfig, error_kind,
+    PassProbeInventory, ProbeOperation, PurgeConfig, VacuumConfig, error_kind,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -27,7 +27,7 @@ const BASE: i64 = 1_704_067_200_000;
 const MINUTE: i64 = 60_000;
 const RETENTION: i64 = 7 * 24 * 60 * MINUTE;
 const ROWS_PER_FILE: i64 = 512;
-const PASSES: usize = 10;
+const PASSES: usize = 30;
 
 type Row = (i64, Option<String>, String);
 
@@ -133,6 +133,40 @@ fn active_files(root: &Path) -> Result<BTreeMap<String, String>> {
     Ok(active)
 }
 
+fn metadata(root: &Path) -> Result<Value> {
+    let mut logs = fs::read_dir(root.join("_delta_log"))?
+        .map(|entry| Ok(entry?.path()))
+        .collect::<Result<Vec<_>>>()?;
+    logs.retain(|p| p.extension().is_some_and(|ext| ext == "json"));
+    logs.sort();
+    let mut metadata = None;
+    for log in logs {
+        for line in fs::read_to_string(log)?.lines() {
+            let action: Value = serde_json::from_str(line)?;
+            if let Some(value) = action.get("metaData") {
+                metadata = Some(value.clone());
+            }
+        }
+    }
+    metadata.context("missing Delta metadata")
+}
+
+fn verify_rewrite_actions(root: &Path, first_version: u64, final_version: u64) -> Result<()> {
+    for version in first_version + 1..=final_version {
+        let path = root.join("_delta_log").join(format!("{version:020}.json"));
+        let mut changes = 0;
+        for line in fs::read_to_string(path)?.lines() {
+            let action: Value = serde_json::from_str(line)?;
+            if let Some(change) = action.get("add").or_else(|| action.get("remove")) {
+                ensure!(change["dataChange"] == false, "rewrite action was marked as ingestion");
+                changes += 1;
+            }
+        }
+        ensure!(changes > 0, "rewrite commit did not contain file actions");
+    }
+    Ok(())
+}
+
 fn data_path(root: &Path, relative: &str) -> Result<PathBuf> {
     url(root)?
         .join(relative)?
@@ -150,8 +184,12 @@ fn rows_and_bytes(root: &Path) -> Result<(Vec<Row>, u64, usize)> {
         let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?.build()?;
         for batch in reader {
             let batch = batch?;
-            let ids = arrow::compute::cast(batch.column_by_name("id").context("id")?, &DataType::Int64)?;
-            let names = arrow::compute::cast(batch.column_by_name("name").context("name")?, &DataType::Utf8)?;
+            let ids = batch.column_by_name("id").context("id")?;
+            let names = batch.column_by_name("name").context("name")?;
+            ensure!(
+                ids.data_type() == &DataType::Int64 && names.data_type() == &DataType::Utf8,
+                "unexpected physical column schema"
+            );
             let ids = ids.as_any().downcast_ref::<Int64Array>().context("id array")?;
             let names = names.as_any().downcast_ref::<StringArray>().context("name array")?;
             for row in 0..batch.num_rows() {
@@ -222,7 +260,30 @@ fn active(root: &Path) -> Result<Value> {
         before.len() == 34 * ROWS_PER_FILE as usize && before_files == 34,
         "unexpected seeded active state"
     );
+    for (index, (id, name, part)) in before.iter().enumerate() {
+        let expected_id = index as i64;
+        let file = expected_id / ROWS_PER_FILE;
+        let expected_part = if file < 16 {
+            0
+        } else if file < 32 {
+            1
+        } else {
+            2
+        };
+        ensure!(
+            *id == expected_id
+                && *name == (expected_id % 3 != 0).then(|| format!("n{expected_id}"))
+                && *part == partition(expected_part),
+            "seed row does not match deterministic input"
+        );
+    }
+    let original_metadata = metadata(&root)?;
+    let protected_before = active_files(&root)?
+        .into_iter()
+        .filter(|(_, part)| part == &partition(2))
+        .collect::<BTreeMap<_, _>>();
     let table = DeltaTable::open_for_maintenance(&url(&root)?)?;
+    let first_version = table.version()?;
     let config = optimize();
     let mut reports = Vec::new();
     let ticks_per_second = tick_rate()?;
@@ -246,6 +307,28 @@ fn active(root: &Path) -> Result<Value> {
     let cpu_seconds = (cpu_ticks()? - cpu_start) as f64 / ticks_per_second as f64;
     let (after, after_bytes, after_files) = rows_and_bytes(&root)?;
     ensure!(before == after, "active row multiset changed");
+    ensure!(metadata(&root)? == original_metadata, "Delta metadata changed");
+    ensure!(
+        active_files(&root)?
+            .into_iter()
+            .filter(|(_, part)| part == &partition(2))
+            .collect::<BTreeMap<_, _>>()
+            == protected_before,
+        "protected files changed"
+    );
+    let final_version = table.version()?;
+    ensure!(
+        final_version == first_version + reports.len() as u64,
+        "unexpected active commit count"
+    );
+    verify_rewrite_actions(&root, first_version, final_version)?;
+    let noop = table.prepare_optimize(&config)?;
+    ensure!(noop.plan.bins.is_empty(), "converged plan has bins");
+    ensure!(
+        table.apply_prepared_optimize(&noop, &config, &control())?.outcome == Outcome::Noop,
+        "converged pass was not a no-op"
+    );
+    ensure!(table.version()? == final_version, "converged pass committed");
     ensure!(final_debt.eligible_files == 0, "eligible debt remains");
     let protected = final_debt
         .protected_partition_backlog
@@ -256,27 +339,38 @@ fn active(root: &Path) -> Result<Value> {
     let removed_bytes: u64 = reports.iter().map(|r| r.bytes_removed).sum();
     let added_bytes: u64 = reports.iter().map(|r| r.bytes_added).sum();
     ensure!(
-        before_bytes
-            .checked_sub(removed_bytes)
-            .and_then(|b| b.checked_add(added_bytes))
-            == Some(after_bytes),
-        "physical active-byte reconciliation failed"
+        removed_bytes <= before_bytes * 4 && removed_files <= before_files as u64 * 4,
+        "rewrite amplification exceeded the fixed 4x fixture bound"
     );
     ensure!(
-        before_files as u64 - removed_files + added_files == after_files as u64,
+        before_bytes
+            .checked_add(added_bytes)
+            .and_then(|b| b.checked_sub(removed_bytes))
+            == Some(after_bytes),
+        "physical active-byte reconciliation failed: before={before_bytes} removed={removed_bytes} added={added_bytes} after={after_bytes}"
+    );
+    ensure!(
+        (before_files as u64)
+            .checked_add(added_files)
+            .and_then(|n| n.checked_sub(removed_files))
+            == Some(after_files as u64),
         "active-file reconciliation failed"
     );
     Ok(json!({
         "fixture": "maintenance-active", "storage": "local-file", "initial_logical_rows": before.len(),
         "initial_logical_rows_per_second_to_convergence": before.len() as f64 / elapsed,
+        "initial_eligible_rows": 32 * ROWS_PER_FILE, "initial_protected_rows": 2 * ROWS_PER_FILE,
         "elapsed_seconds": elapsed, "cpu_seconds": cpu_seconds, "cpu_clock_ticks_per_second": ticks_per_second,
         "initial_active_files": before_files, "initial_active_bytes": before_bytes,
         "final_active_files": after_files, "final_active_bytes": after_bytes,
         "rewrite_input_files": removed_files, "rewrite_input_bytes": removed_bytes,
         "rewrite_output_files": added_files, "rewrite_output_bytes": added_bytes,
+        "rewrite_input_byte_amplification": removed_bytes as f64 / before_bytes as f64,
+        "rewrite_amplification_limit": 4,
         "protected_files": protected.files, "protected_bytes": protected.bytes,
         "eligible_files_after": final_debt.eligible_files, "commits": reports.len(),
-        "row_multiset_equal": true
+        "row_multiset_equal": true, "metadata_equal": true, "protected_files_unchanged": true,
+        "rewrite_actions_data_change_false": true, "converged_noop_commits": 0
     }))
 }
 
@@ -374,6 +468,9 @@ fn idle_case(root: &Path, case: &str) -> Result<Value> {
     let (table, counts) = counted(&root.join(case))?;
     let config = probe();
     let version = table.version()?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
     let ticks_per_second = tick_rate()?;
     let cpu_start = cpu_ticks()?;
     let started = Instant::now();
@@ -393,6 +490,13 @@ fn idle_case(root: &Path, case: &str) -> Result<Value> {
             {
                 fallback_count += 1;
                 match operation {
+                    ProbeOperation::Purge => {
+                        let policy = PurgeConfig::new(RETENTION, config.now_ms, Granularity::Minute);
+                        let plan = table.plan_purge(&policy)?;
+                        ensure!(plan.eligible_files == 0, "idle fixture unexpectedly has purge debt");
+                        let report = table.apply_purge(&plan, &policy, &control())?;
+                        ensure!(report.outcome == Outcome::Noop, "idle purge wrote");
+                    }
                     ProbeOperation::Optimize => {
                         let prepared = table.prepare_optimize(&optimize())?;
                         ensure!(
@@ -407,13 +511,15 @@ fn idle_case(root: &Path, case: &str) -> Result<Value> {
                             table.vacuum_once(&VacuumConfig::new(RETENTION, config.now_ms), true, &control())?;
                         ensure!(report.outcome == Outcome::Noop, "idle vacuum wrote");
                     }
-                    _ => bail!("unexpected due or incomplete idle operation: {operation:?}"),
+                    _ => bail!("unexpected due or incomplete idle operation {operation:?} in {case}"),
                 }
             }
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
     let cpu_seconds = (cpu_ticks()? - cpu_start) as f64 / ticks_per_second as f64;
+    let reads = counts.reads.load(Ordering::SeqCst);
+    let lists = counts.lists.load(Ordering::SeqCst);
     let writes = counts.writes.load(Ordering::SeqCst);
     ensure!(
         table.version()? == version && writes == 0,
@@ -422,7 +528,7 @@ fn idle_case(root: &Path, case: &str) -> Result<Value> {
     Ok(json!({
         "case": case, "passes": PASSES, "probe_invocations": 5 * PASSES,
         "elapsed_seconds": elapsed, "cpu_seconds": cpu_seconds,
-        "store_get_calls": counts.reads.load(Ordering::SeqCst), "store_list_calls": counts.lists.load(Ordering::SeqCst),
+        "store_get_calls": reads, "store_list_calls": lists,
         "store_write_calls": writes, "delta_commits": 0, "planner_fallbacks": fallback_count
     }))
 }
@@ -431,6 +537,30 @@ fn verify_due(root: &Path) -> Result<()> {
     let root = root.join("due");
     let table = DeltaTable::open_for_maintenance(&url(&root)?)?;
     let config = probe();
+    let mut retention_inventory = PassProbeInventory::default();
+    ensure!(
+        table
+            .probe_no_work_with_inventory(ProbeOperation::Purge, &config, &control(), &mut retention_inventory)?
+            .is_some(),
+        "expected initial negative retention probe"
+    );
+    let retention_due = NegativeProbeConfig {
+        now_ms: BASE + 8 * 24 * 60 * MINUTE,
+        ..config.clone()
+    };
+    ensure!(
+        table
+            .probe_no_work_with_inventory(
+                ProbeOperation::Purge,
+                &retention_due,
+                &control(),
+                &mut retention_inventory
+            )?
+            .is_none(),
+        "retention transition hidden by prior negative probe"
+    );
+    let purge = table.plan_purge(&PurgeConfig::new(RETENTION, retention_due.now_ms, Granularity::Minute))?;
+    ensure!(purge.eligible_files > 0, "retention planner missed newly due files");
     let mut inventory = PassProbeInventory::default();
     ensure!(
         table
@@ -460,23 +590,6 @@ fn verify_due(root: &Path) -> Result<()> {
         !table.plan_optimize(&optimize())?.bins.is_empty(),
         "planner missed new compaction debt"
     );
-    let mut inventory = PassProbeInventory::default();
-    ensure!(
-        table
-            .probe_no_work_with_inventory(ProbeOperation::Purge, &config, &control(), &mut inventory)?
-            .is_some(),
-        "expected initial negative retention probe"
-    );
-    let due_config = NegativeProbeConfig {
-        now_ms: BASE + 8 * 24 * 60 * MINUTE,
-        ..config
-    };
-    ensure!(
-        table
-            .probe_no_work_with_inventory(ProbeOperation::Purge, &due_config, &control(), &mut inventory)?
-            .is_none(),
-        "retention transition hidden by prior negative probe"
-    );
     Ok(())
 }
 
@@ -488,7 +601,8 @@ fn idle(root: &Path) -> Result<Value> {
     verify_due(root)?;
     Ok(json!({
         "fixture": "maintenance-idle", "storage": "local-file", "cadence": "five operations per pass, no sleep",
-        "cases": cases, "post_negative_commit_and_retention_due_detected": true
+        "cases": cases, "post_negative_commit_and_retention_due_detected": true,
+        "io_scope": "object-store calls during measured passes; excludes direct filesystem sidecars"
     }))
 }
 
