@@ -78,8 +78,8 @@ test('scaled rendering creates bounded clients with unique ownership and require
     assert.equal(labels['arrowcol-oat/client-index'], String(index + 1));
     const args = loadArgs(job);
     assert.equal(args[args.indexOf('--client-id') + 1], jobs[index]!.clientId);
-    assert.deepEqual(args.filter((_, position) => position !== args.indexOf('--client-id') + 1),
-      baseArgs.filter((_, position) => position !== baseArgs.indexOf('--client-id') + 1));
+    assert.deepEqual(args.filter((_, position) => position !== args.indexOf('--client-id') + 1 && position !== args.indexOf('--pod-ordinal') + 1),
+      baseArgs.filter((_, position) => position !== baseArgs.indexOf('--client-id') + 1 && position !== baseArgs.indexOf('--pod-ordinal') + 1));
     const podSpec = record(record(record(job.spec).template).spec);
     const affinity = record(podSpec.affinity);
     const antiAffinity = record(affinity.podAntiAffinity);
@@ -184,4 +184,47 @@ test('candidate images must bind all pinned workload digests to the exact source
     ...provenance,
     images: incomplete,
   }), /missing a valid digest/);
+});
+
+test('effective config rejects conflicting/unknown env and never labels realistic or Zstd as parity', async () => {
+  const source = (await readFile(resolve(process.cwd(), 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml'), 'utf8'))
+    .replaceAll('BENCHDURATIONSECS', '600');
+  const documents = parseAllDocuments(source);
+  const load = documents.find(document => document.getIn(['metadata', 'name']) === 'direct-load-confirmwide')!;
+  const path = ['spec', 'template', 'spec', 'containers', 0];
+  load.setIn([...path, 'env'], [{ name: 'ARROWCOL_CLIENT_DATA_PROFILE', value: 'realistic' },
+    { name: 'ARROWCOL_CLIENT_IPC_COMPRESSION', value: 'zstd' }]);
+  const realistic = documents.map(document => document.toString()).join('');
+  const effective = effectiveWorkloadConfig(realistic);
+  assert.equal(effective.profile, 'non-parity');
+  assert.equal(effective.dataProfile, 'realistic');
+  assert.equal(effective.ipcCompression, 'zstd');
+  assert.equal(effective.performanceConfig['string-width'], '96');
+  assert.notEqual(effective.sha256, effectiveWorkloadConfig(source).sha256);
+  const args = loadArgs(record(load.toJSON()));
+  load.setIn([...path, 'args'], [...args, '--data-profile', 'diagnostic']);
+  assert.throws(() => effectiveWorkloadConfig(documents.map(document => document.toString()).join('')), /Conflicting/);
+  load.setIn([...path, 'env'], [{ name: 'ARROWCOL_CLIENT_UNKNOWN', value: '1' }]);
+  assert.throws(() => effectiveWorkloadConfig(documents.map(document => document.toString()).join('')), /unknown/);
+  load.setIn([...path, 'envFrom'], [{ configMapRef: { name: 'hidden-defaults' } }]);
+  assert.throws(() => effectiveWorkloadConfig(documents.map(document => document.toString()).join('')), /envFrom/);
+});
+
+test('candidate substitution transforms original container image nodes once, without alias cascades or non-image edits', async () => {
+  const source = (await readFile(resolve(process.cwd(), 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml'), 'utf8'))
+    .replaceAll('BENCHREGISTRY', registry).replaceAll('BENCHDURATIONSECS', '600');
+  const binding = imageManifest(effectiveWorkloadConfig(source).sha256);
+  const first = 'arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30';
+  const second = 'arrowcol-oat-client@sha256:f84be43a9fcf0c1c98071477ae9f20159caf4d294ac6b06986634093611dd892';
+  binding.images[first] = second.split('@')[1]!;
+  const documents = parseAllDocuments(source);
+  documents[0]!.setIn(['metadata', 'annotations', 'image'], registry + '/' + first);
+  const result = resources(applyCandidateImageManifest(documents.map(document => document.toString()).join(''), registry, sourceCommit, binding));
+  const load = result.find(resource => record(resource.metadata).name === 'direct-load-confirmwide')!;
+  const container = record((record(record(record(load.spec).template).spec).containers as unknown[])[0]);
+  assert.equal(container.image, registry + '/' + second);
+  assert.equal(record(record(result[0]!.metadata).annotations).image, registry + '/' + first);
+  const registration = result.find(resource => record(resource.metadata).name === 'direct-catalog-verified')!;
+  assert.equal(record((record(record(record(registration.spec).template).spec).containers as unknown[])[0]).image,
+    registry + '/arrowcol-oat-client@' + binding.images[second]);
 });

@@ -29,12 +29,83 @@ export interface CandidateImageManifest {
 
 export interface EffectiveWorkloadConfig {
   schemaVersion: 1;
-  profile: 'diagnostic-replay';
-  dataProfile: 'diagnostic';
-  ipcCompression: 'none';
+  profile: 'diagnostic-replay' | 'non-parity';
+  dataProfile: 'diagnostic' | 'realistic';
+  ipcCompression: 'none' | 'lz4_frame' | 'zstd';
   clientCount: number;
   generatorArgs: string[];
+  performanceConfig: Record<string, string>;
   sha256: string;
+}
+
+// Pin the CLI defaults from dmv_client::Options instead of inheriting image defaults.
+const clientDefaults: Record<string, string> = {
+  'corpus-rows': '0', 'corpus-bytes': '0', 'batch-rows': '0', workers: '0', 'runtime-threads': '0',
+  'data-mode': 'shared', 'data-profile': 'diagnostic', 'string-width': '0', cardinality: '1024',
+  'null-fraction': '0', skew: '0', entropy: '1', seed: '20260923', 'max-memory-bytes': '536870912',
+  'interval-us': '0', 'connections-per-worker': '1', 'streams-per-worker': '0', 'max-rows': '0',
+  'stream-retry-max-attempts': '4', 'stream-retry-base-backoff-ms': '10', 'stream-retry-max-backoff-ms': '250',
+  'ipc-compression': 'none', 'dictionary-handling': 'hydrate', 'grpc-send-compression': 'none',
+  'grpc-accept-compression': 'none', 'max-flight-data-bytes': '2097152', 'max-message-bytes': '16777216',
+  'stream-window-bytes': '1048576', 'connection-window-bytes': '16777216', 'max-frame-bytes': '16384',
+  'header-table-bytes': '4096', 'max-header-list-bytes': '16384', 'adaptive-window': 'false',
+  'keepalive-interval-ms': '10000', 'keepalive-timeout-ms': '20000', 'keepalive-while-idle': 'true',
+  'connect-timeout-ms': '30000', 'request-timeout-ms': '30000', 'tcp-nodelay': 'true',
+  'tcp-keepalive-ms': '60000', 'tcp-keepalive-interval-ms': '0', 'tcp-keepalive-retries': '0',
+  'endpoint-concurrency-limit': '256', 'endpoint-buffer-size': '1024', 'connect-retries': '0',
+  'retry-backoff-ms': '100', 'rate-limit-rps': '0',
+};
+const distributionFlags = ['string-length-distribution', 'value-variation', 'guid-uniqueness'];
+const controlFlags = ['endpoint', 'client-id', 'table', 'rows', 'concurrency', 'edge-secret-file',
+  'warmup-secs', 'duration-secs', 'schedule-file', 'schedule-timeout-secs', 'pod-ordinal'];
+
+function resolvedClientConfig(resource: Record<string, unknown>): Record<string, string> {
+  const generator = findGenerator(resource);
+  const pod = requireRecord(requireRecord(requireRecord(resource.spec, 'Job spec').template, 'Job template').spec, 'Pod spec');
+  const container = requireRecord((pod.containers as unknown[])[generator.containerIndex], 'Generator');
+  if (container.command !== undefined || container.envFrom !== undefined || pod.initContainers !== undefined) {
+    throw new Error('Unknown generator command, envFrom or init-container configuration source.');
+  }
+  const config: Record<string, string> = {};
+  const allowed = new Set([...Object.keys(clientDefaults), ...distributionFlags, ...controlFlags]);
+  if (generator.args.length % 2 !== 0) throw new Error('Generator arguments must be flag/value pairs.');
+  for (let index = 0; index < generator.args.length; index += 2) {
+    const flag = generator.args[index];
+    const value = generator.args[index + 1];
+    if (typeof flag !== 'string' || !flag.startsWith('--') || typeof value !== 'string' ||
+        !allowed.has(flag.slice(2)) || config[flag.slice(2)] !== undefined) {
+      throw new Error('Unknown or duplicate effective generator argument.');
+    }
+    config[flag.slice(2)] = value;
+  }
+  if (container.env !== undefined && !Array.isArray(container.env)) throw new Error('Generator env is invalid.');
+  const seen = new Set<string>();
+  for (const raw of (container.env ?? []) as unknown[]) {
+    const env = requireRecord(raw, 'Generator env');
+    if (typeof env.name !== 'string' || !env.name.startsWith('ARROWCOL_CLIENT_') || typeof env.value !== 'string' ||
+        env.valueFrom !== undefined || seen.has(env.name)) throw new Error('Unknown effective generator environment source.');
+    seen.add(env.name);
+    const flag = env.name.slice('ARROWCOL_CLIENT_'.length).toLowerCase().replaceAll('_', '-');
+    if (!allowed.has(flag) || (config[flag] !== undefined && config[flag] !== env.value)) {
+      throw new Error('Conflicting or unknown effective generator environment value.');
+    }
+    config[flag] = env.value;
+  }
+  const resolved = { ...clientDefaults, ...config };
+  if (!['diagnostic', 'realistic'].includes(resolved['data-profile']!) ||
+      !['none', 'lz4_frame', 'zstd'].includes(resolved['ipc-compression']!)) throw new Error('Unknown workload profile or IPC codec.');
+  const realistic = resolved['data-profile'] === 'realistic';
+  resolved['string-length-distribution'] ??= realistic ? 'uniform' : 'fixed';
+  resolved['value-variation'] ??= realistic ? 'per_row' : 'cardinality';
+  resolved['guid-uniqueness'] ??= realistic ? 'per_row' : 'cardinality';
+  if (realistic && resolved['string-width'] === '0') resolved['string-width'] = '96';
+  if (resolved['batch-rows'] === '0') resolved['batch-rows'] = resolved.rows!;
+  if (resolved['corpus-rows'] === '0' && resolved['corpus-bytes'] === '0') resolved['corpus-rows'] = resolved.rows!;
+  if (resolved['streams-per-worker'] === '0') resolved['streams-per-worker'] = resolved.concurrency!;
+  if (resolved.workers === '0' || resolved['runtime-threads'] === '0') {
+    throw new Error('Effective workload must specify workers and runtime threads; CPU-derived defaults are unknown.');
+  }
+  return resolved;
 }
 
 export interface ScaledClientJob {
@@ -189,6 +260,11 @@ export function renderScaledProfileManifest(source: string, runId: string, clien
       cloned.setIn(['spec', 'template', 'metadata', 'labels', profileLabel], 'scaled');
       cloned.setIn(['spec', 'template', 'metadata', 'labels', clientIndexLabel], String(job.index));
       cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'args', clientIdIndexes[0]!], job.clientId);
+      const pinned = resolvedClientConfig(requireRecord(cloned.toJSON(), 'Cloned Job'));
+      pinned['pod-ordinal'] = String(job.index);
+      cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'args'],
+        Object.entries(pinned).flatMap(([flag, value]) => ['--' + flag, value]));
+      cloned.deleteIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'env']);
       cloned.setIn(['spec', 'template', 'spec', 'affinity'], affinity);
       output.push(cloned.toString());
     }
@@ -299,20 +375,30 @@ export function applyCandidateImageManifest(
       effectiveWorkloadConfig(renderedManifest).sha256 !== provenance.workloadConfigSha256) {
     throw new Error('Candidate image manifest does not bind the rendered workload configuration.');
   }
-  const imageValues: string[] = [];
-  const collectImages = (value: unknown): void => {
-    if (Array.isArray(value)) { value.forEach(collectImages); return; }
-    if (!isRecord(value)) return;
-    for (const [key, child] of Object.entries(value)) {
-      if (key === 'image' && typeof child === 'string') imageValues.push(child);
-      else collectImages(child);
-    }
-  };
-  for (const document of parseDocuments(renderedManifest)) collectImages(document.toJSON());
+  const documents = parseDocuments(renderedManifest);
+  const imageNodes = documents.flatMap(document => {
+    const resource = document.toJSON();
+    if (!isRecord(resource) || !['Pod', 'Job', 'Deployment', 'DaemonSet', 'StatefulSet'].includes(String(resource.kind))) return [];
+    const path = resource.kind === 'Pod' ? ['spec'] : ['spec', 'template', 'spec'];
+    const spec = requireRecord(resource.spec, 'Image resource spec');
+    const pod = resource.kind === 'Pod' ? spec :
+      requireRecord(requireRecord(spec.template, 'Image pod template').spec, 'Image pod spec');
+    return ['containers', 'initContainers', 'ephemeralContainers'].flatMap(key => {
+      const containers = pod[key];
+      if (containers === undefined) return [];
+      if (!Array.isArray(containers)) throw new Error('Image container list is invalid.');
+      return containers.map((container, index) => {
+        const value = requireRecord(container, 'Image container').image;
+        if (typeof value !== 'string') throw new Error('Container image is invalid.');
+        return { document, path: [...path, key, index, 'image'], value };
+      });
+    });
+  });
+  if (!imageNodes.length) throw new Error('Candidate manifest contains no workload images.');
   const sourceReferences = new Set<string>();
   const replacements = new Map<string, string>();
   const registryPrefix = escapeRegExp(registry);
-  for (const image of imageValues) {
+  for (const { value: image } of imageNodes) {
     const match = new RegExp('^' + registryPrefix + '/([^/@]+)@(sha256:[0-9a-f]{64})$').exec(image);
     if (!match) throw new Error('Rendered benchmark image is outside the pinned stamped registry.');
     const sourceReference = match[1] + '@' + match[2];
@@ -329,9 +415,10 @@ export function applyCandidateImageManifest(
       providedReferences.some((reference, index) => reference !== expectedReferences[index])) {
     throw new Error('Candidate image manifest must cover every exact source image reference in the rendered workload.');
   }
-  let result = renderedManifest;
-  for (const [before, after] of replacements) result = result.replaceAll(before, after);
-  return result;
+  for (const { document, path, value } of imageNodes) {
+    document.setIn(path, replacements.get(value)!);
+  }
+  return documents.map(document => document.toString()).join('');
 }
 
 export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConfig {
@@ -346,8 +433,10 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
   if (loadJobs.length < 1 || loadJobs.length > MAX_SCALED_CLIENTS) throw new Error('Effective workload must contain 1 to 8 load Jobs.');
   const clientIds = new Set<string>();
   let effectiveArgs: string[] | undefined;
+  let performanceConfig: Record<string, string> | undefined;
   for (const loadJob of loadJobs) {
-    const args = findGenerator(loadJob).args;
+    const resolved = resolvedClientConfig(loadJob);
+    const args = Object.entries(resolved).sort(([a], [b]) => a.localeCompare(b)).flatMap(([flag, value]) => ['--' + flag, value]);
     if (!args.every(value => typeof value === 'string') || args.length % 2 !== 0 ||
         args.some((value, index) => index % 2 === 0 && !(value as string).startsWith('--'))) {
       throw new Error('Effective workload generator arguments must be flag/value pairs.');
@@ -359,11 +448,13 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
     }
     clientIds.add(args[clientIdFlags[0]! + 1] as string);
     const clientIdIndex = clientIdFlags[0]!;
-    const argsWithoutClientId = args.filter((_value, index) => index !== clientIdIndex && index !== clientIdIndex + 1) as string[];
+    const argsWithoutClientId = args.filter((_value, index) => index !== clientIdIndex && index !== clientIdIndex + 1 &&
+      args[index - index % 2] !== '--pod-ordinal');
     if (effectiveArgs && JSON.stringify(effectiveArgs) !== JSON.stringify(argsWithoutClientId)) {
       throw new Error('Scaled clients do not have equivalent workload arguments.');
     }
     effectiveArgs = argsWithoutClientId;
+    performanceConfig = Object.fromEntries(Object.entries(resolved).filter(([key]) => !['client-id', 'pod-ordinal'].includes(key)).sort(([a], [b]) => a.localeCompare(b)));
   }
   const valueOf = (flag: string): string => {
     const indexes = effectiveArgs!.flatMap((value, index) => value === flag ? [index + 1] : []);
@@ -375,11 +466,13 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
   }
   const contract = {
     schemaVersion: 1 as const,
-    profile: 'diagnostic-replay' as const,
-    dataProfile: 'diagnostic' as const,
-    ipcCompression: 'none' as const,
+    profile: performanceConfig!['data-profile'] === 'diagnostic' && performanceConfig!['ipc-compression'] === 'none'
+      ? 'diagnostic-replay' as const : 'non-parity' as const,
+    dataProfile: performanceConfig!['data-profile'] as 'diagnostic' | 'realistic',
+    ipcCompression: performanceConfig!['ipc-compression'] as 'none' | 'lz4_frame' | 'zstd',
     clientCount: loadJobs.length,
     generatorArgs: effectiveArgs!,
+    performanceConfig: performanceConfig!,
   };
   return { ...contract, sha256: createHash('sha256').update(JSON.stringify(contract)).digest('hex') };
 }
