@@ -47,6 +47,7 @@ fi
 readarray -t pins < <(node -e '
   const p = require(process.argv[1]);
   console.log(p.debian_image);
+  console.log(p.debian_snapshot);
   console.log(p.rust.version);
   console.log(p.rust.rustup_init_sha256);
   console.log(p.node.version);
@@ -55,12 +56,13 @@ readarray -t pins < <(node -e '
   console.log(p.age.debian_package);
 ' "$lock")
 base_image=${pins[0]}
-rust_version=${pins[1]}
-rustup_sha=${pins[2]}
-node_version=${pins[3]}
-node_sha=${pins[4]}
-docker_cli_package=${pins[5]}
-age_package=${pins[6]}
+debian_snapshot=${pins[1]}
+rust_version=${pins[2]}
+rustup_sha=${pins[3]}
+node_version=${pins[4]}
+node_sha=${pins[5]}
+docker_cli_package=${pins[6]}
+age_package=${pins[7]}
 
 image_digest=$(cd "$script_dir" &&
   sha256sum tools.lock.json Dockerfile install-tools.sh candidate-exec.sh run-darwin.sh |
@@ -71,6 +73,7 @@ candidate_image="rust-playground/darwin-candidate:$image_digest"
 build_images() {
   local build_args=(
     --build-arg "DEBIAN_IMAGE=$base_image"
+    --build-arg "DEBIAN_SNAPSHOT=$debian_snapshot"
     --build-arg "RUST_VERSION=$rust_version"
     --build-arg "RUSTUP_INIT_SHA256=$rustup_sha"
     --build-arg "NODE_VERSION=$node_version"

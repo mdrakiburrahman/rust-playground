@@ -1,5 +1,6 @@
 {
   "debian_image": "debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
+  "debian_snapshot": "http://snapshot.debian.org/archive/debian/20261122T000000Z",
   "darwin": {
     "url": "https://rakirahman.blob.core.windows.net/public/bins/darwin-linux-x86_64",
     "sha256": "461370bcc22ad665045604e0bc0347984f7717e271c35cc53d17b27447dda657",

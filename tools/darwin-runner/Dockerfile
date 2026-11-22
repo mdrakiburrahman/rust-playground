@@ -1,6 +1,7 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim
 FROM ${DEBIAN_IMAGE} AS toolchain
 
+ARG DEBIAN_SNAPSHOT
 ARG RUST_VERSION
 ARG RUSTUP_INIT_SHA256
 ARG NODE_VERSION
@@ -11,7 +12,9 @@ ENV CARGO_HOME=/opt/cargo \
     RUSTUP_HOME=/opt/rustup \
     PATH=/opt/cargo/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+    && printf 'deb [check-valid-until=no] %s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends \
         bash build-essential ca-certificates curl git libsqlite3-0 libssl-dev pkg-config xz-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -43,7 +46,7 @@ USER 10001:10001
 FROM candidate AS controller
 USER root
 ARG DOCKER_CLI_PACKAGE
-RUN apt-get update \
+RUN apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends "$DOCKER_CLI_PACKAGE" "$AGE_PACKAGE" \
     && rm -rf /var/lib/apt/lists/*
 

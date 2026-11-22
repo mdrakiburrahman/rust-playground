@@ -1,6 +1,6 @@
 # Darwin runner
 
-Darwin 0.3.0 runs in a pinned Debian bookworm controller beside the Ubuntu devcontainer. The controller and candidate worker use identical pinned Rust/Node toolchains. Each candidate gets a fresh container with only committed `git archive HEAD`, no host mounts, credentials, cloud config, controller home, inherited environment, or Docker socket.
+Darwin 0.3.0 runs in a pinned Debian bookworm controller beside the Ubuntu devcontainer. The Debian image digest and apt snapshot, Rust/Node versions, and Darwin checksum are pinned. The controller and candidate worker use identical toolchains. Each candidate gets a fresh container with only committed `git archive HEAD`, no host mounts, credentials, cloud config, controller home, inherited environment, or Docker socket.
 
 | Command | Purpose |
 |---|---|
