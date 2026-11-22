@@ -152,6 +152,31 @@ fn verify_snapshot(
     Ok((ids.len(), bytes))
 }
 
+fn verify_physical_files(root: &Path, expected: &BTreeMap<PathBuf, u64>) -> Result<()> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut physical = BTreeSet::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            ensure!(!file_type.is_symlink(), "unexpected symlink in table");
+            if file_type.is_dir() {
+                if entry.file_name() != "_delta_log" {
+                    directories.push(path);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "parquet") {
+                ensure!(physical.insert(path), "duplicate physical file");
+            }
+        }
+    }
+    ensure!(
+        physical.iter().eq(expected.keys()),
+        "physical Parquet files differ from committed Adds"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "explicit local component profile"]
 async fn local_commit_pipeline_profile() -> Result<()> {
@@ -849,6 +874,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         }
     }
     let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, &expected_groups, last_version)?;
+    verify_physical_files(root.path(), &expected_files)?;
     let root_url =
         Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
     let mut remaining = expected_files;
@@ -858,6 +884,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         let mut files = BTreeMap::new();
         for line in log.lines() {
             let action: serde_json::Value = serde_json::from_str(line)?;
+            ensure!(action.get("remove").is_none(), "unexpected Remove action");
             if let Some(txn) = action.get("txn") {
                 ensure!(txn["version"] == 0, "wrong transaction version");
                 ensure!(
@@ -899,6 +926,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
     }
 
     let timed = records.iter().filter(|record| record.index != 0).collect::<Vec<_>>();
+    let timed_output_bytes = timed.iter().map(|record| record.result.files[0].bytes).sum::<u64>();
     let timed_commits = commits
         .iter()
         .filter(|(version, _)| **version != records[0].result.version)
@@ -925,6 +953,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         "timed_groups": CONTINUOUS_GROUPS,
         "timed_durable_rows": CONTINUOUS_GROUPS * ROWS,
         "timed_receipts": timed.len(),
+        "timed_physical_bytes": timed_output_bytes,
         "wall_seconds": wall.as_secs_f64(),
         "process_cpu_seconds": cpu as f64 / hz as f64,
         "stage_wall_sum_seconds": sum(|record| record.stage),
