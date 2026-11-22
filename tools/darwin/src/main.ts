@@ -40,6 +40,16 @@ async function setup(repo: string, home: string, producer?: string): Promise<voi
   await writeFile(path.join(output, "package.json"), '{"type":"module"}\n', { flag: "wx" });
   const launcher = path.join(trusted, "bin", "harness");
   await mkdir(path.dirname(launcher));
+  // Keep the OAT launcher's owned-server recovery path while selecting its release build.
+  const cargo = path.join(trusted, "bin", "cargo");
+  await writeFile(cargo, `#!/bin/sh
+set -eu
+if [ "$#" -eq 7 ] && [ "$1" = build ] && [ "$2" = --locked ] && [ "$3" = --package ] && [ "$4" = arrowcol-oat-rust ] && [ "$5" = --bin ] && [ "$6" = arrowcol-oat-rust ] && [ "$7" = --message-format=json-render-diagnostics ]; then
+  exec /usr/local/cargo/bin/cargo "$@" --release
+fi
+exec /usr/local/cargo/bin/cargo "$@"
+`, { flag: "wx" });
+  await chmod(cargo, 0o755);
   const script = `#!/bin/sh
 set -eu
 home="$(mktemp -d /tmp/arrowcol-darwin-home.XXXXXXXX)"

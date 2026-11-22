@@ -9,6 +9,7 @@ export interface OatMeasurement extends Measurement {
   parquetBytes: number;
   files: number;
   commits: number;
+  completeBuckets: number;
   commitLatencySeconds: { p50: number; p99: number; samples: number };
   cpuMillicoresMean: number | null;
   memoryBytesMaxObserved: number | null;
@@ -194,6 +195,7 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
     parquetBytes: bytes,
     files,
     commits: commitCount,
+    completeBuckets: commits.complete_30_second_commit_windows.length,
     durableRowsPerSecond: rate,
     parquetBytesPerRow: bytesPerRow,
     commitLatencySeconds: { p50, p99, samples: latencySamples },

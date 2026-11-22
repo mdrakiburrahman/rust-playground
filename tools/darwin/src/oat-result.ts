@@ -20,7 +20,7 @@ function imageId(value: unknown): string {
 
 export async function readReconciledOatResult(
   resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number,
-): Promise<{ measurement: OatMeasurement; images: string[]; activeRows: number; snapshotVersion: number; cellRunId: string }> {
+): Promise<{ measurement: OatMeasurement; images: string[]; activeRows: number; snapshotVersion: number; cellRunId: string; snapshotReconciled: true }> {
   const bytes = await readFile(resultsPath);
   if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("OAT result is empty or too large");
   const arrow = tableFromIPC(readParquet(bytes).intoIPCStream());
@@ -65,5 +65,5 @@ export async function readReconciledOatResult(
   const proof = await reconcileStoppedSnapshot(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts, Compression.ZSTD,
   );
-  return { measurement, images, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion, cellRunId: row.run_id };
+  return { measurement, images, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion, cellRunId: row.run_id, snapshotReconciled: true };
 }

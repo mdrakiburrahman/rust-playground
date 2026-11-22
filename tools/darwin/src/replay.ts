@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { cp, mkdir, mkdtemp, open, readFile, readdir, realpath, rmdir, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { readReconciledOatResult } from "./oat-result.js";
@@ -15,10 +15,10 @@ function object(value: unknown, label: string): JsonObject {
   return value as JsonObject;
 }
 
-function cleanEnv(home: string, stackBytes: number): NodeJS.ProcessEnv {
+export function cleanEnv(home: string, stackBytes: number): NodeJS.ProcessEnv {
   return {
     HOME: home, USER: userInfo().username, LANG: "C.UTF-8",
-    PATH: "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+    PATH: `${dirname(process.execPath)}:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin`,
     CARGO_HOME: "/usr/local/cargo", RUSTUP_HOME: "/usr/local/rustup",
     RUST_MIN_STACK: String(stackBytes),
   };
@@ -71,12 +71,14 @@ async function prepareRuntime(repo: string, home: string, manifest: SnapshotMani
   return runtime;
 }
 
-async function runOat(runtime: string, configPath: string, home: string, logPath: string, stackBytes: number): Promise<void> {
+async function runOat(runtime: string, configPath: string, home: string, toolDir: string, logPath: string, stackBytes: number): Promise<void> {
   const log = await open(logPath, "wx");
   try {
+    const env = cleanEnv(home, stackBytes);
+    env.PATH = `${toolDir}:${env.PATH}`;
     const child = spawn(process.execPath, ["--import", "tsx", "projects/arrowcol-oat/cli.ts",
       "--config", configPath, "--mode", "local", "--no-viewer"], {
-      cwd: runtime, env: cleanEnv(home, stackBytes), stdio: ["ignore", log.fd, log.fd],
+      cwd: runtime, env, stdio: ["ignore", log.fd, log.fd],
     });
     const timedOut = { value: false };
     const timer = setTimeout(() => { timedOut.value = true; child.kill("SIGTERM"); }, 6 * 60 * 60 * 1000);
@@ -119,6 +121,9 @@ export async function replayCompressionPair(
   let completed = false;
   try {
     const runtime = await prepareRuntime(repo, home, manifest, producer.revision, stackBytes);
+    execFileSync("/usr/local/cargo/bin/cargo", [
+      "build", "--locked", "--release", "--package", "arrowcol-oat-rust", "--bin", "arrowcol-oat-rust",
+    ], { cwd: runtime, env: cleanEnv(join(home, "trusted", "prepare-home"), stackBytes), stdio: "inherit" });
     const results = [];
     for (const [label, raw, level] of [["baseline", seed, baselineLevel], ["candidate", candidate, candidateLevel]] as const) {
       const runRoot = await mkdtemp(join(data, `${label}-`));
@@ -135,12 +140,12 @@ export async function replayCompressionPair(
       const configPath = join(runRoot, "config.json");
       await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o400 });
       const configHash = await sha256(configPath);
-      await runOat(runtime, configPath, runHome, join(runRoot, "run.log"), stackBytes);
+      await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"), stackBytes);
       if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
       const result = await readReconciledOatResult(
         join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_active_sessions", producer.revision, level,
       );
-      const binaryHash = await sha256(join(runtime, "target", "debug", "arrowcol-oat-rust"));
+      const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
       const env = cleanEnv(runHome, stackBytes);
       if (git(runtime, env, "rev-parse", "HEAD") !== producer.revision
         || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {
