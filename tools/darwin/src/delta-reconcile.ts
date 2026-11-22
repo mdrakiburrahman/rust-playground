@@ -72,7 +72,7 @@ function entries(raw: unknown): InventoryEntry[] {
 export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
   measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
-  rawPreload: unknown,
+  rawPreload: unknown, inspectActiveFooter?: (path: string) => Promise<void>,
 ): Promise<{ rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number }> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
@@ -219,6 +219,7 @@ export async function reconcileStoppedSnapshot(
     const path = join(tableRoot, add.path);
     const stat = await lstat(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== add.size) throw new Error("active Parquet file size mismatch");
+    if (active.has(add.path) && inspectActiveFooter) await inspectActiveFooter(path);
     const bytes = await readFile(path);
     const metadata = readMetadata(bytes);
     let footerRows: number;
