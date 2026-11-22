@@ -35,13 +35,49 @@ active Adds and decoded Parquet, and reports latency sample counts. A candidate
 must meet its own frozen baseline's 10% bytes-per-row guard. The separate
 historical comparable AKS headline guard is 38.17 B/row.
 
+| Local profile | Purpose |
+| --- | --- |
+| `candidate.oat.json` | V9 Realistic seed; its unique per-row identity is high entropy. |
+| `historical-parity.oat.json` | Diagnostic client with historical AKS batching, commit and CPU-worker settings, on the same hourly-partitioned table. Config validation is not a runtime readback. The compression replay does not yet support this profile. |
+
+Confirm Realistic codec, dictionary and compression winners on historical
+parity at AKS-like file sizes (approximately 2 million rows/file) before
+promotion. The parity collector's 4.29 GB queue budget is not headroom inside
+its container limit. The current 86 GiB pin rounds down 75% of observed host
+available memory after the 1 GiB client budget; it is not the historical AKS
+384 GiB allocation. Recheck host availability and the effective cap before
+every arm; refuse a run if the pin exceeds that bound. The 90% overload guard
+remains enabled. Pressure registration uses the same local RSS limit and the
+historical queue limits. Pipeline depth 8 causes the exporter to use
+`force_commit=false`. The sorted-layout limits are 2 million rows, 1 GiB and
+262,144 rows per group; table-effective readback must confirm them. Those
+limits do not guarantee files reach 2 million rows.
+Label measurements **local one-box scale**, not AKS-equivalent; record host
+memory and vCPUs, chosen cap and sampled collector peak RSS, using null when
+unmeasured.
+
+| Deliberate local deviation | Historical AKS |
+| --- | --- |
+| Collector and clients share 32 host vCPUs; collector uses 32 workers. | Collector requests and limits 48 CPUs. |
+| Collector cap 86 GiB; pressure RSS limit equals the local cap. | Collector limit 384 GiB; pressure RSS limit 320 GiB. |
+| Local storage and one-box scheduling. | Separate AKS resources and remote storage. |
+| 60-second warmup and 150-second measurement. | 60-second warmup and 600-second headline window. |
+| Runtime worker, blocking, upload and task limits are explicitly pinned by the local profile. | Historical manifest uses runtime defaults. |
+
+The historical writer policy is source-derived from the deployed config and
+`3630d3e4`: no Parquet override, uncompressed layout output, dictionary and
+page statistics. Historical footer receipt: null. Each parity run must prove
+the codec, dictionary pages and page statistics in stopped-table footers.
+
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
 
 The client uses the fixed business customer ID `direct-e64-confirmwide` while
 delivery and row identities remain unique per run. Its manifest hashes the
 generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
-must report the same hash. Client process CPU is reported separately from
+must report the same hash. This contract applies to the Realistic seed only;
+Diagnostic parity requires the pending profile-aware digest and extractor.
+Client process CPU is reported separately from
 collector samples, with its own sampling interval or an unavailable reason.
 The hourly ingestion-partitioned table is checked against catalog metadata
 before the clients are armed. Each pre-load Delta log is hashed and must have
