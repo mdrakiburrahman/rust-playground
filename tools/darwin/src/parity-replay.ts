@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readReconciledOatResult } from "./oat-result.js";
 import { inspectParityHost, parityLadderConfig, type ParityProfile } from "./parity-preflight.js";
+import { parityImageIds } from "./image-binding.js";
+export { parityImageIds } from "./image-binding.js";
 import { cleanEnv, hasPinnedSubmodules, localReplayOptions, prepareReplayRuntime, runOat, sha256 } from "./replay.js";
 import type { SnapshotManifest } from "./snapshot.js";
 
@@ -63,31 +65,11 @@ function object(value: unknown, label: string): JsonObject {
   return value as JsonObject;
 }
 
-export function parityImageIds(log: string, resultImages: unknown): Record<string, string> {
-  const prefix = "[oat] immutable local images: ";
-  const lines = log.split("\n").filter(line => line.startsWith(prefix));
-  if (lines.length !== 1) throw new Error("expected exactly one immutable image admission record");
-  const images = object(JSON.parse(lines[0]!.slice(prefix.length)), "immutable images");
-  const roles = ["catalog", "client", "collector", "maintenance", "router", "sqlserver"];
-  if (Object.keys(images).sort().join(",") !== roles.join(",")) throw new Error("invalid immutable image admission record");
-  const pinned: Record<string, string> = {};
-  for (const role of roles) {
-    const image = images[role];
-    if (typeof image !== "string" || !/^sha256:[a-f0-9]{64}$/.test(image)) throw new Error("invalid immutable image admission record");
-    pinned[role] = image;
-  }
-  if (!Array.isArray(resultImages) || resultImages.length !== 4
-    || !["client", "collector", "maintenance", "router"].every(role => resultImages.includes(`${role}:${pinned[role]}`))) {
-    throw new Error("runtime image evidence differs from immutable admission");
-  }
-  return pinned;
-}
-
 function git(runtime: string, env: NodeJS.ProcessEnv, ...args: string[]): string {
   return execFileSync("git", ["-C", runtime, ...args], { encoding: "utf8", env }).trimEnd();
 }
 
-async function buildFooterInspector(runtime: string, home: string, stackBytes: number): Promise<{ path: string; sha256: string }> {
+export async function buildFooterInspector(runtime: string, home: string, stackBytes: number): Promise<{ path: string; sha256: string }> {
   const env = cleanEnv(home, stackBytes);
   const output = execFileSync("/usr/local/cargo/bin/cargo", [
     "build", "--locked", "--release", "--package", "arrowcol-oat-rust", "--bin", "oat-parity-footer",

@@ -15,6 +15,7 @@ test("scores invalid candidates but propagates replay infrastructure failures", 
   const config = (level: number) => JSON.stringify({
     tunables: { parquet_writer: { defaults: { compression: "zstd", compression_level: level } } },
   });
+
   try {
     execFileSync("git", ["init", "-q", repo]);
     await mkdir(path.dirname(configPath), { recursive: true });
@@ -40,4 +41,21 @@ test("scores invalid candidates but propagates replay infrastructure failures", 
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
+});
+
+test("qualification infrastructure failures report null measurement and exit nonzero", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "darwin-qualification-cli-"));
+  try {
+    execFileSync("git", ["init", "-q", temporary]);
+    const main = fileURLToPath(new URL("./main.ts", import.meta.url));
+    const run = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), main, "qualify",
+      "--home", path.join(temporary, "missing"), "--roles", path.join(temporary, "roles.json"),
+      "--bind-host", "127.0.0.1", "--endpoint-host", "127.0.0.1", "--controller-stack-bytes", "33554432",
+    ], { cwd: temporary, encoding: "utf8" });
+    assert.equal(run.status, 1);
+    const result = JSON.parse(run.stdout.replace(/^@RESULT /, ""));
+    assert.equal(result.durable_rows_per_second, null);
+    assert.ok(result.measurement_unavailable_reason);
+    assert.match(run.stderr, /@FEEDBACK /);
+  } finally { await rm(temporary, { recursive: true, force: true }); }
 });

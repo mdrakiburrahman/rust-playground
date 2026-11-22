@@ -7,6 +7,9 @@ import { pathToFileURL } from "node:url";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { readReconciledOatResult } from "./oat-result.js";
 import { artifactHash, hashTsx, type IdentityTools } from "./identity-reconcile.js";
+import { parityImageIds } from "./image-binding.js";
+import type { ObserverEvidence } from "./observer-supervisor.js";
+import { isDeepStrictEqual } from "node:util";
 import type { SnapshotManifest } from "./snapshot.js";
 
 type JsonObject = Record<string, unknown>;
@@ -106,7 +109,13 @@ export async function runOat(runtime: string, configPath: string, home: string, 
       cwd: runtime, env, stdio: ["ignore", log.fd, log.fd],
     });
     const timedOut = { value: false };
-    const timer = setTimeout(() => { timedOut.value = true; child.kill("SIGTERM"); }, 6 * 60 * 60 * 1000);
+    let forceTimer: NodeJS.Timeout | undefined;
+    const limitMs = deadlineSeconds === undefined ? 6 * 60 * 60 * 1000 : (deadlineSeconds + 595) * 1000;
+    const timer = setTimeout(() => {
+      timedOut.value = true;
+      child.kill("SIGTERM");
+      forceTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    }, limitMs);
     try {
       const code = await new Promise<number>((resolve, reject) => {
         child.once("error", reject);
@@ -116,7 +125,7 @@ export async function runOat(runtime: string, configPath: string, home: string, 
         });
       });
       if (code !== 0) throw new Error("OAT run did not succeed");
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); if (forceTimer) clearTimeout(forceTimer); }
   } finally { await log.close(); }
 }
 
@@ -152,7 +161,7 @@ export async function prepareReplayRuntime(repo: string, home: string, stackByte
   return { runtime, binaryHash: await sha256(expected) };
 }
 
-async function prepareIdentityTools(
+export async function prepareIdentityTools(
   home: string, runtime: string, manifest: SnapshotManifest, stackBytes: number,
 ): Promise<IdentityTools> {
   const env = cleanEnv(join(home, "trusted", "prepare-home"), stackBytes);
@@ -179,10 +188,18 @@ async function prepareIdentityTools(
   };
 }
 
-async function replayCompressionArm(
+export interface QualifiedArm {
+  collectorRevision: string;
+  expectedImages: Record<string, string>;
+  deadlineUnixMs: number;
+  decodeFile: (path: string, active: boolean) => Promise<number>;
+  launch: (runRoot: string, run: () => Promise<void>) => Promise<ObserverEvidence>;
+}
+
+export async function replayCompressionArm(
   data: string, label: string, raw: unknown, level: number, producerRevision: string,
   runtime: string, home: string, preparedBinaryHash: string, identityTools: IdentityTools,
-  bindHost: string, endpointHost: string, stackBytes: number,
+  bindHost: string, endpointHost: string, stackBytes: number, qualified?: QualifiedArm,
 ) {
   const runRoot = await mkdtemp(join(data, `${label}-`));
   const runHome = join(runRoot, "home");
@@ -193,17 +210,44 @@ async function replayCompressionArm(
     || config.tables[0] !== "sqlserver_availability_replica_states") throw new Error("unsupported replay topology or fixture");
   platform.compose_state_root = join(runRoot, "state");
   platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
+  if (qualified) {
+    const local = object(platform.local, "local");
+    const override = object(local.collector_image_override, "collector override");
+    if (!isDeepStrictEqual(local.expected_image_ids, qualified.expectedImages)
+      || override.source_revision !== qualified.collectorRevision
+      || override.image_id !== qualified.expectedImages.collector) {
+      throw new Error("qualified arm image binding differs from the declared role");
+    }
+    git(runtime, cleanEnv(runHome, stackBytes), "merge-base", "--is-ancestor", qualified.collectorRevision, producerRevision);
+    const observed = execFileSync("docker", [
+      "image", "inspect", "--format", '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}',
+      qualified.expectedImages.collector!,
+    ], { encoding: "utf8" }).trim();
+    if (observed !== `${qualified.expectedImages.collector} ${qualified.collectorRevision}`) {
+      throw new Error("collector image identity or revision does not match");
+    }
+  }
   config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
   config.website_url = pathToFileURL(join(runRoot, "site", "results.parquet")).href;
   const configPath = join(runRoot, "config.json");
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o400 });
   const configHash = await sha256(configPath);
-  await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"), stackBytes);
+  const launch = async () => {
+    const seconds = qualified ? Math.floor((qualified.deadlineUnixMs - Date.now()) / 1000) : undefined;
+    await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"),
+      stackBytes, qualified ? "qualified" : false, seconds);
+  };
+  const observer = qualified ? await qualified.launch(runRoot, launch) : null;
+  if (!qualified) await launch();
   if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
   const result = await readReconciledOatResult(
     join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producerRevision, level, "realistic",
-    undefined, { tools: identityTools, outputDir: runRoot },
+    qualified ? { config, decodeFile: qualified.decodeFile, collectorRevision: qualified.collectorRevision,
+      allowWriterOverrides: true } : undefined,
+    { tools: identityTools, outputDir: runRoot },
   );
+  if (qualified && !isDeepStrictEqual(parityImageIds(await readFile(join(runRoot, "run.log"), "utf8"), result.images),
+    qualified.expectedImages)) throw new Error("admitted image identities differ from the frozen role");
   const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
   if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");
   const env = cleanEnv(runHome, stackBytes);
@@ -211,7 +255,7 @@ async function replayCompressionArm(
     || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {
     throw new Error("trusted source changed during OAT run");
   }
-  return { ...result, binaryHash, configHash, runRoot };
+  return { ...result, binaryHash, configHash, runRoot, ...(observer ? { observer } : {}) };
 }
 
 export async function replayCompressionPair(

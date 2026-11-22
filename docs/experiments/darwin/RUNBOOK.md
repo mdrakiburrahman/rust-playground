@@ -5,6 +5,34 @@ individual local historical-parity arms. It
 does not yet qualify candidates, run Darwin, promote changes, or evaluate code
 lanes. A failed or unsupported lane never scores as a winner.
 
+The experimental `qualify` driver runs a guarded Realistic smoke, optionally
+followed by A/A and main-versus-candidate AB/BA/AB local series. Tier-0 and
+Tier-1 results are not yet bound, so even a passing Tier-2 series remains
+`valid: 0` and cannot promote a candidate. Live end-to-end validation is still
+required before relying on this path.
+
+| Qualification step | Command |
+| --- | --- |
+| Fresh trusted home | `npx --no-install tsx tools/darwin/src/main.ts setup --home "$PWD/.darwin/qualification"` |
+| Identity-bearing smoke | `.darwin/qualification/trusted/bin/harness qualify --roles <roles.json> --bind-host <docker-bridge-ip> --endpoint-host <docker-bridge-ip> --controller-stack-bytes 33554432` |
+| Smoke then full local series | Add `--series` to the command in a fresh trusted home. |
+
+`roles.json` must contain `baseline` and `candidate` objects with `imageId`
+(`sha256:` image ID) and full `revision`, `observerImageId`, and a
+`nonCollectorImages` object with immutable image IDs for `catalog`, `client`,
+`maintenance`, `router`, and `sqlserver`. Build and retain provenance for
+both collector images; labels alone do not prove source provenance. The two
+collector roles must differ, while all other roles remain fixed. The generated
+partition shortcut is not requested. This profile uses 14 client workers and
+a 16 GiB client budget, not the historical 1 GiB client profile.
+
+The driver writes an exclusive original 24-hour deadline and retains failed
+locks for manual owned-cell recovery; it does not resume interrupted series or
+automatically retry. Do not remove the lock or start another series until
+owned resources and the original deadline have been accounted for. Preserve
+the raw active snapshot, manifests, toolchain hashes and receipts before
+releasing the host. A smoke by itself is not a qualification result.
+
 | Step | Command |
 | --- | --- |
 | Snapshot committed source | `npx --no-install tsx tools/darwin/src/main.ts setup --home "$PWD/.darwin/compression" --producer <full-producer-sha>` |

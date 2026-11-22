@@ -5001,7 +5001,12 @@ async fn run_clients_inner(
     if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
         let readback = async {
             let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
-            parity_admission_readback(config, &logs, &ready_clients, darwin_precheck.as_deref() == Ok("qualified"))
+            parity_admission_readback(
+                config,
+                &logs,
+                &ready_clients,
+                darwin_precheck.as_deref() == Ok("qualified"),
+            )
         }
         .await;
         match readback {
@@ -5016,6 +5021,17 @@ async fn run_clients_inner(
                 };
             }
         }
+    }
+    if darwin_precheck.as_deref() == Ok("qualified")
+        && let Err(error) = wait_observer_barrier(config, project_run_id).await
+    {
+        let cleanup = cancel_clients(platform, config, &handles).await;
+        return match cleanup {
+            Ok(()) => Err(error).context("verify observer readiness before admission"),
+            Err(cleanup_error) => Err(error.context(format!(
+                "cancelling clients after observer readiness failure also failed: {cleanup_error:#}"
+            ))),
+        };
     }
 
     // Delta metadata is committed during preflight, so QAP binding must precede arming.
@@ -5391,6 +5407,9 @@ async fn run_clients_inner(
             failure: Some("above_ceiling or overload_guard protection unavailable at terminal observation".to_owned()),
             evidence,
         });
+    }
+    if darwin_precheck.as_deref() == Ok("qualified") {
+        wait_observer_completion(config, project_run_id, measurement_end_unix_ms).await?;
     }
     for table in tables {
         let reports = client_metrics

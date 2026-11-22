@@ -133,7 +133,7 @@ async function threads(pid: number): Promise<Thread[]> {
       if (processStartTime(await readFile(`/proc/${pid}/task/${tid}/stat`, "utf8")) !== startTicks) continue;
       result.push({ tid, affinity, startTicks });
     } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      if (!(error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ESRCH"))) throw error;
     }
   }
   return result;
@@ -204,8 +204,11 @@ export async function observe(options: Options): Promise<void> {
   let failure: unknown = null;
   const abort = new AbortController();
   const interrupt = (): void => { abort.abort(new Error("observer interrupted")); };
+  let finishRequested = false;
+  const finish = (): void => { finishRequested = true; };
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", interrupt);
+  process.once("SIGUSR1", finish);
   try {
     await identity();
     await writeFile(join(output, "ready.json"), `${JSON.stringify({ ready_unix_ms: Date.now(), effective_threads: await threads(options.pid) })}\n`, { flag: "wx" });
@@ -225,7 +228,7 @@ export async function observe(options: Options): Promise<void> {
         auxiliary("perf", "perf", ["record", "-F", "99", "-g", "-p", String(options.pid), "-o", join(output, "perf.data")], output),
       );
     }
-    while (Date.now() < end) {
+    while (Date.now() < end && !finishRequested) {
       if (abort.signal.aborted) throw abort.signal.reason;
       const sampleStart = Date.now();
       const effective = await identity();
@@ -293,6 +296,7 @@ export async function observe(options: Options): Promise<void> {
   } finally {
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);
+    process.removeListener("SIGUSR1", finish);
     for (const job of auxiliaryJobs) job.stop();
     const auxiliaryResults = Object.fromEntries(await Promise.all(auxiliaryJobs.map(async job => [job.name, await job.result])));
     const elapsedNs = observedStart !== null && observedEnd !== null ? (observedEnd - observedStart) * 1_000_000 : 0;
@@ -305,6 +309,7 @@ export async function observe(options: Options): Promise<void> {
     })).sort((a, b) => (b.observed_cpu_percent_of_full_capture ?? 0) - (a.observed_cpu_percent_of_full_capture ?? 0));
     await writeFile(join(output, "completion.json"), `${JSON.stringify({
       complete: failure === null,
+      finished_by_request: finishRequested,
       failure: failure instanceof Error ? failure.message : failure === null ? null : String(failure),
       end_unix_ms: Date.now(), auxiliary: auxiliaryResults, cgroup_after: await capturedCgroup(),
       thread_cpu: hotThreads, thread_cpu_scope: "observed cumulative deltas between surviving same-start-tick samples; CPU before first/after last sample and single-sample threads excluded",

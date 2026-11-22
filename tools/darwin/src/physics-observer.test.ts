@@ -70,6 +70,39 @@ test("read-only observer accepts thread churn and preserves run-created and obse
   }
 });
 
+test("cooperative completion retains successful bounded samples", { skip: process.platform !== "linux" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "physics-complete-"));
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  assert.ok(child.pid);
+  const ended = new Promise<void>(accept => child.once("exit", () => accept()));
+  try {
+    const sha256 = createHash("sha256").update(await readFile(`/proc/${child.pid}/exe`)).digest("hex");
+    const output = join(root, "capture");
+    const capture = observe({ pid: child.pid, executableSha256: sha256, cpuList: null, startUnixMs: 0,
+      durationSeconds: 30, output, metricsUrl: null, sampleMs: 100, profile: false });
+    let sampled = false;
+    for (let i = 0; i < 100; i++) {
+      try {
+        if ((await readFile(join(output, "samples.ndjson"), "utf8")).trim()) { sampled = true; break; }
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await new Promise<void>(accept => setTimeout(accept, 50));
+    }
+    assert.ok(sampled, "observer did not begin sampling");
+    process.kill(process.pid, "SIGUSR1");
+    await capture;
+    const completion = JSON.parse(await readFile(join(output, "completion.json"), "utf8"));
+    assert.equal(completion.complete, true);
+    assert.equal(completion.finished_by_request, true);
+    assert.ok(completion.observed_interval.end_unix_ms >= completion.observed_interval.start_unix_ms);
+  } finally {
+    child.kill("SIGTERM");
+    await ended;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("auxiliary failure cleanup stops and reaps only the owned process with a bounded wait", async () => {
   const root = await mkdtemp(join(tmpdir(), "physics-auxiliary-"));
   try {

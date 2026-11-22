@@ -8,6 +8,7 @@ import { parseParityProfile, parsePartitionFastPath } from "./parity-preflight.j
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
 import { prepareReplayRuntime, replayCompressionPair } from "./replay.js";
+import { replayQualification } from "./qualification.js";
 import { snapshot, type SnapshotManifest } from "./snapshot.js";
 
 function option(args: string[], name: string, fallback?: string): string {
@@ -105,6 +106,28 @@ async function main(args: string[]): Promise<void> {
     console.log(`@RESULT ${JSON.stringify({ version: 1,
       experiment: receipt.profile === "historical-parity-diagnostic" ? "historical-parity" : receipt.profile, valid: 0,
       combined_score: 0, accepted: false, reason: "single local parity arm", receipt })}`);
+    return;
+  }
+  if (command === "qualify") {
+    let qualification: Awaited<ReturnType<typeof replayQualification>>;
+    try {
+      qualification = await replayQualification(repo, home, path.resolve(option(args, "--roles")),
+        option(args, "--bind-host"), option(args, "--endpoint-host"),
+        Number(option(args, "--controller-stack-bytes")), args.includes("--series"));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unexpected qualification error";
+      console.error(`@FEEDBACK ${reason}`);
+      console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "layout-sort",
+        tier: args.includes("--series") ? "tier2-series" : "tier2-smoke", objective: "durable-rate",
+        valid: 0, combined_score: 0, accepted: false, reason, durable_rows_per_second: null,
+        measurement_unavailable_reason: reason })}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("@FEEDBACK Local Tier-2 evidence alone cannot qualify a winner.");
+    console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "layout-sort",
+      tier: args.includes("--series") ? "tier2-series" : "tier2-smoke", objective: "durable-rate",
+      valid: 0, combined_score: 0, accepted: false, reason: qualification.reason, qualification })}`);
     return;
   }
   if (command !== "preflight" && command !== "evaluate") throw new Error("unsupported operation");
