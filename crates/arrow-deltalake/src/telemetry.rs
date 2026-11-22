@@ -3,8 +3,110 @@
 use delta_kernel::metrics::{CommitFailureReason, MetricEvent, MetricsReporter};
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Validate and cache the process-wide opt-in interval at collector startup.
+pub fn stage_telemetry_interval() -> anyhow::Result<Option<Duration>> {
+    static CONFIG: OnceLock<Result<Option<Duration>, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| match std::env::var("ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS") {
+            Ok(value) => parse_stage_interval(&value)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(format!("invalid ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS: {error}")),
+        })
+        .as_ref()
+        .copied()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn parse_stage_interval(value: &str) -> anyhow::Result<Duration> {
+    let ms = value
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| (100..=60_000).contains(ms))
+        .ok_or_else(|| anyhow::anyhow!("ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS must be an integer in 100..=60000"))?;
+    Ok(Duration::from_millis(ms))
+}
+
+#[derive(Default)]
+pub(crate) struct CommitStageAttempt {
+    pub(crate) log_and_conflict: Option<Duration>,
+    pub(crate) local_sync: Option<Duration>,
+}
+
+pub(crate) fn claim_commit_sample(interval: Duration) -> bool {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    let now = ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    claim_sample(&NEXT_MS, now, interval.as_millis() as u64)
+}
+
+fn claim_sample(next: &AtomicU64, now: u64, interval_ms: u64) -> bool {
+    let mut previous = next.load(Ordering::Relaxed);
+    loop {
+        if previous == u64::MAX || now < previous {
+            return false;
+        }
+        match next.compare_exchange_weak(
+            previous,
+            now.saturating_add(interval_ms),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+pub(crate) fn sampled_commit_stages(
+    timing: &Mutex<CommitStageAttempt>,
+    failed_attempts: u32,
+    retry_time: Duration,
+    extra_sync: Duration,
+) -> serde_json::Value {
+    match timing.lock() {
+        Ok(timing) => commit_stage_values(Some(&timing), failed_attempts, retry_time, extra_sync, None),
+        Err(_) => commit_stage_values(
+            None,
+            failed_attempts,
+            retry_time,
+            extra_sync,
+            Some("commit_stage_lock_poisoned"),
+        ),
+    }
+}
+
+fn commit_stage_values(
+    timing: Option<&CommitStageAttempt>,
+    failed_attempts: u32,
+    retry_time: Duration,
+    extra_sync: Duration,
+    lock_error: Option<&'static str>,
+) -> serde_json::Value {
+    let stage = |value: Option<Duration>, reason: &'static str, scope: &'static str| {
+        serde_json::json!({
+            "seconds": value.map(|v| v.as_secs_f64()), "unavailable_reason": value.is_none().then_some(reason), "scope": scope,
+        })
+    };
+    let log = timing.and_then(|t| t.log_and_conflict);
+    let sync = timing.and_then(|t| t.local_sync).map(|v| v + extra_sync);
+    serde_json::json!({
+        "sampling_scope": "process_wide_interval_claimed_at_first_attempt_reported_on_definite_success",
+        "failed_attempts": failed_attempts,
+        "conflict_retry": stage(Some(retry_time), "", "failed_transaction_commit_invocations_and_backoff_only_excludes_reconciliation_and_snapshot_refresh"),
+        "log_write": stage(log, lock_error.unwrap_or("committer_timing_unavailable"), "successful_filesystem_committer_invocation_including_opaque_kernel_work_not_pure_log_write"),
+        "local_durability_sync": stage(sync, lock_error.unwrap_or("local_sync_not_observed_or_nonlocal_log"), "successful_attempt_local_file_and_directory_fsyncs_only_not_response_ack"),
+    })
+}
 
 /// Attach this reporter using Kernel's `WithMetricsReporterLayer` to the process's
 /// global tracing subscriber. Install the global OTel meter provider first.
@@ -231,13 +333,14 @@ pub(crate) fn data_commit(
     elapsed: Duration,
     table_id: &str,
     table_name: Option<&str>,
+    commit_stages: Option<serde_json::Value>,
 ) {
     let metrics = publications();
     metrics.committed_rows.add(rows, &[]);
     metrics.committed_files.add(files, &[]);
     metrics.committed_input_bytes.add(input_bytes, &[]);
     metrics.committed_bytes.add(parquet_bytes, &[]);
-    let event = serde_json::json!({
+    let mut event = serde_json::json!({
         "schema_version": 1,
         "outcome": "committed",
         "table_id": table_id,
@@ -252,6 +355,9 @@ pub(crate) fn data_commit(
         "finished_at_unix_ms": chrono::Utc::now().timestamp_millis(),
         "elapsed_seconds": elapsed.as_secs_f64()
     });
+    if let Some(stages) = commit_stages {
+        event["commit_stages"] = stages;
+    }
     eprintln!("arrowcol_data_commit {event}");
     tracing::info!(commit = %event, "arrowcol_data_commit");
 }
@@ -326,6 +432,84 @@ impl Drop for PublicationObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_interval_and_sampling_boundaries() {
+        for value in ["", "99", "60001", "-1", "1.5", "overflow999999999999999999999999"] {
+            assert!(parse_stage_interval(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_stage_interval("100").unwrap(), Duration::from_millis(100));
+        assert_eq!(parse_stage_interval("60000").unwrap(), Duration::from_secs(60));
+        let next = AtomicU64::new(0);
+        assert!(claim_sample(&next, 0, 100));
+        assert!(!claim_sample(&next, 99, 100));
+        assert!(claim_sample(&next, 100, 100));
+        assert!(claim_sample(&next, u64::MAX, 100));
+        assert!(!claim_sample(&next, u64::MAX, 100));
+    }
+
+    #[test]
+    fn concurrent_sampling_claim_is_bounded() {
+        let next = AtomicU64::new(0);
+        let winners = std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| scope.spawn(|| claim_sample(&next, 0, 100)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|won| *won)
+                .count()
+        });
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn measured_values_are_scoped_and_poison_is_explicit() {
+        let local = CommitStageAttempt {
+            log_and_conflict: Some(Duration::from_millis(8)),
+            local_sync: Some(Duration::from_millis(3)),
+        };
+        let values = commit_stage_values(
+            Some(&local),
+            2,
+            Duration::from_millis(7),
+            Duration::from_millis(2),
+            None,
+        );
+        assert_eq!(values["conflict_retry"]["seconds"], 0.007);
+        assert_eq!(values["log_write"]["seconds"], 0.008);
+        assert_eq!(values["local_durability_sync"]["seconds"], 0.005);
+        assert!(
+            values["log_write"]["scope"]
+                .as_str()
+                .unwrap()
+                .contains("not_pure_log_write")
+        );
+        let cloud = commit_stage_values(
+            Some(&CommitStageAttempt::default()),
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+        );
+        assert!(cloud["local_durability_sync"]["seconds"].is_null());
+        assert_eq!(
+            cloud["local_durability_sync"]["unavailable_reason"],
+            "local_sync_not_observed_or_nonlocal_log"
+        );
+        let poisoned = Mutex::new(local);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test");
+        });
+        let values = sampled_commit_stages(&poisoned, 2, Duration::from_millis(7), Duration::ZERO);
+        assert_eq!(values["conflict_retry"]["seconds"], 0.007);
+        for name in ["log_write", "local_durability_sync"] {
+            assert!(values[name]["seconds"].is_null());
+            assert_eq!(values[name]["unavailable_reason"], "commit_stage_lock_poisoned");
+        }
+    }
 
     #[test]
     fn ambiguous_commit_event_has_table_boundary_and_null_attribution() {

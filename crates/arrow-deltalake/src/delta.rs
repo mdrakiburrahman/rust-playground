@@ -2344,6 +2344,7 @@ pub(crate) struct DurableCommitter;
 
 struct GuardedCommitter {
     session: Option<Arc<PublisherSession>>,
+    timing: Option<Arc<Mutex<crate::telemetry::CommitStageAttempt>>>,
 }
 
 struct FreshSchemaCommitter {
@@ -2432,7 +2433,7 @@ impl Committer for GuardedCommitter {
                 .block_on(async move { session.check_async().await })
                 .map_err(|error| delta_kernel::Error::generic(format!("{error:#}")))?;
         }
-        DurableCommitter.commit(engine, Box::new(prepared.into_iter()), metadata)
+        DurableCommitter::commit_observed(engine, Box::new(prepared.into_iter()), metadata, self.timing.as_deref())
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -2444,14 +2445,20 @@ impl Committer for GuardedCommitter {
     }
 }
 
-impl Committer for DurableCommitter {
-    fn commit(
-        &self,
+impl DurableCommitter {
+    fn commit_observed(
         engine: &dyn Engine,
         actions: DeltaResultIterator<'_, FilteredEngineData>,
         metadata: CommitMetadata,
+        timing: Option<&Mutex<crate::telemetry::CommitStageAttempt>>,
     ) -> DeltaResult<CommitResponse> {
+        let started = timing.map(|_| Instant::now());
         let response = FileSystemCommitter::new().commit(engine, actions, metadata)?;
+        if let (Some(timing), Some(started)) = (timing, started)
+            && let Ok(mut timing) = timing.lock()
+        {
+            timing.log_and_conflict = Some(started.elapsed());
+        }
         if let CommitResponse::Committed { file_meta } = &response {
             if file_meta.location.scheme() != "file" {
                 return Ok(response);
@@ -2462,6 +2469,7 @@ impl Committer for DurableCommitter {
                 .map_err(|_| delta_kernel::Error::generic("non-local commit location"))?;
             let durable =
                 |result: Result<()>| result.map_err(|error| delta_kernel::Error::generic(format!("{error:#}")));
+            let sync_started = timing.map(|_| Instant::now());
             durable(sync_file(&path))?;
             let parent = path
                 .parent()
@@ -2470,8 +2478,24 @@ impl Committer for DurableCommitter {
             if let Some(root) = parent.parent() {
                 durable(sync_directory(root))?;
             }
+            if let (Some(timing), Some(started)) = (timing, sync_started)
+                && let Ok(mut timing) = timing.lock()
+            {
+                timing.local_sync = Some(started.elapsed());
+            }
         }
         Ok(response)
+    }
+}
+
+impl Committer for DurableCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        Self::commit_observed(engine, actions, metadata, None)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -2500,6 +2524,7 @@ impl DeltaTable {
     pub(crate) fn committer(&self) -> Box<dyn Committer> {
         Box::new(GuardedCommitter {
             session: self.session.clone(),
+            timing: None,
         })
     }
     /// Open a local or ADLS table without taking the collector's lifetime ownership lock.
@@ -3358,6 +3383,7 @@ impl DeltaTable {
             Box::new(FreshSchemaCommitter {
                 inner: GuardedCommitter {
                     session: self.session.clone(),
+                    timing: None,
                 },
                 fence,
                 root: self.root.clone(),
@@ -4224,12 +4250,16 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> TimedCommitResult {
+        let stage_interval = crate::telemetry::stage_telemetry_interval()?;
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let started = Instant::now();
+        let mut sample_decided = false;
+        let mut timing: Option<Arc<Mutex<crate::telemetry::CommitStageAttempt>>> = None;
+        let mut retry_time = Duration::ZERO;
         for attempt in 0..8 {
             observation.event("attempt");
             self.check_publication()?;
@@ -4374,8 +4404,23 @@ impl DeltaTable {
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
             let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
+            if !sample_decided {
+                sample_decided = true;
+                if stage_interval.is_some_and(crate::telemetry::claim_commit_sample) {
+                    timing = Some(Arc::new(Mutex::new(crate::telemetry::CommitStageAttempt::default())));
+                }
+            }
+            if let Some(timing) = &timing
+                && let Ok(mut timing) = timing.lock()
+            {
+                *timing = crate::telemetry::CommitStageAttempt::default();
+            }
+            let committer: Box<dyn Committer> = Box::new(GuardedCommitter {
+                session: self.session.clone(),
+                timing: timing.clone(),
+            });
             let mut transaction = snapshot
-                .transaction(self.committer(), &self.engine)?
+                .transaction(committer, &self.engine)?
                 .with_operation("INSERT".into())
                 .with_engine_info("arrow-deltalake")
                 .with_data_change(true);
@@ -4489,9 +4534,25 @@ impl DeltaTable {
                 .zip(&pending_indices)
                 .map(|(append, index)| (*index, append.observation()))
                 .collect();
-            match transaction.commit(&self.engine) {
+            let attempt_started = timing.as_ref().map(|_| Instant::now());
+            let commit_result = transaction.commit(&self.engine);
+            if !matches!(&commit_result, Ok(CommitResult::Committed(_)))
+                && let Some(started) = attempt_started
+            {
+                retry_time += started.elapsed();
+            }
+            match commit_result {
                 Ok(CommitResult::Committed(commit)) => {
+                    let sync_started = timing.as_ref().map(|_| Instant::now());
                     sync_directory(&self.root)?;
+                    let commit_stages = timing.as_deref().map(|timing| {
+                        crate::telemetry::sampled_commit_stages(
+                            timing,
+                            attempt,
+                            retry_time,
+                            sync_started.map_or(Duration::ZERO, |start| start.elapsed()),
+                        )
+                    });
                     crate::telemetry::data_commit(
                         commit.commit_version(),
                         rows,
@@ -4503,6 +4564,7 @@ impl DeltaTable {
                         started.elapsed(),
                         &table_id,
                         table_name.as_deref(),
+                        commit_stages,
                     );
                     observation.finish("committed");
                     return Ok((
@@ -4537,7 +4599,11 @@ impl DeltaTable {
             if started.elapsed() > Duration::from_secs(10) {
                 break;
             }
+            let backoff_started = timing.as_ref().map(|_| Instant::now());
             collision_backoff(attempt);
+            if let Some(started) = backoff_started {
+                retry_time += started.elapsed();
+            }
         }
         observation.finish("exhausted");
         bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")

@@ -13,6 +13,8 @@ struct CommitEvent {
     max_ingested_at_ms: Option<i64>,
     finished_at_unix_ms: Option<i64>,
     elapsed_seconds: Option<f64>,
+    #[serde(default)]
+    commit_stages: Option<Value>,
 }
 
 fn unavailable_commits(reason: &str) -> Value {
@@ -20,6 +22,7 @@ fn unavailable_commits(reason: &str) -> Value {
         "scope": "collector_commit_events",
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
+        "commit_stage_latency_seconds": null,
         "complete_delivery_established": false, "unique_delivered_rows": null,
         "run_cumulative_output": {
             "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
@@ -35,6 +38,75 @@ fn percentile(values: &[f64], percentile: usize) -> Option<f64> {
     }
     let index = (values.len() * percentile).div_ceil(100).saturating_sub(1);
     values.get(index).copied()
+}
+
+fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool) -> Result<Value> {
+    let mut result = serde_json::Map::new();
+    for (name, scope) in [
+        ("conflict_retry", "failed_transaction_commit_invocations_and_backoff_only_excludes_reconciliation_and_snapshot_refresh"),
+        ("log_write", "successful_filesystem_committer_invocation_including_opaque_kernel_work_not_pure_log_write"),
+        ("local_durability_sync", "successful_attempt_local_file_and_directory_fsyncs_only_not_response_ack"),
+    ] {
+        let mut values = Vec::new();
+        let mut sampled_events = 0_usize;
+        let mut unavailable = None::<String>;
+        if enabled {
+            for event in events {
+                let Some(stages) = &event.commit_stages else { continue };
+                sampled_events += 1;
+                let stage = stages
+                    .get(name)
+                    .and_then(Value::as_object)
+                    .context("sampled commit stage missing")?;
+                if stage.get("scope").and_then(Value::as_str) != Some(scope) {
+                    bail!("sampled commit stage scope mismatch");
+                }
+                match stage.get("seconds") {
+                    Some(Value::Number(value)) => {
+                        let value = value
+                            .as_f64()
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                            .context("invalid commit stage duration")?;
+                        if !stage.get("unavailable_reason").is_some_and(Value::is_null) {
+                            bail!("observed commit stage has an unavailable reason");
+                        }
+                        values.push(value);
+                    }
+                    Some(Value::Null) => {
+                        let reason = stage
+                            .get("unavailable_reason")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .context("unavailable commit stage omitted reason")?;
+                        if unavailable.as_deref().is_some_and(|previous| previous != reason) {
+                            unavailable = Some("mixed_unavailable_reasons".to_owned());
+                        } else if unavailable.is_none() {
+                            unavailable = Some(reason.to_owned());
+                        }
+                    }
+                    _ => bail!("sampled commit stage omitted duration"),
+                }
+            }
+        }
+        values.sort_by(f64::total_cmp);
+        let reason = if !enabled {
+            Some("stage_telemetry_disabled")
+        } else if sampled_events == 0 {
+            Some("no_commit_stage_samples")
+        } else {
+            unavailable.as_deref()
+        };
+        result.insert(
+            name.to_owned(),
+            json!({
+                "p50": if reason.is_none() { percentile(&values, 50) } else { None },
+                "p99": if reason.is_none() { percentile(&values, 99) } else { None },
+                "samples": values.len(), "sampled_events": sampled_events,
+                "scope": scope, "unavailable_reason": reason,
+            }),
+        );
+    }
+    Ok(Value::Object(result))
 }
 
 fn canonical_dmv_table_name(table: &str) -> Result<String> {
@@ -483,7 +555,9 @@ fn durable_commit_evidence_for_cell(
                 .filter_map(|event| event.elapsed_seconds)
                 .collect::<Vec<_>>();
             latencies.sort_by(f64::total_cmp);
+            let commit_stages = commit_stage_percentiles(&selected, config.stage_telemetry_interval_ms.is_some())?;
             result.insert(table.clone(), json!({
+                "commit_stage_latency_seconds": commit_stages,
                 "scope": "observed_new_delta_commits_with_ingress_wholly_in_shared_measurement_window",
                 "measurement_start_unix_ms": start, "measurement_end_unix_ms": end,
                 "rows": rows, "files": files, "input_bytes": input_bytes, "parquet_bytes": parquet_bytes,
@@ -888,6 +962,42 @@ mod commit_evidence_tests {
                     .collect::<String>()
             ),
         }
+    }
+
+    #[test]
+    fn sampled_commit_stages_require_complete_observations() -> Result<()> {
+        let config = config()?;
+        let make = |sync: Value| -> Result<CommitEvent> {
+            let mut value = event(&config, 100, 199)?;
+            value["commit_stages"] = json!({
+                "conflict_retry": {"seconds":0.0,"unavailable_reason":null,"scope":"failed_transaction_commit_invocations_and_backoff_only_excludes_reconciliation_and_snapshot_refresh"},
+                "log_write": {"seconds":0.01,"unavailable_reason":null,"scope":"successful_filesystem_committer_invocation_including_opaque_kernel_work_not_pure_log_write"},
+                "local_durability_sync": {"seconds":sync["seconds"],"unavailable_reason":sync["unavailable_reason"],"scope":"successful_attempt_local_file_and_directory_fsyncs_only_not_response_ack"},
+            });
+            Ok(serde_json::from_value(value)?)
+        };
+        let a = make(json!({"seconds":0.002,"unavailable_reason":null}))?;
+        let b = make(json!({"seconds":0.004,"unavailable_reason":null}))?;
+        let stage = commit_stage_percentiles(&[&a, &b], true)?;
+        assert_eq!(stage["local_durability_sync"]["p50"], 0.002);
+        assert_eq!(stage["local_durability_sync"]["p99"], 0.004);
+        assert_eq!(stage["local_durability_sync"]["samples"], 2);
+        assert_eq!(stage["log_write"]["p50"], 0.01);
+        assert_eq!(stage["conflict_retry"]["p50"], 0.0);
+        let cloud = make(json!({"seconds":null,"unavailable_reason":"cloud"}))?;
+        let mixed = commit_stage_percentiles(&[&a, &cloud], true)?;
+        assert!(mixed["local_durability_sync"]["p50"].is_null());
+        assert_eq!(mixed["local_durability_sync"]["samples"], 1);
+        assert_eq!(mixed["local_durability_sync"]["sampled_events"], 2);
+        assert_eq!(mixed["local_durability_sync"]["unavailable_reason"], "cloud");
+        assert_eq!(commit_stage_percentiles(&[], true)?["local_durability_sync"]["unavailable_reason"], "no_commit_stage_samples");
+        assert_eq!(commit_stage_percentiles(&[&a], false)?["local_durability_sync"]["unavailable_reason"], "stage_telemetry_disabled");
+        let malformed = make(json!({"seconds":null,"unavailable_reason":null}))?;
+        assert!(commit_stage_percentiles(&[&malformed], true).is_err());
+        let mut bad_scope = a.clone();
+        bad_scope.commit_stages.as_mut().unwrap()["log_write"]["scope"] = json!("pure_write");
+        assert!(commit_stage_percentiles(&[&bad_scope], true).is_err());
+        Ok(())
     }
 
     #[test]
