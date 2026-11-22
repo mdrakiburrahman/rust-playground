@@ -13,7 +13,7 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Instant;
 
-const ROWS: usize = 524_288;
+const ROWS: usize = 4_194_304;
 const BATCH_ROWS: usize = 8_192;
 const ROW_GROUP_ROWS: usize = 65_536;
 
@@ -122,14 +122,34 @@ async fn darwin_parquet_encode() -> Result<()> {
     let metadata = builder.metadata();
     let row_groups = metadata.num_row_groups();
     let row_group_rows: Vec<_> = metadata.row_groups().iter().map(|group| group.num_rows()).collect();
-    let codecs: Vec<Vec<String>> = metadata
+    let codecs: Vec<Vec<&str>> = metadata
         .row_groups()
         .iter()
         .map(|group| {
             group
                 .columns()
                 .iter()
-                .map(|column| format!("{:?}", column.compression()))
+                .map(|column| match column.compression() {
+                    Compression::UNCOMPRESSED => "UNCOMPRESSED",
+                    Compression::SNAPPY => "SNAPPY",
+                    Compression::GZIP(_) => "GZIP",
+                    Compression::LZO => "LZO",
+                    Compression::BROTLI(_) => "BROTLI",
+                    Compression::LZ4 => "LZ4",
+                    Compression::ZSTD(_) => "ZSTD",
+                    Compression::LZ4_RAW => "LZ4_RAW",
+                })
+                .collect()
+        })
+        .collect();
+    let dictionary_pages: Vec<Vec<bool>> = metadata
+        .row_groups()
+        .iter()
+        .map(|group| {
+            group
+                .columns()
+                .iter()
+                .map(|column| column.dictionary_page_offset().is_some())
                 .collect()
         })
         .collect();
@@ -156,6 +176,7 @@ async fn darwin_parquet_encode() -> Result<()> {
             "base_max_row_group_rows": ROW_GROUP_ROWS,
             "requested_process_config": requested_config,
             "footer_codecs_by_row_group": codecs,
+            "footer_dictionary_pages_by_row_group": dictionary_pages,
             "arrow_deltalake_input_bytes": completed.input_bytes,
             "parquet_bytes": completed.bytes,
             "parquet_bytes_per_row": completed.bytes as f64 / completed.rows as f64,
