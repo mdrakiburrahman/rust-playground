@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { comparableRunConfig, compareLayoutReadbacks, compareOatImages, inspectLayoutContainers } from "./layout-code-trial.js";
+import { LayoutCodeTrial, assertCollectorShutdown, assertSettledDelivery, comparableRunConfig, compareLayoutReadbacks, compareOatImages, inspectLayoutContainers, scopedProject } from "./layout-code-trial.js";
 
 const baseline = `sha256:${"a".repeat(64)}`;
 const candidate = `sha256:${"b".repeat(64)}`;
@@ -10,7 +14,7 @@ const catalog = `sha256:${"d".repeat(64)}`;
 const client = `sha256:${"e".repeat(64)}`;
 const project = "oat-a";
 function container(service: string, image: string, configuredImage = image) {
-  return { Config: { Image: configuredImage, Labels: { "com.docker.compose.project": project, "com.docker.compose.service": service } },
+  return { Id: (service === "dataflow-1" ? "1" : service === "router" ? "2" : "3").repeat(64), Config: { Image: configuredImage, Labels: { "com.docker.compose.project": project, "com.docker.compose.service": service } },
     Image: image, State: { Running: true }, RestartCount: 0, HostConfig: { Memory: 4096 } };
 }
 function containers(image: string) {
@@ -83,4 +87,38 @@ test("permits only run-owned paths to differ in otherwise identical local settin
   assert.throws(() => comparableRunConfig(unsafe, "/tmp/b"));
   const altered = config("/tmp/b"); altered.measure_seconds = 151;
   assert.notDeepEqual(comparableRunConfig(config("/tmp/a"), "/tmp/a"), comparableRunConfig(altered, "/tmp/b"));
+});
+
+test("refuses a source revision other than the pinned baseline before creating snapshots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "layout-source-"));
+  try {
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(join(repo, "file"), "not the baseline");
+    execFileSync("git", ["-C", repo, "add", "file"]);
+    execFileSync("git", ["-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "not baseline"]);
+    await assert.rejects(LayoutCodeTrial.prepare(repo, join(root, "home")), /exact pinned baseline/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("requires observed drain of the captured collector and binds the cell project", () => {
+  const containerId = "1".repeat(64);
+  const shutdown = { shutdown_drain: { schema_version: 1, collectors: [{ container_id: containerId, drain: { status: "observed", sigterm_sent: true, exit_code: 0, log_complete: true } }] } };
+  assertCollectorShutdown(shutdown, containerId);
+  assert.throws(() => assertCollectorShutdown(shutdown, "2".repeat(64)));
+  const bad = structuredClone(shutdown); bad.shutdown_drain.collectors[0].drain.status = "unavailable";
+  assert.throws(() => assertCollectorShutdown(bad, containerId));
+  assert.equal(scopedProject("arrowcol-oat-tuned", "01234567-89ab-cdef-0123-456789abcdef"), "arrowcol-oat-tu-0123456789abcdef0123456789abcdef");
+});
+
+test("refuses unsettled and inconsistent client acknowledgment evidence", () => {
+  const data = { reconciliation: { status: "within_bound", settled: true, scope: "process_cumulative_client_rows_vs_this_cells_new_ingestion_commits_including_warmup", completed_rows: 10, ambiguous_rows: 2, delta_rows: 11 },
+    durable_commits: { run_cumulative_output: { rows: 11, settled: true } }, client_phase_reports: [{ phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 2 } } }] };
+  assertSettledDelivery(data);
+  for (const change of [
+    (v: typeof data) => { v.durable_commits.run_cumulative_output.settled = false; },
+    (v: typeof data) => { v.reconciliation.status = "unsettled"; },
+    (v: typeof data) => { v.durable_commits.run_cumulative_output.rows = 13; v.reconciliation.delta_rows = 13; },
+    (v: typeof data) => { v.client_phase_reports[0].phase_counters.process_cumulative.completed_rows = 9; },
+  ]) { const bad = structuredClone(data); change(bad); assert.throws(() => assertSettledDelivery(bad)); }
 });
