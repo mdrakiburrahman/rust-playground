@@ -82,6 +82,7 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
   assertParityCollectorReadback(seed, collectors[0]!.effective_config);
   assertParityTableLayout(seed, collectors[0]!.layout_table_policies);
   const tunables = object(config.tunables, "tunables");
+  if (tunables.parquet_writer == null) throw new Error("historical writer evidence is not bound");
   const writer = object(collectors[0]!.writer_policy_overrides, "writer policy");
   const expectedWriter = object(tunables.parquet_writer, "parquet writer");
   const expectedDefaults = object(expectedWriter.defaults, "parquet defaults");

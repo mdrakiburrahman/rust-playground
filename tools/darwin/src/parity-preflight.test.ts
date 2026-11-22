@@ -71,6 +71,8 @@ test("collector parity readback rejects drift in historical limits and local pre
       last_caps: [{ metric: "container_memory_bytes", confirmed: true, cap: 92341796864 }] },
   };
   assert.doesNotThrow(() => assertParityEvidence(seed, evidence));
+  assert.throws(() => assertParityEvidence({ ...seed, tunables: { ...seed.tunables, parquet_writer: null } }, evidence),
+    /historical writer evidence is not bound/);
   assert.throws(() => assertParityEvidence(seed, {
     ...evidence, overload_guard: { ...evidence.overload_guard, last_caps: [] },
   }), /memory cap is unconfirmed/);
