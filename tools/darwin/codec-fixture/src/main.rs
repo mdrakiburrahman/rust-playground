@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     println!(
         "DARWIN_CODEC_RESULT={}",
         json!({
-            "corpus":"dmv-batch-diagnostic-65536-replayed-16",
+            "corpus":"dmv-batch-synthetic-65536-replayed-16",
             "customer":"22-byte-public-literal",
             "corpus_sha256_arrow_ipc":corpus_hash,
             "rows":decoded_rows,"distinct_rows":ROWS,"replays":REPEATS,
