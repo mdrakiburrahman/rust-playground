@@ -56,6 +56,14 @@ Label measurements **local one-box scale**, not AKS-equivalent; record host
 memory and vCPUs, chosen cap and sampled collector peak RSS, using null when
 unmeasured.
 
+| Deliberate local deviation | Historical AKS |
+| --- | --- |
+| Collector and clients share 32 host vCPUs; collector uses 32 workers. | Collector requests and limits 48 CPUs. |
+| Collector cap 86 GiB; pressure RSS limit equals the local cap. | Collector limit 384 GiB; pressure RSS limit 320 GiB. |
+| Local storage and one-box scheduling. | Separate AKS resources and remote storage. |
+| 60-second warmup and 150-second measurement. | 60-second warmup and 600-second headline window. |
+| Runtime worker, blocking, upload and task limits are explicitly pinned by the local profile. | Historical manifest uses runtime defaults. |
+
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
 

@@ -30,7 +30,7 @@ export function assertParityCollectorReadback(seed: unknown, actual: unknown): v
   const config = object(seed, "parity seed");
   const expected = object(object(config.tunables, "tunables").collector, "collector");
   const effective = object(actual, "collector readback");
-  for (const section of ["batching", "commit", "pressure"] as const) {
+  for (const section of ["batching", "commit", "pressure", "limits"] as const) {
     const requested = object(expected[section], `collector.${section}`);
     const observed = object(effective[section], `readback.${section}`);
     for (const [key, value] of Object.entries(requested)) {
@@ -38,9 +38,14 @@ export function assertParityCollectorReadback(seed: unknown, actual: unknown): v
     }
   }
   const runtime = object(expected.runtime, "collector.runtime");
-  if (object(effective.runtime, "readback.runtime").cpu_workers !== runtime.cpu_workers) {
-    throw new Error("collector readback differs at runtime.cpu_workers");
+  const actualRuntime = object(effective.runtime, "readback.runtime");
+  for (const [key, value] of Object.entries(runtime)) {
+    const observedKey = key === "workers" ? "runtime_workers" : key;
+    if (!isDeepStrictEqual(actualRuntime[observedKey], value)) {
+      throw new Error(`collector readback differs at runtime.${key}`);
+    }
   }
+  if (effective.cpu_pressure !== expected.cpu_pressure) throw new Error("collector readback differs at cpu_pressure");
   const layout = object(expected.layout, "collector.layout");
   const process = object(object(effective.layout, "readback.layout").process_policy, "readback.layout.process_policy");
   for (const [key, value] of Object.entries(layout)) {
@@ -60,6 +65,51 @@ export function assertParityTableLayout(seed: unknown, policies: unknown): void 
   const actual = object(matches[0]!.config, "table layout config");
   for (const [key, value] of Object.entries(expected)) {
     if (!isDeepStrictEqual(actual[key], value)) throw new Error(`table layout differs at ${key}`);
+  }
+}
+
+export function assertParityEvidence(seed: unknown, input: unknown): void {
+  const config = object(seed, "parity seed");
+  const local = object(object(config.platform, "platform").local, "local");
+  const evidence = object(input, "parity evidence");
+  if (!Array.isArray(evidence.processes)) throw new Error("collector process evidence is unavailable");
+  const collectors = evidence.processes.map((value) => object(value, "process"))
+    .filter((process) => process.component === "collector");
+  if (collectors.length !== 1 || collectors[0]!.log_complete !== true
+    || collectors[0]!.effective_config_source !== "consumer_startup_readback") {
+    throw new Error("complete collector readback is unavailable");
+  }
+  assertParityCollectorReadback(seed, collectors[0]!.effective_config);
+  assertParityTableLayout(seed, collectors[0]!.layout_table_policies);
+  const tunables = object(config.tunables, "tunables");
+  const writer = object(collectors[0]!.writer_policy_overrides, "writer policy");
+  const expectedWriter = object(tunables.parquet_writer, "parquet writer");
+  const expectedDefaults = object(expectedWriter.defaults, "parquet defaults");
+  const actualDefaults = object(writer.defaults, "writer defaults");
+  for (const [key, value] of Object.entries(expectedDefaults)) {
+    if (!isDeepStrictEqual(actualDefaults[key], value)) throw new Error(`writer readback differs at ${key}`);
+  }
+  if (writer.max_row_group_rows != null) throw new Error("writer row-group override masks the historical layout");
+  if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
+    throw new Error("client readback is unavailable");
+  }
+  const client = object(object(evidence.client_phase_reports[0], "client").consumer_effective_config, "client readback");
+  for (const [key, value] of Object.entries(object(tunables.client, "client tunables"))) {
+    if (!isDeepStrictEqual(client[key], value)) throw new Error(`client readback differs at ${key}`);
+  }
+  const transport = object(tunables.transport, "transport");
+  for (const key of ["ipc_compression", "grpc_send_compression", "max_flight_data_bytes", "max_message_bytes"]) {
+    if (!isDeepStrictEqual(client[key], transport[key])) throw new Error(`client transport readback differs at ${key}`);
+  }
+  const guard = object(evidence.overload_guard, "overload guard");
+  const settings = object(guard.settings, "overload settings");
+  if (guard.status !== "complete" || guard.requested_container_memory_limit_bytes !== local.collector_memory_limit_bytes
+    || settings.enabled !== true || settings.cap_fraction !== 0.9 || settings.zero_progress_windows !== 2
+    || !Array.isArray(guard.last_caps)) throw new Error("overload guard evidence is unavailable or inconsistent");
+  const caps = guard.last_caps.map((value) => object(value, "guard cap"))
+    .filter((cap) => cap.metric === "container_memory_bytes");
+  if (caps.length !== 1 || caps[0]!.confirmed !== true || caps[0]!.cap !== local.collector_memory_limit_bytes) {
+    throw new Error("collector container memory cap is unconfirmed");
   }
 }
 

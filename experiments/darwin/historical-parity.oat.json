@@ -99,6 +99,9 @@
         "max_files_per_commit": 128,
         "max_pending_files": 512
       },
+      "limits": {
+        "max_message_bytes": 134217728
+      },
       "pressure": {
         "max_concurrent_streams": 256,
         "rss_limit_bytes": 92341796864,
