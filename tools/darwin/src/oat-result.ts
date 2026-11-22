@@ -98,9 +98,15 @@ export async function readReconciledOatResult(
   const measurement = adaptOatEvidence(evidence);
   const canonicalTable = `telemetry.sqlserver.${table}`;
   const receipts = extractTimedReceipts(evidence, canonicalTable, measurement);
+  const preload = object(evidence.preload_delta, "pre-load Delta evidence");
+  const schedule = object(object(evidence.client_schedule, "client schedule").effective, "effective client schedule");
+  if (!Number.isSafeInteger(schedule.run_start_unix_ms) || typeof preload.observed_at_unix_ms !== "number"
+    || preload.observed_at_unix_ms >= Number(schedule.run_start_unix_ms)) {
+    throw new Error("pre-load Delta evidence was not captured before client admission");
+  }
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
   const proof = await reconcileStoppedSnapshot(
-    join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all, Compression.ZSTD,
+    join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all, Compression.ZSTD, preload,
   );
   return { measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion, cellRunId: row.run_id, snapshotReconciled: true };
 }

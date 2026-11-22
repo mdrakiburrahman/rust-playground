@@ -13,9 +13,10 @@ The root uses no shared defaults or include merging. Offline lint rejects unknow
 
 Short screening is not promotion. Future qualification requires at least three matched pairs, at least 150 seconds per local OAT measurement arm, 60 seconds of frozen warmup, independently reconciled evidence and protected holdouts. The outer runner must preserve each lane's original absolute 24-hour deadline across restarts, reserve cleanup and reconciliation time, and refuse a repeat that cannot fit. Per-agent and evaluator timeouts do not enforce that deadline.
 
-Realistic seed v8 uses `sqlserver_availability_replica_states`: the previous
-table lacks the required `endpoint_url` identity field and v1–v7 produced no
-measurements. Per-row `endpoint_url` identities are artificially high entropy;
+Realistic seed v9 retains v8's `sqlserver_availability_replica_states` and
+changes only the setup/partition coordinate to the catalog's canonical hourly
+ingestion partition. Versions v1–v8 produced no measurements. Per-row
+`endpoint_url` identities are artificially high entropy;
 reconfirm codec, dictionary and compression winners on the Diagnostic
 historical-client-parity profile before promotion. Report client CPU separately
 from collector CPU on one-box runs.

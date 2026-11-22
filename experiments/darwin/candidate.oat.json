@@ -6,7 +6,8 @@
     "compose_project": "arrowcol-oat-tuned",
     "compose_state_root": "out/arrowcol-oat/tuned",
     "local": {
-      "collector_memory_limit_bytes": 4294967296
+      "collector_memory_limit_bytes": 4294967296,
+      "partitioned_table_bootstrap": true
     }
   },
   "warmup_seconds": 60,
@@ -97,6 +98,7 @@
         "checkpoint"
       ],
       "apply": false,
+      "granularity": "hour",
       "interval_secs": 60,
       "target_file_mib": 128
     }

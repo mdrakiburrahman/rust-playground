@@ -62,7 +62,8 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
         let mut environment = role_environment(config, role)?;
         if matches!(role, ComponentRole::Collector) {
             if config.platform.kind == crate::config::OatMode::Local
-                && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+                && (config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+                    || config.platform.local.partitioned_table_bootstrap)
                 && let Some(granularity) = config.tunables.maintenance.as_ref().and_then(|settings| settings.granularity)
             {
                 let value = serde_json::to_value(granularity)?;

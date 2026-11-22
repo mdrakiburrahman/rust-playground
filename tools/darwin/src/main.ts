@@ -118,6 +118,7 @@ async function main(args: string[]): Promise<void> {
     try {
       result = await replayCompressionPair(
         repo, home, changed, option(args, "--bind-host"), option(args, "--endpoint-host"), Number(option(args, "--controller-stack-bytes")),
+        args.includes("--baseline-only"),
       );
     } catch (error) {
       if (!(error instanceof CoverageUnavailableError)) throw error;
@@ -128,6 +129,14 @@ async function main(args: string[]): Promise<void> {
         unattributed_rows: null, unattributed_reason: error.message,
       })}`);
       process.exitCode = 1;
+      return;
+    }
+    if (args.includes("--baseline-only")) {
+      console.log("@FEEDBACK One independently reconciled baseline is diagnostic, not a qualified winner.");
+      console.log(`@RESULT ${JSON.stringify({
+        version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
+        combined_score: 0, accepted: false, reason: "one baseline is not qualified", single_run: result,
+      })}`);
       return;
     }
     console.log("@FEEDBACK One independently reconciled pair is diagnostic, not a qualified winner.");

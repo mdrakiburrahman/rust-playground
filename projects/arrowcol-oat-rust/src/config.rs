@@ -450,6 +450,8 @@ pub struct LocalOptions {
     pub bind_host: Option<std::net::IpAddr>,
     pub endpoint_host: Option<String>,
     pub snapshot_root: Option<String>,
+    #[serde(default)]
+    pub partitioned_table_bootstrap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -1032,6 +1034,16 @@ impl OatConfig {
         }
         match self.platform.kind {
             OatMode::Local => {
+                if self.platform.local.partitioned_table_bootstrap
+                    && (self.campaign_profile.is_some()
+                        || self.tables.as_slice() != ["sqlserver_availability_replica_states"]
+                        || !self.tunables.maintenance.as_ref().is_some_and(|settings| {
+                            settings.enabled == Some(true)
+                                && settings.granularity == Some(arrowcol_tunables::MaintenanceGranularity::Hour)
+                        }))
+                {
+                    bail!("partitioned_table_bootstrap requires the single canonical table and enabled hourly maintenance");
+                }
                 if let Some(host) = self.platform.local.bind_host
                     && (host.is_multicast() || (host.is_unspecified() && self.platform.local.endpoint_host.is_none()))
                 {
@@ -1110,6 +1122,7 @@ impl OatConfig {
                     || self.platform.local.bind_host.is_some()
                     || self.platform.local.endpoint_host.is_some()
                     || self.platform.local.snapshot_root.is_some()
+                    || self.platform.local.partitioned_table_bootstrap
                     || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");

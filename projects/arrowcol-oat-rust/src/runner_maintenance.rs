@@ -199,7 +199,9 @@ async fn verify_local_partition_policy_before_admission(
     platform: &LocalPlatform,
     tables: &[String],
 ) -> Result<()> {
-    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable)
+        && !config.platform.local.partitioned_table_bootstrap
+    {
         return Ok(());
     }
     let [table] = tables else {

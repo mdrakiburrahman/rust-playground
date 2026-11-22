@@ -10,6 +10,7 @@ lanes. A failed or unsupported lane never scores as a winner.
 | Preflight | `.darwin/compression/trusted/bin/harness preflight --experiment compression-config` |
 | Prepare and identify release controller | `.darwin/compression/trusted/bin/harness prepare --controller-stack-bytes 33554432` |
 | Diagnostic pair | `.darwin/compression/trusted/bin/harness evaluate --experiment compression-config --smoke --bind-host <docker-bridge-ip> --endpoint-host <docker-bridge-ip> --controller-stack-bytes 33554432` |
+| Diagnostic baseline only | Add `--baseline-only` to the diagnostic command with the frozen seed unchanged. |
 | Path-only stub | `.darwin/compression/trusted/bin/harness evaluate --experiment compression-config --stub` |
 
 Use an initialized repository, prepared Node and Cargo dependencies, and a
@@ -42,9 +43,11 @@ delivery and row identities remain unique per run. Its manifest hashes the
 generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
 must report the same hash. Client process CPU is reported separately from
 collector samples, with its own sampling interval or an unavailable reason.
-Every post-bootstrap Delta version in the stopped snapshot must have a
-cumulative collector receipt; gaps produce a null unattributed-row count, an
-explicit reason and a nonzero evaluator exit.
+The hourly ingestion-partitioned table is checked against catalog metadata
+before the clients are armed. Each pre-load Delta log is hashed and must have
+no Adds or Removes; all later versions need cumulative collector receipts.
+Gaps produce a null unattributed-row count, an explicit reason and a nonzero
+evaluator exit.
 
 On failure, retain the exact run log and use the documented
 `--cleanup-local <cell-uuid>` recovery for that owned cell. Do not retry until

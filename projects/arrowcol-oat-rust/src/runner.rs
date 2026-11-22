@@ -1020,6 +1020,9 @@ trait Platform: Send + Sync {
     fn delta_root(&self) -> Option<&str> {
         None
     }
+    fn preload_delta_evidence(&self, _config: &OatConfig, _tables: &[String]) -> Result<Option<Value>> {
+        Ok(None)
+    }
     fn router_metrics_endpoint(&self, config: &OatConfig) -> Result<String>;
     async fn ensure_router_metrics_endpoint(&mut self, config: &OatConfig) -> Result<(String, bool)> {
         Ok((self.router_metrics_endpoint(config)?, false))
@@ -1806,6 +1809,18 @@ impl Platform for AksPlatform {
 
 #[async_trait::async_trait]
 impl Platform for LocalPlatform {
+    fn preload_delta_evidence(&self, config: &OatConfig, tables: &[String]) -> Result<Option<Value>> {
+        if !config.platform.local.partitioned_table_bootstrap {
+            return Ok(None);
+        }
+        let [table] = tables else {
+            bail!("partitioned bootstrap requires exactly one table");
+        };
+        let canonical = canonical_dmv_table_name(table)?;
+        let root = self.state_dir.join("dataflow/telemetry/sqlserver").join(table).join("_delta_log");
+        Ok(Some(verify_preload_delta(&root, &canonical)?))
+    }
+
     fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
         self.maintenance_cell_baseline = logs
             .iter()
@@ -5001,6 +5016,18 @@ async fn run_clients_inner(
     platform
         .finalize_campaign_load_admission(config, project_run_id, tables)
         .await?;
+    evidence.preload_delta = match platform.preload_delta_evidence(config, tables) {
+        Ok(proof) => proof,
+        Err(error) => {
+            let cleanup = cancel_clients(platform, config, &handles).await;
+            return match cleanup {
+                Ok(()) => Err(error).context("verify pre-load Delta layout"),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "cancelling prepared OAT clients after Delta verification failure also failed: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
     let schedule_created_at_unix_ms = unix_time_ms_u64()?;
     let run_start_unix_ms = schedule_created_at_unix_ms
@@ -7605,6 +7632,80 @@ fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result
     local_initializer_args(table, dataflow_root, true)
 }
 
+fn verify_preload_delta(log_dir: &Path, canonical_table: &str) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+
+    let mut paths = fs::read_dir(log_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "json"));
+    paths.sort();
+    ensure!(!paths.is_empty() && paths.len() <= 64, "invalid pre-load Delta version count");
+    let mut files = Vec::new();
+    let mut metadata = None;
+    for (version, path) in paths.iter().enumerate() {
+        ensure!(
+            path.file_name().and_then(|name| name.to_str()) == Some(format!("{version:020}.json").as_str()),
+            "pre-load Delta versions are not contiguous"
+        );
+        let bytes = fs::read(path)?;
+        ensure!(bytes.len() <= 64 * 1024 * 1024, "pre-load Delta log exceeds the size limit");
+        for line in std::str::from_utf8(&bytes)?.lines().filter(|line| !line.is_empty()) {
+            let action: Value = serde_json::from_str(line)?;
+            ensure!(action.is_object() && action.get("add").is_none() && action.get("remove").is_none(),
+                "pre-load Delta prefix contains data actions");
+            if let Some(value) = action.get("metaData") {
+                metadata = Some(value.clone());
+            }
+        }
+        files.push(json!({"version": version, "sha256": format!("{:x}", Sha256::digest(&bytes))}));
+    }
+    let metadata = metadata.context("pre-load Delta metadata is missing")?;
+    let schema: Value = serde_json::from_str(
+        metadata["schemaString"].as_str().context("pre-load Delta schema is missing")?,
+    )?;
+    ensure!(
+        schema == arrowcol_loadgen::initialize::canonical_table_delta_schema(canonical_table)?
+            && metadata["partitionColumns"] == json!(["__arrowcol_ingestion"])
+            && metadata.pointer("/configuration/catalog.schemaHistory").and_then(Value::as_str).is_some(),
+        "catalog-registered pre-load Delta layout differs from the canonical ingestion-partitioned table"
+    );
+    Ok(json!({
+        "table": canonical_table,
+        "latest_version": paths.len() - 1,
+        "observed_at_unix_ms": unix_time_ms_u64()?,
+        "partition_columns": ["__arrowcol_ingestion"],
+        "granularity": "hour",
+        "logs": files,
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn preload_delta_rejects_data_actions_and_wrong_layout() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
+    let schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
+    let metadata = json!({
+        "metaData": {
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": ["__arrowcol_ingestion"],
+            "configuration": {"catalog.schemaHistory": "[]"}
+        }
+    });
+    fs::write(temp.path().join("00000000000000000000.json"), format!("{metadata}\n"))?;
+    fs::write(temp.path().join("00000000000000000001.json"), format!("{metadata}\n"))?;
+    let proof = verify_preload_delta(temp.path(), table)?;
+    assert_eq!(proof["latest_version"], 1);
+    fs::write(temp.path().join("00000000000000000001.json"), "{\"add\":{}}\n")?;
+    assert!(verify_preload_delta(temp.path(), table).is_err());
+    let mut wrong = metadata;
+    wrong["metaData"]["partitionColumns"] = json!([]);
+    fs::write(temp.path().join("00000000000000000001.json"), format!("{wrong}\n"))?;
+    assert!(verify_preload_delta(temp.path(), table).is_err());
+    Ok(())
+}
+
 fn local_initializer_args(table: &str, dataflow_root: &Path, partitioned: bool) -> Result<Vec<String>> {
     if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
         bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
@@ -7632,7 +7733,8 @@ fn local_initializer_args(table: &str, dataflow_root: &Path, partitioned: bool) 
 }
 
 async fn initialize_local_maintenance_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
-    let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable);
+    let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        || config.platform.local.partitioned_table_bootstrap;
     if !partitioned && (config.campaign_profile.is_some() || !maintenance_enabled(config) || config.tables.len() != 1) {
         return Ok(());
     }

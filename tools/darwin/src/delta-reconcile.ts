@@ -72,6 +72,7 @@ function entries(raw: unknown): InventoryEntry[] {
 export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
   measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
+  rawPreload: unknown,
 ): Promise<{ rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number }> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
@@ -96,6 +97,16 @@ export async function reconcileStoppedSnapshot(
   const manifest = await json(manifestPath);
   if (manifest.schema_version !== 1 || manifest.run_id !== runId || manifest.table !== table) throw new Error("snapshot manifest identity mismatch");
   const latestVersion = uint(manifest.latestVersion, "snapshot version");
+  const preload = object(rawPreload, "pre-load Delta evidence");
+  if (preload.table !== canonicalTableName
+    || typeof preload.latest_version !== "number" || !Number.isSafeInteger(preload.latest_version) || preload.latest_version < 0 || preload.latest_version > latestVersion
+    || typeof preload.observed_at_unix_ms !== "number" || !Number.isSafeInteger(preload.observed_at_unix_ms) || preload.observed_at_unix_ms <= 0
+    || preload.observed_at_unix_ms >= measurement.startUnixMs
+    || JSON.stringify(preload.partition_columns) !== JSON.stringify(["__arrowcol_ingestion"])
+    || preload.granularity !== "hour" || !Array.isArray(preload.logs)
+    || preload.logs.length !== preload.latest_version + 1) {
+    throw new CoverageUnavailableError("pre-load Delta setup boundary is unavailable or invalid");
+  }
   const expectedActiveRows = uint(manifest.rowCount, "snapshot rows");
   const tableRoot = join(root, table, "table");
   const listed = entries(manifest.files);
@@ -111,6 +122,14 @@ export async function reconcileStoppedSnapshot(
   for (const entry of listed) {
     const actual = await digest(join(tableRoot, entry.path));
     if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw new Error("snapshot file digest mismatch");
+  }
+  for (const [version, rawEntry] of preload.logs.entries()) {
+    const entry = object(rawEntry, "pre-load Delta log");
+    const snapshotEntry = listed.find(file => file.path === `_delta_log/${String(version).padStart(20, "0")}.json`);
+    if (entry.version !== version || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256)
+      || snapshotEntry?.sha256 !== entry.sha256) {
+      throw new CoverageUnavailableError("pre-load Delta setup prefix changed in the stopped snapshot");
+    }
   }
   const active = new Map<string, Add>();
   const referenced = new Map<string, Add>();
@@ -142,7 +161,10 @@ export async function reconcileStoppedSnapshot(
   const selectedAdds = new Map<number, Add[]>();
   let latestSchema: string | undefined;
   for (let version = 0; version <= latestVersion; version++) {
-    if (version > 0 && !all.has(version)) {
+    if (version <= preload.latest_version && all.has(version)) {
+      throw new CoverageUnavailableError(`pre-load Delta version ${version} has an ingestion receipt`);
+    }
+    if (version > preload.latest_version && !all.has(version)) {
       throw new CoverageUnavailableError(`Delta version ${version} has no cumulative collector receipt`);
     }
     const path = join(tableRoot, "_delta_log", `${String(version).padStart(20, "0")}.json`);
@@ -158,6 +180,7 @@ export async function reconcileStoppedSnapshot(
         latestSchema = metadata.schemaString;
       }
       if (action.add != null) {
+        if (version <= preload.latest_version) throw new CoverageUnavailableError("pre-load Delta prefix contains an Add");
         const value = object(action.add, "Delta Add");
         if (value.deletionVector != null || (value.dataChange !== undefined && typeof value.dataChange !== "boolean")) {
           throw new Error("unsupported Delta Add");
@@ -176,12 +199,13 @@ export async function reconcileStoppedSnapshot(
         }
       }
       if (action.remove != null) {
+        if (version <= preload.latest_version) throw new CoverageUnavailableError("pre-load Delta prefix contains a Remove");
         const remove = object(action.remove, "Delta Remove");
         if (remove.deletionVector != null) throw new Error("unsupported Delta Remove");
         active.delete(safePath(remove.path));
       }
     }
-    if ((version === 0 && dataChangeAdds !== 0) || (version > 0 && dataChangeAdds === 0)) {
+    if (version > preload.latest_version && dataChangeAdds === 0) {
       throw new CoverageUnavailableError(`Delta version ${version} is not attributable to the expected fresh-table ingestion`);
     }
   }

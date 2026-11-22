@@ -136,7 +136,7 @@ export async function prepareReplayRuntime(repo: string, home: string, stackByte
 }
 
 export async function replayCompressionPair(
-  repo: string, home: string, candidate: unknown, bindHost: string, endpointHost: string, stackBytes: number,
+  repo: string, home: string, candidate: unknown, bindHost: string, endpointHost: string, stackBytes: number, baselineOnly = false,
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
@@ -149,6 +149,7 @@ export async function replayCompressionPair(
   const seedSha256 = await sha256(join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"));
   const candidateLevel = checkCompressionCandidate(seed, candidate);
   const baselineLevel = checkCompressionCandidate(seed, seed);
+  if (baselineOnly && candidateLevel !== baselineLevel) throw new Error("baseline-only smoke requires the frozen seed");
   const seedClient = object(object(object(seed, "seed").tunables, "tunables").client, "client");
   if (seedClient.data_profile !== "realistic" || seedClient.seed !== 20260923) throw new Error("realistic corpus identity is not pinned");
   const data = join(home, "data");
@@ -159,7 +160,9 @@ export async function replayCompressionPair(
   try {
     const { runtime, binaryHash: preparedBinaryHash } = await prepareReplayRuntime(repo, home, stackBytes);
     const results = [];
-    for (const [label, raw, level] of [["baseline", seed, baselineLevel], ["candidate", candidate, candidateLevel]] as const) {
+    const arms: [string, unknown, number][] = [["baseline", seed, baselineLevel]];
+    if (!baselineOnly) arms.push(["candidate", candidate, candidateLevel]);
+    for (const [label, raw, level] of arms) {
       const runRoot = await mkdtemp(join(data, `${label}-`));
       const runHome = join(runRoot, "home");
       await mkdir(runHome);
@@ -189,6 +192,14 @@ export async function replayCompressionPair(
       results.push({ ...result, binaryHash, configHash, runRoot });
     }
     const [baseline, candidateResult] = results;
+    if (baselineOnly && baseline) {
+      completed = true;
+      return {
+        source_revision: producer.revision, trusted_revision: manifest.commit, seed_sha256: seedSha256,
+        controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923-v9", baseline_level: baselineLevel,
+        baseline,
+      };
+    }
     if (!baseline || !candidateResult || baseline.binaryHash !== candidateResult.binaryHash
       || JSON.stringify(baseline.images) !== JSON.stringify(candidateResult.images)
       || baseline.clientEvidence.payloadCorpusSha256 !== candidateResult.clientEvidence.payloadCorpusSha256) {
@@ -198,7 +209,7 @@ export async function replayCompressionPair(
     completed = true;
     return {
       source_revision: producer.revision, trusted_revision: manifest.commit, seed_sha256: seedSha256,
-      controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923-v8", baseline_level: baselineLevel,
+      controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923-v9", baseline_level: baselineLevel,
       candidate_level: candidateLevel, paired_rate_ratio: ratio,
       bytes_guard_passed: candidateResult.measurement.parquetBytesPerRow <= baseline.measurement.parquetBytesPerRow * 1.1,
       baseline, candidate: candidateResult,

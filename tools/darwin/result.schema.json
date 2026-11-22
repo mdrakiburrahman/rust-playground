@@ -88,7 +88,7 @@
         "trusted_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
         "seed_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "controller_stack_bytes": { "type": "integer", "minimum": 2097152, "maximum": 134217728 },
-        "profile": { "const": "realistic-seed-20260923-v8" },
+        "profile": { "const": "realistic-seed-20260923-v9" },
         "baseline_level": { "type": "integer", "minimum": 1, "maximum": 22 },
         "candidate_level": { "type": "integer", "minimum": 1, "maximum": 22 },
         "paired_rate_ratio": { "type": "number", "exclusiveMinimum": 0 },
@@ -112,7 +112,21 @@
         "reason": { "type": "string", "minLength": 1 },
         "unattributed_rows": { "type": "null" },
         "unattributed_reason": { "type": "string", "minLength": 1 },
-        "replay": { "$ref": "#/$defs/replay" }
+        "replay": { "$ref": "#/$defs/replay" },
+        "single_run": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_revision", "trusted_revision", "seed_sha256", "controller_stack_bytes", "profile", "baseline_level", "baseline"],
+          "properties": {
+            "source_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+            "trusted_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+            "seed_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "controller_stack_bytes": { "type": "integer", "minimum": 2097152, "maximum": 134217728 },
+            "profile": { "const": "realistic-seed-20260923-v9" },
+            "baseline_level": { "type": "integer", "minimum": 1, "maximum": 22 },
+            "baseline": { "$ref": "#/$defs/run" }
+          }
+        }
       }
     },
     "stub": {

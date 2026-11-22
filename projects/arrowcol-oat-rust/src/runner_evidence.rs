@@ -387,6 +387,7 @@ struct CellEvidence {
     processes: Option<Value>,
     measurement_window: Option<(u64, u64)>,
     client_schedule: Option<Value>,
+    preload_delta: Option<Value>,
     durable_commits: HashMap<String, Value>,
     router_sql: Option<Value>,
     router_cpu_pressure: Option<Value>,
@@ -782,6 +783,7 @@ impl CellEvidence {
         json!({
             "version": 1,
             "client_schedule": self.client_schedule,
+            "preload_delta": self.preload_delta,
             "overload_guard": self.overload_guard,
             "overload_stop": self.overload_stop,
             "processes": self.processes,
