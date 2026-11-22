@@ -2,6 +2,8 @@ import type { Measurement } from "./score.js";
 
 type JsonObject = Record<string, unknown>;
 
+export class CoverageUnavailableError extends Error {}
+
 export interface OatMeasurement extends Measurement {
   startUnixMs: number;
   endUnixMs: number;
@@ -63,7 +65,15 @@ function text(value: unknown, label: string): string {
   return value;
 }
 
-export function extractTimedReceipts(input: unknown, tableName: string, measurement: OatMeasurement): TimedReceipt[] {
+export function extractTimedReceipts(input: unknown, tableName: string, measurement: OatMeasurement): { all: TimedReceipt[]; selected: TimedReceipt[] } {
+  try {
+    return parseTimedReceipts(input, tableName, measurement);
+  } catch (error) {
+    throw new CoverageUnavailableError(`timed receipt coverage unavailable: ${error instanceof Error ? error.message : "invalid evidence"}`);
+  }
+}
+
+function parseTimedReceipts(input: unknown, tableName: string, measurement: OatMeasurement): { all: TimedReceipt[]; selected: TimedReceipt[] } {
   const evidence = object(input, "evidence");
   const commits = object(evidence.durable_commits, "durable commits");
   const cumulative = object(commits.run_cumulative_output, "cumulative output");
@@ -109,7 +119,7 @@ export function extractTimedReceipts(input: unknown, tableName: string, measurem
     || sum(selected, "files") !== measurement.files || selected.length !== measurement.commits) {
     throw new Error("timed receipts do not match commit-window totals");
   }
-  return selected;
+  return { all: receipts, selected };
 }
 
 /**

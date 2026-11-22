@@ -55,14 +55,18 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       inputBytes: 0, parquetBytes: one.length, minIngestedAtMs: 0, maxIngestedAtMs: 1,
       finishedAtUnixMs: 1000, elapsedSeconds: 0.1,
     };
-    const reconcile = (receipts: TimedReceipt[]) =>
+    const laterReceipt = { ...receipt, version: 2, rows: 2, parquetBytes: two.length, finishedAtUnixMs: 151000 };
+    const reconcile = (receipts: TimedReceipt[], allReceipts: TimedReceipt[] = [...receipts, laterReceipt]) =>
       reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
-        measurement, receipts, Compression.ZSTD);
+        measurement, receipts, allReceipts, Compression.ZSTD);
     assert.deepEqual(await reconcile([receipt]),
       { rows: 3, parquetBytes: one.length, activeRows: 5, latestVersion: 2, commits: 1 });
     await assert.rejects(reconcile([{ ...receipt, rows: 4 }]), /receipt counters/);
-    await assert.rejects(reconcile([{ ...receipt, tableId: "b".repeat(64) }]), /selected commit receipt/);
+    await assert.rejects(reconcile([{ ...receipt, tableId: "b".repeat(64) }], [receipt, laterReceipt]), /selected commit receipt/);
     await assert.rejects(reconcile([{ ...receipt, finishedAtUnixMs: 151000 }]), /selected commit receipt/);
+    await assert.rejects(reconcile([receipt], [receipt]), /version 2 has no cumulative collector receipt/);
+    await assert.rejects(reconcile([receipt], [receipt, laterReceipt, { ...laterReceipt, version: 3 }]), /cannot be attributed/);
+    await assert.rejects(reconcile([], [receipt, laterReceipt]), /window receipt selection disagree/);
     const changed = await readFile(join(tableRoot, "first.parquet"));
     changed[0] ^= 1;
     await writeFile(join(tableRoot, "first.parquet"), changed);

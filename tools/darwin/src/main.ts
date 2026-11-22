@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { checkCompressionCandidate } from "./compression-policy.js";
+import { CoverageUnavailableError } from "./metrics-adapter.js";
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
 import { prepareReplayRuntime, replayCompressionPair } from "./replay.js";
@@ -113,9 +114,22 @@ async function main(args: string[]): Promise<void> {
       return;
     }
     if (!args.includes("--smoke")) throw new Error("only a single-pair smoke replay is implemented; qualification remains unavailable");
-    const result = await replayCompressionPair(
-      repo, home, changed, option(args, "--bind-host"), option(args, "--endpoint-host"), Number(option(args, "--controller-stack-bytes")),
-    );
+    let result: Awaited<ReturnType<typeof replayCompressionPair>>;
+    try {
+      result = await replayCompressionPair(
+        repo, home, changed, option(args, "--bind-host"), option(args, "--endpoint-host"), Number(option(args, "--controller-stack-bytes")),
+      );
+    } catch (error) {
+      if (!(error instanceof CoverageUnavailableError)) throw error;
+      console.log(`@FEEDBACK Delta version coverage unavailable: ${error.message}`);
+      console.log(`@RESULT ${JSON.stringify({
+        version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
+        combined_score: 0, accepted: false, reason: "Delta version coverage unavailable",
+        unattributed_rows: null, unattributed_reason: error.message,
+      })}`);
+      process.exitCode = 1;
+      return;
+    }
     console.log("@FEEDBACK One independently reconciled pair is diagnostic, not a qualified winner.");
     console.log(`@RESULT ${JSON.stringify({
       version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,

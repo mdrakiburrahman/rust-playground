@@ -37,6 +37,15 @@ historical comparable AKS headline guard is 38.17 B/row.
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
 
+The client uses the fixed business customer ID `direct-e64-confirmwide` while
+delivery and row identities remain unique per run. Its manifest hashes the
+generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
+must report the same hash. Client process CPU is reported separately from
+collector samples, with its own sampling interval or an unavailable reason.
+Every post-bootstrap Delta version in the stopped snapshot must have a
+cumulative collector receipt; gaps produce a null unattributed-row count, an
+explicit reason and a nonzero evaluator exit.
+
 On failure, retain the exact run log and use the documented
 `--cleanup-local <cell-uuid>` recovery for that owned cell. Do not retry until
 the OAT owner has exited and cleanup is confirmed. Fresh HOME and restricted

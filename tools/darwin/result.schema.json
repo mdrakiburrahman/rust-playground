@@ -110,6 +110,8 @@
         "combined_score": { "const": 0 },
         "accepted": { "const": false },
         "reason": { "type": "string", "minLength": 1 },
+        "unattributed_rows": { "type": "null" },
+        "unattributed_reason": { "type": "string", "minLength": 1 },
         "replay": { "$ref": "#/$defs/replay" }
       }
     },

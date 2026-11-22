@@ -4,7 +4,7 @@ import { lstat, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readMetadata, readParquet } from "parquet-wasm";
-import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
+import { CoverageUnavailableError, type OatMeasurement, type TimedReceipt } from "./metrics-adapter.js";
 
 type JsonObject = Record<string, unknown>;
 type InventoryEntry = { path: string; size: number; sha256: string };
@@ -71,7 +71,7 @@ function entries(raw: unknown): InventoryEntry[] {
 
 export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
-  measurement: OatMeasurement, receipts: TimedReceipt[], expectedCodec: Compression,
+  measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
 ): Promise<{ rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number }> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
@@ -114,19 +114,40 @@ export async function reconcileStoppedSnapshot(
   }
   const active = new Map<string, Add>();
   const referenced = new Map<string, Add>();
+  const all = new Map<number, TimedReceipt>();
+  for (const receipt of allReceipts) {
+    if (receipt.tableName !== canonicalTableName || receipt.tableId !== expectedTableId
+      || receipt.version < 1 || receipt.version > latestVersion || all.has(receipt.version)) {
+      throw new CoverageUnavailableError("cumulative receipt cannot be attributed to a unique Delta version");
+    }
+    all.set(receipt.version, receipt);
+  }
   const selected = new Map<number, TimedReceipt>();
   for (const receipt of receipts) {
     if (receipt.tableName !== canonicalTableName || receipt.tableId !== expectedTableId || selected.has(receipt.version)
       || receipt.finishedAtUnixMs < measurement.startUnixMs || receipt.finishedAtUnixMs >= measurement.endUnixMs) {
       throw new Error("invalid selected commit receipt");
     }
+    if (JSON.stringify(all.get(receipt.version)) !== JSON.stringify(receipt)) {
+      throw new CoverageUnavailableError("window receipt is absent from cumulative version evidence");
+    }
     selected.set(receipt.version, receipt);
+  }
+  for (const receipt of all.values()) {
+    const inWindow = receipt.finishedAtUnixMs >= measurement.startUnixMs && receipt.finishedAtUnixMs < measurement.endUnixMs;
+    if (selected.has(receipt.version) !== inWindow) {
+      throw new CoverageUnavailableError("cumulative and window receipt selection disagree");
+    }
   }
   const selectedAdds = new Map<number, Add[]>();
   let latestSchema: string | undefined;
   for (let version = 0; version <= latestVersion; version++) {
+    if (version > 0 && !all.has(version)) {
+      throw new CoverageUnavailableError(`Delta version ${version} has no cumulative collector receipt`);
+    }
     const path = join(tableRoot, "_delta_log", `${String(version).padStart(20, "0")}.json`);
     const log = await readFile(path, "utf8");
+    let dataChangeAdds = 0;
     for (const line of log.split("\n").filter(Boolean)) {
       const action = object(JSON.parse(line), "Delta action");
       if (action.metaData != null) {
@@ -142,6 +163,7 @@ export async function reconcileStoppedSnapshot(
           throw new Error("unsupported Delta Add");
         }
         const add: Add = { path: safePath(value.path), size: uint(value.size, "Delta Add size"), version, dataChange: value.dataChange !== false };
+        if (add.dataChange) dataChangeAdds++;
         const previous = referenced.get(add.path);
         if (previous && previous.size !== add.size) throw new Error("historical Delta Add changed size");
         referenced.set(add.path, add);
@@ -158,6 +180,9 @@ export async function reconcileStoppedSnapshot(
         if (remove.deletionVector != null) throw new Error("unsupported Delta Remove");
         active.delete(safePath(remove.path));
       }
+    }
+    if ((version === 0 && dataChangeAdds !== 0) || (version > 0 && dataChangeAdds === 0)) {
+      throw new CoverageUnavailableError(`Delta version ${version} is not attributable to the expected fresh-table ingestion`);
     }
   }
   if (!latestSchema || latestSchema !== manifest.schemaString || !active.size || !expectedActiveRows) {

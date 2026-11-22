@@ -77,8 +77,8 @@ test("selects half-open timed version receipts and rejects missing or conflictin
       scope: "all_new_ingestion_commits_from_this_cell_including_warmup", rows: 2100, commits: 7, commits_by_version: list,
     } },
   });
-  assert.deepEqual(extractTimedReceipts(withReceipts(receipts), "one", measurement).map(r => r.version), [1, 2, 3, 4, 5]);
-  assert.equal(extractTimedReceipts(withReceipts([...receipts, receipts[1]]), "one", measurement).length, 5);
+  assert.deepEqual(extractTimedReceipts(withReceipts(receipts), "one", measurement).selected.map(r => r.version), [1, 2, 3, 4, 5]);
+  assert.equal(extractTimedReceipts(withReceipts([...receipts, receipts[1]]), "one", measurement).all.length, 7);
   assert.throws(() => extractTimedReceipts(withReceipts(receipts.slice(1)), "one", measurement), /receipt/);
   assert.throws(() => extractTimedReceipts(withReceipts([...receipts, { ...receipts[1], rows: 301 }]), "one", measurement), /conflicting/);
   const missingTime = receipts.map((receipt, index) => index === 1 ? { ...receipt, finished_at_unix_ms: undefined } : receipt);

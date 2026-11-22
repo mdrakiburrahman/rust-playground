@@ -100,7 +100,7 @@ export async function readReconciledOatResult(
   const receipts = extractTimedReceipts(evidence, canonicalTable, measurement);
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
   const proof = await reconcileStoppedSnapshot(
-    join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts, Compression.ZSTD,
+    join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all, Compression.ZSTD,
   );
   return { measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion, cellRunId: row.run_id, snapshotReconciled: true };
 }
