@@ -172,20 +172,21 @@ export async function reconcileStoppedSnapshot(
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== add.size) throw new Error("active Parquet file size mismatch");
     const bytes = await readFile(path);
     const metadata = readMetadata(bytes);
-    const fileMetadata = metadata.fileMetadata();
-    const footerRows = fileMetadata.numRows();
-    fileMetadata.free();
-    if (selectedPaths.has(add.path)) {
-      if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
-      for (const group of metadata.rowGroups()) {
-        const columns = group.columns();
-        const valid = columns.length > 0 && columns.every(column => column.compression() === expectedCodec);
-        for (const column of columns) column.free();
-        group.free();
-        if (!valid) throw new Error("selected Parquet codec differs from expected codec");
+    let footerRows: number;
+    try {
+      const fileMetadata = metadata.fileMetadata();
+      try { footerRows = fileMetadata.numRows(); } finally { fileMetadata.free(); }
+      if (selectedPaths.has(add.path)) {
+        if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
+        for (const group of metadata.rowGroups()) {
+          const columns = group.columns();
+          const valid = columns.length > 0 && columns.every(column => column.compression() === expectedCodec);
+          for (const column of columns) column.free();
+          group.free();
+          if (!valid) throw new Error("selected Parquet codec differs from expected codec");
+        }
       }
-    }
-    metadata.free();
+    } finally { metadata.free(); }
     const rows = tableFromIPC(readParquet(bytes).intoIPCStream()).numRows;
     if (rows !== footerRows) throw new Error("Parquet decoded rows differ from footer");
     decoded.set(add.path, rows);
