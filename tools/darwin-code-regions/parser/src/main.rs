@@ -22,7 +22,7 @@ impl<'ast> Visit<'ast> for BodyCheck {
     }
 }
 
-fn finish_body(source: &str) -> Result<std::ops::Range<usize>, String> {
+fn method_body(source: &str, owner: &str, name: &str) -> Result<std::ops::Range<usize>, String> {
     if source.starts_with('\u{feff}') || source.starts_with("#!") && !source.starts_with("#![") {
         return Err("BOM/shebang source is outside this lane".into());
     }
@@ -35,14 +35,14 @@ fn finish_body(source: &str) -> Result<std::ops::Range<usize>, String> {
             || ty.qself.is_some()
             || ty.path.leading_colon.is_some()
             || ty.path.segments.len() != 1
-            || ty.path.segments[0].ident != "FileSortBuffer"
+            || ty.path.segments[0].ident != owner
             || !ty.path.segments[0].arguments.is_none()
         {
             continue;
         }
         for member in &item.items {
             if let syn::ImplItem::Fn(method) = member
-                && method.sig.ident == "finish"
+                && method.sig.ident == name
             {
                 matches.push(method);
             }
@@ -50,7 +50,7 @@ fn finish_body(source: &str) -> Result<std::ops::Range<usize>, String> {
     }
     if matches.len() != 1 {
         return Err(format!(
-            "expected exactly one root inherent FileSortBuffer::finish, found {}",
+            "expected exactly one root inherent {owner}::{name}, found {}",
             matches.len()
         ));
     }
@@ -83,9 +83,14 @@ fn finish_body(source: &str) -> Result<std::ops::Range<usize>, String> {
 }
 
 fn run() -> Result<(), String> {
-    if std::env::args_os().len() != 1 {
-        return Err("parser takes source on stdin, not an item selector".into());
-    }
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let (owner, name) = match args.as_slice() {
+        [] => ("FileSortBuffer", "finish"),
+        [lane] if lane == "layout-sort-finish-v1" => ("FileSortBuffer", "finish"),
+        [lane] if lane == "maintenance-active-apply-v1" => ("DeltaTable", "apply_prepared_optimize"),
+        [lane] if lane == "maintenance-idle-vacuum-v1" => ("DeltaTable", "vacuum_once"),
+        _ => return Err("unknown trusted lane".into()),
+    };
     let mut bytes = Vec::new();
     io::stdin()
         .take((MAX_SOURCE_BYTES + 1) as u64)
@@ -95,7 +100,7 @@ fn run() -> Result<(), String> {
         return Err("source must contain 1..=1048576 bytes".into());
     }
     let source = std::str::from_utf8(&bytes).map_err(|error| format!("source is not UTF-8: {error}"))?;
-    let body = finish_body(source)?;
+    let body = method_body(source, owner, name)?;
     println!("{}:{}", body.start, body.end);
     Ok(())
 }
