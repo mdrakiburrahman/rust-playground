@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
-use arrow::array::{Array, ArrayRef, Int16Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, Int16Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt32Array};
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, sort_to_indices, take};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::util::display::array_value_to_string;
 use arrow_deltalake::layout::{FileSortBuffer, LayoutPolicy};
 use sha2::{Digest, Sha256};
@@ -20,11 +20,17 @@ fn schema(stress: bool) -> SchemaRef {
     let fields = vec![
         Field::new("customer_id", DataType::Utf8, stress)
             .with_metadata(HashMap::from([("origin".into(), "synthetic".into())])),
-        Field::new("sample_time_utc", DataType::Int64, false),
+        Field::new(
+            "sample_time_utc",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
         Field::new("sql_server_instance_name", DataType::Utf8, false),
         Field::new("machine_name", DataType::Utf8, false),
         Field::new("database_id", DataType::Int16, stress),
         Field::new("database_name", DataType::Utf8, false),
+        Field::new("session_id", DataType::Int16, false),
+        Field::new("session_status", DataType::Utf8, false),
         Field::new("connection_id", DataType::Utf8, false),
     ];
     Arc::new(Schema::new_with_metadata(
@@ -43,6 +49,8 @@ fn corpus(stress: bool) -> Result<Vec<RecordBatch>> {
             let mut machines = Vec::with_capacity(BATCH_ROWS);
             let mut databases = Vec::with_capacity(BATCH_ROWS);
             let mut names = Vec::with_capacity(BATCH_ROWS);
+            let mut sessions = Vec::with_capacity(BATCH_ROWS);
+            let mut statuses = Vec::with_capacity(BATCH_ROWS);
             let mut connections = Vec::with_capacity(BATCH_ROWS);
             for row in 0..BATCH_ROWS {
                 let id = batch * BATCH_ROWS + row;
@@ -65,17 +73,21 @@ fn corpus(stress: bool) -> Result<Vec<RecordBatch>> {
                     Some((id % 17) as i16)
                 });
                 names.push(format!("database-{:02}", id % 17));
+                sessions.push((id % 1000) as i16);
+                statuses.push(if id % 2 == 0 { "running" } else { "sleeping" });
                 connections.push(format!("connection-{id:08}"));
             }
             RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
                     Arc::new(StringArray::from(customers)) as ArrayRef,
-                    Arc::new(Int64Array::from(times)),
+                    Arc::new(TimestampMicrosecondArray::from(times)),
                     Arc::new(StringArray::from(instances)),
                     Arc::new(StringArray::from(machines)),
                     Arc::new(Int16Array::from(databases)),
                     Arc::new(StringArray::from(names)),
+                    Arc::new(Int16Array::from(sessions)),
+                    Arc::new(StringArray::from(statuses)),
                     Arc::new(StringArray::from(connections)),
                 ],
             )
@@ -131,7 +143,7 @@ fn independent_checks(input: &[RecordBatch], output: &RecordBatch, stress: bool)
     let ids = output
         .column(1)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<TimestampMicrosecondArray>()
         .context("time column type")?;
     let keys = output
         .column(0)
@@ -144,10 +156,12 @@ fn independent_checks(input: &[RecordBatch], output: &RecordBatch, stress: bool)
         .downcast_ref::<Int16Array>()
         .context("database type")?;
     let mut seen = vec![false; output.num_rows()];
+    let mut source_indices = Vec::with_capacity(output.num_rows());
     for i in 0..output.num_rows() {
         let id = usize::try_from(ids.value(i) - 1_700_000_000_000)?;
         ensure!(id < seen.len() && !seen[id], "duplicate or invalid source row");
         seen[id] = true;
+        source_indices.push(u32::try_from(id)?);
         if i > 0 {
             let k = |n| if keys.is_null(n) { None } else { Some(keys.value(n)) };
             let d = |n| {
@@ -163,6 +177,13 @@ fn independent_checks(input: &[RecordBatch], output: &RecordBatch, stress: bool)
                 ensure!(
                     null_last(d(i - 1), d(i)) != std::cmp::Ordering::Greater,
                     "secondary order"
+                );
+            }
+            let indices = UInt32Array::from(source_indices);
+            for (source, actual) in original.columns().iter().zip(output.columns()) {
+                ensure!(
+                    take(source, &indices, None)?.as_ref() == actual.as_ref(),
+                    "source row contents changed"
                 );
             }
         }
