@@ -1,0 +1,21 @@
+defaults:
+  executor:
+    parallelism: 1
+    termination:
+      max_iterations: 1
+  agents:
+    - provider: copilot
+      models:
+        - name: claude-sonnet-5
+  evaluator:
+    metrics:
+      score: !eval "float(stdout[-1])"
+    commands:
+      - env -u COPILOT_GITHUB_TOKEN /usr/local/bin/darwin-candidate-exec "printf 1"
+experiments:
+  - name: toy
+    prompt:
+      system: "Improve a toy implementation while preserving behavior."
+    evaluator:
+      commands:
+        - env -u COPILOT_GITHUB_TOKEN /usr/local/bin/darwin-candidate-exec "printf 1"
