@@ -400,8 +400,10 @@ impl DeltaBackend {
             decoded.envelope.source_schema_version,
             decoded.envelope.target_schema_version,
         );
-        let mut capacity = vec![self.capacity.acquire(rows, bytes).await?];
-        capacity.push(owner.capacity.acquire(rows, bytes).await?);
+        let capacity = [
+            self.capacity.acquire(rows, bytes).await?,
+            owner.capacity.acquire(rows, bytes).await?,
+        ];
         let queue_permit = owner
             .sender
             .try_reserve()
@@ -629,7 +631,7 @@ struct QueuedBatch {
     #[cfg(test)]
     submitted: Option<oneshot::Sender<()>>,
     _pending_owner: PendingOwner,
-    _capacity: Vec<CapacityReservation>,
+    _capacity: [CapacityReservation; 2],
     _backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
 }
 
@@ -1990,8 +1992,10 @@ mod tests {
             let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("owner"));
             let rows = batch.num_rows() as u64;
             let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).expect("bytes");
-            let mut capacity = vec![exporter.backend.capacity.acquire(rows, bytes).await.expect("capacity")];
-            capacity.push(owner.capacity.acquire(rows, bytes).await.expect("table capacity"));
+            let capacity = [
+                exporter.backend.capacity.acquire(rows, bytes).await.expect("capacity"),
+                owner.capacity.acquire(rows, bytes).await.expect("table capacity"),
+            ];
             let (reply, receipt) = oneshot::channel();
             let queued = QueuedBatch {
                 publication_id: envelope.publication_id.expect("id"),
