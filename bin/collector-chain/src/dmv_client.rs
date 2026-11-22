@@ -6,6 +6,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -89,6 +90,9 @@ pub enum GuidUniqueness {
 /// All settings are resolved and validated before allocation, registration, or connection.
 #[derive(Args, Clone, Debug, Serialize)]
 pub struct Options {
+    #[arg(long, env = "ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_customer_id: Option<String>,
     #[arg(long, env = "ARROWCOL_CLIENT_CORPUS_ROWS", default_value_t = 0)]
     pub corpus_rows: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_CORPUS_BYTES", default_value_t = 0)]
@@ -282,6 +286,12 @@ impl Options {
                 && self.workers.saturating_mul(self.connections_per_worker) <= 4096
                 && self.workers.saturating_mul(self.streams_per_worker) <= 65536,
             "connections-per-worker must be 1..=256, streams-per-worker 1..=1024; totals <=4096 connections and <=65536 streams"
+        );
+        anyhow::ensure!(
+            self.payload_customer_id
+                .as_deref()
+                .is_none_or(arrowcol_tunables::valid_payload_customer_id),
+            "payload-customer-id must be 1..=128 ASCII letters, digits, '.', '_' or '-'"
         );
         anyhow::ensure!(self.string_width <= 65536, "string-width must be 0..=65536");
         anyhow::ensure!(self.cardinality > 0, "cardinality must be positive");
@@ -919,7 +929,7 @@ impl PreparedClient {
             for field in table.schema.fields() {
                 if field.data_type() == &DataType::Utf8 {
                     let width = if field.name() == "customer_id" {
-                        client_id.len()
+                        options.payload_customer_id.as_deref().unwrap_or(client_id).len()
                     } else if options.string_width == 0 {
                         field.name().len() + 32
                     } else {
@@ -956,6 +966,7 @@ impl PreparedClient {
         let mut encoding_seconds = 0.0;
         let mut generation_cpu_seconds = cpu_started.map(|_| 0.0);
         let mut encoding_cpu_seconds = cpu_started.map(|_| 0.0);
+        let mut payload_hasher = options.payload_customer_id.as_ref().map(|_| Sha256::new());
         for copy in 0..copies {
             let mut batches = Vec::new();
             for (table, version) in tables.iter().zip(&versions) {
@@ -964,6 +975,9 @@ impl PreparedClient {
                     let generation_start = Instant::now();
                     let cpu_start = thread_cpu_seconds()?;
                     let batch = synthetic_batch(table, client_id, length, offset, copy, &options)?;
+                    if let Some(hasher) = payload_hasher.as_mut() {
+                        hash_payload_batch(hasher, table, &batch, copy, offset)?;
+                    }
                     generation_seconds += generation_start.elapsed().as_secs_f64();
                     if let Some((total, (end, start))) = generation_cpu_seconds
                         .as_mut()
@@ -1012,7 +1026,7 @@ impl PreparedClient {
             }
             channels.push(worker);
         }
-        let preparation = serde_json::json!({
+        let mut preparation = serde_json::json!({
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
             "corpus_uncompressed_flight_data_bytes": raw_arrow_bytes_total,
             "corpus_configured_ipc_compression_flight_data_bytes": encoded_bytes,
@@ -1036,6 +1050,9 @@ impl PreparedClient {
             "generator_rows_per_second": rows as f64 * table_count as f64 * copies as f64 / generation_seconds.max(f64::MIN_POSITIVE),
             "steady_state_generation": options.data_profile == DataProfile::Realistic,
         });
+        if let Some(hasher) = payload_hasher {
+            preparation["payload_corpus_sha256"] = serde_json::json!(format!("{:x}", hasher.finalize()));
+        }
         Ok(Arc::new(Self {
             counters: (0..options.workers).map(|_| Counters::default()).collect(),
             worker_next: (0..options.workers).map(|_| AtomicU64::new(0)).collect(),
@@ -1294,6 +1311,10 @@ impl PreparedClient {
                 "ranges": ranges,
             })
         };
+        if let Some(hash) = self.preparation.get("payload_corpus_sha256") {
+            manifest["payload_corpus_sha256"] = hash.clone();
+            manifest["payload_corpus_hash_scope"] = serde_json::json!("arrow-ipc-v1-excluding-endpoint_url");
+        }
         if self.manifest_capacity_reached.load(Ordering::Relaxed) {
             let reason = self.remember_first_terminal_failure("record_capacity_reached")?;
             manifest["terminal_failure"] = serde_json::json!(reason);
@@ -2068,7 +2089,9 @@ fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> 
         .fields()
         .iter()
         .map(|field| match field.data_type() {
-            DataType::Utf8 if field.name() == "customer_id" => client_id.len() as u64 + 5,
+            DataType::Utf8 if field.name() == "customer_id" => {
+                options.payload_customer_id.as_deref().unwrap_or(client_id).len() as u64 + 5
+            }
             DataType::Utf8 => {
                 let category_width = if options.data_profile == DataProfile::Realistic {
                     realistic_category_max_width(field.name())
@@ -2185,7 +2208,7 @@ fn estimated_identity_row_bytes(table: &DmvTable, client_id: &str, options: &Opt
         "logical identity endpoint_url column must be a nonnullable string"
     );
     let previous_width = match endpoint.name().as_str() {
-        "customer_id" => client_id.len(),
+        "customer_id" => options.payload_customer_id.as_deref().unwrap_or(client_id).len(),
         name => realistic_category_max_width(name).unwrap_or_else(|| {
             if options.string_width == 0 {
                 name.len() + 32
@@ -2299,6 +2322,50 @@ fn synthetic_guid(seed: u64, pod_ordinal: u32, worker: usize, column: usize, row
     uuid::Uuid::from_u128(value).to_string()
 }
 
+struct PayloadHashWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for PayloadHashWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.update(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_payload_batch(
+    hasher: &mut Sha256,
+    table: &DmvTable,
+    batch: &RecordBatch,
+    copy: usize,
+    offset: usize,
+) -> Result<()> {
+    let table_name = format!(
+        "{}.{}.{}",
+        table.identity.catalog(),
+        table.identity.schema(),
+        table.identity.table()
+    );
+    hasher.update(u64::try_from(table_name.len())?.to_le_bytes());
+    hasher.update(table_name.as_bytes());
+    hasher.update(u64::try_from(copy)?.to_le_bytes());
+    hasher.update(u64::try_from(offset)?.to_le_bytes());
+    let indices = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (field.name() != "endpoint_url").then_some(index))
+        .collect::<Vec<_>>();
+    let payload = batch.project(&indices)?;
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(PayloadHashWriter(hasher), &payload.schema())?;
+    writer.write(&payload)?;
+    writer.finish()?;
+    Ok(())
+}
+
 fn synthetic_batch(
     table: &DmvTable,
     client_id: &str,
@@ -2347,9 +2414,9 @@ fn synthetic_batch(
                 };
             }
             Ok(match field.data_type() {
-                DataType::Utf8 if field.name() == "customer_id" => {
-                    Arc::new(StringArray::from_iter_values(std::iter::repeat_n(client_id, rows)))
-                }
+                DataType::Utf8 if field.name() == "customer_id" => Arc::new(StringArray::from_iter_values(
+                    std::iter::repeat_n(options.payload_customer_id.as_deref().unwrap_or(client_id), rows),
+                )),
                 DataType::Utf8 => Arc::new(StringArray::from_iter((0..rows).map(|row| {
                     valid(row).then(|| {
                         if is_guid_field(field.name())
@@ -2958,6 +3025,40 @@ mod tests {
         Cli::try_parse_from(["test", "--workers", "2", "--data-profile", "diagnostic"])?
             .options
             .resolve(100, 1)
+    }
+
+    #[test]
+    fn fixed_business_payload_retains_distinct_delivery_identities() -> Result<()> {
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        options.payload_customer_id = Some("direct-e64-confirmwide".to_owned());
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let first = synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?;
+        let second = synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?;
+        assert_eq!(first, second);
+        let customer = first
+            .column_by_name("customer_id")
+            .context("customer_id missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("customer_id is not a string")?;
+        assert!(customer.iter().all(|value| value == Some("direct-e64-confirmwide")));
+        let a = batch_with_logical_identity(&first, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), 0, 0)?;
+        let b = batch_with_logical_identity(&second, uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(4), 0, 0)?;
+        assert_ne!(a.column_by_name("endpoint_url"), b.column_by_name("endpoint_url"));
+        let mut a_hash = Sha256::new();
+        let mut b_hash = Sha256::new();
+        hash_payload_batch(&mut a_hash, &table, &a, 0, 0)?;
+        hash_payload_batch(&mut b_hash, &table, &b, 0, 0)?;
+        assert_eq!(a_hash.finalize(), b_hash.finalize());
+        options.payload_customer_id = None;
+        assert_ne!(
+            synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?,
+            synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?,
+        );
+        options.payload_customer_id = Some("bad identity!".to_owned());
+        assert!(options.resolve(100, 1).is_err());
+        Ok(())
     }
 
     fn manifest_test_client() -> Result<PreparedClient> {

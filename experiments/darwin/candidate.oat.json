@@ -43,6 +43,7 @@
   "website_url": "file:///tmp/arrowcol-oat-tuned/site/results.parquet",
   "tunables": {
     "client": {
+      "payload_customer_id": "direct-e64-confirmwide",
       "corpus_rows": 65536,
       "batch_rows": 4096,
       "workers": 2,

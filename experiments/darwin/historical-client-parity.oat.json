@@ -4,7 +4,10 @@
     "compose_file": "projects/loadtest/compose.yaml",
     "compose_override_file": "projects/loadtest/compose.oat.yaml",
     "compose_project": "arrowcol-oat-historical-client",
-    "compose_state_root": "out/arrowcol-oat/historical-client"
+    "compose_state_root": "out/arrowcol-oat/historical-client",
+    "local": {
+      "collector_memory_limit_bytes": 4294967296
+    }
   },
   "warmup_seconds": 60,
   "measure_seconds": 150,
@@ -34,6 +37,7 @@
   "website_url": "file:///tmp/arrowcol-oat-historical-client/site/results.parquet",
   "tunables": {
     "client": {
+      "payload_customer_id": "direct-e64-confirmwide",
       "corpus_rows": 65536,
       "batch_rows": 65536,
       "workers": 8,

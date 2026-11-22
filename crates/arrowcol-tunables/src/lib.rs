@@ -13,6 +13,16 @@ pub use arrowcol_routing::AdmissionPressureGauge;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// Payload customer IDs are bounded printable identifiers, not delivery identities.
+#[must_use]
+pub fn valid_payload_customer_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tunables {
@@ -39,6 +49,7 @@ pub struct Tunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTunables {
+    pub payload_customer_id: Option<String>,
     pub corpus_rows: Option<u64>,
     pub corpus_bytes: Option<u64>,
     pub batch_rows: Option<usize>,

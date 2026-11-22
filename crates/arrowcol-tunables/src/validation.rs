@@ -53,6 +53,7 @@ macro_rules! capability {
 }
 
 const CAPABILITIES: &[Capability] = &[
+    capability!("client.payload_customer_id", "delivery client ID"),
     capability!("client.corpus_rows", "component default"),
     capability!("client.corpus_bytes", "component default"),
     capability!("client.batch_rows", "8192"),
@@ -448,6 +449,13 @@ impl Tunables {
 
     fn validate_with_transport_defaults(&self, default_message_bytes: u64, default_flight_bytes: u64) -> Result<()> {
         if let Some(client) = &self.client {
+            if client
+                .payload_customer_id
+                .as_deref()
+                .is_some_and(|id| !crate::valid_payload_customer_id(id))
+            {
+                bail!("client.payload_customer_id must be 1..=128 ASCII letters, digits, '.', '_' or '-'");
+            }
             let cardinality = client.cardinality.unwrap_or(1_024);
             let memory = client.max_memory_bytes.unwrap_or(536_870_912);
             let connections = client.connections_per_worker.unwrap_or(1);
