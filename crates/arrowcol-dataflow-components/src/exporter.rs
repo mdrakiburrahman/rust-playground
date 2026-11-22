@@ -3650,8 +3650,8 @@ mod tests {
                                 .column_by_name("id")
                                 .expect("id")
                                 .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .expect("u64 id");
+                                .downcast_ref::<arrow_array::Decimal128Array>()
+                                .expect("decimal id");
                             ids.extend(column.values().iter().copied());
                         }
                     }
