@@ -25,10 +25,10 @@ async function setup(repo: string, home: string): Promise<void> {
   const output = path.join(trusted, "compiled");
   const tsc = path.join(repo, "node_modules", "typescript", "bin", "tsc");
   execFileSync(process.execPath, [
-    tsc, "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext",
+    tsc, "--ignoreConfig", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext",
     "--skipLibCheck", "--types", "node", "--rootDir", source, "--outDir", output,
     ...["main.ts", "paths.ts", "policy.ts", "snapshot.ts"].map((file) => path.join(source, file)),
-  ], { cwd: repo, stdio: "pipe" });
+  ], { cwd: repo, stdio: "inherit" });
   await writeFile(path.join(output, "package.json"), '{"type":"module"}\n', { flag: "wx" });
   const launcher = path.join(trusted, "bin", "harness");
   await mkdir(path.dirname(launcher));
