@@ -145,6 +145,8 @@ export async function replayCompressionPair(
   if (typeof producer.revision !== "string" || !Number.isSafeInteger(stackBytes)
     || stackBytes < 2 * 1024 * 1024 || stackBytes > 128 * 1024 * 1024) throw new Error("invalid producer or controller stack setting");
   const seed = JSON.parse(await readFile(join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+  const manifest = JSON.parse(await readFile(join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
+  const seedSha256 = await sha256(join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"));
   const candidateLevel = checkCompressionCandidate(seed, candidate);
   const baselineLevel = checkCompressionCandidate(seed, seed);
   const seedClient = object(object(object(seed, "seed").tunables, "tunables").client, "client");
@@ -194,7 +196,8 @@ export async function replayCompressionPair(
     const ratio = candidateResult.measurement.durableRowsPerSecond / baseline.measurement.durableRowsPerSecond;
     completed = true;
     return {
-      source_revision: producer.revision, controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923", baseline_level: baselineLevel,
+      source_revision: producer.revision, trusted_revision: manifest.commit, seed_sha256: seedSha256,
+      controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923", baseline_level: baselineLevel,
       candidate_level: candidateLevel, paired_rate_ratio: ratio,
       bytes_guard_passed: candidateResult.measurement.parquetBytesPerRow <= baseline.measurement.parquetBytesPerRow * 1.1,
       baseline, candidate: candidateResult,

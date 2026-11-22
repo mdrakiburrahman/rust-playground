@@ -88,25 +88,16 @@ async function main(args: string[]): Promise<void> {
   const problems = await check(home, candidate, experiment);
   if (!args.includes("--stub")) {
     if (experiment !== "compression-config") throw new Error("this lane is not implemented and is refused");
+    const baseline = JSON.parse(await readFile(path.join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+    checkCompressionCandidate(baseline, baseline);
+    const candidatePath = path.join(candidate, "experiments", "darwin", "candidate.oat.json");
+    const candidateText = problems ? undefined : await readFile(candidatePath, "utf8");
+    let changed: unknown;
     try {
       if (problems) throw new Error(`candidate violates ${problems} path checks`);
-      const baseline = JSON.parse(await readFile(path.join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
-      const changed = JSON.parse(await readFile(path.join(candidate, "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+      if (candidateText === undefined) throw new Error("candidate configuration is unavailable");
+      changed = JSON.parse(candidateText) as unknown;
       checkCompressionCandidate(baseline, changed);
-      if (command === "preflight") {
-        console.log("Config-only compression preflight passed; Tier 1 qualification and code lanes remain unavailable.");
-        return;
-      }
-      if (!args.includes("--smoke")) throw new Error("only a single-pair smoke replay is implemented; qualification remains unavailable");
-      const result = await replayCompressionPair(
-        repo, home, changed, option(args, "--bind-host"), option(args, "--endpoint-host"), Number(option(args, "--controller-stack-bytes")),
-      );
-      console.log("@FEEDBACK One independently reconciled pair is diagnostic, not a qualified winner.");
-      console.log(`@RESULT ${JSON.stringify({
-        version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
-        combined_score: 0, accepted: false, reason: "one pair is not qualified",
-        replay: result,
-      })}`);
     } catch (error) {
       if (command === "preflight") throw error;
       const reason = error instanceof Error ? error.message : "unexpected evaluator error";
@@ -115,8 +106,22 @@ async function main(args: string[]): Promise<void> {
         version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
         combined_score: 0, accepted: false, reason,
       })}`);
-      process.exitCode = 1;
+      return;
     }
+    if (command === "preflight") {
+      console.log("Config-only compression preflight passed; Tier 1 qualification and code lanes remain unavailable.");
+      return;
+    }
+    if (!args.includes("--smoke")) throw new Error("only a single-pair smoke replay is implemented; qualification remains unavailable");
+    const result = await replayCompressionPair(
+      repo, home, changed, option(args, "--bind-host"), option(args, "--endpoint-host"), Number(option(args, "--controller-stack-bytes")),
+    );
+    console.log("@FEEDBACK One independently reconciled pair is diagnostic, not a qualified winner.");
+    console.log(`@RESULT ${JSON.stringify({
+      version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
+      combined_score: 0, accepted: false, reason: "one pair is not qualified",
+      replay: result,
+    })}`);
     return;
   }
   if (command === "preflight") {

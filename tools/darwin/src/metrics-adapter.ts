@@ -13,7 +13,11 @@ export interface OatMeasurement extends Measurement {
   commitLatencySeconds: { p50: number; p99: number; samples: number };
   cpuMillicoresMean: number | null;
   memoryBytesMaxObserved: number | null;
-  downstreamUnavailableReason: string | null;
+  rssBytesMaxObserved: null;
+  rssUnavailableReason: string;
+  resourceSampleCount: number;
+  downstreamRowsPerSecond: null;
+  downstreamUnavailableReason: string;
 }
 
 export interface TimedReceipt {
@@ -183,11 +187,14 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
     cpuTotal += number(metrics.cpu_millicores, "CPU millicores");
     memoryMax = Math.max(memoryMax, number(metrics.memory_bytes, "memory bytes"));
   }
+  if (evidence.downstream_status !== "unavailable" && evidence.downstream_status !== "observed_or_not_attempted") {
+    throw new Error("downstream status is missing or invalid");
+  }
   const downstreamUnavailableReason = evidence.downstream_status === "unavailable"
     ? typeof evidence.downstream_comment === "string" && evidence.downstream_comment.trim()
       ? evidence.downstream_comment
       : (() => { throw new Error("downstream unavailability has no reason"); })()
-    : null;
+    : "downstream throughput not measured";
   return {
     startUnixMs: start,
     endUnixMs: end,
@@ -201,6 +208,10 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
     commitLatencySeconds: { p50, p99, samples: latencySamples },
     cpuMillicoresMean: resources.samples.length ? cpuTotal / resources.samples.length : null,
     memoryBytesMaxObserved: resources.samples.length ? memoryMax : null,
+    rssBytesMaxObserved: null,
+    rssUnavailableReason: "OAT resource samples do not expose process RSS",
+    resourceSampleCount: resources.samples.length,
+    downstreamRowsPerSecond: null,
     downstreamUnavailableReason,
   };
 }

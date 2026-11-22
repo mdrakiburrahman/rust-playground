@@ -46,7 +46,9 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: one.length, files: 1, commits: 1, completeBuckets: 5,
       durableRowsPerSecond: 3 / 150, parquetBytesPerRow: one.length / 3,
       commitLatencySeconds: { p50: 0.1, p99: 0.1, samples: 1 },
-      cpuMillicoresMean: null, memoryBytesMaxObserved: null, downstreamUnavailableReason: null,
+      cpuMillicoresMean: null, memoryBytesMaxObserved: null, rssBytesMaxObserved: null,
+      rssUnavailableReason: "OAT resource samples do not expose process RSS", resourceSampleCount: 0,
+      downstreamRowsPerSecond: null, downstreamUnavailableReason: "downstream throughput not measured",
     };
     const receipt: TimedReceipt = {
       tableId: "a".repeat(64), tableName: "telemetry.sqlserver.orders", version: 1, rows: 3, files: 1,

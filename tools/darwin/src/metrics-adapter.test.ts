@@ -35,8 +35,13 @@ test("extracts commit-window rather than admission throughput", () => {
   assert.equal(result.durableRowsPerSecond, 10);
   assert.equal(result.memoryBytesMaxObserved, 200);
   assert.equal(result.cpuMillicoresMean, 200);
+  assert.equal(result.resourceSampleCount, 2);
+  assert.equal(result.rssBytesMaxObserved, null);
+  assert.match(result.rssUnavailableReason, /do not expose/);
   assert.equal(result.commitLatencySeconds.samples, 5);
+  assert.equal(result.downstreamRowsPerSecond, null);
   assert.equal(result.downstreamUnavailableReason, "Kustainer stopped");
+  assert.throws(() => adaptOatEvidence({ ...evidence(), downstream_comment: null }), /no reason/);
 });
 
 test("rejects incomplete or inconsistent windows and unknown durable counts", () => {
