@@ -73,6 +73,10 @@ test("excludes only the current evaluator state directory", async () => {
     execFileSync("git", ["init", "-q", root]);
     await mkdir(path.join(root, ".darwin", "lane", "trusted"), { recursive: true });
     await writeFile(path.join(root, ".darwin", "lane", "trusted", "snapshot"), "state");
+    const embedded = path.join(root, ".darwin", "lane", "trusted", "runtime");
+    execFileSync("git", ["init", "-q", embedded]);
+    await writeFile(path.join(embedded, "file"), "runtime");
+    execFileSync("git", ["-C", embedded, "add", "file"]);
     await mkdir(path.join(root, ".darwin", "other"), { recursive: true });
     await writeFile(path.join(root, ".darwin", "other", "unexpected"), "extra");
     assert.deepEqual(await checkCandidatePaths(root, {}, [], {}, ".darwin/lane"), [

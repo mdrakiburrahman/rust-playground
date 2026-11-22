@@ -64,8 +64,8 @@ export async function checkCandidatePaths(
   ).split("\0").filter(Boolean);
   const seen = new Set<string>();
   for (const relative of new Set(paths)) {
-    if (!safePath(relative)) throw new Error(`unsafe candidate path: ${relative}`);
     if (stateDirectory && relative.startsWith(`${stateDirectory}/`)) continue;
+    if (!safePath(relative)) throw new Error(`unsafe candidate path: ${relative}`);
     seen.add(relative);
     if (Object.hasOwn(submodules, relative)) {
       try {
