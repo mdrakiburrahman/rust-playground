@@ -276,6 +276,14 @@ impl FileSortBuffer {
             })
             .collect::<Result<Vec<_>>>()?;
         let indices = lexsort_to_indices(&columns, None)?;
+        if indices
+            .values()
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value as usize == index)
+        {
+            return Ok(batch);
+        }
         let arrays = batch
             .columns()
             .iter()
