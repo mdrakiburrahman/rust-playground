@@ -8,6 +8,7 @@
 | Command | The trusted runner must supply `/usr/local/bin/arrowcol-darwin-eval <literal-lane>` and own the immutable candidate/seed/evaluator binding. The YAML does not provide that executable. |
 | Boundary | The pinned path check restricts files, not production subregions or all unsafe edits within an allowed file. Prompts are not security controls. |
 | Validation | `npx --no-install tsx --test experiments/darwin/manifest.test.ts` checks the manifest and flattened settings offline; it does not execute Darwin, install the wrapper, or launch any workload. |
+| Resource and client ceiling observation | [Physics observation](../../docs/experiments/darwin/PHYSICS_OBSERVATION.md) describes the opt-in read-only observer and bounded decode/discard probe. Neither changes the frozen parity control or reports ACKs as durable rows. |
 
 The root uses no shared defaults or include merging. Offline lint rejects unknown, duplicate, missing and redirected lanes, but is not runtime admission; the trusted runner must independently enforce those checks. Metric extraction consumes the trusted terminal `@RESULT` record and rejects malformed, non-finite or inconsistent scores. No tokens or lane clocks are needed for offline checks. The model name and limits are proposed settings, not proof of model availability or authorization to start evolution.
 

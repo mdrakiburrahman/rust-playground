@@ -8,6 +8,7 @@ use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -630,6 +631,9 @@ struct Attempt<'a> {
 struct Measurement {
     start_unix_ms: u64,
     end_unix_ms: u64,
+    offered_rows: AtomicU64,
+    offered_bytes: AtomicU64,
+    offered_worker_rows: Vec<AtomicU64>,
     rows: AtomicU64,
     raw_arrow_bytes: AtomicU64,
     bytes: AtomicU64,
@@ -674,6 +678,9 @@ impl Measurement {
         Ok(Self {
             start_unix_ms,
             end_unix_ms,
+            offered_rows: AtomicU64::new(0),
+            offered_bytes: AtomicU64::new(0),
+            offered_worker_rows: (0..workers).map(|_| AtomicU64::new(0)).collect(),
             rows: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             raw_arrow_bytes: AtomicU64::new(0),
@@ -701,6 +708,15 @@ impl Measurement {
             ambiguous_streams: AtomicU64::new(0),
             ambiguous_rows: AtomicU64::new(0),
         })
+    }
+
+    fn record_offer(&self, worker: usize, rows: u64, bytes: u64, send_unix_ns: u64) {
+        let send_unix_ms = send_unix_ns / 1_000_000;
+        if send_unix_ms >= self.start_unix_ms && send_unix_ms < self.end_unix_ms {
+            self.offered_rows.fetch_add(rows, Ordering::Relaxed);
+            self.offered_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.offered_worker_rows[worker].fetch_add(rows, Ordering::Relaxed);
+        }
     }
 
     fn record_completion(
@@ -766,6 +782,10 @@ impl Measurement {
     fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "start_unix_ms": self.start_unix_ms, "end_unix_ms": self.end_unix_ms,
+            "offered_rows": self.offered_rows.load(Ordering::Relaxed),
+            "offered_flight_data_bytes_configured_ipc_compression": self.offered_bytes.load(Ordering::Relaxed),
+            "offered_worker_rows": self.offered_worker_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "offered_scope": "do_put_attempts_started_in_half_open_shared_window_including_retries_not_admission_or_durability",
             "completed_rows": self.rows.load(Ordering::Relaxed),
             "completed_bytes": self.bytes.load(Ordering::Relaxed),
             "completed_wire_bytes": self.bytes.load(Ordering::Relaxed),
@@ -1766,6 +1786,9 @@ impl PreparedClient {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
                 attempt.send_started = true;
             }
+            if let Some(measurement) = measurement {
+                measurement.record_offer(worker, batch.rows, batch.encoded_bytes, observation.send_unix_ns);
+            }
             completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
         })
         .await
@@ -2699,10 +2722,31 @@ fn batch_with_logical_identity(
         batch.schema().field(identity_column).data_type() == &DataType::Utf8,
         "logical identity endpoint_url column must be a nonnullable string"
     );
-    let values = (0..batch.num_rows())
-        .map(|row| logical_identity_url(run_id, incarnation_id, worker, sequence, row))
-        .collect::<Result<Vec<_>>>()?;
-    let identity: ArrayRef = Arc::new(StringArray::from_iter_values(values.iter().map(String::as_str)));
+    anyhow::ensure!(worker < 1_024, "logical identity worker id exceeds 1023");
+    let last_row =
+        u32::try_from(batch.num_rows().saturating_sub(1)).context("logical identity row ordinal exceeds u32")?;
+    let mut value = format!(
+        "https://x.invalid/v1/{}/{}/{}/{}/",
+        run_id.simple(),
+        incarnation_id.simple(),
+        worker,
+        base36(sequence),
+    );
+    let prefix_len = value.len();
+    let row_digits = last_row.to_string().len();
+    let values_capacity = prefix_len
+        .checked_add(row_digits)
+        .and_then(|width| width.checked_mul(batch.num_rows()))
+        .filter(|bytes| *bytes <= i32::MAX as usize)
+        .context("logical identity values exceed Arrow Utf8's 2147483647-byte column limit")?;
+    let mut builder = arrow_array::builder::StringBuilder::with_capacity(batch.num_rows(), values_capacity);
+    value.reserve(row_digits);
+    for row in 0..batch.num_rows() {
+        value.truncate(prefix_len);
+        write!(&mut value, "{row}")?;
+        builder.append_value(&value);
+    }
+    let identity: ArrayRef = Arc::new(builder.finish());
     let columns = batch
         .columns()
         .iter()
@@ -3335,6 +3379,30 @@ mod tests {
         );
         assert!(logical_identity_url(run, incarnation, 1_024, 0, 0).is_err());
         assert!(logical_identity_url(run, incarnation, 0, 0, u32::MAX as usize + 1).is_err());
+        let mut opts = options()?;
+        opts.data_profile = DataProfile::Realistic;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let template = synthetic_batch(&table, "identity", 101, 0, 0, &opts)?;
+        for sequence in [0, 35, 36, u64::MAX] {
+            let batch = batch_with_logical_identity(&template, run, incarnation, 1023, sequence)?;
+            let values = batch
+                .column(batch.schema().index_of("endpoint_url")?)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("identity column is not Utf8")?;
+            for row in [0, 9, 10, 99, 100] {
+                assert_eq!(
+                    values.value(row),
+                    logical_identity_url(run, incarnation, 1023, sequence, row)?
+                );
+            }
+            for (index, column) in template.columns().iter().enumerate() {
+                if template.schema().field(index).name() != "endpoint_url" {
+                    assert!(Arc::ptr_eq(column, batch.column(index)));
+                }
+            }
+        }
+        assert!(batch_with_logical_identity(&template, run, incarnation, 1024, 0).is_err());
 
         let client = manifest_test_client()?;
         client.worker_batch_sequence[0].store(u64::MAX, Ordering::Relaxed);
@@ -4417,7 +4485,14 @@ mod tests {
         measurement.record_completion(0, 200, 1800, 2000, 10_000);
         measurement.record_completion(0, 300, 2700, 3000, 69_999);
         measurement.record_completion(1, 400, 3600, 4000, 70_000);
+        measurement.record_offer(0, 100, 1000, 9_999_000_000);
+        measurement.record_offer(0, 200, 2000, 10_000_000_000);
+        measurement.record_offer(1, 300, 3000, 69_999_000_000);
+        measurement.record_offer(1, 400, 4000, 70_000_000_000);
         let snapshot = measurement.snapshot();
+        assert_eq!(snapshot["offered_rows"], 500);
+        assert_eq!(snapshot["offered_flight_data_bytes_configured_ipc_compression"], 5000);
+        assert_eq!(snapshot["offered_worker_rows"], serde_json::json!([200, 300]));
         assert_eq!(snapshot["completed_rows"], 500);
         assert_eq!(snapshot["completed_bytes"], 5000);
         assert_eq!(snapshot["completed_raw_arrow_bytes"], 4500);

@@ -20,6 +20,7 @@ arrowcol-flight = { path = "../../crates/arrowcol-flight" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-router-rust = { path = "../../projects/arrowcol-router-rust" }
 arrowcol-tunables = { path = "../../crates/arrowcol-tunables" }
+async-trait = "0.1"
 clap = { workspace = true, features = ["env"] }
 futures = "0.3"
 http = "1"
@@ -33,9 +34,6 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time", "sync"] }
 tonic = { version = "0.14", features = ["gzip", "zstd"] }
 uuid = { version = "1", features = ["v4"] }
-
-[dev-dependencies]
-async-trait = "0.1"
 
 [lints]
 workspace = true
