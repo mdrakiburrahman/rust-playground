@@ -7,7 +7,12 @@ fn parity_has_override(value: &Value) -> bool {
     }
 }
 
-fn parity_admission_readback(config: &OatConfig, logs: &[ProcessLog], clients: &[ClientProgress]) -> Result<Value> {
+fn parity_admission_readback(
+    config: &OatConfig,
+    logs: &[ProcessLog],
+    clients: &[ClientProgress],
+    allow_writer_overrides: bool,
+) -> Result<Value> {
     if config.platform.kind != crate::config::OatMode::Local
         || config.tables.len() != 1
         || config.clients_per_table != 1
@@ -27,7 +32,7 @@ fn parity_admission_readback(config: &OatConfig, logs: &[ProcessLog], clients: &
         .get("parquet_writer")
         .filter(|value| value.is_object())
         .context("parity collector writer readback is missing")?;
-    if parity_has_override(writer) {
+    if parity_has_override(writer) && (!allow_writer_overrides || config.tunables.parquet_writer.is_none()) {
         bail!("parity collector has a Parquet writer override");
     }
     let [client] = clients else {

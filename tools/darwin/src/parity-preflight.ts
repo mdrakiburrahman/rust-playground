@@ -107,7 +107,7 @@ export function assertParityTableLayout(seed: unknown, policies: unknown): void 
   }
 }
 
-export function assertParityEvidence(seed: unknown, input: unknown): void {
+export function assertParityEvidence(seed: unknown, input: unknown, allowWriterOverrides = false): void {
   const config = object(seed, "parity seed");
   const local = object(object(config.platform, "platform").local, "local");
   const evidence = object(input, "parity evidence");
@@ -121,7 +121,7 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
   assertParityCollectorReadback(seed, collectors[0]!.effective_config);
   assertParityTableLayout(seed, collectors[0]!.layout_table_policies);
   const tunables = object(config.tunables, "tunables");
-  if (tunables.parquet_writer != null) throw new Error("historical parity must not override the writer");
+  if (!allowWriterOverrides && tunables.parquet_writer != null) throw new Error("historical parity must not override the writer");
   const writer = object(collectors[0]!.writer_policy_overrides, "writer policy");
   function hasOverride(value: unknown): boolean {
     if (value == null) return false;
@@ -129,7 +129,20 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
     if (typeof value === "object") return Object.values(value).some(hasOverride);
     return true;
   }
-  if (hasOverride(writer)) throw new Error("collector writer readback contains an override");
+  function assertWriter(actual: unknown, expected: unknown): void {
+    if (expected !== null && typeof expected === "object" && !Array.isArray(expected)) {
+      const requested = object(expected, "requested writer");
+      const observed = object(actual, "writer readback");
+      for (const [key, value] of Object.entries(requested)) assertWriter(observed[key], value);
+      for (const [key, value] of Object.entries(observed)) {
+        if (!(key in requested) && hasOverride(value)) throw new Error(`unexpected writer readback at ${key}`);
+      }
+    } else if (!isDeepStrictEqual(actual, expected)) {
+      throw new Error("writer readback differs from requested policy");
+    }
+  }
+  if (allowWriterOverrides && tunables.parquet_writer != null) assertWriter(writer, tunables.parquet_writer);
+  else if (hasOverride(writer)) throw new Error("collector writer readback contains an override");
   const admission = object(evidence.parity_admission_readback, "pre-admission readback");
   const schedule = object(object(evidence.client_schedule, "client schedule").effective, "effective client schedule");
   if (admission.status !== "verified_before_schedule" || !Number.isSafeInteger(admission.observed_at_unix_ms)
@@ -140,9 +153,9 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
   }
   const admissionCollector = object(admission.collector, "pre-admission collector");
   assertParityCollectorReadback(seed, admissionCollector);
-  if (hasOverride(object(admissionCollector.parquet_writer, "pre-admission writer"))) {
-    throw new Error("pre-admission writer readback contains an override");
-  }
+  const admissionWriter = object(admissionCollector.parquet_writer, "pre-admission writer");
+  if (allowWriterOverrides && tunables.parquet_writer != null) assertWriter(admissionWriter, tunables.parquet_writer);
+  else if (hasOverride(admissionWriter)) throw new Error("pre-admission writer readback contains an override");
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
     throw new Error("client readback is unavailable");
   }

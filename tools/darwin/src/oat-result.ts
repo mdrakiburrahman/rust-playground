@@ -124,8 +124,9 @@ export async function readReconciledOatResult(
   resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number | null,
   requestedProfile: ClientDataProfile, parity?: {
     config: unknown; decodeFile: (path: string, active: boolean) => Promise<number>; collectorRevision?: string;
+    allowWriterOverrides?: boolean;
   },
-  identity?: { tools: IdentityTools; outputDir: string },
+  identity?: { tools: IdentityTools; outputDir: string; collectorRevision?: string },
 ): Promise<{
   measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
@@ -138,8 +139,8 @@ export async function readReconciledOatResult(
     if (compressionLevel !== null || !parity || typeof parity.decodeFile !== "function") {
       throw new Error("diagnostic parity requires a physical footer inspector and no codec override");
     }
-  } else if (parity || compressionLevel === null) {
-    throw new Error("realistic compression requires its Zstd level and no parity override");
+  } else if (compressionLevel === null || (parity && (!parity.allowWriterOverrides || typeof parity.decodeFile !== "function"))) {
+    throw new Error("realistic compression requires its Zstd level and an explicitly qualified parity gate");
   }
   if (requestedProfile === "realistic" && !identity) {
     throw new Error("realistic replay requires full delivery identity reconciliation");
@@ -175,8 +176,9 @@ export async function readReconciledOatResult(
     throw new Error("collector capability does not match the run");
   }
   if (parity) {
-    assertParityEvidence(parity.config, evidence);
-  } else {
+    assertParityEvidence(parity.config, evidence, parity.allowWriterOverrides === true);
+  }
+  if (requestedProfile === "realistic") {
     const policy = object(object(collector.writer_policy_overrides, "writer policy").defaults, "writer defaults");
     if (policy.compression !== "zstd" || policy.compression_level !== compressionLevel) {
       throw new Error("collector configured compression does not match the run");
@@ -184,7 +186,9 @@ export async function readReconciledOatResult(
   }
   const images = processes.map(process => {
     if (typeof process.component !== "string" || process.log_complete !== true) throw new Error("incomplete OAT process evidence");
-    if (parity) assertParityProcessRevision(process, sourceRevision, parity.collectorRevision);
+    if (parity || identity?.collectorRevision) {
+      assertParityProcessRevision(process, sourceRevision, parity?.collectorRevision ?? identity?.collectorRevision);
+    }
     return `${process.component}:${imageId(process.image_id)}`;
   });
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
@@ -225,7 +229,7 @@ export async function readReconciledOatResult(
   const identityResult: { value: JsonObject | null } = { value: null };
   const proof = await reconcileStoppedSnapshot(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
-    parity ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.decodeFile,
+    compressionLevel === null ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.decodeFile,
     identity ? async paths => {
       identityResult.value = await verifyReconciledDelivery(identity.tools, identity.outputDir, resultsPath,
         createHash("sha256").update(bytes).digest("hex"), evidenceJson, table, paths);

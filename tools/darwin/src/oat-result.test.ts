@@ -41,6 +41,9 @@ test("refuses a diagnostic result without the physical parity gate", async () =>
     /requires its Zstd level/);
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", 3, "realistic"),
     /requires full delivery identity reconciliation/);
+  await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", 3, "realistic", {
+    config: {}, decodeFile: async () => 0,
+  }), /explicitly qualified parity gate/);
 });
 
 test("accepts matching Realistic evidence and reports client CPU separately", () => {

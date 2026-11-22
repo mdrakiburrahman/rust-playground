@@ -90,14 +90,19 @@ async function prepareRuntime(repo: string, home: string, manifest: SnapshotMani
   return runtime;
 }
 
-export async function runOat(runtime: string, configPath: string, home: string, toolDir: string, logPath: string, stackBytes: number, parity = false): Promise<void> {
+export async function runOat(runtime: string, configPath: string, home: string, toolDir: string, logPath: string,
+  stackBytes: number, parity: boolean | "qualified" = false, deadlineSeconds?: number): Promise<void> {
+  if (deadlineSeconds !== undefined && (!Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1 || deadlineSeconds > 600)) {
+    throw new Error("local launcher deadline must be an integer from 1 to 600 seconds");
+  }
   const log = await open(logPath, "wx");
   try {
     const env = cleanEnv(home, stackBytes);
-    if (parity) env.OAT_DARWIN_PARITY_PRECHECK = "1";
+    if (parity) env.OAT_DARWIN_PARITY_PRECHECK = parity === "qualified" ? "qualified" : "1";
     env.PATH = `${toolDir}:${env.PATH}`;
     const child = spawn(process.execPath, ["--import", "tsx", "projects/arrowcol-oat/cli.ts",
-      "--config", configPath, "--mode", "local", "--no-viewer"], {
+      "--config", configPath, "--mode", "local", "--no-viewer",
+      ...(deadlineSeconds === undefined ? [] : ["--deadline-seconds", String(deadlineSeconds)])], {
       cwd: runtime, env, stdio: ["ignore", log.fd, log.fd],
     });
     const timedOut = { value: false };
@@ -174,6 +179,41 @@ async function prepareIdentityTools(
   };
 }
 
+async function replayCompressionArm(
+  data: string, label: string, raw: unknown, level: number, producerRevision: string,
+  runtime: string, home: string, preparedBinaryHash: string, identityTools: IdentityTools,
+  bindHost: string, endpointHost: string, stackBytes: number,
+) {
+  const runRoot = await mkdtemp(join(data, `${label}-`));
+  const runHome = join(runRoot, "home");
+  await mkdir(runHome);
+  const config = object(structuredClone(raw), "run config");
+  const platform = object(config.platform, "platform");
+  if (platform.kind !== "local" || !Array.isArray(config.tables) || config.tables.length !== 1
+    || config.tables[0] !== "sqlserver_availability_replica_states") throw new Error("unsupported replay topology or fixture");
+  platform.compose_state_root = join(runRoot, "state");
+  platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
+  config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
+  config.website_url = pathToFileURL(join(runRoot, "site", "results.parquet")).href;
+  const configPath = join(runRoot, "config.json");
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o400 });
+  const configHash = await sha256(configPath);
+  await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"), stackBytes);
+  if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
+  const result = await readReconciledOatResult(
+    join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producerRevision, level, "realistic",
+    undefined, { tools: identityTools, outputDir: runRoot },
+  );
+  const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
+  if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");
+  const env = cleanEnv(runHome, stackBytes);
+  if (git(runtime, env, "rev-parse", "HEAD") !== producerRevision
+    || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {
+    throw new Error("trusted source changed during OAT run");
+  }
+  return { ...result, binaryHash, configHash, runRoot };
+}
+
 export async function replayCompressionPair(
   repo: string, home: string, candidate: unknown, bindHost: string, endpointHost: string, stackBytes: number, baselineOnly = false,
 ): Promise<JsonObject> {
@@ -204,34 +244,8 @@ export async function replayCompressionPair(
     const arms: [string, unknown, number][] = [["baseline", seed, baselineLevel]];
     if (!baselineOnly) arms.push(["candidate", candidate, candidateLevel]);
     for (const [label, raw, level] of arms) {
-      const runRoot = await mkdtemp(join(data, `${label}-`));
-      const runHome = join(runRoot, "home");
-      await mkdir(runHome);
-      const config = object(structuredClone(raw), "run config");
-      const platform = object(config.platform, "platform");
-      if (platform.kind !== "local" || !Array.isArray(config.tables) || config.tables.length !== 1
-        || config.tables[0] !== "sqlserver_availability_replica_states") throw new Error("unsupported replay topology or fixture");
-      platform.compose_state_root = join(runRoot, "state");
-      platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
-      config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
-      config.website_url = pathToFileURL(join(runRoot, "site", "results.parquet")).href;
-      const configPath = join(runRoot, "config.json");
-      await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o400 });
-      const configHash = await sha256(configPath);
-      await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"), stackBytes);
-      if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
-      const result = await readReconciledOatResult(
-        join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producer.revision, level, seedClient.data_profile,
-        undefined, { tools: identityTools, outputDir: runRoot },
-      );
-      const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
-      if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");
-      const env = cleanEnv(runHome, stackBytes);
-      if (git(runtime, env, "rev-parse", "HEAD") !== producer.revision
-        || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {
-        throw new Error("trusted source changed during OAT run");
-      }
-      results.push({ ...result, binaryHash, configHash, runRoot });
+      results.push(await replayCompressionArm(data, label, raw, level, producer.revision, runtime, home,
+        preparedBinaryHash, identityTools, bindHost, endpointHost, stackBytes));
     }
     const [baseline, candidateResult] = results;
     if (baselineOnly && baseline) {

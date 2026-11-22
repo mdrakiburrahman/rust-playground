@@ -4997,10 +4997,11 @@ async fn run_clients_inner(
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    if std::env::var("OAT_DARWIN_PARITY_PRECHECK").as_deref() == Ok("1") {
+    let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
+    if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
         let readback = async {
             let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
-            parity_admission_readback(config, &logs, &ready_clients)
+            parity_admission_readback(config, &logs, &ready_clients, darwin_precheck.as_deref() == Ok("qualified"))
         }
         .await;
         match readback {

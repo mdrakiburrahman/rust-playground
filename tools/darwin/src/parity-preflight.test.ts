@@ -148,6 +148,21 @@ test("collector parity readback rejects drift in historical limits and local pre
       last_caps: [{ metric: "container_memory_bytes", confirmed: true, cap: 92341796864 }] },
   };
   assert.doesNotThrow(() => assertParityEvidence(seed, evidence));
+  const requestedWriter = { defaults: { compression: "zstd", compression_level: 3 }, max_row_group_rows: 262144 };
+  const qualifiedSeed = { ...seed, tunables: { ...seed.tunables, parquet_writer: requestedWriter } };
+  const qualifiedEvidence = {
+    ...structuredClone(evidence),
+    processes: [{ ...structuredClone(evidence.processes[0]!), writer_policy_overrides: {
+      ...structuredClone(requestedWriter), columns: {} as Record<string, unknown> } }],
+    parity_admission_readback: { ...structuredClone(evidence.parity_admission_readback),
+      collector: { ...structuredClone(readback), parquet_writer: { ...structuredClone(requestedWriter), columns: {} } } },
+  };
+  assert.doesNotThrow(() => assertParityEvidence(qualifiedSeed, qualifiedEvidence, true));
+  qualifiedEvidence.parity_admission_readback.collector.parquet_writer.defaults.compression_level = 4;
+  assert.throws(() => assertParityEvidence(qualifiedSeed, qualifiedEvidence, true), /writer readback differs/);
+  qualifiedEvidence.parity_admission_readback.collector.parquet_writer.defaults.compression_level = 3;
+  qualifiedEvidence.processes[0]!.writer_policy_overrides.columns = { unexpected: { compression: "snappy" } };
+  assert.throws(() => assertParityEvidence(qualifiedSeed, qualifiedEvidence, true), /unexpected writer readback/);
   assert.throws(() => assertParityEvidence({ ...seed, tunables: { ...seed.tunables, parquet_writer: {} } }, evidence),
     /must not override the writer/);
   assert.throws(() => assertParityEvidence(seed, {
