@@ -63,7 +63,12 @@ fn ticks_per_second() -> Result<u64> {
     Ok(value)
 }
 
-fn verify_snapshot(root: &Path, expected: &BTreeMap<PathBuf, u64>, expected_version: u64) -> Result<(usize, u64)> {
+fn verify_snapshot(
+    root: &Path,
+    expected: &BTreeMap<PathBuf, u64>,
+    expected_groups: &BTreeMap<PathBuf, usize>,
+    expected_version: u64,
+) -> Result<(usize, u64)> {
     let url = Url::from_directory_path(fs::canonicalize(root)?).map_err(|()| anyhow::anyhow!("table URL"))?;
     let engine = DefaultEngineBuilder::new(Arc::new(object_store::local::LocalFileSystem::new())).build();
     let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
@@ -102,6 +107,7 @@ fn verify_snapshot(root: &Path, expected: &BTreeMap<PathBuf, u64>, expected_vers
             .to_file_path()
             .map_err(|()| anyhow::anyhow!("active file URL"))?;
         ensure!(expected.get(&path) == Some(&size), "active file differs from receipt");
+        let expected_group = *expected_groups.get(&path).context("active file lacks source group")?;
         ensure!(fs::metadata(&path)?.len() == size, "active file size differs from Add");
         bytes += size;
         let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?.build()?;
@@ -120,6 +126,10 @@ fn verify_snapshot(root: &Path, expected: &BTreeMap<PathBuf, u64>, expected_vers
             for row in 0..batch.num_rows() {
                 let id = values.value(row);
                 let id_usize = usize::try_from(id)?;
+                ensure!(
+                    id_usize / ROWS == expected_group,
+                    "receipt file has another group's rows"
+                );
                 let expected_payload = format!("value-{:04}-{:08}", id_usize / ROWS, id_usize % ROWS);
                 ensure!(
                     payloads.value(row) == expected_payload,
@@ -168,6 +178,7 @@ async fn local_commit_pipeline_profile() -> Result<()> {
     ensure!(warmup_result.files.len() == 1, "wrong warmup receipt shape");
     let mut expected_files = BTreeMap::new();
     expected_files.insert(warmup_result.files[0].path.clone(), warmup_result.files[0].bytes);
+    let mut expected_groups = BTreeMap::from([(warmup_result.files[0].path.clone(), 0)]);
 
     let batches = (1..=GROUPS).map(input).collect::<Result<Vec<_>>>()?;
     let ticks_hz = ticks_per_second()?;
@@ -229,6 +240,7 @@ async fn local_commit_pipeline_profile() -> Result<()> {
                 .is_none(),
             "duplicate file in receipts"
         );
+        expected_groups.insert(result.files[0].path.clone(), index + 1);
         ensure!(receipts.insert(id), "duplicate receipt identity");
         if let Some(duration) = result.commit_duration {
             commit += duration;
@@ -249,7 +261,12 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         "missing durable transaction"
     );
     drop(table);
-    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, u64::try_from(GROUPS + 1)?)?;
+    let (active_rows, active_bytes) = verify_snapshot(
+        root.path(),
+        &expected_files,
+        &expected_groups,
+        u64::try_from(GROUPS + 1)?,
+    )?;
     let root_url =
         Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
     for version in 1..=GROUPS + 1 {
@@ -428,6 +445,7 @@ async fn local_natural_cohort_screen() -> Result<()> {
     let encode = waves.iter().map(|wave| wave.encode).sum::<Duration>();
     let submit = waves.iter().map(|wave| wave.submit).sum::<Duration>();
     let mut expected_files = BTreeMap::new();
+    let mut expected_groups = BTreeMap::new();
     let mut cohorts: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     let mut cohort_files: BTreeMap<u64, BTreeMap<PathBuf, u64>> = BTreeMap::new();
     let mut cohort_commits: BTreeMap<u64, Duration> = BTreeMap::new();
@@ -450,6 +468,7 @@ async fn local_natural_cohort_screen() -> Result<()> {
                     .is_none(),
                 "duplicate file receipt"
             );
+            expected_groups.insert(result.files[0].path.clone(), *index);
             cohort_files
                 .entry(result.version)
                 .or_default()
@@ -505,7 +524,7 @@ async fn local_natural_cohort_screen() -> Result<()> {
         "replay changed durable files or version"
     );
     drop(table);
-    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, last_version)?;
+    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, &expected_groups, last_version)?;
     let root_url =
         Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
     let mut remaining = expected_files;
