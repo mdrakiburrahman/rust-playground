@@ -26,7 +26,7 @@ interface Resource {
   } } };
 }
 
-async function fixture(scaled = true, failure?: 'missing-client' | 'failed-client' | 'partial-start' | 'collector-create' | 'pool-drift' | 'untrusted') {
+async function fixture(scaled = true, failure?: 'missing-client' | 'failed-client' | 'partial-start' | 'collector-create' | 'pool-drift' | 'untrusted' | 'unknown-quota') {
   const directory = await mkdtemp(join(tmpdir(), 'scaled-cli-'));
   const runId = randomUUID();
   const runHex = runId.replaceAll('-', '');
@@ -146,7 +146,7 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
             { name: 'Standard_E192ids_v6', family: 'E', restrictions: [], capabilities: [{ name: 'vCPUs', value: '192' }, { name: 'MemoryGB', value: '1832' }] },
             { name: 'Standard_D64ds_v6', family: 'D', restrictions: [], capabilities: [{ name: 'vCPUs', value: '64' }, { name: 'MemoryGB', value: '256' }] },
           ]);
-          return ok(['E', 'D', 'cores'].map(value => ({ name: { value }, currentValue: 0, limit: 2000 })));
+          return ok(['E', 'D', 'cores'].map(value => ({ name: { value }, currentValue: failure === 'unknown-quota' ? null : 0, limit: 2000 })));
         }
         if (args[1] === 'deployment') {
           const parameters = JSON.parse(await readFile(arg(args, '--parameters').slice(1), 'utf8'));
@@ -360,6 +360,15 @@ test('actual CLI cleanup preserves externally drifted client pool settings rathe
     assert.equal(f.state().clientMax, 3);
     assert.equal(f.state().collectorPool, undefined);
     assert.equal(f.commands.some(command => command.includes('--max-count') && command[command.indexOf('--max-count') + 1] === '1'), false);
+  } finally { await f.dispose(); }
+});
+
+test('scaled CLI rejects unknown quota usage before any workload or pool write', async () => {
+  const f = await fixture(true, 'unknown-quota');
+  try {
+    assert.equal(await main(f.args, f.dependencies), 1);
+    assert.ok(!f.commands.some(args => args[1] === 'deployment' || args.includes('apply') || args.includes('update')));
+    assert.deepEqual(f.state(), { namespace: undefined, collectorPool: undefined, clientMax: 1, clientNodes: 0 });
   } finally { await f.dispose(); }
 });
 

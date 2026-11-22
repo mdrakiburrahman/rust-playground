@@ -808,12 +808,12 @@ async function assertScaledCapacity(config: Config, options: ScaledOptions): Pro
     if (!isRecord(memoryCapability) || !Number.isFinite(Number(memoryCapability.value)) || Number(memoryCapability.value) <= memory ||
         !isRecord(cpuCapability) || Number(cpuCapability.value) !== cpuRequired) throw new Error('Selected scaled SKU has insufficient or unknown resources.');
     const quota = usage.find(value => isRecord(value) && isRecord(value.name) && value.name.value === sku.family);
-    if (!isRecord(quota) || !Number.isFinite(Number(quota.limit)) || !Number.isFinite(Number(quota.currentValue)) ||
-        Number(quota.limit) - Number(quota.currentValue) < cores) throw new Error('Insufficient scaled SKU family quota: ' + skuName);
+    if (!isRecord(quota) || argNumber(quota.limit, 'Scaled SKU quota limit') -
+        argNumber(quota.currentValue, 'Scaled SKU quota current usage') < cores) throw new Error('Insufficient scaled SKU family quota: ' + skuName);
   }
   const total = usage.find(value => isRecord(value) && isRecord(value.name) && value.name.value === 'cores');
-  if (!isRecord(total) || !Number.isFinite(Number(total.limit)) || !Number.isFinite(Number(total.currentValue)) ||
-      Number(total.limit) - Number(total.currentValue) < collectorShapes[options.collectorShape].vcpus + 64 * options.clientCount) {
+  if (!isRecord(total) || argNumber(total.limit, 'Regional quota limit') -
+      argNumber(total.currentValue, 'Regional quota current usage') < collectorShapes[options.collectorShape].vcpus + 64 * options.clientCount) {
     throw new Error('Insufficient regional scaled vCPU quota.');
   }
   const cluster = requireRecord(parseJson(await command(['az', 'aks', 'show', '--subscription', config.subscription,
