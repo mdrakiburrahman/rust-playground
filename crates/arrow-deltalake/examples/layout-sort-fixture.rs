@@ -1,3 +1,10 @@
+//! Run with `cargo run --locked --release -p arrow-deltalake --no-default-features
+//! --example layout-sort-fixture -- parity|nulls|stress ITERATIONS`.
+//! The parity corpus models per-batch constant customer IDs; the other cases
+//! are synthetic nullable-key stress cases. Arrow's ordering is unstable for
+//! ties. CPU ticks use Linux process accounting (`getconf CLK_TCK` for units);
+//! peak RSS is a whole-process high-water mark including corpus and reference.
+
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
