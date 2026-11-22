@@ -75,89 +75,6 @@ pub fn check(baseline: &Value, candidate: &Value, schema: &SchemaRef) -> Result<
                 defaults.remove(key);
             }
         }
-
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-            use serde_json::json;
-
-            fn schema() -> SchemaRef {
-                collector_chain::dmv::tables()
-                    .unwrap()
-                    .into_iter()
-                    .find(|table| table.identity().table().as_str() == "sqlserver_availability_replica_states")
-                    .unwrap()
-                    .schema()
-                    .clone()
-            }
-            fn baseline() -> Value {
-                json!({"tunables":{"parquet_writer":{"defaults":{"compression":"zstd","compression_level":1}}}})
-            }
-            #[test]
-            fn codec_and_dictionary_coordinates_use_registry_and_physical_schema() {
-                let base = baseline();
-                for (codec, level, family) in [
-                    ("snappy", Value::Null, "SNAPPY"),
-                    ("lz4_raw", Value::Null, "LZ4_RAW"),
-                    ("zstd", json!(6), "ZSTD"),
-                    ("gzip", json!(9), "GZIP"),
-                    ("brotli", json!(11), "BROTLI"),
-                    ("uncompressed", Value::Null, "UNCOMPRESSED"),
-                ] {
-                    let mut candidate = base.clone();
-                    candidate["tunables"]["parquet_writer"]["defaults"] =
-                        json!({"compression":codec,"compression_level":level});
-                    let selection = check(&base, &candidate, &schema()).unwrap();
-                    assert_eq!(selection.coordinate, "codec");
-                    assert!(selection.expected_codecs.iter().all(|value| value == family));
-                }
-                let mut candidate = base.clone();
-                candidate["tunables"]["parquet_writer"]["columns"] =
-                    json!({"customer_id":{"dictionary_enabled":false}});
-                assert_eq!(
-                    check(&base, &candidate, &schema()).unwrap().coordinate,
-                    "dictionary:customer_id"
-                );
-            }
-
-            #[test]
-            fn rejects_invalid_and_multi_coordinate_candidates() {
-                let base = baseline();
-                for defaults in [
-                    json!({"compression":"zstdd","compression_level":1}),
-                    json!({"compression":"zstd","compression_level":23}),
-                    json!({"compression":"snappy","compression_level":1}),
-                    json!({"compression":"lz4","compression_level":null}),
-                    json!({"compression":"gzip","compression_level":10}),
-                    json!({"compression":"brotli","compression_level":-1}),
-                    json!({"compression":"zstd","compression_level":"1"}),
-                    json!({"compression":"zstd","compression_level":1,"misspelled":true}),
-                ] {
-                    let mut candidate = base.clone();
-                    candidate["tunables"]["parquet_writer"]["defaults"] = defaults;
-                    assert!(check(&base, &candidate, &schema()).is_err());
-                }
-                for columns in [
-                    json!({"missing":{"dictionary_enabled":false}}),
-                    json!({"customer_id":{"dictionary_enabled":"false"}}),
-                    json!({"customer_id":{"dictionary_enabled":false,"encoding":"plain"}}),
-                    json!({"customer_id":{"dictionary_enabled":false},"endpoint_url":{"dictionary_enabled":false}}),
-                    json!([]),
-                ] {
-                    let mut candidate = base.clone();
-                    candidate["tunables"]["parquet_writer"]["columns"] = columns;
-                    assert!(check(&base, &candidate, &schema()).is_err());
-                }
-                let mut candidate = base.clone();
-                candidate["tunables"]["parquet_writer"]["defaults"]["compression_level"] = json!(2);
-                candidate["tunables"]["parquet_writer"]["columns"] =
-                    json!({"customer_id":{"dictionary_enabled":false}});
-                assert!(check(&base, &candidate, &schema()).is_err());
-                candidate = base.clone();
-                candidate["extra"] = json!(true);
-                assert!(check(&base, &candidate, &schema()).is_err());
-            }
-        }
     }
     if restored == *baseline {
         let changed = before.get("compression") != after.get("compression")
@@ -235,4 +152,85 @@ pub fn check(baseline: &Value, candidate: &Value, schema: &SchemaRef) -> Result<
         coordinate: format!("dictionary:{name}"),
         expected_codecs: codecs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schema() -> SchemaRef {
+        collector_chain::dmv::tables()
+            .unwrap()
+            .into_iter()
+            .find(|table| table.identity().table().as_str() == "sqlserver_availability_replica_states")
+            .unwrap()
+            .schema()
+            .clone()
+    }
+    fn baseline() -> Value {
+        json!({"tunables":{"parquet_writer":{"defaults":{"compression":"zstd","compression_level":1}}}})
+    }
+    #[test]
+    fn codec_and_dictionary_coordinates_use_registry_and_physical_schema() {
+        let base = baseline();
+        for (codec, level, family) in [
+            ("snappy", Value::Null, "SNAPPY"),
+            ("lz4_raw", Value::Null, "LZ4_RAW"),
+            ("zstd", json!(6), "ZSTD"),
+            ("gzip", json!(9), "GZIP"),
+            ("brotli", json!(11), "BROTLI"),
+            ("uncompressed", Value::Null, "UNCOMPRESSED"),
+        ] {
+            let mut candidate = base.clone();
+            candidate["tunables"]["parquet_writer"]["defaults"] =
+                json!({"compression":codec,"compression_level":level});
+            let selection = check(&base, &candidate, &schema()).unwrap();
+            assert_eq!(selection.coordinate, "codec");
+            assert!(selection.expected_codecs.iter().all(|value| value == family));
+        }
+        let mut candidate = base.clone();
+        candidate["tunables"]["parquet_writer"]["columns"] = json!({"customer_id":{"dictionary_enabled":false}});
+        assert_eq!(
+            check(&base, &candidate, &schema()).unwrap().coordinate,
+            "dictionary:customer_id"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_and_multi_coordinate_candidates() {
+        let base = baseline();
+        for defaults in [
+            json!({"compression":"zstdd","compression_level":1}),
+            json!({"compression":"zstd","compression_level":23}),
+            json!({"compression":"snappy","compression_level":1}),
+            json!({"compression":"lz4","compression_level":null}),
+            json!({"compression":"gzip","compression_level":10}),
+            json!({"compression":"brotli","compression_level":-1}),
+            json!({"compression":"zstd","compression_level":"1"}),
+            json!({"compression":"zstd","compression_level":1,"misspelled":true}),
+        ] {
+            let mut candidate = base.clone();
+            candidate["tunables"]["parquet_writer"]["defaults"] = defaults;
+            assert!(check(&base, &candidate, &schema()).is_err());
+        }
+        for columns in [
+            json!({"missing":{"dictionary_enabled":false}}),
+            json!({"customer_id":{"dictionary_enabled":"false"}}),
+            json!({"customer_id":{"dictionary_enabled":false,"encoding":"plain"}}),
+            json!({"customer_id":{"dictionary_enabled":false},"endpoint_url":{"dictionary_enabled":false}}),
+            json!([]),
+        ] {
+            let mut candidate = base.clone();
+            candidate["tunables"]["parquet_writer"]["columns"] = columns;
+            assert!(check(&base, &candidate, &schema()).is_err());
+        }
+        let mut candidate = base.clone();
+        candidate["tunables"]["parquet_writer"]["defaults"]["compression_level"] = json!(2);
+        candidate["tunables"]["parquet_writer"]["columns"] = json!({"customer_id":{"dictionary_enabled":false}});
+        assert!(check(&base, &candidate, &schema()).is_err());
+        candidate = base.clone();
+        candidate["extra"] = json!(true);
+        assert!(check(&base, &candidate, &schema()).is_err());
+    }
 }
