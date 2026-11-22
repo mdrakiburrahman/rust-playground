@@ -37,8 +37,8 @@ $gcm = @((Get-Command git-credential-manager -ErrorAction SilentlyContinue).Sour
 $origin = git -C $PSScriptRoot remote get-url origin
 $env:GCM_INTERACTIVE = 'never'
 $env:GIT_TERMINAL_PROMPT = '0'
-git ls-remote --exit-code --heads $origin $Branch | Out-Null
-if ($LASTEXITCODE) { throw "Cannot read $Branch from $origin without a prompt; push it, or run 'git fetch' in $PSScriptRoot once to sign in, then rerun." }
+git ls-remote --exit-code --heads $origin $Branch 2>$null | Out-Null
+if ($LASTEXITCODE) { throw "Cannot read $Branch from origin without a prompt; push it, or run 'git fetch' in $PSScriptRoot once to sign in, then rerun." }
 
 # See: https://github.com/microsoft/vscode-remote-release/issues/11480
 $sshDir = Join-Path $env:USERPROFILE ".ssh"
@@ -210,5 +210,39 @@ wsl --manage Ubuntu-24.04 --set-default-user $LinuxUser
 if ($LASTEXITCODE) { throw "Could not make $LinuxUser the default WSL user." }
 
 Write-Host "Cloning $Branch into /workspaces/rust-playground"
-wsl -d Ubuntu-24.04 --cd ~ --exec bash -c 'git config --global user.name "$1" && git config --global user.email "$2" && git config --global credential.helper "$(printf %q "$(wslpath -u "$5")")" && GIT_TERMINAL_PROMPT=0 git clone --recurse-submodules --branch "$3" "$4" /workspaces/rust-playground' bash (git -C $PSScriptRoot config user.name) (git -C $PSScriptRoot config user.email) $Branch $origin $gcm
+$cloneScript = @'
+set -u
+git config --global user.name "$1" &&
+git config --global user.email "$2" &&
+git config --global credential.helper "$(printf %q "$(wslpath -u "$5")")" || exit $?
+target=$6
+error_file=$(mktemp) || exit 1
+trap 'rm -f -- "$error_file"' EXIT
+for attempt in 1 2 3 4; do
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        echo "Clone destination already exists; refusing to overwrite it." >&2
+        exit 1
+    fi
+    if GIT_TERMINAL_PROMPT=0 git clone --recurse-submodules --branch "$3" "$4" "$target" >"$error_file" 2>&1; then
+        exit 0
+    else
+        status=$?
+    fi
+    if ! grep -qiE 'could not resolve host|could not resolve hostname|temporary failure in name resolution' "$error_file"; then
+        echo "Git clone failed with exit code $status; check the branch and authentication." >&2
+        exit "$status"
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        echo "Git clone failed on DNS and left a destination; refusing to overwrite it." >&2
+        exit "$status"
+    fi
+    if [ "$attempt" -eq 4 ]; then
+        echo "Git clone failed on DNS after $attempt attempts." >&2
+        exit "$status"
+    fi
+    echo "Git clone failed on DNS; retrying (attempt $attempt of 4)." >&2
+    sleep $((2 ** attempt))
+done
+'@
+wsl -d Ubuntu-24.04 --cd ~ --exec bash -c $cloneScript bash (git -C $PSScriptRoot config user.name) (git -C $PSScriptRoot config user.email) $Branch $origin $gcm /workspaces/rust-playground
 if ($LASTEXITCODE) { throw "Could not clone $Branch into /workspaces/rust-playground." }
