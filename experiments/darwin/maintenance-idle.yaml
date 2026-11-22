@@ -1,0 +1,66 @@
+name: maintenance-idle
+executor:
+  parallelism: 1
+  termination:
+    max_iterations: 24
+    early_stopping:
+      max_iterations_without_improvement: 8
+      metric: combined_score
+      min_improvement: 0.02
+      improvement_type: absolute
+container:
+  provider: docker
+agents:
+  - provider: copilot
+    timeout: 900
+    models:
+      - name: claude-sonnet-5
+samplers:
+  - provider: islands
+prompt:
+  provider: default
+  system: |
+    Only modify the trusted evaluator's allowlisted production files or configuration fields. The prompt does not enforce that boundary. Preserve authentication, freshness, replay protection, fencing, schema validation, durability, cancellation, shutdown, memory limits, and measurements. Do not edit tests, fixtures, evaluator, dependencies, scoring, or workload identity and data profile. No cloud access or trace publication. Return a small patch and explain the hypothesis and trade-offs.
+    
+    The trusted runner owns all commands, candidate and seed selection. The present evaluator refuses code and throughput lanes; compression supports only a non-qualifying single-pair Zstd-level smoke. These recipes alone do not enable a campaign.
+  agent: |
+    Design proposal only; the trusted evaluator currently refuses this lane.
+    
+    Work only in approved production regions of crates/arrow-deltalake/src/maintenance.rs,
+    centered on probe_no_work_with_inventory and directly necessary helpers.
+    Inventory reuse and fresh log object identity rechecks already exist.
+    Score inverse elapsed cost for the same fixed number of probe invocations
+    across empty, quiescent, protected, and newly-due fixtures. The invocation
+    schedule is frozen; sleeping longer or skipping a probe is not an optimization.
+    Inject commits and retention/eligibility transitions after a negative probe.
+    Preserve post-probe invalidation, genuinely due work, ETag/If-Match,
+    no-op zero commits, bounds and mandatory cadence. Exact I/O counts need a
+    trusted measurement hook; do not infer them from operation duration.
+evaluator:
+  timeout: 1800
+  retries: 0
+  builtin_metrics: []
+  imports: [json, math]
+  commands:
+    - /usr/local/bin/arrowcol-darwin-eval maintenance-idle
+  metrics:
+    combined_score: !exec |
+      records = [line[8:] for line in stdout if line.startswith("@RESULT ")]
+      nonempty = [line for line in stdout if line.strip()]
+      if len(records) != 1 or not nonempty or not nonempty[-1].startswith("@RESULT "):
+          raise ValueError("expected exactly one terminal trusted result")
+      result = json.loads(records[0])
+      if type(result) is not dict:
+          raise ValueError("result must be an object")
+      valid = result.get("valid")
+      score = result.get("combined_score")
+      if type(valid) is not int or valid not in (0, 1):
+          raise ValueError("valid must be integer zero or one")
+      if type(score) not in (int, float) or not math.isfinite(score):
+          raise ValueError("score must be a finite number")
+      if score < 0 or (valid == 0 and score != 0) or (valid == 1 and score <= 0):
+          raise ValueError("invalid candidates score zero; valid scores are positive")
+      return float(score)
+    valid: !eval 'json.loads(next(line for line in reversed(stdout) if line.startswith("@RESULT "))[8:])["valid"]'
+  artifacts:
+    feedback: !eval '"\n".join(line[10:] for line in stdout if line.startswith("@FEEDBACK "))'
