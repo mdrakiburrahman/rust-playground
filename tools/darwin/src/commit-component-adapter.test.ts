@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,12 +12,13 @@ import {
   type CommitCellRequest,
   type CommitComponentHost,
 } from "./commit-component-adapter.js";
+import { reconcileStoppedCommitTable } from "./commit-component-reconciler.js";
 
 const pin: AdmittedCommitPin = {
-  revision: "6fa4c07731921cfa7f52e6419bad08da3dab0801",
-  binarySha256: "8a61cb097391091640df3d6e6f89d34d37b32512af9ce4780eb0df46780f14e2",
-  fixtureSha256: "f3806825344e082b9af27606eaa901a28fc08863069d2d04331e6b016d8c9ccb",
-  entrySha256: "bb33de6dbcdfe6c6ffde2834fb44b41b3905fb988f0893aca478d65f4df73e06",
+  revision: "81e0f384730c518e85a7dff7f2ec7cc39b0addfb",
+  binarySha256: "05a75a0f1082063a4bac08a44667c8802be3e4b74187a8d47a143873149d2598",
+  fixtureSha256: "26003fc4ce54e18f19ace9f549a2b9c01ca11e5c67522090b902c09a0ee53a42",
+  entrySha256: "f87b78dadd63b0b0560034223be8ce14fe7cddddd9037dee2a19cb4b42848f18",
 };
 
 function completeResult(): Record<string, unknown> {
@@ -132,6 +133,9 @@ test("refuses failed, unsettled or mismatched executions and incomplete results"
       const receipt = await valid.runAdmittedCell(request);
       return { ...receipt, settled: false };
     },
+    async reconcileStoppedCell() {
+      assert.fail("must not reconcile before process-tree settlement");
+    },
   }), /exit zero and settle/);
   await assert.rejects(evaluateCommitComponent({
     ...valid,
@@ -187,28 +191,78 @@ test("different candidate never receives an A-A ratio or a score", async (t) => 
 });
 
 const runAa = process.env.DARWIN_COMMIT_AA === "1";
-test("known pinned fixture release binary A-A", { skip: !runAa, timeout: 240_000 }, async () => {
+test("known pinned fixture and external oracle A-A", { skip: !runAa, timeout: 1_200_000 }, async () => {
   const repo = process.cwd();
   const binary = path.join(repo, "target/release/examples/darwin_commit_component");
+  const oracle = path.join(repo, "target/release/delta-inspect");
   const fixture = path.join(repo, "crates/arrow-deltalake/tests/darwin_commit_pipeline.rs");
   const entry = path.join(repo, "crates/arrow-deltalake/examples/darwin_commit_component.rs");
   const digest = async (file: string) => createHash("sha256").update(await readFile(file)).digest("hex");
+  const oracleSha256 = "a0e35d7b3abf55404e4181950984ab57dee009b0c91b4b7f49b4268afd18f973";
   assert.equal(await digest(binary), pin.binarySha256);
+  assert.equal(await digest(oracle), oracleSha256);
   assert.equal(await digest(fixture), pin.fixtureSha256);
   assert.equal(await digest(entry), pin.entrySha256);
   const root = await scratch();
   const exec = promisify(execFile);
-  const host = fakeHost(root, async ({ resultPath }) => {
+  await exec("git", ["merge-base", "--is-ancestor", pin.revision, "HEAD"], { cwd: repo });
+  const host = fakeHost(root, async ({ resultPath, tablePath }) => {
     assert.equal(await digest(binary), pin.binarySha256);
-    await exec(binary, ["--result", resultPath], {
+    await exec(binary, ["--result", resultPath, "--table-root", tablePath], {
       env: { PATH: "/usr/bin:/bin", HOME: root, TMPDIR: root },
       timeout: 90_000,
       maxBuffer: 64 * 1024,
     });
   });
+  let exercisedTampering = false;
+  host.reconcileStoppedCell = async (tablePath) => {
+    assert.equal(await digest(oracle), oracleSha256);
+    const { stdout } = await exec(oracle, ["summarize", path.dirname(tablePath), "--table", "table"], {
+      env: { PATH: "/usr/bin:/bin", HOME: root, TMPDIR: root },
+      timeout: 240_000,
+      maxBuffer: 512 * 1024 * 1024,
+    });
+    const snapshot = JSON.parse(stdout) as {
+      tables: { table: { files: Array<{ path: string }>; row_hashes: Record<string, number> } };
+    };
+    const summary = await reconcileStoppedCommitTable(tablePath, snapshot);
+    if (!exercisedTampering) {
+      const log = path.join(tablePath, "_delta_log", "00000000000000000001.json");
+      const original = await readFile(log, "utf8");
+      const changed = original.replace(/("appId"\s*:\s*")continuous-0000(")/, "$1continuous-9999$2");
+      assert.notEqual(changed, original);
+      try {
+        await writeFile(log, changed);
+        await assert.rejects(reconcileStoppedCommitTable(tablePath, snapshot), /warmup cohort|transaction identity/);
+      } finally {
+        await writeFile(log, original);
+      }
+      const parquet = path.join(tablePath, snapshot.tables.table.files[0]!.path);
+      const size = (await stat(parquet)).size;
+      try {
+        await appendFile(parquet, Buffer.from([0]));
+        await assert.rejects(reconcileStoppedCommitTable(tablePath, snapshot), /physical file size/);
+      } finally {
+        await truncate(parquet, size);
+      }
+      const hashes = snapshot.tables.table.row_hashes;
+      const key = Object.keys(hashes)[0]!;
+      const value = hashes[key]!;
+      delete hashes[key];
+      try {
+        await assert.rejects(reconcileStoppedCommitTable(tablePath, snapshot), /distinct row count/);
+      } finally {
+        hashes[key] = value;
+      }
+      exercisedTampering = true;
+      console.log("COMMIT_NEGATIVE rejected altered transaction, physical bytes and missing row");
+    }
+    return summary;
+  };
   const result = await evaluateCommitComponent(host);
   assert.equal(result.valid, 0);
   assert.equal(result.combined_score, 0);
+  assert.equal(exercisedTampering, true);
   assert.equal(result.calibration?.wallSeconds.control.length, 3);
   assert.equal(result.calibration?.wallSeconds.candidate.length, 3);
   console.log(`COMMIT_AA ${JSON.stringify(result)}`);

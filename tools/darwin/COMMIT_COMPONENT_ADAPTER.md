@@ -30,4 +30,4 @@ a code-speedup, DFE ACK, Azure upload or end-to-end throughput measurement.
 | Check | Command |
 |---|---|
 | Focused tests | `npx --no-install tsx --test tools/darwin/src/commit-component-adapter.test.ts` |
-| Known pinned fixture A-A | Build the `6fa4c077` release fixture, then set `DARWIN_COMMIT_AA=1` for the focused test. The test verifies the exact known fixture and binary hashes and preserves its scratch results. This diagnostic is not an isolation test. |
+| Known pinned fixture A-A | Build the `81e0f384` fixture and `delta-inspect` in release mode, then run `NODE_OPTIONS=--max-old-space-size=4096 DARWIN_COMMIT_AA=1 npx --no-install tsx --test tools/darwin/src/commit-component-adapter.test.ts`. The opt-in diagnostic requires the exact recorded executable and source hashes; rebuilds with different toolchains may not match. It retains its scratch results and is not an isolation test. |

@@ -120,9 +120,13 @@ export async function reconcileStoppedCommitTable(
         const add = object(action.add, "Add");
         const name = relativePath(add.path);
         const bytes = integer(add.size, "Add size", 1);
-        if (adds.has(name) || add.deletionVector != null
+        if (adds.has(name) || add.deletionVector != null || add.dataChange !== true
           || Object.keys(object(add.partitionValues, "Add partition values")).length !== 0) {
           throw new Error("duplicate or unsupported Add");
+        }
+        if (typeof add.stats !== "string"
+          || integer(object(JSON.parse(add.stats) as unknown, "Add stats").numRecords, "Add rows") !== ROWS) {
+          throw new Error("invalid Add row count");
         }
         adds.set(name, bytes);
         if (index === 1) warmupBytes += bytes;
