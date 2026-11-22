@@ -125,7 +125,14 @@ mod fixture {
         }
         ensure!(before_rows == after_rows, "active physical rows changed");
         ensure!(metadata(&before)? == metadata(&after)?, "metadata changed");
-        let protected_before = checked_files(&before)?
+        let initial_files = checked_files(&before)?;
+        for path in initial_files.keys() {
+            ensure!(
+                fs::read(data_path(&before, path)?)? == fs::read(data_path(&after, path)?)?,
+                "retained input file changed"
+            );
+        }
+        let protected_before = initial_files
             .into_iter()
             .filter(|(_, part)| part == &partition(2))
             .collect::<BTreeMap<_, _>>();

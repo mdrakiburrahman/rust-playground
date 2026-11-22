@@ -70,6 +70,9 @@ function buildEnv(home: string, target: string): NodeJS.ProcessEnv {
 
 export async function treeHash(root: string, withMetadata = false): Promise<string> {
   const entries: string[] = [];
+  const rootStat = await lstat(root, { bigint: true });
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("fixture root must be a directory");
+  if (withMetadata) entries.push(`root ${rootStat.ino} ${rootStat.mtimeNs} ${rootStat.ctimeNs}`);
   async function visit(directory: string, prefix: string): Promise<void> {
     const names = (await readdir(directory)).sort();
     for (const name of names) {
@@ -209,20 +212,24 @@ function namespaceRun(args: string[], home: string): Promise<{ stdout: string; s
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let outputExceeded = false;
+    function killGroup(): void {
       if (child.pid && child.exitCode === null) {
         try { process.kill(-child.pid, "SIGKILL"); } catch (error) {
           if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
         }
       }
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup();
     }, 120_000);
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); if (stdout.length > 1_000_000) child.kill("SIGKILL"); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); if (stderr.length > 1_000_000) child.kill("SIGKILL"); });
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); if (stdout.length > 1_000_000) { outputExceeded = true; killGroup(); } });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); if (stderr.length > 1_000_000) { outputExceeded = true; killGroup(); } });
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
     child.once("close", (code, signal) => {
       clearTimeout(timer);
-      if (code !== 0 || timedOut) reject(new Error(`isolated run failed: ${timedOut ? "timeout" : signal ?? code}: ${stderr.slice(-8000)}`));
+      if (code !== 0 || timedOut || outputExceeded) reject(new Error(`isolated run failed: ${timedOut ? "timeout" : outputExceeded ? "output limit" : signal ?? code}: ${stderr.slice(-8000)}`));
       else resolvePromise({ stdout, stderr, elapsedSeconds: (performance.now() - started) / 1000 });
     });
   });

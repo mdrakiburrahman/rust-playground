@@ -1,15 +1,29 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readdir, unlink } from "node:fs/promises";
+import { cp, link, mkdtemp, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { checkCadence, compareStopped, evaluateMaintenance, FIXTURE_REVISION, prepareMaintenance } from "./maintenance-adapter.js";
+import { checkCadence, compareStopped, evaluateMaintenance, FIXTURE_REVISION, prepareMaintenance, treeHash } from "./maintenance-adapter.js";
 
 test("cadence verifier rejects a missing operation", () => {
   const operations = [...Array.from({ length: 90 }, () => [0, 1, 2, 3, 4]).flat(), 0, 0, 1, 1, 1];
   const trace = `Breakpoint 1: where = fixture\n${operations.map((n) => `     rdx = 0x${n.toString(16).padStart(16, "0")}`).join("\n")}\nProcess 1 exited with status = 0 (0x00000000)\n`;
   checkCadence("idle", trace, 0);
   assert.throws(() => checkCadence("idle", trace.replace("     rdx = 0x0000000000000002\n", ""), 0), /cadence differs/);
+});
+
+test("snapshot hashing rejects symbolic and hard links", async () => {
+  const root = await mkdtemp(join(tmpdir(), "darwin-links-"));
+  try {
+    await writeFile(join(root, "data"), "value");
+    await symlink("data", join(root, "symlink"));
+    await assert.rejects(treeHash(root), /non-regular/);
+    await unlink(join(root, "symlink"));
+    await link(join(root, "data"), join(root, "hardlink"));
+    await assert.rejects(treeHash(root), /hard-linked/);
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });
 
 test("real maintenance control and missing protected file", {
@@ -42,6 +56,6 @@ test("real maintenance control and missing protected file", {
   const names = (await readdir(protectedDirectory)).filter((name) => name.endsWith(".parquet"));
   assert.ok(names.length >= 1);
   await unlink(join(protectedDirectory, names[0]));
-  await assert.rejects(compareStopped(prepared, "active", bad));
+  await assert.rejects(compareStopped(prepared, "active", bad), /No such file or directory/);
   console.log(`Maintenance control evidence: ${prepared.root}`);
 });
