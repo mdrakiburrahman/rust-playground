@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { parseAllDocuments } from 'yaml';
+import { clientRepository, imageBuilds, repositories } from './publish-images.js';
 
 const runLabel = 'arrowcol-oat/run-id';
 const profileLabel = 'arrowcol-oat/client-profile';
@@ -166,6 +167,93 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 
+export function summarizeScaledClientWindow(logs: string, binding: {
+  podUid: string; clientId: string; start: number; end: number; completedRows: number; workers: number; streamsPerWorker: number;
+}) {
+  const receipts = logs.split(/\r?\n/).filter(line => line.startsWith('OAT_CLIENT_METRICS ')).map(line =>
+    requireRecord(JSON.parse(line.slice('OAT_CLIENT_METRICS '.length)), 'Client metrics receipt'));
+  if (receipts.some(receipt => receipt.phase === 'failed')) throw new Error('Scaled client emitted a failed terminal receipt.');
+  const terminals = receipts.filter(receipt => receipt.phase === 'completed');
+  if (terminals.length > 1) throw new Error('Scaled client emitted duplicate terminal receipts.');
+  const terminal = terminals[0];
+  const common = {
+    schema_version: 1, pod_uid: binding.podUid, client_id: binding.clientId,
+    measurement_start_unix_ms: binding.start, measurement_end_unix_ms: binding.end,
+    completed_rows: binding.completedRows, completion_semantics: 'client_admission_response_not_delta_commit',
+    configured_workers: binding.workers, configured_streams_per_worker: binding.streamsPerWorker,
+    configured_transport_slots: binding.workers * binding.streamsPerWorker,
+    slot_occupancy: null, slot_occupancy_unavailable_reason: 'Client receipts do not sample active slot occupancy.',
+    completed_rows_per_stream: null, flight_data_messages_per_stream: null,
+    stream_detail_unavailable_reason: 'Receipts do not enumerate each completed stream and its FlightData messages; fixed rows or message counts are not inferred.',
+  };
+  let measurement: Record<string, unknown> | null = null;
+  let unavailableReason: string | null = null;
+  if (!terminal || terminal.version !== 1 || !isRecord(terminal.measurement_window)) {
+    unavailableReason = 'No supported final measurement-window receipt; process-cumulative counters are not substituted.';
+  } else {
+    const window = terminal.measurement_window;
+    if (terminal.completion_semantics !== 'validated_admission_response_not_delta_commit' ||
+        window.scope !== 'per_stream_admission_completion_observed_in_half_open_shared_unix_window' ||
+        window.start_unix_ms !== binding.start || window.end_unix_ms !== binding.end ||
+        window.completed_rows !== binding.completedRows) throw new Error('Client receipt does not match the observed global window and completed rows.');
+    const missing: Record<string, string> = {};
+    const count = (value: unknown, name: string): number | null => {
+      if (value === undefined || value === null) { missing[name] = 'Not present in the final measurement-window receipt.'; return null; }
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('Invalid client measurement counter: ' + name);
+      return value;
+    };
+    const configuredBytes = count(window.completed_flight_data_bytes_configured_ipc_compression, 'configured_ipc_flight_data_bytes');
+    const uncompressedBytes = count(window.completed_flight_data_bytes_uncompressed, 'uncompressed_flight_data_bytes');
+    const semantics = isRecord(terminal.bytes_semantics) ? terminal.bytes_semantics : {};
+    if ((configuredBytes !== null && semantics.configured_ipc_compression_flight_data_bytes !==
+        'sum_of_FlightData_protobuf_encoded_lengths_after_configured_Arrow_IPC_compression') ||
+        (uncompressedBytes !== null && semantics.uncompressed_flight_data_bytes !==
+        'sum_of_FlightData_protobuf_encoded_lengths_before_Arrow_IPC_compression')) {
+      throw new Error('Client receipt has unknown FlightData byte semantics.');
+    }
+    const errors = Object.fromEntries(['rejected_streams', 'rejected_rows', 'retried_streams', 'retried_rows',
+      'given_up_streams', 'given_up_rows', 'ambiguous_streams', 'ambiguous_rows', 'send_errors'].map(name => [name, count(window[name], name)]));
+    const windows: Record<string, unknown>[] = [];
+    let cursor = binding.start;
+    let samples = 0;
+    if (Array.isArray(window.windows) && window.windows.length > 0) {
+      for (const raw of window.windows) {
+        const entry = requireRecord(raw, 'Client latency subwindow');
+        if (entry.start_unix_ms !== cursor || typeof entry.end_unix_ms !== 'number' ||
+            !Number.isSafeInteger(entry.end_unix_ms) || entry.end_unix_ms <= cursor || entry.end_unix_ms > binding.end ||
+            entry.send_latency_scope !== 'attempts_grouped_by_fresh_send_timestamp_in_half_open_window') {
+          throw new Error('Client latency subwindows do not cover the global window with the declared attempt scope.');
+        }
+        const latency = requireRecord(entry.send_latency_us, 'Client send latency');
+        const sampleCount = count(latency.samples, 'latency.samples');
+        const quantiles = Object.fromEntries(['p50', 'p95', 'p99'].map(name => [name, count(latency[name], 'latency.' + name)]));
+        samples += sampleCount ?? 0;
+        if (!Number.isSafeInteger(samples)) throw new Error('Client latency sample count overflow.');
+        windows.push({ start_unix_ms: cursor, end_unix_ms: entry.end_unix_ms, samples: sampleCount, ...quantiles,
+          precision: latency.precision ?? null });
+        cursor = entry.end_unix_ms;
+      }
+      if (cursor !== binding.end) throw new Error('Client latency subwindows do not finish at the global window end.');
+    }
+    const preparation = isRecord(terminal.preparation) ? terminal.preparation : {};
+    measurement = {
+      snapshot_scope: window.scope,
+      completed_rows: binding.completedRows, completed_streams: count(window.completed_streams, 'completed_streams'),
+      configured_ipc_flight_data_bytes: configuredBytes, uncompressed_flight_data_bytes: uncompressedBytes,
+      byte_semantics: 'sum_of_FlightData_protobuf_encoded_lengths; excludes_gRPC_HTTP2_framing_and_NIC_bytes',
+      errors_and_retries: errors,
+      prepared_configured_live_slots: count(preparation.configured_live_slots, 'prepared_configured_live_slots'),
+      prepared_admitted_live_slots: count(preparation.admitted_live_slots, 'prepared_admitted_live_slots'),
+      send_latency_us: { scope: 'attempts_grouped_by_fresh_send_timestamp_in_half_open_window',
+        samples: windows.length && !missing['latency.samples'] ? samples : null, p50: null, p95: null, p99: null,
+        unavailable_reason: 'Only subwindow quantiles are recorded; aggregate percentiles cannot be reconstructed or averaged.',
+        windows },
+      unavailable: missing,
+    };
+  }
+  return { ...common, measurement, measurement_unavailable_reason: unavailableReason };
+}
+
 function validateClientCount(clientCount: number): void {
   if (!Number.isSafeInteger(clientCount) || clientCount < 1 || clientCount > MAX_SCALED_CLIENTS) {
     throw new Error(`Scaled client count must be an integer from 1 to ${MAX_SCALED_CLIENTS}.`);
@@ -265,18 +353,29 @@ export function renderScaledCollector(manifest: string, runId: string, shape: Co
   return { manifest: documents.map(document => document.toString()).join(''), poolName };
 }
 
-export function assertTrustedImageStatement(statement: unknown, digest: string, commit: string): void {
+export function assertTrustedImageStatement(statement: unknown, digest: string, commit: string, imageRepository: string): void {
   const value = requireRecord(statement, 'Verified image statement');
   const subjects = Array.isArray(value.subject) ? value.subject : [];
   const predicate = requireRecord(value.predicate, 'Verified image predicate');
+  const invocation = requireRecord(predicate.invocation, 'Verified build invocation');
+  const source = requireRecord(invocation.configSource, 'Verified primary build source');
+  const parameters = requireRecord(invocation.parameters, 'Verified build parameters');
+  const builder = requireRecord(predicate.builder, 'Verified builder identity');
+  const build = imageBuilds.find(([role]) => (role === 'client' ? clientRepository : repositories[role]) === imageRepository.split('/').at(-1));
   const materials = Array.isArray(predicate.materials) ? predicate.materials : [];
   if (value._type !== 'https://in-toto.io/Statement/v0.1' ||
       value.predicateType !== 'https://slsa.dev/provenance/v0.2' ||
-      !subjects.some(subject => isRecord(subject) && isRecord(subject.digest) && subject.digest.sha256 === digest.slice(7)) ||
+      !build || builder.id !== 'urn:arrowcol:oat:publish-images:buildLocalImages:v1' ||
+      source.uri !== 'git+https://github.com/mdrakiburrahman/rust-playground' ||
+      !isRecord(source.digest) || source.digest.sha1 !== commit ||
+      source.entryPoint !== 'projects/arrowcol-oat/publish-images.ts#buildLocalImages' ||
+      parameters.revision !== commit || parameters.role !== build[0] || parameters.dockerfile !== build[1] || parameters.context !== build[2] ||
+      !subjects.some(subject => isRecord(subject) && subject.name === imageRepository &&
+        isRecord(subject.digest) && subject.digest.sha256 === digest.slice(7)) ||
       !materials.some(material => isRecord(material) &&
         material.uri === 'git+https://github.com/mdrakiburrahman/rust-playground' &&
         isRecord(material.digest) && material.digest.sha1 === commit)) {
-    throw new Error('Trusted build provenance does not bind the candidate digest to the requested repository and commit.');
+    throw new Error('Trusted build provenance does not bind the image role/digest to its primary source, Dockerfile and builder.');
   }
 }
 export function renderScaledProfileManifest(source: string, runId: string, clientCount: number): string {

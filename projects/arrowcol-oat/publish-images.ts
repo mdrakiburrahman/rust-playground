@@ -7,21 +7,21 @@ import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { parseImageOptions, withPublisherIdentity, type ImageOptions, type PublisherSession } from '../../experiments/azure-qap/src/publish-image.js';
 import { validateRuntime, type RuntimeConfig } from './runtime.js';
 
-const repositories = {
+export const repositories = {
   sqlserver: 'arrowcol-sqlserver', catalog: 'arrowcol-catalog-rust',
   router: 'arrowcol-router-rust', dataflow: 'arrowcol-dataflow-rust',
   maintenance: 'delta-maintenance',
 } as const;
 type Options = ImageOptions & { runtimeConfig: string };
 
-const clientRepository = 'arrowcol-oat-client';
+export const clientRepository = 'arrowcol-oat-client';
 const revisionLabel = 'org.opencontainers.image.revision';
 const localImages = {
   sqlserver: 'arrowcol-oat/sqlserver:local', catalog: 'arrowcol-oat/catalog:local',
   router: 'arrowcol-oat/router:local', dataflow: 'arrowcol-oat/dataflow:local', client: 'arrowcol-oat/client:local',
   maintenance: 'arrowcol-oat/maintenance:local',
 } as const;
-const imageBuilds = [
+export const imageBuilds = [
   ['sqlserver', 'projects/arrowcol-infra/docker/sqlserver/Dockerfile', 'projects/arrowcol-infra'],
   ['catalog', 'projects/arrowcol-catalog-rust/Dockerfile', '.'],
   ['router', 'projects/arrowcol-router-rust/Dockerfile', '.'],

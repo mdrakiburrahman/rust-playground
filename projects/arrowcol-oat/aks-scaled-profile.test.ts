@@ -7,12 +7,14 @@ import {
   allScaledClientsReady,
   applyCandidateImageManifest,
   assertScaledRuntimeObservation,
+  assertTrustedImageStatement,
   effectiveWorkloadConfig,
   CandidateImageManifest,
   planScaledClientPool,
   planScaledClientPoolRestore,
   renderScaledProfileManifest,
   scaledClientJobs,
+  summarizeScaledClientWindow,
   ScaledPoolSettings,
 } from './aks-scaled-profile.js';
 
@@ -20,6 +22,54 @@ const runId = '00000000-0000-4000-8000-000000000001';
 const registry = 'arrowcollector68590.azurecr.io';
 const sourceCommit = 'a'.repeat(40);
 const digest = 'sha256:' + 'b'.repeat(64);
+
+test('client summary binds final half-open-window counters and preserves latency samples without averaging quantiles', () => {
+  const binding = { podUid: 'uid-client', clientId: 'client-1', start: 1000, end: 601000, completedRows: 17, workers: 8, streamsPerWorker: 2 };
+  const receipt = { version: 1, phase: 'completed', completion_semantics: 'validated_admission_response_not_delta_commit',
+    bytes_semantics: {
+      configured_ipc_compression_flight_data_bytes: 'sum_of_FlightData_protobuf_encoded_lengths_after_configured_Arrow_IPC_compression',
+      uncompressed_flight_data_bytes: 'sum_of_FlightData_protobuf_encoded_lengths_before_Arrow_IPC_compression' },
+    measurement_window: { start_unix_ms: binding.start, end_unix_ms: binding.end, completed_rows: 17,
+      scope: 'per_stream_admission_completion_observed_in_half_open_shared_unix_window',
+      completed_flight_data_bytes_configured_ipc_compression: 100, completed_flight_data_bytes_uncompressed: 200,
+      rejected_streams: 3, retried_streams: 2,
+      windows: [7, 1023].map((p99, index) => ({ start_unix_ms: binding.start + index * 300000, end_unix_ms: binding.start + (index + 1) * 300000,
+        send_latency_scope: 'attempts_grouped_by_fresh_send_timestamp_in_half_open_window',
+        send_latency_us: { samples: index + 1, p50: 1, p95: p99, p99, precision: 'power_of_two_upper_bound' } })) } };
+  const summary = summarizeScaledClientWindow('OAT_CLIENT_METRICS ' + JSON.stringify(receipt), binding);
+  assert.equal(summary.pod_uid, binding.podUid);
+  assert.equal(summary.configured_transport_slots, 16);
+  assert.equal(summary.completed_rows_per_stream, null);
+  assert.equal(summary.measurement?.completed_streams, null);
+  assert.equal(summary.measurement?.configured_ipc_flight_data_bytes, 100);
+  assert.deepEqual(summary.measurement?.send_latency_us, { scope: 'attempts_grouped_by_fresh_send_timestamp_in_half_open_window',
+    samples: 3, p50: null, p95: null, p99: null,
+    unavailable_reason: 'Only subwindow quantiles are recorded; aggregate percentiles cannot be reconstructed or averaged.',
+    windows: receipt.measurement_window.windows.map(window => ({ start_unix_ms: window.start_unix_ms, end_unix_ms: window.end_unix_ms,
+      ...window.send_latency_us })) });
+  assert.throws(() => summarizeScaledClientWindow('OAT_CLIENT_METRICS ' + JSON.stringify(receipt), { ...binding, end: binding.end + 1 }), /global window/);
+  const missing = summarizeScaledClientWindow('measured_rows=17', binding);
+  assert.equal(missing.measurement, null);
+  assert.match(missing.measurement_unavailable_reason!, /not substituted/);
+});
+
+test('trusted image claims require primary source and exact role build path, not a matching unrelated material', () => {
+  const image = registry + '/arrowcol-oat-client';
+  const statement = { _type: 'https://in-toto.io/Statement/v0.1', predicateType: 'https://slsa.dev/provenance/v0.2',
+    subject: [{ name: image, digest: { sha256: digest.slice(7) } }], predicate: {
+      builder: { id: 'urn:arrowcol:oat:publish-images:buildLocalImages:v1' },
+      invocation: { configSource: { uri: 'git+https://github.com/mdrakiburrahman/rust-playground', digest: { sha1: sourceCommit },
+        entryPoint: 'projects/arrowcol-oat/publish-images.ts#buildLocalImages' },
+      parameters: { revision: sourceCommit, role: 'client', dockerfile: 'projects/arrowcol-oat-rust/Dockerfile.client', context: '.' } },
+      materials: [{ uri: 'git+https://github.com/mdrakiburrahman/rust-playground', digest: { sha1: sourceCommit } }] } };
+  assert.doesNotThrow(() => assertTrustedImageStatement(statement, digest, sourceCommit, image));
+  const wrongSource = structuredClone(statement);
+  wrongSource.predicate.invocation.configSource.digest.sha1 = 'c'.repeat(40);
+  assert.throws(() => assertTrustedImageStatement(wrongSource, digest, sourceCommit, image), /primary source/);
+  const wrongRole = structuredClone(statement);
+  wrongRole.predicate.invocation.parameters.dockerfile = 'unrelated/Dockerfile';
+  assert.throws(() => assertTrustedImageStatement(wrongRole, digest, sourceCommit, image), /Dockerfile/);
+});
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));

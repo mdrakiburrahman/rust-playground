@@ -2,13 +2,19 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import test from 'node:test';
+import { dirname, join, resolve } from 'node:path';
+import test, { after, before } from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { Config, load_env, ROOT } from '../../infra/azure/bootstrap.js';
 import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { main, renderManifest, type BenchmarkDependencies } from './aks-direct-benchmark.js';
 import { collectorShapes, effectiveWorkloadConfig, renderScaledProfileManifest } from './aks-scaled-profile.js';
+import { clientRepository, imageBuilds, repositories } from './publish-images.js';
+
+const azureEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+  key.startsWith('AZURE_') || key.startsWith('ARROWCOL_AZURE_')));
+before(() => { for (const key of Object.keys(azureEnvironment)) delete process.env[key]; });
+after(() => { Object.assign(process.env, azureEnvironment); });
 
 interface Resource {
   kind: string;
@@ -109,10 +115,16 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
       if (args[0] === 'bash') return ok();
       if (args[0] === 'cosign') {
         const digest = args.at(-1)!.split('@')[1]!;
+        const image = args.at(-1)!.split('@')[0]!;
+        const build = imageBuilds.find(([role]) => (role === 'client' ? clientRepository : repositories[role]) === image.split('/').at(-1))!;
         const statement = { _type: 'https://in-toto.io/Statement/v0.1', predicateType: 'https://slsa.dev/provenance/v0.2',
-          subject: [{ digest: { sha256: digest.slice(7) } }],
-          predicate: { materials: [{ uri: 'git+https://github.com/mdrakiburrahman/rust-playground',
-            digest: { sha1: failure === 'untrusted' ? 'b'.repeat(40) : commit } }] } };
+          subject: [{ name: image, digest: { sha256: digest.slice(7) } }],
+          predicate: { builder: { id: 'urn:arrowcol:oat:publish-images:buildLocalImages:v1' },
+            invocation: { configSource: { uri: 'git+https://github.com/mdrakiburrahman/rust-playground',
+              digest: { sha1: failure === 'untrusted' ? 'b'.repeat(40) : commit },
+              entryPoint: 'projects/arrowcol-oat/publish-images.ts#buildLocalImages' },
+              parameters: { revision: commit, role: build[0], dockerfile: build[1], context: build[2] } },
+            materials: [{ uri: 'git+https://github.com/mdrakiburrahman/rust-playground', digest: { sha1: commit } }] } };
         return ok({ payload: Buffer.from(JSON.stringify(statement)).toString('base64') });
       }
       if (args[0] === 'kubelogin') return ok(args.includes('--help') ? '--disable-environment-override' : '');
@@ -180,13 +192,16 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
         }
         if (args.includes('logs')) {
           const name = args[args.indexOf('logs') + 1]!.slice(4);
+          if (name.startsWith('pod-')) events.push('client-window-log');
           if (name === 'direct-catalog-verified') {
             return ok(JSON.stringify({ kind: 'oat_run_table_registered', schema_version: 1, catalog_table_count: 1,
               run_id: runId, table: 'telemetry.sqlserver.sqlserver_availability_replica_states',
               location: `abfss://${config.data}@${config.account}.dfs.core.windows.net/direct-baseline-1/runs/${runId}/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states`,
               provider: 'delta', schema_fingerprint: 'sha256:' + 'a'.repeat(64) }));
           }
-          const job = named(name);
+          const jobName = name.startsWith('pod-') ? pods().find(pod => pod.metadata.name === name)!.metadata.labels['job-name'] : name;
+          if (typeof jobName !== 'string') throw new Error('Mock client pod has no owning Job.');
+          const job = named(jobName);
           const generatorArgs = job!.spec.template.spec.containers[0]!.args;
           const clientId = generatorArgs[generatorArgs.indexOf('--client-id') + 1];
           return ok(`OAT_CLIENT_READY client_id=${clientId}\nOAT_CLIENT_SCHEDULE_RECEIVED client_id=${clientId} run_start_unix_ms=${schedule}\nmeasured_rows=600 measured_seconds=600.000 rows_per_second=1.000 measurement_window_start_unix_ms=${schedule + 60000} measurement_window_end_unix_ms=${schedule + 660000}`);
@@ -195,6 +210,7 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
           const kind = args[args.indexOf('get') + 1];
           const name = args[args.indexOf('get') + 2]!;
           if (kind === 'namespace') return ok(namespace ?? '');
+          if (kind === 'pod') return ok(pods().find(pod => pod.metadata.name === name) ?? '');
           if (kind === 'deployment') return ok({ status: { availableReplicas: 1 } });
           if (kind === 'configmap') return ok(named(name));
           if (kind === 'job') {
@@ -280,6 +296,15 @@ test('actual opt-in CLI renders and runs all clients, binds candidate pods/large
     assert.equal(await main(f.args, f.dependencies), 0);
     const report = JSON.parse(await readFile(f.reportPath, 'utf8'));
     assert.equal(report.scaled_profile.client_results.length, 2);
+    for (const client of report.scaled_profile.client_results) {
+      const summary = JSON.parse(await readFile(join(dirname(f.reportPath), client.job_name + '.measurement.json'), 'utf8'));
+      assert.deepEqual(summary, client.final_measurement_summary);
+      assert.equal(summary.pod_uid, client.pod_uid);
+      assert.equal(summary.configured_transport_slots, 16);
+      assert.equal(summary.measurement, null);
+      assert.match(summary.measurement_unavailable_reason, /not substituted/);
+    }
+    assert.ok(f.events.lastIndexOf('client-window-log') < f.events.indexOf('namespace-delete'));
     assert.equal(report.scaled_profile.placement.clients.length, 2);
     assert.equal(report.scaled_profile.trusted_build_provenance_verified, true);
     assert.deepEqual(report.scaled_profile.hardware, collectorShapes.e192);

@@ -16,7 +16,7 @@ import { startNodeObservation, type NodeObservationHandle, type NodeResourceObse
 import {
   applyCandidateImageManifest, assertScaledRuntimeObservation, assertTrustedImageStatement, collectorShapes,
   effectiveWorkloadConfig, planScaledClientPool, planScaledClientPoolRestore, renderScaledCollector,
-  renderScaledProfileManifest, scaledClientJobs,
+  renderScaledProfileManifest, scaledClientJobs, summarizeScaledClientWindow,
   type CandidateImageManifest, type CollectorShape, type ScaledPoolPlan, type ScaledPoolSettings,
   type ScaledRuntimeObservation,
 } from './aks-scaled-profile.js';
@@ -754,7 +754,8 @@ async function verifyCandidateBuilds(registry: string, options: ScaledOptions, i
     let matches = 0;
     for (const envelope of envelopes) {
       if (!isRecord(envelope) || typeof envelope.payload !== 'string') throw new Error('Verified cosign output is missing its signed payload.');
-      assertTrustedImageStatement(parseJson(Buffer.from(envelope.payload, 'base64').toString('utf8'), 'Signed build statement'), digest, options.candidateCommit);
+      assertTrustedImageStatement(parseJson(Buffer.from(envelope.payload, 'base64').toString('utf8'), 'Signed build statement'),
+        digest, options.candidateCommit, registry + '/' + reference.split('@')[0]);
       matches++;
     }
     if (!matches) throw new Error('No trusted build attestation was returned for a candidate image.');
@@ -1022,7 +1023,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   if (scaled) {
     const hash = createHash('sha256');
     for (const path of ['projects/arrowcol-oat/aks-direct-benchmark.ts', 'projects/arrowcol-oat/aks-scaled-profile.ts',
-      'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep']) {
+      'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep', 'projects/arrowcol-oat/publish-images.ts']) {
       hash.update(path + '\0').update(await readFile(resolve(ROOT, path))).update('\0');
     }
     scaledSourcesSha = hash.digest('hex');
@@ -1193,8 +1194,13 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         const finalPlacement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, true);
         if (JSON.stringify(finalPlacement) !== JSON.stringify(placement)) throw new Error('Scaled client/collector pod UID, image or node changed during the window.');
         for (const jobName of clientJobs) {
-          const logs = await kubectl(config, ['logs', 'job/' + jobName, '-n', namespace, '--all-containers=true'], 'Read scaled client window evidence');
+          const clientPlacement = finalPlacement.clients.find(client => client.jobName === jobName)!;
+          const logs = await kubectl(config, ['logs', 'pod/' + clientPlacement.podName, '-n', namespace, '-c', 'generator'], 'Read scaled client window evidence');
           await writePrivateFile(join(runDir, jobName + '.log'), logs);
+          const loggedPod = await getObject(config, 'pod', namespace, clientPlacement.podName);
+          if (!loggedPod || requireRecord(loggedPod.metadata, 'Logged client pod').uid !== clientPlacement.podUid) {
+            throw new Error('Client pod UID changed while reading final measurement evidence.');
+          }
           const windows = [...logs.matchAll(/measurement_window_start_unix_ms=(\d+) measurement_window_end_unix_ms=(\d+)/g)];
           const schedules = [...logs.matchAll(/OAT_CLIENT_SCHEDULE_RECEIVED client_id=(\S+) run_start_unix_ms=(\d+)/g)];
           const rowCounts = [...logs.matchAll(/(?:^|\n)measured_rows=(\d+) measured_seconds=([\d.]+)/g)];
@@ -1206,9 +1212,14 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
           const client = scaledClientJobs(runId, options.scaled!.clientCount).find(job => job.name === jobName)!;
           const clientId = client.clientId;
           if (schedules[0]![1] !== clientId) throw new Error('Scaled client source identity does not match its run-owned Job.');
+          const effective = effectiveWorkloadConfig(rendered).performanceConfig;
+          const summary = summarizeScaledClientWindow(logs, { podUid: clientPlacement.podUid, clientId, start: measurementStart,
+            end: measurementEnd, completedRows: Number(rowCounts[0]![1]), workers: Number(effective.workers),
+            streamsPerWorker: Number(effective['streams-per-worker']) });
+          await writePrivateFile(join(runDir, jobName + '.measurement.json'), JSON.stringify(summary, null, 2) + '\n');
           clientResults.push({ job_name: jobName, client_id: clientId, pod_ordinal: client.index, measurement_start_unix_ms: measurementStart,
             measurement_end_unix_ms: measurementEnd, client_completed_rows: Number(rowCounts[0]![1]),
-            succeeded: true, restart_count: 0 });
+            pod_uid: clientPlacement.podUid, final_measurement_summary: summary, succeeded: true, restart_count: 0 });
         }
       } else await waitForLoad(config, namespace, writer, 22 * 60_000);
       await assertWriterStable(config, namespace, writer);
