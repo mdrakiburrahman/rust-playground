@@ -400,10 +400,10 @@ impl DeltaBackend {
             decoded.envelope.source_schema_version,
             decoded.envelope.target_schema_version,
         );
-        let capacity = [
+        let capacity = Box::new([
             self.capacity.acquire(rows, bytes).await?,
             owner.capacity.acquire(rows, bytes).await?,
-        ];
+        ]);
         let queue_permit = owner
             .sender
             .try_reserve()
@@ -564,7 +564,7 @@ impl Capacity {
             ));
         }
         let mut reservation = CapacityReservation {
-            permits: Vec::with_capacity(3),
+            permits: [None, None, None],
             occupancy: Arc::clone(&self.occupancy),
             scope: self.scope,
             amounts: [0; 3],
@@ -582,7 +582,7 @@ impl Capacity {
                 ExportFailure::Transient(format!("Arrow file buffering capacity unavailable: {error}"))
             })?;
             drop(wait);
-            reservation.permits.push(permit);
+            reservation.permits[index] = Some(permit);
             reservation.amounts[index] = u64::from(amount);
             self.occupancy.reserve(self.scope, resource, u64::from(amount));
         }
@@ -591,7 +591,7 @@ impl Capacity {
 }
 
 struct CapacityReservation {
-    permits: Vec<OwnedSemaphorePermit>,
+    permits: [Option<OwnedSemaphorePermit>; 3],
     occupancy: Arc<ExporterOccupancy>,
     scope: CapacityScope,
     amounts: [u64; 3],
@@ -599,7 +599,9 @@ struct CapacityReservation {
 
 impl Drop for CapacityReservation {
     fn drop(&mut self) {
-        self.permits.clear();
+        for permit in &mut self.permits {
+            drop(permit.take());
+        }
         for (resource, amount) in [
             CapacityResource::Bytes,
             CapacityResource::Rows,
@@ -631,7 +633,7 @@ struct QueuedBatch {
     #[cfg(test)]
     submitted: Option<oneshot::Sender<()>>,
     _pending_owner: PendingOwner,
-    _capacity: [CapacityReservation; 2],
+    _capacity: Box<[CapacityReservation; 2]>,
     _backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
 }
 
@@ -1992,10 +1994,10 @@ mod tests {
             let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("owner"));
             let rows = batch.num_rows() as u64;
             let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).expect("bytes");
-            let capacity = [
+            let capacity = Box::new([
                 exporter.backend.capacity.acquire(rows, bytes).await.expect("capacity"),
                 owner.capacity.acquire(rows, bytes).await.expect("table capacity"),
-            ];
+            ]);
             let (reply, receipt) = oneshot::channel();
             let queued = QueuedBatch {
                 publication_id: envelope.publication_id.expect("id"),
