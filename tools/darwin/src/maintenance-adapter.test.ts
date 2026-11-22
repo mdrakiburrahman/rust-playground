@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { cp, link, mkdtemp, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { cp, link, lstat, mkdir, mkdtemp, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -40,6 +41,19 @@ test("real maintenance control and missing protected file", {
     output,
   });
   assert.equal(prepared.bindings.baselineBinarySha256, prepared.bindings.candidateBinarySha256);
+  const sandboxProbe = join(prepared.root, "sandbox-probe");
+  await mkdir(sandboxProbe);
+  const probeEnv = { HOME: sandboxProbe, PATH: "/usr/bin:/bin", LANG: "C.UTF-8" };
+  const caps = spawnSync("/usr/bin/unshare", ["-Urnmpf", "--mount-proc", prepared.sandboxBinary,
+    "/usr/bin/cat", "/proc/self/status", sandboxProbe], { encoding: "utf8", env: probeEnv });
+  assert.match(caps.stdout, /^CapEff:\s+0000000000000000$/m);
+  assert.match(caps.stdout, /^CapPrm:\s+0000000000000000$/m);
+  const forbidden = join(prepared.root, "forbidden-write");
+  const touch = spawnSync("/usr/bin/unshare", ["-Urnmpf", "--mount-proc", prepared.sandboxBinary,
+    "/usr/bin/touch", forbidden, sandboxProbe], { encoding: "utf8", env: probeEnv });
+  assert.notEqual(touch.status, 0);
+  await assert.rejects(lstat(forbidden), { code: "ENOENT" });
+  console.log("Sandbox probe: no effective/permitted capabilities; external write denied");
   for (const lane of ["active", "idle"] as const) {
     const result = await evaluateMaintenance(prepared, lane) as {
       lane: string; scope: string; accepted: boolean; pairs: unknown[]; audits: unknown[];

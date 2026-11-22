@@ -7,6 +7,8 @@ use std::process::Command;
 const CREATE_RULESET: i64 = 444;
 const ADD_RULE: i64 = 445;
 const RESTRICT_SELF: i64 = 446;
+const CAPSET: i64 = 126;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 const VERSION: u32 = 1;
 const PATH_BENEATH: u32 = 1;
 const O_PATH: i32 = 0o10000000;
@@ -27,6 +29,19 @@ struct Ruleset {
 struct PathBeneath {
     allowed_access: u64,
     parent_fd: i32,
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
 }
 
 extern "C" {
@@ -94,7 +109,26 @@ fn main() -> io::Result<()> {
         .ok_or_else(|| io::Error::other("arm needs a parent"))?;
     rule(ruleset, parent, READ)?;
     rule(ruleset, Path::new(&args[2]), ALL)?;
-    if unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 || unsafe { syscall(RESTRICT_SELF, ruleset, 0) } != 0 {
+    if unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let empty = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    if unsafe { syscall(CAPSET, &header, &empty) } != 0 || unsafe { syscall(RESTRICT_SELF, ruleset, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     unsafe { close(ruleset) };
