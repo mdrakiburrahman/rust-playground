@@ -3199,6 +3199,29 @@ mod tests {
     }
 
     #[test]
+    fn independently_generated_corpus_hash_ignores_send_batch_size() -> Result<()> {
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let total_rows = 65_537;
+        for profile in [DataProfile::Diagnostic, DataProfile::Realistic] {
+            let hash_for = |batch_rows: usize| -> Result<String> {
+                let mut options = options()?;
+                options.data_profile = profile;
+                options.batch_rows = batch_rows;
+                options.null_fraction = 0.2;
+                let mut hasher = new_payload_hasher(profile, 1, 1)?;
+                for offset in (0..total_rows).step_by(batch_rows) {
+                    let rows = batch_rows.min(total_rows - offset);
+                    let batch = synthetic_batch(&table, "logical-hash", rows, offset, 0, &options)?;
+                    hash_payload_batch(&mut hasher, &table, &batch, 0, offset, total_rows, profile)?;
+                }
+                Ok(finish_payload_hasher(hasher))
+            };
+            assert_eq!(hash_for(4096)?, hash_for(65_536)?, "{profile:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn logical_corpus_hash_ignores_batch_splits_and_detects_order_or_value_changes() -> Result<()> {
         let options = options()?;
         let table = table_named("sqlserver_availability_replica_states")?;
