@@ -86,9 +86,15 @@ async function main(args: string[]): Promise<void> {
     return;
   }
   if (command === "parity") {
+    const hasCollectorImage = args.includes("--collector-image-id");
+    const hasCollectorRevision = args.includes("--collector-source-revision");
+    if (hasCollectorImage !== hasCollectorRevision) throw new Error("collector image ID and source revision must be supplied together");
+    const collectorOverride = hasCollectorImage ? {
+      imageId: option(args, "--collector-image-id"), sourceRevision: option(args, "--collector-source-revision"),
+    } : undefined;
     const receipt = await replayParityArm(
       repo, home, Number(option(args, "--workers")), option(args, "--bind-host"), option(args, "--endpoint-host"),
-      Number(option(args, "--controller-stack-bytes")),
+      Number(option(args, "--controller-stack-bytes")), collectorOverride,
     );
     console.log("@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
     console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "historical-parity", valid: 0,

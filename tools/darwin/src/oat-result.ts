@@ -19,6 +19,14 @@ function imageId(value: unknown): string {
   return value;
 }
 
+export function assertParityProcessRevision(
+  process: JsonObject, producerRevision: string, collectorRevision = producerRevision,
+): void {
+  if (process.source_revision !== (process.component === "collector" ? collectorRevision : producerRevision)) {
+    throw new Error("live process source revision differs from the parity producer");
+  }
+}
+
 export type ClientDataProfile = "diagnostic" | "realistic";
 
 export interface ClientEvidence {
@@ -113,7 +121,9 @@ export function extractClientEvidence(raw: unknown, requestedProfile: ClientData
 
 export async function readReconciledOatResult(
   resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number | null,
-  requestedProfile: ClientDataProfile, parity?: { config: unknown; decodeFile: (path: string, active: boolean) => Promise<number> },
+  requestedProfile: ClientDataProfile, parity?: {
+    config: unknown; decodeFile: (path: string, active: boolean) => Promise<number>; collectorRevision?: string;
+  },
 ): Promise<{
   measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
@@ -163,7 +173,7 @@ export async function readReconciledOatResult(
   }
   const images = processes.map(process => {
     if (typeof process.component !== "string" || process.log_complete !== true) throw new Error("incomplete OAT process evidence");
-    if (parity && process.source_revision !== sourceRevision) throw new Error("live process source revision differs from the parity producer");
+    if (parity) assertParityProcessRevision(process, sourceRevision, parity.collectorRevision);
     return `${process.component}:${imageId(process.image_id)}`;
   });
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {

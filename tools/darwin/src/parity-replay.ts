@@ -9,6 +9,11 @@ import type { SnapshotManifest } from "./snapshot.js";
 
 type JsonObject = Record<string, unknown>;
 
+export interface CollectorImageOverride {
+  imageId: string;
+  sourceRevision: string;
+}
+
 function object(value: unknown, label: string): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as JsonObject;
@@ -59,6 +64,7 @@ async function buildFooterInspector(runtime: string, home: string, stackBytes: n
 
 export async function replayParityArm(
   repo: string, home: string, workers: number, bindHost: string, endpointHost: string, stackBytes: number,
+  collectorOverride?: CollectorImageOverride,
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
@@ -68,6 +74,20 @@ export async function replayParityArm(
   const producer = object(JSON.parse(await readFile(join(trusted, "producer.json"), "utf8")), "producer binding");
   if (typeof producer.revision !== "string" || !/^[a-f0-9]{40}$/.test(producer.revision)) throw new Error("invalid producer revision");
   if (producer.revision !== manifest.commit) throw new Error("parity producer must be the trusted snapshot revision");
+  if (collectorOverride) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(collectorOverride.imageId)
+      || !/^[a-f0-9]{40}$/.test(collectorOverride.sourceRevision)) {
+      throw new Error("collector override requires an immutable image ID and full source revision");
+    }
+    execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", collectorOverride.sourceRevision, producer.revision]);
+    const observed = execFileSync("docker", [
+      "image", "inspect", "--format", '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}',
+      collectorOverride.imageId,
+    ], { encoding: "utf8" }).trim();
+    if (observed !== `${collectorOverride.imageId} ${collectorOverride.sourceRevision}`) {
+      throw new Error("collector override image identity or revision does not match");
+    }
+  }
   const seedPath = join(trusted, "src", "experiments", "darwin", "historical-parity.oat.json");
   const seedHash = await sha256(seedPath);
   if (manifest.files["experiments/darwin/historical-parity.oat.json"]?.sha256 !== seedHash) {
@@ -95,6 +115,9 @@ export async function replayParityArm(
     if (platform.kind !== "local") throw new Error("parity replay requires local mode");
     platform.compose_state_root = join(runRoot, "state");
     platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
+    if (collectorOverride) object(platform.local, "local").collector_image_override = {
+      image_id: collectorOverride.imageId, source_revision: collectorOverride.sourceRevision,
+    };
     const identityPath = join(data, "ladder-identity.json");
     let identity: JsonObject | undefined;
     try {
@@ -104,6 +127,8 @@ export async function replayParityArm(
     }
     if (identity) {
       if (identity.source_revision !== producer.revision || identity.seed_sha256 !== seedHash
+        || identity.collector_revision !== (collectorOverride?.sourceRevision ?? producer.revision)
+        || identity.collector_override_image_id !== (collectorOverride?.imageId ?? null)
         || typeof identity.payload_corpus_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(identity.payload_corpus_sha256)) {
         throw new Error("ladder identity does not match the trusted producer and seed");
       }
@@ -134,9 +159,10 @@ export async function replayParityArm(
     };
     const result = await readReconciledOatResult(
       join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states",
-      producer.revision, null, "diagnostic", { config, decodeFile },
+      producer.revision, null, "diagnostic", { config, decodeFile, collectorRevision: collectorOverride?.sourceRevision },
     );
     const images = parityImageIds(await readFile(join(runRoot, "run.log"), "utf8"), result.images);
+    if (collectorOverride && images.collector !== collectorOverride.imageId) throw new Error("collector image override was not used");
     const payload = result.clientEvidence.payloadCorpusSha256;
     if (typeof payload !== "string" || !/^[a-f0-9]{64}$/.test(payload)) throw new Error("parity corpus identity missing");
     if (identity && (JSON.stringify(identity.images) !== JSON.stringify(images)
@@ -147,6 +173,8 @@ export async function replayParityArm(
       || !hasPinnedSubmodules(runtime, env)) throw new Error("trusted parity runtime changed during the run");
     const receipt = {
       label: "local one-box scale", source_revision: producer.revision, trusted_revision: manifest.commit,
+      collector_revision: collectorOverride?.sourceRevision ?? producer.revision,
+      collector_override_image_id: collectorOverride?.imageId ?? null,
       profile: "historical-parity-diagnostic", seed_sha256: seedHash, config_sha256: configHash,
       controller_sha256: binaryHash, footer_inspector_sha256: footer.sha256, workers, host, runRoot,
       identity_reconciliation: { available: false, reason: "Diagnostic corpus does not carry unique delivery identities" },
@@ -156,6 +184,8 @@ export async function replayParityArm(
     if (!identity) {
       await writeFile(identityPath, `${JSON.stringify({
         source_revision: producer.revision, seed_sha256: seedHash, images, payload_corpus_sha256: payload,
+        collector_revision: collectorOverride?.sourceRevision ?? producer.revision,
+        collector_override_image_id: collectorOverride?.imageId ?? null,
       }, null, 2)}\n`, { flag: "wx", mode: 0o400 });
     }
     completed = true;

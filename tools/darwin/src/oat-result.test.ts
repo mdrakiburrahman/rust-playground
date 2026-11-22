@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractClientEvidence, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
+import { assertParityProcessRevision, extractClientEvidence, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
 import type { OatMeasurement } from "./metrics-adapter.js";
 
 function reportFor(profile: ClientDataProfile) {
@@ -21,6 +21,15 @@ function reportFor(profile: ClientDataProfile) {
   };
   return { phase_counters: { preparation, payload_manifest: payloadManifest, measurement_window: { client_resources: clientResources } } };
 }
+
+test("a control revision applies only to the collector", () => {
+  const collector = { component: "collector", source_revision: "main" };
+  const router = { component: "router", source_revision: "observer" };
+  assert.doesNotThrow(() => assertParityProcessRevision(collector, "observer", "main"));
+  assert.doesNotThrow(() => assertParityProcessRevision(router, "observer", "main"));
+  assert.throws(() => assertParityProcessRevision(collector, "observer"), /source revision/);
+  assert.throws(() => assertParityProcessRevision({ ...router, source_revision: "main" }, "observer", "main"), /source revision/);
+});
 
 test("refuses a diagnostic result without the physical parity gate", async () => {
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "diagnostic"),

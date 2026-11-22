@@ -7861,12 +7861,41 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
         let image = String::from_utf8(output.stdout)?;
         images.insert(role.to_owned(), local_client_image_id(&image)?.to_owned());
     }
+    if let Some(collector) = &config.platform.local.collector_image_override {
+        let mut inspect = Command::new("docker");
+        inspect.args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}}",
+            &collector.image_id,
+        ]);
+        let output = run_command(inspect, "verify control collector image").await?;
+        let observed = String::from_utf8(output.stdout)?;
+        verify_collector_image(&observed, &collector.image_id, &collector.source_revision)?;
+        images.insert("collector".to_owned(), collector.image_id.clone());
+    }
     let path = platform.state_dir.join("tunables.compose.json");
     let mut overlay: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
     apply_stable_local_images(&mut overlay, &images, config.platform.local.expected_image_ids.as_ref())?;
     tokio::fs::write(&path, serde_json::to_vec(&overlay)?).await?;
     println!("[oat] immutable local images: {}", serde_json::to_string(&images)?);
     Ok(())
+}
+
+fn verify_collector_image(observed: &str, image_id: &str, source_revision: &str) -> Result<()> {
+    if observed.trim() != format!("{image_id} {source_revision}") {
+        bail!("control collector image ID or source revision differs from the requested identity");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn collector_override_requires_exact_inspected_identity() {
+    assert!(verify_collector_image("sha256:abc main\n", "sha256:abc", "main").is_ok());
+    assert!(verify_collector_image("sha256:def main", "sha256:abc", "main").is_err());
+    assert!(verify_collector_image("sha256:abc candidate", "sha256:abc", "main").is_err());
 }
 
 fn apply_stable_local_images(

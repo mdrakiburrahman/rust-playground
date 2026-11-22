@@ -455,6 +455,14 @@ pub struct LocalOptions {
     #[serde(default)]
     pub stable_image_build: bool,
     pub expected_image_ids: Option<std::collections::BTreeMap<String, String>>,
+    pub collector_image_override: Option<CollectorImageOverride>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorImageOverride {
+    pub image_id: String,
+    pub source_revision: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -958,6 +966,23 @@ impl OatConfig {
                 bail!("expected local image IDs require six immutable role IDs and a stable image build");
             }
         }
+        if let Some(image) = &self.platform.local.collector_image_override {
+            let valid_hash = |value: &str, len: usize| {
+                value.len() == len
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            };
+            if !self.platform.local.stable_image_build
+                || !image
+                    .image_id
+                    .strip_prefix("sha256:")
+                    .is_some_and(|hash| valid_hash(hash, 64))
+                || !valid_hash(&image.source_revision, 40)
+            {
+                bail!("collector image override requires a stable build, immutable image ID and full source revision");
+            }
+        }
         if !self.overload_guard.cap_fraction.is_finite()
             || self.overload_guard.cap_fraction <= 0.0
             || self.overload_guard.cap_fraction > 0.90
@@ -1149,6 +1174,7 @@ impl OatConfig {
                     || self.platform.local.partitioned_table_bootstrap
                     || self.platform.local.stable_image_build
                     || self.platform.local.expected_image_ids.is_some()
+                    || self.platform.local.collector_image_override.is_some()
                     || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");
@@ -1480,6 +1506,50 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_override_requires_a_local_stable_build_and_exact_identity() -> Result<()> {
+        let mut config = valid();
+        config.platform.kind = OatMode::Local;
+        config.platform.runtime_config_file = None;
+        config.platform.bootstrap_env_file = None;
+        config.platform.compose_file = Some("projects/loadtest/compose.yaml".to_owned());
+        config.platform.compose_override_file = Some("projects/loadtest/compose.override.yaml".to_owned());
+        config.platform.compose_project = Some("oat-test".to_owned());
+        config.platform.compose_state_root = Some(config.directory.to_string_lossy().into_owned());
+        config.qap_database = Some("loadtest".to_owned());
+        config.platform.local.collector_image_override = Some(CollectorImageOverride {
+            image_id: format!("sha256:{}", "a".repeat(64)),
+            source_revision: "b".repeat(40),
+        });
+        assert!(config.validate().is_err());
+        config.platform.local.stable_image_build = true;
+        config.validate()?;
+        config
+            .platform
+            .local
+            .collector_image_override
+            .as_mut()
+            .context("missing override")?
+            .source_revision = "b".repeat(39);
+        assert!(config.validate().is_err());
+        config
+            .platform
+            .local
+            .collector_image_override
+            .as_mut()
+            .context("missing override")?
+            .source_revision = "b".repeat(40);
+        config
+            .platform
+            .local
+            .collector_image_override
+            .as_mut()
+            .context("missing override")?
+            .image_id = "latest".to_owned();
+        assert!(config.validate().is_err());
+        Ok(())
+    }
 
     #[test]
     fn aks_resources_keep_defaults_validate_quantities_and_allow_oversubscription() -> Result<()> {
