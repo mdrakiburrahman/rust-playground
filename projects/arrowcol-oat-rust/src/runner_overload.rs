@@ -482,6 +482,7 @@ struct GuardApi {
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
 struct LocalGuardMemory {
     client: reqwest::Client,
     instance_id: String,
@@ -900,11 +901,20 @@ impl PreparedGuard {
             "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
         let expected = prepared.probe.expected_scale_out_identity.clone();
         let api = prepared.probe.api.clone();
+        #[cfg(unix)]
+        let local_memory = prepared.probe.local_memory.clone();
         let deadline = tokio::time::Instant::now() + GUARD_READ_TIMEOUT;
         let (reading, backlog, identity) = guarded_composite_observation(
             prepared.probe.read(config, &prepared.scraper, diagnostics, deadline),
             prepared.scraper.scrape(),
-            verify_guard_identity(config, expected.as_ref(), api.as_deref()),
+            async {
+                verify_guard_identity(config, expected.as_ref(), api.as_deref()).await?;
+                #[cfg(unix)]
+                if let Some(local) = &local_memory {
+                    local.inspect(&local.get("/json").await?)?;
+                }
+                Ok(())
+            },
             deadline,
         ).await;
         record_guard_read_leg(diagnostics, "collector_identity_after_backlog", &identity);
@@ -2120,7 +2130,7 @@ mod overload_guard_tests {
                     let mut prepared = PreparedGuard::prepare(&config, &platform).await?;
                     anyhow::ensure!(prepared.engine.proof["last_caps"][0]["cap"] == cap, "actual cgroup cap mismatches request");
                     let mut missing = LocalPlatform { collector_metrics_url:None, ..platform };
-                    let error = PreparedGuard::prepare(&config, &missing).await.err().context("missing protection was admitted")?;
+                    let error = PreparedGuard::prepare_inner(&config, &missing, &mut json!({})).await.err().context("missing protection was admitted")?;
                     anyhow::ensure!(format!("{error:#}").contains("metrics endpoint is unavailable"), "unexpected missing-protection cause: {error:#}");
                     println!("guard_docker_missing_protection_refused {error:#}");
                     missing.collector_metrics_url = Some(format!("{endpoint}/metrics"));
@@ -2139,7 +2149,7 @@ mod overload_guard_tests {
                     anyhow::ensure!(evidence.overload_stop.is_none(), "idle collector triggered overload");
                 } else {
                     anyhow::ensure!(cgroup.lines().last() == Some("max"), "uncapped test did not expose unlimited memory.max");
-                    let error = PreparedGuard::prepare(&config, &platform).await.err().context("unlimited container was admitted")?;
+                    let error = PreparedGuard::prepare_inner(&config, &platform, &mut json!({})).await.err().context("unlimited container was admitted")?;
                     anyhow::ensure!(format!("{error:#}").contains("hard cap is unconfirmed or unlimited"), "unexpected uncapped cause: {error:#}");
                     println!("guard_docker_uncapped_refused {error:#}");
                 }
