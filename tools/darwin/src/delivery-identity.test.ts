@@ -113,7 +113,7 @@ test("memory/range limits fail before consuming any observed rows", async () => 
 
 const linux = { skip: process.platform !== "linux" };
 
-test("stream adapter reconciles multiple owned files and rejects aliasing, truncated decoder output and wrong hashes", linux, async () => {
+test("stream adapter keeps original nanosecond bytes/cohorts and rejects aliasing, truncation and wrong hashes", linux, async () => {
   const dir = await mkdtemp(join(tmpdir(), "delivery-verifier-"));
   try {
     const paths = [join(dir, "warmup.parquet"), join(dir, "measurement.parquet"), join(dir, "drain.parquet")];
@@ -122,12 +122,21 @@ test("stream adapter reconciles multiple owned files and rejects aliasing, trunc
     const script = "#!/usr/bin/env node\nconst fs=require('node:fs');const text=fs.readFileSync(process.argv[3],'utf8');process.stdout.write(text);process.stderr.write('DELIVERY_IDENTITY_READER_COMPLETED rows='+(text.split('\\n').length-1)+'\\n');\n";
     await writeFile(decoder, script, { mode: 0o755 });
     const manifestPath = join(dir, "manifest.json");
-    await writeFile(manifestPath, JSON.stringify(manifest()));
+    const original = manifest();
+    original.measurement_bounds = { start_unix_ms_inclusive: 1_710_000_000_000, end_unix_ms_exclusive: 1_710_000_001_000 };
+    original.ranges.forEach(item => { item.last_outcome_unix_ms = 1_710_000_001_001; });
+    const serialized = JSON.stringify(original)
+      .replace('"first_send_unix_ns":999000000', '"first_send_unix_ns":1709999999999999999')
+      .replace('"first_send_unix_ns":1500000000', '"first_send_unix_ns":1710000000500000001')
+      .replace('"first_send_unix_ns":2000000000', '"first_send_unix_ns":1710000001000000001');
+    await writeFile(manifestPath, serialized);
     const input = { table, rewrite_commit_count: 0, manifest_paths: [manifestPath], active_parquet_paths: paths };
     const config = { decoderPath: decoder, expectedDecoderSha256: createHash("sha256").update(script).digest("hex"), expectedVerifierSha256: await verifierArtifactSha256() };
     const result = await verifyActiveParquetIdentitySet(input, config);
     assert.equal(result.activeFileCount, 3);
     assert.equal(result.activeFileRows, 7);
+    assert.deepEqual(result.cohortRows, { warmup: 2, measurement: 3, post_window: 2 });
+    assert.equal(result.manifestSources[0]!.sha256, createHash("sha256").update(await readFile(manifestPath)).digest("hex"));
     await assert.rejects(verifyActiveParquetIdentitySet({ ...input, active_parquet_paths: [paths[0]!, paths[0]!] }, config), /aliased/);
     await assert.rejects(verifyActiveParquetIdentitySet(input, { ...config, expectedDecoderSha256: "0".repeat(64) }), /hash differs/);
     await assert.rejects(verifyActiveParquetIdentitySet(input, { ...config, expectedVerifierSha256: "0".repeat(64) }), /hash differs/);
@@ -138,25 +147,40 @@ test("stream adapter reconciles multiple owned files and rejects aliasing, trunc
   }
 });
 
-test("early identity failure stops/reaps only its exact decoder despite ignored SIGTERM", linux, async () => {
+test("early identity failure and interruption stop/reap exact decoders despite ignored SIGTERM", linux, async () => {
   const dir = await mkdtemp(join(tmpdir(), "delivery-decoder-cleanup-"));
   try {
     const file = join(dir, "active.parquet");
     const decoder = join(dir, "decoder");
-    const pidFile = join(dir, "pid");
     await writeFile(file, "");
     const manifestPath = join(dir, "manifest.json");
     await writeFile(manifestPath, JSON.stringify(manifest()));
-    const script = `#!/usr/bin/env node\nconst fs=require('node:fs');fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));process.on('SIGTERM',()=>{});process.stdout.write(${JSON.stringify(rows[0] + "\n" + rows[0] + "\n")});setInterval(()=>{},10000);\n`;
-    await writeFile(decoder, script, { mode: 0o755 });
-    const start = Date.now();
-    await assert.rejects(verifyActiveParquetIdentitySet(
-      { table, rewrite_commit_count: 0, manifest_paths: [manifestPath], active_parquet_paths: [file] },
-      { decoderPath: decoder, expectedDecoderSha256: createHash("sha256").update(script).digest("hex"), expectedVerifierSha256: await verifierArtifactSha256() },
-    ), /duplicate/);
-    assert.ok(Date.now() - start < 5000);
-    const pid = Number(await readFile(pidFile, "utf8"));
-    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    for (const mode of ["duplicate", "abort"]) {
+      const pidFile = join(dir, `${mode}-pid`);
+      const script = `#!/usr/bin/env node\nconst fs=require('node:fs');process.on('SIGTERM',()=>{});fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));process.stdout.write(${JSON.stringify(mode === "duplicate" ? rows[0] + "\n" + rows[0] + "\n" : "")});setInterval(()=>{},10000);\n`;
+      await writeFile(decoder, script, { mode: 0o755 });
+      const controller = new AbortController();
+      const start = Date.now();
+      const verification = verifyActiveParquetIdentitySet(
+        { table, rewrite_commit_count: 0, manifest_paths: [manifestPath], active_parquet_paths: [file] },
+        { decoderPath: decoder, expectedDecoderSha256: createHash("sha256").update(script).digest("hex"), expectedVerifierSha256: await verifierArtifactSha256(), signal: controller.signal },
+      );
+      if (mode === "abort") {
+        while (true) {
+          try { await readFile(pidFile); break; }
+          catch (error) {
+            if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+          }
+          assert.ok(Date.now() - start < 2000);
+          await new Promise(done => setTimeout(done, 10));
+        }
+        controller.abort(new Error("stop owned decoder"));
+      }
+      await assert.rejects(verification, mode === "duplicate" ? /duplicate/ : /stop owned decoder/);
+      assert.ok(Date.now() - start < 5000);
+      const pid = Number(await readFile(pidFile, "utf8"));
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
