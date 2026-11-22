@@ -15,5 +15,8 @@
   },
   "docker_cli": {
     "debian_package": "docker.io=20.10.24+dfsg1-1+deb12u1+b6"
+  },
+  "age": {
+    "debian_package": "age=1.1.1-1+b3"
   }
 }

@@ -5,6 +5,7 @@ ARG RUST_VERSION
 ARG RUSTUP_INIT_SHA256
 ARG NODE_VERSION
 ARG NODE_SHA256
+ARG AGE_PACKAGE
 
 ENV CARGO_HOME=/opt/cargo \
     RUSTUP_HOME=/opt/rustup \
@@ -43,7 +44,7 @@ FROM candidate AS controller
 USER root
 ARG DOCKER_CLI_PACKAGE
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends "$DOCKER_CLI_PACKAGE" \
+    && apt-get install -y --no-install-recommends "$DOCKER_CLI_PACKAGE" "$AGE_PACKAGE" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY tools.lock.json install-tools.sh /opt/darwin-runner/
@@ -51,4 +52,5 @@ RUN chmod 755 /opt/darwin-runner/install-tools.sh \
     && /opt/darwin-runner/install-tools.sh \
     && install -m 755 /opt/darwin-runner/install-tools.sh /usr/local/bin/darwin-install-tools
 COPY candidate-exec.sh /usr/local/bin/darwin-candidate-exec
-RUN chmod 755 /usr/local/bin/darwin-candidate-exec
+COPY run-darwin.sh /usr/local/bin/darwin-runner-evolve
+RUN chmod 755 /usr/local/bin/darwin-candidate-exec /usr/local/bin/darwin-runner-evolve

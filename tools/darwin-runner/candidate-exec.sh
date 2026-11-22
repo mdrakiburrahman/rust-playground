@@ -68,9 +68,10 @@ git -C "$repo" archive --format=tar HEAD |
         --exclude=".netrc" --exclude="*/.netrc" \
         --exclude=".npmrc" --exclude="*/.npmrc" \
         --exclude=".git-credentials" --exclude="*/.git-credentials" \
-        --exclude=".gitconfig" --exclude="*/.gitconfig"
+        --exclude=".gitconfig" --exclude="*/.gitconfig" \
+        --exclude="*.age"
 
-      if find /workspace \( -type f -o -type l \) \( -name ".env" -o -name ".env.*" -o -name ".netrc" -o -name ".npmrc" -o -name ".git-credentials" -o -name ".gitconfig" \) -print -quit | grep -q .; then
+      if find /workspace \( -type f -o -type l \) \( -name ".env" -o -name ".env.*" -o -name "*.age" -o -name ".netrc" -o -name ".npmrc" -o -name ".git-credentials" -o -name ".gitconfig" \) -print -quit | grep -q .; then
         echo "credential-like file found in candidate snapshot" >&2
         exit 1
       fi

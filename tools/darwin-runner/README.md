@@ -1,23 +1,27 @@
 # Darwin runner
 
-Runs pinned Darwin 0.3.0 in a Debian bookworm controller beside the Ubuntu devcontainer. Darwin and candidate workers use the same pinned Rust and Node toolchains; each candidate gets a fresh container with only `git archive HEAD`, a sanitized environment, no host home or credentials, and no Docker socket. The candidate image is identical across A/B evaluations.
+Darwin 0.3.0 runs in a pinned Debian bookworm controller beside the Ubuntu devcontainer. The controller and candidate worker use identical pinned Rust/Node toolchains. Each candidate gets a fresh container with only committed `git archive HEAD`, no host mounts, credentials, cloud config, controller home, inherited environment, or Docker socket.
 
 | Command | Purpose |
 |---|---|
-| `tools/darwin-runner/run.sh dry-run tools/darwin-runner/toy.yaml` | Parse and dry-run the toy config without inference or a token. |
-| `tools/darwin-runner/run.sh evolve <tracked-config.yaml> <experiment>` | Run the isolation proof, then Darwin. Requires one `COPILOT_GITHUB_TOKEN` in the gitignored `.env`. |
-| `env -u COPILOT_GITHUB_TOKEN /usr/local/bin/darwin-candidate-exec 'cargo test --locked'` | Evaluator command form; use it for every evaluator command. |
+| `tools/darwin-runner/run.sh version` | Build the pinned images and print the Darwin version. |
+| `tools/darwin-runner/run.sh dry-run tools/darwin-runner/toy.yaml` | Validate the toy config and ask Darwin to dry-run it without a token. |
+| `tools/darwin-runner/run.sh prepare` | Generate a per-run age identity in a Docker volume and print its run ID, public recipient, and SHA-256 fingerprint. |
+| `tools/darwin-runner/run.sh evolve <tracked-config.yaml> <experiment> <run-id>` | Prove isolation, unwrap the run-scoped encrypted token for Darwin, and run the experiment. |
+| `tools/darwin-runner/run.sh cleanup <run-id>` | Remove an unused run's encrypted workspace copy and private-key volume. |
+| `env -u COPILOT_GITHUB_TOKEN /usr/local/bin/darwin-candidate-exec 'cargo test --locked'` | Required evaluator command form. |
 
-`evolve` refuses configs whose evaluator commands do not start with the isolated executor and token scrub. Before exposing the real token, it runs a fake-token probe that includes a tracked sentinel `.env`; the worker must report that its environment and filesystem contain no sentinel, credential path, or controller socket. Any failed proof stops the run before inference.
+After `prepare`, encrypt a one-line `COPILOT_GITHUB_TOKEN=<value>` file to the returned `age1...` recipient. Place only the ciphertext at `sync/rust-playground/.darwin-runner-<run-id>.env.age`; bootstrapper sync places it at the repository root. Do not stage plaintext in the shared sync folder, a command, or job history. The runner removes its workspace copy and destroys the key volume on completion or failed decryption; remove the source ciphertext from the sync folder after the run. The existing `.env` is neither read nor changed, and there is no fallback recipient.
 
-The Docker socket and the workspace (including `.env`) are mounted only into the controller. The real token is filtered into an ephemeral, mode-0600 env file and passed to the Darwin container; candidate archives are generated from the committed `HEAD` and exclude `.env*` and credential/config paths. The worker has no bind mounts, cloud configuration, GitHub credentials, inherited environment, or controller home.
+Before decrypting anything, `evolve` checks that every evaluator command drops `COPILOT_GITHUB_TOKEN` before invoking the isolated executor. It then runs a fake-token probe using a separate temporary repository with a tracked sentinel `.env`. The worker must confirm the sentinel environment, `.env`, encrypted-file patterns, credentials, home and controller socket are absent. A failed probe stops before decryption or inference. The private key volume is mounted only into the controller and read-only; the decrypted one-line env file exists only in the controller's fresh tmpfs and is passed to Darwin with `--env-file`.
 
-Live inference command for the ArrowCol campaign:
+The pinned binary prints `darwin 0.3.0`. In the first no-token dry-run, the Debian controller started, and Darwin parsed the toy config, but dry-run failed with `ModuleNotFoundError: No module named 'darwin.prompts.default'`. The source repository is not readable with the authorized `mdrakiburrahman` GitHub identity, so this runner does not substitute an unverified binary or copy private source.
+
+Once a trusted campaign config is available, use:
 
 ```bash
-tools/darwin-runner/run.sh evolve tools/darwin/darwin.yaml <experiment-name>
+tools/darwin-runner/run.sh prepare
+tools/darwin-runner/run.sh evolve tools/darwin/darwin.yaml <experiment-name> <run-id>
 ```
 
-The command prints the Darwin result only after the fake-token isolation proof passes. It requires the repo-bootstrapper-injected `.env`; never put a real token in command arguments or job code. `darwin --version` in the controller prints `darwin 0.3.0`.
-
-The dry run should print Darwin's parsed experiment summary and exit without starting an agent. The inference run should first print `candidate isolation assertions passed`, `Isolation proof passed: ...`, and `Darwin evaluator isolation check passed (...)`; no token value is emitted.
+The prepare output contains only the public recipient and fingerprint. A successful inference run first prints `candidate isolation assertions passed`, `Isolation proof passed: ...`, and `Darwin evaluator isolation check passed (...)`; no credential value is emitted.

@@ -14,11 +14,14 @@ if (document.errors.length > 0) {
 }
 
 const config = document.toJS() as {
+  name?: string;
+  evaluator?: { commands?: unknown };
+  agents?: unknown;
   defaults?: { evaluator?: { commands?: unknown } };
   experiments?: Array<{ name?: string; evaluator?: { commands?: unknown } }>;
 };
+
 let commandCount = 0;
-const defaultCommands = config.defaults?.evaluator?.commands;
 function validateCommands(location: string, commands: unknown, required: boolean): void {
   if (commands === undefined && !required) return;
   if (!Array.isArray(commands) || commands.length === 0) {
@@ -35,17 +38,26 @@ function validateCommands(location: string, commands: unknown, required: boolean
   }
 }
 
-validateCommands("defaults.evaluator", defaultCommands, false);
-for (const [index, experiment] of (config.experiments ?? []).entries()) {
-  const name = experiment.name ? ` (${experiment.name})` : "";
-  validateCommands(
-    `experiments[${index}]${name}.evaluator`,
-    experiment.evaluator?.commands ?? defaultCommands,
-    true,
-  );
+const isManifest = Array.isArray(config.experiments);
+if (!isManifest) {
+  if (!config.name || !Array.isArray(config.agents) || config.agents.length === 0) {
+    throw new Error("single-experiment config requires a name and at least one agent");
+  }
+  validateCommands("evaluator", config.evaluator?.commands, true);
+} else {
+  const defaultCommands = config.defaults?.evaluator?.commands;
+  validateCommands("defaults.evaluator", defaultCommands, false);
+  for (const [index, experiment] of (config.experiments ?? []).entries()) {
+    const name = experiment.name ? ` (${experiment.name})` : "";
+    validateCommands(
+      `experiments[${index}]${name}.evaluator`,
+      experiment.evaluator?.commands ?? defaultCommands,
+      true,
+    );
+  }
 }
 
-if (commandCount === 0 || !config.experiments?.length) {
+if (commandCount === 0 || (isManifest && !config.experiments?.length)) {
   throw new Error("configuration has no isolated evaluator commands");
 }
 
