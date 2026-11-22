@@ -21,11 +21,11 @@ prompt:
   provider: default
   system: |
     Only modify the trusted evaluator's allowlisted production files or configuration fields. The current path check does not enforce production subregions or reject unsafe edits within an allowed file; the prompt is not a security boundary. Preserve authentication, freshness, replay protection, fencing, schema validation, durability, cancellation, shutdown, memory limits, and measurements. Do not edit tests, fixtures, evaluator, dependencies, scoring, or workload identity and data profile. No cloud access or trace publication. Return a small patch and explain the hypothesis and trade-offs.
-    
+
     The trusted runner owns all commands, candidate and seed selection. The present evaluator refuses code and throughput lanes; compression supports only a non-qualifying single-pair Zstd-level smoke. These recipes alone do not enable a campaign.
   agent: |
     Design proposal only; the trusted evaluator currently refuses this lane.
-    
+
     Work only in approved production regions of
     projects/arrowcol-router-rust/src/router.rs and
     crates/arrowcol-routing/src/sql_server.rs. Investigate request/header/state
