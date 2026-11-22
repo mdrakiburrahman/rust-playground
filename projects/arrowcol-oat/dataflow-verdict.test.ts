@@ -241,6 +241,32 @@ test('v3 requires evidenced collector output, but known zero commits remain vali
   assert.equal(evaluate({ version: 1 }).pass, false);
 });
 
+test('local collector override binds the observed image and source revision', () => {
+  const image = `sha256:${'b'.repeat(64)}`;
+  const revision = 'b'.repeat(40);
+  const evidence = outputEvidence();
+  evidence.processes[0].image_id = image;
+  evidence.processes[0].source_revision = revision;
+  const localRow = row({ mode: 'local', schema_version: 3, measure_seconds: 1, evidence_json: JSON.stringify(evidence) });
+  const withOverride = (image_id: unknown, source_revision: unknown) => ({
+    ...config, platform: { local: { collector_image_override: { image_id, source_revision } } },
+  });
+  assert.equal(evaluateDataFlow(status, [localRow], sha, 'local', withOverride(image, revision)).pass, true);
+  for (const invalid of [
+    withOverride(`sha256:${'c'.repeat(64)}`, revision),
+    withOverride(image, 'c'.repeat(40)),
+    withOverride(image, null),
+    withOverride('invalid', revision),
+    config,
+  ]) assert.equal(evaluateDataFlow(status, [localRow], sha, 'local', invalid).pass, false);
+  const missingRevision = outputEvidence();
+  Object.assign(missingRevision.processes[0], { image_id: image, source_revision: null });
+  assert.equal(evaluateDataFlow(status, [row({ ...localRow, evidence_json: JSON.stringify(missingRevision) })],
+    sha, 'local', withOverride(image, revision)).pass, false);
+  assert.equal(evaluateDataFlow(status, [row({ ...localRow, mode: 'aks' })],
+    sha, 'aks', withOverride(image, revision)).pass, false);
+});
+
 test('run reporting returns failure exit status for a runner exception and success only after evidence passes', async (t) => {
   const output: string[] = [];
   t.mock.method(console, 'log', (message: string) => output.push(message));
