@@ -58,7 +58,8 @@ const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const launcherDeadlineReceiptRoot = resolve(workspaceRoot, 'out/arrowcol-oat/deadline-receipts');
 const launcherDeadlineMaxSeconds = 600;
 const localCancellationCleanupMs = 10 * 60 * 1000;
-const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
+const localDeadCleanupDispositionSuffix = '.local-dead-cleanup';
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds', '--reconcile-dead-local']);
 
 export class OatCliError extends Error {
   readonly exitCode = 2;
@@ -100,6 +101,8 @@ Options:
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  --reconcile-dead-local <id>
+                       Record cleanup-only disposition for one exact dead local run
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
                        Post-load evidence must be no more than 60 minutes old.
@@ -138,6 +141,7 @@ interface LauncherDeadlineReceipt {
   server_pid?: number | null;
   server_start_ticks?: string | null;
   server_executable?: string | null;
+  local_runtime_identity?: LocalRunRuntimeIdentity | null;
   run_id: string | null;
   run_state: OatRunStatus['state'] | 'not_started' | 'unknown';
   terminal_observation?: LauncherTerminalObservation | null;
@@ -145,6 +149,65 @@ interface LauncherDeadlineReceipt {
   last_cancel_result: string | null;
   cleanup_state: DeadlineCleanupState;
   error: string | null;
+}
+
+interface LocalRunRuntimeIdentity {
+  docker_engine_id: string;
+  compose_project: string;
+  compose_state_root: string;
+  owner_pid: number;
+  owner_start_ticks: string;
+}
+
+interface LocalDeadRunCleanupDisposition {
+  schema_version: 1;
+  kind: 'dead_local_controller_cleanup_only';
+  invocation_id: string;
+  run_id: string;
+  original_receipt_name: string;
+  original_receipt_sha256: string;
+  recorded_at_unix_ms: number;
+  original_run_state: 'queued' | 'running' | 'unknown';
+  original_error: string;
+  original_deadline: {
+    deadline_at_unix_ms: number | null;
+    deadline_seconds: number | null;
+    overrun: boolean;
+    overrun_at_unix_ms: number | null;
+  };
+  outcome: 'unknown';
+  cleanup_only: true;
+  metric_usable: false;
+  deadline_reset: false;
+  run_state_store: 'process_local_only';
+  service_pid: number;
+  service_start_ticks: string;
+  service_executable: string;
+  service_url: string;
+  owner_pid: number;
+  owner_start_ticks: string;
+  docker_engine_id: string;
+  compose_project: string;
+  compose_state_root: string;
+  evidence: {
+    service_process_absent: true;
+    owner_process_absent: true;
+    endpoint_unbound: true;
+    docker_engine_matches: true;
+    containers_absent: true;
+    networks_absent: true;
+    volumes_absent: true;
+    local_state_absent: true;
+    run_state_not_resumable: true;
+  };
+}
+
+export interface LocalDeadRunRecoveryDependencies {
+  docker?: DockerCommand;
+  processStartTicks?: (pid: number) => Promise<string | undefined>;
+  reserveEndpoint?: (serverUrl: string) => Promise<() => Promise<void>>;
+  now?: () => number;
+  workspaceRoot?: string;
 }
 
 interface LauncherTerminalObservation {
@@ -216,6 +279,7 @@ export class OatLauncherDeadline {
       server_pid: null,
       server_start_ticks: null,
       server_executable: null,
+      local_runtime_identity: null,
       run_id: null,
       run_state: 'not_started',
       terminal_observation: null,
@@ -243,6 +307,7 @@ export class OatLauncherDeadline {
       server_pid: parsed.server_pid ?? null,
       server_start_ticks: parsed.server_start_ticks ?? null,
       server_executable: parsed.server_executable ?? null,
+      local_runtime_identity: parsed.local_runtime_identity ?? null,
       terminal_observation: parsed.terminal_observation ?? null,
     };
     const deadline = new OatLauncherDeadline(path, restored, writeReceipt);
@@ -346,6 +411,29 @@ export class OatLauncherDeadline {
     receipt.server_pid = identity.serverPid;
     receipt.server_start_ticks = identity.serverStartTicks;
     receipt.server_executable = identity.serverExecutable;
+    await this.persist();
+  }
+
+  async recordLocalRuntimeIdentity(identity: Readonly<LocalRunRuntimeIdentity>): Promise<void> {
+    const receipt = this.receipt;
+    let config: unknown;
+    try {
+      config = receipt.submitted_config_body === null ? undefined : JSON.parse(receipt.submitted_config_body);
+    } catch {
+      throw new Error('Local runtime identity has no valid submitted OAT config');
+    }
+    if (!receipt.run_id || receipt.creation_state !== 'accepted' || submittedPlatform(receipt.submitted_config_body) !== 'local' ||
+        !identity || !isLocalRunRuntimeIdentity(identity) ||
+        identity.compose_project !== localProjectForRun(config, receipt.run_id) ||
+        identity.compose_state_root !== localStateRoot(isRecord(config) ? config : {}) ||
+        identity.owner_pid <= 0 ||
+        receipt.server_pid === null || receipt.server_start_ticks === null || receipt.server_executable === null) {
+      throw new Error('Local runtime identity does not match the accepted local run');
+    }
+    if (receipt.local_runtime_identity && !isDeepStrictEqual(receipt.local_runtime_identity, identity)) {
+      throw new Error('Local runtime identity changed for the accepted run');
+    }
+    receipt.local_runtime_identity = structuredClone(identity);
     await this.persist();
   }
 
@@ -456,6 +544,17 @@ function hasConfirmedAksFailure(status: OatRunStatus | undefined): boolean {
     Number.isSafeInteger(status.finished_at_unix_ms) && status.finished_at_unix_ms > 0;
 }
 
+function isLocalRunRuntimeIdentity(value: unknown): value is LocalRunRuntimeIdentity {
+  return isRecord(value) &&
+    Object.keys(value).sort().join(',') === 'compose_project,compose_state_root,docker_engine_id,owner_pid,owner_start_ticks' &&
+    typeof value.docker_engine_id === 'string' && /^[a-f0-9]{12,128}$/i.test(value.docker_engine_id) &&
+    typeof value.compose_project === 'string' && /^[a-z0-9][a-z0-9_-]{0,62}$/.test(value.compose_project) &&
+    typeof value.compose_state_root === 'string' && isAbsolute(value.compose_state_root) &&
+    !/[\r\n\0]/.test(value.compose_state_root) &&
+    typeof value.owner_pid === 'number' && Number.isSafeInteger(value.owner_pid) && value.owner_pid > 0 &&
+    typeof value.owner_start_ticks === 'string' && /^[0-9]+$/.test(value.owner_start_ticks);
+}
+
 function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineReceipt {
   if (!isRecord(value)) return false;
   const noBinding = value.submitted_config_body === null && value.submitted_config_sha256 === null && value.source_config_sha256 === null;
@@ -468,6 +567,9 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
   const identityIsValid = typeof value.server_pid === 'number' && Number.isSafeInteger(value.server_pid) && value.server_pid > 0 &&
     typeof value.server_start_ticks === 'string' && value.server_start_ticks.length > 0 &&
     typeof value.server_executable === 'string' && value.server_executable.length > 0;
+  const localRuntimeIdentityAbsent = !('local_runtime_identity' in value);
+  const localRuntimeIdentityIsNull = value.local_runtime_identity === null;
+  const localRuntimeIdentityIsValid = isLocalRunRuntimeIdentity(value.local_runtime_identity);
   const observationAbsent = !('terminal_observation' in value);
   const observationIsValid = value.terminal_observation === null || isLauncherTerminalObservation(value.terminal_observation);
   const observationMatches = value.terminal_observation === undefined || value.terminal_observation === null ||
@@ -496,6 +598,7 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
     (value.error === null || typeof value.error === 'string') &&
     (identityFieldsAbsent || identityIsNull || identityIsValid) &&
     (identityFieldsAbsent || identityIsNull || (value.creation_state === 'accepted' && value.run_id !== null && value.server_url !== null)) &&
+    (localRuntimeIdentityAbsent || localRuntimeIdentityIsNull || localRuntimeIdentityIsValid) &&
     (observationAbsent || observationIsValid) && observationMatches &&
     (value.run_state !== 'failed' || value.cleanup_state !== 'confirmed' ||
       (bindingIsValid && submittedPlatform(value.submitted_config_body) === 'aks' && value.config_binding_error === null &&
@@ -1105,6 +1208,25 @@ export async function assertNoUnsettledDeadlineReceipts(
     throw error;
   });
   const admittedDispositions = new Set<string>();
+  for (const name of names.filter((entry) => entry.endsWith(localDeadCleanupDispositionSuffix))) {
+    const originalName = name.slice(0, -localDeadCleanupDispositionSuffix.length);
+    if (!originalName.endsWith('.json') || !names.includes(originalName)) {
+      throw new Error('Orphaned local cleanup-only disposition');
+    }
+    const receiptBytes = await readLegacyRegularFile(resolve(root, originalName));
+    const dispositionBytes = await readLegacyRegularFile(resolve(root, name));
+    let receiptValue: unknown;
+    let dispositionValue: unknown;
+    try {
+      receiptValue = JSON.parse(receiptBytes.toString('utf8'));
+      dispositionValue = JSON.parse(dispositionBytes.toString('utf8'));
+    } catch {
+      throw new Error(`Invalid local cleanup-only disposition ${name}`);
+    }
+    if (!isLauncherDeadlineReceipt(receiptValue)) throw new Error(`Invalid original launcher receipt for ${name}`);
+    validateLocalDeadRunDisposition(receiptBytes, originalName, receiptValue, dispositionValue, name);
+    admittedDispositions.add(originalName);
+  }
   for (const name of names.filter((entry) => entry.endsWith(legacyDispositionSuffix))) {
     const originalName = name.slice(0, -legacyDispositionSuffix.length);
     const approval = originalName.endsWith('.json') ? findAksDispositionApproval(approvals, originalName.slice(0, -5)) : undefined;
@@ -1191,6 +1313,56 @@ function localProjectPrefix(config: Record<string, unknown>, length: number): st
   return `${base.slice(0, length).replace(/[-_]+$/g, '')}-`;
 }
 
+function localProjectForRun(config: unknown, runId: string): string {
+  if (!isRecord(config) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
+    throw new Error('Local run identity is missing a valid config or canonical run ID');
+  }
+  return localProjectPrefix(config, 15) + runId.replace(/-/g, '').toLowerCase();
+}
+
+function readDockerEngineId(docker: DockerCommand = runDocker): string {
+  const engineId = docker(['info', '--format', '{{.ID}}']).trim();
+  if (!/^[a-f0-9]{12,128}$/i.test(engineId)) throw new Error('Docker did not return a valid engine ID');
+  return engineId;
+}
+
+export async function assertLocalCleanupEngineBinding(
+  root: string,
+  runId: string,
+  config: Record<string, unknown>,
+  docker: DockerCommand = runDocker,
+): Promise<void> {
+  const names: string[] = await readdir(root).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  const matches: Array<{ receipt: LauncherDeadlineReceipt }> = [];
+  for (const name of names.filter((entry) => entry.endsWith('.json'))) {
+    const bytes = await readLegacyRegularFile(resolve(root, name));
+    let value: unknown;
+    try {
+      value = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      throw new Error(`Invalid launcher receipt ${name}`);
+    }
+    if (!isLauncherDeadlineReceipt(value)) throw new Error(`Invalid launcher receipt ${name}`);
+    if (value.run_id === runId) matches.push({ receipt: value });
+  }
+  if (!matches.length) return;
+  if (matches.length !== 1) throw new Error(`Local run ${runId} has ambiguous launcher receipts`);
+  const { receipt } = matches[0]!;
+  const identity = receipt.local_runtime_identity;
+  if (!identity || !isLocalRunRuntimeIdentity(identity) ||
+      identity.compose_project !== localProjectForRun(config, runId) ||
+      identity.compose_state_root !== localStateRoot(config) ||
+      submittedPlatform(receipt.submitted_config_body) !== 'local') {
+    throw new Error(`Local run ${runId} lacks verified Docker engine/project identity; refusing cleanup`);
+  }
+  if (readDockerEngineId(docker) !== identity.docker_engine_id) {
+    throw new Error('Current Docker engine does not match the recorded local run engine; refusing cleanup');
+  }
+}
+
 export async function cleanupLocalComposeProjects(
   config: Record<string, unknown>,
   runId: string,
@@ -1272,12 +1444,12 @@ interface LocalRunMarkerContext {
   marker: Omit<LocalRunMarker, 'runId' | keyof SubmittedOatConfig>;
 }
 
-function localStateRoot(config: Record<string, unknown>): string {
+function localStateRoot(config: Record<string, unknown>, root = workspaceRoot): string {
   const platform = isRecord(config.platform) ? config.platform : {};
   if (typeof platform.compose_state_root !== 'string' || !platform.compose_state_root) {
     throw new Error('Local Compose state root is missing from config');
   }
-  return resolve(workspaceRoot, platform.compose_state_root);
+  return resolve(root, platform.compose_state_root);
 }
 
 export async function processStartTicks(
@@ -1295,6 +1467,304 @@ export async function processStartTicks(
   const fields = statText.slice(statText.lastIndexOf(')') + 2).trim().split(/\s+/);
   if (fields[0] === 'Z' || fields.length <= 19) return undefined;
   return fields[19];
+}
+
+async function reserveLocalEndpoint(serverUrl: string): Promise<() => Promise<void>> {
+  const url = new URL(serverUrl);
+  if (!isLocalOatServerUrl(url.href) || url.hostname !== '127.0.0.1' || !url.port) {
+    throw new Error('Dead local run receipt does not identify a fixed loopback endpoint');
+  }
+  const listener = createTcpServer();
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error) => rejectListen(error);
+    listener.once('error', onError);
+    listener.listen({ host: '127.0.0.1', port: Number(url.port), exclusive: true }, () => {
+      listener.off('error', onError);
+      resolveListen();
+    });
+  });
+  return async () => new Promise<void>((resolveClose, rejectClose) => {
+    listener.close((error) => error ? rejectClose(error) : resolveClose());
+  });
+}
+
+async function assertDeadProcessIdentity(
+  label: string,
+  pid: number,
+  startTicks: string,
+  readStartTicks: (pid: number) => Promise<string | undefined>,
+): Promise<void> {
+  if (pid === process.pid) throw new Error(`Recorded local ${label} identity is the reconciliation process`);
+  const observed = await readStartTicks(pid);
+  if (observed !== undefined) {
+    throw new Error(observed === startTicks
+      ? `Recorded local ${label} process is still live`
+      : `Recorded local ${label} PID has been reused`);
+  }
+}
+
+async function assertLocalProjectResourcesAbsent(project: string, docker: DockerCommand): Promise<void> {
+  const resources: Array<{ name: string; list: string[]; inspect: (id: string) => string[] }> = [
+    {
+      name: 'container',
+      list: ['ps', '-aq', '--filter', `label=com.docker.compose.project=${project}`],
+      inspect: (id) => ['inspect', '--format', '{{ index .Config.Labels "com.docker.compose.project" }}', id],
+    },
+    {
+      name: 'network',
+      list: ['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`],
+      inspect: (id) => ['network', 'inspect', '--format', '{{ index .Labels "com.docker.compose.project" }}', id],
+    },
+    {
+      name: 'volume',
+      list: ['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`],
+      inspect: (id) => ['volume', 'inspect', '--format', '{{ index .Labels "com.docker.compose.project" }}', id],
+    },
+  ];
+  for (const resource of resources) {
+    for (const id of docker(resource.list).split(/\r?\n/).filter(Boolean)) {
+      if (docker(resource.inspect(id)).trim() !== project) {
+        throw new Error(`Docker returned an ambiguously labeled ${resource.name} for the local Compose project`);
+      }
+      throw new Error(`Local Compose ${resource.name} remains for exact project ${project}`);
+    }
+  }
+}
+
+async function assertLocalRunStateAbsent(
+  identity: LocalRunRuntimeIdentity,
+  runId: string,
+  serverPid: number,
+  root: string,
+): Promise<void> {
+  const stateRoot = resolve(identity.compose_state_root);
+  const rootRelative = relative(resolve(root), stateRoot);
+  if (!rootRelative || rootRelative === '..' || rootRelative.startsWith('..' + sep) || isAbsolute(rootRelative)) {
+    throw new Error('Recorded local state root is outside the launcher workspace');
+  }
+  let cursor = resolve(root);
+  for (const component of rootRelative.split(sep)) {
+    cursor = resolve(cursor, component);
+    let metadata;
+    try {
+      metadata = await lstat(cursor);
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (metadata.isSymbolicLink()) throw new Error('Recorded local state root traverses a symlink');
+  }
+  const rootMetadata = await lstat(stateRoot);
+  if (!rootMetadata.isDirectory() || await realpath(stateRoot) !== stateRoot) {
+    throw new Error('Recorded local state root is not a canonical directory');
+  }
+  for (const target of [
+    resolve(stateRoot, runId),
+    resolve(stateRoot, `.arrowcol-oat-owner-${serverPid}.json`),
+  ]) {
+    try {
+      await lstat(target);
+      throw new Error(`Local OAT state remains for exact run ${runId}`);
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+      throw error;
+    }
+  }
+}
+
+function isLocalDeadRunCleanupDisposition(value: unknown): value is LocalDeadRunCleanupDisposition {
+  if (!isRecord(value) ||
+      Object.keys(value).sort().join(',') !==
+        'cleanup_only,compose_project,compose_state_root,docker_engine_id,deadline_reset,evidence,invocation_id,kind,metric_usable,original_deadline,original_error,original_receipt_name,original_receipt_sha256,original_run_state,owner_pid,owner_start_ticks,outcome,recorded_at_unix_ms,run_id,run_state_store,schema_version,service_executable,service_pid,service_start_ticks,service_url' ||
+      value.schema_version !== 1 || value.kind !== 'dead_local_controller_cleanup_only' ||
+      typeof value.invocation_id !== 'string' || typeof value.run_id !== 'string' ||
+      typeof value.original_receipt_name !== 'string' || typeof value.original_receipt_sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(value.original_receipt_sha256) ||
+      typeof value.recorded_at_unix_ms !== 'number' || !Number.isSafeInteger(value.recorded_at_unix_ms) ||
+      !['queued', 'running', 'unknown'].includes(String(value.original_run_state)) ||
+      typeof value.original_error !== 'string' || !value.original_error ||
+      value.outcome !== 'unknown' || value.cleanup_only !== true || value.metric_usable !== false ||
+      value.deadline_reset !== false || value.run_state_store !== 'process_local_only' ||
+      typeof value.service_pid !== 'number' || typeof value.service_start_ticks !== 'string' ||
+      typeof value.service_executable !== 'string' || typeof value.service_url !== 'string' ||
+      typeof value.owner_pid !== 'number' || typeof value.owner_start_ticks !== 'string' ||
+      typeof value.docker_engine_id !== 'string' || typeof value.compose_project !== 'string' ||
+      typeof value.compose_state_root !== 'string' || !isRecord(value.original_deadline) ||
+      Object.keys(value.original_deadline).sort().join(',') !== 'deadline_at_unix_ms,deadline_seconds,overrun,overrun_at_unix_ms' ||
+      !isRecord(value.evidence) ||
+      Object.keys(value.evidence).sort().join(',') !==
+        'containers_absent,docker_engine_matches,endpoint_unbound,local_state_absent,networks_absent,owner_process_absent,run_state_not_resumable,service_process_absent,volumes_absent' ||
+      Object.values(value.evidence).some((item) => item !== true)) return false;
+  return true;
+}
+
+function validateLocalDeadRunDisposition(
+  receiptBytes: Buffer,
+  receiptName: string,
+  receipt: LauncherDeadlineReceipt,
+  disposition: unknown,
+  dispositionName: string,
+): asserts disposition is LocalDeadRunCleanupDisposition {
+  const identity = receipt.local_runtime_identity;
+  if (!isLocalDeadRunCleanupDisposition(disposition) || !identity || !receipt.run_id ||
+      receiptName !== `${receipt.invocation_id}.json` ||
+      dispositionName !== receiptName + localDeadCleanupDispositionSuffix ||
+      disposition.invocation_id !== receipt.invocation_id || disposition.run_id !== receipt.run_id ||
+      disposition.original_receipt_name !== receiptName ||
+      disposition.original_receipt_sha256 !== createHash('sha256').update(receiptBytes).digest('hex') ||
+      disposition.original_run_state !== (receipt.run_state ?? 'unknown') ||
+      disposition.original_error !== receipt.error ||
+      !isDeepStrictEqual(disposition.original_deadline, {
+        deadline_at_unix_ms: receipt.deadline_at_unix_ms,
+        deadline_seconds: receipt.deadline_seconds,
+        overrun: receipt.overrun,
+        overrun_at_unix_ms: receipt.overrun_at_unix_ms,
+      }) ||
+      disposition.service_pid !== receipt.server_pid || disposition.service_start_ticks !== receipt.server_start_ticks ||
+      disposition.service_executable !== receipt.server_executable || disposition.service_url !== receipt.server_url ||
+      disposition.owner_pid !== identity.owner_pid || disposition.owner_start_ticks !== identity.owner_start_ticks ||
+      disposition.docker_engine_id !== identity.docker_engine_id ||
+      disposition.compose_project !== identity.compose_project ||
+      disposition.compose_state_root !== identity.compose_state_root ||
+      receipt.cleanup_state !== 'unsettled' || receipt.terminal_observation !== null ||
+      receipt.error === null || submittedPlatform(receipt.submitted_config_body) !== 'local') {
+    throw new Error(`Invalid or conflicting local cleanup-only disposition ${dispositionName}`);
+  }
+}
+
+async function writeExclusiveJson(path: string, value: unknown): Promise<void> {
+  const temporary = path + '.' + randomUUID() + '.tmp';
+  const output = await open(temporary, 'wx', 0o600);
+  try {
+    try {
+      await output.writeFile(JSON.stringify(value, null, 2) + '\n');
+      await output.sync();
+    } finally {
+      await output.close();
+    }
+    await link(temporary, path);
+    const directory = await open(dirname(path), 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  } finally {
+    await unlink(temporary);
+  }
+}
+
+export async function recordLocalDeadRunCleanupDisposition(
+  root: string,
+  runId: string,
+  dependencies: LocalDeadRunRecoveryDependencies = {},
+): Promise<void> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
+    throw new Error('--reconcile-dead-local requires one canonical OAT run UUID');
+  }
+  const names = await readdir(root);
+  const candidates: Array<{ name: string; bytes: Buffer; receipt: LauncherDeadlineReceipt }> = [];
+  for (const name of names.filter((entry) => entry.endsWith('.json'))) {
+    const bytes = await readLegacyRegularFile(resolve(root, name));
+    let value: unknown;
+    try {
+      value = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      throw new Error(`Invalid launcher receipt ${name}`);
+    }
+    if (!isLauncherDeadlineReceipt(value)) throw new Error(`Invalid launcher receipt ${name}`);
+    if (value.run_id === runId) candidates.push({ name, bytes, receipt: value });
+  }
+  if (candidates.length !== 1) throw new Error(`Expected exactly one launcher receipt for local run ${runId}`);
+  const { name, bytes, receipt } = candidates[0]!;
+  const identity = receipt.local_runtime_identity;
+  let config: unknown;
+  try {
+    config = receipt.submitted_config_body === null ? undefined : JSON.parse(receipt.submitted_config_body);
+  } catch {
+    throw new Error('Dead local run receipt has invalid submitted config');
+  }
+  const stateRoot = isRecord(config) ? localStateRoot(config, dependencies.workspaceRoot ?? workspaceRoot) : '';
+  if (name !== `${receipt.invocation_id}.json` || receipt.creation_state !== 'accepted' ||
+      receipt.cleanup_state !== 'unsettled' || receipt.terminal_observation !== null ||
+      receipt.run_state !== 'queued' && receipt.run_state !== 'running' && receipt.run_state !== 'unknown' ||
+      typeof receipt.error !== 'string' || !receipt.error || !receipt.run_id ||
+      !isLocalOatServerUrl(receipt.server_url ?? '') || !identity || !isLocalRunRuntimeIdentity(identity) ||
+      !Number.isSafeInteger(receipt.server_pid) || typeof receipt.server_start_ticks !== 'string' ||
+      typeof receipt.server_executable !== 'string' || !isAbsolute(receipt.server_executable) ||
+      identity.compose_project !== localProjectForRun(config, runId) ||
+      identity.compose_state_root !== stateRoot || identity.owner_pid === receipt.server_pid ||
+      submittedPlatform(receipt.submitted_config_body) !== 'local') {
+    throw new Error(`Local run ${runId} lacks complete, unambiguous recovery identity; legacy receipts remain unsettled`);
+  }
+  const docker = dependencies.docker ?? runDocker;
+  const currentEngineId = readDockerEngineId(docker);
+  if (currentEngineId !== identity.docker_engine_id) throw new Error('Current Docker engine does not match the recorded local run engine');
+  const readStartTicks = dependencies.processStartTicks ?? processStartTicks;
+  if (!dependencies.processStartTicks && process.platform !== 'linux') {
+    throw new Error('Dead local run reconciliation requires readable Linux process identities');
+  }
+  await assertDeadProcessIdentity('server', receipt.server_pid!, receipt.server_start_ticks, readStartTicks);
+  await assertDeadProcessIdentity('launcher', identity.owner_pid, identity.owner_start_ticks, readStartTicks);
+  const releaseEndpoint = await (dependencies.reserveEndpoint ?? reserveLocalEndpoint)(receipt.server_url!);
+  try {
+    await assertLocalProjectResourcesAbsent(identity.compose_project, docker);
+    await assertLocalRunStateAbsent(identity, runId, receipt.server_pid!, dependencies.workspaceRoot ?? workspaceRoot);
+    if (readDockerEngineId(docker) !== identity.docker_engine_id) throw new Error('Docker engine changed during local run reconciliation');
+    await assertDeadProcessIdentity('server', receipt.server_pid!, receipt.server_start_ticks, readStartTicks);
+    await assertDeadProcessIdentity('launcher', identity.owner_pid, identity.owner_start_ticks, readStartTicks);
+    await assertLocalProjectResourcesAbsent(identity.compose_project, docker);
+    await assertLocalRunStateAbsent(identity, runId, receipt.server_pid!, dependencies.workspaceRoot ?? workspaceRoot);
+    const originalNow = await readLegacyRegularFile(resolve(root, name));
+    if (!originalNow.equals(bytes)) throw new Error('Original launcher receipt changed during local run reconciliation');
+    const dispositionPath = resolve(root, name + localDeadCleanupDispositionSuffix);
+    const disposition: LocalDeadRunCleanupDisposition = {
+      schema_version: 1,
+      kind: 'dead_local_controller_cleanup_only',
+      invocation_id: receipt.invocation_id,
+      run_id: runId,
+      original_receipt_name: name,
+      original_receipt_sha256: createHash('sha256').update(bytes).digest('hex'),
+      recorded_at_unix_ms: (dependencies.now ?? Date.now)(),
+      original_run_state: receipt.run_state ?? 'unknown',
+      original_error: receipt.error,
+      original_deadline: {
+        deadline_at_unix_ms: receipt.deadline_at_unix_ms,
+        deadline_seconds: receipt.deadline_seconds,
+        overrun: receipt.overrun,
+        overrun_at_unix_ms: receipt.overrun_at_unix_ms,
+      },
+      outcome: 'unknown',
+      cleanup_only: true,
+      metric_usable: false,
+      deadline_reset: false,
+      run_state_store: 'process_local_only',
+      service_pid: receipt.server_pid!,
+      service_start_ticks: receipt.server_start_ticks,
+      service_executable: receipt.server_executable,
+      service_url: receipt.server_url!,
+      owner_pid: identity.owner_pid,
+      owner_start_ticks: identity.owner_start_ticks,
+      docker_engine_id: identity.docker_engine_id,
+      compose_project: identity.compose_project,
+      compose_state_root: identity.compose_state_root,
+      evidence: {
+        service_process_absent: true,
+        owner_process_absent: true,
+        endpoint_unbound: true,
+        docker_engine_matches: true,
+        containers_absent: true,
+        networks_absent: true,
+        volumes_absent: true,
+        local_state_absent: true,
+        run_state_not_resumable: true,
+      },
+    };
+    validateLocalDeadRunDisposition(bytes, name, receipt, disposition, name + localDeadCleanupDispositionSuffix);
+    await writeExclusiveJson(dispositionPath, disposition);
+  } finally {
+    await releaseEndpoint();
+  }
 }
 
 async function prepareLocalRunMarker(config: Record<string, unknown>, server: {
@@ -1901,11 +2371,24 @@ export async function main(
   collect: typeof collectDataFlow = collectDataFlow,
   onOwnedRun?: OatOwnedRunObserver,
   signal?: AbortSignal,
+  localRecovery: LocalDeadRunRecoveryDependencies = {},
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
     console.log(cliUsage);
+    return;
+  }
+  if (args.includes('--reconcile-dead-local')) {
+    if (args[0] !== '--reconcile-dead-local' || args.length !== 2 ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(args[1] ?? '')) {
+      throw new OatCliError('--reconcile-dead-local requires exactly one canonical local run UUID');
+    }
+    await recordLocalDeadRunCleanupDisposition(receiptRoot, args[1]!, {
+      ...localRecovery,
+      docker: localRecovery.docker ?? runDocker,
+    });
+    console.log('Recorded cleanup-only disposition; original run outcome remains unknown and unusable as a metric.');
     return;
   }
   if (args[0] === '--recover-failed-aks') {
@@ -2000,6 +2483,7 @@ export async function main(
   const submission = bindSubmittedConfig(config, sourceBytes);
   if (cleanupRunId !== undefined) {
     if (mode !== 'local') throw new OatCliError('--cleanup-local is local-only');
+    await assertLocalCleanupEngineBinding(receiptRoot, cleanupRunId, config, localRecovery.docker ?? runDocker);
     const recoveredProjects = await recoverInterruptedLocalRuns(config, cleanupRunId, cleanupLocal);
     const projects = recoveredProjects ?? await cleanupLocal(config, cleanupRunId);
     await removeStaleLocalMarkers(config);
@@ -2014,6 +2498,13 @@ export async function main(
     config.subscriptionId = subscriptionId;
   }
   await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const docker = localRecovery.docker ?? runDocker;
+  const platformConfig = isRecord(config.platform) ? config.platform : {};
+  const hasLocalComposeIdentity = typeof platformConfig.compose_project === 'string' &&
+    typeof platformConfig.compose_state_root === 'string';
+  const localDockerEngineId = mode === 'local' && !requestedServerUrl && hasLocalComposeIdentity
+    ? readDockerEngineId(docker)
+    : undefined;
   const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
     if (deadline.isExpired()) {
@@ -2155,6 +2646,15 @@ export async function main(
           serverExecutable: localMarker.marker.serverExecutable,
         });
         await deadline.recordOwnedServerIdentity(identity);
+        if (localDockerEngineId) {
+          await deadline.recordLocalRuntimeIdentity({
+            docker_engine_id: localDockerEngineId,
+            compose_project: localProjectForRun(config, status.id),
+            compose_state_root: localStateRoot(config),
+            owner_pid: localMarker.marker.ownerPid,
+            owner_start_ticks: localMarker.marker.ownerStartTicks,
+          });
+        }
         if (onOwnedRun && !supplementaryEmitted) {
           if (interrupt?.controller.signal.aborted ||
               localMarker.marker.serverUrl !== new URL(server.url).href || localMarker.marker.serverPid !== server.child.pid ||

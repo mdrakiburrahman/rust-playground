@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -16,7 +16,8 @@ import { tableFromArrays, tableToIPC } from 'apache-arrow';
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import { collectDataFlow } from './dataflow-verdict.js';
 import {
-  buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
+  assertLocalCleanupEngineBinding, buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main,
+  OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode, recordLocalDeadRunCleanupDisposition,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
   aksDispositionMessage, assertCanonicalAksLaunchWorkspace, isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
@@ -34,6 +35,81 @@ async function bindLocalReceipt(deadline: OatLauncherDeadline): Promise<void> {
     submitted_config_sha256: status('running').config_sha256,
     source_config_sha256: 'a'.repeat(64),
   });
+}
+
+async function createUnsettledLocalReceipt(options: {
+  ownerPid?: number;
+  ownerStartTicks?: string;
+  serverPid?: number;
+  serverStartTicks?: string;
+  serverUrl?: string;
+  runId?: string;
+  engineId?: string;
+} = {}) {
+  const workspace = fileURLToPath(new URL('../..', import.meta.url));
+  const testRoot = path.join(workspace, 'out', 'arrowcol-oat');
+  await mkdir(testRoot, { recursive: true });
+  const directory = await mkdtemp(path.join(testRoot, 'dead-local-test-'));
+  const receiptRoot = path.join(directory, 'receipts');
+  const stateRoot = path.join(directory, 'state');
+  await mkdir(stateRoot, { recursive: true });
+  const runId = options.runId ?? '123e4567-e89b-42d3-a456-426614174000';
+  const serverUrl = options.serverUrl ?? 'http://127.0.0.1:42423';
+  const ownerPid = options.ownerPid ?? 2147483640;
+  const serverPid = options.serverPid ?? 2147483641;
+  const config = {
+    platform: {
+      kind: 'local',
+      compose_project: 'oat-dead-local-test',
+      compose_state_root: path.relative(workspace, stateRoot),
+    },
+  };
+  const submitted_config_body = JSON.stringify(config);
+  const submitted_config_sha256 = createHash('sha256').update(submitted_config_body).digest('hex');
+  const deadline = await OatLauncherDeadline.create(undefined, performance.now(), receiptRoot, Date.now());
+  await deadline.setSubmissionBinding({
+    submitted_config_body,
+    submitted_config_sha256,
+    source_config_sha256: 'a'.repeat(64),
+  });
+  await deadline.markCreationPending(serverUrl);
+  await deadline.recordRunStarted({
+    ...status('running'),
+    id: runId,
+    config_sha256: submitted_config_sha256,
+  });
+  await deadline.recordOwnedServerIdentity({
+    invocationId: deadline.invocationId,
+    runId,
+    serverUrl,
+    serverPid,
+    serverStartTicks: options.serverStartTicks ?? '99',
+    serverExecutable: process.execPath,
+  });
+  const project = `${config.platform.compose_project.slice(0, 15).replace(/[-_]+$/g, '')}-${runId.replace(/-/g, '').toLowerCase()}`;
+  await deadline.recordLocalRuntimeIdentity({
+    docker_engine_id: options.engineId ?? 'a'.repeat(64),
+    compose_project: project,
+    compose_state_root: stateRoot,
+    owner_pid: ownerPid,
+    owner_start_ticks: options.ownerStartTicks ?? '98',
+  });
+  await deadline.markUnsettled(new Error('synthetic controller loss'));
+  deadline.dispose();
+  return {
+    directory,
+    receiptRoot,
+    stateRoot,
+    workspace,
+    config,
+    runId,
+    serverUrl,
+    serverPid,
+    ownerPid,
+    project,
+    engineId: options.engineId ?? 'a'.repeat(64),
+    receiptPath: deadline.receiptPath,
+  };
 }
 
 test('procfs ESRCH race is treated as an exited process', { skip: process.platform !== 'linux' }, async () => {
@@ -1925,6 +2001,195 @@ test('local cleanup refuses ambiguous legacy project before removing resources o
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+
+test('dead local cleanup disposition is explicit, linked, and preserves the original receipt', async () => {
+  const fixture = await createUnsettledLocalReceipt();
+  const original = await readFile(fixture.receiptPath);
+  const docker = (args: string[]) => args[0] === 'info' ? fixture.engineId : '';
+  try {
+    await recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, {
+      docker,
+      processStartTicks: async () => undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: fixture.workspace,
+      now: () => 1_700_000_000_000,
+    });
+    const after = await readFile(fixture.receiptPath);
+    assert.deepEqual(after, original);
+    const dispositionPath = fixture.receiptPath + '.local-dead-cleanup';
+    const disposition = JSON.parse(await readFile(dispositionPath, 'utf8'));
+    assert.equal(disposition.outcome, 'unknown');
+    assert.equal(disposition.cleanup_only, true);
+    assert.equal(disposition.metric_usable, false);
+    assert.equal(disposition.deadline_reset, false);
+    assert.equal(disposition.original_receipt_sha256, createHash('sha256').update(original).digest('hex'));
+    await assertNoUnsettledDeadlineReceipts(fixture.receiptRoot);
+    await assertLocalCleanupEngineBinding(fixture.receiptRoot, fixture.runId, fixture.config, docker);
+    await assert.rejects(assertLocalCleanupEngineBinding(
+      fixture.receiptRoot, fixture.runId, fixture.config, () => 'b'.repeat(64),
+    ), /does not match the recorded local run engine/);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('dead local cleanup disposition rejects legacy identity gaps, reused PIDs, and remaining resources', async () => {
+  const legacy = await createUnsettledLocalReceipt({ runId: randomUUID() });
+  const processReused = await createUnsettledLocalReceipt({ runId: randomUUID() });
+  const resourcePresent = await createUnsettledLocalReceipt({ runId: randomUUID() });
+  try {
+    const legacyValue = JSON.parse(await readFile(legacy.receiptPath, 'utf8'));
+    delete legacyValue.local_runtime_identity;
+    await writeFile(legacy.receiptPath, JSON.stringify(legacyValue));
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(legacy.receiptRoot, legacy.runId, {
+      docker: (args) => args[0] === 'info' ? legacy.engineId : '',
+      processStartTicks: async () => undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: legacy.workspace,
+    }), /lacks complete, unambiguous recovery identity/);
+    await assert.rejects(assertLocalCleanupEngineBinding(legacy.receiptRoot, legacy.runId, legacy.config, () => {
+      throw new Error('docker must not be queried for legacy identity');
+    }), /lacks verified Docker engine\/project identity/);
+
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(processReused.receiptRoot, processReused.runId, {
+      docker: (args) => args[0] === 'info' ? processReused.engineId : '',
+      processStartTicks: async (pid) => pid === processReused.serverPid ? 'different-start-ticks' : undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: processReused.workspace,
+    }), /PID has been reused/);
+
+    const resourceDocker = (args: string[]) => {
+      if (args[0] === 'info') return resourcePresent.engineId;
+      if (args[0] === 'ps' && args[1] === '-aq') return 'stopped-container-id';
+      if (args[0] === 'inspect') return resourcePresent.project;
+      return '';
+    };
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(resourcePresent.receiptRoot, resourcePresent.runId, {
+      docker: resourceDocker,
+      processStartTicks: async () => undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: resourcePresent.workspace,
+    }), /Local Compose container remains/);
+    for (const fixture of [legacy, processReused, resourcePresent]) {
+      assert.equal((await readdir(fixture.receiptRoot)).filter((name) => name.endsWith('.local-dead-cleanup')).length, 0);
+    }
+  } finally {
+    await Promise.all([legacy, processReused, resourcePresent].map((fixture) =>
+      rm(fixture.directory, { recursive: true, force: true })));
+  }
+});
+
+test('dead local cleanup disposition refuses a live endpoint', async () => {
+  const listener = createServer();
+  await new Promise<void>((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(0, '127.0.0.1', resolve);
+  });
+  const address = listener.address();
+  assert.ok(address && typeof address !== 'string');
+  const fixture = await createUnsettledLocalReceipt({
+    runId: randomUUID(),
+    serverUrl: `http://127.0.0.1:${address.port}`,
+  });
+  try {
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, {
+      docker: (args) => args[0] === 'info' ? fixture.engineId : '',
+      processStartTicks: async () => undefined,
+      workspaceRoot: fixture.workspace,
+    }), /address already in use|EADDRINUSE/i);
+    assert.equal((await readdir(fixture.receiptRoot)).filter((name) => name.endsWith('.local-dead-cleanup')).length, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('dead local disposition verifies absence after a real stopped disposable worker', { skip: process.platform !== 'linux' }, async (t) => {
+  const docker = (args: string[]) => execFileSync('docker', args, { encoding: 'utf8', timeout: 30_000 });
+  try {
+    docker(['info', '--format', '{{.ID}}']);
+    docker(['image', 'inspect', 'busybox:latest']);
+  } catch {
+    t.skip('Docker engine or cached busybox image is unavailable');
+    return;
+  }
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', resolve);
+  });
+  const address = probe.address();
+  assert.ok(address && typeof address !== 'string');
+  const port = address.port;
+  await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+  const serverChild = spawn(process.execPath, ['-e',
+    `require('node:http').createServer((_q,r)=>r.end('ok')).listen(${port},'127.0.0.1');setInterval(()=>{},1000)`,
+  ], { stdio: 'ignore' });
+  const ownerChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+  let fixture: Awaited<ReturnType<typeof createUnsettledLocalReceipt>> | undefined;
+  let containerId: string | undefined;
+  const stopChild = async (child: ReturnType<typeof spawn>) => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
+  };
+  try {
+    assert.ok(serverChild.pid && ownerChild.pid);
+    const deadline = Date.now() + 5000;
+    let serverReady = false;
+    while (Date.now() < deadline) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const socket = createTcpConnection(port, '127.0.0.1');
+          socket.once('connect', () => { socket.destroy(); resolve(); });
+          socket.once('error', reject);
+        });
+        serverReady = true;
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    assert.ok(serverReady, 'disposable server process did not bind its endpoint');
+    const serverTicks = await processStartTicks(serverChild.pid);
+    const ownerTicks = await processStartTicks(ownerChild.pid);
+    assert.ok(serverTicks && ownerTicks);
+    fixture = await createUnsettledLocalReceipt({
+      runId: randomUUID(),
+      serverUrl: `http://127.0.0.1:${port}`,
+      serverPid: serverChild.pid,
+      serverStartTicks: serverTicks,
+      ownerPid: ownerChild.pid,
+      ownerStartTicks: ownerTicks,
+      engineId: docker(['info', '--format', '{{.ID}}']).trim(),
+    });
+    const containerName = `oat-deadlocal-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    containerId = docker([
+      'run', '--detach', '--name', containerName, '--network', 'none',
+      '--label', `com.docker.compose.project=${fixture.project}`,
+      'busybox:latest', 'sleep', '300',
+    ]).trim();
+    assert.ok(containerId);
+    docker(['stop', containerId]);
+    await stopChild(serverChild);
+    await stopChild(ownerChild);
+    const dependencies = { docker, workspaceRoot: fixture.workspace };
+    await assert.rejects(
+      recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, dependencies),
+      /Local Compose container remains/,
+    );
+    docker(['rm', containerId]);
+    containerId = undefined;
+    const original = await readFile(fixture.receiptPath);
+    await recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, dependencies);
+    assert.deepEqual(await readFile(fixture.receiptPath), original);
+    await assertNoUnsettledDeadlineReceipts(fixture.receiptRoot);
+  } finally {
+    if (containerId) docker(['rm', '-f', containerId]);
+    await stopChild(serverChild);
+    await stopChild(ownerChild);
+    if (fixture) await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test('local recovery and cleanup resolve relative state beside the owned server, not the caller cwd', { skip: process.platform !== 'linux' }, async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-recovery-cwd-'));
