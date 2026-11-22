@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, openSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
@@ -37,7 +37,7 @@ async function sha256(path: string): Promise<string> {
 }
 
 function run(command: string, args: string[], log: string): { done: Promise<number>; stop: () => void } {
-  const output = createWriteStream(log, { flags: "wx" });
+  const output = createWriteStream(log, { fd: openSync(log, "wx") });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ARROWCOL_CLIENT_") && key !== "ARROWCOL_OAT_RUN_ID"));
   const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.pipe(output, { end: false });
