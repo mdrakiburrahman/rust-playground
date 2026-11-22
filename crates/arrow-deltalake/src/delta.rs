@@ -2203,6 +2203,38 @@ fn fitting_sort_chunk(
     let remaining = batch.num_rows().saturating_sub(start);
     let mut low = 0;
     let mut high = max_rows.min(remaining);
+    // For these Arrow 58 scalar types, a contiguous identity take cannot use
+    // more than the input backing buffers plus per-column allocation slack.
+    // A generous checked bound makes every binary-search probe fit too.
+    if start == 0
+        && high == batch.num_rows()
+        && high > 0
+        && u32::try_from(high).is_ok()
+        && batch.columns().iter().all(|column| {
+            column.null_count() == 0
+                && matches!(
+                    column.data_type(),
+                    arrow::datatypes::DataType::Utf8
+                        | arrow::datatypes::DataType::Int16
+                        | arrow::datatypes::DataType::Timestamp(_, _)
+                )
+        })
+        && batch
+            .get_array_memory_size()
+            .checked_mul(2)
+            .and_then(|bytes| {
+                batch
+                    .num_columns()
+                    .checked_mul(256)
+                    .and_then(|slack| bytes.checked_add(slack))
+            })
+            .is_some_and(|bound| bound <= max_bytes)
+    {
+        let candidate = owned_for_sort(batch.slice(0, high))?;
+        if candidate.get_array_memory_size() <= max_bytes {
+            return Ok(Some(candidate));
+        }
+    }
     while low < high {
         let rows = low + (high - low).div_ceil(2);
         let candidate = owned_for_sort(batch.slice(start, rows))?;
