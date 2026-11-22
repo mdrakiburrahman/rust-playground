@@ -1,6 +1,7 @@
 use super::{fitting_sort_chunk, owned_for_sort};
 use anyhow::{Context, Result, ensure};
-use arrow::array::{ArrayRef, Int16Array, ListArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Array, ArrayRef, Int16Array, ListArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -61,6 +62,32 @@ fn nested() -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(lists)])?)
 }
 
+fn all_valid_sliced() -> Result<RecordBatch> {
+    let full = input()?;
+    let mut columns = full.columns().to_vec();
+    let original = columns[0]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .context("customer type")?;
+    columns[0] = Arc::new(StringArray::new(
+        original.offsets().clone(),
+        original.values().clone(),
+        Some(NullBuffer::new(BooleanBuffer::new_set(ROWS))),
+    ));
+    let sliced = RecordBatch::try_new(full.schema(), columns)?.slice(12_345, 3_000);
+    ensure!(sliced.column(0).nulls().is_some(), "all-valid bitmap was discarded");
+    Ok(sliced)
+}
+
+fn skewed() -> Result<RecordBatch> {
+    let strings =
+        StringArray::from_iter_values((0..1024).map(|i| if i == 0 { "x".repeat(65_536) } else { String::new() }));
+    Ok(RecordBatch::try_from_iter(vec![(
+        "key",
+        Arc::new(strings) as ArrayRef,
+    )])?)
+}
+
 fn reference(batch: &RecordBatch, start: usize, max_rows: usize, max_bytes: usize) -> Result<Option<RecordBatch>> {
     let mut low = 0;
     let mut high = max_rows.min(batch.num_rows().saturating_sub(start));
@@ -113,7 +140,16 @@ fn cpu_ticks() -> Result<u64> {
 fn chunk_reference_cap_and_backing_buffers() -> Result<()> {
     let full = input()?;
     let nested = nested()?;
-    for batch in [&full, &full.slice(12_345, 3_000), &nested, &nested.slice(19, 157)] {
+    let all_valid = all_valid_sliced()?;
+    let skewed = skewed()?;
+    for batch in [
+        &full,
+        &full.slice(12_345, 3_000),
+        &nested,
+        &nested.slice(19, 157),
+        &all_valid,
+        &skewed,
+    ] {
         for start in [0, batch.num_rows() / 3, batch.num_rows(), batch.num_rows() + 1] {
             for rows in [0, 1, 17, batch.num_rows(), batch.num_rows() + 1] {
                 let full_len = rows.min(batch.num_rows().saturating_sub(start));
@@ -128,6 +164,9 @@ fn chunk_reference_cap_and_backing_buffers() -> Result<()> {
                     charge.saturating_sub(1),
                     charge,
                     charge.saturating_add(1),
+                    batch.get_array_memory_size().saturating_sub(1),
+                    batch.get_array_memory_size(),
+                    batch.get_array_memory_size().saturating_add(1),
                     usize::MAX,
                 ] {
                     assert_equal(batch, start, rows, bytes)?;
@@ -199,6 +238,10 @@ async fn measure_coalesced_stage() -> Result<()> {
         let output = reader.collect::<arrow::error::Result<Vec<_>>>()?;
         let merged = arrow::compute::concat_batches(&output.first().context("missing output")?.schema(), &output)?;
         ensure!(merged.num_rows() == ROWS * 4, "physical parquet row count");
+        ensure!(
+            merged.schema() == normalized.schema(),
+            "physical parquet schema differs"
+        );
         for (index, column) in normalized.columns().iter().enumerate() {
             for repeat in 0..4 {
                 ensure!(
