@@ -91,6 +91,12 @@ export async function snapshot(repo: string, home: string): Promise<SnapshotMani
   const homePath = path.resolve(home);
   await mkdir(homePath, { recursive: true });
   if (await realpath(homePath) !== homePath) throw new Error("snapshot home must not traverse symlinks");
+  try {
+    await lstat(path.join(homePath, "data"));
+    throw new Error("snapshot home already contains Darwin data");
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
   const trusted = path.join(homePath, "trusted");
   await mkdir(trusted);
   await archive(repo, commit, path.join(trusted, "src"), path.join(trusted, "archive.tar"), "", manifest);
