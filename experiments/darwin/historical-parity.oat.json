@@ -11,7 +11,7 @@
     "compose_project": "arrowcol-oat-historical-parity",
     "compose_state_root": "out/arrowcol-oat/historical-parity",
     "local": {
-      "collector_memory_limit_bytes": 4294967296,
+      "collector_memory_limit_bytes": 92341796864,
       "partitioned_table_bootstrap": true
     }
   },

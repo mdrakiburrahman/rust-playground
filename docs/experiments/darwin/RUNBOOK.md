@@ -43,8 +43,14 @@ historical comparable AKS headline guard is 38.17 B/row.
 Confirm Realistic codec, dictionary and compression winners on historical
 parity at AKS-like file sizes (approximately 2 million rows/file) before
 promotion. The parity collector's 4.29 GB queue budget is not headroom inside
-its 4 GiB container limit; confirm the effective cap and use the overload guard
-before load. Pipeline depth 8 causes the exporter to use `force_commit=false`.
+its container limit. The current 86 GiB pin rounds down 75% of observed host
+available memory after the 1 GiB client budget; it is not the historical AKS
+384 GiB allocation. Recheck host availability and the effective cap before
+every arm; refuse a run if the pin exceeds that bound. The 90% overload guard
+remains enabled. Pipeline depth 8 causes the exporter to use `force_commit=false`.
+Label measurements **local one-box scale**, not AKS-equivalent; record host
+memory and vCPUs, chosen cap and sampled collector peak RSS, using null when
+unmeasured.
 
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
