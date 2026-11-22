@@ -1817,7 +1817,11 @@ impl Platform for LocalPlatform {
             bail!("partitioned bootstrap requires exactly one table");
         };
         let canonical = canonical_dmv_table_name(table)?;
-        let root = self.state_dir.join("dataflow/telemetry/sqlserver").join(table).join("_delta_log");
+        let root = self
+            .state_dir
+            .join("dataflow/telemetry/sqlserver")
+            .join(table)
+            .join("_delta_log");
         Ok(Some(verify_preload_delta(&root, &canonical)?))
     }
 
@@ -7640,7 +7644,10 @@ fn verify_preload_delta(log_dir: &Path, canonical_table: &str) -> Result<Value> 
         .collect::<std::io::Result<Vec<_>>>()?;
     paths.retain(|path| path.extension().is_some_and(|ext| ext == "json"));
     paths.sort();
-    ensure!(!paths.is_empty() && paths.len() <= 64, "invalid pre-load Delta version count");
+    ensure!(
+        !paths.is_empty() && paths.len() <= 64,
+        "invalid pre-load Delta version count"
+    );
     let mut files = Vec::new();
     let mut metadata = None;
     for (version, path) in paths.iter().enumerate() {
@@ -7649,11 +7656,16 @@ fn verify_preload_delta(log_dir: &Path, canonical_table: &str) -> Result<Value> 
             "pre-load Delta versions are not contiguous"
         );
         let bytes = fs::read(path)?;
-        ensure!(bytes.len() <= 64 * 1024 * 1024, "pre-load Delta log exceeds the size limit");
+        ensure!(
+            bytes.len() <= 64 * 1024 * 1024,
+            "pre-load Delta log exceeds the size limit"
+        );
         for line in std::str::from_utf8(&bytes)?.lines().filter(|line| !line.is_empty()) {
             let action: Value = serde_json::from_str(line)?;
-            ensure!(action.is_object() && action.get("add").is_none() && action.get("remove").is_none(),
-                "pre-load Delta prefix contains data actions");
+            ensure!(
+                action.is_object() && action.get("add").is_none() && action.get("remove").is_none(),
+                "pre-load Delta prefix contains data actions"
+            );
             if let Some(value) = action.get("metaData") {
                 metadata = Some(value.clone());
             }
@@ -7662,12 +7674,17 @@ fn verify_preload_delta(log_dir: &Path, canonical_table: &str) -> Result<Value> 
     }
     let metadata = metadata.context("pre-load Delta metadata is missing")?;
     let schema: Value = serde_json::from_str(
-        metadata["schemaString"].as_str().context("pre-load Delta schema is missing")?,
+        metadata["schemaString"]
+            .as_str()
+            .context("pre-load Delta schema is missing")?,
     )?;
     ensure!(
         schema == arrowcol_loadgen::initialize::canonical_table_delta_schema(canonical_table)?
             && metadata["partitionColumns"] == json!(["__arrowcol_ingestion"])
-            && metadata.pointer("/configuration/catalog.schemaHistory").and_then(Value::as_str).is_some(),
+            && metadata
+                .pointer("/configuration/catalog.schemaHistory")
+                .and_then(Value::as_str)
+                .is_some(),
         "catalog-registered pre-load Delta layout differs from the canonical ingestion-partitioned table"
     );
     Ok(json!({
@@ -8314,8 +8331,13 @@ fn stopped_collector_commit_output(config: &OatConfig, log: &ProcessLog) -> Resu
     let evidence = durable_commit_evidence_for_cell(config, logs, logs, Some((0, 1)), None)?;
     let mut tables = serde_json::Map::new();
     for table in &config.tables {
-        let output = evidence.get(table).context("stopped collector commit evidence missing")?;
-        tables.insert(canonical_dmv_table_name(table)?, output["run_cumulative_output"].clone());
+        let output = evidence
+            .get(table)
+            .context("stopped collector commit evidence missing")?;
+        tables.insert(
+            canonical_dmv_table_name(table)?,
+            output["run_cumulative_output"].clone(),
+        );
     }
     Ok(json!({
         "source": if log.complete { "complete_stopped_collector_logs" } else { "incomplete_stopped_collector_logs" },

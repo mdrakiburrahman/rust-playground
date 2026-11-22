@@ -1042,7 +1042,9 @@ impl OatConfig {
                                 && settings.granularity == Some(arrowcol_tunables::MaintenanceGranularity::Hour)
                         }))
                 {
-                    bail!("partitioned_table_bootstrap requires the single canonical table and enabled hourly maintenance");
+                    bail!(
+                        "partitioned_table_bootstrap requires the single canonical table and enabled hourly maintenance"
+                    );
                 }
                 if let Some(host) = self.platform.local.bind_host
                     && (host.is_multicast() || (host.is_unspecified() && self.platform.local.endpoint_host.is_none()))
