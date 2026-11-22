@@ -12,7 +12,7 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use std::task::{Context, Poll};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 use std::{pin::Pin, vec::IntoIter};
 use tokio::task::JoinSet;
@@ -1199,7 +1199,7 @@ enum ClientRequestBody {
 impl futures::Stream for ClientRequestBody {
     type Item = FlightData;
 
-    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
             Self::Untracked(messages) => Poll::Ready(messages.next()),
             Self::Tracked {
@@ -1304,6 +1304,7 @@ fn latency_percentiles(latency: &[u64; 64]) -> serde_json::Value {
     serde_json::json!({ "p50": percentile(50), "p95": percentile(95), "p99": percentile(99), "samples": count, "precision": "power_of_two_upper_bound" })
 }
 impl Measurement {
+    #[cfg(test)]
     fn new(start_unix_ms: u64, end_unix_ms: u64, workers: usize) -> Result<Self> {
         Self::new_with_stage_telemetry(start_unix_ms, end_unix_ms, workers, None)
     }
