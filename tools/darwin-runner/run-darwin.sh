@@ -19,7 +19,43 @@ awk -F= '
   exit 1
 }
 rm -f -- "$envelope"
-exec /usr/local/bin/darwin evolve "/workspace/$config" \
+export DARWIN_HOME=/run/darwin-home/.darwin
+git config --global --add safe.directory /workspace
+server_log=/run/darwin-home/darwin-server.log
+/usr/local/bin/darwin start --host 127.0.0.1 --port 0 >"$server_log" 2>&1 &
+server_pid=$!
+stop_server() {
+  if kill -0 "$server_pid" 2>/dev/null; then
+    /usr/local/bin/darwin shutdown --yes >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$server_pid" 2>/dev/null; then
+      kill -TERM "$server_pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$server_pid" 2>/dev/null || true
+}
+trap stop_server EXIT
+ready=
+for _ in $(seq 1 100); do
+  if grep -q "http://127.0.0.1:" "$server_log"; then
+    ready=yes
+    break
+  fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    cat "$server_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [[ "$ready" != yes ]]; then
+  echo "Darwin foreground daemon did not become ready" >&2
+  cat "$server_log" >&2
+  exit 1
+fi
+/usr/local/bin/darwin evolve "/workspace/$config" \
   --repo /workspace \
   --home "/workspace/.darwin/runner-$experiment-$run_id" \
   --only "$experiment" \
