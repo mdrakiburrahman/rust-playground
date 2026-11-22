@@ -11,7 +11,18 @@ function object(value: unknown, name: string): JsonObject {
   return value as JsonObject;
 }
 
-export function parityLadderConfig(seed: unknown, workers: number): JsonObject {
+export type ParityProfile = "historical-parity-diagnostic" | "bounded-table-2500m-diagnostic";
+
+export function parseParityProfile(value: string): ParityProfile {
+  if (value !== "historical-parity-diagnostic" && value !== "bounded-table-2500m-diagnostic") {
+    throw new Error("unsupported parity profile");
+  }
+  return value;
+}
+
+export function parityLadderConfig(
+  seed: unknown, workers: number, profile: ParityProfile = "historical-parity-diagnostic",
+): JsonObject {
   if (![1, 2, 4, 8, 16].includes(workers)) throw new Error("unsupported parity ladder worker count");
   const config = object(structuredClone(seed), "parity seed");
   const tunables = object(config.tunables, "tunables");
@@ -25,6 +36,21 @@ export function parityLadderConfig(seed: unknown, workers: number): JsonObject {
     throw new Error("invalid frozen parity seed");
   }
   client.workers = workers;
+  if (profile === "bounded-table-2500m-diagnostic") {
+    const collector = object(tunables.collector, "collector");
+    const batching = object(collector.batching, "batching");
+    const global = object(batching.global_capacity, "global capacity");
+    const table = object(batching.per_table_capacity, "table capacity");
+    const guard = object(config.overload_guard, "overload guard");
+    if (global.bytes !== 4_290_000_000 || table.bytes !== 4_000_000_000
+      || batching.max_arrow_memory_per_flush !== 1_073_741_824
+      || guard.enabled !== true || guard.cap_fraction !== 0.9) {
+      throw new Error("bounded profile requires the unchanged historical guard and capacity seed");
+    }
+    table.bytes = 2_500_000_000;
+  } else if (profile !== "historical-parity-diagnostic") {
+    throw new Error("unsupported parity profile");
+  }
   return config;
 }
 

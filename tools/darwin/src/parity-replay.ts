@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rmdir, writeFile } from "node:fs/pr
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readReconciledOatResult } from "./oat-result.js";
-import { inspectParityHost, parityLadderConfig } from "./parity-preflight.js";
+import { inspectParityHost, parityLadderConfig, type ParityProfile } from "./parity-preflight.js";
 import { cleanEnv, hasPinnedSubmodules, localReplayOptions, prepareReplayRuntime, runOat, sha256 } from "./replay.js";
 import type { SnapshotManifest } from "./snapshot.js";
 
@@ -110,6 +110,7 @@ export async function replayParityArm(
   repo: string, home: string, workers: number, bindHost: string, endpointHost: string, stackBytes: number,
   collectorOverride?: CollectorImageOverride,
   collectorCpus?: number[],
+  profile: ParityProfile = "historical-parity-diagnostic",
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
@@ -140,7 +141,7 @@ export async function replayParityArm(
   }
   const seed = object(JSON.parse(await readFile(seedPath, "utf8")), "parity seed");
   if (seed.warmup_seconds !== 60 || seed.measure_seconds !== 150) throw new Error("unexpected parity timing contract");
-  const config = parityLadderConfig(seed, workers);
+  const config = parityLadderConfig(seed, workers, profile);
   const data = join(home, "data");
   await mkdir(data, { recursive: true });
   const lock = join(data, "evaluating");
@@ -178,6 +179,7 @@ export async function replayParityArm(
     }
     if (identity) {
       if (identity.source_revision !== producer.revision || identity.seed_sha256 !== seedHash
+        || (identity.profile ?? "historical-parity-diagnostic") !== profile
         || identity.collector_revision !== (collectorOverride?.sourceRevision ?? producer.revision)
         || identity.collector_override_image_id !== (collectorOverride?.imageId ?? null)
         || JSON.stringify(identity.collector_cpus ?? null) !== JSON.stringify(collectorCpus ?? null)
@@ -230,7 +232,7 @@ export async function replayParityArm(
       collector_revision: collectorOverride?.sourceRevision ?? producer.revision,
       collector_override_image_id: collectorOverride?.imageId ?? null,
       collector_cpu_allocation: cpuAllocation,
-      profile: "historical-parity-diagnostic", seed_sha256: seedHash, config_sha256: configHash,
+      profile, seed_sha256: seedHash, config_sha256: configHash,
       controller_sha256: binaryHash, footer_inspector_sha256: footer.sha256, workers, host, runRoot,
       identity_reconciliation: { available: false, reason: "Diagnostic corpus does not carry unique delivery identities" },
       ...result,
@@ -242,6 +244,7 @@ export async function replayParityArm(
         collector_revision: collectorOverride?.sourceRevision ?? producer.revision,
         collector_override_image_id: collectorOverride?.imageId ?? null,
         collector_cpus: collectorCpus ?? null,
+        profile,
       }, null, 2)}\n`, { flag: "wx", mode: 0o400 });
     }
     completed = true;

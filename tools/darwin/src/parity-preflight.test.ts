@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertParityCollectorReadback, assertParityEvidence, assertParityTableLayout, parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
+import { assertParityCollectorReadback, assertParityEvidence, assertParityTableLayout, parityHostReceipt, parityLadderConfig, parseParityProfile } from "./parity-preflight.js";
 import { parityCpuAllocation, parityImageIds, parseCollectorCpus } from "./parity-replay.js";
 
 const meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n";
@@ -55,6 +55,30 @@ test("the parity ladder changes only offered worker count", () => {
   assert.throws(() => parityLadderConfig({ ...seed, replica_counts: [2] }, 4), /parity seed/);
   assert.throws(() => parityLadderConfig({ ...seed, tunables: { ...seed.tunables, parquet_writer: {} } }, 4),
     /must not override the writer/);
+});
+
+test("bounded table profile preserves the historical guard and isolates its capacity change", () => {
+  const seed = {
+    tables: ["sqlserver_availability_replica_states"], replica_counts: [1],
+    overload_guard: { enabled: true, cap_fraction: 0.9 },
+    tunables: { client: {
+      data_profile: "diagnostic", payload_customer_id: "direct-e64-confirmwide",
+      workers: 8, streams_per_worker: 2,
+    }, collector: { batching: {
+      global_capacity: { bytes: 4_290_000_000 },
+      per_table_capacity: { bytes: 4_000_000_000 },
+      max_arrow_memory_per_flush: 1_073_741_824,
+    } } },
+  };
+  const bounded = parityLadderConfig(seed, 1, parseParityProfile("bounded-table-2500m-diagnostic"));
+  const expected = structuredClone(seed);
+  expected.tunables.client.workers = 1;
+  expected.tunables.collector.batching.per_table_capacity.bytes = 2_500_000_000;
+  assert.deepEqual(bounded, expected);
+  assert.equal(seed.tunables.collector.batching.per_table_capacity.bytes, 4_000_000_000);
+  assert.throws(() => parityLadderConfig({ ...seed, overload_guard: { enabled: true, cap_fraction: 0.95 } }, 1,
+    "bounded-table-2500m-diagnostic"), /unchanged/);
+  assert.throws(() => parseParityProfile("bounded"), /unsupported/);
 });
 
 test("collector parity readback rejects drift in historical limits and local pressure", () => {
