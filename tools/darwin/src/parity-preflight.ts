@@ -96,13 +96,18 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
     throw new Error("client readback is unavailable");
   }
-  const client = object(object(evidence.client_phase_reports[0], "client").consumer_effective_config, "client readback");
+  const report = object(evidence.client_phase_reports[0], "client");
+  const client = object(report.consumer_effective_config, "client readback");
   for (const [key, value] of Object.entries(object(tunables.client, "client tunables"))) {
     if (!isDeepStrictEqual(client[key], value)) throw new Error(`client readback differs at ${key}`);
   }
   const transport = object(tunables.transport, "transport");
   for (const key of ["ipc_compression", "grpc_send_compression", "max_flight_data_bytes", "max_message_bytes"]) {
     if (!isDeepStrictEqual(client[key], transport[key])) throw new Error(`client transport readback differs at ${key}`);
+  }
+  const cumulative = object(object(report.phase_counters, "client phase counters").process_cumulative, "client cumulative counters");
+  if (cumulative.ambiguous_rows !== 0 || !Number.isSafeInteger(cumulative.completed_rows) || Number(cumulative.completed_rows) < 0) {
+    throw new Error("client cumulative delivery evidence is ambiguous or unavailable");
   }
   const guard = object(evidence.overload_guard, "overload guard");
   const settings = object(guard.settings, "overload settings");

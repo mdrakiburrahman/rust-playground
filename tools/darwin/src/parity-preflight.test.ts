@@ -67,7 +67,8 @@ test("collector parity readback rejects drift in historical limits and local pre
       effective_config: readback, layout_table_policies: [policy],
       writer_policy_overrides: { defaults: { compression: null, compression_level: null },
         columns: {}, max_row_group_rows: null } }],
-    client_phase_reports: [{ consumer_effective_config: { ...client, ...transport } }],
+    client_phase_reports: [{ consumer_effective_config: { ...client, ...transport },
+      phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 0 } } }],
     overload_guard: { status: "complete", requested_container_memory_limit_bytes: 92341796864,
       settings: { enabled: true, cap_fraction: 0.9, zero_progress_windows: 2 },
       last_caps: [{ metric: "container_memory_bytes", confirmed: true, cap: 92341796864 }] },
@@ -79,6 +80,10 @@ test("collector parity readback rejects drift in historical limits and local pre
     ...evidence, overload_guard: { ...evidence.overload_guard, last_caps: [] },
   }), /memory cap is unconfirmed/);
   assert.throws(() => assertParityEvidence(seed, {
-    ...evidence, client_phase_reports: [{ consumer_effective_config: { ...client, ...transport, workers: 8 } }],
+    ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0], consumer_effective_config: { ...client, ...transport, workers: 8 } }],
   }), /client readback differs at workers/);
+  assert.throws(() => assertParityEvidence(seed, {
+    ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0],
+      phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 1 } } }],
+  }), /delivery evidence is ambiguous/);
 });

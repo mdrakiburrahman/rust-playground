@@ -181,6 +181,14 @@ export async function readReconciledOatResult(
   }
   const stopped = JSON.parse(await readFile(stoppedPath, "utf8"));
   const receipts = extractStoppedReceipts(evidence, stopped, row.run_id, canonicalTable, measurement);
+  if (parity) {
+    const report = object(evidence.client_phase_reports[0], "client report");
+    const cumulative = object(object(report.phase_counters, "client phase counters").process_cumulative, "client cumulative counters");
+    const stoppedRows = receipts.all.reduce((sum, receipt) => sum + receipt.rows, 0);
+    if (!Number.isSafeInteger(stoppedRows) || stoppedRows !== cumulative.completed_rows) {
+      throw new CoverageUnavailableError("stopped Delta rows do not match unambiguous cumulative client completions");
+    }
+  }
   if (typeof evidence.preload_delta !== "object" || evidence.preload_delta === null || Array.isArray(evidence.preload_delta)) {
     throw new CoverageUnavailableError("pre-load Delta evidence is unavailable");
   }
