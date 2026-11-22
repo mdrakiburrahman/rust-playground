@@ -94,6 +94,9 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
     if let Some(bytes) = config.platform.local.collector_memory_limit_bytes {
         collector["mem_limit"] = json!(bytes);
     }
+    if let Some(cpus) = &config.platform.local.collector_cpus {
+        collector["cpuset"] = json!(cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+    }
     collector["stop_grace_period"] = json!(format!("{}s", config.collector_stop_grace_seconds));
     collector["ports"] = json!([{
         "host_ip": config.platform.local.bind_host.map_or_else(|| "127.0.0.1".to_owned(), |host| host.to_string()),
@@ -403,11 +406,38 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         for (service, value) in overlay["services"].as_object().context("services missing")? {
             if service != "dataflow-1" { assert!(value.get("mem_limit").is_none()); }
         }
+
         for invalid in [json!("4GiB"), json!("4096Mi"), json!(-1), json!(1.5)] {
             assert!(serde_json::from_value::<crate::config::LocalOptions>(
                 json!({"collector_memory_limit_bytes":invalid})).is_err());
         }
         config.platform.local.collector_memory_limit_bytes = Some(1);
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn collector_cpu_allocation_is_local_and_scoped() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.platform.local.stable_image_build = true;
+        config.replica_counts = vec![1];
+        config.platform.local.collector_cpus = Some(vec![1, 3]);
+        config.validate()?;
+        let mut overlay = compose_tunables(&config)?;
+        local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
+        assert_eq!(overlay["services"]["dataflow-1"]["cpuset"], "1,3");
+        for (service, value) in overlay["services"].as_object().context("services missing")? {
+            if service != "dataflow-1" {
+                assert!(value.get("cpuset").is_none());
+            }
+        }
+        config.platform.local.collector_cpus = Some(vec![3, 1]);
+        assert!(config.validate().is_err());
+        config.platform.local.collector_cpus = Some(vec![1, 1]);
+        assert!(config.validate().is_err());
+        config.platform.local.collector_cpus = Some(vec![]);
         assert!(config.validate().is_err());
         Ok(())
     }

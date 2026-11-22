@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { assertParityCollectorReadback, assertParityEvidence, assertParityTableLayout, parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
-import { parityImageIds } from "./parity-replay.js";
+import { parityCpuAllocation, parityImageIds, parseCollectorCpus } from "./parity-replay.js";
 
 const meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n";
 const timestamp = "2026-11-22T09:00:00Z";
+
+test("collector CPU strata require exact configured and effective allocations", () => {
+  const requested = parseCollectorCpus("0,1,2,4");
+  const proof = { container_id: "a".repeat(64), requested, configured: "0,1,2,4", effective: "0-2,4" };
+  const log = `[oat] collector CPU allocation: ${JSON.stringify(proof)}\n`;
+  assert.deepEqual(parityCpuAllocation(log, requested), proof);
+  assert.throws(() => parityCpuAllocation(log, undefined), /unexpected/);
+  assert.throws(() => parityCpuAllocation("", requested), /missing/);
+  assert.throws(() => parityCpuAllocation(log, [0, 1]), /differs/);
+  assert.throws(() => parityCpuAllocation(`[oat] collector CPU allocation: ${JSON.stringify({ ...proof, effective: "0-1" })}`, requested), /differs/);
+  for (const invalid of ["", "1,1", "3,2", "0-2", "4096"]) assert.throws(() => parseCollectorCpus(invalid));
+});
 
 test("parity images are bound to admission and actual role evidence", () => {
   const images = Object.fromEntries(["catalog", "client", "collector", "maintenance", "router", "sqlserver"]

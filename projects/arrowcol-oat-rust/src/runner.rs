@@ -8151,6 +8151,80 @@ async fn scale_local_arrowcols(
         "dataflow-1",
     ]);
     run_streaming_command(up, "scale local ArrowCol containers").await?;
+    if let Some(cpus) = &config.platform.local.collector_cpus {
+        let mut ps = compose_command(
+            compose_file,
+            config.platform.compose_override_file.as_deref(),
+            &project,
+            "benchmark",
+        );
+        platform.add_compose_environment(&mut ps);
+        ps.args(["ps", "--quiet", "dataflow-1"]);
+        let id = String::from_utf8(run_command(ps, "resolve capped collector").await?.stdout)?;
+        let id = id.trim();
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("expected exactly one running collector container");
+        }
+        let mut inspect = Command::new("docker");
+        inspect.args([
+            "inspect",
+            "--format",
+            "{{.State.Running}} {{.HostConfig.CpusetCpus}}",
+            id,
+        ]);
+        let configured = String::from_utf8(run_command(inspect, "inspect collector CPU allocation").await?.stdout)?;
+        let configured = configured
+            .trim()
+            .strip_prefix("true ")
+            .context("capped collector is not running")?;
+        let mut effective = Command::new("docker");
+        effective.args(["exec", id, "cat", "/sys/fs/cgroup/cpuset.cpus.effective"]);
+        let effective = String::from_utf8(run_command(effective, "read effective collector CPUs").await?.stdout)?;
+        let expected = cpus.iter().copied().collect::<BTreeSet<_>>();
+        if parse_linux_cpu_list(configured)? != expected || parse_linux_cpu_list(effective.trim())? != expected {
+            bail!("collector configured or effective CPU allocation differs from the requested stratum");
+        }
+        println!(
+            "[oat] collector CPU allocation: {}",
+            json!({"container_id":id,"requested":cpus,"configured":configured,"effective":effective.trim()})
+        );
+    }
+    Ok(())
+}
+
+fn parse_linux_cpu_list(value: &str) -> Result<BTreeSet<u32>> {
+    let mut cpus = BTreeSet::new();
+    for part in value.split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((start, end)) => (start.parse::<u32>()?, end.parse::<u32>()?),
+            None => {
+                let cpu = part.parse::<u32>()?;
+                (cpu, cpu)
+            }
+        };
+        if first > last || last > 4095 {
+            bail!("invalid Linux CPU list");
+        }
+        for cpu in first..=last {
+            if !cpus.insert(cpu) {
+                bail!("duplicate CPU in Linux CPU list");
+            }
+        }
+    }
+    Ok(cpus)
+}
+
+#[cfg(test)]
+#[test]
+fn collector_cpu_readback_parses_linux_ranges_and_rejects_bad_lists() -> Result<()> {
+    assert_eq!(parse_linux_cpu_list("0-2,4")?, BTreeSet::from([0, 1, 2, 4]));
+    for invalid in ["", "3-1", "0-4096", "0-2,2", "0, 1"] {
+        assert!(parse_linux_cpu_list(invalid).is_err());
+    }
     Ok(())
 }
 

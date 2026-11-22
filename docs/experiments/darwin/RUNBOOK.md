@@ -46,12 +46,17 @@ historical comparable AKS headline guard is 38.17 B/row.
 | Snapshot current committed producer | `npx --no-install tsx tools/darwin/src/main.ts setup --home "$PWD/.darwin/parity"` |
 | One ladder arm | `.darwin/parity/trusted/bin/harness parity --workers <1\|2\|4\|8\|16> --bind-host <docker-bridge-ip> --endpoint-host <docker-bridge-ip> --controller-stack-bytes 33554432` |
 | Substitute a control collector | Append `--collector-image-id sha256:<digest> --collector-source-revision <full-commit>` to the parity command, using a separate trusted home. |
+| Collector-only CPU stratum | Append `--collector-cpus 0,1,2,3` to a new trusted home; choose CPUs available to the host. |
 
 Build the control image from a clean checkout of the recorded commit and retain
 the build log and source tree identity. An image revision label alone does not
 prove provenance. Compare controls only when the non-collector image IDs,
 observer, corpus, settings and host match; an individual arm is not a
 qualified comparison.
+The CPU option applies only to the collector before startup. The run refuses
+admission unless its configured and effective cgroup CPU sets match the
+requested list. It does not reserve CPUs from clients; record their placement
+and use disjoint allocations where possible.
 
 Each arm builds the trusted controller and footer inspector, checks host
 headroom immediately before launch, verifies collector and client readback

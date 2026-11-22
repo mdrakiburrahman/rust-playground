@@ -14,6 +14,50 @@ export interface CollectorImageOverride {
   sourceRevision: string;
 }
 
+export function parseCollectorCpus(value: string): number[] {
+  if (!/^(0|[1-9]\d*)(,(0|[1-9]\d*))*$/.test(value)) throw new Error("collector CPUs must be an ordered comma-separated list");
+  const cpus = value.split(",").map(Number);
+  if (cpus.some((cpu, index) => !Number.isSafeInteger(cpu) || cpu > 4095 || (index > 0 && cpu <= cpus[index - 1]!))) {
+    throw new Error("collector CPUs must be an ordered unique list in 0..4095");
+  }
+  return cpus;
+}
+
+function linuxCpus(value: string): number[] {
+  const cpus: number[] = [];
+  for (const part of value.split(",")) {
+    const match = /^(0|[1-9]\d*)(?:-(0|[1-9]\d*))?$/.exec(part);
+    if (!match) throw new Error("invalid Linux CPU allocation");
+    const first = Number(match[1]);
+    const last = Number(match[2] ?? match[1]);
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first > last || last > 4095) {
+      throw new Error("invalid Linux CPU allocation");
+    }
+    for (let cpu = first; cpu <= last; cpu++) cpus.push(cpu);
+  }
+  if (new Set(cpus).size !== cpus.length) throw new Error("duplicate Linux CPU allocation");
+  return cpus.sort((left, right) => left - right);
+}
+
+export function parityCpuAllocation(log: string, requested: number[] | undefined): JsonObject | null {
+  const prefix = "[oat] collector CPU allocation: ";
+  const lines = log.split("\n").filter(line => line.startsWith(prefix));
+  if (!requested) {
+    if (lines.length !== 0) throw new Error("unexpected collector CPU allocation");
+    return null;
+  }
+  if (lines.length !== 1) throw new Error("collector CPU allocation evidence is missing or repeated");
+  const evidence = object(JSON.parse(lines[0]!.slice(prefix.length)), "collector CPU allocation");
+  if (JSON.stringify(evidence.requested) !== JSON.stringify(requested)
+    || typeof evidence.container_id !== "string" || !/^[a-f0-9]{64}$/.test(evidence.container_id)
+    || typeof evidence.configured !== "string" || typeof evidence.effective !== "string"
+    || JSON.stringify(linuxCpus(evidence.configured)) !== JSON.stringify(requested)
+    || JSON.stringify(linuxCpus(evidence.effective)) !== JSON.stringify(requested)) {
+    throw new Error("collector CPU allocation evidence differs from the requested stratum");
+  }
+  return evidence;
+}
+
 function object(value: unknown, label: string): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as JsonObject;
@@ -65,6 +109,7 @@ async function buildFooterInspector(runtime: string, home: string, stackBytes: n
 export async function replayParityArm(
   repo: string, home: string, workers: number, bindHost: string, endpointHost: string, stackBytes: number,
   collectorOverride?: CollectorImageOverride,
+  collectorCpus?: number[],
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
@@ -118,6 +163,12 @@ export async function replayParityArm(
     if (collectorOverride) object(platform.local, "local").collector_image_override = {
       image_id: collectorOverride.imageId, source_revision: collectorOverride.sourceRevision,
     };
+    if (collectorCpus) {
+      if (JSON.stringify(parseCollectorCpus(collectorCpus.join(","))) !== JSON.stringify(collectorCpus)) {
+        throw new Error("invalid collector CPU allocation");
+      }
+      object(platform.local, "local").collector_cpus = collectorCpus;
+    }
     const identityPath = join(data, "ladder-identity.json");
     let identity: JsonObject | undefined;
     try {
@@ -129,6 +180,7 @@ export async function replayParityArm(
       if (identity.source_revision !== producer.revision || identity.seed_sha256 !== seedHash
         || identity.collector_revision !== (collectorOverride?.sourceRevision ?? producer.revision)
         || identity.collector_override_image_id !== (collectorOverride?.imageId ?? null)
+        || JSON.stringify(identity.collector_cpus ?? null) !== JSON.stringify(collectorCpus ?? null)
         || typeof identity.payload_corpus_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(identity.payload_corpus_sha256)) {
         throw new Error("ladder identity does not match the trusted producer and seed");
       }
@@ -161,7 +213,9 @@ export async function replayParityArm(
       join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states",
       producer.revision, null, "diagnostic", { config, decodeFile, collectorRevision: collectorOverride?.sourceRevision },
     );
-    const images = parityImageIds(await readFile(join(runRoot, "run.log"), "utf8"), result.images);
+    const log = await readFile(join(runRoot, "run.log"), "utf8");
+    const images = parityImageIds(log, result.images);
+    const cpuAllocation = parityCpuAllocation(log, collectorCpus);
     if (collectorOverride && images.collector !== collectorOverride.imageId) throw new Error("collector image override was not used");
     const payload = result.clientEvidence.payloadCorpusSha256;
     if (typeof payload !== "string" || !/^[a-f0-9]{64}$/.test(payload)) throw new Error("parity corpus identity missing");
@@ -175,6 +229,7 @@ export async function replayParityArm(
       label: "local one-box scale", source_revision: producer.revision, trusted_revision: manifest.commit,
       collector_revision: collectorOverride?.sourceRevision ?? producer.revision,
       collector_override_image_id: collectorOverride?.imageId ?? null,
+      collector_cpu_allocation: cpuAllocation,
       profile: "historical-parity-diagnostic", seed_sha256: seedHash, config_sha256: configHash,
       controller_sha256: binaryHash, footer_inspector_sha256: footer.sha256, workers, host, runRoot,
       identity_reconciliation: { available: false, reason: "Diagnostic corpus does not carry unique delivery identities" },
@@ -186,6 +241,7 @@ export async function replayParityArm(
         source_revision: producer.revision, seed_sha256: seedHash, images, payload_corpus_sha256: payload,
         collector_revision: collectorOverride?.sourceRevision ?? producer.revision,
         collector_override_image_id: collectorOverride?.imageId ?? null,
+        collector_cpus: collectorCpus ?? null,
       }, null, 2)}\n`, { flag: "wx", mode: 0o400 });
     }
     completed = true;

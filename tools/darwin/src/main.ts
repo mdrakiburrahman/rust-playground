@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { CoverageUnavailableError } from "./metrics-adapter.js";
-import { replayParityArm } from "./parity-replay.js";
+import { parseCollectorCpus, replayParityArm } from "./parity-replay.js";
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
 import { prepareReplayRuntime, replayCompressionPair } from "./replay.js";
@@ -95,6 +95,7 @@ async function main(args: string[]): Promise<void> {
     const receipt = await replayParityArm(
       repo, home, Number(option(args, "--workers")), option(args, "--bind-host"), option(args, "--endpoint-host"),
       Number(option(args, "--controller-stack-bytes")), collectorOverride,
+      args.includes("--collector-cpus") ? parseCollectorCpus(option(args, "--collector-cpus")) : undefined,
     );
     console.log("@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
     console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "historical-parity", valid: 0,
