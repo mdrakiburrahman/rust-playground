@@ -14,7 +14,9 @@ function object(value: unknown, name: string): JsonObject {
 export function parityLadderConfig(seed: unknown, workers: number): JsonObject {
   if (![1, 2, 4, 8, 16].includes(workers)) throw new Error("unsupported parity ladder worker count");
   const config = object(structuredClone(seed), "parity seed");
-  const client = object(object(config.tunables, "tunables").client, "client");
+  const tunables = object(config.tunables, "tunables");
+  if (tunables.parquet_writer == null) throw new Error("historical writer evidence is not bound");
+  const client = object(tunables.client, "client");
   if (client.data_profile !== "diagnostic" || client.payload_customer_id !== "direct-e64-confirmwide"
     || client.workers !== 8 || client.streams_per_worker !== 2
     || !Array.isArray(config.replica_counts) || config.replica_counts.length !== 1 || config.replica_counts[0] !== 1

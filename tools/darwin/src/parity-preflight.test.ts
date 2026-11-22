@@ -22,13 +22,15 @@ test("the parity ladder changes only offered worker count", () => {
     tunables: { client: {
       data_profile: "diagnostic", payload_customer_id: "direct-e64-confirmwide",
       workers: 8, streams_per_worker: 2,
-    }, collector: { runtime: { cpu_workers: 32 } } },
+    }, collector: { runtime: { cpu_workers: 32 } }, parquet_writer: { defaults: { compression: "uncompressed" } } },
   };
   const config = parityLadderConfig(seed, 4);
   assert.deepEqual(config, { ...seed, tunables: { ...seed.tunables, client: { ...seed.tunables.client, workers: 4 } } });
   assert.equal(seed.tunables.client.workers, 8);
   assert.throws(() => parityLadderConfig(seed, 3), /worker count/);
   assert.throws(() => parityLadderConfig({ ...seed, replica_counts: [2] }, 4), /parity seed/);
+  assert.throws(() => parityLadderConfig({ ...seed, tunables: { ...seed.tunables, parquet_writer: null } }, 4),
+    /historical writer evidence is not bound/);
 });
 
 test("collector parity readback rejects drift in historical limits and local pressure", () => {
