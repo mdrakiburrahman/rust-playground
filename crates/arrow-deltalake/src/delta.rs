@@ -460,6 +460,84 @@ mod io_tests {
     use std::collections::HashSet;
 
     #[test]
+    fn fitting_sort_chunk_preserves_ownership_and_exact_budget_behavior() -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray, UInt32Array};
+
+        fn original(batch: &RecordBatch, start: usize, rows: usize, bytes: usize) -> Result<Option<RecordBatch>> {
+            let mut low = 0;
+            let mut high = rows.min(batch.num_rows().saturating_sub(start));
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if owned_for_sort(batch.slice(start, mid))?.get_array_memory_size() <= bytes {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            if low == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(owned_for_sort(batch.slice(start, low))?))
+            }
+        }
+
+        let ids = Arc::new(UInt32Array::from_iter_values(0..2048)) as ArrayRef;
+        let strings = Arc::new(StringArray::from_iter(
+            (0..2048).map(|i| (i % 7 != 0).then(|| format!("{i:04}-{}", "x".repeat(128)))),
+        )) as ArrayRef;
+        let batch = RecordBatch::try_from_iter(vec![("id", ids), ("text", strings)])?.slice(1000, 128);
+        let (logical, bound) = flat_take_prefix_bound(&batch).context("flat bound")?;
+        assert!(batch.get_array_memory_size() > logical * 2);
+        let full = fitting_sort_chunk(&batch, 0, 128, bound)?.context("full chunk")?;
+        assert_eq!(full, batch);
+        assert!(full.get_array_memory_size() < batch.get_array_memory_size());
+        assert_ne!(
+            full.column(0).to_data().buffers()[0].as_ptr(),
+            batch.column(0).to_data().buffers()[0].as_ptr()
+        );
+        for rows in 1..=128 {
+            let (_, upper) = flat_take_prefix_bound(&batch.slice(0, rows)).context("prefix bound")?;
+            assert!(owned_for_sort(batch.slice(0, rows))?.get_array_memory_size() <= upper);
+        }
+        let one_row = owned_for_sort(batch.slice(0, 1))?.get_array_memory_size();
+        let almost_full = owned_for_sort(batch.slice(0, 127))?.get_array_memory_size();
+        for budget in [
+            0,
+            one_row - 1,
+            one_row,
+            almost_full - 1,
+            almost_full,
+            bound - 1,
+            bound,
+            batch.get_array_memory_size() - 1,
+            usize::MAX,
+        ] {
+            for rows in [1, 63, 128] {
+                let actual = fitting_sort_chunk(&batch, 0, rows, budget)?;
+                let expected = original(&batch, 0, rows, budget)?;
+                assert_eq!(actual, expected);
+                if let Some(actual) = actual {
+                    assert!(actual.get_array_memory_size() <= budget);
+                }
+            }
+        }
+
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::UInt32, false)),
+            Arc::clone(batch.column(0)),
+        )]);
+        let nested = RecordBatch::try_from_iter(vec![("nested", Arc::new(nested) as ArrayRef)])?;
+        assert!(flat_take_prefix_bound(&nested).is_none());
+        for budget in [0, 512, usize::MAX] {
+            assert_eq!(
+                fitting_sort_chunk(&nested, 0, 128, budget)?,
+                original(&nested, 0, 128, budget)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn delta_target_root_redacts_credentials_query_and_fragment() {
         assert_eq!(
             normalize_delta_target_root(
@@ -2256,6 +2334,39 @@ struct CoalescedPartitionOutput {
     file_bytes: Vec<usize>,
 }
 
+// Bound every prefix produced by Arrow's flat-array take kernels, including
+// array headers, an extra byte-array offset and rounded bitmap allocations.
+// Nested and other types use the exact materializing search below.
+fn flat_take_prefix_bound(batch: &RecordBatch) -> Option<(usize, usize)> {
+    use arrow::datatypes::DataType;
+
+    let alignment = arrow::alloc::ALIGNMENT;
+    let mut logical = 0usize;
+    let mut bound = 0usize;
+    for column in batch.columns() {
+        let ty = column.data_type();
+        if ty.primitive_width().is_none()
+            && !matches!(
+                ty,
+                DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+            )
+        {
+            return None;
+        }
+        let bytes = column.to_data().get_slice_memory_size().ok()?;
+        let header = column
+            .get_array_memory_size()
+            .checked_sub(column.get_buffer_memory_size())?;
+        logical = logical.checked_add(bytes)?;
+        bound = bound
+            .checked_add(bytes)?
+            .checked_add(header)?
+            .checked_add(alignment.checked_mul(3)?)?
+            .checked_add(8)?;
+    }
+    Some((logical, bound))
+}
+
 fn fitting_sort_chunk(
     batch: &RecordBatch,
     start: usize,
@@ -2265,6 +2376,20 @@ fn fitting_sort_chunk(
     let remaining = batch.num_rows().saturating_sub(start);
     let mut low = 0;
     let mut high = max_rows.min(remaining);
+    if high > 0 && u32::try_from(high).is_ok() {
+        let full = batch.slice(start, high);
+        if let Some((logical, copy_bound)) = flat_take_prefix_bound(&full) {
+            let charged = full.get_array_memory_size();
+            // A prefix either keeps the original buffers or is copied. If the
+            // full slice is copied, all shorter flat prefixes are copied too.
+            if copy_bound <= max_bytes && (charged <= max_bytes || charged > logical.saturating_mul(2)) {
+                let candidate = owned_for_sort(full)?;
+                if candidate.get_array_memory_size() <= max_bytes {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
     while low < high {
         let rows = low + (high - low).div_ceil(2);
         let candidate = owned_for_sort(batch.slice(start, rows))?;
