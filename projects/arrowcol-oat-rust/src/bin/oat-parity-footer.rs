@@ -2,6 +2,7 @@ use std::{fs::File, path::Path};
 
 use anyhow::{Context, Result, bail};
 use parquet::{
+    arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
     basic::Compression,
     file::{
         metadata::{PageIndexPolicy, ParquetMetaDataReader},
@@ -62,13 +63,34 @@ fn inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn decode(path: &Path) -> Result<u64> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        .with_batch_size(8192)
+        .build()?;
+    reader.into_iter().try_fold(0_u64, |total, batch| {
+        let rows = u64::try_from(batch?.num_rows())?;
+        total.checked_add(rows).context("decoded row count overflow")
+    })
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
+    let mode = args
+        .next()
+        .context("expected --active or --decode and a Parquet file path")?;
     let path = args.next().context("expected one Parquet file path")?;
     if args.next().is_some() {
         bail!("expected one Parquet file path");
     }
-    inspect(Path::new(&path))
+    match mode.to_str() {
+        Some("--active") => inspect(Path::new(&path))?,
+        Some("--decode") => {}
+        _ => bail!("expected --active or --decode"),
+    }
+    let rows = decode(Path::new(&path))?;
+    println!("{rows}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -135,6 +157,7 @@ mod tests {
         ] {
             let path = fixture(compression, dictionary, statistics, None);
             assert_eq!(inspect(&path).is_ok(), valid);
+            assert_eq!(decode(&path).unwrap(), 4);
             fs::remove_file(path).unwrap();
         }
         let path = fixture(

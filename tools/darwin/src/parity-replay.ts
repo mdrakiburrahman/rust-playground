@@ -89,14 +89,18 @@ export async function replayParityArm(
     await writeFile(join(runRoot, "host.json"), `${JSON.stringify(host, null, 2)}\n`, { flag: "wx" });
     await runOat(runtime, configPath, runHome, join(trusted, "bin"), join(runRoot, "run.log"), stackBytes, true);
     if (await sha256(configPath) !== configHash || await sha256(seedPath) !== seedHash) throw new Error("parity configuration changed during the run");
-    const inspectActiveFooter = async (path: string): Promise<void> => {
+    const decodeFile = async (path: string, active: boolean): Promise<number> => {
       if (await sha256(footer.path) !== footer.sha256) throw new Error("trusted footer inspector changed");
-      execFileSync(footer.path, [path], { env: cleanEnv(runHome, stackBytes), timeout: 120_000, stdio: ["ignore", "ignore", "pipe"] });
+      const output = execFileSync(footer.path, [active ? "--active" : "--decode", path], {
+        env: cleanEnv(runHome, stackBytes), timeout: 600_000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
       if (await sha256(footer.path) !== footer.sha256) throw new Error("trusted footer inspector changed");
+      if (!/^(0|[1-9][0-9]*)$/.test(output) || !Number.isSafeInteger(Number(output))) throw new Error("invalid decoded row count");
+      return Number(output);
     };
     const result = await readReconciledOatResult(
       join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states",
-      producer.revision, null, "diagnostic", { config, inspectActiveFooter },
+      producer.revision, null, "diagnostic", { config, decodeFile },
     );
     if (await sha256(join(runtime, "target", "release", "arrowcol-oat-rust")) !== binaryHash
       || git(runtime, env, "rev-parse", "HEAD") !== producer.revision

@@ -26,7 +26,7 @@ test("refuses a diagnostic result without the physical parity gate", async () =>
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "diagnostic"),
     /requires a physical footer inspector/);
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", 3, "diagnostic", {
-    config: {}, inspectActiveFooter: async () => {},
+    config: {}, decodeFile: async () => 0,
   }), /requires a physical footer inspector/);
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "realistic"),
     /requires its Zstd level/);

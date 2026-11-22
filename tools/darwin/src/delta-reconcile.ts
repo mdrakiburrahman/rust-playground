@@ -84,7 +84,7 @@ function entries(raw: unknown): InventoryEntry[] {
 export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
   measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
-  rawPreload: unknown, inspectActiveFooter?: (path: string) => Promise<void>,
+  rawPreload: unknown, decodeFile?: (path: string, active: boolean) => Promise<number>,
 ): Promise<{
   rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number;
   activeFileRows: FileGeometry; windowFileRows: FileGeometry;
@@ -235,7 +235,6 @@ export async function reconcileStoppedSnapshot(
     const path = join(tableRoot, add.path);
     const stat = await lstat(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== add.size) throw new Error("active Parquet file size mismatch");
-    if (active.has(add.path) && inspectActiveFooter) await inspectActiveFooter(path);
     const bytes = await readFile(path);
     const metadata = readMetadata(bytes);
     let footerRows: number;
@@ -253,7 +252,9 @@ export async function reconcileStoppedSnapshot(
         }
       }
     } finally { metadata.free(); }
-    const rows = tableFromIPC(readParquet(bytes).intoIPCStream()).numRows;
+    const rows = decodeFile
+      ? uint(await decodeFile(path, active.has(add.path)), "decoded file rows")
+      : tableFromIPC(readParquet(bytes).intoIPCStream()).numRows;
     if (rows !== footerRows) throw new Error("Parquet decoded rows differ from footer");
     decoded.set(add.path, rows);
     if (active.has(add.path)) {

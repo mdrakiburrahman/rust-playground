@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
@@ -1381,6 +1381,29 @@ test('owned main rechecks supplementary eligibility after cancellation during ma
   }
 });
 
+test('unsettled owned server is unreferenced but retained for recovery', { skip: process.platform !== 'linux' }, async (t) => {
+  const fixture = await passingMainFixture({ configHash: '0'.repeat(64) });
+  const previousExitCode = process.exitCode;
+  const original = ChildProcess.prototype.unref;
+  let unrefs = 0;
+  t.mock.method(ChildProcess.prototype, 'unref', function (this: ChildProcess) {
+    unrefs++;
+    return original.call(this);
+  });
+  try {
+    process.exitCode = undefined;
+    await main(['--deadline-seconds', '10', '--no-viewer', '--config', fixture.configPath],
+      fixture.runner, undefined, fixture.receiptRoot);
+    assert.equal(process.exitCode, 1);
+    assert.equal(unrefs, 1);
+    assert.equal((await readdir(fixture.stateRoot)).length, 1);
+  } finally {
+    process.exitCode = previousExitCode;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test('owned main does not emit supplementary identity for rejected, unknown or unattested runs', { skip: process.platform !== 'linux' }, async (t) => {
   for (const options of [{ rejectRun: true }, { invalidRunId: true }, { configHash: null }, { configHash: '0'.repeat(64) }]) {
     await t.test(JSON.stringify(options), async () => {
@@ -1961,6 +1984,30 @@ test('local recovery and cleanup resolve relative state beside the owned server,
     await assert.rejects(stat(markerPath), { code: 'ENOENT' });
   } finally {
     process.chdir(cwd);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('local status polling retries transient timeouts without resubmitting the run', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-poll-timeout-'));
+  const configPath = path.join(directory, 'config.json');
+  await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
+  const calls: string[] = [];
+  let polls = 0;
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push((init?.method ?? 'GET') + ' ' + url.pathname);
+    if (init?.method === 'POST') return Response.json(status('running'), { status: 202 });
+    if (++polls <= 2) throw new DOMException('synthetic timeout', 'TimeoutError');
+    return Response.json(status('succeeded'));
+  };
+  t.mock.method(console, 'error', () => {});
+  try {
+    const result = await launchOat(configPath, undefined, 1, fetcher, () => {}, 'local', () => '127.0.0.1');
+    assert.equal(result.state, 'succeeded');
+    assert.equal(calls.filter(call => call === 'POST /runs').length, 1);
+    assert.equal(polls, 3);
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

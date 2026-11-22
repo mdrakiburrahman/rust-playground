@@ -72,11 +72,14 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
     const inspected: string[] = [];
     await reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
       measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,
-      async path => { inspected.push(path); });
+      async (path, active) => { assert.equal(active, true); inspected.push(path); return path.endsWith("first.parquet") ? 3 : 2; });
     assert.deepEqual(inspected.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
     await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
       measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,
       async () => { throw new Error("invalid physical footer"); }), /invalid physical footer/);
+    await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+      measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,
+      async () => 99), /decoded rows differ from footer/);
     await assert.rejects(reconcile([{ ...receipt, rows: 4 }]), /receipt counters/);
     await assert.rejects(reconcile([{ ...receipt, tableId: "b".repeat(64) }], [receipt, laterReceipt]), /selected commit receipt/);
     await assert.rejects(reconcile([{ ...receipt, finishedAtUnixMs: 151000 }]), /selected commit receipt/);

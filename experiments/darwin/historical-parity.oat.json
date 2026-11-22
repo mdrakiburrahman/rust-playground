@@ -81,7 +81,7 @@
         "max_arrow_memory_per_flush": 1073741824,
         "max_rows_per_flush": 2000000,
         "max_batches_per_flush": 2048,
-        "max_age": "60s",
+        "max_age": "1m",
         "max_concurrent_flushes": 12,
         "pipeline_depth": 8,
         "adaptive_file": {

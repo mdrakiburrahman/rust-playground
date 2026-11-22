@@ -113,7 +113,7 @@ export function extractClientEvidence(raw: unknown, requestedProfile: ClientData
 
 export async function readReconciledOatResult(
   resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number | null,
-  requestedProfile: ClientDataProfile, parity?: { config: unknown; inspectActiveFooter: (path: string) => Promise<void> },
+  requestedProfile: ClientDataProfile, parity?: { config: unknown; decodeFile: (path: string, active: boolean) => Promise<number> },
 ): Promise<{
   measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
@@ -122,7 +122,7 @@ export async function readReconciledOatResult(
   cellRunId: string; snapshotReconciled: true;
 }> {
   if (requestedProfile === "diagnostic") {
-    if (compressionLevel !== null || !parity || typeof parity.inspectActiveFooter !== "function") {
+    if (compressionLevel !== null || !parity || typeof parity.decodeFile !== "function") {
       throw new Error("diagnostic parity requires a physical footer inspector and no codec override");
     }
   } else if (parity || compressionLevel === null) {
@@ -203,7 +203,7 @@ export async function readReconciledOatResult(
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
   const proof = await reconcileStoppedSnapshot(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
-    parity ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.inspectActiveFooter,
+    parity ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.decodeFile,
   );
   return {
     measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,

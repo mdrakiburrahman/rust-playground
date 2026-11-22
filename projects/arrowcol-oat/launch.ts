@@ -1743,6 +1743,7 @@ export async function launchOat(
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
   let cancellationRequested = false;
   let cancellationObserved = false;
+  let consecutivePollTimeouts = 0;
   let resolveCancellationStarted!: () => void;
   const cancellationStarted = new Promise<void>((resolveStarted) => { resolveCancellationStarted = resolveStarted; });
   const runSignal = deadline
@@ -1816,9 +1817,20 @@ export async function launchOat(
           break;
         }
       }
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
-        signal: AbortSignal.timeout(30_000),
-      });
+      let response: Response;
+      try {
+        response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (error) {
+        if (mode === 'local' && error instanceof DOMException && error.name === 'TimeoutError'
+            && !cancellationRequested && !deadline?.isExpired() && ++consecutivePollTimeouts <= 3) {
+          console.error(`[oat] Run status poll timed out; retrying owned run ${ownedRunId} (${consecutivePollTimeouts}/3)`);
+          continue;
+        }
+        throw error;
+      }
+      consecutivePollTimeouts = 0;
       const next = await readStatus(response, 'poll OAT run', ownedRunId);
       if ((deadline || submission) && next.config_sha256 !== binding.submitted_config_sha256) {
         bindingFailure = new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`);
@@ -2202,6 +2214,7 @@ export async function main(
         async () => {
           if (deadline && deadline.cleanupState !== 'confirmed') {
             console.error(`[oat] Preserving OAT server for unresolved run receipt ${deadline.receiptPath}`);
+            server.child.unref();
             return;
           }
           await stopLocalServer(server.child);
