@@ -1,14 +1,12 @@
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, readlink, stat, writeFile } from "node:fs/promises";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
-const exec = promisify(execFile);
 type Observation<T> = { value: T | null; unavailable_reason: string | null };
 
 export function cpuList(value: string): number[] {
@@ -34,6 +32,23 @@ export function processStartTime(contents: string): string {
   const fields = contents.slice(end + 2).trim().split(/\s+/);
   if (end < 0 || !/^[0-9]+$/.test(fields[19] ?? "")) throw new Error("invalid /proc stat identity");
   return fields[19]!;
+}
+
+export function cgroupDirectory(placement: string, mountinfo: string): string | null {
+  const v2 = /^0::(\/.*)$/m.exec(placement);
+  if (!v2 || v2[1]!.split("/").includes("..")) return null;
+  for (const line of mountinfo.split("\n")) {
+    const [mount, filesystem] = line.split(" - ");
+    if (!filesystem?.startsWith("cgroup2 ")) continue;
+    const fields = mount!.split(" ");
+    const root = fields[3]!;
+    const point = fields[4]!;
+    if (!root || !point || root.includes("\\") || point.includes("\\")) continue;
+    if (v2[1] === root) return point;
+    const prefix = root === "/" ? "/" : `${root}/`;
+    if (v2[1]!.startsWith(prefix)) return join(point, v2[1]!.slice(prefix.length));
+  }
+  return null;
 }
 
 export function allowedCpus(status: string): string {
@@ -70,23 +85,29 @@ interface Options {
 interface Thread {
   tid: string;
   affinity: string;
+  startTicks: string;
 }
 
 interface Auxiliary {
   name: string;
   result: Promise<Observation<string>>;
+  stop: () => void;
 }
 
-function auxiliary(name: string, command: string, args: string[], output: string): Auxiliary {
+export function auxiliary(name: string, command: string, args: string[], output: string): Auxiliary {
   const destination = createWriteStream(join(output, `${name}.txt`), { flags: "wx" });
   const errors = createWriteStream(join(output, `${name}.stderr.txt`), { flags: "wx" });
   const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.pipe(destination);
   child.stderr.pipe(errors);
+  let reaped = false;
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
   const result = new Promise<Observation<string>>(resolveResult => {
     let failure: string | null = null;
     child.on("error", error => { failure = error.message; });
     child.on("close", (code, signal) => {
+      reaped = true;
+      if (killTimer !== null) clearTimeout(killTimer);
       destination.end();
       errors.end();
       resolveResult({
@@ -95,18 +116,27 @@ function auxiliary(name: string, command: string, args: string[], output: string
       });
     });
   });
-  return { name, result };
+  return { name, result, stop: () => {
+    if (reaped || killTimer !== null) return;
+    child.kill("SIGINT");
+    killTimer = setTimeout(() => { if (!reaped) child.kill("SIGKILL"); }, 1000);
+  } };
 }
 
 async function threads(pid: number): Promise<Thread[]> {
   const tids = (await readdir(`/proc/${pid}/task`)).sort((a, b) => Number(a) - Number(b));
-  return Promise.all(tids.map(async tid => ({
-    tid, affinity: allowedCpus(await readFile(`/proc/${pid}/task/${tid}/status`, "utf8")),
-  })));
-}
-
-function sameThreads(actual: Thread[], expected: Thread[]): boolean {
-  return actual.map(thread => thread.tid).join(",") === expected.map(thread => thread.tid).join(",");
+  const result: Thread[] = [];
+  for (const tid of tids) {
+    try {
+      const startTicks = processStartTime(await readFile(`/proc/${pid}/task/${tid}/stat`, "utf8"));
+      const affinity = allowedCpus(await readFile(`/proc/${pid}/task/${tid}/status`, "utf8"));
+      if (processStartTime(await readFile(`/proc/${pid}/task/${tid}/stat`, "utf8")) !== startTicks) continue;
+      result.push({ tid, affinity, startTicks });
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  return result;
 }
 
 export async function observe(options: Options): Promise<void> {
@@ -124,14 +154,16 @@ export async function observe(options: Options): Promise<void> {
   const originalThreads = await threads(options.pid);
   if (originalThreads.length === 0) throw new Error("collector has no visible threads");
   const requested = options.cpuList === null ? null : cpuList(options.cpuList);
-  if (requested && originalThreads.some(thread => requested.some(cpu => !cpuList(thread.affinity).includes(cpu)))) {
-    throw new Error("requested collector CPUs exceed an original thread's allowed allocation");
-  }
+  const verifyAffinity = (current: Thread[]): void => {
+    if (requested && current.some(thread => thread.affinity !== requested.join(","))) {
+      throw new Error("collector affinity differs from the run-scoped CPU allocation; observer never changes affinity");
+    }
+  };
+  verifyAffinity(originalThreads);
   const output = resolve(options.output);
   await mkdir(output, { recursive: false });
   const cgroup = await readFile(`${target}/cgroup`, "utf8");
-  const v2 = /^0::(\/.*)$/m.exec(cgroup);
-  const cgroupRoot = v2 && !v2[1]!.split("/").includes("..") ? join("/sys/fs/cgroup", v2[1]!) : null;
+  const cgroupRoot = cgroupDirectory(cgroup, await readFile("/proc/self/mountinfo", "utf8"));
   const cgroupFiles = ["cpu.max", "cpu.stat", "cpuset.cpus.effective", "memory.current", "memory.max", "memory.events", "io.stat"];
   const capturedCgroup = async (): Promise<Record<string, Observation<string>>> => Object.fromEntries(await Promise.all(
     cgroupFiles.map(async file => [file, cgroupRoot
@@ -143,8 +175,7 @@ export async function observe(options: Options): Promise<void> {
     if (processStartTime(await readFile(`${target}/stat`, "utf8")) !== originalStart
       || currentExe.ino !== originalExe.ino || currentExe.dev !== originalExe.dev) throw new Error("collector PID/executable identity changed");
     const current = await threads(options.pid);
-    if (!sameThreads(current, originalThreads)) throw new Error("collector thread set changed; intervention is invalid");
-    if (requested && current.some(thread => thread.affinity !== requested.join(","))) throw new Error("collector affinity changed");
+    verifyAffinity(current);
     return current;
   };
   const metadata = {
@@ -153,6 +184,7 @@ export async function observe(options: Options): Promise<void> {
     observer_pid: process.pid, observer_affinity: allowedCpus(await readFile("/proc/self/status", "utf8")),
     collector_cgroup: cgroup, collector_cgroup_mountinfo: await readFile(`${target}/mountinfo`, "utf8"),
     requested_collector_cpu_list: requested, original_threads: originalThreads,
+    resource_control: "read-only observer; collector cpuset/quota must be set at run creation by trusted harness; clients untouched",
     interval: { start_unix_ms: options.startUnixMs, duration_seconds: options.durationSeconds, sample_ms: options.sampleMs },
     cpu_scope: "per-thread schedstat CPU nanoseconds; affinity is not cgroup quota",
     disk_scope: "observer-visible system-wide diskstats; cgroup io.stat separately; neither is Parquet bytes",
@@ -166,17 +198,12 @@ export async function observe(options: Options): Promise<void> {
   };
   await writeFile(join(output, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, { flag: "wx" });
   const auxiliaryJobs: Auxiliary[] = [];
-  let interventionStarted = false;
   let failure: unknown = null;
   const abort = new AbortController();
   const interrupt = (): void => { abort.abort(new Error("observer interrupted")); };
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", interrupt);
   try {
-    if (requested) {
-      interventionStarted = true;
-      for (const thread of originalThreads) await exec("taskset", ["-pc", requested.join(","), thread.tid]);
-    }
     await identity();
     await writeFile(join(output, "ready.json"), `${JSON.stringify({ ready_unix_ms: Date.now(), effective_threads: await threads(options.pid) })}\n`, { flag: "wx" });
     const remaining = options.startUnixMs - Date.now();
@@ -192,19 +219,23 @@ export async function observe(options: Options): Promise<void> {
       auxiliaryJobs.push(
         auxiliary("pidstat", "pidstat", ["-t", "-u", "-r", "-d", "-p", String(options.pid), "1", String(options.durationSeconds)], output),
         auxiliary("iostat", "iostat", ["-x", "-y", "-t", "1", String(options.durationSeconds)], output),
-        auxiliary("perf", "perf", ["record", "-F", "99", "-g", "-p", String(options.pid), "-o", join(output, "perf.data"), "--", "sleep", String(options.durationSeconds)], output),
+        auxiliary("perf", "perf", ["record", "-F", "99", "-g", "-p", String(options.pid), "-o", join(output, "perf.data")], output),
       );
     }
     while (Date.now() < end) {
       if (abort.signal.aborted) throw abort.signal.reason;
       const sampleStart = Date.now();
       const effective = await identity();
-      const threadSamples = await Promise.all(effective.map(async thread => ({
-        ...thread,
-        comm: await readFile(`${target}/task/${thread.tid}/comm`, "utf8"),
-        schedstat: await optionalText(`${target}/task/${thread.tid}/schedstat`),
-        stat: await readFile(`${target}/task/${thread.tid}/stat`, "utf8"),
-      })));
+      const threadSamples = await Promise.all(effective.map(async thread => {
+        const comm = await optionalText(`${target}/task/${thread.tid}/comm`);
+        const schedstat = await optionalText(`${target}/task/${thread.tid}/schedstat`);
+        const currentStat = await optionalText(`${target}/task/${thread.tid}/stat`);
+        const stable = currentStat.value !== null && processStartTime(currentStat.value) === thread.startTicks;
+        return {
+          ...thread, comm, schedstat: stable ? schedstat : { value: null, unavailable_reason: "thread exited or TID was reused during sample" },
+          stat: stable ? currentStat : { value: null, unavailable_reason: "thread exited or TID was reused during sample" },
+        };
+      }));
       let metrics: Observation<string> = { value: null, unavailable_reason: "no collector metrics URL configured; queue/flush/commit waits unavailable here" };
       if (options.metricsUrl !== null) {
         try {
@@ -217,13 +248,15 @@ export async function observe(options: Options): Promise<void> {
         }
       }
       const sample = {
-        sample_start_unix_ms: sampleStart, sample_end_unix_ms: Date.now(), monotonic_ns: process.hrtime.bigint().toString(),
+        sample_start_unix_ms: sampleStart,
         threads: threadSamples, collector_status: await readFile(`${target}/status`, "utf8"),
         collector_io: await optionalText(`${target}/io`), cgroup: await capturedCgroup(),
         system_cpu_stat: await readFile("/proc/stat", "utf8"), system_diskstats: await optionalText("/proc/diskstats"),
         collector_namespace_netdev: await optionalText(`${target}/net/dev`), collector_metrics: metrics,
       };
-      await appendFile(join(output, "samples.ndjson"), `${JSON.stringify(sample)}\n`);
+      await appendFile(join(output, "samples.ndjson"), `${JSON.stringify({
+        ...sample, sample_end_unix_ms: Date.now(), monotonic_ns: process.hrtime.bigint().toString(),
+      })}\n`);
       await new Promise<void>(accept => setTimeout(accept, Math.max(0, Math.min(options.sampleMs - (Date.now() - sampleStart), end - Date.now()))));
     }
     await identity();
@@ -233,28 +266,13 @@ export async function observe(options: Options): Promise<void> {
   } finally {
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);
-    const restores: Observation<string>[] = [];
-    if (interventionStarted) {
-      for (const thread of originalThreads) {
-        try {
-          if (processStartTime(await readFile(`${target}/stat`, "utf8")) !== originalStart) throw new Error("collector PID was reused");
-          await exec("taskset", ["-pc", thread.affinity, thread.tid]);
-          const restored = allowedCpus(await readFile(`${target}/task/${thread.tid}/status`, "utf8"));
-          if (restored !== thread.affinity) throw new Error(`thread ${thread.tid} affinity restore mismatch`);
-          restores.push({ value: thread.tid, unavailable_reason: null });
-        } catch (error) {
-          if (!(error instanceof Error)) throw error;
-          restores.push({ value: null, unavailable_reason: error.message });
-        }
-      }
-    }
+    for (const job of auxiliaryJobs) job.stop();
     const auxiliaryResults = Object.fromEntries(await Promise.all(auxiliaryJobs.map(async job => [job.name, await job.result])));
     await writeFile(join(output, "completion.json"), `${JSON.stringify({
-      complete: failure === null && restores.every(result => result.value !== null),
+      complete: failure === null,
       failure: failure instanceof Error ? failure.message : failure === null ? null : String(failure),
-      end_unix_ms: Date.now(), restores, auxiliary: auxiliaryResults, cgroup_after: await capturedCgroup(),
+      end_unix_ms: Date.now(), auxiliary: auxiliaryResults, cgroup_after: await capturedCgroup(),
     }, null, 2)}\n`, { flag: "wx" });
-    if (restores.some(result => result.value === null)) throw new Error("collector affinity restore failed; see completion.json");
   }
   if (failure !== null) throw failure;
 }
