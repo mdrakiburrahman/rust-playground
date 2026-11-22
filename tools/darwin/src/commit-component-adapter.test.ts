@@ -208,11 +208,21 @@ test("known pinned fixture and external oracle A-A", { skip: !runAa, timeout: 1_
   await exec("git", ["merge-base", "--is-ancestor", pin.revision, "HEAD"], { cwd: repo });
   const host = fakeHost(root, async ({ resultPath, tablePath }) => {
     assert.equal(await digest(binary), pin.binarySha256);
-    await exec(binary, ["--result", resultPath, "--table-root", tablePath], {
+    const execution = exec("/usr/bin/setsid", [binary, "--result", resultPath, "--table-root", tablePath], {
       env: { PATH: "/usr/bin:/bin", HOME: root, TMPDIR: root },
       timeout: 90_000,
       maxBuffer: 64 * 1024,
     });
+    const pid = execution.child.pid;
+    assert.ok(pid);
+    await execution;
+    try {
+      process.kill(-pid, 0);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ESRCH") return;
+      throw error;
+    }
+    assert.fail("fixture process group did not settle");
   });
   let exercisedTampering = false;
   host.reconcileStoppedCell = async (tablePath) => {
