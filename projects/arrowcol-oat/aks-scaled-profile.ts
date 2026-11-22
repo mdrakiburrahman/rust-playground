@@ -6,6 +6,12 @@ const profileLabel = 'arrowcol-oat/client-profile';
 const clientIndexLabel = 'arrowcol-oat/client-index';
 export const MAX_SCALED_CLIENTS = 8;
 
+export const collectorShapes = {
+  e64: { vmSize: 'Standard_E64ds_v6', vcpus: 64, runtimeCores: 48, memoryGiB: 384 },
+  e192: { vmSize: 'Standard_E192ids_v6', vcpus: 192, runtimeCores: 176, memoryGiB: 1536 },
+} as const;
+export type CollectorShape = keyof typeof collectorShapes;
+
 export interface ScaledPoolSettings {
   enableAutoScaling: boolean;
   minCount: number;
@@ -53,7 +59,7 @@ const clientDefaults: Record<string, string> = {
   'connect-timeout-ms': '30000', 'request-timeout-ms': '30000', 'tcp-nodelay': 'true',
   'tcp-keepalive-ms': '60000', 'tcp-keepalive-interval-ms': '0', 'tcp-keepalive-retries': '0',
   'endpoint-concurrency-limit': '256', 'endpoint-buffer-size': '1024', 'connect-retries': '0',
-  'retry-backoff-ms': '100', 'rate-limit-rps': '0',
+  'retry-backoff-ms': '100', 'rate-limit-rps': '0', pilot: 'false',
 };
 const distributionFlags = ['string-length-distribution', 'value-variation', 'guid-uniqueness'];
 const controlFlags = ['endpoint', 'client-id', 'table', 'rows', 'concurrency', 'edge-secret-file',
@@ -99,6 +105,21 @@ function resolvedClientConfig(resource: Record<string, unknown>): Record<string,
   resolved['value-variation'] ??= realistic ? 'per_row' : 'cardinality';
   resolved['guid-uniqueness'] ??= realistic ? 'per_row' : 'cardinality';
   if (realistic && resolved['string-width'] === '0') resolved['string-width'] = '96';
+  const enums: Record<string, string[]> = {
+    'data-mode': ['shared', 'independent'], 'dictionary-handling': ['hydrate'],
+    'grpc-send-compression': ['none', 'gzip', 'zstd'], 'grpc-accept-compression': ['none', 'gzip', 'zstd'],
+    'string-length-distribution': ['fixed', 'uniform'], 'value-variation': ['cardinality', 'per_row'],
+    'guid-uniqueness': ['cardinality', 'per_row'],
+  };
+  for (const [flag, values] of Object.entries(enums)) if (!values.includes(resolved[flag]!)) throw new Error('Unknown effective ' + flag + '.');
+  for (const flag of ['adaptive-window', 'keepalive-while-idle', 'tcp-nodelay', 'pilot']) {
+    if (!['true', 'false'].includes(resolved[flag]!)) throw new Error('Unknown effective ' + flag + '.');
+  }
+  const numeric = Object.keys(clientDefaults).filter(flag => !['data-profile', 'ipc-compression', ...Object.keys(enums),
+    'adaptive-window', 'keepalive-while-idle', 'tcp-nodelay', 'pilot'].includes(flag));
+  for (const flag of [...numeric, 'rows', 'concurrency', 'duration-secs', 'warmup-secs', 'schedule-timeout-secs']) {
+    if (!/^\d+(?:\.\d+)?$/.test(resolved[flag] ?? '') || !Number.isFinite(Number(resolved[flag]))) throw new Error('Unknown effective numeric ' + flag + '.');
+  }
   if (resolved['batch-rows'] === '0') resolved['batch-rows'] = resolved.rows!;
   if (resolved['corpus-rows'] === '0' && resolved['corpus-bytes'] === '0') resolved['corpus-rows'] = resolved.rows!;
   if (resolved['streams-per-worker'] === '0') resolved['streams-per-worker'] = resolved.concurrency!;
@@ -133,6 +154,7 @@ export interface ScaledRuntimeObservation {
   collectorNodeName: string;
   collectorImageId: string;
   clients: ScaledClientPlacement[];
+  nodeEvidence?: { nodeName: string; vmSize: string; allocatableCpuCores: number; allocatableMemoryBytes: number }[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -201,6 +223,62 @@ export function scaledClientJobs(runId: string, clientCount: number): ScaledClie
   });
 }
 
+export function renderScaledCollector(manifest: string, runId: string, shape: CollectorShape): { manifest: string; poolName: string } {
+  const poolName = 's' + validateRunId(runId).slice(0, 10);
+  const hardware = collectorShapes[shape];
+  if (!hardware) throw new Error('Unknown scaled collector shape.');
+  const documents = parseDocuments(manifest);
+  const writer = documents.filter(document => document.getIn(['kind']) === 'Deployment' && document.getIn(['metadata', 'name']) === 'arrowcol');
+  const config = documents.filter(document => document.getIn(['kind']) === 'ConfigMap' && document.getIn(['metadata', 'name']) === 'arrowcol-config');
+  if (writer.length !== 1 || config.length !== 1) throw new Error('Scaled collector requires exactly one writer and configuration.');
+  const podPath = ['spec', 'template', 'spec'];
+  for (const document of documents) {
+    if (document.getIn([...podPath, 'nodeSelector', 'arrow-collector/role']) === 'arrowcol' ||
+        document.getIn([...podPath, 'nodeSelector', 'kubernetes.azure.com/agentpool']) === 'benche64') {
+      document.setIn([...podPath, 'nodeSelector', 'kubernetes.azure.com/agentpool'], poolName);
+      const pod = requireRecord(requireRecord(requireRecord(requireRecord(document.toJSON(), 'Collector-stage resource').spec,
+        'Collector-stage spec').template, 'Collector-stage template').spec, 'Collector-stage pod');
+      const existing = pod.tolerations ?? [];
+      if (!Array.isArray(existing)) throw new Error('Scaled collector-stage tolerations are invalid.');
+      document.setIn([...podPath, 'tolerations'], [...existing,
+        { key: runLabel, operator: 'Equal', value: runId, effect: 'NoSchedule' }]);
+    }
+  }
+  const containerPath = [...podPath, 'containers', 0];
+  if (writer[0]!.getIn([...containerPath, 'name']) !== 'dataflow') throw new Error('Scaled writer container shape changed.');
+  writer[0]!.setIn([...podPath, 'nodeSelector', 'kubernetes.azure.com/agentpool'], poolName);
+  writer[0]!.setIn(['spec', 'template', 'metadata', 'labels', runLabel], runId);
+  writer[0]!.setIn(['spec', 'template', 'metadata', 'annotations', 'benchmark.arrowcol/tuning'], 'scaled-' + shape);
+  writer[0]!.setIn([...containerPath, 'args'], ['--config', '/etc/oat/dataflow.yaml', '--num-cores', String(hardware.runtimeCores)]);
+  writer[0]!.setIn([...containerPath, 'resources'], {
+    requests: { cpu: String(hardware.runtimeCores), memory: hardware.memoryGiB + 'Gi' },
+    limits: { cpu: String(hardware.runtimeCores), memory: hardware.memoryGiB + 'Gi' },
+  });
+  const dataflow = config[0]!.getIn(['data', 'dataflow.yaml']);
+  if (typeof dataflow !== 'string') throw new Error('Scaled dataflow configuration is invalid.');
+  const embedded = parseDocuments(dataflow);
+  if (embedded.length !== 1) throw new Error('Scaled dataflow configuration must be a single YAML document.');
+  embedded[0]!.setIn(['policies', 'resources', 'core_allocation', 'count'], hardware.runtimeCores);
+  embedded[0]!.setIn(['groups', 'arrowcol', 'pipelines', 'ingest', 'nodes', 'flight', 'config', 'registration', 'rss_limit_bytes'],
+    Math.floor(hardware.memoryGiB * 1024 ** 3 * 0.8));
+  config[0]!.setIn(['data', 'dataflow.yaml'], embedded[0]!.toString());
+  return { manifest: documents.map(document => document.toString()).join(''), poolName };
+}
+
+export function assertTrustedImageStatement(statement: unknown, digest: string, commit: string): void {
+  const value = requireRecord(statement, 'Verified image statement');
+  const subjects = Array.isArray(value.subject) ? value.subject : [];
+  const predicate = requireRecord(value.predicate, 'Verified image predicate');
+  const materials = Array.isArray(predicate.materials) ? predicate.materials : [];
+  if (value._type !== 'https://in-toto.io/Statement/v0.1' ||
+      value.predicateType !== 'https://slsa.dev/provenance/v0.2' ||
+      !subjects.some(subject => isRecord(subject) && isRecord(subject.digest) && subject.digest.sha256 === digest.slice(7)) ||
+      !materials.some(material => isRecord(material) &&
+        material.uri === 'git+https://github.com/mdrakiburrahman/rust-playground' &&
+        isRecord(material.digest) && material.digest.sha1 === commit)) {
+    throw new Error('Trusted build provenance does not bind the candidate digest to the requested repository and commit.');
+  }
+}
 export function renderScaledProfileManifest(source: string, runId: string, clientCount: number): string {
   const jobs = scaledClientJobs(runId, clientCount);
   const normalizedRunId = runId.toLowerCase();
@@ -262,9 +340,11 @@ export function renderScaledProfileManifest(source: string, runId: string, clien
       cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'args', clientIdIndexes[0]!], job.clientId);
       const pinned = resolvedClientConfig(requireRecord(cloned.toJSON(), 'Cloned Job'));
       pinned['pod-ordinal'] = String(job.index);
+      pinned['schedule-timeout-secs'] = '900';
       cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'args'],
-        Object.entries(pinned).flatMap(([flag, value]) => ['--' + flag, value]));
-      cloned.deleteIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'env']);
+        Object.entries(pinned).filter(([flag]) => flag !== 'pilot').flatMap(([flag, value]) => ['--' + flag, value]));
+      cloned.setIn(['spec', 'template', 'spec', 'containers', cloneGenerator.containerIndex, 'env'],
+        [{ name: 'ARROWCOL_CLIENT_PILOT', value: pinned.pilot }]);
       cloned.setIn(['spec', 'template', 'spec', 'affinity'], affinity);
       output.push(cloned.toString());
     }
@@ -466,7 +546,8 @@ export function effectiveWorkloadConfig(manifest: string): EffectiveWorkloadConf
   }
   const contract = {
     schemaVersion: 1 as const,
-    profile: performanceConfig!['data-profile'] === 'diagnostic' && performanceConfig!['ipc-compression'] === 'none'
+    profile: performanceConfig!['data-profile'] === 'diagnostic' && performanceConfig!['ipc-compression'] === 'none' &&
+      performanceConfig!['grpc-send-compression'] === 'none' && performanceConfig!['grpc-accept-compression'] === 'none'
       ? 'diagnostic-replay' as const : 'non-parity' as const,
     dataProfile: performanceConfig!['data-profile'] as 'diagnostic' | 'realistic',
     ipcCompression: performanceConfig!['ipc-compression'] as 'none' | 'lz4_frame' | 'zstd',

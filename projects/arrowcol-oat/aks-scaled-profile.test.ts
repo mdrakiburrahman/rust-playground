@@ -228,3 +228,19 @@ test('candidate substitution transforms original container image nodes once, wit
   assert.equal(record((record(record(record(registration.spec).template).spec).containers as unknown[])[0]).image,
     registry + '/arrowcol-oat-client@' + binding.images[second]);
 });
+
+test('effective workload explicitly covers every performance input exposed by the compiled client source', async () => {
+  const manifest = (await readFile(resolve(process.cwd(), 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml'), 'utf8'))
+    .replaceAll('BENCHDURATIONSECS', '600');
+  const config = effectiveWorkloadConfig(manifest).performanceConfig;
+  const sources = await Promise.all([
+    readFile(resolve(process.cwd(), 'bin/collector-chain/src/dmv_client.rs'), 'utf8'),
+    readFile(resolve(process.cwd(), 'bin/collector-chain/src/bin/arrowcol-dmv.rs'), 'utf8'),
+  ]);
+  const flags = new Set(sources.flatMap(source => [...source.matchAll(/env = "ARROWCOL_CLIENT_([A-Z_]+)"/g)]
+    .map(match => match[1]!.toLowerCase().replaceAll('_', '-'))));
+  for (const flag of flags) {
+    if (['client-id', 'pod-ordinal', 'run-start-unix-ms'].includes(flag)) continue;
+    assert.ok(config[flag] !== undefined, 'Unpinned effective client input: ' + flag);
+  }
+});

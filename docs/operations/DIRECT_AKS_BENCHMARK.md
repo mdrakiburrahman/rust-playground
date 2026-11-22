@@ -46,15 +46,43 @@ npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run \
 
 Cleanup is automatic on success and failure after owned resources are created. The entrypoint deletes only the namespace whose labels, annotations, and UID still match this run and removes only its run-scoped FIC after namespace absence. For each non-zero workload pool, it waits up to 25 minutes for any non-DaemonSet pods, including completed pods, to leave or for the autoscaler to drain the pool naturally. Only when no such pods remain does it temporarily disable autoscaling, scale the pool to zero, and restore autoscaling min 0/max 1; already-empty pools are left unchanged. It never removes Delta data, the shared identity, the stamp, other namespaces, or other FICs. If ownership verification, namespace deletion, FIC cleanup, a remaining workload pod, scale-down, or autoscaler restoration fails, the command exits nonzero and preserves the private receipt/report for recovery; do not broaden cleanup to shared resources.
 
-## Offline scaled-profile contract
+## Opt-in scaled holdout
 
-The checked-in runner and manifest remain the default one-writer/one-client path. `projects/arrowcol-oat/aks-scaled-profile.ts` is an offline integration contract only; it is not exposed as a live runner option and does not authorize or verify an AKS run.
+The default runner and source manifest retain the historical one-writer/one-client behavior. The same entrypoint now accepts `--profile scaled`; this path has been verified offline with mock commands, not with a live deployment or load. These commands do not authorize cloud execution.
 
 | Guard | Scaled-profile requirement |
 | --- | --- |
-| Clients | Render 1–8 separate Jobs with distinct run-scoped client IDs, unchanged shared generation arguments, and required hostname anti-affinity. All use the existing shared start schedule; the schedule is not advanced until every client is ready, and any failed client aborts. |
-| Pool | Snapshot `benchd64` autoscaler settings only when autoscaling is enabled, min is 0, and both configured and observed node counts are 0. Temporarily cap max at the client count; restore the exact original min/max only after the pool drains and the active settings have not drifted. |
-| Workload identity | Hash the effective `diagnostic-replay` / `diagnostic` / IPC `none` profile, client count, and every generator argument except per-client IDs. The existing diagnostic parity context includes batch/corpus 65,536; the historical 528,220 rows/s result is comparable only with the same profile and tunables. Any realistic profile must be labeled separately. |
-| Images and observation | Bind all exact source image references (including distinct digests sharing one repository) to candidate digests and the same source commit/config hash. Runtime evidence must retain each client pod UID-to-node/image-ID mapping, distinct node placement, and collector pod UID-to-node/image-ID mapping. |
+| Clients | `--clients 1..8` (default 1): separate one-completion Jobs, unique run-scoped client IDs and pod ordinals, identical distribution/tuning, required hostname anti-affinity. Every client must become ready before one common schedule is patched; every client must finish the same 60-second warmup and 600-second measurement window. Missing/failed clients abort; smoke is not accepted. |
+| Collector | `--collector-shape e64` (default): E64ds_v6, 48 runtime/request/limit cores, 384 GiB; `e192`: E192ids_v6, 176 cores, 1536 GiB. Core-allocation policy and RSS admission limit are rendered for the shape. All collector/support stages target a fresh run-owned pool with a run-ID taint, declared by `infra/azure/scaled-collector.bicep`; existing `arrowe192` and `benche64` are not modified. |
+| Client pool | Snapshot `benchd64` only when autoscaling is enabled, min is 0, and configured/observed nodes are 0. Temporarily cap max at the client count. After namespace deletion, drain and restore the exact original settings; drift is a nonzero failure, never overwritten. Partial startup also takes the owned cleanup path. |
+| Workload provenance | Resolve and explicitly pin known client defaults, CLI flags and literal env. Conflicting/unknown env, envFrom, commands and args are rejected. The workload SHA-256 hashes sorted effective generator configuration and client count, excluding only unique client IDs/ordinals. The rendered-manifest SHA-256 separately binds all collector/support configuration and resources. Diagnostic replay/IPC None is distinct from realistic or compressed non-parity profiles. |
+| Candidate images | JSON binds each exact original image reference to a candidate digest, requested commit and workload hash. This is **structural binding, not build proof**. Before any workload/pool write, `run` requires `cosign verify-attestation` using `--provenance-key` from an independently trusted signer, with a matching image digest and repository/commit in SLSA v0.2 materials. No historical-image fallback exists. |
+| Runtime evidence | Validate actual pod UID, node, image ID, args, resources, client env and collector ConfigMap against the render; verify distinct client nodes, actual VM SKUs and allocatable CPU/memory. Retain each client's full-window result and private transcript. The observer starts before scheduling and stops before Delta replay; `node_resources` is target-pod procfs/cgroup-v2 aggregation, **not host-wide counters**. Unavailable samples remain null with a reason. |
 
-These helpers have only been exercised with local fixtures. Candidate image builds/attestations, live pool mutation/restoration, pod observation, quota/SKU availability, and end-to-end scaled execution remain unverified; no Azure or AKS writes or image pushes were performed.
+Prepare an offline render and binding template (zero digests are placeholders, not deployable candidate images). The output paths must not already exist:
+
+```bash
+mkdir -p out/arrowcol-oat
+CANDIDATE_COMMIT=$(git rev-parse HEAD)
+npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts render \
+  --profile scaled --clients 4 --collector-shape e192 \
+  --candidate-commit "$CANDIDATE_COMMIT" --output out/arrowcol-oat/scaled-holdout.yaml \
+  --env-file .env --stamp-config .temp/stamp-68590.yaml
+```
+
+This writes `scaled-holdout.yaml.images.json` with the workload hash and every source-image slot. Later, an authorized image build must populate its candidate digests and publish trusted attestations. To re-render those bindings offline, add `--image-manifest <populated-json>` and choose a new output path.
+
+**Live execution requires separate authorization, serial stamp custody, candidate builds and a trusted public key.** The following reference command provisions a run-owned collector pool and temporarily changes the empty client pool; do not execute it as part of offline preparation:
+
+```bash
+npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run \
+  --profile scaled --clients 4 --collector-shape e192 \
+  --candidate-commit "$CANDIDATE_COMMIT" \
+  --image-manifest out/arrowcol-oat/scaled-holdout.yaml.images.json \
+  --provenance-key <trusted-build-public-key> \
+  --env-file .env --stamp-config .temp/stamp-68590.yaml
+```
+
+Read-only discovery on 2026-11-22 found no Canada Central SKU restrictions for the three shapes above, with 1800 E-family, 1776 D-family and 3800 regional vCPUs available. The runner rechecks SKU/family/regional quota before any scaled mutation; this is not a capacity reservation or proof of schedulability. Offline CLI tests exercise success, missing/failed clients, partial collector/startup failure, source-provenance rejection, pool drift and default compatibility. Actual signed candidate images, live pool restoration, observer access and end-to-end scaled throughput remain unverified. No Azure/AKS write, image push or load was performed for this work.
+
+The historical 528,220 rows/s context is Diagnostic replay, IPC None, batch/corpus 65,536. Compare code revisions only at identical effective tuning **and hardware/client counts**; a larger collector or additional clients are not a code speedup. Label realistic assessments separately.

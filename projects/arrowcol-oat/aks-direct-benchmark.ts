@@ -5,13 +5,21 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/p
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseArgs } from 'node:util';
+import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { parseAllDocuments } from 'yaml';
 import { Azure, Config, load_env, ROOT, run_tree } from '../../infra/azure/bootstrap.js';
 import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
 import { readDeltaAddWindow } from './aks-delta-preservation.js';
+import { startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
+import {
+  applyCandidateImageManifest, assertScaledRuntimeObservation, assertTrustedImageStatement, collectorShapes,
+  effectiveWorkloadConfig, planScaledClientPool, planScaledClientPoolRestore, renderScaledCollector,
+  renderScaledProfileManifest, scaledClientJobs,
+  type CandidateImageManifest, type CollectorShape, type ScaledPoolPlan, type ScaledPoolSettings,
+  type ScaledRuntimeObservation,
+} from './aks-scaled-profile.js';
 
 const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
 const namespacePrefix = 'arrow-collector-';
@@ -21,7 +29,18 @@ const tablePath = 'telemetry/sqlserver/sqlserver_availability_replica_states';
 const table = tablePath.replaceAll('/', '.');
 const uuidPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const workloadPools = ['benche64', 'benchd64'] as const;
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+export interface BenchmarkDependencies {
+  runTree?: typeof run_tree;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  readDelta?: typeof readDeltaAddWindow;
+  generation?: typeof capturedGeneration;
+  startObservation?: typeof startNodeObservation;
+}
+const executionScope = new AsyncLocalStorage<BenchmarkDependencies>();
+const now = () => executionScope.getStore()?.now?.() ?? Date.now();
+const sleep = (ms: number) => executionScope.getStore()?.sleep?.(ms) ?? new Promise<void>(resolve => setTimeout(resolve, ms));
+const invokeTree: typeof run_tree = (...args) => (executionScope.getStore()?.runTree ?? run_tree)(...args);
 
 const stageScope = new AsyncLocalStorage<{ name: string; deadline: number; timeoutMs: number }>();
 const manifestStages = ['identity', 'sql', 'migration', 'catalog', 'writer', 'initializer', 'registration', 'load'] as const;
@@ -29,25 +48,25 @@ const manifestStages = ['identity', 'sql', 'migration', 'catalog', 'writer', 'in
 function boundedTimeoutSeconds(timeout: number): number {
   const stage = stageScope.getStore();
   if (!stage) return timeout;
-  const remaining = Math.ceil((stage.deadline - Date.now()) / 1000);
+  const remaining = Math.ceil((stage.deadline - now()) / 1000);
   if (remaining < 1) throw new Error(stage.name + ' stage timed out after ' + (stage.timeoutMs / 1000) + ' seconds.');
   return Math.min(timeout, remaining);
 }
 
 const stageAwareRunTree: typeof run_tree = (args, timeout, cwd, env, onStderr, maxOutputBytes) =>
-  run_tree(args, boundedTimeoutSeconds(timeout), cwd, env, onStderr, maxOutputBytes);
+  invokeTree(args, boundedTimeoutSeconds(timeout), cwd, env, onStderr, maxOutputBytes);
 
 async function runStage<T>(name: string, timeoutMs: number, action: () => Promise<T>): Promise<T> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error(name + ' stage timeout is invalid.');
-  const stage = { name, timeoutMs, deadline: Date.now() + timeoutMs };
+  const stage = { name, timeoutMs, deadline: now() + timeoutMs };
   return stageScope.run(stage, async () => {
     try {
       const result = await action();
-      if (Date.now() >= stage.deadline) throw new Error('stage deadline elapsed.');
+      if (now() >= stage.deadline) throw new Error('stage deadline elapsed.');
       return result;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      const timedOut = Date.now() >= stage.deadline || /timed out|deadline elapsed/i.test(detail);
+      const timedOut = now() >= stage.deadline || /timed out|deadline elapsed/i.test(detail);
       throw new Error(name + ' stage ' + (timedOut ? 'timed out' : 'failed') + ' after ' + (timeoutMs / 1000) + ' seconds' + (detail ? ': ' + detail : ''), { cause: error });
     }
   });
@@ -84,7 +103,7 @@ function checkResult(result: Awaited<ReturnType<typeof run_tree>>, label: string
 }
 
 async function command(args: string[], label: string, timeout = 120): Promise<string> {
-  return checkResult(await run_tree(args, boundedTimeoutSeconds(timeout), ROOT), label);
+  return checkResult(await invokeTree(args, boundedTimeoutSeconds(timeout), ROOT), label);
 }
 
 function parseJson(text: string, label: string): unknown {
@@ -113,13 +132,13 @@ async function getObject(config: Config, resource: string, namespace: string, na
 }
 
 async function waitUntil<T>(label: string, timeoutMs: number, predicate: () => Promise<T | undefined>, intervalMs = 5000): Promise<T> {
-  const localEnd = Date.now() + timeoutMs;
+  const localEnd = now() + timeoutMs;
   const stage = stageScope.getStore();
   const end = Math.min(localEnd, stage?.deadline ?? Number.POSITIVE_INFINITY);
-  while (Date.now() < end) {
+  while (now() < end) {
     const value = await predicate();
     if (value !== undefined) return value;
-    await sleep(Math.min(intervalMs, Math.max(0, end - Date.now())));
+    await sleep(Math.min(intervalMs, Math.max(0, end - now())));
   }
   if (stage && stage.deadline <= localEnd) throw new Error(stage.name + ' stage timed out after ' + (stage.timeoutMs / 1000) + ' seconds.');
   throw new Error(label + ' timed out.');
@@ -165,10 +184,12 @@ async function poolNodeCount(config: Config, pool: string): Promise<number> {
   return value.items.length;
 }
 
-async function readPool(config: Config, pool: string): Promise<JsonObject> {
+async function readPool(config: Config, pool: string, includeShape = false): Promise<JsonObject> {
   const output = await command(['az', 'aks', 'nodepool', 'show', '--subscription', config.subscription,
     '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-    '--query', '{enableAutoScaling:enableAutoScaling,minCount:minCount,maxCount:maxCount,count:count}',
+    '--query', includeShape
+      ? '{enableAutoScaling:enableAutoScaling,minCount:minCount,maxCount:maxCount,count:count,vmSize:vmSize}'
+      : '{enableAutoScaling:enableAutoScaling,minCount:minCount,maxCount:maxCount,count:count}',
     '--output', 'json', '--only-show-errors'], `Read ${pool} node-pool configuration`);
   return requireRecord(parseJson(output, `${pool} node-pool configuration`), `${pool} node-pool configuration`);
 }
@@ -225,15 +246,15 @@ async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise
   if (blockers.length) throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`);
 }
 
-async function scalePoolToZero(config: Config, pool: string): Promise<void> {
+async function scalePoolToZero(config: Config, pool: string, maxCount = 1): Promise<void> {
   let blockers: string[] = [];
   const label = `${pool} safe scale-down`;
   let decision: 'drained' | 'scale';
   try {
     decision = await waitUntil(label, 25 * 60_000, async () => {
       const current = await readPool(config, pool);
-      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
-        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
+      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== maxCount) {
+        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max ${maxCount}; refusing to change shared pool configuration.`);
       }
       const nodes = await poolNodeCount(config, pool);
       blockers = nodes === 0 ? [] : await readWorkloadPodsOnPool(config, pool);
@@ -266,8 +287,8 @@ async function scalePoolToZero(config: Config, pool: string): Promise<void> {
   try {
     await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
       '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--enable-cluster-autoscaler', '--min-count', '0', '--max-count', '1',
-      '--only-show-errors', '--output', 'none'], `Restore ${pool} autoscaling min 0/max 1`, 600);
+      '--enable-cluster-autoscaler', '--min-count', '0', '--max-count', String(maxCount),
+      '--only-show-errors', '--output', 'none'], `Restore ${pool} autoscaling min 0/max ${maxCount}`, 600);
   } catch (error) {
     restoreError = error instanceof Error ? error : new Error(String(error));
   }
@@ -430,7 +451,7 @@ export function renderManifest(source: string, values: Record<string, string>): 
   return rendered;
 }
 
-export function assertRenderedManifest(rendered: string, runId: string, owner: string, registry: string): void {
+export function assertRenderedManifest(rendered: string, runId: string, owner: string, registry: string, clientCount = 1): void {
   if (!uuidPattern.test(runId) || !/^[0-9a-f]{48}$/.test(owner) || !registry) throw new Error('Rendered manifest inputs are invalid.');
   const expectedNamespace = namespacePrefix + runId.replaceAll('-', '');
   const expirySentinels = rendered.match(/"expires_at_unix_ms"\s*:\s*9876543210000(?=\s*[,}])/g) ?? [];
@@ -467,7 +488,8 @@ export function assertRenderedManifest(rendered: string, runId: string, owner: s
         throw new Error('Rendered namespace ownership markers do not match the fake run inputs.');
       }
     }
-    if (resource.kind === 'Job' && metadata.name === 'direct-load-confirmwide') {
+    if (resource.kind === 'Job' && (metadata.name === 'direct-load-confirmwide' ||
+        scaledClientJobs(runId, clientCount).some(job => job.name === metadata.name))) {
       const spec = requireRecord(resource.spec, 'Rendered load Job spec');
       const template = requireRecord(spec.template, 'Rendered load Job template');
       const podSpec = requireRecord(template.spec, 'Rendered load pod spec');
@@ -482,7 +504,7 @@ export function assertRenderedManifest(rendered: string, runId: string, owner: s
       loadDurationCount++;
     }
   }
-  if (namespaceCount !== 1 || loadDurationCount !== 1 || images.length === 0 ||
+  if (namespaceCount !== 1 || loadDurationCount !== clientCount || images.length === 0 ||
       manifestStages.some(stage => !foundStages.has(stage)) || foundStages.size !== manifestStages.length) {
     throw new Error('Rendered manifest is missing a namespace, load duration, or expected stage.');
   }
@@ -517,8 +539,8 @@ async function waitForReadyLoad(config: Config, namespace: string, writer: Write
 }
 
 async function waitForLoad(config: Config, namespace: string, writer: WriterIdentity, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
     await assertWriterStable(config, namespace, writer);
     const job = await getObject(config, 'job', namespace, 'direct-load-confirmwide');
     if (job) {
@@ -585,6 +607,25 @@ interface BenchmarkReport {
   namespace_removed: boolean;
   run_fic_removed: boolean;
   workload_pools_at_zero: boolean;
+  node_resources?: NodeResourceObservation;
+  scaled_profile?: {
+    client_count: number;
+    collector_shape: CollectorShape;
+    collector_pool: string;
+    hardware: typeof collectorShapes[CollectorShape];
+    workload: ReturnType<typeof effectiveWorkloadConfig>;
+    rendered_manifest_sha256: string;
+    runner_sources_sha256: string;
+    candidate_source_commit: string;
+    image_binding: CandidateImageManifest;
+    trusted_build_provenance_verified: boolean;
+    trusted_signer_key_sha256: string;
+    original_client_pool: ScaledPoolSettings;
+    placement: ScaledRuntimeObservation;
+    client_results: JsonObject[];
+    collector_pool_removed: boolean;
+    client_pool_restored: boolean;
+  };
 }
 
 async function ensureFreshRunDirectory(runDir: string): Promise<void> {
@@ -597,7 +638,7 @@ async function ensureFreshRunDirectory(runDir: string): Promise<void> {
   }
 }
 
-async function executeCheck(options: { envFile: string; stampConfigPath: string }): Promise<void> {
+async function executeCheck(options: { envFile: string; stampConfigPath: string; scaled?: ScaledOptions; outputPath?: string }): Promise<void> {
   const fileEnv = load_env(options.envFile);
   const missing = ['AZURE_SUBSCRIPTION_ID', 'AZURE_UAMI_CLIENT_ID'].filter(key => !fileEnv[key]?.trim());
   if (missing.length) throw new Error('Private .env is missing required keys: ' + missing.join(', ') + '.');
@@ -611,19 +652,29 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string 
   const runHex = runId.replaceAll('-', '');
   const deltaRoot = 'abfss://' + config.data + '@' + config.account + '.dfs.core.windows.net/direct-baseline-1/runs/' + runId + '/dataflow';
   const source = await readFile(manifestPath, 'utf8');
-  const rendered = renderManifest(source, {
+  let rendered = renderManifest(source, {
     BENCHRUNUUID: runId, BENCHRUNHEX: runHex, BENCHOWNER: owner, BENCHCLIENTID: config.identity_client_id,
     BENCHREGISTRY: config.registryLoginServer, BENCHDELTA_ROOT: deltaRoot, BENCHSTAMP: config.stamp,
     BENCHSUBSCRIPTION: config.subscription, BENCHRESOURCEGROUP: config.group,
     BENCHSTORAGEACCOUNT: config.account, BENCHCHECKPOINTS: config.checkpoints, BENCHDURATIONSECS: '600',
   });
-  assertRenderedManifest(rendered, runId, owner, config.registryLoginServer);
+  const scaledRender = options.scaled ? await scaledInputs(rendered, runId, config.registryLoginServer, options.scaled) : undefined;
+  if (scaledRender) rendered = scaledRender.manifest;
+  assertRenderedManifest(rendered, runId, owner, config.registryLoginServer, options.scaled?.clientCount ?? 1);
+  if (options.outputPath) {
+    await writeFile(options.outputPath, rendered, { flag: 'wx', mode: 0o600 });
+    if (scaledRender && !options.scaled?.imageManifestPath) {
+      await writeFile(options.outputPath + '.images.json', JSON.stringify(scaledRender.binding, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    }
+    console.log('PASS offline render; image binding is structural only, NOT trusted build provenance; output ' + options.outputPath);
+    return;
+  }
   const directory = await mkdtemp(join(tmpdir(), 'arrowcol-aks-check-'));
   await chmod(directory, 0o700);
   try {
     const fakeNamespace = namespacePrefix + runHex;
     const namespaced = rendered.replaceAll('namespace: ' + fakeNamespace, 'namespace: default');
-    const dryRunManifest = replaceInitializerExpiry(namespaced, Date.now() + 45 * 60_000);
+    const dryRunManifest = replaceInitializerExpiry(namespaced, now() + 45 * 60_000);
     const manifestFile = join(directory, 'rendered.yaml');
     await writeFile(manifestFile, dryRunManifest, { flag: 'wx', mode: 0o600 });
     let mode: 'server' | 'client' = 'server';
@@ -639,7 +690,7 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string 
     if (mode === 'server') args.push('--context', config.cluster);
     args.push('apply', '--dry-run=' + mode, '--validate=false', '-f', manifestFile);
     let result: Awaited<ReturnType<typeof run_tree>>;
-    try { result = await run_tree(args, 90, ROOT); }
+    try { result = await invokeTree(args, 90, ROOT); }
     catch { throw new Error('kubectl apply --dry-run=' + mode + ' could not complete; no resources were applied.'); }
     if (result.returncode !== 0) throw new Error('kubectl apply --dry-run=' + mode + ' failed (exit ' + result.returncode + '); no resources were applied.');
     console.log('PASS private config and rendered manifest invariants; kubectl apply --dry-run=' + mode + '.');
@@ -648,7 +699,284 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string 
   }
 }
 
-async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string; mode: 'full' | 'smoke' }): Promise<BenchmarkReport> {
+interface ScaledOptions {
+  clientCount: number;
+  collectorShape: CollectorShape;
+  candidateCommit: string;
+  imageManifestPath?: string;
+  provenanceKey?: string;
+}
+
+interface ScaledInputs {
+  manifest: string;
+  poolName: string;
+  binding: CandidateImageManifest;
+}
+
+async function scaledInputs(base: string, runId: string, registry: string, options: ScaledOptions): Promise<ScaledInputs> {
+  const clients = renderScaledProfileManifest(base, runId, options.clientCount);
+  const collector = renderScaledCollector(clients, runId, options.collectorShape);
+  const references = new Set(parseAllDocuments(collector.manifest).flatMap(document => {
+    const resource = document.toJSON();
+    if (!isRecord(resource) || !isRecord(resource.spec) || !isRecord(resource.spec.template) || !isRecord(resource.spec.template.spec) ||
+        !Array.isArray(resource.spec.template.spec.containers)) return [];
+    return resource.spec.template.spec.containers.map(container => {
+      const image = requireRecord(container, 'Binding image container').image;
+      if (typeof image !== 'string' || !image.startsWith(registry + '/')) throw new Error('Binding image is outside candidate registry.');
+      return image.slice(registry.length + 1);
+    });
+  }));
+  const binding = options.imageManifestPath
+    ? parseJson(await readFile(options.imageManifestPath, 'utf8'), 'Candidate image manifest') as CandidateImageManifest
+    : { schemaVersion: 1 as const, sourceCommit: options.candidateCommit, workloadConfigSha256: effectiveWorkloadConfig(collector.manifest).sha256,
+      images: Object.fromEntries([...references].map(reference => [reference, 'sha256:' + '0'.repeat(64)])) };
+  if (!isRecord(binding) || !isRecord(binding.images) || typeof binding.sourceCommit !== 'string') {
+    throw new Error('Candidate image binding is invalid; it is not trusted build provenance.');
+  }
+  return { ...collector, binding, manifest: applyCandidateImageManifest(collector.manifest, registry, options.candidateCommit, binding) };
+}
+
+async function verifyCandidateBuilds(registry: string, options: ScaledOptions, inputs: ScaledInputs): Promise<string> {
+  if (!options.provenanceKey) throw new Error('Scaled run requires --provenance-key from a trusted build signer; self-declared sourceCommit is not proof.');
+  const keySha = createHash('sha256').update(await readFile(options.provenanceKey)).digest('hex');
+  for (const [reference, digest] of Object.entries(inputs.binding.images)) {
+    const image = registry + '/' + reference.split('@')[0] + '@' + digest;
+    const output = await command(['cosign', 'verify-attestation', '--key', options.provenanceKey, '--type', 'slsaprovenance',
+      '--output', 'json', image], 'Verify trusted candidate image attestation', 180);
+    let values: unknown[];
+    try {
+      const value = parseJson(output, 'Verified cosign output');
+      values = Array.isArray(value) ? value : [value];
+    } catch {
+      values = output.split(/\r?\n/).filter(Boolean).map(line => parseJson(line, 'Verified cosign envelope'));
+    }
+    const envelopes = values.flatMap(value => Array.isArray(value) ? value : [value]);
+    let matches = 0;
+    for (const envelope of envelopes) {
+      if (!isRecord(envelope) || typeof envelope.payload !== 'string') throw new Error('Verified cosign output is missing its signed payload.');
+      assertTrustedImageStatement(parseJson(Buffer.from(envelope.payload, 'base64').toString('utf8'), 'Signed build statement'), digest, options.candidateCommit);
+      matches++;
+    }
+    if (!matches) throw new Error('No trusted build attestation was returned for a candidate image.');
+  }
+  return keySha;
+}
+
+function poolSettings(raw: JsonObject): ScaledPoolSettings {
+  if (typeof raw.enableAutoScaling !== 'boolean') throw new Error('Pool autoscaler state is unknown.');
+  return { enableAutoScaling: raw.enableAutoScaling, minCount: argNumber(raw.minCount, 'Pool min count'),
+    maxCount: argNumber(raw.maxCount, 'Pool max count'), count: argNumber(raw.count, 'Pool count') };
+}
+
+function poolCommand(config: Config, pool: string): string[] {
+  return ['az', 'aks', 'nodepool', '--subscription', config.subscription, '--resource-group', config.group,
+    '--cluster-name', config.cluster, '--name', pool];
+}
+
+async function readCollectorPool(config: Config, pool: string): Promise<JsonObject | undefined> {
+  const output = await command(['az', 'aks', 'nodepool', 'list', '--subscription', config.subscription,
+    '--resource-group', config.group, '--cluster-name', config.cluster, '--output', 'json', '--only-show-errors'],
+  'Read run-owned collector pool inventory');
+  const pools = parseJson(output, 'Collector pool inventory');
+  if (!Array.isArray(pools)) throw new Error('Collector pool inventory is invalid.');
+  const matches = pools.filter(poolValue => isRecord(poolValue) && poolValue.name === pool);
+  if (matches.length > 1) throw new Error('Duplicate run-owned collector pool.');
+  return matches[0] === undefined ? undefined : requireRecord(matches[0], 'Collector pool');
+}
+
+async function assertScaledCapacity(config: Config, options: ScaledOptions): Promise<string> {
+  const skuOutput = await command(['az', 'vm', 'list-skus', '--subscription', config.subscription, '--location', config.location,
+    '--resource-type', 'virtualMachines', '--all', '--query',
+    "[?name=='" + collectorShapes[options.collectorShape].vmSize + "' || name=='Standard_D64ds_v6'].{name:name,family:family,capabilities:capabilities,restrictions:restrictions}",
+    '--output', 'json', '--only-show-errors'], 'Read scaled SKU feasibility', 180);
+  const usageOutput = await command(['az', 'vm', 'list-usage', '--subscription', config.subscription,
+    '--location', config.location, '--output', 'json', '--only-show-errors'], 'Read scaled vCPU quota');
+  const skus = parseJson(skuOutput, 'SKU feasibility');
+  const usage = parseJson(usageOutput, 'vCPU quota');
+  if (!Array.isArray(skus) || !Array.isArray(usage)) throw new Error('Scaled capacity inventory is invalid.');
+  for (const [skuName, cores, memory] of [
+    [collectorShapes[options.collectorShape].vmSize, collectorShapes[options.collectorShape].vcpus, collectorShapes[options.collectorShape].memoryGiB],
+    ['Standard_D64ds_v6', 64 * options.clientCount, 24],
+  ] as const) {
+    const sku = skus.find(value => isRecord(value) && value.name === skuName);
+    if (!isRecord(sku) || !Array.isArray(sku.restrictions) || sku.restrictions.length !== 0 ||
+        !Array.isArray(sku.capabilities) || typeof sku.family !== 'string') throw new Error('Selected scaled SKU is restricted or unknown: ' + skuName);
+    const memoryCapability = sku.capabilities.find(value => isRecord(value) && value.name === 'MemoryGB');
+    const cpuCapability = sku.capabilities.find(value => isRecord(value) && value.name === 'vCPUs');
+    const cpuRequired = skuName === 'Standard_D64ds_v6' ? 64 : collectorShapes[options.collectorShape].vcpus;
+    if (!isRecord(memoryCapability) || !Number.isFinite(Number(memoryCapability.value)) || Number(memoryCapability.value) <= memory ||
+        !isRecord(cpuCapability) || Number(cpuCapability.value) !== cpuRequired) throw new Error('Selected scaled SKU has insufficient or unknown resources.');
+    const quota = usage.find(value => isRecord(value) && isRecord(value.name) && value.name.value === sku.family);
+    if (!isRecord(quota) || !Number.isFinite(Number(quota.limit)) || !Number.isFinite(Number(quota.currentValue)) ||
+        Number(quota.limit) - Number(quota.currentValue) < cores) throw new Error('Insufficient scaled SKU family quota: ' + skuName);
+  }
+  const total = usage.find(value => isRecord(value) && isRecord(value.name) && value.name.value === 'cores');
+  if (!isRecord(total) || !Number.isFinite(Number(total.limit)) || !Number.isFinite(Number(total.currentValue)) ||
+      Number(total.limit) - Number(total.currentValue) < collectorShapes[options.collectorShape].vcpus + 64 * options.clientCount) {
+    throw new Error('Insufficient regional scaled vCPU quota.');
+  }
+  const cluster = requireRecord(parseJson(await command(['az', 'aks', 'show', '--subscription', config.subscription,
+    '--resource-group', config.group, '--name', config.cluster, '--output', 'json', '--only-show-errors'], 'Read selected cluster network'), 'Cluster'), 'Cluster');
+  const pools = Array.isArray(cluster.agentPoolProfiles) ? cluster.agentPoolProfiles : [];
+  const subnets = [...new Set(pools.flatMap(pool => isRecord(pool) && typeof pool.vnetSubnetId === 'string' ? [pool.vnetSubnetId] : []))];
+  if (subnets.length !== 1) throw new Error('Scaled collector requires one proven AKS node subnet.');
+  return subnets[0]!;
+}
+
+function assertCollectorOwnership(pool: JsonObject, runId: string, owner: string, shape: CollectorShape): void {
+  const tags = requireRecord(pool.tags, 'Collector pool ownership tags');
+  if (tags['arrowcol-oat-run-id'] !== runId || tags['arrowcol-oat-owner-token'] !== owner ||
+      pool.vmSize !== collectorShapes[shape].vmSize) throw new Error('Collector pool ownership or selected shape changed; refusing mutation.');
+}
+
+async function assertNoQueuedForeignClients(config: Config): Promise<void> {
+  const list = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '--all-namespaces', '-o', 'json'],
+    'Read pending workloads before changing the shared client pool'), 'Pending pods'), 'Pending pods');
+  if (!Array.isArray(list.items)) throw new Error('Pending pod inventory is invalid.');
+  const blockers: string[] = [];
+  for (const raw of list.items) {
+    const pod = requireRecord(raw, 'Pending pod');
+    const spec = requireRecord(pod.spec ?? {}, 'Pending pod spec');
+    const status = requireRecord(pod.status ?? {}, 'Pending pod status');
+    if (status.phase !== 'Pending' || spec.nodeName) continue;
+    const metadata = requireRecord(pod.metadata, 'Pending pod metadata');
+    const owners = Array.isArray(metadata.ownerReferences) ? metadata.ownerReferences : [];
+    if (owners.some(owner => isRecord(owner) && owner.kind === 'DaemonSet')) continue;
+    const selector = isRecord(spec.nodeSelector) ? spec.nodeSelector : {};
+    const pool = selector['kubernetes.azure.com/agentpool'];
+    const tolerations = Array.isArray(spec.tolerations) ? spec.tolerations : [];
+    const couldTolerateClient = tolerations.some(value => isRecord(value) &&
+      (value.key === '' || value.key === undefined || value.key === 'arrow-collector/role') &&
+      (value.operator === 'Exists' || value.value === 'client'));
+    if (pool === 'benchd64' || selector['arrow-collector/role'] === 'client' || (pool === undefined && couldTolerateClient)) {
+      blockers.push(String(metadata.namespace) + '/' + String(metadata.name) + ' (Pending)');
+    }
+  }
+  if (blockers.length) throw new Error('Unrelated pending client workloads prevent pool expansion: ' + blockers.join(', '));
+}
+
+async function captureScaledPods(config: Config, namespace: string, runId: string, jobs: string[], manifest: string, finished = false): Promise<ScaledRuntimeObservation> {
+  const list = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace, '-o', 'json'], 'Capture scaled pod placement'), 'Pod inventory'), 'Pod inventory');
+  if (!Array.isArray(list.items)) throw new Error('Scaled pod inventory is invalid.');
+  const measuredPods = list.items;
+  const profiledClients = measuredPods.filter(value => isRecord(value) && isRecord(value.metadata) &&
+    isRecord(value.metadata.labels) && value.metadata.labels['arrowcol-oat/client-profile'] === 'scaled');
+  if (profiledClients.length !== jobs.length || profiledClients.some(value => !isRecord(value) || !isRecord(value.metadata) ||
+      !isRecord(value.metadata.labels) || !jobs.includes(String(value.metadata.labels['job-name'])))) {
+    throw new Error('Scaled runtime contains missing, duplicate or unexpected client pods.');
+  }
+  const podEvidence = (pod: unknown, containerName: string) => {
+    const value = requireRecord(pod, 'Measured pod');
+    const metadata = requireRecord(value.metadata, 'Measured pod metadata');
+    const spec = requireRecord(value.spec, 'Measured pod spec');
+    const status = requireRecord(value.status, 'Measured pod status');
+    const labels = requireRecord(metadata.labels, 'Measured pod labels');
+    if (labels[runLabel] !== runId || typeof metadata.name !== 'string' || typeof metadata.uid !== 'string' ||
+        typeof spec.nodeName !== 'string' || !Array.isArray(status.containerStatuses)) throw new Error('Measured pod ownership/identity is missing.');
+    const container = status.containerStatuses.find(value => isRecord(value) && value.name === containerName);
+    const expectedPhase = containerName === 'generator' && finished ? 'Succeeded' : 'Running';
+    if (!isRecord(container) || typeof container.imageID !== 'string' || container.restartCount !== 0 ||
+        status.phase !== expectedPhase || (!finished && container.ready !== true)) throw new Error('Measured pod image, phase, readiness or restart state is invalid.');
+    return { podName: metadata.name, podUid: metadata.uid, nodeName: spec.nodeName, imageId: container.imageID };
+  };
+  const collectors = measuredPods.filter(value => isRecord(value) && isRecord(value.metadata) && isRecord(value.metadata.labels) && value.metadata.labels.app === 'arrowcol');
+  if (collectors.length !== 1) throw new Error('Exactly one measured collector is required.');
+  const collector = podEvidence(collectors[0], 'dataflow');
+  const clients = jobs.map(jobName => {
+    const pods = measuredPods.filter(value => isRecord(value) && isRecord(value.metadata) && isRecord(value.metadata.labels) &&
+      value.metadata.labels['job-name'] === jobName);
+    if (pods.length !== 1) throw new Error('Missing or duplicated measured client pod for ' + jobName);
+    return { jobName, ...podEvidence(pods[0], 'generator') };
+  });
+  const observation: ScaledRuntimeObservation = { collectorPodUid: collector.podUid, collectorNodeName: collector.nodeName,
+    collectorImageId: collector.imageId, clients, nodeEvidence: [] };
+  const documents = parseAllDocuments(manifest);
+  const load = documents.find(document => document.getIn(['metadata', 'name']) === jobs[0]);
+  const writer = documents.find(document => document.getIn(['metadata', 'name']) === 'arrowcol');
+  const clientImage = load?.getIn(['spec', 'template', 'spec', 'containers', 0, 'image']);
+  const collectorImage = writer?.getIn(['spec', 'template', 'spec', 'containers', 0, 'image']);
+  if (typeof clientImage !== 'string' || typeof collectorImage !== 'string') throw new Error('Rendered candidate images are absent.');
+  assertScaledRuntimeObservation(jobs, observation, clientImage.split('@')[1]!, collectorImage.split('@')[1]!);
+  const memoryBytes = (value: unknown): number => {
+    if (typeof value !== 'string') throw new Error('Node memory quantity is unknown.');
+    const match = /^(\d+)(Ki|Mi|Gi)?$/.exec(value);
+    if (!match) throw new Error('Node memory quantity is unsupported.');
+    return Number(match[1]) * ({ Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3 }[match[2] ?? ''] ?? 1);
+  };
+  for (const evidence of [collector, ...clients]) {
+    const node = requireRecord(parseJson(await kubectl(config, ['get', 'node', evidence.nodeName, '-o', 'json'], 'Verify measured node resources'), 'Measured node'), 'Measured node');
+    const allocatable = requireRecord(requireRecord(node.status, 'Node status').allocatable, 'Node allocatable resources');
+    const nodeLabels = requireRecord(requireRecord(node.metadata, 'Node metadata').labels, 'Node labels');
+    const isCollector = evidence.podUid === collector.podUid;
+    const jobName = clients.find(client => client.podUid === evidence.podUid)?.jobName;
+    const expected = isCollector ? writer : documents.find(document => document.getIn(['metadata', 'name']) === jobName);
+    const livePod = measuredPods.find(value => isRecord(value) && isRecord(value.metadata) && value.metadata.uid === evidence.podUid);
+    const liveContainers = requireRecord(requireRecord(livePod, 'Measured pod').spec, 'Measured pod spec').containers;
+    const desiredPod = requireRecord(requireRecord(requireRecord(requireRecord(expected?.toJSON(), 'Desired resource').spec, 'Desired spec').template, 'Desired template').spec, 'Desired pod');
+    if (!Array.isArray(desiredPod.containers)) throw new Error('Desired measured containers are unknown.');
+    const desired = requireRecord(desiredPod.containers[0], 'Desired measured container');
+    if (!Array.isArray(liveContainers)) throw new Error('Measured pod containers are unknown.');
+    const actual = requireRecord(liveContainers[0], 'Actual measured container');
+    if (actual.image !== desired.image || !isDeepStrictEqual(actual.args, desired.args) ||
+        (!isCollector && (!isDeepStrictEqual(actual.env, desired.env) || actual.envFrom !== undefined)) ||
+        !isDeepStrictEqual(actual.resources, desired.resources)) {
+      throw new Error('Actual measured pod image, arguments or resources differ from rendered candidate configuration.');
+    }
+    const cpu = String(allocatable.cpu);
+    const cpuCores = cpu.endsWith('m') ? Number(cpu.slice(0, -1)) / 1000 : Number(cpu);
+    const requested = Number(expected?.getIn(['spec', 'template', 'spec', 'containers', 0, 'resources', 'limits', 'cpu']));
+    const expectedPool = expected?.getIn(['spec', 'template', 'spec', 'nodeSelector', 'kubernetes.azure.com/agentpool']);
+    const memoryRequired = expected?.getIn(['spec', 'template', 'spec', 'containers', 0, 'resources', 'limits', 'memory']);
+    const vmSize = nodeLabels['node.kubernetes.io/instance-type'];
+    const expectedVm = isCollector ? (requested === collectorShapes.e192.runtimeCores ? collectorShapes.e192.vmSize : collectorShapes.e64.vmSize) : 'Standard_D64ds_v6';
+    if (!Number.isFinite(cpuCores) || !Number.isFinite(requested) || cpuCores < requested ||
+        memoryBytes(allocatable.memory) < memoryBytes(memoryRequired) ||
+        nodeLabels['kubernetes.azure.com/agentpool'] !== expectedPool || vmSize !== expectedVm) {
+      throw new Error('Measured node placement or allocatable CPU does not match selected shape.');
+    }
+    observation.nodeEvidence!.push({ nodeName: evidence.nodeName, vmSize: expectedVm,
+      allocatableCpuCores: cpuCores, allocatableMemoryBytes: memoryBytes(allocatable.memory) });
+  }
+  const desiredDataflow = documents.find(document => document.getIn(['metadata', 'name']) === 'arrowcol-config')?.getIn(['data', 'dataflow.yaml']);
+  const actualConfig = await getObject(config, 'configmap', namespace, 'arrowcol-config');
+  if (!actualConfig || requireRecord(actualConfig.data, 'Actual dataflow config')['dataflow.yaml'] !== desiredDataflow) {
+    throw new Error('Actual collector dataflow configuration differs from the rendered candidate.');
+  }
+  return observation;
+}
+
+async function waitScaledClients(config: Config, namespace: string, writer: WriterIdentity, jobs: string[], ready: boolean): Promise<void> {
+  await waitUntil(ready ? 'all scaled client readiness' : 'all scaled client completion', ready ? 7 * 60_000 : 22 * 60_000, async () => {
+    await assertWriterStable(config, namespace, writer);
+    let complete = true;
+    for (const name of jobs) {
+      const job = await getObject(config, 'job', namespace, name);
+      if (!job) { complete = false; continue; }
+      const status = requireRecord(job.status ?? {}, 'Scaled Job status');
+      if (Number(status.failed ?? 0) > 0 || (Array.isArray(status.conditions) &&
+          status.conditions.some(value => isRecord(value) && value.type === 'Failed' && value.status === 'True'))) {
+        throw new Error('Scaled client ' + name + ' failed.');
+      }
+      if (ready) {
+        const list = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace, '-l', 'job-name=' + name,
+          '-o', 'json'], 'Read scaled client startup state'), 'Scaled client pods'), 'Scaled client pods');
+        if (!Array.isArray(list.items) || list.items.length > 1) throw new Error('Scaled client pod inventory is invalid or duplicated.');
+        if (list.items.length === 0) { complete = false; continue; }
+        const pod = requireRecord(list.items[0], 'Scaled client pod');
+        const podStatus = requireRecord(pod.status ?? {}, 'Scaled client pod status');
+        if (podStatus.phase === 'Failed' || podStatus.phase === 'Succeeded') throw new Error('Scaled client ' + name + ' terminated before synchronized readiness.');
+        const containers = Array.isArray(podStatus.containerStatuses) ? podStatus.containerStatuses : [];
+        const generator = containers.find(value => isRecord(value) && value.name === 'generator');
+        if (podStatus.phase !== 'Running' || !isRecord(generator) || generator.ready !== true) { complete = false; continue; }
+        const logs = await kubectl(config, ['logs', 'job/' + name, '-n', namespace, '--all-containers=true'], 'Read scaled client readiness');
+        if (!logs.includes('OAT_CLIENT_READY')) complete = false;
+      } else if (status.succeeded !== 1) complete = false;
+    }
+    return complete ? true : undefined;
+  });
+}
+
+async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string; mode: 'full' | 'smoke'; scaled?: ScaledOptions }): Promise<BenchmarkReport> {
   const runId = (options.runId ?? randomUUID()).toLowerCase();
   const measurementSeconds = options.mode === 'smoke' ? 60 : 600;
   if (!uuidPattern.test(runId)) throw new Error('--run-id must be a UUID. Generate a new UUID for every run.');
@@ -666,11 +994,11 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   const config = new Config(env, stamp);
   if (!config.identity_client_id) throw new Error('The approved stamp workload identity client ID is missing from private configuration.');
   const { generation, relativePath } = await runStage('prepare run inputs', 10 * 60_000, async () => ({
-    generation: await capturedGeneration(config, stageAwareRunTree),
+    generation: await (executionScope.getStore()?.generation ?? capturedGeneration)(config, stageAwareRunTree),
     relativePath: await checkDeltaRoot(config, runId),
   }));
   const deltaRoot = `abfss://${config.data}@${config.account}.dfs.core.windows.net/${relativePath}`;
-  const rendered = renderManifest(source, {
+  let rendered = renderManifest(source, {
     BENCHRUNUUID: runId,
     BENCHRUNHEX: runHex,
     BENCHOWNER: owner,
@@ -684,10 +1012,21 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     BENCHCHECKPOINTS: config.checkpoints,
     BENCHDURATIONSECS: String(measurementSeconds),
   });
-  assertRenderedManifest(rendered, runId, owner, config.registryLoginServer);
+  const scaled = options.scaled ? await scaledInputs(rendered, runId, config.registryLoginServer, options.scaled) : undefined;
+  if (scaled) rendered = scaled.manifest;
+  assertRenderedManifest(rendered, runId, owner, config.registryLoginServer, options.scaled?.clientCount ?? 1);
   const manifestSha = createHash('sha256').update(source).digest('hex');
   const sourcePath = fileURLToPath(import.meta.url);
   const runbookSha = createHash('sha256').update(await readFile(sourcePath)).digest('hex');
+  let scaledSourcesSha = '';
+  if (scaled) {
+    const hash = createHash('sha256');
+    for (const path of ['projects/arrowcol-oat/aks-direct-benchmark.ts', 'projects/arrowcol-oat/aks-scaled-profile.ts',
+      'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep']) {
+      hash.update(path + '\0').update(await readFile(resolve(ROOT, path))).update('\0');
+    }
+    scaledSourcesSha = hash.digest('hex');
+  }
   const parent = dirname(runDir);
   await mkdir(parent, { recursive: true, mode: 0o700 });
   await mkdir(runDir, { mode: 0o700 });
@@ -716,20 +1055,68 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   let measurementStart = 0;
   let measurementEnd = 0;
   let metrics: Awaited<ReturnType<typeof readDeltaAddWindow>> | undefined;
+  let clientPoolPlan: ScaledPoolPlan | undefined;
+  let clientChangeRequested = false;
+  let collectorRequested = false;
+  let collectorRemoved = false;
+  let clientRestored = false;
+  let nodeSubnet = '';
+  let signerKeySha = '';
+  let placement: ScaledRuntimeObservation | undefined;
+  let observer: NodeObservationHandle | undefined;
+  let nodeResources: NodeResourceObservation | undefined;
+  const clientResults: JsonObject[] = [];
+  const clientJobs = options.scaled ? scaledClientJobs(runId, options.scaled.clientCount).map(job => job.name) : [];
   console.log('Run ' + runId + ': namespace ' + namespace + '; report ' + reportPath);
   try {
-    await runStage('AKS preflight', 5 * 60_000, async () => {
+    await runStage('AKS preflight', (options.scaled ? 20 : 5) * 60_000, async () => {
       const activeSubscription = await command(['az', 'account', 'show', '--subscription', config.subscription, '--query', 'id', '--output', 'tsv', '--only-show-errors'],
         'Verify Azure login for the approved subscription');
       if (activeSubscription.toLowerCase() !== config.subscription.toLowerCase()) throw new Error('Azure login is not scoped to the approved stamp subscription.');
       await configureKubeAuth(config);
       kubeAuthReady = true;
-      await requirePoolsAtZero(config);
+      if (options.scaled && scaled) {
+        signerKeySha = await verifyCandidateBuilds(config.registryLoginServer, options.scaled, scaled);
+        const clientPool = await readPool(config, 'benchd64', true);
+        if (clientPool.vmSize !== 'Standard_D64ds_v6') throw new Error('Scaled clients require the actual D64ds_v6 pool; refusing a hardware substitution.');
+        clientPoolPlan = planScaledClientPool(poolSettings(clientPool), await poolNodeCount(config, 'benchd64'), options.scaled.clientCount);
+        nodeSubnet = await assertScaledCapacity(config, options.scaled);
+        await assertNoQueuedForeignClients(config);
+        if (await readCollectorPool(config, scaled.poolName)) throw new Error('Run-owned collector pool name already exists; refusing reuse.');
+      } else await requirePoolsAtZero(config);
     });
     namespaceUid = await runStage('identity', 5 * 60_000, async () => {
       await applyStage(config, namespace, renderedPath, 'identity');
       return prepareNamespace(config, namespace, runId, owner);
     });
+    if (options.scaled && scaled && clientPoolPlan) {
+      await runStage('scaled run-owned capacity', 30 * 60_000, async () => {
+        const current = poolSettings(await readPool(config, 'benchd64'));
+        if (JSON.stringify(current) !== JSON.stringify(clientPoolPlan!.original) || await poolNodeCount(config, 'benchd64') !== 0) {
+          throw new Error('Client pool changed since preflight; refusing expansion.');
+        }
+        await assertNoQueuedForeignClients(config);
+        clientChangeRequested = true;
+        await command([...poolCommand(config, 'benchd64').slice(0, 3), 'update', ...poolCommand(config, 'benchd64').slice(3),
+          '--enable-cluster-autoscaler', '--min-count', '0', '--max-count', String(options.scaled!.clientCount),
+          '--output', 'none', '--only-show-errors'], 'Expand bounded client pool', 600);
+        collectorRequested = true;
+        if (await readCollectorPool(config, scaled.poolName)) throw new Error('Collector pool name became occupied; refusing to overwrite it.');
+        const parameters = join(runDir, 'collector-parameters.json');
+        await writePrivateFile(parameters, JSON.stringify({
+          clusterName: { value: config.cluster }, nodeSubnetId: { value: nodeSubnet }, poolName: { value: scaled.poolName },
+          vmSize: { value: collectorShapes[options.scaled!.collectorShape].vmSize }, runId: { value: runId }, ownerToken: { value: owner },
+        }));
+        try {
+          await command(['az', 'deployment', 'group', 'create', '--subscription', config.subscription, '--resource-group', config.group,
+            '--name', scaled.poolName, '--mode', 'Incremental', '--template-file', resolve(ROOT, 'infra/azure/scaled-collector.bicep'),
+            '--parameters', '@' + parameters, '--output', 'none', '--only-show-errors'], 'Create run-owned collector pool', 1500);
+        } finally { await rm(parameters, { force: true }); }
+        const collector = await readCollectorPool(config, scaled.poolName);
+        if (!collector) throw new Error('Run-owned collector pool was not created.');
+        assertCollectorOwnership(collector, runId, owner, options.scaled!.collectorShape);
+      });
+    }
     await runStage('run FIC', 25 * 60_000, async () => {
       await runFic('prepare-run-fic', runId, namespace, recordPath, options.envFile, options.stampConfigPath);
       await runFic('probe-run-fic', runId, namespace, recordPath, options.envFile, options.stampConfigPath);
@@ -753,7 +1140,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     });
     await runStage('initializer', 6 * 60_000, async () => {
       if (!writer) throw new Error('Writer readiness was not established.');
-      await writePrivateFile(renderedPath, replaceInitializerExpiry(rendered, Date.now() + 45 * 60_000));
+      await writePrivateFile(renderedPath, replaceInitializerExpiry(rendered, now() + 45 * 60_000));
       await applyStage(config, namespace, renderedPath, 'initializer');
       await waitJob(config, namespace, 'direct-pin-live', 180_000, dirname(reportPath));
       await assertWriterStable(config, namespace, writer);
@@ -768,18 +1155,66 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     await runStage('load and Delta reconciliation', 30 * 60_000, async () => {
       if (!writer || !namespaceUid) throw new Error('Writer or owned namespace readiness was not established.');
       await applyStage(config, namespace, renderedPath, 'load');
-      await waitForReadyLoad(config, namespace, writer);
-      const scheduleStart = Date.now() + 130_000;
-      if (scheduleStart - Date.now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
-      await kubectl(config, ['patch', 'configmap', 'direct-schedule-confirmwide', '-n', namespace, '--type', 'merge',
-        '-p', JSON.stringify({ data: { start: String(scheduleStart) } })], 'Schedule benchmark load');
+      if (scaled) {
+        await waitScaledClients(config, namespace, writer, clientJobs, true);
+        placement = await captureScaledPods(config, namespace, runId, clientJobs, rendered);
+      } else await waitForReadyLoad(config, namespace, writer);
+      const scheduleStart = now() + 130_000;
+      if (scheduleStart - now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
       measurementStart = scheduleStart + 60_000;
       measurementEnd = measurementStart + measurementSeconds * 1000;
-      await waitForLoad(config, namespace, writer, 22 * 60_000);
+      if (placement) {
+        const collectorPod = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace,
+          '-l', 'app=arrowcol', '-o', 'json'], 'Read collector observation target'), 'Collector inventory'), 'Collector inventory');
+        if (!Array.isArray(collectorPod.items) || collectorPod.items.length !== 1) throw new Error('Missing collector observation target.');
+        const collectorName = requireRecord(requireRecord(collectorPod.items[0], 'Collector').metadata, 'Collector metadata').name;
+        if (typeof collectorName !== 'string') throw new Error('Missing collector pod name.');
+        observer = (executionScope.getStore()?.startObservation ?? startNodeObservation)({
+          targets: [
+            { pod_uid: placement.collectorPodUid, pod_name: collectorName, node_name: placement.collectorNodeName, role: 'collector', container_name: 'dataflow' },
+            ...placement.clients.map(client => ({ pod_uid: client.podUid, pod_name: client.podName, node_name: client.nodeName, role: 'client' as const, container_name: 'generator' })),
+          ],
+          measurement_start_unix_ms: measurementStart, measurement_end_unix_ms: measurementEnd,
+          execute: async (target, sampleCommand) => {
+            const current = await getObject(config, 'pod', namespace, target.pod_name);
+            if (!current || requireRecord(current.metadata, 'Observed pod metadata').uid !== target.pod_uid) throw new Error('Observed pod UID changed.');
+            return kubectl(config, ['exec', '-n', namespace, target.pod_name, '-c', target.container_name, '--', 'sh', '-c', sampleCommand],
+              'Capture target pod resource sample', 30);
+          },
+        });
+      }
+      if (scheduleStart - now() < 125_000) throw new Error('Scaled observation setup exceeded the common schedule lead time.');
+      await kubectl(config, ['patch', 'configmap', 'direct-schedule-confirmwide', '-n', namespace, '--type', 'merge',
+        '-p', JSON.stringify({ data: { start: String(scheduleStart) } })], 'Schedule benchmark load');
+      if (scaled) {
+        await waitScaledClients(config, namespace, writer, clientJobs, false);
+        if (observer) { nodeResources = await observer.stop(); observer = undefined; }
+        if (now() < measurementEnd) throw new Error('Scaled clients completed before the full common measurement window ended.');
+        const finalPlacement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, true);
+        if (JSON.stringify(finalPlacement) !== JSON.stringify(placement)) throw new Error('Scaled client/collector pod UID, image or node changed during the window.');
+        for (const jobName of clientJobs) {
+          const logs = await kubectl(config, ['logs', 'job/' + jobName, '-n', namespace, '--all-containers=true'], 'Read scaled client window evidence');
+          await writePrivateFile(join(runDir, jobName + '.log'), logs);
+          const windows = [...logs.matchAll(/measurement_window_start_unix_ms=(\d+) measurement_window_end_unix_ms=(\d+)/g)];
+          const schedules = [...logs.matchAll(/OAT_CLIENT_SCHEDULE_RECEIVED client_id=(\S+) run_start_unix_ms=(\d+)/g)];
+          const rowCounts = [...logs.matchAll(/(?:^|\n)measured_rows=(\d+) measured_seconds=([\d.]+)/g)];
+          if (windows.length !== 1 || Number(windows[0]![1]) !== measurementStart || Number(windows[0]![2]) !== measurementEnd ||
+              schedules.length !== 1 || Number(schedules[0]![2]) !== scheduleStart || rowCounts.length !== 1 ||
+              Number(rowCounts[0]![2]) !== 600 || !Number.isSafeInteger(Number(rowCounts[0]![1]))) {
+            throw new Error('Scaled client ' + jobName + ' did not prove the common schedule and full measurement window.');
+          }
+          const client = scaledClientJobs(runId, options.scaled!.clientCount).find(job => job.name === jobName)!;
+          const clientId = client.clientId;
+          if (schedules[0]![1] !== clientId) throw new Error('Scaled client source identity does not match its run-owned Job.');
+          clientResults.push({ job_name: jobName, client_id: clientId, pod_ordinal: client.index, measurement_start_unix_ms: measurementStart,
+            measurement_end_unix_ms: measurementEnd, client_completed_rows: Number(rowCounts[0]![1]),
+            succeeded: true, restart_count: 0 });
+        }
+      } else await waitForLoad(config, namespace, writer, 22 * 60_000);
       await assertWriterStable(config, namespace, writer);
       await verifyNamespace(config, namespace, runId, owner, namespaceUid);
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
-      metrics = await readDeltaAddWindow(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
+      metrics = await (executionScope.getStore()?.readDelta ?? readDeltaAddWindow)(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
         async () => { await verifyNamespace(config, namespace, runId, owner, namespaceUid); });
       if (metrics.window_rows <= 0 || metrics.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
     });
@@ -787,6 +1222,10 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     primaryError = error;
   } finally {
     const rememberCleanupError = (error: unknown) => cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+    if (observer) {
+      try { nodeResources = await observer.stop(); observer = undefined; }
+      catch (error) { rememberCleanupError(error); }
+    }
     try {
       await runStage('cleanup owned namespace', 12 * 60_000, async () => {
         if (!kubeAuthReady) throw new Error('AKS API access was not established; namespace ownership cannot be verified.');
@@ -813,9 +1252,49 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     } else {
       rememberCleanupError(new Error('Run FIC cleanup skipped because namespace absence was not verified.'));
     }
-    if (kubeAuthReady) {
-      try { await waitPoolsAtZero(config); poolsAtZero = true; }
-      catch (error) { rememberCleanupError(error); }
+    if (kubeAuthReady && scaled && options.scaled) {
+      if (namespaceRemoved) {
+        if (collectorRequested) {
+          try {
+            await runStage('remove owned scaled collector', 35 * 60_000, async () => {
+              const collector = await readCollectorPool(config, scaled.poolName);
+              if (collector) {
+                assertCollectorOwnership(collector, runId, owner, options.scaled!.collectorShape);
+                await assertNoWorkloadPodsOnPool(config, scaled.poolName);
+                await command([...poolCommand(config, scaled.poolName).slice(0, 3), 'delete', ...poolCommand(config, scaled.poolName).slice(3),
+                  '--output', 'none', '--only-show-errors'], 'Delete only the run-owned collector pool', 1800);
+              }
+              if (await readCollectorPool(config, scaled.poolName)) throw new Error('Run-owned collector pool remains.');
+              collectorRemoved = true;
+            });
+          } catch (error) { rememberCleanupError(error); }
+        } else collectorRemoved = true;
+        if (clientChangeRequested && clientPoolPlan) {
+          try {
+            await runStage('restore original scaled client pool', 40 * 60_000, async () => {
+              const current = poolSettings(await readPool(config, 'benchd64'));
+              const original = clientPoolPlan!.original;
+              if (JSON.stringify(current) === JSON.stringify(original) && await poolNodeCount(config, 'benchd64') === 0) {
+                clientRestored = true;
+                return;
+              }
+              await scalePoolToZero(config, 'benchd64', clientPoolPlan!.active.maxCount);
+              await waitUntil('scaled client pool drain', 30 * 60_000, async () =>
+                (await readPool(config, 'benchd64')).count === 0 && await poolNodeCount(config, 'benchd64') === 0 ? true : undefined, 30_000);
+              const restore = planScaledClientPoolRestore(clientPoolPlan!, poolSettings(await readPool(config, 'benchd64')), await poolNodeCount(config, 'benchd64'));
+              await command([...poolCommand(config, 'benchd64').slice(0, 3), 'update', ...poolCommand(config, 'benchd64').slice(3),
+                '--enable-cluster-autoscaler', '--min-count', String(restore.minCount), '--max-count', String(restore.maxCount),
+                '--output', 'none', '--only-show-errors'], 'Restore original client pool settings', 600);
+              if (JSON.stringify(poolSettings(await readPool(config, 'benchd64'))) !== JSON.stringify(original) ||
+                  await poolNodeCount(config, 'benchd64') !== 0) throw new Error('Original client pool settings were not restored.');
+              clientRestored = true;
+            });
+          } catch (error) { rememberCleanupError(error); }
+        } else clientRestored = true;
+        poolsAtZero = collectorRemoved && clientRestored;
+      } else rememberCleanupError(new Error('Scaled pool cleanup refused until owned namespace absence is proven.'));
+    } else if (kubeAuthReady) {
+      try { await waitPoolsAtZero(config); poolsAtZero = true; } catch (error) { rememberCleanupError(error); }
     } else {
       rememberCleanupError(new Error('Workload pools could not be verified or restored without AKS API access.'));
     }
@@ -849,6 +1328,17 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     namespace_removed: namespaceRemoved,
     run_fic_removed: ficRemoved,
     workload_pools_at_zero: poolsAtZero,
+    ...(nodeResources ? { node_resources: nodeResources } : {}),
+    ...(options.scaled && scaled && placement && clientPoolPlan ? { scaled_profile: {
+      client_count: options.scaled.clientCount, collector_shape: options.scaled.collectorShape,
+      collector_pool: scaled.poolName, hardware: collectorShapes[options.scaled.collectorShape],
+      workload: effectiveWorkloadConfig(rendered), rendered_manifest_sha256: createHash('sha256').update(rendered).digest('hex'),
+      runner_sources_sha256: scaledSourcesSha,
+      candidate_source_commit: options.scaled.candidateCommit, image_binding: scaled.binding,
+      trusted_build_provenance_verified: !!signerKeySha, trusted_signer_key_sha256: signerKeySha,
+      original_client_pool: clientPoolPlan.original, placement, client_results: clientResults,
+      collector_pool_removed: collectorRemoved, client_pool_restored: clientRestored,
+    } } : {}),
   } : undefined;
   if (report) await writePrivateFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   if (primaryError || cleanupErrors.length || !report || !namespaceRemoved || !ficRemoved || !poolsAtZero) {
@@ -861,30 +1351,64 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   return report;
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<number> {
+export async function main(argv = process.argv.slice(2), dependencies: BenchmarkDependencies = {}): Promise<number> {
+  return executionScope.run(dependencies, () => executeMain(argv));
+}
+
+async function executeMain(argv: string[]): Promise<number> {
   try {
     const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
       'env-file': { type: 'string', default: resolve(ROOT, '.env') },
       'stamp-config': { type: 'string', default: resolve(ROOT, 'infra/azure/stamp.yaml') },
       'run-id': { type: 'string' },
       mode: { type: 'string', default: 'full' },
+      profile: { type: 'string', default: 'default' },
+      clients: { type: 'string' },
+      'collector-shape': { type: 'string' },
+      'candidate-commit': { type: 'string' },
+      'image-manifest': { type: 'string' },
+      'provenance-key': { type: 'string' },
+      output: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     } });
     if (values.help) {
       console.log('Usage: npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts check [--env-file PATH] [--stamp-config YAML]');
       console.log('       npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run [--mode full|smoke] [--env-file PATH] [--stamp-config YAML] [--run-id UUID]');
+      console.log('Scaled opt-in: --profile scaled --clients 1..8 --collector-shape e64|e192 --candidate-commit SHA --image-manifest JSON [--provenance-key TRUSTED_PUBLIC_KEY]');
+      console.log('Offline only: render --output PATH (exclusive create); scaled run requires trusted signed image attestations.');
       return 0;
     }
-    if (positionals.length !== 1) throw new Error('Choose check or run.');
+    if (positionals.length !== 1 || !['check', 'render', 'run'].includes(positionals[0]!)) throw new Error('Choose check, render or run.');
     const inputs = { envFile: resolve(values['env-file']!), stampConfigPath: resolve(values['stamp-config']!) };
-    if (positionals[0] === 'check') {
-      if (values.mode !== 'full' || values['run-id']) throw new Error('check does not accept --mode or --run-id.');
-      await executeCheck(inputs);
+    if (!['default', 'scaled'].includes(values.profile!)) throw new Error('--profile must be default or scaled.');
+    let scaled: ScaledOptions | undefined;
+    if (values.profile === 'scaled') {
+      const count = Number(values.clients ?? '1');
+      scaledClientJobs('00000000-0000-4000-8000-000000000001', count);
+      const shape = values['collector-shape'] ?? 'e64';
+      if (shape !== 'e64' && shape !== 'e192') throw new Error('--collector-shape must be e64 or e192.');
+      if (!values['candidate-commit'] || !/^[0-9a-f]{40}$/.test(values['candidate-commit']) ||
+          (positionals[0] !== 'render' && !values['image-manifest'])) {
+        throw new Error('Scaled profile requires --candidate-commit and --image-manifest (render can generate an image-binding template).');
+      }
+      scaled = { clientCount: count, collectorShape: shape, candidateCommit: values['candidate-commit'],
+        imageManifestPath: values['image-manifest'] ? resolve(values['image-manifest']) : undefined,
+        provenanceKey: values['provenance-key'] ? resolve(values['provenance-key']) : undefined };
+      if (values.mode !== 'full') throw new Error('Scaled holdout requires the common full 600-second window.');
+      if (positionals[0] === 'run' && !scaled.provenanceKey) throw new Error('Scaled run requires a trusted --provenance-key; image bindings alone are not build proof.');
+    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key']) {
+      throw new Error('Scaled options require explicit --profile scaled; default behavior is unchanged.');
+    }
+    if (positionals[0] === 'check' || positionals[0] === 'render') {
+      if (values.mode !== 'full' || values['run-id']) throw new Error('check/render does not accept --mode or --run-id.');
+      if (positionals[0] === 'render' && !values.output) throw new Error('Offline render requires --output PATH.');
+      if (positionals[0] === 'check' && values.output) throw new Error('--output is only accepted by render.');
+      await executeCheck({ ...inputs, scaled, outputPath: values.output ? resolve(values.output) : undefined });
       return 0;
     }
-    if (positionals[0] !== 'run') throw new Error('Choose check or run.');
+    if (values.output) throw new Error('--output is only accepted by render.');
     if (values.mode !== 'full' && values.mode !== 'smoke') throw new Error('--mode must be full or smoke.');
-    const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode });
+    const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode, scaled });
     console.log('PASS ' + report.committed_rows_per_second.toFixed(2) + ' committed rows/s; ' + report.committed_rows +
       ' rows in ' + report.measurement_seconds + ' seconds; Delta v' + report.first_delta_version + '-v' + report.last_delta_version +
       '; report ' + resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', report.run_id.replaceAll('-', ''), 'report.json'));
