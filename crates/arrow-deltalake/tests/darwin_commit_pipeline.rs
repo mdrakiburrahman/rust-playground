@@ -1,4 +1,13 @@
 #![cfg(all(feature = "delta", target_os = "linux"))]
+//! Local component profile: `cargo test --release -p arrow-deltalake --test
+//! darwin_commit_pipeline -- --ignored --nocapture`.
+//!
+//! The timed window covers twelve sequential real `BatchedTable` publications
+//! through durable Delta commit receipts; input construction, warmup, and
+//! independent snapshot/Parquet verification are outside it. This is not a DFE
+//! acknowledgment, exporter, or Azure network benchmark. Phase durations overlap:
+//! encode is included in stage wall time, and commit service is included in
+//! receipt wait. Local storage does not exercise upload, so upload is unavailable.
 
 use anyhow::{Context, Result, ensure};
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
@@ -287,10 +296,17 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         );
     }
     ensure!(expected_files.is_empty(), "receipt missing from committed Adds");
+    let upload_seconds = if upload_samples == 0 {
+        "unavailable".to_owned()
+    } else {
+        format!("{:.6}", upload.as_secs_f64())
+    };
     println!(
-        "backend=local_filesystem timed_groups={GROUPS} timed_durable_rows={} receipt_count={} wall_s={:.6} process_cpu_s={:.6} stage_wall_s={:.6} preparation_build_s={:.6} preparation_sort_s={:.6} encode_s={:.6} upload_samples={} upload_s={:.6} admission_s={:.6} receipt_wait_s={:.6} commit_samples={} commit_s={:.6} active_files={} active_rows={} active_bytes={} warmup_rows={} barrier=passed",
+        "backend=local_filesystem timed_groups={GROUPS} timed_durable_rows={} receipt_count={} durable_rows_per_s={:.3} receipts_per_s={:.3} wall_s={:.6} process_cpu_s={:.6} stage_wall_s={:.6} preparation_build_s={:.6} preparation_sort_s={:.6} encode_s={:.6} upload_samples={} upload_s={} admission_s={:.6} receipt_wait_s={:.6} commit_samples={} commit_s={:.6} active_files={} active_rows={} active_bytes={} warmup_rows={} barrier=passed",
         GROUPS * ROWS,
         receipts.len(),
+        (GROUPS * ROWS) as f64 / wall.as_secs_f64(),
+        receipts.len() as f64 / wall.as_secs_f64(),
         wall.as_secs_f64(),
         cpu_ticks as f64 / ticks_hz as f64,
         stage_wall.as_secs_f64(),
@@ -298,7 +314,7 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         sort.as_secs_f64(),
         encode.as_secs_f64(),
         upload_samples,
-        upload.as_secs_f64(),
+        upload_seconds,
         admission.as_secs_f64(),
         receipt_wait.as_secs_f64(),
         commits_timed,
