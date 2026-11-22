@@ -72,6 +72,23 @@ the codec, dictionary pages and page statistics in stopped-table footers.
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
 
+Stage evidence is diagnostic only and does not affect scoring. Darwin results
+preserve the OAT collector, client and commit stage objects under
+`stageEvidence`, with null and a reason when an object is unavailable. The
+OAT `stage_telemetry_interval_ms` option defaults to null; enabled values are
+currently rejected while the remaining instrumentation is incomplete.
+
+| Evidence | Scope and limitations |
+| --- | --- |
+| Collector | Sampled table-level waiting, flushing and written-not-durable cohorts, flush-slot occupancy and admission wait. Partition attribution is null when lineage is unavailable. |
+| Client | Sampled unsent and body-yielded bytes per stream; body-yield gaps can include scheduler delay and are not transport stalls. Actual network in-flight bytes and transport stalls are null when unobserved. |
+| Commit | Sampled conflict/retry, filesystem committer invocation and local durability sync; each includes its scope and sample count. Local sync does not measure a response ACK. |
+
+Flight response latency is client-observed admission or buffer response latency,
+not client-to-Delta-commit latency. Durable throughput comes from reconciled
+Delta commits; publication-ID deduplication alone does not establish exactly-once
+client delivery.
+
 The client uses the fixed business customer ID `direct-e64-confirmwide` while
 delivery and row identities remain unique per run. Its manifest hashes the
 generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
