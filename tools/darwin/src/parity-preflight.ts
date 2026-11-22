@@ -15,7 +15,7 @@ export function parityLadderConfig(seed: unknown, workers: number): JsonObject {
   if (![1, 2, 4, 8, 16].includes(workers)) throw new Error("unsupported parity ladder worker count");
   const config = object(structuredClone(seed), "parity seed");
   const tunables = object(config.tunables, "tunables");
-  if (tunables.parquet_writer == null) throw new Error("historical writer evidence is not bound");
+  if (tunables.parquet_writer != null) throw new Error("historical parity must not override the writer");
   const client = object(tunables.client, "client");
   if (client.data_profile !== "diagnostic" || client.payload_customer_id !== "direct-e64-confirmwide"
     || client.workers !== 8 || client.streams_per_worker !== 2
@@ -84,15 +84,15 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
   assertParityCollectorReadback(seed, collectors[0]!.effective_config);
   assertParityTableLayout(seed, collectors[0]!.layout_table_policies);
   const tunables = object(config.tunables, "tunables");
-  if (tunables.parquet_writer == null) throw new Error("historical writer evidence is not bound");
+  if (tunables.parquet_writer != null) throw new Error("historical parity must not override the writer");
   const writer = object(collectors[0]!.writer_policy_overrides, "writer policy");
-  const expectedWriter = object(tunables.parquet_writer, "parquet writer");
-  const expectedDefaults = object(expectedWriter.defaults, "parquet defaults");
-  const actualDefaults = object(writer.defaults, "writer defaults");
-  for (const [key, value] of Object.entries(expectedDefaults)) {
-    if (!isDeepStrictEqual(actualDefaults[key], value)) throw new Error(`writer readback differs at ${key}`);
+  function hasOverride(value: unknown): boolean {
+    if (value == null) return false;
+    if (Array.isArray(value)) return value.length !== 0;
+    if (typeof value === "object") return Object.values(value).some(hasOverride);
+    return true;
   }
-  if (writer.max_row_group_rows != null) throw new Error("writer row-group override masks the historical layout");
+  if (hasOverride(writer)) throw new Error("collector writer readback contains an override");
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
     throw new Error("client readback is unavailable");
   }

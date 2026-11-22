@@ -22,15 +22,15 @@ test("the parity ladder changes only offered worker count", () => {
     tunables: { client: {
       data_profile: "diagnostic", payload_customer_id: "direct-e64-confirmwide",
       workers: 8, streams_per_worker: 2,
-    }, collector: { runtime: { cpu_workers: 32 } }, parquet_writer: { defaults: { compression: "uncompressed" } } },
+    }, collector: { runtime: { cpu_workers: 32 } } },
   };
   const config = parityLadderConfig(seed, 4);
   assert.deepEqual(config, { ...seed, tunables: { ...seed.tunables, client: { ...seed.tunables.client, workers: 4 } } });
   assert.equal(seed.tunables.client.workers, 8);
   assert.throws(() => parityLadderConfig(seed, 3), /worker count/);
   assert.throws(() => parityLadderConfig({ ...seed, replica_counts: [2] }, 4), /parity seed/);
-  assert.throws(() => parityLadderConfig({ ...seed, tunables: { ...seed.tunables, parquet_writer: null } }, 4),
-    /historical writer evidence is not bound/);
+  assert.throws(() => parityLadderConfig({ ...seed, tunables: { ...seed.tunables, parquet_writer: {} } }, 4),
+    /must not override the writer/);
 });
 
 test("collector parity readback rejects drift in historical limits and local pressure", () => {
@@ -46,8 +46,7 @@ test("collector parity readback rejects drift in historical limits and local pre
   const client = { data_profile: "diagnostic", workers: 4 };
   const transport = { ipc_compression: "none", grpc_send_compression: "none",
     max_flight_data_bytes: 67108864, max_message_bytes: 134217728 };
-  const parquet_writer = { defaults: { compression: "zstd", compression_level: 3 } };
-  const seed = { tunables: { collector, client, transport, parquet_writer },
+  const seed = { tunables: { collector, client, transport },
     platform: { local: { collector_memory_limit_bytes: 92341796864 } } };
   const readback = { ...collector, layout: { process_policy: collector.layout } };
   assert.doesNotThrow(() => assertParityCollectorReadback(seed, readback));
@@ -66,15 +65,16 @@ test("collector parity readback rejects drift in historical limits and local pre
   const evidence = {
     processes: [{ component: "collector", log_complete: true, effective_config_source: "consumer_startup_readback",
       effective_config: readback, layout_table_policies: [policy],
-      writer_policy_overrides: { ...parquet_writer, max_row_group_rows: null } }],
+      writer_policy_overrides: { defaults: { compression: null, compression_level: null },
+        columns: {}, max_row_group_rows: null } }],
     client_phase_reports: [{ consumer_effective_config: { ...client, ...transport } }],
     overload_guard: { status: "complete", requested_container_memory_limit_bytes: 92341796864,
       settings: { enabled: true, cap_fraction: 0.9, zero_progress_windows: 2 },
       last_caps: [{ metric: "container_memory_bytes", confirmed: true, cap: 92341796864 }] },
   };
   assert.doesNotThrow(() => assertParityEvidence(seed, evidence));
-  assert.throws(() => assertParityEvidence({ ...seed, tunables: { ...seed.tunables, parquet_writer: null } }, evidence),
-    /historical writer evidence is not bound/);
+  assert.throws(() => assertParityEvidence({ ...seed, tunables: { ...seed.tunables, parquet_writer: {} } }, evidence),
+    /must not override the writer/);
   assert.throws(() => assertParityEvidence(seed, {
     ...evidence, overload_guard: { ...evidence.overload_guard, last_caps: [] },
   }), /memory cap is unconfirmed/);
