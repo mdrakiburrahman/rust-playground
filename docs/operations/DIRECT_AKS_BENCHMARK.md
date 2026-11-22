@@ -115,6 +115,13 @@ ARROWCOL_APPLICATION_FIXTURE_PROOF=1 npx --no-install tsx --test \
 
 The new directory retains `application-build.json`, OCI archives and BuildKit metadata. Local source objects/gitlinks are checked and archived; this **unsigned local proof does not verify repository origin independently or authorize AKS**. The test's tiny installed file is explicitly fixture evidence, not a collector-code comparison.
 
+The offline real dependency replay used `f9b87c9e` plus only `crates/arrow-deltalake/src/layout.rs` from `f3c4425c`. Deliberately sharing the Cargo target reproduced identical installed bytes; a fresh builder rebuilt the changed dependency. Both executable hashes matched the independent layout-trial witnesses. This local composition is not a production candidate or throughput qualification.
+
+| Collector build | Installed executable SHA-256 |
+| --- | --- |
+| Baseline and stale shared-cache candidate | `dd24005d38a02503bddca30bfaefe563c20a719c646a3ce5354ba59b25df646c` |
+| Isolated candidate | `88682c27ab43a367253215273b3586e387e74cde8a8a522bdbb3d935849f5a6a` |
+
 For a live run, independently supply `--application-evidence` outside candidate source. Its JSON has `schema_version: 1`, `source_commit`, and `roles`. Each role record contains `role`, `image_digest`, `platform_digest`, `config_digest`, `build_invocation_sha256`, `comparison` (`changed-code` or `source-only`) and `executables` (`path`, `sha256`, optional `baseline_sha256`). These are operator-expected witnesses, not a file auto-generated from candidate claims. The runner compares them to the trusted signed producer output and retains accepted records under `scaled_profile.application_evidence`.
 
 `changed-code` requires complete expected baseline hashes and at least one changed installed executable for that role. Equal or missing bytes refuse qualification; differing image labels alone do not count. Unrelated or behavior-neutral source edits may use `source-only` with identical bytes and are not labeled changed-code. SQL Server has no repository-owned installed executable and cannot qualify a changed-code comparison. Missing/mismatched application evidence fails before workload/pool writes; a missing CLI flag fails before any cloud operation.

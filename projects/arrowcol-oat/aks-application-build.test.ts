@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
-import { run_tree } from '../../infra/azure/bootstrap.js';
-import { assertApplicationEvidence, buildLocalApplications, captureInstalledExecutables, isolatedBuild,
+import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
+import { assertApplicationEvidence, captureInstalledExecutables, isolatedBuild,
   type ApplicationEvidence } from './aks-application-build.js';
+import type { LocalApplicationBuild } from './aks-application-build.js';
 import type { BuildOutput } from './aks-candidate-build.js';
 
 const revision = 'a'.repeat(40), config = 'sha256:' + 'b'.repeat(64), platform = 'sha256:' + 'c'.repeat(64);
@@ -116,13 +117,16 @@ test('real isolated local OCI export and installed-file extraction, without regi
     await git('remote', 'add', 'origin', 'https://github.com/mdrakiburrahman/rust-playground.git');
     await git('add', '.'); await git('commit', '--quiet', '-m', 'local-only fixture');
     const sourceCommit = await git('rev-parse', 'HEAD');
-    const bundle = await buildLocalApplications({ sourceRoot: source, revision: sourceCommit,
-      output: join(root, 'output'), roles: ['dataflow'], fixture: true });
+    const command = await run_tree(['npx', '--no-install', 'tsx',
+      resolve(ROOT, 'projects/arrowcol-oat/aks-application-build.ts'), '--source-root', source,
+      '--revision', sourceCommit, '--output', join(root, 'output'), '--roles', 'dataflow'], 120, ROOT);
+    assert.equal(command.returncode, 0, command.stderr);
+    const bundle: LocalApplicationBuild = JSON.parse(command.stdout);
     const output = bundle.builds[0]!.output;
     image = output.platforms[0]!.config_digest;
     assert.equal(output.application!.executables[0]!.sha256,
       createHash('sha256').update('LOCAL FIXTURE ONLY\n').digest('hex'));
-    assert.equal(bundle.scope, 'local-fixture');
+    assert.equal(bundle.scope, 'local-application-proof');
     const retained = JSON.parse(await readFile(join(root, 'output/application-build.json'), 'utf8'));
     assert.equal(retained.builds[0].output.digest, output.digest);
   } finally {

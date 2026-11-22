@@ -28,7 +28,7 @@ export interface ApplicationEvidence {
   }>;
 }
 export interface LocalApplicationBuild {
-  schema_version: 1; scope: 'local-application-proof' | 'local-fixture';
+  schema_version: 1; scope: 'local-application-proof';
   source_commit: string; materials: SourceMaterial[];
   builds: Array<{ output: BuildOutput; invocation: string[]; archive: string }>;
 }
@@ -172,7 +172,7 @@ async function archiveObject(archive: string, directory: string, path: string, r
 }
 
 export async function buildLocalApplications(options: { sourceRoot: string; revision: string; output: string;
-  roles: Role[]; fixture?: boolean }, runner: Runner = run_tree): Promise<LocalApplicationBuild> {
+  roles: Role[] }, runner: Runner = run_tree): Promise<LocalApplicationBuild> {
   if (!options.roles.length || new Set(options.roles).size !== options.roles.length ||
       options.roles.some(role => !imageBuilds.some(([name]) => name === role))) throw new Error('Select unique known publisher roles.');
   const output = resolve(options.output), source = await realpath(options.sourceRoot);
@@ -182,7 +182,7 @@ export async function buildLocalApplications(options: { sourceRoot: string; revi
   const directory = await mkdtemp(join(tmpdir(), 'arrowcol-application-source-'));
   try {
     const materials = await snapshotSource({ ...options, scope: 'local-fixture' }, directory, runner);
-    const bundle: LocalApplicationBuild = { schema_version: 1, scope: options.fixture ? 'local-fixture' : 'local-application-proof',
+    const bundle: LocalApplicationBuild = { schema_version: 1, scope: 'local-application-proof',
       source_commit: options.revision, materials, builds: [] };
     for (const role of options.roles) {
       const definition = imageBuilds.find(([name]) => name === role)!;
