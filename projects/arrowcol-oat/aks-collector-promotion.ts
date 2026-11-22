@@ -99,6 +99,9 @@ function selectedTunables(promotion: CollectorPromotion, qualifiedConfig: Object
       if (source === undefined || source === null) throw new Error('Won coordinate is missing: ' + coordinate);
       if (index === parts.length - 1) {
         if (typeof source === 'object') throw new Error('Only explicitly won leaf coordinates may be promoted.');
+        if (typeof source === 'number' && (!Number.isFinite(source) || (Number.isInteger(source) && !Number.isSafeInteger(source)))) {
+          throw new Error('Won numeric coordinate cannot be represented exactly: ' + coordinate);
+        }
         destination[part] = source;
       } else {
         destination[part] ??= {};

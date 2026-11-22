@@ -323,6 +323,11 @@ test('historical no-promotion render is byte-identical and rejects non-collector
       schema_version: 1, qualified_source_commit: 'a'.repeat(40), qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(qualifiedConfig)),
       qualified_config_json: JSON.stringify(qualifiedConfig), won_coordinates: ['client.batch_rows'],
     }, 'a'.repeat(40), rejectProject), /Unmappable/);
+    const unsafe = { ...qualifiedConfig, tunables: { collector: { commit: { max_pending_files: Number.MAX_SAFE_INTEGER + 1 } } } };
+    await assert.rejects(applyCollectorPromotion(f.base, {
+      schema_version: 1, qualified_source_commit: 'a'.repeat(40), qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(unsafe)),
+      qualified_config_json: JSON.stringify(unsafe), won_coordinates: ['collector.commit.max_pending_files'],
+    }, 'a'.repeat(40), rejectProject), /represented exactly/);
   } finally { await f.dispose(); }
 });
 

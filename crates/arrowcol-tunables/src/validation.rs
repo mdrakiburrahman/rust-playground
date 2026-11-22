@@ -2034,7 +2034,10 @@ mod tests {
         let env = selected.environment_for(ComponentRole::Collector)?;
         assert_eq!(env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"], r#"{"pipeline_depth":16}"#);
         assert_eq!(
-            effective.collector.unwrap().batching.unwrap().coalesce_publications,
+            effective
+                .collector
+                .and_then(|collector| collector.batching)
+                .and_then(|batching| batching.coalesce_publications),
             Some(true)
         );
         for invalid in [
