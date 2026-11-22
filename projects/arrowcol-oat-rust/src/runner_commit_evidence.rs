@@ -108,6 +108,15 @@ fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool, unavailable_
             }),
         );
     }
+    result.insert("response_ack".to_owned(), json!({
+        "p50": null, "p99": null, "samples": null, "sampled_events": null,
+        "scope": "client_flight_response",
+        "unavailable_reason": if enabled {
+            "flight_response_acknowledges_admission_or_durable_buffer_not_delta_commit"
+        } else {
+            "stage_telemetry_disabled"
+        },
+    }));
     Ok(Value::Object(result))
 }
 
@@ -1035,6 +1044,12 @@ mod commit_evidence_tests {
         let output = commit_window_output(&events, &table, 100, 200, None, Some(10), true)?;
         assert_eq!(output["commits"], 2);
         assert_eq!(output["rows"], 20);
+        let ack = &output["commit_stage_latency_seconds"]["response_ack"];
+        for field in ["p50", "p99", "samples", "sampled_events"] {
+            assert!(ack[field].is_null(), "{field}");
+        }
+        assert_eq!(ack["scope"], "client_flight_response");
+        assert_eq!(ack["unavailable_reason"], "flight_response_acknowledges_admission_or_durable_buffer_not_delta_commit");
         let stage = &output["commit_stage_latency_seconds"]["log_write"];
         assert_eq!(stage["samples"], 2);
         assert_eq!(stage["sampled_events"], 2);
@@ -1046,9 +1061,13 @@ mod commit_evidence_tests {
         let missing = commit_window_output(&events, &table, 100, 200, Some("collector_commit_log_incomplete"), Some(10), true)?;
         assert!(missing["commit_stage_latency_seconds"]["log_write"]["p50"].is_null());
         assert_eq!(missing["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "collector_commit_log_incomplete");
+        assert_eq!(missing["commit_stage_latency_seconds"]["response_ack"]["unavailable_reason"], "flight_response_acknowledges_admission_or_durable_buffer_not_delta_commit");
         assert!(missing["commit_stage_latency_seconds"]["log_write"]["samples"].is_null());
         let disabled = commit_window_output(&events, &table, 100, 200, None, Some(10), false)?;
         assert_eq!(disabled["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "stage_telemetry_disabled");
+        let ack = &disabled["commit_stage_latency_seconds"]["response_ack"];
+        assert!(ack["p50"].is_null() && ack["p99"].is_null() && ack["samples"].is_null());
+        assert_eq!(ack["unavailable_reason"], "stage_telemetry_disabled");
         events.get_mut(&("a".repeat(64), 2)).unwrap().min_ingested_at_ms = Some(5);
         let crossed = commit_window_output(&events, &table, 100, 200, None, Some(10), true)?;
         assert!(crossed["commit_stage_latency_seconds"]["log_write"]["p50"].is_null());
@@ -1060,6 +1079,7 @@ mod commit_evidence_tests {
         assert_eq!(unknown["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "commit_finish_time_unavailable");
         let no_window = durable_commit_evidence(&config, &[], None)?;
         assert_eq!(no_window[&config.tables[0]]["output_throughput"]["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "measurement_window_unavailable");
+        assert_eq!(no_window[&config.tables[0]]["output_throughput"]["commit_stage_latency_seconds"]["response_ack"]["unavailable_reason"], "stage_telemetry_disabled");
         Ok(())
     }
 
