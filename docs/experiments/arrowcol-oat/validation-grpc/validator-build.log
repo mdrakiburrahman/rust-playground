@@ -1,4 +1,0 @@
-COMMAND: cargo build --locked -p arrowcol-oat-rust
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
-
-EXIT=0
