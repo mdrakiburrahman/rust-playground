@@ -3480,7 +3480,7 @@ mod tests {
                 },
                 FileBatchConfig {
                     coalesce_publications: true,
-                    pipeline_depth: 4,
+                    pipeline_depth: 5,
                     max_batches_per_flush: 1,
                     global_capacity: BatchCapacity {
                         bytes: global_bytes,
