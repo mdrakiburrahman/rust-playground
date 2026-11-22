@@ -104,9 +104,14 @@ shutdown drain. Overlapping receipts and the measured window must agree.
 Gaps produce a null unattributed-row count, an explicit reason and a nonzero
 evaluator exit.
 
-On failure, retain the exact run log and use the documented
-`--cleanup-local <cell-uuid>` recovery for that owned cell. Do not retry until
-the OAT owner has exited and cleanup is confirmed. Fresh HOME and restricted
-paths prevent accidental credential inheritance; they are not a security
-sandbox. Run candidate workloads only in throwaway environments and never pass
-the Darwin model token to builds or runs.
+On failure, retain the exact receipt, ownership marker, result and run log; use
+`--cleanup-local <cell-uuid>` for that owned cell. For a failed single-cell
+local run with bound overload evidence, run
+`--recover-failed-local <invocation-id> <preserved-ownership-marker-path>` from
+the receipt-owning runtime after verified cleanup. It appends a disposition
+without changing the failed receipt; each subsequent launch rechecks its
+evidence and same-host resource absence. Missing evidence, active writers,
+resources or a changed host boot block recovery. Do not retry until cleanup is
+confirmed. Fresh HOME and restricted paths prevent accidental credential
+inheritance; they are not a security sandbox. Run candidate workloads only in
+throwaway environments and never pass the Darwin model token to builds or runs.

@@ -8,6 +8,7 @@ import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { assertLocalFailedDisposition, localDispositionSuffix, recordLocalFailedDisposition } from './local-failed-disposition.js';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
@@ -100,6 +101,8 @@ Options:
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  --recover-failed-local <invocation-id> <ownership-marker-path>
+                       Record verified cleanup without changing the failed receipt
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
                        Post-load evidence must be no more than 60 minutes old.
@@ -1116,6 +1119,16 @@ export async function assertNoUnsettledDeadlineReceipts(
     await syncLegacyReceiptDirectory(resolve(root, name));
     admittedDispositions.add(originalName);
   }
+  for (const name of names.filter((entry) => entry.endsWith(localDispositionSuffix))) {
+    const originalName = name.slice(0, -localDispositionSuffix.length);
+    if (!originalName.endsWith('.json') || !names.includes(originalName) || admittedDispositions.has(originalName)) {
+      throw new Error('Orphaned or conflicting local failure disposition');
+    }
+    const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(root, originalName))).toString('utf8'));
+    if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
+    await assertLocalFailedDisposition(resolve(root, originalName), resolve(root, name));
+    admittedDispositions.add(originalName);
+  }
   for (const name of names.filter((entry) => entry.endsWith('.json'))) {
     if (admittedDispositions.has(name)) continue;
     const path = resolve(root, name);
@@ -1918,6 +1931,17 @@ export async function main(
   const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
     console.log(cliUsage);
+    return;
+  }
+  if (args[0] === '--recover-failed-local') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--recover-failed-local requires exactly an invocation ID and the preserved ownership marker');
+    }
+    if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
+    const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(receiptRoot, `${args[1]}.json`))).toString('utf8'));
+    if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
+    await recordLocalFailedDisposition(receiptRoot, args[1], resolve(args[2]));
+    console.log('Recorded verified local cleanup; the original failure remains unranked.');
     return;
   }
   if (args[0] === '--recover-failed-aks') {
