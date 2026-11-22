@@ -244,5 +244,5 @@ for attempt in 1 2 3 4; do
     sleep $((2 ** attempt))
 done
 '@
-wsl -d Ubuntu-24.04 --cd ~ --exec bash -c $cloneScript bash (git -C $PSScriptRoot config user.name) (git -C $PSScriptRoot config user.email) $Branch $origin $gcm /workspaces/rust-playground
+wsl -d Ubuntu-24.04 --cd ~ --exec bash -c ($cloneScript -replace "`r`n", "`n") bash (git -C $PSScriptRoot config user.name) (git -C $PSScriptRoot config user.email) $Branch $origin $gcm /workspaces/rust-playground
 if ($LASTEXITCODE) { throw "Could not clone $Branch into /workspaces/rust-playground." }

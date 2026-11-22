@@ -8,6 +8,7 @@ import test from 'node:test';
 const source = readFileSync(resolve('dev/bootstrap-dev-env.ps1'), 'utf8');
 const cloneScript = source.match(/\$cloneScript = @'\r?\n([\s\S]*?)\r?\n'@/u)?.[1] ??
   (() => { throw new Error('WSL clone script must be present in the bootstrap'); })();
+assert.ok(source.includes('($cloneScript -replace "`r`n", "`n")'));
 
 function runClone(mode: string, existing = false) {
   const directory = mkdtempSync(join(tmpdir(), 'bootstrap-clone-'));
@@ -30,7 +31,8 @@ exit 128
 `, { mode: 0o755 });
     writeFileSync(join(bin, 'wslpath'), '#!/bin/bash\nprintf "%s" "$2"\n', { mode: 0o755 });
     writeFileSync(join(bin, 'sleep'), '#!/bin/bash\nprintf "%s\\n" "$1" >> "$SLEEPS"\n', { mode: 0o755 });
-    const result = spawnSync('bash', ['-c', cloneScript, 'bash', 'user', 'mail', 'branch',
+    const windowsCheckout = cloneScript.replace(/\r?\n/gu, '\r\n');
+    const result = spawnSync('bash', ['-c', windowsCheckout.replace(/\r\n/gu, '\n'), 'bash', 'user', 'mail', 'branch',
       'https://user:test-secret@example.test/repo', 'credential-helper', target], {
       encoding: 'utf8',
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MODE: mode, CALLS: calls, SLEEPS: sleeps },
