@@ -66,7 +66,9 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
         measurement, receipts, allReceipts, Compression.ZSTD, proof);
     assert.deepEqual(await reconcile([receipt]),
-      { rows: 3, parquetBytes: one.length, activeRows: 5, latestVersion: 3, commits: 1 });
+      { rows: 3, parquetBytes: one.length, activeRows: 5, latestVersion: 3, commits: 1,
+        activeFileRows: { count: 2, min: 2, p50: 2.5, max: 3, mean: 2.5 },
+        windowFileRows: { count: 1, min: 3, p50: 3, max: 3, mean: 3 } });
     const inspected: string[] = [];
     await reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
       measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,

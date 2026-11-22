@@ -9,6 +9,18 @@ import { CoverageUnavailableError, type OatMeasurement, type TimedReceipt } from
 type JsonObject = Record<string, unknown>;
 type InventoryEntry = { path: string; size: number; sha256: string };
 type Add = { path: string; size: number; version: number; dataChange: boolean };
+type FileGeometry = { count: number; min: number | null; p50: number | null; max: number | null; mean: number | null };
+
+function fileGeometry(values: number[]): FileGeometry {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (!sorted.length) return { count: 0, min: null, p50: null, max: null, mean: null };
+  const middle = Math.floor(sorted.length / 2);
+  return {
+    count: sorted.length, min: sorted[0]!, max: sorted[sorted.length - 1]!,
+    p50: sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2,
+    mean: sorted.reduce((sum, value) => sum + value, 0) / sorted.length,
+  };
+}
 
 function object(value: unknown, label: string): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -73,7 +85,10 @@ export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
   measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
   rawPreload: unknown, inspectActiveFooter?: (path: string) => Promise<void>,
-): Promise<{ rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number }> {
+): Promise<{
+  rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number;
+  activeFileRows: FileGeometry; windowFileRows: FileGeometry;
+}> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
   const complete = await json(join(root, "complete.json"));
@@ -215,6 +230,7 @@ export async function reconcileStoppedSnapshot(
   const selectedPaths = new Set([...selectedAdds.values()].flat().map(add => add.path));
   const decoded = new Map<string, number>();
   let activeRows = 0;
+  const activeFileRows: number[] = [];
   for (const add of referenced.values()) {
     const path = join(tableRoot, add.path);
     const stat = await lstat(path);
@@ -240,11 +256,15 @@ export async function reconcileStoppedSnapshot(
     const rows = tableFromIPC(readParquet(bytes).intoIPCStream()).numRows;
     if (rows !== footerRows) throw new Error("Parquet decoded rows differ from footer");
     decoded.set(add.path, rows);
-    if (active.has(add.path)) activeRows = uint(activeRows + rows, "active rows");
+    if (active.has(add.path)) {
+      activeRows = uint(activeRows + rows, "active rows");
+      activeFileRows.push(rows);
+    }
   }
   if (activeRows !== expectedActiveRows) throw new Error("decoded active snapshot rows do not match manifest");
   let rows = 0;
   let parquetBytes = 0;
+  const windowFileRows: number[] = [];
   for (const [version, receipt] of selected) {
     const adds = selectedAdds.get(version) ?? [];
     if (adds.length !== receipt.files) throw new Error("receipt file count does not match Delta version");
@@ -253,6 +273,7 @@ export async function reconcileStoppedSnapshot(
     for (const add of adds) {
       if (active.get(add.path)?.version !== version || !decoded.has(add.path)) throw new Error("receipt Add is not active in stopped snapshot");
       versionRows = uint(versionRows + decoded.get(add.path)!, "decoded version rows");
+      windowFileRows.push(decoded.get(add.path)!);
       versionBytes = uint(versionBytes + add.size, "version bytes");
     }
     if (versionRows !== receipt.rows || versionBytes !== receipt.parquetBytes) throw new Error("receipt counters differ from independently decoded Delta Adds");
@@ -260,5 +281,8 @@ export async function reconcileStoppedSnapshot(
     parquetBytes = uint(parquetBytes + versionBytes, "selected bytes");
   }
   if (rows !== measurement.rows || parquetBytes !== measurement.parquetBytes) throw new Error("reconciled window totals differ from measurement");
-  return { rows, parquetBytes, activeRows, latestVersion, commits: selected.size };
+  return {
+    rows, parquetBytes, activeRows, latestVersion, commits: selected.size,
+    activeFileRows: fileGeometry(activeFileRows), windowFileRows: fileGeometry(windowFileRows),
+  };
 }
