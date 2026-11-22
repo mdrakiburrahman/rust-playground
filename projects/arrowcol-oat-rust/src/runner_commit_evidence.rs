@@ -22,7 +22,6 @@ fn unavailable_commits(reason: &str) -> Value {
         "scope": "collector_commit_events",
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
-        "commit_stage_latency_seconds": null,
         "complete_delivery_established": false, "unique_delivered_rows": null,
         "run_cumulative_output": {
             "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
@@ -40,7 +39,7 @@ fn percentile(values: &[f64], percentile: usize) -> Option<f64> {
     values.get(index).copied()
 }
 
-fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool) -> Result<Value> {
+fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool, unavailable_reason: Option<&str>) -> Result<Value> {
     let mut result = serde_json::Map::new();
     for (name, scope) in [
         ("conflict_retry", "failed_transaction_commit_invocations_and_backoff_only_excludes_reconciliation_and_snapshot_refresh"),
@@ -50,7 +49,7 @@ fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool) -> Result<Va
         let mut values = Vec::new();
         let mut sampled_events = 0_usize;
         let mut unavailable = None::<String>;
-        if enabled {
+        if enabled && unavailable_reason.is_none() {
             for event in events {
                 let Some(stages) = &event.commit_stages else { continue };
                 sampled_events += 1;
@@ -89,7 +88,9 @@ fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool) -> Result<Va
             }
         }
         values.sort_by(f64::total_cmp);
-        let reason = if !enabled {
+        let reason = if let Some(reason) = unavailable_reason {
+            Some(reason)
+        } else if !enabled {
             Some("stage_telemetry_disabled")
         } else if sampled_events == 0 {
             Some("no_commit_stage_samples")
@@ -101,7 +102,8 @@ fn commit_stage_percentiles(events: &[&CommitEvent], enabled: bool) -> Result<Va
             json!({
                 "p50": if reason.is_none() { percentile(&values, 50) } else { None },
                 "p99": if reason.is_none() { percentile(&values, 99) } else { None },
-                "samples": values.len(), "sampled_events": sampled_events,
+                "samples": unavailable_reason.is_none().then_some(values.len()),
+                "sampled_events": unavailable_reason.is_none().then_some(sampled_events),
                 "scope": scope, "unavailable_reason": reason,
             }),
         );
@@ -131,6 +133,7 @@ fn commit_window_output(
     end: u64,
     unavailable: Option<&str>,
     cell_start_unix_ms: Option<u64>,
+    stage_telemetry_enabled: bool,
 ) -> Result<Value> {
     let seconds = end
         .checked_sub(start)
@@ -147,6 +150,7 @@ fn commit_window_output(
         "unique_delivered_rows": null, "complete_delivery_established": false,
         "warmup_backlog": "included_when_commit_finishes_in_window",
         "rewrite_commits": "excluded_by_ingestion_only_producer_capability",
+        "commit_stage_latency_seconds": commit_stage_percentiles(&[], stage_telemetry_enabled, unavailable)?,
     });
     if let Some(reason) = unavailable {
         result["unavailable_reason"] = json!(reason);
@@ -157,12 +161,14 @@ fn commit_window_output(
     let mut input_bytes = 0_u64;
     let mut parquet_bytes = 0_u64;
     let mut latencies = Vec::new();
+    let mut stage_events = Vec::new();
     for event in events
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
     {
         let Some(finished) = event.finished_at_unix_ms.and_then(|time| u64::try_from(time).ok()) else {
             result["unavailable_reason"] = json!("commit_finish_time_unavailable");
+            result["commit_stage_latency_seconds"] = commit_stage_percentiles(&[], stage_telemetry_enabled, Some("commit_finish_time_unavailable"))?;
             return Ok(result);
         };
         if finished < start || finished >= end {
@@ -171,6 +177,7 @@ fn commit_window_output(
         if let Some(cell_start) = cell_start_unix_ms {
             let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
                 result["unavailable_reason"] = json!("commit_ingress_boundary_unavailable");
+                result["commit_stage_latency_seconds"] = commit_stage_percentiles(&[], stage_telemetry_enabled, Some("commit_ingress_boundary_unavailable"))?;
                 return Ok(result);
             };
             if last < cell_start as i64 {
@@ -178,6 +185,7 @@ fn commit_window_output(
             }
             if first < cell_start as i64 || last < first {
                 result["unavailable_reason"] = json!("commit_crosses_cell_ingress_boundary");
+                result["commit_stage_latency_seconds"] = commit_stage_percentiles(&[], stage_telemetry_enabled, Some("commit_crosses_cell_ingress_boundary"))?;
                 return Ok(result);
             }
         }
@@ -202,7 +210,9 @@ fn commit_window_output(
             .checked_add(event_bytes)
             .context("commit output byte overflow")?;
         latencies.push(elapsed);
+        stage_events.push(event);
     }
+    result["commit_stage_latency_seconds"] = commit_stage_percentiles(&stage_events, stage_telemetry_enabled, None)?;
     latencies.sort_by(f64::total_cmp);
     result["rows"] = json!(rows);
     result["files"] = json!(files);
@@ -322,12 +332,13 @@ fn complete_commit_windows(
     end: u64,
     unavailable: Option<&str>,
     cell_start_unix_ms: Option<u64>,
+    stage_telemetry_enabled: bool,
 ) -> Result<Vec<Value>> {
     let mut windows = Vec::new();
     let mut window_start = start;
     while let Some(window_end) = window_start.checked_add(30_000).filter(|window_end| *window_end <= end) {
         windows.push(commit_window_output(
-            events, table, window_start, window_end, unavailable, cell_start_unix_ms,
+            events, table, window_start, window_end, unavailable, cell_start_unix_ms, stage_telemetry_enabled,
         )?);
         window_start = window_end;
     }
@@ -406,11 +417,17 @@ fn durable_commit_evidence_for_cell(
     cell_start_unix_ms: Option<u64>,
 ) -> Result<HashMap<String, Value>> {
     let Some((start, end)) = window else {
-        return Ok(config
-            .tables
-            .iter()
-            .map(|table| (table.clone(), unavailable_commits("measurement_window_unavailable")))
-            .collect());
+        let reason = "measurement_window_unavailable";
+        let stages = commit_stage_percentiles(&[], config.stage_telemetry_interval_ms.is_some(), Some(reason))?;
+        return Ok(config.tables.iter().map(|table| {
+            let mut evidence = unavailable_commits(reason);
+            evidence["output_throughput"] = json!({
+                "scope": "new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort",
+                "measurement_start_unix_ms": null, "measurement_end_unix_ms": null,
+                "commit_stage_latency_seconds": stages.clone(), "unavailable_reason": reason,
+            });
+            (table.clone(), evidence)
+        }).collect());
     };
     let collector_logs = process_logs
         .iter()
@@ -477,10 +494,10 @@ fn durable_commit_evidence_for_cell(
         if let Some(reason) = unavailable {
             let mut evidence = unavailable_commits(reason);
             evidence["output_throughput"] = commit_window_output(
-                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms,
+                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms, config.stage_telemetry_interval_ms.is_some(),
             )?;
             evidence["complete_30_second_commit_windows"] = json!(complete_commit_windows(
-                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms,
+                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms, config.stage_telemetry_interval_ms.is_some(),
             )?);
             result.insert(table.clone(), evidence);
             continue;
@@ -555,9 +572,7 @@ fn durable_commit_evidence_for_cell(
                 .filter_map(|event| event.elapsed_seconds)
                 .collect::<Vec<_>>();
             latencies.sort_by(f64::total_cmp);
-            let commit_stages = commit_stage_percentiles(&selected, config.stage_telemetry_interval_ms.is_some())?;
             result.insert(table.clone(), json!({
-                "commit_stage_latency_seconds": commit_stages,
                 "scope": "observed_new_delta_commits_with_ingress_wholly_in_shared_measurement_window",
                 "measurement_start_unix_ms": start, "measurement_end_unix_ms": end,
                 "rows": rows, "files": files, "input_bytes": input_bytes, "parquet_bytes": parquet_bytes,
@@ -587,9 +602,10 @@ fn durable_commit_evidence_for_cell(
             end,
             cumulative_unavailable,
             cell_start_unix_ms,
+            config.stage_telemetry_interval_ms.is_some(),
         )?;
         evidence["complete_30_second_commit_windows"] = json!(complete_commit_windows(
-            &events, &canonical_table_name, start, end, cumulative_unavailable, cell_start_unix_ms,
+            &events, &canonical_table_name, start, end, cumulative_unavailable, cell_start_unix_ms, config.stage_telemetry_interval_ms.is_some(),
         )?);
         evidence["run_cumulative_output"] = run_cumulative_output(
             &events,
@@ -978,25 +994,72 @@ mod commit_evidence_tests {
         };
         let a = make(json!({"seconds":0.002,"unavailable_reason":null}))?;
         let b = make(json!({"seconds":0.004,"unavailable_reason":null}))?;
-        let stage = commit_stage_percentiles(&[&a, &b], true)?;
+        let stage = commit_stage_percentiles(&[&a, &b], true, None)?;
         assert_eq!(stage["local_durability_sync"]["p50"], 0.002);
         assert_eq!(stage["local_durability_sync"]["p99"], 0.004);
         assert_eq!(stage["local_durability_sync"]["samples"], 2);
         assert_eq!(stage["log_write"]["p50"], 0.01);
         assert_eq!(stage["conflict_retry"]["p50"], 0.0);
         let cloud = make(json!({"seconds":null,"unavailable_reason":"cloud"}))?;
-        let mixed = commit_stage_percentiles(&[&a, &cloud], true)?;
+        let mixed = commit_stage_percentiles(&[&a, &cloud], true, None)?;
         assert!(mixed["local_durability_sync"]["p50"].is_null());
         assert_eq!(mixed["local_durability_sync"]["samples"], 1);
         assert_eq!(mixed["local_durability_sync"]["sampled_events"], 2);
         assert_eq!(mixed["local_durability_sync"]["unavailable_reason"], "cloud");
-        assert_eq!(commit_stage_percentiles(&[], true)?["local_durability_sync"]["unavailable_reason"], "no_commit_stage_samples");
-        assert_eq!(commit_stage_percentiles(&[&a], false)?["local_durability_sync"]["unavailable_reason"], "stage_telemetry_disabled");
+        assert_eq!(commit_stage_percentiles(&[], true, None)?["local_durability_sync"]["unavailable_reason"], "no_commit_stage_samples");
+        assert_eq!(commit_stage_percentiles(&[&a], false, None)?["local_durability_sync"]["unavailable_reason"], "stage_telemetry_disabled");
         let malformed = make(json!({"seconds":null,"unavailable_reason":null}))?;
-        assert!(commit_stage_percentiles(&[&malformed], true).is_err());
+        assert!(commit_stage_percentiles(&[&malformed], true, None).is_err());
         let mut bad_scope = a.clone();
         bad_scope.commit_stages.as_mut().unwrap()["log_write"]["scope"] = json!("pure_write");
-        assert!(commit_stage_percentiles(&[&bad_scope], true).is_err());
+        assert!(commit_stage_percentiles(&[&bad_scope], true, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn commit_stage_samples_use_verified_half_open_finish_window() -> Result<()> {
+        let config = config()?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let mut events = std::collections::BTreeMap::new();
+        for (version, finish, duration) in [(1, 99, 0.01), (2, 100, 0.02), (3, 199, 0.03), (4, 200, 0.04)] {
+            let mut value = event(&config, if version == 4 { 150 } else { 20 }, if version == 4 { 160 } else { 80 })?;
+            value["delta_version"] = json!(version);
+            value["finished_at_unix_ms"] = json!(finish);
+            value["commit_stages"] = json!({
+                "conflict_retry": {"seconds":0.0,"unavailable_reason":null,"scope":"failed_transaction_commit_invocations_and_backoff_only_excludes_reconciliation_and_snapshot_refresh"},
+                "log_write": {"seconds":duration,"unavailable_reason":null,"scope":"successful_filesystem_committer_invocation_including_opaque_kernel_work_not_pure_log_write"},
+                "local_durability_sync": {"seconds":duration,"unavailable_reason":null,"scope":"successful_attempt_local_file_and_directory_fsyncs_only_not_response_ack"},
+            });
+            events.insert(("a".repeat(64), version), serde_json::from_value(value)?);
+        }
+        let output = commit_window_output(&events, &table, 100, 200, None, Some(10), true)?;
+        assert_eq!(output["commits"], 2);
+        assert_eq!(output["rows"], 20);
+        let stage = &output["commit_stage_latency_seconds"]["log_write"];
+        assert_eq!(stage["samples"], 2);
+        assert_eq!(stage["sampled_events"], 2);
+        assert_eq!(stage["p50"], 0.02);
+        assert_eq!(stage["p99"], 0.03);
+        let empty = commit_window_output(&events, &table, 201, 300, None, Some(10), true)?;
+        assert!(empty["commit_stage_latency_seconds"]["log_write"]["p50"].is_null());
+        assert_eq!(empty["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "no_commit_stage_samples");
+        let missing = commit_window_output(&events, &table, 100, 200, Some("collector_commit_log_incomplete"), Some(10), true)?;
+        assert!(missing["commit_stage_latency_seconds"]["log_write"]["p50"].is_null());
+        assert_eq!(missing["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "collector_commit_log_incomplete");
+        assert!(missing["commit_stage_latency_seconds"]["log_write"]["samples"].is_null());
+        let disabled = commit_window_output(&events, &table, 100, 200, None, Some(10), false)?;
+        assert_eq!(disabled["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "stage_telemetry_disabled");
+        events.get_mut(&("a".repeat(64), 2)).unwrap().min_ingested_at_ms = Some(5);
+        let crossed = commit_window_output(&events, &table, 100, 200, None, Some(10), true)?;
+        assert!(crossed["commit_stage_latency_seconds"]["log_write"]["p50"].is_null());
+        assert_eq!(crossed["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "commit_crosses_cell_ingress_boundary");
+        let altered = events.get_mut(&("a".repeat(64), 2)).unwrap();
+        altered.min_ingested_at_ms = Some(20);
+        altered.finished_at_unix_ms = None;
+        let unknown = commit_window_output(&events, &table, 100, 200, None, Some(10), true)?;
+        assert_eq!(unknown["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "commit_finish_time_unavailable");
+        let no_window = durable_commit_evidence(&config, &[], None)?;
+        assert_eq!(no_window[&config.tables[0]]["output_throughput"]["commit_stage_latency_seconds"]["log_write"]["unavailable_reason"], "measurement_window_unavailable");
         Ok(())
     }
 
