@@ -210,3 +210,11 @@ Each binary receives a separate debugger-observed cadence audit on a fresh copy;
 The cold pinned seed creates local vacuum progress and lock sidecars on its first idle pass. Preparation runs the trusted baseline once, validates it, and incorporates those sidecars into the single frozen seed; results therefore describe initialized steady-idle state, not cold-start I/O. Each idle arm is checked for unchanged names, content, inode and modification/change timestamps after the process stops. The physical comparator inspects a verified copy, so it cannot change the measured snapshot.
 
 The local screening flag uses the existing Darwin 5% paired-effect and conservative 95% log-uncertainty rule; identical-source controls cannot pass it. It is not a candidate admission or integration decision.
+
+### Darwin trusted maintenance control dispatch
+
+The trusted runner can call `dispatchMaintenanceControl({ repo, home }, { mode: "control", experiments: ["maintenance-active", "maintenance-idle"] })` after its own snapshot setup. `repo` and `home` are runner-owned roots, not candidate or command-line paths; the dispatch derives all source and output paths itself. Run once per new `home`: it seeds once and alternates three fresh-copy pairs per lane. The trusted manifest, fixture, maintenance source, comparator and sandbox must match the pinned revisions. A missing or mismatched input fails closed.
+
+Run the focused checks from the pinned fixture branch with `npx --no-install tsx --test tools/darwin/src/maintenance-dispatch.test.ts`; add `DARWIN_MAINTENANCE_E2E=1` for the real local, no-token control and missing-protected-file rejection. The latter builds and runs native code in the existing isolation helper and needs the prepared devcontainer's Cargo cache, LLDB and namespace support.
+
+The result is a Tier-1 **local maintenance-only** inverse-elapsed score, not durable ingestion throughput or promotion. Object-store counts are fixture-reported. A changed native source is deliberately refused: the missing input is a separately verified native-admission receipt from the trusted outer runner. The existing single-file region checker is not that receipt.
