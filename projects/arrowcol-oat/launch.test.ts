@@ -2006,14 +2006,16 @@ test('dead local cleanup disposition is explicit, linked, and preserves the orig
   const fixture = await createUnsettledLocalReceipt();
   const original = await readFile(fixture.receiptPath);
   const docker = (args: string[]) => args[0] === 'info' ? fixture.engineId : '';
+  const dependencies = {
+    docker,
+    processStartTicks: async () => undefined,
+    reserveEndpoint: async () => async () => {},
+    workspaceRoot: fixture.workspace,
+    now: () => 1_700_000_000_000,
+  };
   try {
-    await recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, {
-      docker,
-      processStartTicks: async () => undefined,
-      reserveEndpoint: async () => async () => {},
-      workspaceRoot: fixture.workspace,
-      now: () => 1_700_000_000_000,
-    });
+    await main(['--reconcile-dead-local', fixture.runId], undefined, undefined, fixture.receiptRoot,
+      undefined, undefined, undefined, dependencies);
     const after = await readFile(fixture.receiptPath);
     assert.deepEqual(after, original);
     const dispositionPath = fixture.receiptPath + '.local-dead-cleanup';
@@ -2037,10 +2039,19 @@ test('dead local cleanup disposition rejects legacy identity gaps, reused PIDs, 
   const legacy = await createUnsettledLocalReceipt({ runId: randomUUID() });
   const processReused = await createUnsettledLocalReceipt({ runId: randomUUID() });
   const resourcePresent = await createUnsettledLocalReceipt({ runId: randomUUID() });
+  const ownerLive = await createUnsettledLocalReceipt({ runId: randomUUID() });
+  const statePresent = await createUnsettledLocalReceipt({ runId: randomUUID() });
+  const engineMismatch = await createUnsettledLocalReceipt({ runId: randomUUID() });
   try {
     const legacyValue = JSON.parse(await readFile(legacy.receiptPath, 'utf8'));
     delete legacyValue.local_runtime_identity;
     await writeFile(legacy.receiptPath, JSON.stringify(legacyValue));
+    const legacyBytes = await readFile(legacy.receiptPath);
+    await assert.rejects(main(['--reconcile-dead-local', legacy.runId, '--mode', 'local'],
+      undefined, undefined, legacy.receiptRoot), /requires exactly one canonical local run UUID/);
+    await assert.rejects(main(['--reconcile-dead-local', legacy.runId],
+      undefined, undefined, legacy.receiptRoot), /lacks complete, unambiguous recovery identity/);
+    assert.deepEqual(await readFile(legacy.receiptPath), legacyBytes);
     await assert.rejects(recordLocalDeadRunCleanupDisposition(legacy.receiptRoot, legacy.runId, {
       docker: (args) => args[0] === 'info' ? legacy.engineId : '',
       processStartTicks: async () => undefined,
@@ -2058,6 +2069,26 @@ test('dead local cleanup disposition rejects legacy identity gaps, reused PIDs, 
       workspaceRoot: processReused.workspace,
     }), /PID has been reused/);
 
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(ownerLive.receiptRoot, ownerLive.runId, {
+      docker: (args) => args[0] === 'info' ? ownerLive.engineId : '',
+      processStartTicks: async (pid) => pid === ownerLive.ownerPid ? '98' : undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: ownerLive.workspace,
+    }), /launcher process is still live/);
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(engineMismatch.receiptRoot, engineMismatch.runId, {
+      docker: () => 'b'.repeat(64),
+      processStartTicks: async () => undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: engineMismatch.workspace,
+    }), /does not match the recorded local run engine/);
+    await mkdir(path.join(statePresent.stateRoot, statePresent.runId));
+    await assert.rejects(recordLocalDeadRunCleanupDisposition(statePresent.receiptRoot, statePresent.runId, {
+      docker: (args) => args[0] === 'info' ? statePresent.engineId : '',
+      processStartTicks: async () => undefined,
+      reserveEndpoint: async () => async () => {},
+      workspaceRoot: statePresent.workspace,
+    }), /Local OAT state remains/);
+
     const resourceDocker = (args: string[]) => {
       if (args[0] === 'info') return resourcePresent.engineId;
       if (args[0] === 'ps' && args[1] === '-aq') return 'stopped-container-id';
@@ -2070,11 +2101,11 @@ test('dead local cleanup disposition rejects legacy identity gaps, reused PIDs, 
       reserveEndpoint: async () => async () => {},
       workspaceRoot: resourcePresent.workspace,
     }), /Local Compose container remains/);
-    for (const fixture of [legacy, processReused, resourcePresent]) {
+    for (const fixture of [legacy, processReused, resourcePresent, ownerLive, statePresent, engineMismatch]) {
       assert.equal((await readdir(fixture.receiptRoot)).filter((name) => name.endsWith('.local-dead-cleanup')).length, 0);
     }
   } finally {
-    await Promise.all([legacy, processReused, resourcePresent].map((fixture) =>
+    await Promise.all([legacy, processReused, resourcePresent, ownerLive, statePresent, engineMismatch].map((fixture) =>
       rm(fixture.directory, { recursive: true, force: true })));
   }
 });
