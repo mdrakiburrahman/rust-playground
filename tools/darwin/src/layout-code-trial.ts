@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { cp, lstat, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -246,7 +246,13 @@ export class LayoutCodeTrial {
       const root = this.#source[arm];
       await verifyTree(root, this.#expected[arm]);
       const iid = join(this.#home, "trusted", `${arm}.iid`);
-      execFileSync("docker", ["build", "--iidfile", iid, "--file", join(root, DOCKERFILE), "--build-arg", `VCS_REF=${BASE}`, root], { env, stdio: "inherit" });
+      const builder = "layout-" + randomUUID();
+      execFileSync("docker", ["buildx", "create", "--name", builder, "--driver", "docker-container"], { env, stdio: "inherit" });
+      try {
+        execFileSync("docker", ["buildx", "build", "--builder", builder, "--load", "--iidfile", iid, "--file", join(root, DOCKERFILE), "--build-arg", "VCS_REF=" + BASE, root], { env, stdio: "inherit" });
+      } finally {
+        execFileSync("docker", ["buildx", "rm", builder], { env, stdio: "inherit" });
+      }
       await verifyTree(root, this.#expected[arm]);
       const image = id((await readFile(iid, "utf8")).trim());
       const actual = execFileSync("docker", ["image", "inspect", "--format", "{{.Id}}", image], { env, encoding: "utf8" }).trim();
