@@ -73,7 +73,7 @@ docker_cli_package=${pins[6]}
 age_package=${pins[7]}
 
 image_digest=$(cd "$script_dir" &&
-  sha256sum tools.lock.json Dockerfile install-tools.sh candidate-exec.sh run-darwin.sh dispatch-contract.ts bridge-listener.ts bridge-fixture-worker.ts |
+  sha256sum tools.lock.json Dockerfile install-tools.sh candidate-exec.sh run-darwin.sh dispatch-contract.ts bridge-listener.ts bridge-fixture-worker.ts production-preflight.ts |
   sha256sum | cut -c1-16)
 controller_image="rust-playground/darwin-controller:$image_digest"
 candidate_image="rust-playground/darwin-candidate:$image_digest"

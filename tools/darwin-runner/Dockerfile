@@ -57,5 +57,5 @@ RUN chmod 755 /opt/darwin-runner/install-tools.sh \
     && install -m 755 /opt/darwin-runner/install-tools.sh /usr/local/bin/darwin-install-tools
 COPY candidate-exec.sh /usr/local/bin/darwin-candidate-exec
 COPY run-darwin.sh /usr/local/bin/darwin-runner-evolve
-COPY dispatch-contract.ts bridge-listener.ts bridge-fixture-worker.ts /opt/darwin-runner/
+COPY dispatch-contract.ts bridge-listener.ts bridge-fixture-worker.ts production-preflight.ts /opt/darwin-runner/
 RUN chmod 755 /usr/local/bin/darwin-candidate-exec /usr/local/bin/darwin-runner-evolve

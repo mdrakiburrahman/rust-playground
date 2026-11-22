@@ -19,7 +19,14 @@ export interface ValidatedDispatch {
   compressionLevel: number;
 }
 
-export type ConfigValidator = (baseline: Buffer, candidate: Buffer) => number;
+export interface DispatchValidationContext {
+  repoRoot: string;
+  producerCommit: string;
+  candidateCommit: string;
+  configPath: string;
+}
+
+export type ConfigValidator = (baseline: Buffer, candidate: Buffer, context: DispatchValidationContext) => number | Promise<number>;
 export type Workload = (dispatch: ValidatedDispatch) => Promise<unknown> | unknown;
 
 function runGit(repoRoot: string, args: string[], binary = false, maxBuffer = 1024 * 1024): Buffer {
@@ -55,13 +62,13 @@ export function parseDispatchRequest(payload: Uint8Array): DispatchRequest {
   return { version: 1, lane: DISPATCH_LANE, candidateCommit: record.candidateCommit };
 }
 
-export function validateDispatch(
+export async function validateDispatch(
   repoRoot: string,
   producerCommit: string,
   configPath: string,
   payload: Uint8Array,
   validateConfig: ConfigValidator,
-): ValidatedDispatch {
+): Promise<ValidatedDispatch> {
   const request = parseDispatchRequest(payload);
   if (path.isAbsolute(configPath) || configPath.split(/[\\/]/).includes("..")
     || configPath.replaceAll("\\", "/") !== configPath) {
@@ -87,7 +94,12 @@ export function validateDispatch(
   if (baseline.length > MAX_CONFIG_BYTES || candidate.length > MAX_CONFIG_BYTES) {
     throw new Error("trusted compression config exceeds the size limit");
   }
-  const compressionLevel = validateConfig(baseline, candidate);
+  const compressionLevel = await validateConfig(baseline, candidate, {
+    repoRoot,
+    producerCommit,
+    candidateCommit: request.candidateCommit,
+    configPath,
+  });
   if (!Number.isInteger(compressionLevel)
     || compressionLevel < MIN_COMPRESSION_LEVEL || compressionLevel > MAX_COMPRESSION_LEVEL) {
     throw new Error("validated compression level is outside the supported range");
@@ -103,7 +115,7 @@ export async function dispatchRequest(
   validateConfig: ConfigValidator,
   startWorkload: Workload,
 ): Promise<unknown> {
-  const validated = validateDispatch(repoRoot, producerCommit, configPath, payload, validateConfig);
+  const validated = await validateDispatch(repoRoot, producerCommit, configPath, payload, validateConfig);
   return startWorkload(validated);
 }
 
