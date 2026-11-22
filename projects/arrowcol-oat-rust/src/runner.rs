@@ -4275,6 +4275,9 @@ async fn run_matrix_cell(
             .overload_guard
             .as_ref()
             .is_some_and(|guard| guard["status"] == "unavailable");
+    if config.stage_telemetry_interval_ms.is_none() {
+        client_run.evidence.collector_stage_telemetry = Some(collector_stage_telemetry(&[], None, None));
+    }
     let mut startup_readback_diff = None;
     let capture = async {
         let post_client_ms = config
@@ -4287,7 +4290,7 @@ async fn run_matrix_cell(
             Duration::from_millis(post_client_ms),
             "commit reconciliation",
         )?;
-        let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
+        let (collector_logs, durable_commits) = settle_cell_commit_evidence(
             config,
             platform,
             &baseline_logs,
@@ -4296,6 +4299,9 @@ async fn run_matrix_cell(
         )
         .await?;
         client_run.evidence.durable_commits = durable_commits;
+        client_run.evidence.collector_stage_telemetry = Some(collector_stage_telemetry(
+            &collector_logs, client_run.evidence.measurement_window, config.stage_telemetry_interval_ms,
+        ));
         let process_logs = platform.process_logs(config).await?;
         client_run.evidence.processes = Some(process_evidence_for_cell(
             config,

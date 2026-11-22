@@ -100,7 +100,9 @@ impl GenericDeltaExporter {
                 loop {
                     tick.tick().await;
                     let Some(backend) = weak.upgrade() else { break };
-                    backend.sample_stage_saturation();
+                    if !backend.sample_stage_saturation() {
+                        break;
+                    }
                 }
             }) {
                 tracing::error!(error = %error, "stage saturation sampler could not start");
@@ -237,13 +239,41 @@ const ADMISSION_WAIT_BUCKETS_US: [u64; 10] = [
     100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
 
-#[derive(Default)]
+const STAGE_SAMPLE_LOG_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+static STAGE_SAMPLE_LOG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAGE_SAMPLE_BUDGET_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NEXT_STAGE_BACKEND_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct StageSaturation {
+    generation: u64,
     sequence: std::sync::atomic::AtomicU64,
     admission_count: std::sync::atomic::AtomicU64,
     admission_wait_us: std::sync::atomic::AtomicU64,
     admission_buckets: [std::sync::atomic::AtomicU64; 11],
     admission_overflow: std::sync::atomic::AtomicBool,
+}
+
+impl Default for StageSaturation {
+    fn default() -> Self {
+        use std::sync::atomic::Ordering;
+        Self {
+            generation: NEXT_STAGE_BACKEND_GENERATION.fetch_add(1, Ordering::Relaxed),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            admission_count: std::sync::atomic::AtomicU64::new(0),
+            admission_wait_us: std::sync::atomic::AtomicU64::new(0),
+            admission_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            admission_overflow: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+fn reserve_stage_sample_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64, limit: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            v.checked_add(bytes).filter(|total| *total <= limit)
+        })
+        .is_ok()
 }
 
 impl StageSaturation {
@@ -296,9 +326,11 @@ impl Drop for DeltaBackend {
 }
 
 impl DeltaBackend {
-    fn sample_stage_saturation(&self) {
+    fn sample_stage_saturation(&self) -> bool {
         use std::sync::atomic::Ordering;
-        let Some(stage) = &self.stage_telemetry else { return };
+        let Some(stage) = &self.stage_telemetry else {
+            return false;
+        };
         let overflow = stage.admission_overflow.load(Ordering::Relaxed);
         let Ok(sequence) = stage
             .sequence
@@ -308,7 +340,7 @@ impl DeltaBackend {
                 std::io::stderr().lock(),
                 "arrowcol_collector_stage_sample_error sequence_overflow"
             );
-            return;
+            return false;
         };
         let sampled_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -316,12 +348,20 @@ impl DeltaBackend {
             .and_then(|v| u64::try_from(v.as_millis()).ok());
         let sample = serde_json::json!({
             "schema_version": 1,
+            "collector_instance_id": self.metrics.instance_id().to_string(),
             "backend": self.base_path.to_string_lossy(),
+            "backend_generation": stage.generation,
             "sequence": sequence,
             "sampled_at_unix_ms": sampled_at,
             "clock_unavailable_reason": sampled_at.is_none().then_some("system_clock_unavailable"),
             "cohorts": self.metrics.stage_saturation_snapshot(),
             "cohort_scope": "process_wide_queue_admitted_publications",
+            "stage_semantics": {
+                "flushing": "whole_group_from_flush_slot_until_all_files_staged_not_file_exact",
+                "written_not_durable": "all_group_files_staged_durability_not_yet_confirmed",
+                "partition": "unavailable_without_per_publication_partition_lineage",
+            },
+            "snapshot_consistency": "sequential_not_atomic",
             "oldest_age_scope": "since_first_queue_admission",
             "flush_slots_occupied": self.batching.max_concurrent_flushes.saturating_sub(self.flush_slots.available_permits()),
             "flush_slots_capacity": self.batching.max_concurrent_flushes,
@@ -336,7 +376,18 @@ impl DeltaBackend {
                 "bucket_semantics": "noncumulative_inclusive_upper_last_is_overflow",
             },
         });
-        let _ = writeln!(std::io::stderr().lock(), "arrowcol_collector_stage_sample {sample}");
+        let line = format!("arrowcol_collector_stage_sample {sample}\n");
+        let Ok(bytes) = u64::try_from(line.len()) else {
+            return false;
+        };
+        if !reserve_stage_sample_bytes(&STAGE_SAMPLE_LOG_BYTES, bytes, STAGE_SAMPLE_LOG_BUDGET_BYTES) {
+            if !STAGE_SAMPLE_BUDGET_REPORTED.swap(true, Ordering::Relaxed) {
+                let end = serde_json::json!({"schema_version": 1, "backend": self.base_path.to_string_lossy(), "backend_generation": stage.generation, "sequence": sequence, "sampled_at_unix_ms": sampled_at, "unavailable_reason": "emission_budget_exhausted"});
+                let _ = writeln!(std::io::stderr().lock(), "arrowcol_collector_stage_sample_end {end}");
+            }
+            return false;
+        }
+        std::io::stderr().lock().write_all(line.as_bytes()).is_ok()
     }
 
     async fn owner(&self, decoded: &DecodedArrowBatch) -> Result<Arc<TableOwner>, ExportFailure> {
@@ -1205,7 +1256,7 @@ impl GroupPublisher<'_> {
                             ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                         })?;
                     }
-                    let stage = if split { PublicationStage::Unknown } else { PublicationStage::Written };
+                    let stage = if split || !prepared.committed_identities.is_empty() { PublicationStage::Unknown } else { PublicationStage::Written };
                     for entry in group.iter().filter(|entry| entry.stage_enabled) {
                         if let Some(token) = entry.backlog_token { self.metrics.stage_transition(token, stage); }
                     }
@@ -1679,6 +1730,18 @@ mod tests {
     use super::*;
     use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
     use crate::metrics::RuntimeMetrics;
+
+    #[test]
+    fn collector_sample_budget_is_bounded_and_overflow_safe() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let budget = AtomicU64::new(0);
+        assert!(reserve_stage_sample_bytes(&budget, 7, 10));
+        assert!(!reserve_stage_sample_bytes(&budget, 4, 10));
+        assert_eq!(budget.load(Ordering::Relaxed), 7);
+        assert!(reserve_stage_sample_bytes(&budget, 3, 10));
+        assert!(!reserve_stage_sample_bytes(&budget, u64::MAX, 10));
+        assert_eq!(budget.load(Ordering::Relaxed), 10);
+    }
 
     #[test]
     fn admission_wait_histogram_keeps_boundaries_and_overflow() {

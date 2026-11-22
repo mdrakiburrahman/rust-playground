@@ -376,6 +376,7 @@ struct CellEvidence {
     downstream_comment: Option<String>,
     qap_observation: Option<Value>,
     native_telemetry: Option<Value>,
+    collector_stage_telemetry: Option<Value>,
     resource_samples: Vec<ResourceSample>,
     resource_sampling_failures: u64,
     resource_samples_dropped: u64,
@@ -392,6 +393,209 @@ struct CellEvidence {
     durable_commits: HashMap<String, Value>,
     router_sql: Option<Value>,
     router_cpu_pressure: Option<Value>,
+}
+
+const COLLECTOR_STAGE_RETAINED_SAMPLES: usize = 2048;
+const COLLECTOR_STAGE_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+fn collector_stage_telemetry(logs: &[ProcessLog], window: Option<(u64, u64)>, interval_ms: Option<u64>) -> Value {
+    let mut reason = if interval_ms.is_none() {
+        Some("disabled_by_default")
+    } else {
+        None
+    };
+    if reason.is_none() && !window.is_some_and(|(start, end)| start < end) {
+        reason = Some("measurement_window_unavailable");
+    }
+    let collectors: Vec<_> = logs
+        .iter()
+        .filter(|log| matches!(log.role, ComponentRole::Collector))
+        .collect();
+    if reason.is_none() && collectors.is_empty() {
+        reason = Some("collector_logs_unavailable");
+    }
+    let mut identities = HashSet::new();
+    let mut process_identities = HashMap::<String, String>::new();
+    let mut samples = BTreeMap::<(String, String, u64, u64), Value>::new();
+    let mut dropped = 0u64;
+    let mut retained_bytes = 0usize;
+    let mut duplicates = 0u64;
+    let mut malformed = 0u64;
+    let mut budget_exhausted = false;
+    let mut identity_unverified = false;
+    if let Some((start, end)) = window.filter(|(start, end)| start < end)
+        && interval_ms.is_some()
+    {
+        for log in &collectors {
+            if log.instance_id.is_empty() || !identities.insert(log.instance_id.clone()) {
+                reason.get_or_insert("collector_identity_missing_or_duplicate");
+            }
+            if !log.complete {
+                reason.get_or_insert("collector_log_incomplete");
+            }
+            if log.instance_id.contains('/') {
+                identity_unverified = true;
+            }
+            for line in log.text.lines() {
+                if line.starts_with("arrowcol_collector_stage_sample_error ") {
+                    reason.get_or_insert("collector_sample_emission_failed");
+                    continue;
+                }
+                if let Some(body) = line.strip_prefix("arrowcol_collector_stage_sample_end ") {
+                    match serde_json::from_str::<Value>(body) {
+                        Ok(value)
+                            if value["schema_version"] == 1
+                                && value["unavailable_reason"] == "emission_budget_exhausted" =>
+                        {
+                            if value["sampled_at_unix_ms"]
+                                .as_u64()
+                                .is_none_or(|timestamp| timestamp < end)
+                            {
+                                budget_exhausted = true;
+                            }
+                        }
+                        _ => {
+                            malformed += 1;
+                        }
+                    }
+                    continue;
+                }
+                let Some(body) = line.strip_prefix("arrowcol_collector_stage_sample ") else {
+                    continue;
+                };
+                if body.len() > COLLECTOR_STAGE_RETAINED_BYTES {
+                    dropped += 1;
+                    continue;
+                }
+                let Ok(sample) = serde_json::from_str::<Value>(body) else {
+                    malformed += 1;
+                    continue;
+                };
+                let Some(process_id) = sample["collector_instance_id"].as_str().filter(|value| !value.is_empty()) else {
+                    malformed += 1;
+                    continue;
+                };
+                if process_identities.get(&log.instance_id).is_some_and(|prior| prior != process_id) {
+                    reason.get_or_insert("collector_process_identity_changed");
+                } else {
+                    process_identities.insert(log.instance_id.clone(), process_id.to_owned());
+                }
+                let Some(backend) = sample["backend"].as_str().filter(|value| !value.is_empty()) else {
+                    malformed += 1;
+                    continue;
+                };
+                let (Some(generation), Some(sequence), Some(timestamp)) = (
+                    sample["backend_generation"].as_u64(),
+                    sample["sequence"].as_u64(),
+                    sample["sampled_at_unix_ms"].as_u64(),
+                ) else {
+                    malformed += 1;
+                    continue;
+                };
+                if sample["schema_version"] != 1
+                    || !sample["cohorts"].is_object()
+                    || !sample["admission_wait"].is_object()
+                    || !sample["flush_slots_occupied"].is_u64()
+                    || !sample["flush_slots_capacity"].is_u64()
+                {
+                    malformed += 1;
+                    continue;
+                }
+                if timestamp < start || timestamp >= end {
+                    continue;
+                }
+                let key = (log.instance_id.clone(), backend.to_owned(), generation, sequence);
+                if let Some(previous) = samples.get(&key) {
+                    duplicates += 1;
+                    if previous != &sample {
+                        reason.get_or_insert("conflicting_duplicate_sample");
+                    }
+                } else if samples.len() == COLLECTOR_STAGE_RETAINED_SAMPLES
+                    || retained_bytes.saturating_add(body.len()) > COLLECTOR_STAGE_RETAINED_BYTES
+                {
+                    dropped += 1;
+                } else {
+                    retained_bytes += body.len();
+                    samples.insert(key, sample);
+                }
+            }
+        }
+        let mut process_ids = HashSet::new();
+        if process_identities.values().any(|id| !process_ids.insert(id)) {
+            reason.get_or_insert("collector_process_identity_duplicate");
+        }
+        if malformed > 0 {
+            reason.get_or_insert("invalid_collector_sample");
+        }
+        if budget_exhausted {
+            reason.get_or_insert("collector_emission_budget_exhausted");
+        }
+        if dropped > 0 {
+            reason.get_or_insert("collector_sample_retention_exceeded");
+        }
+        if samples.is_empty() {
+            reason.get_or_insert("no_collector_samples_in_measurement_window");
+        }
+        if identity_unverified {
+            reason.get_or_insert("pod_uid_not_bound_to_collector_logs");
+        }
+        let tolerance = interval_ms.unwrap_or(0).saturating_mul(2);
+        let mut coverage = BTreeMap::<(String, String, u64), (u64, u64, u64)>::new();
+        for ((instance, backend, generation, sequence), sample) in &samples {
+            let timestamp = sample["sampled_at_unix_ms"].as_u64().unwrap_or(0);
+            let key = (instance.clone(), backend.clone(), *generation);
+            if let Some((_, last_time, last_sequence)) = coverage.get_mut(&key) {
+                if timestamp < *last_time
+                    || timestamp.saturating_sub(*last_time) > tolerance
+                    || sequence.checked_sub(*last_sequence) != Some(1)
+                {
+                    reason.get_or_insert("collector_sample_gap");
+                }
+                *last_time = timestamp;
+                *last_sequence = *sequence;
+            } else {
+                coverage.insert(key, (timestamp, timestamp, *sequence));
+            }
+        }
+        if identities
+            .iter()
+            .any(|id| !coverage.keys().any(|(instance, _, _)| instance == id))
+            || coverage.values().any(|(first, last, _)| {
+                *first > start.saturating_add(tolerance) || last.saturating_add(tolerance) < end
+            })
+        {
+            reason.get_or_insert("collector_measurement_window_not_covered");
+        }
+    }
+    let backend_count = samples.keys().map(|(instance, backend, generation, _)| (instance, backend, generation)).collect::<HashSet<_>>().len();
+    let partial = samples
+        .into_iter()
+        .map(|((instance, _, _, _), sample)| json!({"collector_instance_id": instance, "sample": sample}))
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 1,
+        "source": "collector_stderr_stage_sample",
+        "sample_interval_ms": interval_ms,
+        "measurement_window": window.map(|(start_unix_ms, end_unix_ms)| json!({"start_unix_ms": start_unix_ms, "end_unix_ms": end_unix_ms})),
+        "identity_binding": "process_log_instance_id_collector_instance_id_and_backend_generation_pod_uid_not_verified",
+        "coverage": {
+            "scope": "observed_collector_logs_only",
+            "method": "each_observed_backend_within_two_intervals_of_window_edges_and_no_sequence_or_two_interval_gaps",
+            "observed_collectors": identities.len(),
+            "observed_backend_generations": backend_count,
+            "max_gap_ms": interval_ms.map(|value| value.saturating_mul(2)),
+            "status": if reason.is_none() { "complete_for_observed_logs" } else { "incomplete" },
+        },
+        "samples": if reason.is_none() { Some(&partial) } else { None },
+        "partial_samples": if reason.is_some() && !partial.is_empty() { Some(&partial) } else { None },
+        "unavailable_reason": reason,
+        "samples_dropped": dropped,
+        "duplicate_samples": duplicates,
+        "malformed_samples": malformed,
+        "retention": "first_2048_measurement_window_samples_up_to_4MiB",
+        "retained_sample_bytes": retained_bytes,
+        "emission_limit": "4MiB_per_collector_process_with_terminal_marker",
+    })
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -799,6 +1003,7 @@ impl CellEvidence {
             "downstream_comment": self.downstream_comment,
             "qap_observation": self.qap_observation,
             "native_telemetry": self.native_telemetry,
+            "collector_stage_telemetry": self.collector_stage_telemetry.clone().unwrap_or_else(|| json!({"schema_version": 1, "samples": null, "unavailable_reason": "collector_capture_not_completed"})),
             "resources": {
                 "scope": "collector_fleet_measurement_window_only",
                 "cpu_summary": "arithmetic_mean_of_observed_samples",
@@ -1474,6 +1679,117 @@ impl ResourceSampler {
 #[cfg(test)]
 mod measurement_evidence_tests {
     use super::*;
+
+    fn stage_log(instance: &str, lines: &str, complete: bool) -> ProcessLog {
+        ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: instance.to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete,
+            raw_log_bytes: lines.len() as u64,
+            raw_log_lines: lines.lines().count() as u64,
+            stdout: String::new(),
+            stderr: String::new(),
+            text: lines.to_owned(),
+        }
+    }
+
+    fn stage_line(sequence: u64, timestamp: u64) -> String {
+        format!(
+            "arrowcol_collector_stage_sample {}\n",
+            json!({
+                "schema_version": 1, "collector_instance_id": "collector", "backend": "backend", "backend_generation": 1, "sequence": sequence, "sampled_at_unix_ms": timestamp,
+                "cohorts": {"tables": [], "unavailable_reason": null}, "admission_wait": {}, "flush_slots_occupied": 0, "flush_slots_capacity": 4
+            })
+        )
+    }
+
+    #[test]
+    fn collector_stage_samples_are_windowed_deduplicated_and_identity_bound() {
+        let mut lines = stage_line(0, 900);
+        for i in 0..10 {
+            lines.push_str(&stage_line(i + 1, 1000 + i * 100));
+        }
+        lines.push_str(&stage_line(10, 1900));
+        lines.push_str(&stage_line(11, 2000));
+        let evidence = collector_stage_telemetry(
+            &[stage_log("container-id", &lines, true)],
+            Some((1000, 2000)),
+            Some(100),
+        );
+        assert_eq!(evidence["unavailable_reason"], Value::Null);
+        assert_eq!(evidence["samples"].as_array().expect("samples").len(), 10);
+        assert_eq!(evidence["duplicate_samples"], 1);
+        assert_eq!(evidence["samples"][0]["collector_instance_id"], "container-id");
+        let aks = collector_stage_telemetry(
+            &[stage_log("pod/container", &lines, true)],
+            Some((1000, 2000)),
+            Some(100),
+        );
+        assert!(aks["samples"].is_null());
+        assert_eq!(aks["unavailable_reason"], "pod_uid_not_bound_to_collector_logs");
+        assert_eq!(aks["partial_samples"].as_array().expect("partial").len(), 10);
+    }
+
+    #[test]
+    fn collector_stage_unavailable_evidence_is_never_zero_or_complete() {
+        assert_eq!(
+            collector_stage_telemetry(&[], None, None)["unavailable_reason"],
+            "disabled_by_default"
+        );
+        assert_eq!(
+            collector_stage_telemetry(&[], None, Some(100))["unavailable_reason"],
+            "measurement_window_unavailable"
+        );
+        let lines = stage_line(0, 1000) + &stage_line(2, 1900);
+        let gap = collector_stage_telemetry(&[stage_log("id", &lines, true)], Some((1000, 2000)), Some(100));
+        assert!(gap["samples"].is_null());
+        assert_eq!(gap["unavailable_reason"], "collector_sample_gap");
+        let lost = collector_stage_telemetry(&[stage_log("id", &lines, false)], Some((1000, 2000)), Some(100));
+        assert_eq!(lost["unavailable_reason"], "collector_log_incomplete");
+        let end = format!(
+            "arrowcol_collector_stage_sample_end {}\n",
+            json!({"schema_version":1,"sampled_at_unix_ms":1500,"unavailable_reason":"emission_budget_exhausted"})
+        );
+        let limited = collector_stage_telemetry(
+            &[stage_log("id", &(stage_line(0, 1000) + &end), true)],
+            Some((1000, 2000)),
+            Some(100),
+        );
+        assert_eq!(limited["unavailable_reason"], "collector_emission_budget_exhausted");
+    }
+
+    #[test]
+    fn collector_stage_detects_conflicting_identity_and_duplicates() {
+        let first = stage_line(0, 1000);
+        let conflicting = first.replace("\"flush_slots_capacity\":4", "\"flush_slots_capacity\":5");
+        let evidence = collector_stage_telemetry(&[stage_log("id", &(first.clone() + &conflicting), true)], Some((1000, 1100)), Some(100));
+        assert_eq!(evidence["unavailable_reason"], "conflicting_duplicate_sample");
+        let replacement = stage_line(1, 1050).replace("\"collector\"", "\"replacement\"");
+        let evidence = collector_stage_telemetry(&[stage_log("id", &(first + &replacement), true)], Some((1000, 1100)), Some(100));
+        assert_eq!(evidence["unavailable_reason"], "collector_process_identity_changed");
+    }
+
+    #[test]
+    fn collector_stage_retention_and_log_filter_are_bounded() -> Result<()> {
+        let mut lines = String::new();
+        for i in 0..(COLLECTOR_STAGE_RETAINED_SAMPLES + 1) {
+            lines.push_str(&stage_line(i as u64, 1000 + i as u64));
+        }
+        let filtered = filter_process_evidence_text(&("discard me\n".to_owned() + &lines))?;
+        assert_eq!(filtered, lines);
+        let evidence = collector_stage_telemetry(&[stage_log("id", &filtered, true)], Some((1000, 4000)), Some(100));
+        assert!(evidence["samples"].is_null());
+        assert_eq!(evidence["unavailable_reason"], "collector_sample_retention_exceeded");
+        assert_eq!(evidence["samples_dropped"], 1);
+        assert_eq!(
+            evidence["partial_samples"].as_array().expect("partial").len(),
+            COLLECTOR_STAGE_RETAINED_SAMPLES
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn native_observation_runtime_cancels_pending_source_when_sampler_is_dropped() -> Result<()> {
