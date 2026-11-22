@@ -1859,7 +1859,12 @@ mod measurement_evidence_tests {
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
+        let hash = "a".repeat(64);
         let prepared = json!({
+            "data_profile": "realistic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-excluding-endpoint_url",
             "corpus_rows": 65_536,
             "corpus_uncompressed_flight_data_bytes": 535_000,
             "corpus_configured_ipc_compression_flight_data_bytes": 500_000,
@@ -1883,35 +1888,65 @@ mod measurement_evidence_tests {
             "generator_rows_per_second": 655_360.0,
             "steady_state_generation": true,
         });
+        let realistic_manifest = json!({
+            "data_profile": "realistic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-excluding-endpoint_url",
+            "identity_status": "identity_bearing",
+            "eligible_for_identity_reconciliation": true,
+            "complete": true,
+            "truncated": false,
+        });
         snapshots[1].preparation = Some(prepared.clone());
+        snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
         let realistic = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
         assert_eq!(realistic["preparation"]["steady_state_generation"], true);
         assert_eq!(realistic["preparation"]["corpus_rows"], 65_536);
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_err());
-
-        let hash = "a".repeat(64);
-        snapshots[1].preparation.as_mut().context("test preparation")?["payload_corpus_sha256"] = json!(hash);
-        snapshots[1].logical_batch_manifest = Some(json!({
-            "payload_corpus_sha256": hash,
-            "payload_corpus_hash_scope": "arrow-ipc-v1-excluding-endpoint_url",
-            "identity_status": "identity_bearing",
-            "complete": true,
-        }));
         snapshots[1].measurement_window.as_mut().context("test measurement window")?.client_resources =
             Some(json!({"cpu_core_equivalents": 2.5}));
         let evidence = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
         assert_eq!(evidence["payload_manifest"]["payload_corpus_sha256"], hash);
+        assert_eq!(evidence["payload_manifest"]["eligible_for_identity_reconciliation"], true);
         assert_eq!(evidence["measurement_window"]["client_resources"]["cpu_core_equivalents"], 2.5);
         snapshots[1].logical_batch_manifest.as_mut().context("test manifest")?["payload_corpus_sha256"] = json!("b".repeat(64));
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
         snapshots[1].preparation = Some(prepared.clone());
-        snapshots[1].logical_batch_manifest = None;
+        snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
+
+        let diagnostic_preparation = json!({
+            "data_profile": "diagnostic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-all-columns",
+            "steady_state_generation": false,
+        });
+        let diagnostic_manifest = json!({
+            "data_profile": "diagnostic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-all-columns",
+            "identity_status": "diagnostic_only",
+            "eligible_for_identity_reconciliation": false,
+            "complete": false,
+            "truncated": false,
+        });
+        snapshots[1].preparation = Some(diagnostic_preparation.clone());
+        snapshots[1].logical_batch_manifest = Some(diagnostic_manifest);
+        let diagnostic = client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?;
+        assert_eq!(diagnostic["payload_manifest"]["identity_status"], "diagnostic_only");
+        assert_eq!(diagnostic["payload_manifest"]["complete"], false);
+        assert_eq!(diagnostic["payload_manifest"]["eligible_for_identity_reconciliation"], false);
 
         for (flag, valid_diagnostic) in [(json!(false), true), (json!("true"), false)] {
-            snapshots[1].preparation.as_mut().context("test preparation")?["steady_state_generation"] = flag;
+            let mut diagnostic_preparation = diagnostic_preparation.clone();
+            diagnostic_preparation["steady_state_generation"] = flag;
+            snapshots[1].preparation = Some(diagnostic_preparation);
             assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
             assert_eq!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_ok(), valid_diagnostic);
         }
+        snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
         snapshots[1].preparation = Some(json!({"corpus_rows": 65_536}));
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
         snapshots[1].preparation = None;
@@ -2066,6 +2101,20 @@ struct ClientMeasurementWindow {
     client_resources: Option<Value>,
 }
 
+fn client_profile_name(profile: ClientDataProfile) -> &'static str {
+    match profile {
+        ClientDataProfile::Diagnostic => "diagnostic",
+        ClientDataProfile::Realistic => "realistic",
+    }
+}
+
+fn client_payload_hash_scope(profile: ClientDataProfile) -> &'static str {
+    match profile {
+        ClientDataProfile::Diagnostic => "arrow-logical-v2-all-columns",
+        ClientDataProfile::Realistic => "arrow-logical-v2-excluding-endpoint_url",
+    }
+}
+
 fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) -> Result<Value> {
     let Some(value) = value else {
         if data_profile == ClientDataProfile::Realistic {
@@ -2081,7 +2130,18 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
         }) {
             bail!("invalid client payload corpus hash");
         }
+        if object.get("data_profile").and_then(Value::as_str) != Some(client_profile_name(data_profile))
+            || object.get("payload_corpus_hash_version").and_then(Value::as_u64) != Some(2)
+            || object.get("payload_corpus_hash_scope").and_then(Value::as_str) != Some(client_payload_hash_scope(data_profile))
+        {
+            bail!("client preparation profile or payload hash contract mismatch");
+        }
         result.insert("payload_corpus_sha256".to_owned(), hash.clone());
+        for key in ["data_profile", "payload_corpus_hash_version", "payload_corpus_hash_scope"] {
+            result.insert(key.to_owned(), object[key].clone());
+        }
+    } else if data_profile == ClientDataProfile::Realistic {
+        bail!("missing realistic client payload corpus hash");
     }
     for key in [
         "corpus_rows",
@@ -2721,17 +2781,30 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
     });
     if let Some(hash) = preparation.get("payload_corpus_sha256") {
         let manifest = end.logical_batch_manifest.as_ref().context("payload hash lacks a terminal manifest")?;
+        let (identity_status, identity_eligible, complete) = match data_profile {
+            ClientDataProfile::Diagnostic => ("diagnostic_only", false, false),
+            ClientDataProfile::Realistic => ("identity_bearing", true, true),
+        };
         if manifest["payload_corpus_sha256"] != *hash
-            || manifest["payload_corpus_hash_scope"] != "arrow-ipc-v1-excluding-endpoint_url"
-            || (data_profile == ClientDataProfile::Realistic && manifest["complete"] != true)
+            || manifest["data_profile"].as_str() != Some(client_profile_name(data_profile))
+            || manifest["payload_corpus_hash_version"].as_u64() != Some(2)
+            || manifest["payload_corpus_hash_scope"].as_str() != Some(client_payload_hash_scope(data_profile))
+            || manifest["identity_status"].as_str() != Some(identity_status)
+            || manifest["eligible_for_identity_reconciliation"].as_bool() != Some(identity_eligible)
+            || manifest["complete"].as_bool() != Some(complete)
+            || manifest["truncated"].as_bool() != Some(false)
         {
             bail!("client payload hash disagrees with terminal manifest");
         }
         result["payload_manifest"] = json!({
             "payload_corpus_sha256": hash,
+            "data_profile": manifest["data_profile"],
+            "payload_corpus_hash_version": manifest["payload_corpus_hash_version"],
             "payload_corpus_hash_scope": manifest["payload_corpus_hash_scope"],
             "identity_status": manifest["identity_status"],
+            "eligible_for_identity_reconciliation": manifest["eligible_for_identity_reconciliation"],
             "complete": manifest["complete"],
+            "truncated": manifest["truncated"],
         });
     }
     Ok(result)

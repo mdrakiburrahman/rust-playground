@@ -1,22 +1,66 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractClientEvidence, extractStoppedReceipts } from "./oat-result.js";
+import { extractClientEvidence, extractStoppedReceipts, type ClientDataProfile } from "./oat-result.js";
 import type { OatMeasurement } from "./metrics-adapter.js";
 
-test("requires matching business corpus evidence and reports client CPU separately", () => {
+function reportFor(profile: ClientDataProfile) {
   const hash = "a".repeat(64);
-  const report = { phase_counters: {
-    preparation: { payload_corpus_sha256: hash },
-    payload_manifest: { payload_corpus_sha256: hash, payload_corpus_hash_scope: "arrow-ipc-v1-excluding-endpoint_url", identity_status: "identity_bearing", complete: true },
-    measurement_window: { client_resources: { cpu_core_equivalents: 2.5, start_sample_unix_ms: 100, end_sample_unix_ms: 200 } },
-  } };
-  assert.equal(extractClientEvidence(report).payloadCorpusSha256, hash);
-  assert.equal(extractClientEvidence(report).cpu.coreEquivalents, 2.5);
+  const scope = profile === "diagnostic" ? "arrow-logical-v2-all-columns" : "arrow-logical-v2-excluding-endpoint_url";
+  const identityEligible = profile === "realistic";
+  const preparation: Record<string, unknown> = {
+    data_profile: profile, steady_state_generation: identityEligible,
+    payload_corpus_sha256: hash, payload_corpus_hash_version: 2, payload_corpus_hash_scope: scope,
+  };
+  const payloadManifest: Record<string, unknown> = {
+    data_profile: profile, payload_corpus_sha256: hash, payload_corpus_hash_version: 2,
+    payload_corpus_hash_scope: scope, identity_status: identityEligible ? "identity_bearing" : "diagnostic_only",
+    eligible_for_identity_reconciliation: identityEligible, complete: identityEligible, truncated: false,
+  };
+  const clientResources: Record<string, unknown> = {
+    cpu_core_equivalents: 2.5, start_sample_unix_ms: 100, end_sample_unix_ms: 200,
+  };
+  return { phase_counters: { preparation, payload_manifest: payloadManifest, measurement_window: { client_resources: clientResources } } };
+}
+
+test("accepts matching Realistic evidence and reports client CPU separately", () => {
+  const report = reportFor("realistic");
+  const evidence = extractClientEvidence(report, "realistic");
+  assert.equal(evidence.profile, "realistic");
+  assert.equal(evidence.identityEligibleForReconciliation, true);
+  assert.equal(evidence.payloadCorpusSha256, "a".repeat(64));
+  assert.equal(evidence.cpu.coreEquivalents, 2.5);
   report.phase_counters.payload_manifest.payload_corpus_sha256 = "b".repeat(64);
-  assert.throws(() => extractClientEvidence(report), /corpus evidence/);
-  report.phase_counters.payload_manifest.payload_corpus_sha256 = hash;
+  assert.throws(() => extractClientEvidence(report, "realistic"), /corpus evidence/);
+  report.phase_counters.payload_manifest.payload_corpus_sha256 = "a".repeat(64);
   report.phase_counters.measurement_window.client_resources.cpu_core_equivalents = -1;
-  assert.throws(() => extractClientEvidence(report), /CPU evidence/);
+  assert.throws(() => extractClientEvidence(report, "realistic"), /CPU evidence/);
+});
+
+test("accepts honest Diagnostic evidence without claiming unique delivery", () => {
+  const report = reportFor("diagnostic");
+  assert.equal(report.phase_counters.payload_manifest.complete, false);
+  const evidence = extractClientEvidence(report, "diagnostic");
+  assert.equal(evidence.profile, "diagnostic");
+  assert.equal(evidence.identityEligibleForReconciliation, false);
+  assert.equal(evidence.cpu.coreEquivalents, 2.5);
+});
+
+test("rejects profile, hash contract, unavailable, and truncated evidence", () => {
+  const mismatchedProfile = reportFor("realistic");
+  assert.throws(() => extractClientEvidence(mismatchedProfile, "diagnostic"), /corpus evidence/);
+
+  const invalidEvidence = [
+    (report: ReturnType<typeof reportFor>) => { delete report.phase_counters.preparation.payload_corpus_sha256; },
+    (report: ReturnType<typeof reportFor>) => { report.phase_counters.payload_manifest.payload_corpus_hash_version = 1; },
+    (report: ReturnType<typeof reportFor>) => { report.phase_counters.preparation.payload_corpus_hash_scope = "wrong-scope"; },
+    (report: ReturnType<typeof reportFor>) => { report.phase_counters.payload_manifest.truncated = true; },
+    (report: ReturnType<typeof reportFor>) => { report.phase_counters.payload_manifest.eligible_for_identity_reconciliation = false; },
+  ];
+  for (const corrupt of invalidEvidence) {
+    const report = reportFor("realistic");
+    corrupt(report);
+    assert.throws(() => extractClientEvidence(report, "realistic"), /corpus evidence/);
+  }
 });
 
 test("extends the frozen window with complete stopped collector receipts", () => {
