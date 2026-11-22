@@ -128,12 +128,6 @@
         "cpu_workers": 32
       }
     },
-    "parquet_writer": {
-      "defaults": {
-        "compression": "zstd",
-        "compression_level": 3
-      }
-    },
     "maintenance": {
       "enabled": true,
       "operations": ["optimize", "checkpoint"],

@@ -64,6 +64,11 @@ unmeasured.
 | 60-second warmup and 150-second measurement. | 60-second warmup and 600-second headline window. |
 | Runtime worker, blocking, upload and task limits are explicitly pinned by the local profile. | Historical manifest uses runtime defaults. |
 
+The historical run's physical codec, dictionary settings and per-column
+writer overrides are **unproven**. No codec is pinned in the parity profile;
+do not launch a parity comparison until selected-run footer and writer evidence
+binds these settings. A fixture reproducing file sizes alone is not that proof.
+
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
 
