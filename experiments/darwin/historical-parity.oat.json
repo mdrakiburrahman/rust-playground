@@ -99,6 +99,16 @@
         "max_files_per_commit": 128,
         "max_pending_files": 512
       },
+      "pressure": {
+        "max_concurrent_streams": 256,
+        "rss_limit_bytes": 92341796864,
+        "buffered_bytes_limit": 4290000000,
+        "buffered_rows_limit": 25000000,
+        "buffered_batches_limit": 16384,
+        "pressure_interval": "2s",
+        "heartbeat_interval": "5s",
+        "registration_ttl": "30s"
+      },
       "runtime": {
         "workers": 4,
         "blocking_workers": 64,

@@ -47,7 +47,9 @@ its container limit. The current 86 GiB pin rounds down 75% of observed host
 available memory after the 1 GiB client budget; it is not the historical AKS
 384 GiB allocation. Recheck host availability and the effective cap before
 every arm; refuse a run if the pin exceeds that bound. The 90% overload guard
-remains enabled. Pipeline depth 8 causes the exporter to use `force_commit=false`.
+remains enabled. Pressure registration uses the same local RSS limit and the
+historical queue limits. Pipeline depth 8 causes the exporter to use
+`force_commit=false`.
 Label measurements **local one-box scale**, not AKS-equivalent; record host
 memory and vCPUs, chosen cap and sampled collector peak RSS, using null when
 unmeasured.
