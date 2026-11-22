@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { CoverageUnavailableError } from "./metrics-adapter.js";
@@ -31,6 +31,7 @@ async function setup(repo: string, home: string, producer?: string): Promise<voi
   await writeFile(path.join(trusted, "producer.json"), `${JSON.stringify({ revision })}\n`, { flag: "wx" });
   const source = path.join(trusted, "src", "tools", "darwin", "src");
   const output = path.join(trusted, "compiled");
+  await symlink(path.join(repo, "node_modules"), path.join(trusted, "node_modules"), "dir");
   const tsc = path.join(repo, "node_modules", "typescript", "bin", "tsc");
   execFileSync(process.execPath, [
     tsc, "--ignoreConfig", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext",
