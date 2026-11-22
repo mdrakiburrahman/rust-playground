@@ -3538,8 +3538,18 @@ async fn run_isolated_cell(
     {
         publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
     }
+    let shutdown_started = unix_time_ms_u64();
     let cleanup = platform.cleanup(&config).await;
-    let shutdown_drain_evidence = platform.shutdown_drain_evidence();
+    let shutdown_drain_evidence = platform.shutdown_drain_evidence().map(|mut evidence| {
+        match shutdown_started {
+            Ok(timestamp) => evidence["ordered_shutdown_started_at_unix_ms"] = json!(timestamp),
+            Err(error) => {
+                evidence["ordered_shutdown_started_at_unix_ms"] = Value::Null;
+                evidence["ordered_shutdown_timestamp_unavailable_reason"] = json!(format!("{error:#}"));
+            }
+        }
+        evidence
+    });
     let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
@@ -4595,6 +4605,7 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                evidence["ownership_samples"] = json!(client_run.pinning.samples);
                 if let Some(fleet) = &config.platform.fleet {
                     let mut pool_rates = BTreeMap::<String, f64>::new();
                     for report in client_run.evidence.client_reports.get(&table).into_iter().flatten() {
@@ -4727,6 +4738,7 @@ struct PinningReport {
     owners: HashMap<String, String>,
     violation: Option<String>,
     verification_error: Option<String>,
+    samples: Vec<Value>,
 }
 
 async fn run_clients(
@@ -4778,6 +4790,14 @@ fn record_owner_observation(
     tables: &[String],
     require_owner: bool,
 ) {
+    let timestamp = unix_time_ms_u64();
+    report.samples.push(json!({
+        "observed_at_unix_ms": timestamp.as_ref().ok(),
+        "timestamp_unavailable_reason": timestamp.as_ref().err().map(|error| format!("{error:#}")),
+        "owners_by_table": sample.as_ref().ok(),
+        "unavailable_reason": sample.as_ref().err().map(|error| format!("{error:#}")),
+        "require_owner": require_owner,
+    }));
     match sample {
         Ok(sample) => {
             let violation = check_owner_sample(tables, &sample, &mut report.owners).or_else(|| {
@@ -14879,7 +14899,7 @@ mod tests {
                 .is_some_and(|message| message.contains("no active ArrowCol"))
         );
         let upstream = anyhow::anyhow!("gRPC failed: pinning_violation: pinned collector became unavailable");
-        let failed = failed_client_pinning_report(&upstream, Ok(healthy), &tables, PinningReport::default());
+        let failed = failed_client_pinning_report(&upstream, Ok(healthy.clone()), &tables, PinningReport::default());
         assert_eq!(
             failed.owners.get("sqlserver_wait_stats").map(String::as_str),
             Some("collector-a")
@@ -14907,6 +14927,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("router rejected 1"))
         );
+        let mut observed = PinningReport::default();
+        record_owner_observation(&mut observed, Ok(healthy), &tables, false);
+        record_owner_observation(&mut observed, Ok(HashMap::new()), &tables, false);
+        assert!(observed.violation.is_some());
+        assert!(observed.samples[0]["observed_at_unix_ms"].is_u64());
+        assert_eq!(
+            observed.samples[0]["owners_by_table"]["sqlserver_wait_stats"][0],
+            "collector-a"
+        );
+        assert_eq!(observed.samples[1]["owners_by_table"], json!({}));
         Ok(())
     }
 
@@ -17479,9 +17509,15 @@ mod tests {
             "unknown"
         );
         let mut pinning = PinningReport::default();
-        pinning
-            .owners
-            .insert(canonical_table_key(&table), "collector".to_owned());
+        record_owner_observation(
+            &mut pinning,
+            Ok(HashMap::from([(
+                canonical_table_key(&table),
+                vec!["collector".to_owned()],
+            )])),
+            std::slice::from_ref(&table),
+            false,
+        );
         let clients = ClientRun {
             metrics: HashMap::from([(
                 table.clone(),
@@ -17515,6 +17551,11 @@ mod tests {
         let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
         assert_eq!(result["downstream_status"], "unavailable");
+        assert!(result["ownership_samples"][0]["observed_at_unix_ms"].is_u64());
+        assert_eq!(
+            result["ownership_samples"][0]["owners_by_table"][&canonical_table_key(&table)][0],
+            "collector"
+        );
         Ok(())
     }
 

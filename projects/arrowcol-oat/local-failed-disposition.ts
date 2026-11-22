@@ -138,7 +138,9 @@ async function inspect(
   const cell = string(row.run_id, 'cell');
   const evidence = object(JSON.parse(string(row.evidence_json, 'cell evidence')), 'cell evidence');
   const guard = object(evidence.overload_guard, 'overload evidence');
-  if (!uuid.test(cell) || row.mode !== 'local' || row.status !== 'failed' ||
+  const failedCell = row.status === 'failed' ||
+    (row.status === 'pinning_violation' && row.pinning_ok === false && status.error.includes('pinning_violation'));
+  if (!uuid.test(cell) || row.mode !== 'local' || !failedCell ||
       row.table !== config.tables[0] || guard.run_id !== cell) throw new Error('Failed cell identity mismatch');
   const project = projectName(platform.compose_project, cell, 15, 32);
   const legacy = projectName(platform.compose_project, cell, 39, 8);

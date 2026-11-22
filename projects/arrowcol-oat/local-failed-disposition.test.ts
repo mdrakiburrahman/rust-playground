@@ -9,7 +9,7 @@ import { tableFromArrays, tableToIPC } from 'apache-arrow';
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import { assertLocalFailedDisposition, localDispositionSuffix, recordLocalFailedDisposition } from './local-failed-disposition.js';
 
-test('local failed disposition preserves evidence and refuses changed or live custody', async t => {
+for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${resultStatus} disposition preserves evidence and refuses changed or live custody`, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oat-local-disposition-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const receiptRoot = path.join(root, 'receipts');
@@ -35,6 +35,7 @@ test('local failed disposition preserves evidence and refuses changed or live cu
     serverUrl: 'http://127.0.0.1:1234/', serverExecutable: '/tmp/oat',
     submitted_config_body: body, submitted_config_sha256: hash, source_config_sha256: 'a'.repeat(64),
   };
+  const error = resultStatus === 'failed' ? 'guard unavailable' : 'pinning_violation: no active owner';
   const receipt = {
     version: 1, invocation_id: invocation, run_id: run, creation_state: 'accepted', run_state: 'failed',
     started_at_unix_ms: 1,
@@ -42,23 +43,38 @@ test('local failed disposition preserves evidence and refuses changed or live cu
     server_executable: '/tmp/oat', server_url: marker.serverUrl, submitted_config_body: body,
     submitted_config_sha256: hash, source_config_sha256: marker.source_config_sha256,
     terminal_observation: {
-      observed_at_unix_ms: 10, status: { id: run, state: 'failed', config_sha256: hash, error: 'guard unavailable', started_at_unix_ms: 2, finished_at_unix_ms: 9 },
+      observed_at_unix_ms: 10, status: { id: run, state: 'failed', config_sha256: hash, error, started_at_unix_ms: 2, finished_at_unix_ms: 9 },
     },
   };
   const table = tableFromArrays({
-    run_id: [cell], mode: ['local'], status: ['failed'], table: ['test_table'],
+    run_id: [cell], mode: ['local'], status: [resultStatus], pinning_ok: [false], table: ['test_table'],
     evidence_json: [JSON.stringify({ overload_guard: { run_id: cell } })],
   });
   await writeFile(resultPath, writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream'))));
   await writeFile(receiptPath, JSON.stringify(receipt));
   await writeFile(markerPath, JSON.stringify(marker));
-  await writeFile(logPath, `${run} ${project} guard unavailable`);
+  await writeFile(logPath, `${run} ${project} ${error}`);
   const originals = await Promise.all([receiptPath, markerPath, resultPath, logPath].map(file => readFile(file)));
   const env = {
     docker: (_args: string[]) => '',
     processStartTicks: async (_pid: number) => undefined,
     bootId: async () => '123e4567-e89b-42d3-a456-426614174004',
   };
+  if (resultStatus === 'pinning_violation') {
+    await writeFile(receiptPath, JSON.stringify({
+      ...receipt, terminal_observation: { ...receipt.terminal_observation,
+        status: { ...receipt.terminal_observation.status, error: 'guard unavailable' } },
+    }));
+    await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env), /Failed cell identity mismatch/);
+    await writeFile(receiptPath, originals[0]!);
+    const invalid = tableFromArrays({
+      run_id: [cell], mode: ['local'], status: [resultStatus], pinning_ok: [true], table: ['test_table'],
+      evidence_json: [JSON.stringify({ overload_guard: { run_id: cell } })],
+    });
+    await writeFile(resultPath, writeParquet(WasmTable.fromIPCStream(tableToIPC(invalid, 'stream'))));
+    await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env), /Failed cell identity mismatch/);
+    await writeFile(resultPath, originals[2]!);
+  }
   await recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env);
   const dispositionPath = receiptPath + localDispositionSuffix;
   await assertLocalFailedDisposition(receiptPath, dispositionPath, env);

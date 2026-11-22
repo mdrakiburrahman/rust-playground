@@ -58,6 +58,8 @@ a ladder or A/A. Parity builds use a stable Compose build project and pin each
 role to its immutable image ID. The first reconciled arm records the image and
 corpus identity; subsequent arms refuse an image mismatch before starting.
 A failed arm retains its lock until owned-cell recovery.
+Results retain timestamped router ownership samples and the start time of
+ordered shutdown; missing timestamps carry an explicit reason.
 
 Confirm Realistic codec, dictionary and compression winners on historical
 parity at AKS-like file sizes (approximately 2 million rows/file) before
@@ -113,7 +115,7 @@ evaluator exit.
 
 On failure, retain the exact receipt, ownership marker, result and run log; use
 `--cleanup-local <cell-uuid>` for that owned cell. For a failed single-cell
-local run with bound overload evidence, run
+local run with bound overload evidence, including an unranked `pinning_violation`, run
 `--recover-failed-local <invocation-id> <preserved-ownership-marker-path>` from
 the receipt-owning runtime after verified cleanup. It appends a disposition
 without changing the failed receipt; each subsequent launch rechecks its
