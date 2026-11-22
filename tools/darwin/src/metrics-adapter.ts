@@ -13,6 +13,20 @@ export interface OatMeasurement extends Measurement {
   downstreamUnavailableReason: string | null;
 }
 
+export interface TimedReceipt {
+  tableId: string;
+  tableName: string;
+  version: number;
+  rows: number;
+  files: number;
+  inputBytes: number;
+  parquetBytes: number;
+  minIngestedAtMs: number;
+  maxIngestedAtMs: number;
+  finishedAtUnixMs: number;
+  elapsedSeconds: number;
+}
+
 function object(value: unknown, label: string): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${label} must be an object`);
@@ -35,6 +49,59 @@ function integer(value: unknown, label: string, minimum = 0): number {
 
 function nearlyEqual(actual: number, expected: number): boolean {
   return Math.abs(actual - expected) <= 1e-8 * Math.max(1, Math.abs(expected));
+}
+
+function text(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim() === "") throw new Error(`${label} is missing`);
+  return value;
+}
+
+export function extractTimedReceipts(input: unknown, tableName: string, measurement: OatMeasurement): TimedReceipt[] {
+  const evidence = object(input, "evidence");
+  const commits = object(evidence.durable_commits, "durable commits");
+  const cumulative = object(commits.run_cumulative_output, "cumulative output");
+  if (cumulative.unavailable_reason != null || !Array.isArray(cumulative.commits_by_version)) {
+    throw new Error("complete timed receipts are unavailable");
+  }
+  const cumulativeRows = integer(cumulative.rows, "cumulative receipt rows", 1);
+  const seen = new Map<string, TimedReceipt>();
+  for (const raw of cumulative.commits_by_version) {
+    const receipt = object(raw, "commit receipt");
+    const parsed: TimedReceipt = {
+      tableId: text(receipt.table_id, "receipt table id"),
+      tableName: text(receipt.table_name, "receipt table name"),
+      version: integer(receipt.delta_version, "receipt Delta version"),
+      rows: integer(receipt.rows, "receipt rows", 1),
+      files: integer(receipt.files, "receipt files", 1),
+      inputBytes: integer(receipt.input_bytes, "receipt input bytes"),
+      parquetBytes: integer(receipt.parquet_bytes, "receipt Parquet bytes", 1),
+      minIngestedAtMs: integer(receipt.min_ingested_at_ms, "receipt minimum ingest time"),
+      maxIngestedAtMs: integer(receipt.max_ingested_at_ms, "receipt maximum ingest time"),
+      finishedAtUnixMs: integer(receipt.finished_at_unix_ms, "receipt finish time"),
+      elapsedSeconds: number(receipt.elapsed_seconds, "receipt elapsed seconds"),
+    };
+    if (parsed.tableName !== tableName || parsed.minIngestedAtMs > parsed.maxIngestedAtMs) {
+      throw new Error("commit receipt table or ingest times are inconsistent");
+    }
+    const key = `${parsed.tableId}\0${parsed.version}`;
+    const prior = seen.get(key);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(parsed)) throw new Error("conflicting commit receipts");
+    seen.set(key, parsed);
+  }
+  const receipts = [...seen.values()];
+  if (new Set(receipts.map(receipt => receipt.tableId)).size !== 1) {
+    throw new Error("expected exactly one receipt table identity");
+  }
+  const selected = receipts.filter(receipt =>
+    receipt.finishedAtUnixMs >= measurement.startUnixMs && receipt.finishedAtUnixMs < measurement.endUnixMs);
+  const sum = (items: TimedReceipt[], field: "rows" | "parquetBytes") =>
+    items.reduce((total, receipt) => integer(total + receipt[field], "receipt total"), 0);
+  if (sum(receipts, "rows") !== cumulativeRows
+    || sum(selected, "rows") !== measurement.rows || sum(selected, "parquetBytes") !== measurement.parquetBytes
+    || selected.length !== measurement.commitLatencySeconds.samples) {
+    throw new Error("timed receipts do not match commit-window totals");
+  }
+  return selected;
 }
 
 /**

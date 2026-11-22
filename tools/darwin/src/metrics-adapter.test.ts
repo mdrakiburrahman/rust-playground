@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { adaptOatEvidence } from "./metrics-adapter.js";
+import { adaptOatEvidence, extractTimedReceipts } from "./metrics-adapter.js";
 
 function evidence() {
   return {
@@ -51,4 +51,27 @@ test("rejects incomplete or inconsistent windows and unknown durable counts", ()
   const mismatchedBucket = evidence();
   mismatchedBucket.durable_commits.complete_30_second_commit_windows[1].rows++;
   assert.throws(() => adaptOatEvidence(mismatchedBucket), /bucket totals/);
+});
+
+test("selects half-open timed version receipts and rejects missing or conflicting evidence", () => {
+  const raw = evidence();
+  const measurement = adaptOatEvidence(raw);
+  const receipts = Array.from({ length: 7 }, (_, i) => ({
+    table_id: "one-id", table_name: "one", delta_version: i, rows: 300, files: 1,
+    input_bytes: 900, parquet_bytes: 600, min_ingested_at_ms: 0, max_ingested_at_ms: 100,
+    finished_at_unix_ms: [999, 1000, 31000, 61000, 91000, 121000, 151000][i],
+    elapsed_seconds: 0.1,
+  }));
+  const withReceipts = (list: unknown[]) => ({
+    ...raw,
+    durable_commits: { ...raw.durable_commits, run_cumulative_output: {
+      rows: 2100, commits_by_version: list,
+    } },
+  });
+  assert.deepEqual(extractTimedReceipts(withReceipts(receipts), "one", measurement).map(r => r.version), [1, 2, 3, 4, 5]);
+  assert.equal(extractTimedReceipts(withReceipts([...receipts, receipts[1]]), "one", measurement).length, 5);
+  assert.throws(() => extractTimedReceipts(withReceipts(receipts.slice(1)), "one", measurement), /receipt/);
+  assert.throws(() => extractTimedReceipts(withReceipts([...receipts, { ...receipts[1], rows: 301 }]), "one", measurement), /conflicting/);
+  const missingTime = receipts.map((receipt, index) => index === 1 ? { ...receipt, finished_at_unix_ms: undefined } : receipt);
+  assert.throws(() => extractTimedReceipts(withReceipts(missingTime), "one", measurement), /finish time/);
 });
