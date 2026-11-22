@@ -3253,6 +3253,12 @@ mod tests {
         options.data_profile = DataProfile::Realistic;
         options.payload_customer_id = Some("direct-e64-confirmwide".to_owned());
         let table = table_named("sqlserver_availability_replica_states")?;
+        options.data_profile = DataProfile::Diagnostic;
+        assert_eq!(
+            synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?,
+            synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?
+        );
+        options.data_profile = DataProfile::Realistic;
         let first = synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?;
         let second = synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?;
         assert_eq!(first, second);

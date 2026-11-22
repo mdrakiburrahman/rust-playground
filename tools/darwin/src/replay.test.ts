@@ -4,7 +4,26 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { cleanEnv, hasPinnedSubmodules, localReplayOptions } from "./replay.js";
+import { assertMatchingReplayInputs, cleanEnv, hasPinnedSubmodules, localReplayOptions } from "./replay.js";
+
+test("rejects paired results with different business corpora or binaries", () => {
+  const baseline = {
+    binaryHash: "controller",
+    images: ["client:image", "collector:image"],
+    clientEvidence: {
+      profile: "realistic" as const,
+      identityEligibleForReconciliation: true,
+      payloadCorpusSha256: "a".repeat(64),
+      cpu: { coreEquivalents: null, sampleStartUnixMs: null, sampleEndUnixMs: null, unavailableReason: "unavailable" },
+    },
+  };
+  assert.doesNotThrow(() => assertMatchingReplayInputs(baseline, structuredClone(baseline)));
+  assert.throws(() => assertMatchingReplayInputs(baseline, {
+    ...baseline, clientEvidence: { ...baseline.clientEvidence, payloadCorpusSha256: "b".repeat(64) },
+  }), /business corpus/);
+  assert.throws(() => assertMatchingReplayInputs(baseline, { ...baseline, binaryHash: "other" }), /binaries/);
+  assert.throws(() => assertMatchingReplayInputs(baseline, { ...baseline, images: ["client:other"] }), /binaries/);
+});
 
 test("keeps the frozen collector hard cap when wiring replay endpoints", () => {
   const local = localReplayOptions({ collector_memory_limit_bytes: 4294967296 }, "127.0.0.1", "127.0.0.1", "/snapshot");

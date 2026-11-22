@@ -15,6 +15,16 @@ function object(value: unknown, label: string): JsonObject {
   return value as JsonObject;
 }
 
+type ReplayIdentity = Pick<Awaited<ReturnType<typeof readReconciledOatResult>>, "images" | "clientEvidence"> & { binaryHash: string };
+
+export function assertMatchingReplayInputs(baseline: ReplayIdentity, candidate: ReplayIdentity): void {
+  if (baseline.binaryHash !== candidate.binaryHash
+    || JSON.stringify(baseline.images) !== JSON.stringify(candidate.images)
+    || baseline.clientEvidence.payloadCorpusSha256 !== candidate.clientEvidence.payloadCorpusSha256) {
+    throw new Error("baseline and candidate did not use identical OAT/workload binaries and business corpus");
+  }
+}
+
 export function localReplayOptions(raw: unknown, bindHost: string, endpointHost: string, snapshotRoot: string): JsonObject {
   const local = object(raw, "local platform");
   if (!Number.isSafeInteger(local.collector_memory_limit_bytes) || Number(local.collector_memory_limit_bytes) <= 0) {
@@ -201,11 +211,8 @@ export async function replayCompressionPair(
         baseline,
       };
     }
-    if (!baseline || !candidateResult || baseline.binaryHash !== candidateResult.binaryHash
-      || JSON.stringify(baseline.images) !== JSON.stringify(candidateResult.images)
-      || baseline.clientEvidence.payloadCorpusSha256 !== candidateResult.clientEvidence.payloadCorpusSha256) {
-      throw new Error("baseline and candidate did not use identical OAT/workload binaries and business corpus");
-    }
+    if (!baseline || !candidateResult) throw new Error("baseline and candidate are required");
+    assertMatchingReplayInputs(baseline, candidateResult);
     const ratio = candidateResult.measurement.durableRowsPerSecond / baseline.measurement.durableRowsPerSecond;
     completed = true;
     return {
