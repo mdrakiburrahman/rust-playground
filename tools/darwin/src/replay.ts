@@ -1,0 +1,163 @@
+import { createHash } from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
+import { cp, mkdir, mkdtemp, open, readFile, readdir, realpath, rmdir, writeFile } from "node:fs/promises";
+import { userInfo } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { checkCompressionCandidate } from "./compression-policy.js";
+import { readReconciledOatResult } from "./oat-result.js";
+import type { SnapshotManifest } from "./snapshot.js";
+
+type JsonObject = Record<string, unknown>;
+
+function object(value: unknown, label: string): JsonObject {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  return value as JsonObject;
+}
+
+function cleanEnv(home: string, stackBytes: number): NodeJS.ProcessEnv {
+  return {
+    HOME: home, USER: userInfo().username, LANG: "C.UTF-8",
+    PATH: "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+    CARGO_HOME: "/usr/local/cargo", RUSTUP_HOME: "/usr/local/rustup",
+    RUST_MIN_STACK: String(stackBytes),
+  };
+}
+
+function git(workspace: string, env: NodeJS.ProcessEnv, ...args: string[]): string {
+  return execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8", env, maxBuffer: 64 * 1024 * 1024 }).trim();
+}
+
+async function checkDependencyLinks(runtime: string, directory: string): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const target = join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      const resolved = await realpath(target);
+      if (resolved !== runtime && !resolved.startsWith(`${runtime}/`)) throw new Error("trusted dependency points outside the isolated runtime");
+    } else if (entry.isDirectory()) {
+      await checkDependencyLinks(runtime, target);
+    } else if (!entry.isFile()) {
+      throw new Error("trusted dependencies contain a non-file");
+    }
+  }
+}
+
+async function prepareRuntime(repo: string, home: string, manifest: SnapshotManifest, producerRevision: string, stackBytes: number): Promise<string> {
+  const runtime = join(home, "trusted", "runtime");
+  const preparationHome = join(home, "trusted", "prepare-home");
+  await mkdir(preparationHome, { recursive: true });
+  const env = cleanEnv(preparationHome, stackBytes);
+  if (!/^[a-f0-9]{40}$/.test(producerRevision)) throw new Error("producer revision must be a full Git SHA");
+  git(repo, env, "merge-base", "--is-ancestor", producerRevision, manifest.commit);
+  try {
+    await realpath(runtime);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    git(repo, env, "worktree", "add", "--detach", runtime, producerRevision);
+    git(runtime, env, "submodule", "update", "--init", "--recursive");
+    await cp(join(repo, "node_modules"), join(runtime, "node_modules"), { recursive: true, dereference: false, verbatimSymlinks: true });
+  }
+  if (git(runtime, env, "rev-parse", "--show-toplevel") !== runtime
+    || git(runtime, env, "rev-parse", "HEAD") !== producerRevision
+    || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+    || git(runtime, env, "submodule", "status", "--recursive").split("\n").some(line => line && !line.startsWith(" "))) {
+    throw new Error("trusted OAT runtime is not clean at the frozen source revision");
+  }
+  await checkDependencyLinks(runtime, join(runtime, "node_modules"));
+  return runtime;
+}
+
+async function runOat(runtime: string, configPath: string, home: string, logPath: string, stackBytes: number): Promise<void> {
+  const log = await open(logPath, "wx");
+  try {
+    const child = spawn(process.execPath, ["--import", "tsx", "projects/arrowcol-oat/cli.ts",
+      "--config", configPath, "--mode", "local", "--no-viewer"], {
+      cwd: runtime, env: cleanEnv(home, stackBytes), stdio: ["ignore", log.fd, log.fd],
+    });
+    const timedOut = { value: false };
+    const timer = setTimeout(() => { timedOut.value = true; child.kill("SIGTERM"); }, 6 * 60 * 60 * 1000);
+    try {
+      const code = await new Promise<number>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (status, signal) => {
+          if (status === 0 && !timedOut.value) resolve(status);
+          else reject(new Error(`OAT run failed (${timedOut.value ? "deadline" : signal ?? status}); inspect ${logPath} and owned-cell recovery before retrying`));
+        });
+      });
+      if (code !== 0) throw new Error("OAT run did not succeed");
+    } finally { clearTimeout(timer); }
+  } finally { await log.close(); }
+}
+
+async function sha256(path: string): Promise<string> {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+export async function replayCompressionPair(
+  repo: string, home: string, candidate: unknown, bindHost: string, endpointHost: string, stackBytes: number,
+): Promise<JsonObject> {
+  if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
+    throw new Error("local bind and endpoint hosts must be explicit IP addresses");
+  }
+  const manifest = JSON.parse(await readFile(join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
+  const producer = object(JSON.parse(await readFile(join(home, "trusted", "producer.json"), "utf8")), "producer binding");
+  if (typeof producer.revision !== "string" || !Number.isSafeInteger(stackBytes)
+    || stackBytes < 2 * 1024 * 1024 || stackBytes > 128 * 1024 * 1024) throw new Error("invalid producer or controller stack setting");
+  const seed = JSON.parse(await readFile(join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+  const candidateLevel = checkCompressionCandidate(seed, candidate);
+  const baselineLevel = checkCompressionCandidate(seed, seed);
+  const seedClient = object(object(object(seed, "seed").tunables, "tunables").client, "client");
+  if (seedClient.data_profile !== "realistic" || seedClient.seed !== 20260923) throw new Error("realistic corpus identity is not pinned");
+  const data = join(home, "data");
+  await mkdir(data, { recursive: true });
+  const lock = join(data, "evaluating");
+  await mkdir(lock);
+  let completed = false;
+  try {
+    const runtime = await prepareRuntime(repo, home, manifest, producer.revision, stackBytes);
+    const results = [];
+    for (const [label, raw, level] of [["baseline", seed, baselineLevel], ["candidate", candidate, candidateLevel]] as const) {
+      const runRoot = await mkdtemp(join(data, `${label}-`));
+      const runHome = join(runRoot, "home");
+      await mkdir(runHome);
+      const config = object(structuredClone(raw), "run config");
+      const platform = object(config.platform, "platform");
+      if (platform.kind !== "local" || !Array.isArray(config.tables) || config.tables.length !== 1
+        || config.tables[0] !== "sqlserver_active_sessions") throw new Error("unsupported replay topology or fixture");
+      platform.compose_state_root = join(runRoot, "state");
+      platform.local = { bind_host: bindHost, endpoint_host: endpointHost, snapshot_root: join(runRoot, "snapshots") };
+      config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
+      config.website_url = pathToFileURL(join(runRoot, "site", "results.parquet")).href;
+      const configPath = join(runRoot, "config.json");
+      await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o400 });
+      const configHash = await sha256(configPath);
+      await runOat(runtime, configPath, runHome, join(runRoot, "run.log"), stackBytes);
+      if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
+      const result = await readReconciledOatResult(
+        join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_active_sessions", producer.revision, level,
+      );
+      const binaryHash = await sha256(join(runtime, "target", "debug", "arrowcol-oat-rust"));
+      const env = cleanEnv(runHome, stackBytes);
+      if (git(runtime, env, "rev-parse", "HEAD") !== producer.revision
+        || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {
+        throw new Error("trusted source changed during OAT run");
+      }
+      results.push({ ...result, binaryHash, configHash, runRoot });
+    }
+    const [baseline, candidateResult] = results;
+    if (!baseline || !candidateResult || baseline.binaryHash !== candidateResult.binaryHash
+      || JSON.stringify(baseline.images) !== JSON.stringify(candidateResult.images)) {
+      throw new Error("baseline and candidate did not use identical OAT and workload binaries");
+    }
+    const ratio = candidateResult.measurement.durableRowsPerSecond / baseline.measurement.durableRowsPerSecond;
+    completed = true;
+    return {
+      source_revision: producer.revision, controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923", baseline_level: baselineLevel,
+      candidate_level: candidateLevel, paired_rate_ratio: ratio,
+      bytes_guard_passed: candidateResult.measurement.parquetBytesPerRow <= baseline.measurement.parquetBytesPerRow * 1.1,
+      baseline, candidate: candidateResult,
+    };
+  } finally {
+    if (completed) await rmdir(lock);
+  }
+}

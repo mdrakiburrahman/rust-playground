@@ -1,8 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { checkCompressionCandidate } from "./compression-policy.js";
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
+import { replayCompressionPair } from "./replay.js";
 import { snapshot, type SnapshotManifest } from "./snapshot.js";
 
 function option(args: string[], name: string, fallback?: string): string {
@@ -18,16 +20,22 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-async function setup(repo: string, home: string): Promise<void> {
+async function setup(repo: string, home: string, producer?: string): Promise<void> {
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const revision = producer ?? head;
+  if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error("producer must be a full Git SHA");
+  execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", revision, head]);
   const manifest = await snapshot(repo, home);
   const trusted = path.join(path.resolve(home), "trusted");
+  await writeFile(path.join(trusted, "producer.json"), `${JSON.stringify({ revision })}\n`, { flag: "wx" });
   const source = path.join(trusted, "src", "tools", "darwin", "src");
   const output = path.join(trusted, "compiled");
   const tsc = path.join(repo, "node_modules", "typescript", "bin", "tsc");
   execFileSync(process.execPath, [
     tsc, "--ignoreConfig", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext",
     "--skipLibCheck", "--types", "node", "--rootDir", source, "--outDir", output,
-    ...["main.ts", "paths.ts", "policy.ts", "snapshot.ts"].map((file) => path.join(source, file)),
+    ...["main.ts", "paths.ts", "policy.ts", "snapshot.ts", "compression-policy.ts", "metrics-adapter.ts",
+      "score.ts", "delta-reconcile.ts", "oat-result.ts", "replay.ts"].map((file) => path.join(source, file)),
   ], { cwd: repo, stdio: "inherit" });
   await writeFile(path.join(output, "package.json"), '{"type":"module"}\n', { flag: "wx" });
   const launcher = path.join(trusted, "bin", "harness");
@@ -40,7 +48,7 @@ env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$home" DARWIN_HOME=${shellQuote(p
 `;
   await writeFile(launcher, script, { flag: "wx" });
   await chmod(launcher, 0o755);
-  console.log(`Snapshot ${manifest.commit} prepared; only stub evaluation is available.`);
+  console.log(`Snapshot ${manifest.commit} prepared with OAT producer ${revision}.`);
 }
 
 async function check(home: string, candidate: string, experiment: string): Promise<number> {
@@ -56,16 +64,46 @@ async function main(args: string[]): Promise<void> {
   const repo = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
   const home = path.resolve(option(args, "--home", process.env.DARWIN_HOME));
   if (command === "setup") {
-    await setup(repo, home);
+    await setup(repo, home, args.includes("--producer") ? option(args, "--producer") : undefined);
     return;
   }
   if (command !== "preflight" && command !== "evaluate") throw new Error("unsupported operation");
   const experiment = option(args, "--experiment");
   const candidate = path.resolve(option(args, "--candidate", repo));
-  if (!args.includes("--stub")) {
-    throw new Error("real evaluation is unavailable: production-region guards, fixtures, isolated execution and reconciliation are not implemented");
-  }
   const problems = await check(home, candidate, experiment);
+  if (!args.includes("--stub")) {
+    if (experiment !== "compression-config") throw new Error("this lane is not implemented and is refused");
+    try {
+      if (problems) throw new Error(`candidate violates ${problems} path checks`);
+      const baseline = JSON.parse(await readFile(path.join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+      const changed = JSON.parse(await readFile(path.join(candidate, "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+      checkCompressionCandidate(baseline, changed);
+      if (command === "preflight") {
+        console.log("Config-only compression preflight passed; Tier 1 qualification and code lanes remain unavailable.");
+        return;
+      }
+      if (!args.includes("--smoke")) throw new Error("only a single-pair smoke replay is implemented; qualification remains unavailable");
+      const result = await replayCompressionPair(
+        repo, home, changed, option(args, "--bind-host"), option(args, "--endpoint-host"), Number(option(args, "--controller-stack-bytes")),
+      );
+      console.log("@FEEDBACK One independently reconciled pair is diagnostic, not a qualified winner.");
+      console.log(`@RESULT ${JSON.stringify({
+        version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
+        combined_score: 0, accepted: false, reason: "one pair is not qualified",
+        replay: result,
+      })}`);
+    } catch (error) {
+      if (command === "preflight") throw error;
+      const reason = error instanceof Error ? error.message : "unexpected evaluator error";
+      console.log(`@FEEDBACK ${reason}`);
+      console.log(`@RESULT ${JSON.stringify({
+        version: 1, experiment, tier: "tier2-smoke", objective: "durable-rate", valid: 0,
+        combined_score: 0, accepted: false, reason,
+      })}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (command === "preflight") {
     if (problems) throw new Error(`candidate violates ${problems} path checks`);
     console.log("Stub preflight passed path checks only; production-region and evidence checks remain unavailable.");
