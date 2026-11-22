@@ -17,7 +17,7 @@ const fields: Readonly<Record<string, Field>> = {
   "tunables.collector.batching.pipeline_depth": { group: "batching", values: [1, 2, 4, 8] },
   "tunables.collector.batching.max_concurrent_flushes": { group: "batching", values: [1, 2, 4] },
   "tunables.collector.batching.age_flush_policy": { group: "batching", values: ["immediate", "drain_ready"] },
-  "tunables.collector.commit.batch_window": { group: "commit", values: ["2ms", "10ms"] },
+  "tunables.collector.commit.batch_window": { group: "commit", values: ["2ms", "10ms", "250ms", "2s"] },
   "tunables.collector.commit.max_files_per_commit": { group: "commit", values: [1, 4, 16] },
   "tunables.collector.runtime.cpu_workers": { group: "runtime", values: [1, 2, 4] },
   "tunables.collector.runtime.upload_limit": { group: "runtime", values: [1, 2, 4] },

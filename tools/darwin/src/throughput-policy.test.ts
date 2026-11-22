@@ -40,7 +40,7 @@ const grid: ReadonlyArray<[ThroughputGroup, string, readonly (number | string)[]
   ["batching", "tunables.collector.batching.pipeline_depth", [1, 2, 4, 8]],
   ["batching", "tunables.collector.batching.max_concurrent_flushes", [1, 2, 4]],
   ["batching", "tunables.collector.batching.age_flush_policy", ["immediate", "drain_ready"]],
-  ["commit", "tunables.collector.commit.batch_window", ["2ms", "10ms"]],
+  ["commit", "tunables.collector.commit.batch_window", ["2ms", "10ms", "250ms", "2s"]],
   ["commit", "tunables.collector.commit.max_files_per_commit", [1, 4, 16]],
   ["runtime", "tunables.collector.runtime.cpu_workers", [1, 2, 4]],
   ["runtime", "tunables.collector.runtime.upload_limit", [1, 2, 4]],
@@ -76,6 +76,8 @@ test("rejects type, enum and grid errors without mutating either input", () => {
     ["tunables.client.streams_per_worker", null], ["tunables.collector.batching.pipeline_depth", 9],
     ["tunables.collector.batching.age_flush_policy", "drain-ready"],
     ["tunables.collector.commit.batch_window", "0ms"], ["tunables.collector.commit.batch_window", "0s"],
+    ["tunables.collector.commit.batch_window", 250], ["tunables.collector.commit.batch_window", "250 ms"],
+    ["tunables.collector.commit.batch_window", "2sec"],
     ["tunables.collector.runtime.upload_limit", 5], ["tunables.router.sql_pool_max_size", 16],
   ] as const) {
     const candidate = structuredClone(baseline);
@@ -91,6 +93,8 @@ test("rejects cross-group changes including explicit overrides of effective defa
     ["tunables.collector.batching.pipeline_depth", 1],
     ["tunables.collector.batching.age_flush_policy", "immediate"],
     ["tunables.collector.commit.batch_window", "2ms"],
+    ["tunables.collector.commit.batch_window", "250ms"],
+    ["tunables.collector.commit.batch_window", "2s"],
   ] as const) {
     const candidate = structuredClone(baseline);
     set(candidate, first, value);
