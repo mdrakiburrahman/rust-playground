@@ -60,6 +60,9 @@ const INTERNAL_CONTEXT_HEADER: &str = "x-arrowcol-internal-auth-context";
 const EDGE_SIGNATURE_HEADER: &str = "x-arrowcol-edge-signature";
 const COMPRESSION_ENV: &str = "ARROWCOL_ROUTER_TEST_COMPRESSION";
 
+#[path = "support/router_sql_fixture.rs"]
+mod router_sql_fixture;
+
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[derive(Clone)]
@@ -806,6 +809,9 @@ async fn serve_compression_backend(backend: SocketAddr, codecs: &str, state: &st
 }
 
 fn run_child() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_ROUTER_SQL_FIXTURE").as_deref() == Ok("1") {
+        return router_sql_fixture::run_child();
+    }
     let listen: SocketAddr = std::env::var(LISTEN_ENV)?.parse()?;
     let backend: SocketAddr = std::env::var(BACKEND_ENV)?.parse()?;
     let state = std::env::var(STATE_ENV)?;
