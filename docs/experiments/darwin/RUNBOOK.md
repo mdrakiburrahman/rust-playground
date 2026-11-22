@@ -107,7 +107,11 @@ Client process CPU is reported separately from
 collector samples, with its own sampling interval or an unavailable reason.
 The hourly ingestion-partitioned table is checked against catalog metadata
 before the clients are armed. Each pre-load Delta log is hashed and must have
-no Adds or Removes; all later versions need cumulative collector receipts.
+no Adds or Removes. Later metadata-only versions need no receipt; every ingestion
+Add version, including post-window drain, must match a final stopped collector
+receipt and independently decoded file counts, rows and bytes. Removes and
+non-ingestion Adds fail the fresh-table, no-rewrite check. Window selection uses
+receipt completion times, not Delta commitInfo timestamps.
 The stopped collector's complete log extends the pre-stop ledger through
 shutdown drain. Overlapping receipts and the measured window must agree.
 Gaps produce a null unattributed-row count, an explicit reason and a nonzero

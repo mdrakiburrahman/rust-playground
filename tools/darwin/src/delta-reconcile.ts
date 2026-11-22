@@ -173,18 +173,15 @@ export async function reconcileStoppedSnapshot(
       throw new CoverageUnavailableError("cumulative and window receipt selection disagree");
     }
   }
-  const selectedAdds = new Map<number, Add[]>();
+  const ingestionAdds = new Map<number, Add[]>();
   let latestSchema: string | undefined;
   for (let version = 0; version <= latestVersion; version++) {
     if (version <= preload.latest_version && all.has(version)) {
       throw new CoverageUnavailableError(`pre-load Delta version ${version} has an ingestion receipt`);
     }
-    if (version > preload.latest_version && !all.has(version)) {
-      throw new CoverageUnavailableError(`Delta version ${version} has no cumulative collector receipt`);
-    }
     const path = join(tableRoot, "_delta_log", `${String(version).padStart(20, "0")}.json`);
     const log = await readFile(path, "utf8");
-    let dataChangeAdds = 0;
+    const adds: Add[] = [];
     for (const line of log.split("\n").filter(Boolean)) {
       const action = object(JSON.parse(line), "Delta action");
       if (action.metaData != null) {
@@ -201,33 +198,30 @@ export async function reconcileStoppedSnapshot(
           throw new Error("unsupported Delta Add");
         }
         const add: Add = { path: safePath(value.path), size: uint(value.size, "Delta Add size"), version, dataChange: value.dataChange !== false };
-        if (add.dataChange) dataChangeAdds++;
-        const previous = referenced.get(add.path);
-        if (previous && previous.size !== add.size) throw new Error("historical Delta Add changed size");
+        if (!add.dataChange || referenced.has(add.path)) {
+          throw new CoverageUnavailableError("fresh-table ingestion contains a rewrite or duplicate Add");
+        }
         referenced.set(add.path, add);
         active.set(add.path, add);
-        if (selected.has(version) && add.dataChange) {
-          const adds = selectedAdds.get(version) ?? [];
-          if (adds.some(previousAdd => previousAdd.path === add.path)) throw new Error("duplicate Delta Add in commit");
-          adds.push(add);
-          selectedAdds.set(version, adds);
-        }
+        adds.push(add);
       }
       if (action.remove != null) {
         if (version <= preload.latest_version) throw new CoverageUnavailableError("pre-load Delta prefix contains a Remove");
-        const remove = object(action.remove, "Delta Remove");
-        if (remove.deletionVector != null) throw new Error("unsupported Delta Remove");
-        active.delete(safePath(remove.path));
+        throw new CoverageUnavailableError("fresh-table ingestion contains a Delta Remove");
       }
     }
-    if (version > preload.latest_version && dataChangeAdds === 0) {
-      throw new CoverageUnavailableError(`Delta version ${version} is not attributable to the expected fresh-table ingestion`);
+    if (adds.length) {
+      if (!all.has(version)) throw new CoverageUnavailableError(`Delta version ${version} has no cumulative collector receipt`);
+      ingestionAdds.set(version, adds);
+    } else if (all.has(version)) {
+      throw new CoverageUnavailableError(`Delta version ${version} has a collector receipt but no ingestion Adds`);
     }
   }
   if (!latestSchema || latestSchema !== manifest.schemaString || !active.size || !expectedActiveRows) {
     throw new Error("snapshot has no consistent schema or active files");
   }
-  const selectedPaths = new Set([...selectedAdds.values()].flat().map(add => add.path));
+  const selectedPaths = new Set([...ingestionAdds.entries()]
+    .filter(([version]) => selected.has(version)).flatMap(([, adds]) => adds.map(add => add.path)));
   const decoded = new Map<string, number>();
   let activeRows = 0;
   const activeFileRows: number[] = [];
@@ -266,20 +260,22 @@ export async function reconcileStoppedSnapshot(
   let rows = 0;
   let parquetBytes = 0;
   const windowFileRows: number[] = [];
-  for (const [version, receipt] of selected) {
-    const adds = selectedAdds.get(version) ?? [];
+  for (const [version, receipt] of all) {
+    const adds = ingestionAdds.get(version) ?? [];
     if (adds.length !== receipt.files) throw new Error("receipt file count does not match Delta version");
     let versionRows = 0;
     let versionBytes = 0;
     for (const add of adds) {
       if (active.get(add.path)?.version !== version || !decoded.has(add.path)) throw new Error("receipt Add is not active in stopped snapshot");
       versionRows = uint(versionRows + decoded.get(add.path)!, "decoded version rows");
-      windowFileRows.push(decoded.get(add.path)!);
+      if (selected.has(version)) windowFileRows.push(decoded.get(add.path)!);
       versionBytes = uint(versionBytes + add.size, "version bytes");
     }
     if (versionRows !== receipt.rows || versionBytes !== receipt.parquetBytes) throw new Error("receipt counters differ from independently decoded Delta Adds");
-    rows = uint(rows + versionRows, "selected rows");
-    parquetBytes = uint(parquetBytes + versionBytes, "selected bytes");
+    if (selected.has(version)) {
+      rows = uint(rows + versionRows, "selected rows");
+      parquetBytes = uint(parquetBytes + versionBytes, "selected bytes");
+    }
   }
   if (rows !== measurement.rows || parquetBytes !== measurement.parquetBytes) throw new Error("reconciled window totals differ from measurement");
   return {
