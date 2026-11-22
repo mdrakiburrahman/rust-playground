@@ -151,6 +151,15 @@ fn commit_window_output(
     Ok(result)
 }
 
+fn unavailable_cumulative_output(reason: &str) -> Value {
+    json!({
+        "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+        "rows": null,
+        "commits_by_version": [],
+        "unavailable_reason": reason,
+    })
+}
+
 fn run_cumulative_output(
     events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
     table: &str,
@@ -158,12 +167,7 @@ fn run_cumulative_output(
     cell_start_unix_ms: Option<u64>,
 ) -> Result<Value> {
     if let Some(reason) = unavailable {
-        return Ok(json!({
-            "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-            "rows": null,
-            "commits_by_version": [],
-            "unavailable_reason": reason,
-        }));
+        return Ok(unavailable_cumulative_output(reason));
     }
     let mut rows = 0_u64;
     let mut commits = 0_u64;
@@ -172,50 +176,62 @@ fn run_cumulative_output(
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
     {
+        let (
+            Some(table_id),
+            Some(table_name),
+            Some(event_rows),
+            Some(event_files),
+            Some(event_input_bytes),
+            Some(event_parquet_bytes),
+            Some(min_ingested_at_ms),
+            Some(max_ingested_at_ms),
+            Some(elapsed_seconds),
+        ) = (
+            event.table_id.as_deref(),
+            event.table_name.as_deref(),
+            event.rows,
+            event.files,
+            event.input_bytes,
+            event.parquet_bytes,
+            event.min_ingested_at_ms,
+            event.max_ingested_at_ms,
+            event.elapsed_seconds,
+        ) else {
+            return Ok(unavailable_cumulative_output("cumulative_commit_metadata_unavailable"));
+        };
+        let Some(finished_at_unix_ms) = event.finished_at_unix_ms else {
+            return Ok(unavailable_cumulative_output("cumulative_commit_finish_time_unavailable"));
+        };
+        if max_ingested_at_ms < min_ingested_at_ms || finished_at_unix_ms < 0
+            || !elapsed_seconds.is_finite() || elapsed_seconds < 0.0
+        {
+            return Ok(unavailable_cumulative_output("cumulative_commit_metadata_invalid"));
+        }
         if let Some(cell_start) = cell_start_unix_ms {
-            let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
-                return Ok(json!({
-                    "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                    "rows": null,
-                    "commits_by_version": [],
-                    "unavailable_reason": "cumulative_commit_ingress_boundary_unavailable",
-                }));
-            };
-            if last < cell_start as i64 {
+            if max_ingested_at_ms < cell_start as i64 {
                 continue;
             }
-            if first < cell_start as i64 || last < first {
-                return Ok(json!({
-                    "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                    "rows": null,
-                    "commits_by_version": [],
-                    "unavailable_reason": "commit_crosses_cell_ingress_boundary",
-                }));
+            if min_ingested_at_ms < cell_start as i64 {
+                return Ok(unavailable_cumulative_output("commit_crosses_cell_ingress_boundary"));
             }
         }
-        let Some(event_rows) = event.rows else {
-            return Ok(json!({
-                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                "rows": null,
-                "commits_by_version": [],
-                "unavailable_reason": "cumulative_commit_rows_unavailable",
-            }));
-        };
         let Some(delta_version) = event.delta_version else {
-            return Ok(json!({
-                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                "rows": null,
-                "commits_by_version": [],
-                "unavailable_reason": "cumulative_commit_version_unavailable",
-            }));
+            return Ok(unavailable_cumulative_output("cumulative_commit_version_unavailable"));
         };
         rows = rows.checked_add(event_rows).context("cumulative commit row overflow")?;
         commits = commits.checked_add(1).context("cumulative commit count overflow")?;
         commits_by_version.push(json!({
+            "table_id": table_id,
+            "table_name": table_name,
             "delta_version": delta_version,
             "rows": event_rows,
-            "files": event.files,
-            "parquet_bytes": event.parquet_bytes,
+            "files": event_files,
+            "input_bytes": event_input_bytes,
+            "parquet_bytes": event_parquet_bytes,
+            "min_ingested_at_ms": min_ingested_at_ms,
+            "max_ingested_at_ms": max_ingested_at_ms,
+            "finished_at_unix_ms": finished_at_unix_ms,
+            "elapsed_seconds": elapsed_seconds,
         }));
     }
     Ok(json!({
@@ -419,16 +435,28 @@ fn durable_commit_evidence_for_cell(
                 reason = Some("commit_overlaps_preflight_warmup_or_measurement_boundary");
                 break;
             }
-            if event.finished_at_unix_ms.is_none_or(|finished| finished < last as i64)
-                || event
-                    .elapsed_seconds
-                    .is_none_or(|elapsed| !elapsed.is_finite() || elapsed < 0.0)
-                || event.rows.is_none_or(|rows| rows == 0)
-                || event.files.is_none_or(|files| files == 0)
-                || event.parquet_bytes.is_none_or(|bytes| bytes == 0)
+            if event.finished_at_unix_ms.is_none() {
+                reason = Some("commit_finish_time_unavailable");
+                break;
+            }
+            if event.finished_at_unix_ms.is_some_and(|finished| finished < last as i64) {
+                bail!("commit finish time predates its ingress boundary");
+            }
+            if event.elapsed_seconds.is_none()
+                || event.rows.is_none()
+                || event.files.is_none()
+                || event.parquet_bytes.is_none()
                 || event.input_bytes.is_none()
             {
-                bail!("committed event omitted valid file/row/byte/timing evidence");
+                reason = Some("committed_event_evidence_unavailable");
+                break;
+            }
+            if event.elapsed_seconds.is_some_and(|elapsed| !elapsed.is_finite() || elapsed < 0.0)
+                || event.rows.is_some_and(|rows| rows == 0)
+                || event.files.is_some_and(|files| files == 0)
+                || event.parquet_bytes.is_some_and(|bytes| bytes == 0)
+            {
+                bail!("invalid committed file/row/byte/timing evidence");
             }
             selected.push(event);
         }
@@ -974,6 +1002,32 @@ mod commit_evidence_tests {
         assert_eq!(evidence["compression_ratio"], 2.0);
         assert!(evidence["unique_delivered_rows"].is_null());
         assert_eq!(evidence["complete_delivery_established"], false);
+        let receipts = evidence["run_cumulative_output"]["commits_by_version"].as_array().context("missing commit receipts")?;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["table_id"], "a".repeat(64));
+        assert_eq!(receipts[0]["table_name"], canonical_dmv_table_name(&config.tables[0])?);
+        assert_eq!(receipts[0]["delta_version"], 7);
+        assert_eq!(receipts[0]["rows"], 10);
+        assert_eq!(receipts[0]["files"], 1);
+        assert_eq!(receipts[0]["input_bytes"], 100);
+        assert_eq!(receipts[0]["parquet_bytes"], 50);
+        assert_eq!(receipts[0]["min_ingested_at_ms"], 100);
+        assert_eq!(receipts[0]["max_ingested_at_ms"], 199);
+        assert_eq!(receipts[0]["finished_at_unix_ms"], 200);
+        assert_eq!(receipts[0]["elapsed_seconds"], 0.5);
+        Ok(())
+    }
+
+    #[test]
+    fn cumulative_commit_receipts_without_finish_time_are_unavailable() -> Result<()> {
+        let config = config()?;
+        let mut commit = event(&config, 100, 199)?;
+        commit["finished_at_unix_ms"] = Value::Null;
+        let evidence = durable_commit_evidence(&config, &[log(&[commit])], Some((100, 200)))?;
+        let cumulative = &evidence[&config.tables[0]]["run_cumulative_output"];
+        assert!(cumulative["rows"].is_null());
+        assert_eq!(cumulative["commits_by_version"], json!([]));
+        assert_eq!(cumulative["unavailable_reason"], "cumulative_commit_finish_time_unavailable");
         Ok(())
     }
 
@@ -1039,12 +1093,21 @@ mod commit_evidence_tests {
         let mut tail = event(&config, 1000, 1001)?;
         tail["delta_version"] = json!(9);
         tail["finished_at_unix_ms"] = json!(61_000);
-        let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail])], Some((1000, 66_000)))?;
+        let mut at_end = event(&config, 1000, 1001)?;
+        at_end["delta_version"] = json!(10);
+        at_end["finished_at_unix_ms"] = json!(66_000);
+        let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail, at_end])], Some((1000, 66_000)))?;
         let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
         assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
         assert_eq!(windows[0]["rows"], 10);
         assert_eq!(windows[1]["rows"], 10);
         assert_eq!(evidence[&config.tables[0]]["output_throughput"]["rows"], 30);
+        let cumulative = &evidence[&config.tables[0]]["run_cumulative_output"];
+        let receipts = cumulative["commits_by_version"].as_array().context("missing cumulative commit receipts")?;
+        assert_eq!(receipts.len(), 4);
+        assert_eq!(receipts.iter().map(|receipt| receipt["finished_at_unix_ms"].as_i64().unwrap()).collect::<Vec<_>>(),
+            vec![1_000, 31_000, 61_000, 66_000]);
+        assert_eq!(cumulative["rows"], 40);
         let mut missing = log(&[]);
         missing.complete = false;
         let evidence = durable_commit_evidence(&config, &[missing], Some((1000, 66_000)))?;
