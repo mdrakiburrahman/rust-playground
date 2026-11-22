@@ -9,14 +9,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 const MAX_LOGICAL_BATCH_RECORDS: usize = 1_000_000;
 const MAX_LOGICAL_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_OAT_CLIENT_METRICS_LINE_BYTES: usize = 1_048_576;
+const MAX_STAGE_TELEMETRY_SAMPLES: usize = 64;
+const MAX_STAGE_TELEMETRY_STREAMS_PER_SAMPLE: usize = 32;
+const ACTUAL_NETWORK_IN_FLIGHT_UNAVAILABLE_REASON: &str =
+    "tonic_hyper_does_not_expose_per_stream_socket_or_http2_frame_queue_occupancy";
+const ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON: &str =
+    "tonic_hyper_does_not_expose_per_stream_send_stall_state_or_duration";
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +133,9 @@ pub struct Options {
     pub seed: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_MAX_MEMORY_BYTES", default_value_t = 536_870_912)]
     pub max_memory_bytes: u64,
+    #[arg(long, env = "ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_telemetry_interval_ms: Option<u64>,
     #[arg(long, env = "ARROWCOL_CLIENT_INTERVAL_US", default_value_t = 0)]
     pub interval_us: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER", default_value_t = 1)]
@@ -216,6 +225,11 @@ impl Options {
     ///
     /// Returns the same validation failures as `resolve`, including unavailable CPU discovery.
     pub fn resolve_with_evidence(mut self, rows: usize, concurrency: usize) -> Result<(Self, serde_json::Value)> {
+        anyhow::ensure!(
+            self.stage_telemetry_interval_ms
+                .map_or(true, |interval| (100..=60_000).contains(&interval)),
+            "ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS must be between 100 and 60000 when set"
+        );
         let requested = serde_json::json!({
             "workers": self.workers, "runtime_threads": self.runtime_threads,
             "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
@@ -227,6 +241,7 @@ impl Options {
             "stream_retry_max_attempts": self.stream_retry_max_attempts,
             "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
             "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
+            "stage_telemetry_interval_ms": self.stage_telemetry_interval_ms,
         });
         let corpus_rows_source = if self.corpus_bytes > 0 {
             "corpus_bytes_estimate_deferred_until_preparation"
@@ -622,6 +637,588 @@ struct Attempt<'a> {
     finished: bool,
 }
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum ClientTelemetryUnavailable {
+    LockPoisoned = 1,
+    CounterOverflow = 2,
+    StreamIdOverflow = 3,
+    ByteAccountingInconsistent = 4,
+    DurationOverflow = 5,
+}
+
+impl ClientTelemetryUnavailable {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::LockPoisoned => "telemetry_lock_poisoned",
+            Self::CounterOverflow => "telemetry_counter_overflow",
+            Self::StreamIdOverflow => "telemetry_stream_id_overflow",
+            Self::ByteAccountingInconsistent => "telemetry_byte_accounting_inconsistent",
+            Self::DurationOverflow => "telemetry_duration_overflow",
+        }
+    }
+}
+
+struct StageStreamProgress {
+    started: Instant,
+    last_progress: Instant,
+    unsent_bytes: u64,
+    body_yielded_bytes: u64,
+    no_progress_started: Option<Instant>,
+    producer_no_progress_count: u64,
+    producer_no_progress_duration: Duration,
+}
+
+impl StageStreamProgress {
+    fn new(total_bytes: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_progress: now,
+            unsent_bytes: total_bytes,
+            body_yielded_bytes: 0,
+            no_progress_started: None,
+            producer_no_progress_count: 0,
+            producer_no_progress_duration: Duration::ZERO,
+        }
+    }
+}
+
+struct ClientStageTelemetry {
+    interval_ms: u64,
+    next_stream_id: AtomicU64,
+    unavailable_reason: AtomicU8,
+    active_streams: Mutex<std::collections::BTreeMap<u64, (usize, Arc<Mutex<StageStreamProgress>>)>>,
+    samples: Mutex<std::collections::VecDeque<serde_json::Value>>,
+    sample_count: AtomicU64,
+    evicted_samples: AtomicU64,
+    completed_producer_no_progress_count: AtomicU64,
+    completed_producer_no_progress_duration_ns: AtomicU64,
+}
+
+impl ClientStageTelemetry {
+    fn new(interval_ms: u64) -> Self {
+        Self {
+            interval_ms,
+            next_stream_id: AtomicU64::new(0),
+            unavailable_reason: AtomicU8::new(0),
+            active_streams: Mutex::new(std::collections::BTreeMap::new()),
+            samples: Mutex::new(std::collections::VecDeque::new()),
+            sample_count: AtomicU64::new(0),
+            evicted_samples: AtomicU64::new(0),
+            completed_producer_no_progress_count: AtomicU64::new(0),
+            completed_producer_no_progress_duration_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn unavailable_reason(&self) -> Option<&'static str> {
+        match self.unavailable_reason.load(Ordering::Relaxed) {
+            0 => None,
+            value if value == ClientTelemetryUnavailable::LockPoisoned as u8 => {
+                Some(ClientTelemetryUnavailable::LockPoisoned.reason())
+            }
+            value if value == ClientTelemetryUnavailable::CounterOverflow as u8 => {
+                Some(ClientTelemetryUnavailable::CounterOverflow.reason())
+            }
+            value if value == ClientTelemetryUnavailable::StreamIdOverflow as u8 => {
+                Some(ClientTelemetryUnavailable::StreamIdOverflow.reason())
+            }
+            value if value == ClientTelemetryUnavailable::ByteAccountingInconsistent as u8 => {
+                Some(ClientTelemetryUnavailable::ByteAccountingInconsistent.reason())
+            }
+            _ => Some(ClientTelemetryUnavailable::DurationOverflow.reason()),
+        }
+    }
+
+    fn mark_unavailable(&self, reason: ClientTelemetryUnavailable) {
+        let _ = self
+            .unavailable_reason
+            .compare_exchange(0, reason as u8, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    fn is_available(&self) -> bool {
+        self.unavailable_reason.load(Ordering::Relaxed) == 0
+    }
+
+    fn add_counter(&self, counter: &AtomicU64, amount: u64) -> bool {
+        if counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(amount))
+            .is_err()
+        {
+            self.mark_unavailable(ClientTelemetryUnavailable::CounterOverflow);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn start_stream(self: &Arc<Self>, worker: usize, total_bytes: u64) -> Option<ClientStreamGuard> {
+        if !self.is_available() {
+            return None;
+        }
+        let id = match self
+            .next_stream_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        {
+            Ok(id) => id,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::StreamIdOverflow);
+                return None;
+            }
+        };
+        let mut active_streams = match self.active_streams.lock() {
+            Ok(active_streams) => active_streams,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return None;
+            }
+        };
+        let progress = Arc::new(Mutex::new(StageStreamProgress::new(total_bytes)));
+        active_streams.insert(id, (worker, Arc::clone(&progress)));
+        Some(ClientStreamGuard {
+            telemetry: Arc::clone(self),
+            id,
+            progress,
+        })
+    }
+
+    fn begin_measurement_window(&self) {
+        if !self.is_available() {
+            return;
+        }
+        let now = Instant::now();
+        let active_streams = match self.active_streams.lock() {
+            Ok(active_streams) => active_streams,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return;
+            }
+        };
+        for (_, progress) in active_streams.values() {
+            let mut progress = match progress.lock() {
+                Ok(progress) => progress,
+                Err(_) => {
+                    self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                    return;
+                }
+            };
+            progress.producer_no_progress_count = 0;
+            progress.producer_no_progress_duration = Duration::ZERO;
+            progress.no_progress_started = None;
+            progress.last_progress = now;
+        }
+    }
+
+    fn finish_stream(&self, id: u64, shared_progress: &Mutex<StageStreamProgress>) {
+        let mut active_streams = match self.active_streams.lock() {
+            Ok(active_streams) => active_streams,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return;
+            }
+        };
+        let mut progress = match shared_progress.lock() {
+            Ok(progress) => progress,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                active_streams.remove(&id);
+                return;
+            }
+        };
+        if let Some(started) = progress.no_progress_started.take() {
+            let duration = Instant::now().saturating_duration_since(started);
+            match progress.producer_no_progress_duration.checked_add(duration) {
+                Some(total) => progress.producer_no_progress_duration = total,
+                None => self.mark_unavailable(ClientTelemetryUnavailable::DurationOverflow),
+            }
+        }
+        let duration_ns = match u64::try_from(progress.producer_no_progress_duration.as_nanos()) {
+            Ok(value) => value,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::DurationOverflow);
+                0
+            }
+        };
+        self.add_counter(
+            &self.completed_producer_no_progress_count,
+            progress.producer_no_progress_count,
+        );
+        self.add_counter(&self.completed_producer_no_progress_duration_ns, duration_ns);
+        drop(progress);
+        active_streams.remove(&id);
+    }
+
+    fn record_sample(&self, timestamp_unix_ms: u64) {
+        if !self.is_available() {
+            return;
+        }
+        let now = Instant::now();
+        let interval = Duration::from_millis(self.interval_ms);
+        let mut active_streams = match self.active_streams.lock() {
+            Ok(active_streams) => active_streams,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return;
+            }
+        };
+        let active_stream_count = active_streams.len();
+        let mut unsent_bytes_total = 0_u64;
+        let mut body_yielded_pending_response_bytes_total = 0_u64;
+        let mut oldest_active_stream_age_ms = 0_u64;
+        let mut producer_no_progress_count = self.completed_producer_no_progress_count.load(Ordering::Relaxed);
+        let mut producer_no_progress_duration_ns =
+            self.completed_producer_no_progress_duration_ns.load(Ordering::Relaxed);
+        let mut streams = Vec::new();
+        for (stream_id, (worker, shared_progress)) in active_streams.iter() {
+            let mut progress = match shared_progress.lock() {
+                Ok(progress) => progress,
+                Err(_) => {
+                    self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                    return;
+                }
+            };
+            if progress.unsent_bytes > 0
+                && progress.no_progress_started.is_none()
+                && now.saturating_duration_since(progress.last_progress) >= interval
+            {
+                let no_progress_started = progress.last_progress;
+                let Some(count) = progress.producer_no_progress_count.checked_add(1) else {
+                    self.mark_unavailable(ClientTelemetryUnavailable::CounterOverflow);
+                    return;
+                };
+                progress.producer_no_progress_count = count;
+                progress.no_progress_started = Some(no_progress_started);
+            }
+            let age_ms = match u64::try_from(now.saturating_duration_since(progress.started).as_millis()) {
+                Ok(age) => age,
+                Err(_) => {
+                    self.mark_unavailable(ClientTelemetryUnavailable::DurationOverflow);
+                    return;
+                }
+            };
+            let ongoing_no_progress = progress
+                .no_progress_started
+                .map_or(Duration::ZERO, |started| now.saturating_duration_since(started));
+            let no_progress_duration = match progress.producer_no_progress_duration.checked_add(ongoing_no_progress) {
+                Some(duration) => duration,
+                None => {
+                    self.mark_unavailable(ClientTelemetryUnavailable::DurationOverflow);
+                    return;
+                }
+            };
+            let no_progress_duration_ns = match u64::try_from(no_progress_duration.as_nanos()) {
+                Ok(duration) => duration,
+                Err(_) => {
+                    self.mark_unavailable(ClientTelemetryUnavailable::DurationOverflow);
+                    return;
+                }
+            };
+            for (total, amount) in [
+                (&mut unsent_bytes_total, progress.unsent_bytes),
+                (
+                    &mut body_yielded_pending_response_bytes_total,
+                    progress.body_yielded_bytes,
+                ),
+                (&mut producer_no_progress_count, progress.producer_no_progress_count),
+                (&mut producer_no_progress_duration_ns, no_progress_duration_ns),
+            ] {
+                let Some(sum) = total.checked_add(amount) else {
+                    self.mark_unavailable(ClientTelemetryUnavailable::CounterOverflow);
+                    return;
+                };
+                *total = sum;
+            }
+            oldest_active_stream_age_ms = oldest_active_stream_age_ms.max(age_ms);
+            if streams.len() < MAX_STAGE_TELEMETRY_STREAMS_PER_SAMPLE {
+                streams.push(serde_json::json!({
+                    "stream_id": stream_id,
+                    "worker": worker,
+                    "age_ms": age_ms,
+                    "unsent_flight_data_bytes": progress.unsent_bytes,
+                    "body_yielded_pending_response_bytes": progress.body_yielded_bytes,
+                    "producer_no_progress_count": progress.producer_no_progress_count,
+                    "producer_no_progress_duration_ms": no_progress_duration_ns / 1_000_000,
+                }));
+            }
+        }
+        let streams_omitted = match active_stream_count.checked_sub(streams.len()) {
+            Some(omitted) => omitted,
+            None => {
+                self.mark_unavailable(ClientTelemetryUnavailable::CounterOverflow);
+                return;
+            }
+        };
+        let stream_coverage = if streams_omitted == 0 { "complete" } else { "partial" };
+        let sample = serde_json::json!({
+            "timestamp_unix_ms": timestamp_unix_ms,
+            "active_stream_count": active_stream_count,
+            "unsent_flight_data_bytes": unsent_bytes_total,
+            "body_yielded_pending_response_bytes": body_yielded_pending_response_bytes_total,
+            "oldest_active_stream_age_ms": if active_stream_count == 0 { serde_json::Value::Null } else { serde_json::json!(oldest_active_stream_age_ms) },
+            "oldest_active_stream_age_ms_unavailable_reason": if active_stream_count == 0 { serde_json::json!("no_active_streams_at_sample") } else { serde_json::Value::Null },
+            "producer_no_progress_count": producer_no_progress_count,
+            "producer_no_progress_duration_ms": producer_no_progress_duration_ns / 1_000_000,
+            "streams": streams,
+            "stream_coverage": stream_coverage,
+            "streams_omitted": streams_omitted,
+            "stream_coverage_unavailable_reason": if streams_omitted > 0 { serde_json::json!("per_sample_stream_limit_exceeded") } else { serde_json::Value::Null },
+            "actual_transport_stall_count": null,
+            "actual_transport_stall_count_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+            "actual_transport_stall_duration_ms": null,
+            "actual_transport_stall_duration_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+            "actual_network_in_flight_bytes": null,
+            "actual_network_in_flight_bytes_unavailable_reason": ACTUAL_NETWORK_IN_FLIGHT_UNAVAILABLE_REASON,
+            "scope": "client_stream_body_items_not_yet_yielded_and_items_yielded_but_pending_do_put_response",
+            "bytes_semantics": "sum_of_FlightData_protobuf_encoded_lengths_after_configured_Arrow_IPC_compression",
+            "producer_no_progress_scope": "sampled_gap_without_a_client_body_item_yield_for_at_least_interval_while_unsent_bytes_remain; may include scheduler delays and is not evidence of transport stall",
+            "producer_no_progress_duration_semantics": "sum_of_per_stream_no_progress_durations",
+        });
+        drop(active_streams);
+        let mut samples = match self.samples.lock() {
+            Ok(samples) => samples,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return;
+            }
+        };
+        if samples.len() == MAX_STAGE_TELEMETRY_SAMPLES {
+            if !self.add_counter(&self.evicted_samples, 1) {
+                return;
+            }
+            samples.pop_front();
+        }
+        if !self.add_counter(&self.sample_count, 1) {
+            return;
+        }
+        samples.push_back(sample);
+    }
+
+    fn unavailable_snapshot(&self, reason: &'static str) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "interval_ms": self.interval_ms,
+            "sample_count": null,
+            "sample_count_unavailable_reason": reason,
+            "retained_sample_count": null,
+            "evicted_older_samples": null,
+            "samples": null,
+            "samples_unavailable_reason": reason,
+            "sampled_active_stream_count": null,
+            "sampled_unsent_flight_data_bytes": null,
+            "sampled_body_yielded_pending_response_bytes": null,
+            "oldest_active_stream_age_ms": null,
+            "sampled_values_unavailable_reason": reason,
+            "oldest_active_stream_age_ms_unavailable_reason": reason,
+            "stream_coverage": "unavailable",
+            "stream_coverage_unavailable_reason": reason,
+            "producer_no_progress_count": null,
+            "producer_no_progress_count_unavailable_reason": reason,
+            "producer_no_progress_duration_ms": null,
+            "producer_no_progress_duration_unavailable_reason": reason,
+            "actual_transport_stall_count": null,
+            "actual_transport_stall_count_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+            "actual_transport_stall_duration_ms": null,
+            "actual_transport_stall_duration_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+            "actual_network_in_flight_bytes": null,
+            "actual_network_in_flight_bytes_unavailable_reason": ACTUAL_NETWORK_IN_FLIGHT_UNAVAILABLE_REASON,
+            "telemetry_unavailable_reason": reason,
+            "reservation_relationship": "bounded_telemetry_storage_is_separate_from_and_not_added_to_max_memory_bytes_reservation",
+            "scope": "client_stream_body_poll_progress_until_do_put_response; not socket_or_http2_frame_occupancy",
+        })
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        if let Some(reason) = self.unavailable_reason() {
+            return self.unavailable_snapshot(reason);
+        }
+        let samples = match self.samples.lock() {
+            Ok(samples) => samples,
+            Err(_) => {
+                self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return self.unavailable_snapshot(ClientTelemetryUnavailable::LockPoisoned.reason());
+            }
+        };
+        let retained_samples = samples.iter().cloned().collect::<Vec<_>>();
+        let latest = samples.back();
+        let missing_reason = if self.sample_count.load(Ordering::Relaxed) == 0 {
+            "no_sample_recorded"
+        } else {
+            ""
+        };
+        let sampled = |name: &str| {
+            latest
+                .map(|value| value[name].clone())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let missing = if latest.is_none() {
+            serde_json::json!(missing_reason)
+        } else {
+            serde_json::Value::Null
+        };
+        let value = serde_json::json!({
+            "enabled": true,
+            "interval_ms": self.interval_ms,
+            "sample_count": self.sample_count.load(Ordering::Relaxed),
+            "sample_count_unavailable_reason": null,
+            "retained_sample_count": retained_samples.len(),
+            "evicted_older_samples": self.evicted_samples.load(Ordering::Relaxed),
+            "sample_capacity": MAX_STAGE_TELEMETRY_SAMPLES,
+            "streams_per_sample_capacity": MAX_STAGE_TELEMETRY_STREAMS_PER_SAMPLE,
+            "samples": retained_samples,
+            "samples_unavailable_reason": null,
+            "sampled_active_stream_count": sampled("active_stream_count"),
+            "sampled_unsent_flight_data_bytes": sampled("unsent_flight_data_bytes"),
+            "sampled_body_yielded_pending_response_bytes": sampled("body_yielded_pending_response_bytes"),
+            "oldest_active_stream_age_ms": sampled("oldest_active_stream_age_ms"),
+            "oldest_active_stream_age_ms_unavailable_reason": latest.and_then(|sample| sample["oldest_active_stream_age_ms_unavailable_reason"].as_str()).map(|reason| serde_json::json!(reason)).unwrap_or_else(|| missing.clone()),
+            "sampled_values_unavailable_reason": missing.clone(),
+            "stream_coverage": sampled("stream_coverage"),
+            "stream_coverage_unavailable_reason": latest.and_then(|sample| sample["stream_coverage_unavailable_reason"].as_str()).map(|reason| serde_json::json!(reason)).unwrap_or_else(|| missing.clone()),
+            "producer_no_progress_count": sampled("producer_no_progress_count"),
+            "producer_no_progress_count_unavailable_reason": missing.clone(),
+            "producer_no_progress_duration_ms": sampled("producer_no_progress_duration_ms"),
+            "producer_no_progress_duration_unavailable_reason": missing,
+            "actual_transport_stall_count": null,
+            "actual_transport_stall_count_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+            "actual_transport_stall_duration_ms": null,
+            "actual_transport_stall_duration_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+            "actual_network_in_flight_bytes": null,
+            "actual_network_in_flight_bytes_unavailable_reason": ACTUAL_NETWORK_IN_FLIGHT_UNAVAILABLE_REASON,
+            "telemetry_unavailable_reason": null,
+            "reservation_relationship": "bounded_telemetry_storage_is_separate_from_and_not_added_to_max_memory_bytes_reservation",
+            "scope": "client_stream_body_poll_progress_until_do_put_response; not socket_or_http2_frame_occupancy",
+            "producer_no_progress_scope": "sampled_gap_without_a_client_body_item_yield_for_at_least_interval_while_unsent_bytes_remain; may include scheduler delays and is not evidence of transport stall",
+            "producer_no_progress_duration_semantics": "sum_of_per_stream_no_progress_durations",
+        });
+        if let Some(reason) = self.unavailable_reason() {
+            self.unavailable_snapshot(reason)
+        } else {
+            value
+        }
+    }
+}
+
+struct ClientStreamGuard {
+    telemetry: Arc<ClientStageTelemetry>,
+    id: u64,
+    progress: Arc<Mutex<StageStreamProgress>>,
+}
+
+impl ClientStreamGuard {
+    fn begin_body(&self) {
+        if !self.telemetry.is_available() {
+            return;
+        }
+        let mut progress = match self.progress.lock() {
+            Ok(progress) => progress,
+            Err(_) => {
+                self.telemetry
+                    .mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return;
+            }
+        };
+        let now = Instant::now();
+        progress.started = now;
+        progress.last_progress = now;
+    }
+
+    fn record_yield(telemetry: &ClientStageTelemetry, shared_progress: &Mutex<StageStreamProgress>, bytes: u64) {
+        if !telemetry.is_available() {
+            return;
+        }
+        let mut progress = match shared_progress.lock() {
+            Ok(progress) => progress,
+            Err(_) => {
+                telemetry.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
+                return;
+            }
+        };
+        let Some(unsent_bytes) = progress.unsent_bytes.checked_sub(bytes) else {
+            telemetry.mark_unavailable(ClientTelemetryUnavailable::ByteAccountingInconsistent);
+            return;
+        };
+        let Some(body_yielded_bytes) = progress.body_yielded_bytes.checked_add(bytes) else {
+            telemetry.mark_unavailable(ClientTelemetryUnavailable::CounterOverflow);
+            return;
+        };
+        let now = Instant::now();
+        let producer_no_progress_duration = if let Some(started) = progress.no_progress_started {
+            match progress
+                .producer_no_progress_duration
+                .checked_add(now.saturating_duration_since(started))
+            {
+                Some(duration) => duration,
+                None => {
+                    telemetry.mark_unavailable(ClientTelemetryUnavailable::DurationOverflow);
+                    return;
+                }
+            }
+        } else {
+            progress.producer_no_progress_duration
+        };
+        progress.unsent_bytes = unsent_bytes;
+        progress.body_yielded_bytes = body_yielded_bytes;
+        progress.producer_no_progress_duration = producer_no_progress_duration;
+        progress.no_progress_started = None;
+        progress.last_progress = now;
+    }
+}
+
+impl Drop for ClientStreamGuard {
+    fn drop(&mut self) {
+        self.telemetry.finish_stream(self.id, &self.progress);
+    }
+}
+
+fn client_request_body(
+    data: Vec<FlightData>,
+    guard: Option<&ClientStreamGuard>,
+) -> impl futures::Stream<Item = FlightData> + Send + 'static {
+    match guard {
+        Some(guard) => {
+            let telemetry = Arc::clone(&guard.telemetry);
+            let progress = Arc::clone(&guard.progress);
+            futures::stream::Either::Left(stream::iter(data).inspect(move |message| {
+                ClientStreamGuard::record_yield(
+                    &telemetry,
+                    &progress,
+                    u64::try_from(message.encoded_len()).unwrap_or(u64::MAX),
+                );
+            }))
+        }
+        None => futures::stream::Either::Right(stream::iter(data)),
+    }
+}
+
+fn disabled_stage_telemetry() -> serde_json::Value {
+    serde_json::json!({
+        "enabled": false,
+        "interval_ms": null,
+        "sample_count": 0,
+        "samples": null,
+        "samples_unavailable_reason": "disabled_by_default",
+        "sampled_active_stream_count": null,
+        "sampled_unsent_flight_data_bytes": null,
+        "sampled_body_yielded_pending_response_bytes": null,
+        "oldest_active_stream_age_ms": null,
+        "oldest_active_stream_age_ms_unavailable_reason": "disabled_by_default",
+        "sampled_values_unavailable_reason": "disabled_by_default",
+        "stream_coverage": null,
+        "stream_coverage_unavailable_reason": "disabled_by_default",
+        "producer_no_progress_count": null,
+        "producer_no_progress_count_unavailable_reason": "disabled_by_default",
+        "producer_no_progress_duration_ms": null,
+        "producer_no_progress_duration_unavailable_reason": "disabled_by_default",
+        "actual_transport_stall_count": null,
+        "actual_transport_stall_count_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+        "actual_transport_stall_duration_ms": null,
+        "actual_transport_stall_duration_unavailable_reason": ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON,
+        "actual_network_in_flight_bytes": null,
+        "actual_network_in_flight_bytes_unavailable_reason": ACTUAL_NETWORK_IN_FLIGHT_UNAVAILABLE_REASON,
+        "reservation_relationship": "telemetry_disabled; no reservation or load behavior changed",
+    })
+}
+
 struct Measurement {
     start_unix_ms: u64,
     end_unix_ms: u64,
@@ -635,6 +1232,7 @@ struct Measurement {
     window_latency: Vec<Mutex<[u64; 64]>>,
     resource_start: Mutex<Option<ResourceSample>>,
     resource_end: Mutex<Option<ResourceSample>>,
+    stage_telemetry: Option<Arc<ClientStageTelemetry>>,
     rejected_streams: AtomicU64,
     rejected_rows: AtomicU64,
     retried_streams: AtomicU64,
@@ -665,7 +1263,20 @@ fn latency_percentiles(latency: &[u64; 64]) -> serde_json::Value {
 }
 impl Measurement {
     fn new(start_unix_ms: u64, end_unix_ms: u64, workers: usize) -> Result<Self> {
+        Self::new_with_stage_telemetry(start_unix_ms, end_unix_ms, workers, None)
+    }
+
+    fn new_with_stage_telemetry(
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+        workers: usize,
+        interval_ms: Option<u64>,
+    ) -> Result<Self> {
         anyhow::ensure!(end_unix_ms > start_unix_ms, "measurement window must be positive");
+        anyhow::ensure!(
+            interval_ms.map_or(true, |interval| (100..=60_000).contains(&interval)),
+            "stage telemetry interval must be between 100 and 60000 ms when enabled"
+        );
         Ok(Self {
             start_unix_ms,
             end_unix_ms,
@@ -687,6 +1298,7 @@ impl Measurement {
                 .collect(),
             resource_start: Mutex::new(None),
             resource_end: Mutex::new(None),
+            stage_telemetry: interval_ms.map(|interval| Arc::new(ClientStageTelemetry::new(interval))),
             rejected_streams: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
             retried_streams: AtomicU64::new(0),
@@ -794,6 +1406,7 @@ impl Measurement {
             "ambiguous_rows": self.ambiguous_rows.load(Ordering::Relaxed),
             "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
             "client_resources": self.resource_metrics(),
+            "client_stage_telemetry": self.stage_telemetry.as_ref().map_or_else(disabled_stage_telemetry, |telemetry| telemetry.snapshot()),
         })
     }
 
@@ -1493,10 +2106,11 @@ impl PreparedClient {
         measurement_start_unix_ms: u64,
         measurement_end_unix_ms: u64,
     ) -> Result<ContinuousReport> {
-        let measurement = Arc::new(Measurement::new(
+        let measurement = Arc::new(Measurement::new_with_stage_telemetry(
             measurement_start_unix_ms,
             measurement_end_unix_ms,
             self.options.workers,
+            self.options.stage_telemetry_interval_ms,
         )?);
         *self
             .measurement
@@ -1513,6 +2127,69 @@ impl PreparedClient {
             scheduled_start_observed_unix_ms.abs_diff(scheduled_start_unix_ms) <= 250,
             "client did not start within 250ms of the shared scheduled interval"
         );
+        let sampler = measurement.stage_telemetry.as_ref().map(|telemetry| {
+            let telemetry = Arc::clone(telemetry);
+            let start_unix_ms = measurement.start_unix_ms;
+            let end_unix_ms = measurement.end_unix_ms;
+            tokio::spawn(async move {
+                let first_sample_unix_ms = loop {
+                    if !telemetry.is_available() {
+                        return;
+                    }
+                    let now_unix_ms = match unix_ms() {
+                        Ok(now) => now,
+                        Err(_) => {
+                            telemetry.set_sampling_unavailable("unix_clock_unavailable");
+                            return;
+                        }
+                    };
+                    if now_unix_ms >= end_unix_ms {
+                        telemetry.set_sampling_unavailable("measurement_window_elapsed_before_first_sample");
+                        return;
+                    }
+                    if now_unix_ms >= start_unix_ms {
+                        break now_unix_ms;
+                    }
+                    tokio::time::sleep(Duration::from_millis(start_unix_ms.saturating_sub(now_unix_ms).min(10))).await;
+                };
+                telemetry.begin_measurement_window();
+                telemetry.record_sample(first_sample_unix_ms);
+                loop {
+                    if !telemetry.is_available() {
+                        return;
+                    }
+                    let now_unix_ms = match unix_ms() {
+                        Ok(now) => now,
+                        Err(_) => {
+                            telemetry.set_sampling_unavailable("unix_clock_unavailable");
+                            return;
+                        }
+                    };
+                    if now_unix_ms >= end_unix_ms {
+                        break;
+                    }
+                    if now_unix_ms < start_unix_ms {
+                        tokio::time::sleep(Duration::from_millis(start_unix_ms.saturating_sub(now_unix_ms).min(10)))
+                            .await;
+                        continue;
+                    }
+                    tokio::time::sleep(Duration::from_millis(
+                        end_unix_ms.saturating_sub(now_unix_ms).min(telemetry.interval_ms),
+                    ))
+                    .await;
+                    let sample_unix_ms = match unix_ms() {
+                        Ok(now) => now,
+                        Err(_) => {
+                            telemetry.set_sampling_unavailable("unix_clock_unavailable");
+                            return;
+                        }
+                    };
+                    if (start_unix_ms..end_unix_ms).contains(&sample_unix_ms) {
+                        telemetry.record_sample(sample_unix_ms);
+                    }
+                }
+            })
+        });
         let mut tasks = JoinSet::new();
         for worker in 0..self.options.workers {
             for slot in 0..self.options.streams_per_worker {
@@ -1564,6 +2241,7 @@ impl PreparedClient {
                         Ok(started) => measurement_started = Some(started),
                         Err(error) => {
                             tasks.abort_all();
+                            if let Some(sampler) = &sampler { sampler.abort(); }
                             while tasks.join_next().await.is_some() {}
                             return Err(error);
                         }
@@ -1574,6 +2252,7 @@ impl PreparedClient {
                         Ok(()) => resource_end_recorded = true,
                         Err(error) => {
                             tasks.abort_all();
+                            if let Some(sampler) = &sampler { sampler.abort(); }
                             while tasks.join_next().await.is_some() {}
                             return Err(error);
                         }
@@ -1584,6 +2263,7 @@ impl PreparedClient {
                         Some(Ok(Ok(()))) => {}
                         Some(result) => {
                             tasks.abort_all();
+                            if let Some(sampler) = &sampler { sampler.abort(); }
                             while tasks.join_next().await.is_some() {}
                             return match result {
                                 Ok(Err(error)) => Err(error),
@@ -1596,6 +2276,9 @@ impl PreparedClient {
                 }
                 else => break,
             }
+        }
+        if let Some(sampler) = sampler {
+            let _ = sampler.await;
         }
         Ok(ContinuousReport {
             completed_rows: measurement.rows.load(Ordering::Relaxed),
@@ -1742,7 +2425,14 @@ impl PreparedClient {
             finished: false,
         };
         let observation = SendObservation::fresh()?;
-        let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
+        let stream_guard = measurement.and_then(|measurement| {
+            measurement
+                .stage_telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.start_stream(worker, batch.encoded_bytes))
+        });
+        let request_body = client_request_body(batch.data.as_ref().clone(), stream_guard.as_ref());
+        let mut request = Request::new(request_body);
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
             request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
@@ -1751,11 +2441,15 @@ impl PreparedClient {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
                 attempt.send_started = true;
             }
+            if let Some(stream_guard) = &stream_guard {
+                stream_guard.begin_body();
+            }
             completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
         })
         .await
         .context("DMV upload timeout")
         .and_then(std::convert::identity);
+        drop(stream_guard);
         if let Some(index) = logical.manifest_index {
             let outcome = match &result {
                 Ok(_) => ManifestOutcome::Acknowledged,
@@ -1911,7 +2605,7 @@ impl PreparedClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if telemetry state is poisoned or terminal receipt sizing overflows.
+    /// Returns an error if terminal receipt sizing or serialization overflows.
     #[must_use = "metrics snapshots must be emitted to preserve OAT evidence"]
     pub fn metrics(&self, phase: &str) -> Result<serde_json::Value> {
         let measurement_window = {
@@ -3025,6 +3719,183 @@ mod tests {
         Cli::try_parse_from(["test", "--workers", "2", "--data-profile", "diagnostic"])?
             .options
             .resolve(100, 1)
+    }
+
+    #[test]
+    fn stage_telemetry_interval_is_opt_in_and_bounded() -> Result<()> {
+        assert!(Cli::try_parse_from(["test", "--stage-telemetry-interval-ms", "invalid"]).is_err());
+        assert_eq!(options()?.stage_telemetry_interval_ms, None);
+        for interval in [100, 60_000] {
+            let mut configured = options()?;
+            configured.stage_telemetry_interval_ms = Some(interval);
+            assert_eq!(configured.resolve(100, 1)?.stage_telemetry_interval_ms, Some(interval));
+        }
+        for interval in [99, 60_001] {
+            let mut configured = options()?;
+            configured.stage_telemetry_interval_ms = Some(interval);
+            let error = configured.resolve(100, 1).expect_err("out-of-range interval accepted");
+            assert!(error.to_string().contains("ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn client_stage_telemetry_stream_bytes_do_not_claim_network_in_flight_bytes() -> Result<()> {
+        let telemetry = Arc::new(ClientStageTelemetry::new(100));
+        let guard = telemetry
+            .start_stream(2, 300)
+            .context("telemetry unexpectedly unavailable")?;
+        ClientStreamGuard::record_yield(&telemetry, &guard.progress, 100);
+        {
+            let mut progress = guard.progress.lock().unwrap_or_else(|error| error.into_inner());
+            progress.started = Instant::now() - Duration::from_millis(20);
+            progress.last_progress = Instant::now() - Duration::from_millis(500);
+        }
+        telemetry.record_sample(1_234);
+        let snapshot = telemetry.snapshot();
+        let sample = &snapshot["samples"][0];
+        assert_eq!(sample["timestamp_unix_ms"], 1_234);
+        assert_eq!(sample["unsent_flight_data_bytes"], 200);
+        assert_eq!(sample["body_yielded_pending_response_bytes"], 100);
+        assert!(sample["oldest_active_stream_age_ms"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(sample["producer_no_progress_count"], 1);
+        assert_eq!(
+            sample["producer_no_progress_scope"],
+            "sampled_gap_without_a_client_body_item_yield_for_at_least_interval_while_unsent_bytes_remain; may include scheduler delays and is not evidence of transport stall"
+        );
+        assert_eq!(sample["streams"][0]["worker"], 2);
+        assert_eq!(sample["actual_transport_stall_count"], serde_json::Value::Null);
+        assert_eq!(
+            sample["actual_transport_stall_count_unavailable_reason"],
+            ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON
+        );
+        assert_eq!(sample["actual_transport_stall_duration_ms"], serde_json::Value::Null);
+        assert_eq!(
+            sample["actual_transport_stall_duration_unavailable_reason"],
+            ACTUAL_TRANSPORT_STALL_UNAVAILABLE_REASON
+        );
+        assert_eq!(snapshot["actual_network_in_flight_bytes"], serde_json::Value::Null);
+        assert_eq!(
+            snapshot["actual_network_in_flight_bytes_unavailable_reason"],
+            ACTUAL_NETWORK_IN_FLIGHT_UNAVAILABLE_REASON
+        );
+        drop(guard);
+        telemetry.record_sample(1_235);
+        let empty_snapshot = telemetry.snapshot();
+        assert_eq!(
+            empty_snapshot["samples"][1]["oldest_active_stream_age_ms"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            empty_snapshot["samples"][1]["oldest_active_stream_age_ms_unavailable_reason"],
+            "no_active_streams_at_sample"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn client_stage_telemetry_marks_per_stream_detail_partial_when_capped() -> Result<()> {
+        let telemetry = Arc::new(ClientStageTelemetry::new(100));
+        let mut guards = Vec::new();
+        for worker in 0..=MAX_STAGE_TELEMETRY_STREAMS_PER_SAMPLE {
+            guards.push(
+                telemetry
+                    .start_stream(worker, 1)
+                    .context("telemetry unexpectedly unavailable")?,
+            );
+        }
+        telemetry.record_sample(2_000);
+        let snapshot = telemetry.snapshot();
+        let sample = &snapshot["samples"][0];
+        assert_eq!(
+            sample["active_stream_count"],
+            MAX_STAGE_TELEMETRY_STREAMS_PER_SAMPLE + 1
+        );
+        assert_eq!(
+            sample["streams"].as_array().map(Vec::len),
+            Some(MAX_STAGE_TELEMETRY_STREAMS_PER_SAMPLE)
+        );
+        assert_eq!(sample["streams_omitted"], 1);
+        assert_eq!(sample["stream_coverage"], "partial");
+        assert_eq!(
+            sample["stream_coverage_unavailable_reason"],
+            "per_sample_stream_limit_exceeded"
+        );
+        assert_eq!(snapshot["stream_coverage"], "partial");
+        assert_eq!(
+            snapshot["stream_coverage_unavailable_reason"],
+            "per_sample_stream_limit_exceeded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn client_stage_telemetry_overflow_and_poison_are_explicitly_unavailable() -> Result<()> {
+        let overflowed = Arc::new(ClientStageTelemetry::new(100));
+        overflowed.sample_count.store(u64::MAX, Ordering::Relaxed);
+        overflowed.record_sample(3_000);
+        let overflow_snapshot = overflowed.snapshot();
+        assert_eq!(overflow_snapshot["samples"], serde_json::Value::Null);
+        assert_eq!(
+            overflow_snapshot["telemetry_unavailable_reason"],
+            "telemetry_counter_overflow"
+        );
+
+        let poisoned = Arc::new(ClientStageTelemetry::new(100));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.active_streams.lock().unwrap();
+            panic!("poison telemetry registry lock for regression test");
+        }));
+        assert!(result.is_err());
+        poisoned.record_sample(3_001);
+        let poisoned_snapshot = poisoned.snapshot();
+        assert_eq!(poisoned_snapshot["samples"], serde_json::Value::Null);
+        assert_eq!(
+            poisoned_snapshot["telemetry_unavailable_reason"],
+            "telemetry_lock_poisoned"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "manual bounded component benchmark; run with --ignored --nocapture"]
+    async fn client_stage_telemetry_stream_instrumentation_benchmark() -> Result<()> {
+        const OPERATIONS: usize = 50_000;
+
+        let disabled_messages = vec![FlightData::default(); OPERATIONS];
+        let started = Instant::now();
+        let disabled_count = client_request_body(disabled_messages, None).count().await;
+        let disabled_ns_per_op = started.elapsed().as_nanos() as f64 / OPERATIONS as f64;
+
+        let telemetry = Arc::new(ClientStageTelemetry::new(100));
+        let guard = telemetry
+            .start_stream(0, 0)
+            .context("telemetry unexpectedly unavailable")?;
+        guard.begin_body();
+        let enabled_messages = vec![FlightData::default(); OPERATIONS];
+        let started = Instant::now();
+        let enabled_count = client_request_body(enabled_messages, Some(&guard)).count().await;
+        let enabled_ns_per_op = started.elapsed().as_nanos() as f64 / OPERATIONS as f64;
+
+        assert_eq!(disabled_count, OPERATIONS);
+        assert_eq!(enabled_count, OPERATIONS);
+        eprintln!(
+            "CLIENT_STAGE_TELEMETRY_COMPONENT_BENCHMARK operations={OPERATIONS} disabled_ns_per_op={disabled_ns_per_op:.2} enabled_ns_per_op={enabled_ns_per_op:.2}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_client_stage_telemetry_has_explicit_unavailable_values() -> Result<()> {
+        let measurement = Measurement::new(1_000, 2_000, 1)?;
+        let snapshot = measurement.snapshot();
+        let telemetry = &snapshot["client_stage_telemetry"];
+        assert_eq!(telemetry["enabled"], false);
+        assert_eq!(telemetry["samples"], serde_json::Value::Null);
+        assert_eq!(telemetry["samples_unavailable_reason"], "disabled_by_default");
+        assert_eq!(telemetry["sampled_unsent_flight_data_bytes"], serde_json::Value::Null);
+        assert_eq!(telemetry["sampled_values_unavailable_reason"], "disabled_by_default");
+        Ok(())
     }
 
     #[test]
