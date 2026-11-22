@@ -69,7 +69,7 @@
         "trusted_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
         "seed_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "controller_stack_bytes": { "type": "integer", "minimum": 2097152, "maximum": 134217728 },
-        "profile": { "const": "realistic-seed-20260923" },
+        "profile": { "const": "realistic-seed-20260923-v8" },
         "baseline_level": { "type": "integer", "minimum": 1, "maximum": 22 },
         "candidate_level": { "type": "integer", "minimum": 1, "maximum": 22 },
         "paired_rate_ratio": { "type": "number", "exclusiveMinimum": 0 },

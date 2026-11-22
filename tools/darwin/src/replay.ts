@@ -166,7 +166,7 @@ export async function replayCompressionPair(
       const config = object(structuredClone(raw), "run config");
       const platform = object(config.platform, "platform");
       if (platform.kind !== "local" || !Array.isArray(config.tables) || config.tables.length !== 1
-        || config.tables[0] !== "sqlserver_active_sessions") throw new Error("unsupported replay topology or fixture");
+        || config.tables[0] !== "sqlserver_availability_replica_states") throw new Error("unsupported replay topology or fixture");
       platform.compose_state_root = join(runRoot, "state");
       platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
       config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
@@ -177,7 +177,7 @@ export async function replayCompressionPair(
       await runOat(runtime, configPath, runHome, join(home, "trusted", "bin"), join(runRoot, "run.log"), stackBytes);
       if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
       const result = await readReconciledOatResult(
-        join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_active_sessions", producer.revision, level,
+        join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producer.revision, level,
       );
       const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
       if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");
@@ -197,7 +197,7 @@ export async function replayCompressionPair(
     completed = true;
     return {
       source_revision: producer.revision, trusted_revision: manifest.commit, seed_sha256: seedSha256,
-      controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923", baseline_level: baselineLevel,
+      controller_stack_bytes: stackBytes, profile: "realistic-seed-20260923-v8", baseline_level: baselineLevel,
       candidate_level: candidateLevel, paired_rate_ratio: ratio,
       bytes_guard_passed: candidateResult.measurement.parquetBytesPerRow <= baseline.measurement.parquetBytesPerRow * 1.1,
       baseline, candidate: candidateResult,

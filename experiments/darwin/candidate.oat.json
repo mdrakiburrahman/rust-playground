@@ -26,7 +26,7 @@
   "dmv_client_binary": "target/debug/arrowcol-dmv",
   "edge_secret_file": "/run/secrets/edge-hmac",
   "tables": [
-    "sqlserver_active_sessions"
+    "sqlserver_availability_replica_states"
   ],
   "rows_per_table": 4096,
   "clients_per_table": 1,
