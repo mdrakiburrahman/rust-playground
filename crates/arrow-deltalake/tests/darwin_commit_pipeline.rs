@@ -495,10 +495,7 @@ async fn local_natural_cohort_screen() -> Result<()> {
     }
     ensure!(observed.len() == total_groups, "missing receipt");
     let last_version = *cohorts.keys().next_back().context("missing cohort version")?;
-    ensure!(
-        cohorts.len() >= TIMED_WAVES + 1,
-        "insufficient independent natural cohorts"
-    );
+    ensure!(cohorts.len() > TIMED_WAVES, "insufficient independent natural cohorts");
     ensure!(cohort_commits.len() == cohorts.len(), "missing per-commit timing");
     let identities = (0..total_groups)
         .map(|index| (format!("wave-{index:04}"), 0))
