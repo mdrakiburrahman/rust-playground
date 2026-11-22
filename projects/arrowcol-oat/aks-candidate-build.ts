@@ -19,6 +19,12 @@ export interface SourceMaterial {
 export interface BuildOutput {
   role: Role; repository: string; digest: string; media_type: string;
   platforms: Array<{ os: string; architecture: string; digest: string; config_digest: string }>;
+  application?: {
+    schema_version: 1; source_commit: string; build_invocation_sha256: string;
+    isolation: 'fresh_docker_container_builder';
+    executables: Array<{ path: string; sha256: string; platform_digest: string; config_digest: string }>;
+    unavailable_reason?: string;
+  };
 }
 export interface BuildEnvelope { payloadType: string; payload: string; signatures: Array<{ keyid: string; sig: string }> }
 export interface CandidateBuildBundle {
@@ -29,6 +35,7 @@ export interface CandidateBuildOptions {
   sourceRoot: string; revision: string; registry: string; signingKey: string; output: string;
   scope?: 'candidate' | 'local-fixture';
   allowRemotePublishing?: boolean;
+  application?: boolean;
 }
 type Runner = typeof run_tree;
 export type RegistryRead = (repository: string, kind: 'manifests' | 'blobs', digest: string) => Promise<Buffer>;
@@ -134,7 +141,7 @@ export function assertProducedBuildStatement(statement: unknown, imageDigest: st
       sourceDigest.sha1 !== commit || typeof sourceDigest.gitTree !== 'string' || !/^[a-f0-9]{40}$/.test(sourceDigest.gitTree) ||
       source.entryPoint !== 'projects/arrowcol-oat/aks-candidate-build.ts#buildCandidateImages' ||
       params.revision !== commit || params.role !== build[0] || params.dockerfile !== build[1] || params.context !== build[2] ||
-      params.platform !== 'linux/amd64' || output.digest !== imageDigest || output.repository !== repository ||
+      params.platform !== 'linux/amd64' || output.role !== build[0] || output.digest !== imageDigest || output.repository !== repository ||
       !Array.isArray(s.subject) || s.subject.length !== 1 ||
       object(s.subject[0], 'subject').name !== repository ||
       object(object(s.subject[0], 'subject').digest, 'subject digest').sha256 !== imageDigest.slice(7)) {
@@ -173,7 +180,8 @@ export function assertProducedBuildStatement(statement: unknown, imageDigest: st
   }
 }
 
-async function snapshotSource(options: CandidateBuildOptions, directory: string, runner: Runner): Promise<SourceMaterial[]> {
+export async function snapshotSource(options: Pick<CandidateBuildOptions, 'sourceRoot' | 'revision' | 'scope'>,
+  directory: string, runner: Runner): Promise<SourceMaterial[]> {
   const original = await realpath(options.sourceRoot);
   const fixture = options.scope === 'local-fixture';
   const revision = gitHash(options.revision);
@@ -228,7 +236,7 @@ async function snapshotSource(options: CandidateBuildOptions, directory: string,
   return materials;
 }
 
-async function readOutput(repository: string, rootDigest: string, metadata: Json, read: RegistryRead): Promise<BuildOutput['platforms']> {
+export async function readOutput(repository: string, rootDigest: string, metadata: Json, read: RegistryRead): Promise<BuildOutput['platforms']> {
   async function record(kind: 'manifests' | 'blobs', id: string): Promise<Json> {
     const bytes = await read(repository, kind, id);
     if ('sha256:' + sha(bytes) !== id) throw new Error('Registry content does not match the completed build digest.');
@@ -273,9 +281,16 @@ export async function buildCandidateImages(options: CandidateBuildOptions, runne
       const repository = options.registry + '/' + (role === 'client' ? clientRepository : repositories[role]);
       const metadataPath = join(directory, role + '.metadata.json');
       const tag = repository + ':candidate-' + options.revision;
-      await checked(runner, ['docker', 'buildx', 'build', '--platform', 'linux/amd64', '--provenance=false', '--sbom=false',
+      const buildArgs = ['docker', 'buildx', 'build', '--platform', 'linux/amd64', '--provenance=false', '--sbom=false',
         '--push', '--metadata-file', metadataPath, '--tag', tag, '--label', 'org.opencontainers.image.revision=' + options.revision,
-        '--file', file, cwd], root, 3600);
+        ...(options.application ? ['--build-arg', 'VCS_REF=' + options.revision] : []), '--file', file, cwd];
+      let invocation: string[] | undefined;
+      if (options.application) {
+        const { isolatedBuild } = await import('./aks-application-build.js');
+        invocation = await isolatedBuild(buildArgs, root, runner);
+      } else {
+        await checked(runner, buildArgs, root, 3600);
+      }
       const metadata = object(JSON.parse(await readFile(metadataPath, 'utf8')), 'completed BuildKit metadata');
       const rootDigest = digest(metadata['containerimage.digest']);
       const rootBytes = await read(repository, 'manifests', rootDigest);
@@ -283,12 +298,19 @@ export async function buildCandidateImages(options: CandidateBuildOptions, runne
       const rootManifest = object(JSON.parse(rootBytes.toString('utf8')), 'registry manifest');
       const output: BuildOutput = { role, repository, digest: rootDigest, media_type: String(rootManifest.mediaType),
         platforms: await readOutput(repository, rootDigest, metadata, read) };
+      if (invocation) {
+        const { captureInstalledExecutables } = await import('./aks-application-build.js');
+        await checked(runner, ['docker', 'pull', '--platform', 'linux/amd64',
+          repository + '@' + output.platforms[0]!.digest], root, 3600);
+        output.application = await captureInstalledExecutables(role, output.platforms[0]!, invocation, options.revision, root, runner);
+      }
       const statement: Json = { _type: 'https://in-toto.io/Statement/v0.1', predicateType: 'https://slsa.dev/provenance/v0.2',
         subject: [{ name: repository, digest: { sha256: rootDigest.slice(7) } }],
         predicate: { builder: { id: PRODUCER_ID }, scope,
           invocation: { configSource: { uri: materials[0]!.uri, digest: materials[0]!.digest,
             entryPoint: 'projects/arrowcol-oat/aks-candidate-build.ts#buildCandidateImages' },
-            parameters: { revision: options.revision, role, dockerfile, context, platform: 'linux/amd64' } },
+            parameters: { revision: options.revision, role, dockerfile, context, platform: 'linux/amd64',
+              ...(invocation ? { build_invocation: invocation } : {}) } },
           materials, output } };
       assertProducedBuildStatement(statement, rootDigest, options.revision, repository, scope, materials[0]!.uri);
       bundle.outputs.push(output); statements.push(statement);
@@ -321,13 +343,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const { values } = parseArgs({ options: { 'source-root': { type: 'string' }, revision: { type: 'string' },
     registry: { type: 'string' }, 'signing-key': { type: 'string' }, output: { type: 'string' },
     publish: { type: 'boolean' }, federated: { type: 'boolean' }, 'azure-env': { type: 'string' },
+    application: { type: 'boolean' },
     'stamp-config': { type: 'string' }, env: { type: 'string' }, 'image-template': { type: 'string' }, 'image-binding': { type: 'string' } } });
   Promise.resolve().then(async () => {
     if (!values.revision || !values.registry || !values['signing-key'] || !values.output) {
       throw new Error('Usage: aks-candidate-build.ts --source-root PATH --revision SHA --registry localhost:PORT --signing-key EXTERNAL_KEY --output EXTERNAL_BUNDLE');
     }
     const options: CandidateBuildOptions = { sourceRoot: resolve(values['source-root'] ?? ROOT), revision: values.revision,
-      registry: values.registry, signingKey: resolve(values['signing-key']), output: resolve(values.output) };
+      registry: values.registry, signingKey: resolve(values['signing-key']), output: resolve(values.output),
+      application: values.application };
     if (!!values['image-template'] !== !!values['image-binding']) throw new Error('Provide both --image-template and --image-binding.');
     let bundle: CandidateBuildBundle;
     if (values.publish) {

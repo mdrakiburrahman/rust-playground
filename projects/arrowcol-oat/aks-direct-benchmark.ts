@@ -14,6 +14,7 @@ import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.
 import { readDeltaAddWindow } from './aks-delta-preservation.js';
 import { reconcileCollectorWindow } from './aks-collector-window.js';
 import { assertProducedBuildStatement, verifyBuildEnvelope } from './aks-candidate-build.js';
+import { assertApplicationEvidence, type ApplicationEvidence } from './aks-application-build.js';
 import { applyCollectorPromotion, assertPromotionEnvironment, collectorCapacityReadback, collectorSettings,
   type CollectorContract, type CollectorContractRequest, type ProjectCollector } from './aks-collector-promotion.js';
 import { createKubeletNodeResourceReader, startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
@@ -630,6 +631,7 @@ interface BenchmarkReport {
     image_binding: CandidateImageManifest;
     trusted_build_provenance_verified: boolean;
     trusted_signer_key_sha256: string;
+    application_evidence?: ApplicationEvidence['roles'];
     collector_receipt_window?: ReturnType<typeof reconcileCollectorWindow>;
     attested_platform_digests?: Record<string, string>;
     original_client_pool: ScaledPoolSettings;
@@ -724,6 +726,7 @@ interface ScaledOptions {
   imageManifestPath?: string;
   provenanceKey?: string;
   provenanceBundle?: string;
+  applicationEvidencePath?: string;
   promotionPath?: string;
 }
 
@@ -732,6 +735,7 @@ interface ScaledInputs {
   poolName: string;
   binding: CandidateImageManifest;
   platformDigests?: Record<string, string>;
+  applicationEvidence?: ApplicationEvidence['roles'];
   expectedCollector: ReturnType<typeof collectorSettings>;
   historicalControl: { dfe_core_allocation_count: unknown; receiver_rss_limit_bytes: unknown };
   promotion: Awaited<ReturnType<typeof applyCollectorPromotion>>;
@@ -790,6 +794,27 @@ async function scaledInputs(base: string, runId: string, registry: string, optio
 
 async function verifyCandidateBuilds(registry: string, options: ScaledOptions, inputs: ScaledInputs): Promise<string> {
   if (!options.provenanceKey) throw new Error('Scaled run requires --provenance-key from a trusted build signer; self-declared sourceCommit is not proof.');
+  if (!options.applicationEvidencePath) throw new Error('Scaled live run requires independent --application-evidence; absent executable binding is unknown, not changed-code qualification.');
+  const expectedPath = relative(await realpath(ROOT), await realpath(options.applicationEvidencePath));
+  if (!isAbsolute(expectedPath) && expectedPath !== '..' && !expectedPath.startsWith('../')) {
+    throw new Error('Expected application evidence must be independently supplied outside candidate source.');
+  }
+  const expected = parseJson(await readFile(options.applicationEvidencePath, 'utf8'), 'Independent application evidence');
+  inputs.applicationEvidence = [];
+  const verifyApplication = (statement: JsonObject, repository: string, digest: string) => {
+    const predicate = requireRecord(statement.predicate, 'Application predicate');
+    const invocation = requireRecord(predicate.invocation, 'Application invocation');
+    const parameters = requireRecord(invocation.parameters, 'Application parameters');
+    const output = requireRecord(predicate.output, 'Application output');
+    const application = requireRecord(output.application, 'Installed executable binding');
+    if (output.repository !== repository || output.digest !== digest || output.role !== parameters.role ||
+        !Array.isArray(parameters.build_invocation) || !parameters.build_invocation.every(value => typeof value === 'string') ||
+        createHash('sha256').update(JSON.stringify(parameters.build_invocation)).digest('hex') !== application.build_invocation_sha256) {
+      throw new Error('Installed executable is not bound to the signed completed build invocation.');
+    }
+    const evidence = assertApplicationEvidence(output, expected, options.candidateCommit);
+    if (!inputs.applicationEvidence!.some(value => value.role === evidence.role)) inputs.applicationEvidence!.push(evidence);
+  };
   const publicKey = await readFile(options.provenanceKey);
   const keySha = createHash('sha256').update(publicKey).digest('hex');
   if (options.provenanceBundle) {
@@ -809,6 +834,7 @@ async function verifyCandidateBuilds(registry: string, options: ScaledOptions, i
       if (matches.length !== 1) throw new Error('Build bundle must contain exactly one verified result for each candidate role/digest.');
       const statement = matches[0]!;
       assertProducedBuildStatement(statement, digest, options.candidateCommit, repository);
+      verifyApplication(statement, repository, digest);
       const output = requireRecord(requireRecord(statement.predicate, 'Produced predicate').output, 'Produced output');
       if (!Array.isArray(output.platforms)) throw new Error('Missing attested platform manifest.');
       const platform = requireRecord(output.platforms[0], 'Attested platform');
@@ -832,8 +858,10 @@ async function verifyCandidateBuilds(registry: string, options: ScaledOptions, i
     let matches = 0;
     for (const envelope of envelopes) {
       if (!isRecord(envelope) || typeof envelope.payload !== 'string') throw new Error('Verified cosign output is missing its signed payload.');
-      assertTrustedImageStatement(parseJson(Buffer.from(envelope.payload, 'base64').toString('utf8'), 'Signed build statement'),
+      const statement = requireRecord(parseJson(Buffer.from(envelope.payload, 'base64').toString('utf8'), 'Signed build statement'), 'Signed build statement');
+      assertTrustedImageStatement(statement,
         digest, options.candidateCommit, registry + '/' + reference.split('@')[0]);
+      verifyApplication(statement, registry + '/' + reference.split('@')[0], digest);
       matches++;
     }
     if (!matches) throw new Error('No trusted build attestation was returned for a candidate image.');
@@ -1139,7 +1167,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     const hash = createHash('sha256');
     for (const path of ['projects/arrowcol-oat/aks-direct-benchmark.ts', 'projects/arrowcol-oat/aks-scaled-profile.ts',
       'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep', 'projects/arrowcol-oat/publish-images.ts',
-      'infra/azure/bootstrap.ts', 'projects/arrowcol-oat/aks-candidate-build.ts',
+      'infra/azure/bootstrap.ts', 'projects/arrowcol-oat/aks-candidate-build.ts', 'projects/arrowcol-oat/aks-application-build.ts',
       'projects/arrowcol-oat/aks-delta-preservation.ts', 'projects/arrowcol-oat/aks-collector-window.ts',
       'projects/arrowcol-oat/aks-collector-promotion.ts', 'projects/arrowcol-oat-rust/src/runner_tunables.rs',
       'projects/arrowcol-oat-rust/src/runner_process_evidence.rs', 'crates/arrowcol-tunables/src/validation.rs',
@@ -1490,6 +1518,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       collector_promotion: scaled.promotion.binding, collector_startup_readback: scaled.collectorReadback,
       collector_capacity_readback: collectorCapacityReadback(scaled.collectorReadback),
       trusted_build_provenance_verified: !!signerKeySha, trusted_signer_key_sha256: signerKeySha,
+      application_evidence: scaled.applicationEvidence,
       collector_receipt_window: collectorWindow, attested_platform_digests: scaled.platformDigests,
       original_client_pool: clientPoolPlan.original, placement, client_results: clientResults,
       collector_pool_removed: collectorRemoved, client_pool_restored: clientRestored,
@@ -1524,6 +1553,7 @@ async function executeMain(argv: string[]): Promise<number> {
       'image-manifest': { type: 'string' },
       'provenance-key': { type: 'string' },
       'provenance-bundle': { type: 'string' },
+      'application-evidence': { type: 'string' },
       'collector-promotion': { type: 'string' },
       output: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -1534,6 +1564,7 @@ async function executeMain(argv: string[]): Promise<number> {
       console.log('Scaled opt-in: --profile scaled --clients 1..8 --collector-shape e64|e192 --candidate-commit SHA --image-manifest JSON [--provenance-key TRUSTED_PUBLIC_KEY]');
       console.log('Offline only: render --output PATH (exclusive create); scaled run requires trusted signed image attestations.');
       console.log('Qualified collector delta: --collector-promotion JSON; requires the locally built strict Rust collector-contract binary.');
+      console.log('Scaled live gate: --application-evidence EXTERNAL_JSON binds installed executable hashes to independently expected build/image identities.');
       return 0;
     }
     if (positionals.length !== 1 || !['check', 'render', 'run'].includes(positionals[0]!)) throw new Error('Choose check, render or run.');
@@ -1553,10 +1584,12 @@ async function executeMain(argv: string[]): Promise<number> {
         imageManifestPath: values['image-manifest'] ? resolve(values['image-manifest']) : undefined,
         provenanceKey: values['provenance-key'] ? resolve(values['provenance-key']) : undefined,
         promotionPath: values['collector-promotion'] ? resolve(values['collector-promotion']) : undefined,
-        provenanceBundle: values['provenance-bundle'] ? resolve(values['provenance-bundle']) : undefined };
+        provenanceBundle: values['provenance-bundle'] ? resolve(values['provenance-bundle']) : undefined,
+        applicationEvidencePath: values['application-evidence'] ? resolve(values['application-evidence']) : undefined };
       if (values.mode !== 'full') throw new Error('Scaled holdout requires the common full 600-second window.');
       if (positionals[0] === 'run' && !scaled.provenanceKey) throw new Error('Scaled run requires a trusted --provenance-key; image bindings alone are not build proof.');
-    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key'] || values['provenance-bundle'] || values['collector-promotion']) {
+      if (positionals[0] === 'run' && !scaled.applicationEvidencePath) throw new Error('Scaled live run requires independent --application-evidence before any cloud operation.');
+    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key'] || values['provenance-bundle'] || values['collector-promotion'] || values['application-evidence']) {
       throw new Error('Scaled options require explicit --profile scaled; default behavior is unchanged.');
     }
     if (positionals[0] === 'check' || positionals[0] === 'render') {

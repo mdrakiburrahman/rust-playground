@@ -13,6 +13,7 @@ import { collectorShapes, effectiveWorkloadConfig, renderScaledProfileManifest }
 import { clientRepository, imageBuilds, repositories } from './publish-images.js';
 import { POD_RESOURCE_SAMPLE_COMMAND } from './aks-node-observation.js';
 import { PRIMARY_REPOSITORY, PRODUCER_ID } from './aks-candidate-build.js';
+import { installedExecutables, type ApplicationEvidence } from './aks-application-build.js';
 
 const azureEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   key.startsWith('AZURE_') || key.startsWith('ARROWCOL_AZURE_')));
@@ -42,6 +43,16 @@ const qualifiedConfig = {
   },
 };
 const collectorProof = process.env.ARROWCOL_COLLECTOR_CONTRACT_PROOF === '1';
+const applicationInvocation = ['docker', 'buildx', 'build', '--builder', 'arrowcol-application-offline-mock', '--load', '.'];
+const applicationInvocationHash = createHash('sha256').update(JSON.stringify(applicationInvocation)).digest('hex');
+function applicationOutput(role: typeof imageBuilds[number][0], repository: string, image: string, commit: string) {
+  return { role, repository, digest: image, media_type: 'application/vnd.docker.distribution.manifest.v2+json',
+    platforms: [{ os: 'linux', architecture: 'amd64', digest: image, config_digest: 'sha256:' + 'd'.repeat(64) }],
+    application: { schema_version: 1, source_commit: commit, isolation: 'fresh_docker_container_builder',
+      build_invocation_sha256: applicationInvocationHash,
+      executables: installedExecutables[role].map(path => ({ path, sha256: 'e'.repeat(64),
+        platform_digest: image, config_digest: 'sha256:' + 'd'.repeat(64) })) } };
+}
 
 async function fixture(scaled = true, failure?: 'missing-client' | 'failed-client' | 'partial-start' | 'collector-create' | 'pool-drift' | 'untrusted' | 'unknown-quota',
   promotion?: 'valid' | 'readback-drift') {
@@ -51,6 +62,7 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
   const envFile = join(directory, 'env');
   const stampFile = join(directory, 'stamp.yaml');
   const imageFile = join(directory, 'images.json');
+  const applicationFile = join(directory, 'independent-application.json');
   const promotionFile = join(directory, 'promotion.json');
   const publicKey = join(directory, 'trusted.pub');
   const commit = 'a'.repeat(40);
@@ -69,12 +81,24 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
   });
   const workload = renderScaledProfileManifest(base, placeholderRun, 2);
   const images: Record<string, string> = {};
+  const roleImages = new Map<string, string>();
   let ordinal = 0;
   for (const match of base.matchAll(/image: \S+\/([^/@]+@sha256:[0-9a-f]{64})/g)) {
-    images[match[1]!] ??= 'sha256:' + String(++ordinal).padStart(64, '0');
+    const reference = match[1]!, repository = reference.split('@')[0]!;
+    if (!roleImages.has(repository)) roleImages.set(repository, 'sha256:' + String(++ordinal).padStart(64, '0'));
+    images[reference] = roleImages.get(repository)!;
   }
   await writeFile(imageFile, JSON.stringify({ schemaVersion: 1, sourceCommit: commit,
     workloadConfigSha256: effectiveWorkloadConfig(workload).sha256, images }));
+  const application: ApplicationEvidence = { schema_version: 1, source_commit: commit, roles: [] };
+  for (const [reference, image] of Object.entries(images)) {
+    const role = imageBuilds.find(([name]) => (name === 'client' ? clientRepository : repositories[name]) === reference.split('@')[0])![0];
+    if (application.roles.some(value => value.role === role)) continue;
+    application.roles.push({ role, image_digest: image, platform_digest: image, config_digest: 'sha256:' + 'd'.repeat(64),
+      build_invocation_sha256: applicationInvocationHash, comparison: 'source-only',
+      executables: installedExecutables[role].map(path => ({ path, sha256: 'e'.repeat(64) })) });
+  }
+  await writeFile(applicationFile, JSON.stringify(application));
   if (promotion) await writeFile(promotionFile, JSON.stringify({
     schema_version: 1, qualified_source_commit: commit, qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(qualifiedConfig)),
     qualified_config_json: JSON.stringify(qualifiedConfig), won_coordinates: ['collector.batching.pipeline_depth'],
@@ -153,7 +177,9 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
             invocation: { configSource: { uri: 'git+https://github.com/mdrakiburrahman/rust-playground',
               digest: { sha1: failure === 'untrusted' ? 'b'.repeat(40) : commit },
               entryPoint: 'projects/arrowcol-oat/publish-images.ts#buildLocalImages' },
-              parameters: { revision: commit, role: build[0], dockerfile: build[1], context: build[2] } },
+              parameters: { revision: commit, role: build[0], dockerfile: build[1], context: build[2],
+                build_invocation: applicationInvocation } },
+            output: applicationOutput(build[0], image, digest, commit),
             materials: [{ uri: 'git+https://github.com/mdrakiburrahman/rust-playground', digest: { sha1: commit } }] } };
         return ok({ payload: Buffer.from(JSON.stringify(statement)).toString('base64') });
       }
@@ -303,7 +329,7 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
   };
   const args = ['run', '--env-file', envFile, '--stamp-config', stampFile, '--run-id', runId, ...(scaled ? [
     '--profile', 'scaled', '--clients', '2', '--collector-shape', 'e192', '--candidate-commit', commit,
-    '--image-manifest', imageFile, '--provenance-key', publicKey,
+    '--image-manifest', imageFile, '--provenance-key', publicKey, '--application-evidence', applicationFile,
   ] : []), ...(promotion ? ['--collector-promotion', promotionFile] : [])];
   const reportPath = resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', runHex, 'report.json');
   return { args, dependencies, commands, events, reportPath, imageFile, promotionFile, base, directory,
@@ -481,8 +507,9 @@ test('actual CLI verifies independently anchored DSSE bundles, rejects fixture s
       const keyId = createHash('sha256').update(keys.publicKey.export({ type: 'spki', format: 'der' })).digest('hex');
       const binding = JSON.parse(await readFile(f.imageFile, 'utf8'));
       const commit = f.args[f.args.indexOf('--candidate-commit') + 1]!;
-      const envelopes = Object.entries(binding.images as Record<string, string>).map(([reference, imageDigest]) => {
-        const repo = reference.split('@')[0]!;
+      const references = new Map(Object.entries(binding.images as Record<string, string>).map(([reference, digest]) =>
+        [reference.split('@')[0]!, digest]));
+      const envelopes = [...references.entries()].map(([repo, imageDigest]) => {
         const build = imageBuilds.find(([role]) => (role === 'client' ? clientRepository : repositories[role]) === repo)!;
         const repository = 'arrowcollector1.azurecr.io/' + repo;
         const material = { path: '', uri: PRIMARY_REPOSITORY, digest: { sha1: commit, gitTree: 'e'.repeat(40) },
@@ -492,13 +519,39 @@ test('actual CLI verifies independently anchored DSSE bundles, rejects fixture s
           predicate: { builder: { id: PRODUCER_ID }, scope: 'candidate',
             invocation: { configSource: { uri: PRIMARY_REPOSITORY, digest: material.digest,
               entryPoint: 'projects/arrowcol-oat/aks-candidate-build.ts#buildCandidateImages' },
-            parameters: { revision: commit, role: build[0], dockerfile: build[1], context: build[2], platform: 'linux/amd64' } },
-            materials: [material], output: { repository, digest: imageDigest, media_type: 'application/vnd.docker.distribution.manifest.v2+json',
-              platforms: [{ os: 'linux', architecture: 'amd64', digest: imageDigest, config_digest: 'sha256:' + 'd'.repeat(64) }] } } };
+            parameters: { revision: commit, role: build[0], dockerfile: build[1], context: build[2], platform: 'linux/amd64',
+              build_invocation: applicationInvocation } },
+            materials: [material], output: applicationOutput(build[0], repository, imageDigest, commit) } };
         const payload = Buffer.from(JSON.stringify(statement));
         const type = 'application/vnd.in-toto+json';
         const pae = Buffer.concat([Buffer.from(`DSSEv1 ${Buffer.byteLength(type)} ${type} ${payload.length} `), payload]);
         return { payloadType: type, payload: payload.toString('base64'), signatures: [{ keyid: keyId, sig: sign(null, pae, keys.privateKey).toString('base64') }] };
+      });
+
+      test('scaled live gate refuses missing or mismatched independent executable evidence before workload writes', async () => {
+        for (const mode of ['absent', 'wrong-bytes', 'stale-code']) {
+          const f = await fixture();
+          try {
+            const index = f.args.indexOf('--application-evidence');
+            if (mode === 'absent') {
+              f.args.splice(index, 2);
+            } else {
+              const file = f.args[index + 1]!;
+              const expected: ApplicationEvidence = JSON.parse(await readFile(file, 'utf8'));
+              const role = expected.roles.find(value => value.role === 'dataflow')!;
+              if (mode === 'wrong-bytes') role.executables[0]!.sha256 = 'f'.repeat(64);
+              else {
+                role.comparison = 'changed-code';
+                role.executables[0]!.baseline_sha256 = role.executables[0]!.sha256;
+              }
+              await writeFile(file, JSON.stringify(expected));
+            }
+            assert.equal(await main(f.args, f.dependencies), 1);
+            assert.ok(!f.events.some(event => event.startsWith('apply-')));
+            assert.ok(!f.commands.some(args => args.includes('update') || args.includes('create')));
+            if (mode === 'absent') assert.equal(f.commands.length, 0);
+          } finally { await f.dispose(); }
+        }
       });
       const bundlePath = join(f.directory, 'build-bundle.json');
       await writeFile(bundlePath, JSON.stringify({ schema_version: 1, scope, source_commit: commit, envelopes }));
@@ -510,7 +563,7 @@ test('actual CLI verifies independently anchored DSSE bundles, rejects fixture s
       }
       assert.ok(!f.commands.some(command => command[0] === 'cosign'));
       const report = JSON.parse(await readFile(f.reportPath, 'utf8'));
-      assert.equal(Object.keys(report.scaled_profile.attested_platform_digests).length, Object.keys(binding.images).length);
+      assert.equal(Object.keys(report.scaled_profile.attested_platform_digests).length, references.size);
     } finally { await f.dispose(); }
   }
 });
