@@ -1539,6 +1539,7 @@ mod tests {
         CollectorRegistration, LeaseClaim, LeaseKey, MemoryRoutingStore, RichPressureSnapshot, RoutingStore,
         SubsystemState,
     };
+    use cpu_time::ProcessTime;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     use super::*;
@@ -3129,10 +3130,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct AgedBacklogSample {
+        receipt_completion: std::time::Duration,
+        process_cpu: std::time::Duration,
+        rss_before_bytes: u64,
+        rss_after_bytes: u64,
+        output_physical_bytes: u64,
+    }
+
+    fn actual_rss_bytes(metrics: &RuntimeMetrics) -> u64 {
+        serde_json::to_value(metrics.pressure().expect("pressure snapshot"))
+            .expect("serialize pressure snapshot")
+            .get("actual_rss_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("actual RSS bytes")
+    }
+
     async fn aged_backlog_fixture(
         policy: FileBatchConfig,
         batches: usize,
         boundary: BacklogBoundary,
+        mut sample: Option<&mut AgedBacklogSample>,
     ) -> (Vec<usize>, Vec<u64>) {
         let directory = tempfile::tempdir().expect("directory");
         let store = Arc::new(MemoryRoutingStore::default());
@@ -3195,6 +3214,11 @@ mod tests {
         if matches!(boundary, BacklogBoundary::Drain) {
             owner.drain.send_replace(true);
         }
+        let receipt_started = sample.as_ref().map(|_| std::time::Instant::now());
+        let cpu_started = sample
+            .as_ref()
+            .map(|_| ProcessTime::try_now().expect("process CPU clock"));
+        let rss_before_bytes = sample.as_ref().map(|_| actual_rss_bytes(&metrics));
         drop(publication_slot);
         tokio::time::timeout(std::time::Duration::from_secs(45), async {
             first_flush.await.expect("seed committed");
@@ -3223,8 +3247,23 @@ mod tests {
         })
         .await
         .expect("finite real-worker completion");
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.receipt_completion = receipt_started.expect("receipt timer").elapsed();
+            sample.process_cpu = cpu_started
+                .expect("process CPU timer")
+                .try_elapsed()
+                .expect("process CPU elapsed");
+            sample.rss_before_bytes = rss_before_bytes.expect("RSS before drain");
+            sample.rss_after_bytes = actual_rss_bytes(&metrics);
+        }
 
         let root = directory.path().join("demo/generated/events");
+        let output_physical_bytes = std::fs::read_dir(&root)
+            .expect("files")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+            .map(|path| std::fs::metadata(path).expect("Parquet metadata").len())
+            .sum::<u64>();
         let mut rows_per_file = std::fs::read_dir(&root)
             .expect("files")
             .map(|entry| entry.expect("entry").path())
@@ -3239,6 +3278,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         rows_per_file.sort_unstable();
+        if let Some(sample) = sample.as_deref_mut() {
+            sample.output_physical_bytes = output_physical_bytes;
+        }
         let reasons = metrics
             .prometheus()
             .lines()
@@ -3296,7 +3338,7 @@ mod tests {
     #[tokio::test]
     async fn aged_ready_backlog_uses_real_worker_and_publication_path() {
         let policy = aged_backlog_policy();
-        let (baseline, _) = aged_backlog_fixture(policy.clone(), 256, BacklogBoundary::None).await;
+        let (baseline, _) = aged_backlog_fixture(policy.clone(), 256, BacklogBoundary::None, None).await;
         assert!(baseline.len() > 32, "unchanged default fragments expired ready work");
         let (coalesced, _) = aged_backlog_fixture(
             FileBatchConfig {
@@ -3305,9 +3347,84 @@ mod tests {
             },
             256,
             BacklogBoundary::None,
+            None,
         )
         .await;
         assert_eq!(coalesced, [2, 512], "one seed file and one finite ready snapshot");
+    }
+
+    #[tokio::test]
+    async fn aged_ready_backlog_component_pairs_measure_drain_costs() {
+        let logical_bytes_per_row =
+            arrow_deltalake::record_batch_logical_bytes(&fixture_batch()).expect("logical bytes") as f64 / 2.0;
+        let mut immediate_ms = Vec::with_capacity(3);
+        let mut drain_ready_ms = Vec::with_capacity(3);
+        let mut paired_latency_deltas_ms = Vec::with_capacity(3);
+
+        for pair in 0..3 {
+            let order = if pair % 2 == 0 {
+                [
+                    (arrowcol_tunables::AgeFlushPolicy::Immediate, false),
+                    (arrowcol_tunables::AgeFlushPolicy::DrainReady, true),
+                ]
+            } else {
+                [
+                    (arrowcol_tunables::AgeFlushPolicy::DrainReady, true),
+                    (arrowcol_tunables::AgeFlushPolicy::Immediate, false),
+                ]
+            };
+            let mut pair_immediate_ms = None;
+            let mut pair_drain_ready_ms = None;
+            for (age_flush_policy, drain_ready) in order {
+                let policy = FileBatchConfig {
+                    age_flush_policy,
+                    ..aged_backlog_policy()
+                };
+                let mut sample = AgedBacklogSample::default();
+                let (rows_per_file, versions) =
+                    aged_backlog_fixture(policy, 256, BacklogBoundary::None, Some(&mut sample)).await;
+                assert_eq!(rows_per_file.iter().sum::<usize>(), 514);
+                assert_eq!(versions.len(), 257, "seed and every queued publication committed");
+                if drain_ready {
+                    assert_eq!(rows_per_file, [2, 512]);
+                } else {
+                    assert!(rows_per_file.len() > 32, "control retains baseline fragmentation");
+                }
+
+                let receipt_ms = sample.receipt_completion.as_secs_f64() * 1_000.0;
+                let cpu_ms = sample.process_cpu.as_secs_f64() * 1_000.0;
+                let rss_delta_bytes = sample.rss_after_bytes as i128 - sample.rss_before_bytes as i128;
+                let output_bytes_per_row = sample.output_physical_bytes as f64 / 514.0;
+                println!(
+                    "BUFFER_DRAIN_SAMPLE pair={pair} policy={age_flush_policy:?} n_batches=257 rows=514 receipt_completion_ms={receipt_ms:.3} process_cpu_ms={cpu_ms:.3} rss_before_bytes={} rss_after_bytes={} rss_delta_bytes={rss_delta_bytes} output_parquet_bytes={} output_bytes_per_row={output_bytes_per_row:.3} logical_input_bytes_per_row={logical_bytes_per_row:.3} files={}",
+                    sample.rss_before_bytes,
+                    sample.rss_after_bytes,
+                    sample.output_physical_bytes,
+                    rows_per_file.len(),
+                );
+                if drain_ready {
+                    drain_ready_ms.push(receipt_ms);
+                    pair_drain_ready_ms = Some(receipt_ms);
+                } else {
+                    immediate_ms.push(receipt_ms);
+                    pair_immediate_ms = Some(receipt_ms);
+                }
+            }
+            paired_latency_deltas_ms
+                .push(pair_drain_ready_ms.expect("DrainReady arm") - pair_immediate_ms.expect("Immediate arm"));
+        }
+
+        let mean_and_sample_sd = |values: &[f64]| {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance = values.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+            (mean, variance.sqrt())
+        };
+        let (immediate_mean_ms, immediate_sd_ms) = mean_and_sample_sd(&immediate_ms);
+        let (drain_ready_mean_ms, drain_ready_sd_ms) = mean_and_sample_sd(&drain_ready_ms);
+        let (paired_mean_delta_ms, paired_sd_delta_ms) = mean_and_sample_sd(&paired_latency_deltas_ms);
+        println!(
+            "BUFFER_DRAIN_SUMMARY pairs=3 immediate_receipt_mean_ms={immediate_mean_ms:.3} immediate_receipt_sd_ms={immediate_sd_ms:.3} drain_ready_receipt_mean_ms={drain_ready_mean_ms:.3} drain_ready_receipt_sd_ms={drain_ready_sd_ms:.3} paired_drain_minus_immediate_mean_ms={paired_mean_delta_ms:.3} paired_delta_sd_ms={paired_sd_delta_ms:.3}"
+        );
     }
 
     #[tokio::test]
@@ -3351,18 +3468,18 @@ mod tests {
                 vec![2, 16, 16, 16, 16],
             ),
         ] {
-            let (rows, _) = aged_backlog_fixture(capped, 32, BacklogBoundary::None).await;
+            let (rows, _) = aged_backlog_fixture(capped, 32, BacklogBoundary::None, None).await;
             assert_eq!(rows, expected, "each existing cap still ends collection");
         }
         for boundary in [BacklogBoundary::Explicit, BacklogBoundary::Schema] {
-            let (rows, versions) = aged_backlog_fixture(policy.clone(), 32, boundary).await;
+            let (rows, versions) = aged_backlog_fixture(policy.clone(), 32, boundary, None).await;
             assert_eq!(rows, [2, 32, 32]);
             assert!(
                 versions[1..17].iter().max() < versions[17..].iter().min(),
                 "{boundary:?}"
             );
         }
-        let (rows, _) = aged_backlog_fixture(policy, 32, BacklogBoundary::Drain).await;
+        let (rows, _) = aged_backlog_fixture(policy, 32, BacklogBoundary::Drain, None).await;
         assert_eq!(rows, [2, 64], "drain closes admission and completes finite queued work");
     }
 
@@ -3376,6 +3493,7 @@ mod tests {
             },
             800,
             BacklogBoundary::Refill,
+            None,
         )
         .await;
         assert!(versions[1..801].iter().max() < versions[801..].iter().min());
