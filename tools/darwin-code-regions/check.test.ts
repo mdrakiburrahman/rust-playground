@@ -52,8 +52,8 @@ function fixture() {
 test("actual reviewed layout blobs pass without checking out or executing the candidate", () => {
   const repo = fileURLToPath(new URL("../../", import.meta.url));
   const result = checkRegion(repo,
-    "f3c4425c93d394632af0f0c1f11c631d23fe7811",
-    "24d5237cbd15645ef238064fe5981b603c826be1");
+    "24d5237cbd15645ef238064fe5981b603c826be1",
+    "f3c4425c93d394632af0f0c1f11c631d23fe7811");
   assert.equal(result.verdict, "scope-only-pass");
   assert.notEqual(result.seed.blob, result.candidate.blob);
 });

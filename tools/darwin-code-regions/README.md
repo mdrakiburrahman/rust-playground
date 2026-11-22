@@ -17,8 +17,8 @@ or any production crate:
 npx --no-install nx run darwin-code-regions:build-parser
 npx --no-install tsx tools/darwin-code-regions/check.ts \
   --repo /workspaces/rust-playground \
-  --seed f3c4425c93d394632af0f0c1f11c631d23fe7811 \
-  --candidate 24d5237cbd15645ef238064fe5981b603c826be1
+  --seed 24d5237cbd15645ef238064fe5981b603c826be1 \
+  --candidate f3c4425c93d394632af0f0c1f11c631d23fe7811
 npx --no-install nx run darwin-code-regions:test
 npx --no-install nx run darwin-code-regions:typecheck
 ```
