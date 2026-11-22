@@ -5345,3 +5345,7 @@ mod layout_readback_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "delta/chunk_fixture.rs"]
+mod chunk_fixture;
