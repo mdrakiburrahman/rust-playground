@@ -49,6 +49,8 @@ test('changed-code admission binds source, invocation, exact image platform and 
   assert.throws(() => assertApplicationEvidence(absent, expected, revision), /binding/);
   assert.throws(() => assertApplicationEvidence({ ...output,
     application: { ...output.application, isolation: 'shared' } }, expected, revision), /isolated/);
+  assert.throws(() => assertApplicationEvidence(output, { ...expected,
+    roles: [{ ...expected.roles[0], comparison: ['changed-code'] }] }, revision), /binding/);
 });
 
 test('source-only edits allow unchanged executable bytes but cannot be mislabeled changed-code', () => {

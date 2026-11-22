@@ -119,6 +119,71 @@ test('producer refuses dirty source, revision mismatch and keys in candidate con
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test('opt-in application producer signs fresh-builder invocation and extracted bytes, never supplied executable claims', async () => {
+  const f = await fixture(), objects = new Map<string, Buffer>(), builders = new Set<string>(), calls: string[][] = [];
+  let builds = 0, currentConfig = '';
+  const bytes = (value: unknown) => {
+    const content = Buffer.from(JSON.stringify(value)), id = 'sha256:' + createHash('sha256').update(content).digest('hex');
+    objects.set(id, content); return id;
+  };
+  const runner: typeof run_tree = async (args, seconds, cwd, ...rest) => {
+    if (args[0] !== 'docker') return run_tree(args, seconds, cwd, ...rest);
+    calls.push(args);
+    if (args[1] === 'buildx' && args[2] === 'create') builders.add(args[args.indexOf('--name') + 1]!);
+    if (args[1] === 'buildx' && args[2] === 'build') {
+      builds++;
+      assert.ok(builders.has(args[args.indexOf('--builder') + 1]!));
+      currentConfig = bytes({ os: 'linux', architecture: 'amd64', build: builds });
+      const manifest = bytes({ mediaType: 'application/vnd.oci.image.manifest.v1+json',
+        config: { digest: currentConfig }, layers: [] });
+      await writeFile(args[args.indexOf('--metadata-file') + 1]!, JSON.stringify({
+        'containerimage.digest': manifest, 'containerimage.config.digest': currentConfig }));
+    }
+    if (args[1] === 'image') return { returncode: 0, stdout: JSON.stringify({ Id: currentConfig, Os: 'linux', Architecture: 'amd64' }), stderr: '' };
+    if (args[1] === 'create') return { returncode: 0, stdout: 'a'.repeat(64), stderr: '' };
+    if (args[1] === 'cp') await writeFile(args[3]!, 'extracted image bytes:' + currentConfig);
+    return { returncode: 0, stdout: '', stderr: '' };
+  };
+  const read: RegistryRead = async (_repository, _kind, id) => {
+    const content = objects.get(id); assert.ok(content); return content;
+  };
+  try {
+    const bundle = await buildCandidateImages({ ...f.options, application: true }, runner, read);
+    assert.equal(builders.size, imageBuilds.length);
+    assert.equal(calls.filter(args => args[1] === 'buildx' && args[2] === 'rm').length, imageBuilds.length);
+    assert.ok(!calls.some(args => args.includes('--secret') || args.includes(f.signingKey)));
+    for (const [index, output] of bundle.outputs.entries()) {
+      const statement = verifyBuildEnvelope(bundle.envelopes[index], f.publicKey);
+      assertProducedBuildStatement(statement, output.digest, f.revision, output.repository, 'local-fixture', f.uri);
+      const invocation = (statement.predicate as { invocation: { parameters: { build_invocation: string[] } } }).invocation.parameters.build_invocation;
+      assert.equal(output.application!.build_invocation_sha256,
+        createHash('sha256').update(JSON.stringify(invocation)).digest('hex'));
+      for (const executable of output.application!.executables) {
+        assert.equal(executable.sha256, createHash('sha256').update('extracted image bytes:' + executable.config_digest).digest('hex'));
+      }
+    }
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test('immutable source admission ignores Git replacement refs and rejects a replacement-clean working tree', async () => {
+  const f = await fixture();
+  let builds = 0;
+  try {
+    await writeFile(join(f.source, 'marker'), 'replacement tree input\n');
+    await command(['git', 'add', 'marker'], f.source);
+    const tree = await command(['git', 'write-tree'], f.source);
+    const replacement = await command(['git', 'commit-tree', tree, '-m', 'fixture replacement'], f.source);
+    await command(['git', 'replace', f.revision, replacement], f.source);
+    assert.equal(await command(['git', 'status', '--porcelain'], f.source), '');
+    const runner: typeof run_tree = async (args, ...rest) => {
+      if (args[0] === 'docker') builds++;
+      return run_tree(args, ...rest);
+    };
+    await assert.rejects(buildCandidateImages(f.options, runner), /clean checkout/);
+    assert.equal(builds, 0);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test('real small-image publisher and verifier chain with a disposable signer and owned loopback registry', {
   skip: process.env.ARROWCOL_LOCAL_BUILD_PROOF !== '1',
 }, async () => {

@@ -56,7 +56,7 @@ The default runner and source manifest retain the historical one-writer/one-clie
 | Collector | `--collector-shape e64` (default): E64ds_v6, 48 runtime/request/limit cores, 384 GiB; `e192`: E192ids_v6, 176 cores, 1536 GiB. Core-allocation policy and RSS admission limit are rendered for the shape. All collector/support stages target a fresh run-owned pool with a run-ID taint, declared by `infra/azure/scaled-collector.bicep`; existing `arrowe192` and `benche64` are not modified. |
 | Client pool | Snapshot `benchd64` only when autoscaling is enabled, min is 0, and configured/observed nodes are 0. Temporarily cap max at the client count. After namespace deletion, drain and restore the exact original settings; drift is a nonzero failure, never overwritten. Partial startup also takes the owned cleanup path. |
 | Workload provenance | Resolve and explicitly pin known client defaults, CLI flags and literal env. Conflicting/unknown env, envFrom, commands and args are rejected. The workload SHA-256 binds sorted effective generator configuration, client count and ordered payload-ID/pod-ordinal pairs. Job/run names remain unique but do not change diagnostic inputs. Historical data-identity eligibility requires the exact single-client ID and ordinal; another ID or multiple clients is non-parity. The rendered-manifest SHA-256 separately binds collector/support configuration and resources. Realistic or compressed profiles are separately labeled. |
-| Candidate images | JSON binds each exact original image reference to a candidate digest, requested commit and workload hash. This is **structural binding, not build proof**. Before any workload/pool write, `run` verifies an independently anchored `--provenance-bundle` or the existing cosign path. The new producer signs actual completed outputs, exact source commit/tree and recursive gitlinks, and the publisher's role/Dockerfile/context. Manifest/index and platform-child digests are distinct; runtime evidence must match the signed chain. No historical-image fallback exists. |
+| Candidate images | JSON binds each exact original image reference to a candidate digest, requested commit and workload hash. This is **structural binding, not build proof**. Before any workload/pool write, `run` verifies an independently anchored `--provenance-bundle` or the existing cosign path, plus external `--application-evidence`. The producer's opt-in `--application` mode binds isolated builds and installed executable hashes to source/role and final registry identities. Manifest/index, platform-child and config digests remain distinct. No historical-image fallback exists. |
 | Runtime evidence | Validate actual pod UID, node, image ID, args, resources, client env and collector ConfigMap against the render; verify distinct client nodes, actual VM SKUs and allocatable CPU/memory. Retain each client's full-window result and private transcript. The observer starts before scheduling and stops before Delta replay/failure cleanup. `node_observation` schema v2 separates target-pod procfs/cgroup-v2 aggregates from optional read-only Kubelet host totals/capacity. Reads have 5-second abortable bounds; stop kills owned reads. Coverage and reset/unavailable reasons accompany samples; missing data remains null. |
 | Collector promotion | Optional `--collector-promotion JSON` applies only qualified leaf coordinates under `collector.batching`, `collector.commit`, `collector.runtime` or `parquet_writer.defaults`. The existing Rust typed registry validates against historical component context and projects env; the existing consumer-startup adapter checks actual readback before scheduling and after completion. Unmapped coordinates, invalid enums, explicit flag/env conflicts, table-writer policy or readback drift fail closed. Client profile, table/endpoint/data identities and pod/node limits are never copied from the local winner. |
 
@@ -101,14 +101,30 @@ Promoted runs retain `collector-promotion-startup.json` and `collector-promotion
 
 **Remaining external trust binding:** an operator must approve/pin the trusted producer tool revision separately from candidate source, protect an Ed25519 signing key so candidate build steps cannot access it, and independently supply its public-key fingerprint/PEM outside the candidate checkout. A key or approval shipped by a candidate is not a trust anchor. Production federation/ACR permission and normal campaign custody/approval are still required; this repository creates no production key, identity or approval.
 
-**Application-code binding is also a live gate:** source plus a completed OCI digest does not prove a changed executable was rebuilt when Cargo target cache mounts are reused. Actual application publication requires independently validated per-arm BuildKit/Cargo isolation (a fresh builder with no shared writable target state is sufficient) and a retained installed-executable digest for the changed role. `--no-cache` alone does not clear cache mounts. The tiny fixture proof does not establish this application-build prerequisite.
+**Application-code binding is also a live gate.** Source plus an OCI digest cannot establish that a shared writable Cargo target rebuilt changed code. Opt-in `--application` creates/removes an exact uniquely named Docker-container Buildx builder per role, without imported caches, and captures every repository-owned installed executable from the exact linux/amd64 image config after verifying its platform manifest. It retains executable path/SHA-256, source revision, signed build-invocation hash and OCI identities. Extraction uses stopped containers; no executable is started. The existing publisher and producer mode without this flag remain unchanged. `--no-cache` alone does not clear cache mounts.
+
+Local-only application proof, with no registry push, signer or Azure operation:
+
+```bash
+npx --no-install tsx projects/arrowcol-oat/aks-application-build.ts \
+  --source-root "$CANDIDATE_SOURCE" --revision "$CANDIDATE_COMMIT" \
+  --roles dataflow --output "$EVIDENCE/new-local-application-proof"
+ARROWCOL_APPLICATION_FIXTURE_PROOF=1 npx --no-install tsx --test \
+  projects/arrowcol-oat/aks-application-build.test.ts
+```
+
+The new directory retains `application-build.json`, OCI archives and BuildKit metadata. Local source objects/gitlinks are checked and archived; this **unsigned local proof does not verify repository origin independently or authorize AKS**. The test's tiny installed file is explicitly fixture evidence, not a collector-code comparison.
+
+For a live run, independently supply `--application-evidence` outside candidate source. Its JSON has `schema_version: 1`, `source_commit`, and `roles`. Each role record contains `role`, `image_digest`, `platform_digest`, `config_digest`, `build_invocation_sha256`, `comparison` (`changed-code` or `source-only`) and `executables` (`path`, `sha256`, optional `baseline_sha256`). These are operator-expected witnesses, not a file auto-generated from candidate claims. The runner compares them to the trusted signed producer output and retains accepted records under `scaled_profile.application_evidence`.
+
+`changed-code` requires complete expected baseline hashes and at least one changed installed executable for that role. Equal or missing bytes refuse qualification; differing image labels alone do not count. Unrelated or behavior-neutral source edits may use `source-only` with identical bytes and are not labeled changed-code. SQL Server has no repository-owned installed executable and cannot qualify a changed-code comparison. Missing/mismatched application evidence fails before workload/pool writes; a missing CLI flag fails before any cloud operation.
 
 After those gates only, the following command performs **ACR writes and production signing**. Run the approved tool installation, not code controlled by the candidate; keep outputs and keys outside candidate source. Production registry transport/federation has not been exercised by the local fixture proof:
 
 ```bash
 npx --no-install tsx "$TRUSTED_TOOLS/projects/arrowcol-oat/aks-candidate-build.ts" \
   --source-root "$CANDIDATE_SOURCE" --revision "$CANDIDATE_COMMIT" \
-  --publish --federated --registry arrowcollector68590 \
+  --application --publish --federated --registry arrowcollector68590 \
   --env "$PUBLISHER_ENV" --azure-env "$GENERATED_AZURE_ENV" \
   --stamp-config "$STAMP_CONFIG" --signing-key "$APPROVED_BUILD_SIGNING_KEY" \
   --output "$EVIDENCE/build-bundle.json" \
@@ -131,6 +147,7 @@ npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run \
   --image-manifest "$EVIDENCE/candidate-images.json" \
   --provenance-bundle "$EVIDENCE/build-bundle.json" \
   --provenance-key "${TRUSTED_BUILD_PUBLIC_KEY:?Set the independently trusted builder public-key path}" \
+  --application-evidence "${INDEPENDENT_APPLICATION_EVIDENCE:?Set the operator-approved expected executable/image evidence path}" \
   --env-file .env --stamp-config .temp/stamp-68590.yaml
 ```
 

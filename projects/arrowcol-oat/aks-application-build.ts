@@ -105,7 +105,8 @@ export async function captureInstalledExecutables(role: Role, platform: BuildOut
 export function assertApplicationEvidence(output: unknown, rawExpected: unknown, revision: string): ApplicationEvidence['roles'][number] {
   const actual = object(output, 'application output'), expected = object(rawExpected, 'independent application evidence');
   const role = imageBuilds.find(([name]) => name === actual.role)?.[0];
-  if (!role || expected.schema_version !== 1 || expected.source_commit !== revision || !Array.isArray(expected.roles)) {
+  if (!/^[a-f0-9]{40}$/.test(revision) || !role || expected.schema_version !== 1 ||
+      expected.source_commit !== revision || !Array.isArray(expected.roles)) {
     throw new Error('Independent application evidence does not bind the requested source and role.');
   }
   const matches = expected.roles.filter(value => object(value, 'expected role').role === role);
@@ -122,7 +123,7 @@ export function assertApplicationEvidence(output: unknown, rawExpected: unknown,
       digest(wanted.config_digest) !== digest(platform.config_digest) ||
       hash(wanted.build_invocation_sha256) !== hash(application.build_invocation_sha256) ||
       platform.os !== 'linux' || platform.architecture !== 'amd64' ||
-      !['changed-code', 'source-only'].includes(String(wanted.comparison)) ||
+      (wanted.comparison !== 'changed-code' && wanted.comparison !== 'source-only') ||
       !Array.isArray(wanted.executables) || !Array.isArray(application.executables)) {
     throw new Error('Independent application evidence differs from the isolated source/build/image binding.');
   }

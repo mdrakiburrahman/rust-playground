@@ -99,7 +99,8 @@ function sourceUri(raw: string, fixture: boolean, parent?: string): string {
   return 'git+' + url.href.replace(/\/$/, '').replace(/\.git$/, '');
 }
 async function checked(runner: Runner, args: string[], cwd: string, seconds = 30): Promise<string> {
-  const result = await runner(args, seconds, cwd);
+  const command = args[0] === 'git' ? ['git', '--no-replace-objects', ...args.slice(1)] : args;
+  const result = await runner(command, seconds, cwd);
   if (result.returncode) throw new Error(`${args[0]} ${args[1]} failed (${result.returncode}); raw build diagnostics are not published.`);
   return result.stdout;
 }
