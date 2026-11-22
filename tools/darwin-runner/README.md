@@ -1,27 +1,24 @@
 # Darwin runner
 
-Darwin 0.3.0 runs in a pinned Debian bookworm controller beside the Ubuntu devcontainer. The Debian image digest and apt snapshot, Rust/Node versions, and Darwin checksum are pinned. The controller and candidate worker use identical toolchains. Each candidate gets a fresh container with only committed `git archive HEAD`, no host mounts, credentials, cloud config, controller home, inherited environment, or Docker socket.
+The runner pins Darwin 0.3.0 and its Debian bookworm toolchain. Candidate containers use the same Rust/Node toolchain, no host workspace or credential mounts, and no network. Controller commands use a clean committed checkout; the ignored `.env` and encrypted token file are never mounted as workspace content.
 
 | Command | Purpose |
 |---|---|
-| `tools/darwin-runner/run.sh version` | Build the pinned images and print the Darwin version. |
-| `tools/darwin-runner/run.sh dry-run tools/darwin-runner/toy.yaml` | Validate the toy config and ask Darwin to dry-run it without a token. |
-| `tools/darwin-runner/run.sh prepare` | Generate a per-run age identity in a Docker volume and print its run ID, public recipient, and SHA-256 fingerprint. |
-| `tools/darwin-runner/run.sh evolve <tracked-config.yaml> <experiment> <run-id>` | Prove isolation, unwrap the run-scoped encrypted token for Darwin, and run the experiment. |
-| `tools/darwin-runner/run.sh cleanup <run-id>` | Remove an unused run's encrypted workspace copy and private-key volume. |
-| `env -u COPILOT_GITHUB_TOKEN /usr/local/bin/darwin-candidate-exec 'cargo test --locked'` | Required evaluator command form. |
+| `tools/darwin-runner/run.sh version` | Build pinned images and print the Darwin version. |
+| `tools/darwin-runner/run.sh dry-run tools/darwin-runner/toy.yaml` | Validate the tracked toy config and run Darwin's no-token dry-run. |
+| `tools/darwin-runner/run.sh prepare [run-id]` | Create an age key volume and print its public recipient. |
+| `tools/darwin-runner/run.sh evolve <config> <experiment> <run-id>` | Fail closed while native Docker-provider evolution is blocked. |
+| `tools/darwin-runner/run.sh cleanup <run-id>` | Remove an unused encrypted input and private-key volume. |
+| `npx --no-install tsx --test tools/darwin-runner/*.test.ts` | Run manifest, dispatch-contract, and deadline tests. |
 
-After `prepare`, encrypt a one-line `COPILOT_GITHUB_TOKEN=<value>` file to the returned `age1...` recipient. Place only the ciphertext at `sync/rust-playground/.darwin-runner-<run-id>.env.age`; bootstrapper sync places it at the repository root. Do not stage plaintext in the shared sync folder, a command, or job history. The runner removes its workspace copy and destroys the key volume on completion or failed decryption; remove the source ciphertext from the sync folder after the run. The existing `.env` is neither read nor changed, and there is no fallback recipient.
+## Native Darwin status
 
-Before decrypting anything, `evolve` checks that every evaluator command drops `COPILOT_GITHUB_TOKEN` before invoking the isolated executor. It then runs a fake-token probe using a separate temporary repository with a tracked sentinel `.env`. The worker must confirm the sentinel environment, `.env`, encrypted-file patterns, credentials, home and controller socket are absent. A failed probe stops before decryption or inference. The private key volume is mounted only into the controller and read-only; the decrypted one-line env file exists only in the controller's fresh tmpfs and is passed to Darwin with `--env-file`.
+The pinned executable reports `darwin 0.3.0`, but its frozen bundle does not include `python_on_whales`. The campaign's Docker-backed config therefore fails before lane selection. No compatible checksum-pinned external runtime loader or complete official distribution is available in this branch. `evolve` is disabled; do not stage credentials or infer with this artifact. The minimum unblock is a compatible complete Darwin distribution that includes the native Docker provider and dependencies.
 
-The pinned binary prints `darwin 0.3.0`. In the first no-token dry-run, the Debian controller started, and Darwin parsed the toy config, but dry-run failed with `ModuleNotFoundError: No module named 'darwin.prompts.default'`. The source repository is not readable with the authorized `mdrakiburrahman` GitHub identity, so this runner does not substitute an unverified binary or copy private source.
+## Direct bridge contract
 
-Once a trusted campaign config is available, use:
+`dispatch-contract.ts` accepts only `{version: 1, lane: "compression-config", candidateCommit: "<full-sha>"}`. The trusted worker supplies the repository, producer commit, fixed config path, and complete config validator; candidate input cannot choose a path, command, environment, or evaluator. Validation rejects non-descendant commits and any changed path beyond the one trusted config before invoking the workload callback. The tests use committed fixture Git refs and an inert compression-only validator to prove distinct levels and fail-closed rejection. This is a direct bridge contract test, not Darwin evolve, OAT evaluation, or production worker integration.
 
-```bash
-tools/darwin-runner/run.sh prepare
-tools/darwin-runner/run.sh evolve tools/darwin/darwin.yaml <experiment-name> <run-id>
-```
+`deadline-state.ts` stores a run's exact UTC deadline outside the repository and refuses a changed or expired deadline on resume. `deadline-runner.ts` pins this campaign to `2026-11-23T05:06:42.133Z`, bounds a child process by the remaining budget, and reserves up to 30 seconds for termination and container cleanup. The direct tests exercise persistence, expiry, cleanup reserve, and process termination with no token. Reuse the same run ID when resuming; these helpers do not establish native Darwin confinement.
 
-The prepare output contains only the public recipient and fingerprint. A successful inference run first prints `candidate isolation assertions passed`, `Isolation proof passed: ...`, and `Darwin evaluator isolation check passed (...)`; no credential value is emitted.
+`config-check.ts` is an offline strict check for the ten-lane root manifest and literal evaluator commands; it is not Darwin's production admission enforcement. The toy config is intentionally separate and has no inference or Docker evaluator.

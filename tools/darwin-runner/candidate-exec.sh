@@ -44,7 +44,7 @@ docker_host=${DOCKER_HOST:-unix:///var/run/docker-host.sock}
 set +e
 git -C "$repo" archive --format=tar HEAD |
   env -i PATH=/usr/bin:/bin DOCKER_HOST="$docker_host" docker run --rm --interactive \
-    --network bridge \
+    --network none \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --pids-limit 2048 \
@@ -59,6 +59,8 @@ git -C "$repo" archive --format=tar HEAD |
       tar -xf - -C /workspace --no-same-owner \
         --exclude=.env --exclude="*/.env" \
         --exclude=".env.*" --exclude="*/.env.*" \
+        --exclude=".envrc" --exclude="*/.envrc" \
+        --exclude="*.pem" --exclude="*.key" \
         --exclude=".azure" --exclude="*/.azure" \
         --exclude=".aws" --exclude="*/.aws" \
         --exclude=".config/gh" --exclude="*/.config/gh" \
@@ -71,7 +73,7 @@ git -C "$repo" archive --format=tar HEAD |
         --exclude=".gitconfig" --exclude="*/.gitconfig" \
         --exclude="*.age"
 
-      if find /workspace \( -type f -o -type l \) \( -name ".env" -o -name ".env.*" -o -name "*.age" -o -name ".netrc" -o -name ".npmrc" -o -name ".git-credentials" -o -name ".gitconfig" \) -print -quit | grep -q .; then
+      if find /workspace \( -type f -o -type l \) \( -name ".env" -o -name ".env.*" -o -name ".envrc" -o -name "*.age" -o -name "*.pem" -o -name "*.key" -o -name ".netrc" -o -name ".npmrc" -o -name ".git-credentials" -o -name ".gitconfig" \) -print -quit | grep -q .; then
         echo "credential-like file found in candidate snapshot" >&2
         exit 1
       fi

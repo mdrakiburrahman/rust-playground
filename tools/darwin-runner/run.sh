@@ -2,13 +2,14 @@
 set -euo pipefail
 
 usage() {
-  cat >&2 <<'EOF'
+  cat >&2 <<'USAGE'
 Usage:
   tools/darwin-runner/run.sh prepare [run-id]
+  tools/darwin-runner/run.sh version
   tools/darwin-runner/run.sh dry-run <tracked-config.yaml>
-  tools/darwin-runner/run.sh evolve <tracked-config.yaml> <experiment> <run-id>
+  DARWIN_DEADLINE_UTC=<fixed-UTC> tools/darwin-runner/run.sh evolve <tracked-config.yaml> <experiment> <run-id>
   tools/darwin-runner/run.sh cleanup <run-id>
-EOF
+USAGE
   exit 2
 }
 
@@ -23,6 +24,12 @@ repo=$(git rev-parse --show-toplevel)
 cd "$repo"
 script_dir="$repo/tools/darwin-runner"
 lock="$script_dir/tools.lock.json"
+workspace=
+active_container_name=
+
+temp_workspace_cleanup() {
+  if [[ -n "$workspace" ]]; then rm -rf -- "$workspace"; fi
+}
 
 volume_for() {
   printf 'rust-playground-darwin-key-%s' "$1"
@@ -85,8 +92,39 @@ build_images() {
   docker build --pull "${build_args[@]}" --target controller --tag "$controller_image" "$script_dir"
 }
 
+make_clean_checkout() {
+  local destination commit
+  destination=$(mktemp -d "${TMPDIR:-/tmp}/darwin-runner-workspace.XXXXXX")
+  commit=$(git -C "$repo" rev-parse --verify HEAD)
+  if ! git clone --quiet --no-hardlinks --no-local --no-checkout "$repo" "$destination" \
+      || ! git -C "$destination" checkout --quiet --detach "$commit" \
+      || ! git -C "$destination" submodule update --init --recursive; then
+    rm -rf -- "$destination"
+    return 1
+  fi
+  git -C "$destination" remote remove origin
+  for credential_dir in .azure .aws .kube .ssh .docker .config/gh; do
+    if [[ -e "$destination/$credential_dir" ]]; then
+      echo "credential directory found in clean checkout: $credential_dir" >&2
+      rm -rf -- "$destination"
+      return 1
+    fi
+  done
+  if find "$destination" \( -type f -o -type l \) \( \
+      -name '.env' -o -name '.env.*' -o -name '.envrc' -o -name '*.age' \
+      -o -name '*.pem' -o -name '*.key' -o -name '.netrc' -o -name '.npmrc' \
+      -o -name '.git-credentials' -o -name '.gitconfig' \) -print -quit | grep -q .; then
+    echo "credential-like file found in clean checkout" >&2
+    rm -rf -- "$destination"
+    return 1
+  fi
+  workspace=$destination
+}
+
 run_controller_base() {
-  docker run --rm --init \
+  local name_args=()
+  if [[ -n "$active_container_name" ]]; then name_args+=(--name "$active_container_name"); fi
+  docker run --rm --init "${name_args[@]}" \
     --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker-host.sock \
     --tmpfs /run/darwin-home:rw,nosuid,nodev,noexec,size=512m \
     --env HOME=/run/darwin-home \
@@ -96,13 +134,15 @@ run_controller_base() {
 }
 
 run_controller() {
+  [[ -n "$workspace" ]] || { echo "clean workspace is required" >&2; return 2; }
   run_controller_base \
-    --mount "type=bind,source=$repo,target=/workspace" \
+    --mount "type=bind,source=$workspace,target=/workspace" \
     --workdir /workspace "$@"
 }
 
 check_config() {
   local config=$1
+  local mode=${2:-}
   [[ -f "$repo/$config" ]] || { echo "config not found in repository" >&2; exit 2; }
   local relative
   relative=$(realpath --relative-to="$repo" "$repo/$config")
@@ -111,7 +151,13 @@ check_config() {
     echo "config must be tracked before running Darwin" >&2
     exit 2
   }
-  npx --no-install tsx "$script_dir/config-check.ts" "$repo/$relative" >&2
+  git diff --quiet HEAD -- "$relative" || {
+    echo "config must be committed before running Darwin" >&2
+    exit 2
+  }
+  local check_args=("$script_dir/config-check.ts" "$repo/$relative")
+  [[ -z "$mode" ]] || check_args+=("$mode")
+  npx --no-install tsx "${check_args[@]}" >&2
   printf '%s' "$relative"
 }
 
@@ -151,7 +197,11 @@ case "$action" in
     ;;
   dry-run)
     [[ $# -eq 1 ]] || usage
-    config_rel=$(check_config "$1")
+    config_mode=
+    [[ "$1" != "tools/darwin-runner/toy.yaml" ]] || config_mode=--toy
+    config_rel=$(check_config "$1" "$config_mode")
+    make_clean_checkout
+    trap temp_workspace_cleanup EXIT
     build_images
     run_controller --entrypoint /bin/bash "$controller_image" -euo pipefail -c '
       export DARWIN_HOME=/run/darwin-home/.darwin
@@ -195,34 +245,8 @@ case "$action" in
     ;;
   evolve)
     [[ $# -eq 3 ]] || usage
-    config_rel=$(check_config "$1")
-    experiment=$2
-    run_id=$3
-    [[ "$experiment" =~ ^[A-Za-z0-9._-]+$ ]] || {
-      echo "experiment must be a simple name" >&2
-      exit 2
-    }
-    valid_run_id "$run_id" || { echo "invalid run id" >&2; exit 2; }
-    envelope="$repo/.darwin-runner-$run_id.env.age"
-    volume=$(volume_for "$run_id")
-    [[ -f "$envelope" && ! -L "$envelope" ]] || {
-      echo "run-scoped encrypted token must be a regular file" >&2
-      exit 1
-    }
-    docker volume inspect "$volume" >/dev/null
-
-    run_controller_base \
-      --env COPILOT_GITHUB_TOKEN=darwin-runner-fake-token \
-      --env DARWIN_TEST_SENTINEL=darwin-runner-fake-token \
-      --entrypoint /usr/local/bin/darwin-candidate-exec \
-      "$controller_image" --isolation-check
-
-    trap 'rm -f -- "$envelope"; docker volume rm "$volume"' EXIT
-    run_controller \
-      --mount "type=volume,source=$volume,target=/run/age,readonly" \
-      --env "DARWIN_TOKEN_ENVELOPE=/workspace/$(basename "$envelope")" \
-      --entrypoint /usr/local/bin/darwin-runner-evolve \
-      "$controller_image" "$config_rel" "$experiment" "$run_id"
+    echo "native Darwin Docker-provider evolution is blocked: the pinned bundle lacks python_on_whales; no credential or inference was used" >&2
+    exit 2
     ;;
   *)
     usage

@@ -14,6 +14,6 @@ evaluator:
   metrics:
     score: !eval "float(stdout[-1])"
   commands:
-    - env -u COPILOT_GITHUB_TOKEN /usr/local/bin/darwin-candidate-exec "printf 1"
+    - /usr/bin/printf 1
 prompt:
-  system: "Improve a toy implementation while preserving behavior."
+  system: "No inference; exercise only the local default executor."
