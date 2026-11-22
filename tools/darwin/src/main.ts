@@ -45,7 +45,9 @@ env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$home" DARWIN_HOME=${shellQuote(p
 
 async function check(home: string, candidate: string, experiment: string): Promise<number> {
   const manifest = JSON.parse(await readFile(path.join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
-  const problems = await checkCandidatePaths(candidate, manifest.files, experimentPathsFor(experiment), manifest.submodules);
+  const relativeHome = path.relative(candidate, home).split(path.sep).join("/");
+  const stateDirectory = /^\.darwin\/[A-Za-z0-9_-]+$/.test(relativeHome) ? relativeHome : undefined;
+  const problems = await checkCandidatePaths(candidate, manifest.files, experimentPathsFor(experiment), manifest.submodules, stateDirectory);
   return problems.length;
 }
 
@@ -72,9 +74,12 @@ async function main(args: string[]): Promise<void> {
   const reason = problems ? "candidate violates path checks" : "stub evaluation does not produce measurements";
   console.log(`@FEEDBACK ${reason}`);
   console.log(`@RESULT ${JSON.stringify({
-    version: 1, experiment, tier: "stub", valid: 0, combined_score: 0, accepted: false,
+    version: 1, experiment, tier: "stub", objective: "stub", proxy: null,
+    valid: 0, combined_score: 0, accepted: false,
     reason, durable_rows_per_second: null, parquet_bytes_per_row: null,
-    commit_latency_seconds: null, resources: null, downstream: null, window: null,
+    commit_latency_seconds: null, resources: null,
+    downstream: { rows_per_second: null, unavailable_reason: "stub has no downstream observation" },
+    window: null,
   })}`);
 }
 

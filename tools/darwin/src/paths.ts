@@ -43,9 +43,15 @@ export async function checkCandidatePaths(
   baseline: Manifest,
   allowed: readonly string[],
   submodules: Readonly<Record<string, string>> = {},
+  stateDirectory?: string,
 ): Promise<string[]> {
   root = await realpath(root);
   const problems: string[] = [];
+  if (stateDirectory !== undefined && (!/^\.darwin\/[A-Za-z0-9_-]+$/.test(stateDirectory)
+    || Object.keys(baseline).some(relative => relative.startsWith(`${stateDirectory}/`))
+    || Object.keys(submodules).some(relative => relative === stateDirectory || relative.startsWith(`${stateDirectory}/`)))) {
+    throw new Error("invalid evaluator state directory");
+  }
   const allowedPaths = new Set(allowed);
   for (const relative of allowedPaths) {
     if (!safePath(relative) || !Object.hasOwn(baseline, relative)) {
@@ -59,6 +65,7 @@ export async function checkCandidatePaths(
   const seen = new Set<string>();
   for (const relative of new Set(paths)) {
     if (!safePath(relative)) throw new Error(`unsafe candidate path: ${relative}`);
+    if (stateDirectory && relative.startsWith(`${stateDirectory}/`)) continue;
     seen.add(relative);
     if (Object.hasOwn(submodules, relative)) {
       try {

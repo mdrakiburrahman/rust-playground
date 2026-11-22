@@ -7,6 +7,8 @@ export interface OatMeasurement extends Measurement {
   endUnixMs: number;
   rows: number;
   parquetBytes: number;
+  files: number;
+  commits: number;
   commitLatencySeconds: { p50: number; p99: number; samples: number };
   cpuMillicoresMean: number | null;
   memoryBytesMaxObserved: number | null;
@@ -60,7 +62,8 @@ export function extractTimedReceipts(input: unknown, tableName: string, measurem
   const evidence = object(input, "evidence");
   const commits = object(evidence.durable_commits, "durable commits");
   const cumulative = object(commits.run_cumulative_output, "cumulative output");
-  if (cumulative.unavailable_reason != null || !Array.isArray(cumulative.commits_by_version)) {
+  if (cumulative.scope !== "all_new_ingestion_commits_from_this_cell_including_warmup"
+    || cumulative.unavailable_reason != null || !Array.isArray(cumulative.commits_by_version)) {
     throw new Error("complete timed receipts are unavailable");
   }
   const cumulativeRows = integer(cumulative.rows, "cumulative receipt rows", 1);
@@ -94,11 +97,11 @@ export function extractTimedReceipts(input: unknown, tableName: string, measurem
   }
   const selected = receipts.filter(receipt =>
     receipt.finishedAtUnixMs >= measurement.startUnixMs && receipt.finishedAtUnixMs < measurement.endUnixMs);
-  const sum = (items: TimedReceipt[], field: "rows" | "parquetBytes") =>
+  const sum = (items: TimedReceipt[], field: "rows" | "files" | "parquetBytes") =>
     items.reduce((total, receipt) => integer(total + receipt[field], "receipt total"), 0);
-  if (sum(receipts, "rows") !== cumulativeRows
+  if (integer(cumulative.commits, "cumulative commit count") !== receipts.length || sum(receipts, "rows") !== cumulativeRows
     || sum(selected, "rows") !== measurement.rows || sum(selected, "parquetBytes") !== measurement.parquetBytes
-    || selected.length !== measurement.commitLatencySeconds.samples) {
+    || sum(selected, "files") !== measurement.files || selected.length !== measurement.commits) {
     throw new Error("timed receipts do not match commit-window totals");
   }
   return selected;
@@ -112,7 +115,13 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
   const evidence = object(input, "evidence");
   const commits = object(evidence.durable_commits, "durable commits");
   const output = object(commits.output_throughput, "commit window output");
-  if (output.unavailable_reason != null) throw new Error("commit output is unavailable");
+  if (output.unavailable_reason != null
+    || output.scope !== "new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort"
+    || output.clock !== "collector_system_unix_ms_shared_schedule_clock_skew_not_measured"
+    || output.warmup_backlog !== "included_when_commit_finishes_in_window"
+    || output.rewrite_commits !== "excluded_by_ingestion_only_producer_capability") {
+    throw new Error("commit output is unavailable or has invalid provenance");
+  }
   const start = integer(output.measurement_start_unix_ms, "window start");
   const end = integer(output.measurement_end_unix_ms, "window end");
   const durationMs = end - start;
@@ -121,6 +130,8 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
   if (!nearlyEqual(seconds * 1000, durationMs)) throw new Error("window duration is inconsistent");
   const rows = integer(output.rows, "durable rows", 1);
   const bytes = integer(output.parquet_bytes, "Parquet bytes", 1);
+  const files = integer(output.files, "committed files", 1);
+  const commitCount = integer(output.commits, "commit count", 1);
   const rate = number(output.rows_per_second, "durable rows/s", Number.MIN_VALUE);
   const bytesPerRow = number(output.bytes_per_row, "Parquet bytes/row", Number.MIN_VALUE);
   if (!nearlyEqual(rate, rows / seconds) || !nearlyEqual(bytesPerRow, bytes / rows)) {
@@ -155,7 +166,8 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
   const p50 = number(latency.p50, "commit p50");
   const p99 = number(latency.p99, "commit p99");
   const latencySamples = integer(latency.samples, "commit latency samples", 1);
-  if (p99 < p50) {
+  if (p99 < p50 || latencySamples !== commitCount
+    || latency.scope !== "commit_retry_and_sync_not_encoding_or_admission") {
     throw new Error("invalid commit latency distribution");
   }
   const resources = object(evidence.resources, "resources");
@@ -180,6 +192,8 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
     endUnixMs: end,
     rows,
     parquetBytes: bytes,
+    files,
+    commits: commitCount,
     durableRowsPerSecond: rate,
     parquetBytesPerRow: bytesPerRow,
     commitLatencySeconds: { p50, p99, samples: latencySamples },

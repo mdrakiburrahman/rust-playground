@@ -6,10 +6,14 @@ function evidence() {
   return {
     durable_commits: {
       output_throughput: {
+        scope: "new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort",
+        clock: "collector_system_unix_ms_shared_schedule_clock_skew_not_measured",
+        warmup_backlog: "included_when_commit_finishes_in_window",
+        rewrite_commits: "excluded_by_ingestion_only_producer_capability",
         measurement_start_unix_ms: 1000, measurement_end_unix_ms: 151000,
-        window_seconds: 150, rows: 1500, parquet_bytes: 3000,
+        window_seconds: 150, rows: 1500, files: 5, commits: 5, parquet_bytes: 3000,
         rows_per_second: 10, bytes_per_row: 2,
-        commit_latency_seconds: { p50: 0.1, p99: 0.5, samples: 5 },
+        commit_latency_seconds: { p50: 0.1, p99: 0.5, samples: 5, scope: "commit_retry_and_sync_not_encoding_or_admission" },
       },
       complete_30_second_commit_windows: Array.from({ length: 5 }, (_, i) => ({
         measurement_start_unix_ms: 1000 + i * 30000,
@@ -65,7 +69,7 @@ test("selects half-open timed version receipts and rejects missing or conflictin
   const withReceipts = (list: unknown[]) => ({
     ...raw,
     durable_commits: { ...raw.durable_commits, run_cumulative_output: {
-      rows: 2100, commits_by_version: list,
+      scope: "all_new_ingestion_commits_from_this_cell_including_warmup", rows: 2100, commits: 7, commits_by_version: list,
     } },
   });
   assert.deepEqual(extractTimedReceipts(withReceipts(receipts), "one", measurement).map(r => r.version), [1, 2, 3, 4, 5]);

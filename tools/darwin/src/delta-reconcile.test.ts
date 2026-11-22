@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { tableFromArrays, tableToIPC } from "apache-arrow";
-import { Table as WasmTable, writeParquet } from "parquet-wasm";
+import { Compression, Table as WasmTable, WriterPropertiesBuilder, writeParquet } from "parquet-wasm";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
 import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
 
@@ -14,9 +14,10 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
   try {
     const tableRoot = join(root, "orders", "table");
     await mkdir(join(tableRoot, "_delta_log"), { recursive: true });
-    const parquet = (rows: number[]) => Buffer.from(writeParquet(WasmTable.fromIPCStream(
-      tableToIPC(tableFromArrays({ value: rows }), "stream"),
-    )));
+    const parquet = (rows: number[]) => Buffer.from(writeParquet(
+      WasmTable.fromIPCStream(tableToIPC(tableFromArrays({ value: rows }), "stream")),
+      new WriterPropertiesBuilder().setCompression(Compression.ZSTD).build(),
+    ));
     const one = parquet([1, 2, 3]);
     const two = parquet([4, 5]);
     const files: Record<string, Buffer> = {
@@ -29,7 +30,7 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
     const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
     for (const [path, bytes] of Object.entries(files)) await writeFile(join(tableRoot, path), bytes);
     const manifest = Buffer.from(JSON.stringify({
-      schema_version: 1, run_id: "abc-123", table: "orders", latestVersion: 2, rowCount: 5,
+      schema_version: 1, run_id: "abc-123", table: "orders", latestVersion: 2, rowCount: 5, schemaString: JSON.stringify({ fields: [] }),
       files: Object.entries(files).map(([path, bytes]) => ({ path, size: bytes.length, sha256: sha(bytes) })),
     }));
     await writeFile(join(root, "orders", "manifest.json"), manifest);
@@ -42,7 +43,7 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       finished_at: "2026-01-01T00:00:00Z", oom_killed: false,
     }] }));
     const measurement: OatMeasurement = {
-      startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: one.length,
+      startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: one.length, files: 1, commits: 1,
       durableRowsPerSecond: 3 / 150, parquetBytesPerRow: one.length / 3,
       commitLatencySeconds: { p50: 0.1, p99: 0.1, samples: 1 },
       cpuMillicoresMean: null, memoryBytesMaxObserved: null, downstreamUnavailableReason: null,
@@ -53,7 +54,8 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       finishedAtUnixMs: 1000, elapsedSeconds: 0.1,
     };
     const reconcile = (receipts: TimedReceipt[]) =>
-      reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64), measurement, receipts);
+      reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+        measurement, receipts, Compression.ZSTD);
     assert.deepEqual(await reconcile([receipt]),
       { rows: 3, parquetBytes: one.length, activeRows: 5, latestVersion: 2, commits: 1 });
     await assert.rejects(reconcile([{ ...receipt, rows: 4 }]), /receipt counters/);

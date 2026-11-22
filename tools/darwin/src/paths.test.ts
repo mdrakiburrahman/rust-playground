@@ -66,3 +66,20 @@ test("requires a clean initialized submodule at the pinned revision", async () =
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("excludes only the current evaluator state directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "darwin-state-paths-"));
+  try {
+    execFileSync("git", ["init", "-q", root]);
+    await mkdir(path.join(root, ".darwin", "lane", "trusted"), { recursive: true });
+    await writeFile(path.join(root, ".darwin", "lane", "trusted", "snapshot"), "state");
+    await mkdir(path.join(root, ".darwin", "other"), { recursive: true });
+    await writeFile(path.join(root, ".darwin", "other", "unexpected"), "extra");
+    assert.deepEqual(await checkCandidatePaths(root, {}, [], {}, ".darwin/lane"), [
+      "extra file: .darwin/other/unexpected",
+    ]);
+    await assert.rejects(() => checkCandidatePaths(root, {}, [], {}, ".darwin/../other"), /state directory/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

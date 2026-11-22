@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
-import { readParquet } from "parquet-wasm";
+import { Compression, readMetadata, readParquet } from "parquet-wasm";
 import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
 
 type JsonObject = Record<string, unknown>;
@@ -71,7 +71,7 @@ function entries(raw: unknown): InventoryEntry[] {
 
 export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
-  measurement: OatMeasurement, receipts: TimedReceipt[],
+  measurement: OatMeasurement, receipts: TimedReceipt[], expectedCodec: Compression,
 ): Promise<{ rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number }> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
@@ -103,6 +103,11 @@ export async function reconcileStoppedSnapshot(
   if (new Set(listedPaths).size !== listedPaths.length || JSON.stringify(listedPaths) !== JSON.stringify(await inventory(tableRoot))) {
     throw new Error("snapshot inventory differs from manifest");
   }
+  const logs = listedPaths.filter(path => /^_delta_log\/\d{20}\.json$/.test(path));
+  if (logs.length !== latestVersion + 1
+    || logs.some((path, version) => path !== `_delta_log/${String(version).padStart(20, "0")}.json`)) {
+    throw new Error("snapshot Delta log history is incomplete");
+  }
   for (const entry of listed) {
     const actual = await digest(join(tableRoot, entry.path));
     if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw new Error("snapshot file digest mismatch");
@@ -118,7 +123,7 @@ export async function reconcileStoppedSnapshot(
     selected.set(receipt.version, receipt);
   }
   const selectedAdds = new Map<number, Add[]>();
-  let schemaSeen = false;
+  let latestSchema: string | undefined;
   for (let version = 0; version <= latestVersion; version++) {
     const path = join(tableRoot, "_delta_log", `${String(version).padStart(20, "0")}.json`);
     const log = await readFile(path, "utf8");
@@ -129,7 +134,7 @@ export async function reconcileStoppedSnapshot(
         if (typeof metadata.schemaString !== "string" || !Array.isArray(object(JSON.parse(metadata.schemaString), "Delta schema").fields)) {
           throw new Error("invalid Delta schema");
         }
-        schemaSeen = true;
+        latestSchema = metadata.schemaString;
       }
       if (action.add != null) {
         const value = object(action.add, "Delta Add");
@@ -143,6 +148,7 @@ export async function reconcileStoppedSnapshot(
         active.set(add.path, add);
         if (selected.has(version) && add.dataChange) {
           const adds = selectedAdds.get(version) ?? [];
+          if (adds.some(previousAdd => previousAdd.path === add.path)) throw new Error("duplicate Delta Add in commit");
           adds.push(add);
           selectedAdds.set(version, adds);
         }
@@ -154,14 +160,34 @@ export async function reconcileStoppedSnapshot(
       }
     }
   }
-  if (!schemaSeen || !active.size) throw new Error("snapshot has no schema or active files");
+  if (!latestSchema || latestSchema !== manifest.schemaString || !active.size || !expectedActiveRows) {
+    throw new Error("snapshot has no consistent schema or active files");
+  }
+  const selectedPaths = new Set([...selectedAdds.values()].flat().map(add => add.path));
   const decoded = new Map<string, number>();
   let activeRows = 0;
   for (const add of referenced.values()) {
     const path = join(tableRoot, add.path);
     const stat = await lstat(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== add.size) throw new Error("active Parquet file size mismatch");
-    const rows = tableFromIPC(readParquet(await readFile(path)).intoIPCStream()).numRows;
+    const bytes = await readFile(path);
+    const metadata = readMetadata(bytes);
+    const fileMetadata = metadata.fileMetadata();
+    const footerRows = fileMetadata.numRows();
+    fileMetadata.free();
+    if (selectedPaths.has(add.path)) {
+      if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
+      for (const group of metadata.rowGroups()) {
+        const columns = group.columns();
+        const valid = columns.length > 0 && columns.every(column => column.compression() === expectedCodec);
+        for (const column of columns) column.free();
+        group.free();
+        if (!valid) throw new Error("selected Parquet codec differs from expected codec");
+      }
+    }
+    metadata.free();
+    const rows = tableFromIPC(readParquet(bytes).intoIPCStream()).numRows;
+    if (rows !== footerRows) throw new Error("Parquet decoded rows differ from footer");
     decoded.set(add.path, rows);
     if (active.has(add.path)) activeRows = uint(activeRows + rows, "active rows");
   }
