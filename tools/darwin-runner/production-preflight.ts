@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, realpath, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -35,11 +35,24 @@ interface CandidatePathModule {
   ): Promise<string[]>;
 }
 
+export type MaintenanceExperiment = "maintenance-active" | "maintenance-idle";
+
+export interface MaintenanceControlRequest {
+  mode: "control";
+  experiments: MaintenanceExperiment[];
+}
+
+export type MaintenanceControlAdapter = (
+  context: { repo: string; home: string },
+  request: MaintenanceControlRequest,
+) => Promise<unknown>;
+
 export interface ArrowColCompressionPreflightOptions {
   socketPath: string;
   repoRoot: string;
   darwinHome: string;
   startOneArm: Workload;
+  maintenanceControlAdapter?: MaintenanceControlAdapter;
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -47,6 +60,24 @@ function object(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function maintenanceControlRequest(value: unknown): MaintenanceControlRequest {
+  const request = object(value, "maintenance control request");
+  const names = request.experiments;
+  if (Object.keys(request).sort().join(",") !== "experiments,mode" || request.mode !== "control"
+    || !Array.isArray(names) || names.length < 1 || names.length > 2) {
+    throw new Error("maintenance lane accepts only fixed maintenance control experiments");
+  }
+  const experiments: MaintenanceExperiment[] = [];
+  for (const name of names) {
+    if (name !== "maintenance-active" && name !== "maintenance-idle") {
+      throw new Error("maintenance lane accepts only fixed maintenance control experiments");
+    }
+    if (experiments.includes(name)) throw new Error("maintenance lane does not accept duplicate experiments");
+    experiments.push(name);
+  }
+  return { mode: "control", experiments };
 }
 
 function fullSha(value: unknown, label: string): string {
@@ -180,6 +211,99 @@ async function validateRuntime(trustedRoot: string, producerRevision: string): P
   return { root: runtime, validator };
 }
 
+interface CachedSubmoduleWorktree {
+  source: string;
+  candidate: string;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    && typeof error.code === "string" ? error.code : undefined;
+}
+
+async function initializeCachedSubmodules(
+  candidateParent: string,
+  sourceParent: string,
+  home: string,
+  worktrees: CachedSubmoduleWorktree[],
+): Promise<void> {
+  const modulesFile = path.join(candidateParent, ".gitmodules");
+  let metadata;
+  try {
+    metadata = await lstat(modulesFile);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return;
+    throw error;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("candidate .gitmodules is not a regular file");
+
+  const declarations = gitText(candidateParent, ["config", "--file", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"], home)
+    .split("\n").filter(Boolean);
+  for (const declaration of declarations) {
+    const match = /^(submodule\.(.+)\.path)\s+(.+)$/.exec(declaration);
+    if (!match) throw new Error("candidate .gitmodules contains an invalid path entry");
+    const name = match[2];
+    const relative = match[3];
+    if (relative.startsWith("/") || relative.includes("\\")
+      || relative.split("/").some((part) => part === "" || part === "." || part === "..")) {
+      throw new Error("candidate .gitmodules contains an unsafe path");
+    }
+    const treeEntry = gitText(candidateParent, ["ls-tree", "HEAD", "--", relative], home);
+    const gitlink = /^160000 commit ([0-9a-f]{40})\t(.+)$/.exec(treeEntry);
+    if (!gitlink || gitlink[2] !== relative) throw new Error(`candidate submodule is not pinned in Git: ${relative}`);
+    const expected = gitlink[1];
+    const sourcePath = path.join(sourceParent, ...relative.split("/"));
+    const source = await realpath(sourcePath);
+    if (source !== sourcePath
+      || gitText(source, ["rev-parse", "--show-toplevel"], home) !== source
+      || gitText(source, ["rev-parse", "HEAD"], home) !== expected
+      || gitText(source, ["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"], home)) {
+      throw new Error(`pinned submodule is not available as a clean local worktree: ${relative}`);
+    }
+
+    const candidate = path.join(candidateParent, ...relative.split("/"));
+    try {
+      const entries = await readdir(candidate);
+      if (entries.length !== 0) throw new Error(`candidate submodule mountpoint is not empty: ${relative}`);
+      await rmdir(candidate);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    gitText(source, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", candidate, expected], home);
+    worktrees.push({ source, candidate });
+    await initializeCachedSubmodules(candidate, source, home, worktrees);
+    if (gitText(candidate, ["rev-parse", "--show-toplevel"], home) !== candidate
+      || gitText(candidate, ["rev-parse", "HEAD"], home) !== expected
+      || gitText(candidate, ["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"], home)) {
+      throw new Error(`candidate submodule worktree is not clean at its pinned commit: ${relative}`);
+    }
+  }
+}
+
+function removeCandidateWorktrees(
+  repoRoot: string,
+  candidateTree: string,
+  rootAdded: boolean,
+  submodules: CachedSubmoduleWorktree[],
+  home: string,
+): void {
+  const failures: Error[] = [];
+  for (const worktree of [...submodules].reverse()) {
+    try {
+      gitText(worktree.source, ["-c", "core.hooksPath=/dev/null", "worktree", "remove", "--force", worktree.candidate], home);
+    } catch (error) {
+      failures.push(new Error(`failed to remove cached submodule worktree ${worktree.candidate}`, { cause: error }));
+    }
+  }
+  if (rootAdded) {
+    try {
+      gitText(repoRoot, ["-c", "core.hooksPath=/dev/null", "worktree", "remove", "--force", candidateTree], home);
+    } catch (error) {
+      failures.push(new Error(`failed to remove candidate worktree ${candidateTree}`, { cause: error }));
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "candidate worktree cleanup failed");
+}
 function json(bytes: Buffer, label: string): unknown {
   try {
     return JSON.parse(bytes.toString("utf8")) as unknown;
@@ -188,11 +312,29 @@ function json(bytes: Buffer, label: string): unknown {
   }
 }
 
+export async function dispatchArrowColMaintenanceControl(
+  options: Pick<ArrowColCompressionPreflightOptions, "repoRoot" | "darwinHome" | "maintenanceControlAdapter">,
+  value: unknown,
+): Promise<void> {
+  const adapter = options.maintenanceControlAdapter;
+  if (!adapter) throw new Error("maintenance lane is blocked: trusted maintenance adapter is not injected");
+  const request = maintenanceControlRequest(value);
+  const repo = await realpath(options.repoRoot);
+  if (gitText(repo, ["rev-parse", "--show-toplevel"], os.tmpdir()) !== repo) {
+    throw new Error("maintenance control repo must be a trusted Git root");
+  }
+  const home = await realpath(options.darwinHome);
+  await adapter({ repo, home }, request);
+}
+
 export async function startArrowColCompressionPreflight(
   options: ArrowColCompressionPreflightOptions,
 ): Promise<TrustedBridgeListener> {
-  if (process.env.COPILOT_GITHUB_TOKEN !== undefined) {
-    throw new Error("trusted ArrowCol preflight worker must not receive the model token");
+  for (const name of ["COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] as const) {
+    if (process.env[name] !== undefined) {
+      const credential = name === "COPILOT_GITHUB_TOKEN" ? "model token" : "GitHub credentials";
+      throw new Error(`trusted ArrowCol preflight worker must not receive ${credential}`);
+    }
   }
   const repoRoot = await realpath(options.repoRoot);
   if (gitText(repoRoot, ["rev-parse", "--show-toplevel"], os.tmpdir()) !== repoRoot) {
@@ -219,11 +361,12 @@ export async function startArrowColCompressionPreflight(
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "arrowcol-preflight-"));
     const candidateTree = path.join(temporaryRoot, "candidate");
     const env = cleanEnvironment(temporaryRoot);
+    const submoduleWorktrees: CachedSubmoduleWorktree[] = [];
     let worktreeAdded = false;
     try {
       gitText(repoRoot, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", candidateTree, context.candidateCommit], temporaryRoot);
       worktreeAdded = true;
-      gitText(candidateTree, ["-c", "core.hooksPath=/dev/null", "submodule", "update", "--init", "--recursive", "--no-fetch"], temporaryRoot);
+      await initializeCachedSubmodules(candidateTree, repoRoot, temporaryRoot, submoduleWorktrees);
       if (gitText(candidateTree, ["rev-parse", "HEAD"], temporaryRoot) !== context.candidateCommit
         || gitText(candidateTree, ["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"], temporaryRoot)) {
         throw new Error("candidate worktree is not the exact clean committed tree");
@@ -248,9 +391,7 @@ export async function startArrowColCompressionPreflight(
       return compressionLevel;
     } finally {
       try {
-        if (worktreeAdded) {
-          gitText(repoRoot, ["-c", "core.hooksPath=/dev/null", "worktree", "remove", "--force", candidateTree], temporaryRoot);
-        }
+        removeCandidateWorktrees(repoRoot, candidateTree, worktreeAdded, submoduleWorktrees, temporaryRoot);
       } finally {
         await rm(temporaryRoot, { recursive: true, force: true });
       }

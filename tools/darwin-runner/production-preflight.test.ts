@@ -8,11 +8,20 @@ import path from "node:path";
 import { connect } from "node:net";
 import test from "node:test";
 import { encodeDispatchRequest } from "./dispatch-contract.js";
-import { startArrowColCompressionPreflight } from "./production-preflight.js";
+import { dispatchArrowColMaintenanceControl, startArrowColCompressionPreflight } from "./production-preflight.js";
 
 const CONFIG_PATH = "experiments/darwin/candidate.oat.json";
 const repositoryInput = process.env.DARWIN_PREFLIGHT_TEST_REPO;
 const homeInput = process.env.DARWIN_PREFLIGHT_TEST_HOME;
+
+test("maintenance control fails closed without an injected adapter", async () => {
+  await assert.rejects(
+    dispatchArrowColMaintenanceControl({ repoRoot: "", darwinHome: "" }, {
+      mode: "control", experiments: ["maintenance-active"],
+    }),
+    /adapter is not injected/,
+  );
+});
 
 type JsonObject = Record<string, unknown>;
 
@@ -92,6 +101,13 @@ async function send(socketPath: string, candidateCommit: string): Promise<unknow
     socket.on("error", reject);
   });
 }
+
+test("fails closed when the trusted worker receives a model token", async () => {
+  const previous = process.env.COPILOT_GITHUB_TOKEN;
+  process.env.COPILOT_GITHUB_TOKEN = "test-only-sentinel";
+  try { await assert.rejects(startArrowColCompressionPreflight({ socketPath: "", repoRoot: "", darwinHome: "", startOneArm: () => undefined }), /must not receive model token/); }
+  finally { if (previous === undefined) delete process.env.COPILOT_GITHUB_TOKEN; else process.env.COPILOT_GITHUB_TOKEN = previous; }
+});
 
 test("trusted ArrowCol preflight validates committed configs before an inert callback", {
   skip: !repositoryInput || !homeInput,
