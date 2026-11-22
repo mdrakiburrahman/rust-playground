@@ -45,7 +45,7 @@ for (let pair = 1; pair <= 3; pair++) {
     const runEnv = { ...env };
     if (arm === 'candidate') runEnv.ARROWCOL_PARQUET_CONFIG = candidate;
     const name = `${pair}-${arm}`;
-    const stdout = execute(name, 'cargo', [...testArgs, '--', '--exact', 'historical_delta_writer', '--nocapture'], runEnv);
+    const stdout = execute(name, 'cargo', [...testArgs, '--', '--exact', 'historical_delta_writer', '--ignored', '--nocapture'], runEnv);
     const lines = stdout.split('\n');
     const one = (prefix: string) => {
       const matches = lines.filter(line => line.startsWith(prefix));

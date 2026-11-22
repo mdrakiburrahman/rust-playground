@@ -8,7 +8,7 @@
 | Checks | One file and one row group, UNCOMPRESSED codec, selected column's actual data-page encoding, normalized physical schema and every decoded value in order; the driver rejects changes to corpus, sort metadata or other column footers. |
 | Timing | Each process warms the coalesced stage once, then measures process CPU and elapsed time through local staging and file close. Input generation, capture, decoding and local table-owner startup are outside that timer. No remote upload or Delta Add/commit throughput is measured. |
 
-Build the historical client and run from this fixture's checkout. The client worktree and output path must not already exist. Initialize the historical worktree's submodules and the current checkout's submodules before building.
+The fixture is ignored by ordinary tests and explicitly selected by the driver. Build the historical client and run from this fixture's checkout. The client worktree and output path must not already exist. Initialize the historical worktree's submodules and the current checkout's submodules before building.
 
 ```sh
 git worktree add --detach /tmp/darwin-historical-client 6f5832394236c3df60bdd8f24744c1c3f212ff87

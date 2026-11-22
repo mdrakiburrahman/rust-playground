@@ -206,6 +206,7 @@ fn check_rows(expected: &[RecordBatch], actual: &[RecordBatch]) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "explicit historical-client component profile"]
 async fn historical_delta_writer() -> Result<()> {
     let candidate = match std::env::var("ARROWCOL_PARQUET_CONFIG") {
         Err(std::env::VarError::NotPresent) => false,
