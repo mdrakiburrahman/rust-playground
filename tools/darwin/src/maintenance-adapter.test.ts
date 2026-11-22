@@ -70,6 +70,9 @@ test("real maintenance control and missing protected file", {
   const names = (await readdir(protectedDirectory)).filter((name) => name.endsWith(".parquet"));
   assert.ok(names.length >= 1);
   await unlink(join(protectedDirectory, names[0]));
-  await assert.rejects(compareStopped(prepared, "active", bad), /No such file or directory/);
+  const failure: unknown = await compareStopped(prepared, "active", bad).then(() => null, (error: unknown) => error);
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /No such file or directory/);
+  await writeFile(join(prepared.root, "negative-missing-protected-error.txt"), `${failure.message}\n`, { flag: "wx" });
   console.log(`Maintenance control evidence: ${prepared.root}`);
 });

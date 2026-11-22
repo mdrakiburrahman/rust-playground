@@ -4,6 +4,7 @@ import { writeFileSync } from "node:fs";
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rmdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { fileURLToPath } from "node:url";
 
 export type MaintenanceLane = "active" | "idle";
 
@@ -161,9 +162,13 @@ export async function prepareMaintenance(options: PrepareOptions): Promise<Prepa
     baseRevision: options.baseRevision, fixtureSha256: FIXTURE_SHA256, lockSha256: LOCK_SHA256,
     baselineMaintenanceSha256: baselineSourceHash, candidateMaintenanceSha256: candidateSourceHash,
     comparatorSourceSha256: comparatorSourceHash, sandboxSourceSha256: sandboxSourceHash,
+    adapterSourceSha256: await fileHash(fileURLToPath(import.meta.url)),
     baselineBinarySha256: await fileHash(baselineBinary), candidateBinarySha256: await fileHash(candidateBinary),
     comparatorBinarySha256: await fileHash(comparatorBinary), sandboxBinarySha256: await fileHash(sandboxBinary),
     submodulesSha256: hash(submodules), submodules: submodules.trimEnd(),
+    rustcVersion: run("/usr/local/cargo/bin/rustc", ["--version"], source, env).trim(),
+    lldbVersion: run("/usr/bin/lldb", ["--version"], source, env).split("\n")[0],
+    nodeVersion: process.version,
   };
   const seed = join(root, "seed");
   run(baselineBinary, ["seed", seed], source, env, join(root, "seed.log"));
@@ -199,6 +204,7 @@ async function assertBindings(prepared: PreparedMaintenance): Promise<void> {
   for (const [file, key] of files) {
     if (await fileHash(file) !== prepared.bindings[key]) throw new Error(`bound artifact changed: ${key}`);
   }
+  if (await fileHash(fileURLToPath(import.meta.url)) !== prepared.bindings.adapterSourceSha256) throw new Error("adapter source changed");
   if (await treeHash(prepared.seed) !== prepared.bindings.seedSha256) throw new Error("seed changed");
 }
 
