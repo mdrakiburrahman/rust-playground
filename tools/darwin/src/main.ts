@@ -34,7 +34,7 @@ async function setup(repo: string, home: string, producer?: string): Promise<voi
   const tsc = path.join(repo, "node_modules", "typescript", "bin", "tsc");
   execFileSync(process.execPath, [
     tsc, "--ignoreConfig", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext",
-    "--skipLibCheck", "--types", "node", "--rootDir", source, "--outDir", output,
+    "--skipLibCheck", "--baseUrl", path.join(repo, "node_modules"), "--types", "node", "--rootDir", source, "--outDir", output,
     ...["main.ts", "paths.ts", "policy.ts", "snapshot.ts", "compression-policy.ts", "metrics-adapter.ts",
       "score.ts", "delta-reconcile.ts", "oat-result.ts", "replay.ts"].map((file) => path.join(source, file)),
   ], { cwd: repo, stdio: "inherit" });
