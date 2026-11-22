@@ -1917,6 +1917,11 @@ mod measurement_evidence_tests {
             "eligible_for_identity_reconciliation": true,
             "complete": true,
             "truncated": false,
+            "run_uuid": "c784d07ceefe4191aaf92a269f272ecf",
+            "incarnation_uuid": "1ae94edfe4044f0894fa78d4467f568a",
+            "ranges": [{"table": "example", "worker": 0, "first_sequence": 1, "last_sequence": 2,
+                "batch_count": 2, "rows_per_batch": 5, "cohort": "measurement",
+                "attempts": 1, "outcome": "acknowledged"}],
         });
         snapshots[1].preparation = Some(prepared.clone());
         snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
@@ -1927,8 +1932,7 @@ mod measurement_evidence_tests {
         snapshots[1].measurement_window.as_mut().context("test measurement window")?.client_resources =
             Some(json!({"cpu_core_equivalents": 2.5}));
         let evidence = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
-        assert_eq!(evidence["payload_manifest"]["payload_corpus_sha256"], hash);
-        assert_eq!(evidence["payload_manifest"]["eligible_for_identity_reconciliation"], true);
+        assert_eq!(evidence["payload_manifest"], realistic_manifest);
         assert_eq!(evidence["measurement_window"]["client_resources"]["cpu_core_equivalents"], 2.5);
         snapshots[1].logical_batch_manifest.as_mut().context("test manifest")?["payload_corpus_sha256"] = json!("b".repeat(64));
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
@@ -2826,16 +2830,7 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
         {
             bail!("client payload hash disagrees with terminal manifest");
         }
-        result["payload_manifest"] = json!({
-            "payload_corpus_sha256": hash,
-            "data_profile": manifest["data_profile"],
-            "payload_corpus_hash_version": manifest["payload_corpus_hash_version"],
-            "payload_corpus_hash_scope": manifest["payload_corpus_hash_scope"],
-            "identity_status": manifest["identity_status"],
-            "eligible_for_identity_reconciliation": manifest["eligible_for_identity_reconciliation"],
-            "complete": manifest["complete"],
-            "truncated": manifest["truncated"],
-        });
+        result["payload_manifest"] = manifest.clone();
     }
     Ok(result)
 }

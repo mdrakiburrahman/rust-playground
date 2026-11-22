@@ -56,7 +56,11 @@ qualified comparison.
 The CPU option applies only to the collector before startup. The run refuses
 admission unless its configured and effective cgroup CPU sets match the
 requested list. It does not reserve CPUs from clients; record their placement
-and use disjoint allocations where possible.
+and use disjoint allocations where possible. A causal CPU-scaling claim also
+requires noncompeting physical-core/SMT allocations, effective ancestor
+constraints, actual collector utilization and bounded queues; otherwise the
+shared-placement run is diagnostic only. Hold the candidate, configuration,
+and clients fixed while changing only the collector allocation.
 
 Each arm builds the trusted controller and footer inspector, checks host
 headroom immediately before launch, verifies collector and client readback
