@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractClientEvidence, extractStoppedReceipts, type ClientDataProfile } from "./oat-result.js";
+import { extractClientEvidence, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
 import type { OatMeasurement } from "./metrics-adapter.js";
 
 function reportFor(profile: ClientDataProfile) {
@@ -21,6 +21,16 @@ function reportFor(profile: ClientDataProfile) {
   };
   return { phase_counters: { preparation, payload_manifest: payloadManifest, measurement_window: { client_resources: clientResources } } };
 }
+
+test("refuses a diagnostic result without the physical parity gate", async () => {
+  await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "diagnostic"),
+    /requires a physical footer inspector/);
+  await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", 3, "diagnostic", {
+    config: {}, inspectActiveFooter: async () => {},
+  }), /requires a physical footer inspector/);
+  await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "realistic"),
+    /requires its Zstd level/);
+});
 
 test("accepts matching Realistic evidence and reports client CPU separately", () => {
   const report = reportFor("realistic");

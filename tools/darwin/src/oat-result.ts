@@ -5,6 +5,7 @@ import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
 import { adaptOatEvidence, CoverageUnavailableError, extractTimedReceipts, type OatMeasurement } from "./metrics-adapter.js";
+import { assertParityEvidence } from "./parity-preflight.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -111,8 +112,21 @@ export function extractClientEvidence(raw: unknown, requestedProfile: ClientData
 }
 
 export async function readReconciledOatResult(
-  resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number, requestedProfile: ClientDataProfile,
-): Promise<{ measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number; cellRunId: string; snapshotReconciled: true }> {
+  resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number | null,
+  requestedProfile: ClientDataProfile, parity?: { config: unknown; inspectActiveFooter: (path: string) => Promise<void> },
+): Promise<{
+  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
+  activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
+  windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
+  cellRunId: string; snapshotReconciled: true;
+}> {
+  if (requestedProfile === "diagnostic") {
+    if (compressionLevel !== null || !parity || typeof parity.inspectActiveFooter !== "function") {
+      throw new Error("diagnostic parity requires a physical footer inspector and no codec override");
+    }
+  } else if (parity || compressionLevel === null) {
+    throw new Error("realistic compression requires its Zstd level and no parity override");
+  }
   const bytes = await readFile(resultsPath);
   if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("OAT result is empty or too large");
   const arrow = tableFromIPC(readParquet(bytes).intoIPCStream());
@@ -133,11 +147,18 @@ export async function readReconciledOatResult(
   const collector = collectors[0]!;
   const effective = object(collector.effective_config, "collector effective config");
   const capability = object(effective.commit_telemetry, "collector commit capability");
-  const policy = object(object(collector.writer_policy_overrides, "writer policy").defaults, "writer defaults");
   if (collector.log_complete !== true || collector.effective_config_source !== "consumer_startup_readback"
     || capability.schema_version !== 1 || capability.scope !== "new_ingestion_addfiles_after_sync"
-    || capability.clock !== "system_unix_ms" || policy.compression !== "zstd" || policy.compression_level !== compressionLevel) {
-    throw new Error("collector capability or configured compression does not match the run");
+    || capability.clock !== "system_unix_ms") {
+    throw new Error("collector capability does not match the run");
+  }
+  if (parity) {
+    assertParityEvidence(parity.config, evidence);
+  } else {
+    const policy = object(object(collector.writer_policy_overrides, "writer policy").defaults, "writer defaults");
+    if (policy.compression !== "zstd" || policy.compression_level !== compressionLevel) {
+      throw new Error("collector configured compression does not match the run");
+    }
   }
   const images = processes.map(process => {
     if (typeof process.component !== "string" || process.log_complete !== true) throw new Error("incomplete OAT process evidence");
@@ -171,7 +192,12 @@ export async function readReconciledOatResult(
   }
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
   const proof = await reconcileStoppedSnapshot(
-    join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all, Compression.ZSTD, preload,
+    join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
+    parity ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.inspectActiveFooter,
   );
-  return { measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion, cellRunId: row.run_id, snapshotReconciled: true };
+  return {
+    measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
+    activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows,
+    cellRunId: row.run_id, snapshotReconciled: true,
+  };
 }
