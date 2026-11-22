@@ -17,15 +17,20 @@ use arrow_deltalake::commit::{BatchedTable, CommitOptions};
 use delta_kernel::Snapshot;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel_default_engine::DefaultEngineBuilder;
+use fs2::FileExt;
+#[cfg(test)]
 use futures::FutureExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use url::Url;
 
+#[cfg(test)]
 const GROUPS: usize = 12;
 const ROWS: usize = 16_384;
 
@@ -342,9 +347,12 @@ async fn local_commit_pipeline_profile() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 const DEPTH: usize = 8;
+#[cfg(test)]
 const TIMED_WAVES: usize = 4;
 
+#[cfg(test)]
 struct Wave {
     stage: Duration,
     build: Duration,
@@ -353,6 +361,7 @@ struct Wave {
     receipts: Vec<(usize, Duration, arrow_deltalake::commit::GroupAppendResult)>,
 }
 
+#[cfg(test)]
 async fn run_natural_wave(table: &BatchedTable, first: usize, batches: &[RecordBatch]) -> Result<Wave> {
     let mut prepared = Vec::with_capacity(DEPTH);
     let mut stage = Duration::ZERO;
@@ -608,4 +617,330 @@ async fn local_natural_cohort_screen() -> Result<()> {
         active_bytes as f64 / active_rows as f64,
     );
     Ok(())
+}
+
+const CONTINUOUS_DEPTH: usize = 8;
+const CONTINUOUS_GROUPS: usize = 64;
+const MAX_IN_FLIGHT_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+struct ContinuousResult {
+    index: usize,
+    input_bytes: usize,
+    stage: Duration,
+    build: Duration,
+    sort: Duration,
+    encode: Duration,
+    admission: Duration,
+    receipt_wait: Duration,
+    result: arrow_deltalake::commit::GroupAppendResult,
+}
+
+async fn continuous_group(
+    table: Arc<BatchedTable>,
+    index: usize,
+    batch: RecordBatch,
+    input_bytes: usize,
+    outstanding: Arc<AtomicUsize>,
+    peak_outstanding: Arc<AtomicUsize>,
+    staging: Arc<AtomicUsize>,
+    peak_staging: Arc<AtomicUsize>,
+) -> Result<ContinuousResult> {
+    let active = staging.fetch_add(1, Ordering::SeqCst) + 1;
+    peak_staging.fetch_max(active, Ordering::SeqCst);
+    let started = Instant::now();
+    let group = table
+        .stage_coalesced_publications(vec![(batch, format!("continuous-{index:04}"), 0, 1)])
+        .await;
+    staging.fetch_sub(1, Ordering::SeqCst);
+    let group = group?;
+    let stage = started.elapsed();
+    ensure!(
+        group.identities.len() == 1 && group.committed_identities.is_empty() && group.appends.len() == 1,
+        "unexpected prepared group"
+    );
+    let build = group.preparation_build;
+    let sort = group.preparation_sort;
+    let timing = group.appends[0].stage_timings();
+    ensure!(timing.upload.is_none(), "local run unexpectedly reports remote upload");
+    let started = Instant::now();
+    let receipt = table.submit_prepared_group(group, false).await?;
+    let admission = started.elapsed();
+    let active = outstanding.fetch_add(1, Ordering::SeqCst) + 1;
+    peak_outstanding.fetch_max(active, Ordering::SeqCst);
+    let started = Instant::now();
+    let result = receipt.wait().await;
+    outstanding.fetch_sub(1, Ordering::SeqCst);
+    let result = result?;
+    Ok(ContinuousResult {
+        index,
+        input_bytes,
+        stage,
+        build,
+        sort,
+        encode: timing.encode,
+        admission,
+        receipt_wait: started.elapsed(),
+        result,
+    })
+}
+
+/// Run a fixed synthetic local-only component workload and independently verify its durable output.
+pub async fn continuous_component() -> Result<serde_json::Value> {
+    let root = tempfile::tempdir()?;
+    let table = BatchedTable::open(
+        root.path(),
+        CommitOptions {
+            batch_window: Duration::from_secs(2),
+            max_files_per_commit: 128,
+            max_pending_files: 512,
+        },
+    )
+    .await?;
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let peak_outstanding = Arc::new(AtomicUsize::new(0));
+    let staging = Arc::new(AtomicUsize::new(0));
+    let peak_staging = Arc::new(AtomicUsize::new(0));
+    let warmup_batch = input(0)?;
+    let warmup_bytes = warmup_batch.get_array_memory_size();
+    ensure!(
+        warmup_bytes <= MAX_IN_FLIGHT_INPUT_BYTES,
+        "warmup exceeds input byte limit"
+    );
+    let warmup = continuous_group(
+        Arc::clone(&table),
+        0,
+        warmup_batch,
+        warmup_bytes,
+        Arc::clone(&outstanding),
+        Arc::clone(&peak_outstanding),
+        Arc::clone(&staging),
+        Arc::clone(&peak_staging),
+    )
+    .await?;
+    peak_outstanding.store(0, Ordering::SeqCst);
+    peak_staging.store(0, Ordering::SeqCst);
+    let hz = ticks_per_second()?;
+    let cpu_start = process_ticks()?;
+    let wall_start = Instant::now();
+    let mut pending = FuturesUnordered::new();
+    let mut records = vec![warmup];
+    let mut next = 1;
+    let mut in_flight_bytes = 0;
+    let mut peak_input_bytes = 0;
+    let mut peak_groups = 0;
+    while next <= CONTINUOUS_GROUPS || !pending.is_empty() {
+        while next <= CONTINUOUS_GROUPS && pending.len() < CONTINUOUS_DEPTH {
+            let batch = input(next)?;
+            let bytes = batch.get_array_memory_size();
+            in_flight_bytes += bytes;
+            ensure!(
+                in_flight_bytes <= MAX_IN_FLIGHT_INPUT_BYTES,
+                "in-flight Arrow input exceeded fixed byte limit"
+            );
+            peak_input_bytes = peak_input_bytes.max(in_flight_bytes);
+            pending.push(continuous_group(
+                Arc::clone(&table),
+                next,
+                batch,
+                bytes,
+                Arc::clone(&outstanding),
+                Arc::clone(&peak_outstanding),
+                Arc::clone(&staging),
+                Arc::clone(&peak_staging),
+            ));
+            peak_groups = peak_groups.max(pending.len());
+            next += 1;
+        }
+        let record = pending.next().await.context("missing pending group")??;
+        in_flight_bytes = in_flight_bytes
+            .checked_sub(record.input_bytes)
+            .context("in-flight accounting underflow")?;
+        records.push(record);
+    }
+    let wall = wall_start.elapsed();
+    let cpu = process_ticks()?
+        .checked_sub(cpu_start)
+        .context("process ticks went backwards")?;
+    ensure!(in_flight_bytes == 0, "input reservations did not drain");
+    ensure!(outstanding.load(Ordering::SeqCst) == 0, "receipts did not drain");
+    ensure!(staging.load(Ordering::SeqCst) == 0, "staging did not drain");
+    ensure!(
+        peak_outstanding.load(Ordering::SeqCst) > 1,
+        "no overlapping submitted groups observed"
+    );
+
+    let identities = (0..=CONTINUOUS_GROUPS)
+        .map(|index| (format!("continuous-{index:04}"), 0))
+        .collect::<Vec<_>>();
+    ensure!(
+        table
+            .lookup_publications(identities.clone())
+            .await?
+            .into_iter()
+            .all(|found| found),
+        "missing durable transaction"
+    );
+    let replay = table
+        .stage_coalesced_publications(vec![(input(0)?, "continuous-0000".into(), 0, 1)])
+        .await?;
+    ensure!(
+        replay.identities.is_empty() && replay.committed_identities.len() == 1 && replay.appends.is_empty(),
+        "replay was not deduplicated"
+    );
+    let replay_result = table.submit_prepared_group(replay, false).await?.wait().await?;
+    ensure!(replay_result.files.is_empty(), "replay produced a file");
+
+    let mut expected_files = BTreeMap::new();
+    let mut expected_groups = BTreeMap::new();
+    let mut cohort_ids: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    let mut cohort_files: BTreeMap<u64, BTreeMap<PathBuf, u64>> = BTreeMap::new();
+    let mut commits = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for record in &records {
+        ensure!(seen.insert(record.index), "duplicate receipt");
+        let result = &record.result;
+        ensure!(
+            result.files.len() == 1 && result.file_observations.len() == 1 && result.file_observations[0].rows == ROWS,
+            "unexpected receipt shape"
+        );
+        let file = &result.files[0];
+        ensure!(
+            expected_files.insert(file.path.clone(), file.bytes).is_none(),
+            "duplicate receipt file"
+        );
+        expected_groups.insert(file.path.clone(), record.index);
+        cohort_ids
+            .entry(result.version)
+            .or_default()
+            .insert(format!("continuous-{:04}", record.index));
+        cohort_files
+            .entry(result.version)
+            .or_default()
+            .insert(file.path.clone(), file.bytes);
+        if let Some(duration) = result.commit_duration {
+            ensure!(
+                commits.insert(result.version, duration).is_none(),
+                "duplicate commit timing"
+            );
+        }
+    }
+    ensure!(
+        seen.iter().copied().eq(0..=CONTINUOUS_GROUPS),
+        "missing receipt identity"
+    );
+    let last_version = *cohort_ids.keys().next_back().context("missing durable version")?;
+    ensure!(replay_result.version == last_version, "replay changed version");
+    ensure!(commits.len() == cohort_ids.len(), "missing commit timing");
+    drop(pending);
+    drop(table);
+
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.path().join(arrow_deltalake::delta::WRITER_LOCK))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error).context("writer did not stop before verification"),
+        }
+    }
+    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, &expected_groups, last_version)?;
+    let root_url =
+        Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
+    let mut remaining = expected_files;
+    for version in 1..=last_version {
+        let log = fs::read_to_string(root.path().join(format!("_delta_log/{version:020}.json")))?;
+        let mut ids = BTreeSet::new();
+        let mut files = BTreeMap::new();
+        for line in log.lines() {
+            let action: serde_json::Value = serde_json::from_str(line)?;
+            if let Some(txn) = action.get("txn") {
+                ensure!(txn["version"] == 0, "wrong transaction version");
+                ensure!(
+                    ids.insert(txn["appId"].as_str().context("missing appId")?.to_owned()),
+                    "duplicate txn"
+                );
+            }
+            if let Some(add) = action.get("add") {
+                let path = root_url
+                    .join(add["path"].as_str().context("missing Add path")?)?
+                    .to_file_path()
+                    .map_err(|()| anyhow::anyhow!("Add URL"))?;
+                let bytes = add["size"].as_u64().context("missing Add size")?;
+                ensure!(
+                    remaining.remove(&path) == Some(bytes),
+                    "Add does not match a unique receipt"
+                );
+                ensure!(files.insert(path, bytes).is_none(), "duplicate Add");
+            }
+        }
+        ensure!(
+            cohort_ids.get(&version) == Some(&ids),
+            "committed identities differ from receipts"
+        );
+        ensure!(
+            cohort_files.get(&version) == Some(&files),
+            "committed files differ from receipts"
+        );
+    }
+    ensure!(remaining.is_empty(), "receipt missing from committed Adds");
+    let engine = DefaultEngineBuilder::new(Arc::new(object_store::local::LocalFileSystem::new())).build();
+    let snapshot = Snapshot::builder_for(root_url.as_str()).build(&engine)?;
+    ensure!(snapshot.version() == last_version, "replay changed snapshot version");
+    for (id, version) in &identities {
+        ensure!(
+            snapshot.get_app_id_version(id, &engine)? == Some(*version),
+            "snapshot lost transaction"
+        );
+    }
+
+    let timed = records.iter().filter(|record| record.index != 0).collect::<Vec<_>>();
+    let timed_commits = commits
+        .iter()
+        .filter(|(version, _)| **version != records[0].result.version)
+        .map(|(_, duration)| duration.as_secs_f64())
+        .sum::<f64>();
+    let sum = |select: fn(&ContinuousResult) -> Duration| {
+        timed.iter().map(|record| select(record).as_secs_f64()).sum::<f64>()
+    };
+    Ok(serde_json::json!({
+        "schema": "arrowcol-commit-component-v1",
+        "scope": "local_component_not_dfe_ack_or_azure",
+        "storage": "local_filesystem",
+        "workload": "public_synthetic_id_payload_v1",
+        "timing_boundary": "generate_input_through_nonforced_durable_receipts",
+        "batch_window_ms": 2000,
+        "max_files_per_commit": 128,
+        "max_pending_files": 512,
+        "max_in_flight_groups": CONTINUOUS_DEPTH,
+        "max_in_flight_input_bytes": MAX_IN_FLIGHT_INPUT_BYTES,
+        "peak_in_flight_input_bytes": peak_input_bytes,
+        "peak_in_flight_groups": peak_groups,
+        "peak_submitted_unconsumed_receipts": peak_outstanding.load(Ordering::SeqCst),
+        "peak_staging_groups": peak_staging.load(Ordering::SeqCst),
+        "timed_groups": CONTINUOUS_GROUPS,
+        "timed_durable_rows": CONTINUOUS_GROUPS * ROWS,
+        "timed_receipts": timed.len(),
+        "wall_seconds": wall.as_secs_f64(),
+        "process_cpu_seconds": cpu as f64 / hz as f64,
+        "stage_wall_sum_seconds": sum(|record| record.stage),
+        "preparation_build_sum_seconds": sum(|record| record.build),
+        "preparation_sort_sum_seconds": sum(|record| record.sort),
+        "encode_sum_seconds": sum(|record| record.encode),
+        "submit_sum_seconds": sum(|record| record.admission),
+        "receipt_wait_sum_seconds": sum(|record| record.receipt_wait),
+        "commit_service_sum_seconds": timed_commits,
+        "upload_seconds": null,
+        "active_files_including_warmup": seen.len(),
+        "active_rows_including_warmup": active_rows,
+        "active_physical_bytes_including_warmup": active_bytes,
+        "delta_versions": last_version,
+        "cohort_sizes": cohort_ids.values().map(BTreeSet::len).collect::<Vec<_>>(),
+        "replay": "deduplicated",
+        "verification": "stopped_writer_delta_log_kernel_snapshot_and_parquet"
+    }))
 }
