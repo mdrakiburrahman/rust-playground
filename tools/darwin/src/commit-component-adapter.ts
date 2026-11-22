@@ -15,6 +15,17 @@ export interface CommitCellRequest {
   arm: CommitArm;
   pair: number;
   resultPath: string;
+  tablePath: string;
+}
+
+export interface CommitPhysicalSummary {
+  timedRows: number;
+  timedBytes: number;
+  activeFiles: number;
+  activeRows: number;
+  activeBytes: number;
+  deltaVersions: number;
+  cohortSizes: number[];
 }
 
 export interface CommitCellReceipt {
@@ -31,6 +42,7 @@ export interface CommitComponentHost {
   control: AdmittedCommitPin;
   candidate: AdmittedCommitPin;
   runAdmittedCell(request: CommitCellRequest): Promise<CommitCellReceipt>;
+  reconcileStoppedCell(tablePath: string): Promise<CommitPhysicalSummary>;
 }
 
 export interface CommitComponentResult {
@@ -95,7 +107,7 @@ function fixed(value: unknown, expected: unknown, label: string): void {
   if (value !== expected) throw new Error(`component result has invalid ${label}`);
 }
 
-function validateResult(input: unknown): { wallSeconds: number } {
+function validateResult(input: unknown): { wallSeconds: number; physical: CommitPhysicalSummary } {
   const result = record(input);
   fixed(result.schema, "arrowcol-commit-component-v1", "schema");
   fixed(result.scope, "local_component_not_dfe_ack_or_azure", "scope");
@@ -139,7 +151,28 @@ function validateResult(input: unknown): { wallSeconds: number } {
     "preparation_sort_sum_seconds", "encode_sum_seconds", "submit_sum_seconds",
     "receipt_wait_sum_seconds", "commit_service_sum_seconds",
   ] as const) number(result[field], field, 0);
-  return { wallSeconds: number(result.wall_seconds, "wall time", Number.MIN_VALUE) };
+  return {
+    wallSeconds: number(result.wall_seconds, "wall time", Number.MIN_VALUE),
+    physical: {
+      timedRows: 1_048_576,
+      timedBytes,
+      activeFiles: 65,
+      activeRows: 1_064_960,
+      activeBytes,
+      deltaVersions: versions,
+      cohortSizes: result.cohort_sizes,
+    },
+  };
+}
+
+function comparePhysical(actual: CommitPhysicalSummary, reported: CommitPhysicalSummary): void {
+  for (const field of ["timedRows", "timedBytes", "activeFiles", "activeRows", "activeBytes", "deltaVersions"] as const) {
+    if (actual[field] !== reported[field]) throw new Error(`physical ${field} differs from component result`);
+  }
+  if (!Array.isArray(actual.cohortSizes) || actual.cohortSizes.length !== reported.cohortSizes.length
+    || actual.cohortSizes.some((size, index) => size !== reported.cohortSizes[index])) {
+    throw new Error("physical cohort sizes differ from component result");
+  }
 }
 
 async function readResult(file: string): Promise<unknown> {
@@ -187,7 +220,8 @@ async function privateScratch(root: string): Promise<string> {
  * Run three alternating component pairs through a trusted, pre-admitted host.
  * The host owns isolation, immutable source/executable admission and process-tree
  * settlement; it must not forward candidate-controlled paths or stdout here.
- * Results are diagnostic only until independent stopped files are available.
+ * The host must run the separate trusted stopped-table reconciler after settlement.
+ * Results remain diagnostic until admission and settlement are enforced.
  */
 export async function evaluateCommitComponent(host: CommitComponentHost): Promise<CommitComponentResult> {
   assertPin(host.control);
@@ -202,12 +236,15 @@ export async function evaluateCommitComponent(host: CommitComponentHost): Promis
     const directory = path.join(evidenceDirectory, `${index + 1}-${cell.arm}-${cell.pair}`);
     await mkdir(directory, { mode: 0o700 });
     const resultPath = path.join(directory, "result.json");
-    const receipt = await host.runAdmittedCell({ ...cell, resultPath });
+    const tablePath = path.join(directory, "table");
+    await mkdir(tablePath, { mode: 0o700 });
+    const receipt = await host.runAdmittedCell({ ...cell, resultPath, tablePath });
     const pin = host[cell.arm];
     if (!samePin(receipt, pin) || receipt.exitCode !== 0 || receipt.settled !== true) {
       throw new Error(`${cell.arm} cell did not exit zero and settle with its admitted pin`);
     }
     const result = validateResult(await readResult(resultPath));
+    comparePhysical(await host.reconcileStoppedCell(tablePath), result.physical);
     times[cell.arm][cell.pair - 1] = result.wallSeconds;
   }
   let calibration: CommitComponentResult["calibration"] = null;
@@ -225,7 +262,7 @@ export async function evaluateCommitComponent(host: CommitComponentHost): Promis
     valid: 0,
     combined_score: 0,
     accepted: false,
-    reason: "independent stopped Delta and Parquet files are unavailable outside candidate control",
+    reason: "candidate admission and process-tree settlement are not independently enforced",
     feedback: "Component-only diagnostic; the fixed 2s commit window dominates wall time and limits sensitivity.",
     evidenceDirectory,
     calibration,

@@ -77,6 +77,17 @@ function fakeHost(
       await run(request);
       return { ...(request.arm === "control" ? pin : candidate), exitCode: 0, settled: true };
     },
+    async reconcileStoppedCell() {
+      return {
+        timedRows: 1_048_576,
+        timedBytes: 36_232_640,
+        activeFiles: 65,
+        activeRows: 1_064_960,
+        activeBytes: 36_798_775,
+        deltaVersions: 9,
+        cohortSizes: [1, 8, 8, 8, 8, 8, 8, 8, 8],
+      };
+    },
   };
 }
 
@@ -93,10 +104,11 @@ test("three alternating fresh A-A cells remain unscored", async (t) => {
     "control1", "candidate1", "candidate2", "control2", "control3", "candidate3",
   ]);
   assert.equal(new Set(seen.map(({ resultPath }) => resultPath)).size, 6);
+  assert.equal(new Set(seen.map(({ tablePath }) => tablePath)).size, 6);
   assert.equal(result.valid, 0);
   assert.equal(result.combined_score, 0);
   assert.equal(result.accepted, false);
-  assert.match(result.reason, /independent stopped Delta and Parquet/);
+  assert.match(result.reason, /admission and process-tree settlement/);
   assert.match(result.feedback, /2s commit window/);
   assert.equal(result.calibration?.geometricMean, 1);
 });
@@ -140,6 +152,12 @@ test("refuses failed, unsettled or mismatched executions and incomplete results"
     await writeFile(resultPath, "x".repeat(64 * 1024 + 1), { flag: "wx" });
   });
   await assert.rejects(evaluateCommitComponent(oversized), /bounded regular file/);
+  await assert.rejects(evaluateCommitComponent({
+    ...valid,
+    async reconcileStoppedCell(tablePath) {
+      return { ...await valid.reconcileStoppedCell(tablePath), activeBytes: 1 };
+    },
+  }), /physical activeBytes/);
 });
 
 test("rejects foreign fixture pins and symlink results", async (t) => {
