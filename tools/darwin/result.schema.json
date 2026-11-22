@@ -47,10 +47,29 @@
     "run": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["measurement", "images", "activeRows", "snapshotVersion", "cellRunId", "snapshotReconciled", "binaryHash", "configHash", "runRoot"],
+      "required": ["measurement", "images", "clientEvidence", "activeRows", "snapshotVersion", "cellRunId", "snapshotReconciled", "binaryHash", "configHash", "runRoot"],
       "properties": {
         "measurement": { "$ref": "#/$defs/measurement" },
         "images": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[^:]+:sha256:[a-f0-9]{64}$" } },
+        "clientEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["payloadCorpusSha256", "cpu"],
+          "properties": {
+            "payloadCorpusSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "cpu": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["coreEquivalents", "sampleStartUnixMs", "sampleEndUnixMs", "unavailableReason"],
+              "properties": {
+                "coreEquivalents": { "type": ["number", "null"], "minimum": 0 },
+                "sampleStartUnixMs": { "type": ["integer", "null"], "minimum": 0 },
+                "sampleEndUnixMs": { "type": ["integer", "null"], "minimum": 0 },
+                "unavailableReason": { "type": ["string", "null"], "minLength": 1 }
+              }
+            }
+          }
+        },
         "activeRows": { "type": "integer", "minimum": 1 },
         "snapshotVersion": { "type": "integer", "minimum": 0 },
         "cellRunId": { "type": "string", "format": "uuid" },

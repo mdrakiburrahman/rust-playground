@@ -1887,6 +1887,24 @@ mod measurement_evidence_tests {
         assert_eq!(realistic["preparation"]["corpus_rows"], 65_536);
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_err());
 
+        let hash = "a".repeat(64);
+        snapshots[1].preparation.as_mut().context("test preparation")?["payload_corpus_sha256"] = json!(hash);
+        snapshots[1].logical_batch_manifest = Some(json!({
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_scope": "arrow-ipc-v1-excluding-endpoint_url",
+            "identity_status": "identity_bearing",
+            "complete": true,
+        }));
+        snapshots[1].measurement_window.as_mut().context("test measurement window")?.client_resources =
+            Some(json!({"cpu_core_equivalents": 2.5}));
+        let evidence = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
+        assert_eq!(evidence["payload_manifest"]["payload_corpus_sha256"], hash);
+        assert_eq!(evidence["measurement_window"]["client_resources"]["cpu_core_equivalents"], 2.5);
+        snapshots[1].logical_batch_manifest.as_mut().context("test manifest")?["payload_corpus_sha256"] = json!("b".repeat(64));
+        assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
+        snapshots[1].preparation = Some(prepared.clone());
+        snapshots[1].logical_batch_manifest = None;
+
         for (flag, valid_diagnostic) in [(json!(false), true), (json!("true"), false)] {
             snapshots[1].preparation.as_mut().context("test preparation")?["steady_state_generation"] = flag;
             assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
@@ -2014,6 +2032,7 @@ struct ClientCounterSnapshot {
     workers: Vec<WorkerCounterSnapshot>,
     preparation: Option<Value>,
     measurement_window: Option<ClientMeasurementWindow>,
+    logical_batch_manifest: Option<Value>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -2041,6 +2060,8 @@ struct ClientMeasurementWindow {
     worker_completed_rows: Vec<u64>,
     pilot_window_rows: Vec<u64>,
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_resources: Option<Value>,
 }
 
 fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) -> Result<Value> {
@@ -2052,6 +2073,14 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
     };
     let object = value.as_object().context("client preparation must be an object")?;
     let mut result = serde_json::Map::new();
+    if let Some(hash) = object.get("payload_corpus_sha256") {
+        if hash.as_str().is_none_or(|value| {
+            value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            bail!("invalid client payload corpus hash");
+        }
+        result.insert("payload_corpus_sha256".to_owned(), hash.clone());
+    }
     for key in [
         "corpus_rows",
         "corpus_decoded_bytes",
@@ -2673,7 +2702,8 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
             .try_fold(0_u64, |total, worker| total.checked_add(field(worker)))
             .context("client cumulative counter overflow")
     };
-    Ok(json!({
+    let preparation = client_preparation(end.preparation.as_ref(), data_profile)?;
+    let mut result = json!({
         "scope": "measurement_start_to_completed_snapshot_delta_not_unique_delivery",
         "process_cumulative": {
             "completed_rows": cumulative_total(|worker| worker.completed_rows)?,
@@ -2684,9 +2714,25 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
         "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
         "latency_scope": "process_cumulative_includes_preflight_and_warmup_not_phase_percentiles",
         "workers": deltas,
-        "preparation": client_preparation(end.preparation.as_ref(), data_profile)?,
+        "preparation": preparation,
         "measurement_window": end.measurement_window,
-    }))
+    });
+    if let Some(hash) = preparation.get("payload_corpus_sha256") {
+        let manifest = end.logical_batch_manifest.as_ref().context("payload hash lacks a terminal manifest")?;
+        if manifest["payload_corpus_sha256"] != *hash
+            || manifest["payload_corpus_hash_scope"] != "arrow-ipc-v1-excluding-endpoint_url"
+            || (data_profile == ClientDataProfile::Realistic && manifest["complete"] != true)
+        {
+            bail!("client payload hash disagrees with terminal manifest");
+        }
+        result["payload_manifest"] = json!({
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_scope": manifest["payload_corpus_hash_scope"],
+            "identity_status": manifest["identity_status"],
+            "complete": manifest["complete"],
+        });
+    }
+    Ok(result)
 }
 
 #[test]

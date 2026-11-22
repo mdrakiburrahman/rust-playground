@@ -2463,6 +2463,25 @@ mod tests {
     }
 
     #[test]
+    fn payload_customer_id_is_validated_and_projected_only_to_the_client() -> Result<()> {
+        let config =
+            Tunables::parse_oat_json(serde_json::json!({"client": {"payload_customer_id": "direct-e64-confirmwide"}}))?;
+        assert_eq!(
+            config.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID"],
+            "direct-e64-confirmwide"
+        );
+        assert!(
+            !config
+                .environment_for(ComponentRole::Collector)?
+                .contains_key("ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID")
+        );
+        for id in ["", "space inside", "line\nbreak", &"x".repeat(129)] {
+            assert!(Tunables::parse_oat_json(serde_json::json!({"client": {"payload_customer_id": id}})).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn canonical_json_environment_and_durability_are_deterministic() -> Result<()> {
         let config: Tunables = serde_json::from_str(r#"{"wal":{"flush_interval_ms":15},"client":{"batch_rows":4}}"#)?;
         assert_eq!(

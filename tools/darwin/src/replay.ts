@@ -190,8 +190,9 @@ export async function replayCompressionPair(
     }
     const [baseline, candidateResult] = results;
     if (!baseline || !candidateResult || baseline.binaryHash !== candidateResult.binaryHash
-      || JSON.stringify(baseline.images) !== JSON.stringify(candidateResult.images)) {
-      throw new Error("baseline and candidate did not use identical OAT and workload binaries");
+      || JSON.stringify(baseline.images) !== JSON.stringify(candidateResult.images)
+      || baseline.clientEvidence.payloadCorpusSha256 !== candidateResult.clientEvidence.payloadCorpusSha256) {
+      throw new Error("baseline and candidate did not use identical OAT/workload binaries and business corpus");
     }
     const ratio = candidateResult.measurement.durableRowsPerSecond / baseline.measurement.durableRowsPerSecond;
     completed = true;
