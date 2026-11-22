@@ -1,5 +1,6 @@
 //! Fixed local component case. Run the release executable with `--result PATH`,
 //! where PATH must not exist; its JSON is separate from application stdout.
+//! Accept the result only on exit zero; a failed run may leave an empty file.
 //! Timings include input generation through durable receipts, not DFE ACKs.
 //! The byte bound covers retained Arrow inputs, not total process memory.
 
@@ -17,8 +18,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let path = args.next().ok_or_else(|| anyhow::anyhow!("missing result path"))?;
     anyhow::ensure!(args.next().is_none(), "unexpected arguments");
-    let result = fixture::continuous_component().await?;
     let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = fixture::continuous_component().await?;
     serde_json::to_writer(&mut output, &result)?;
     writeln!(output)?;
     output.sync_all()?;

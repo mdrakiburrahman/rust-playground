@@ -660,23 +660,28 @@ struct ContinuousResult {
     result: arrow_deltalake::commit::GroupAppendResult,
 }
 
+#[derive(Default)]
+struct ContinuousCounters {
+    outstanding: AtomicUsize,
+    peak_outstanding: AtomicUsize,
+    staging: AtomicUsize,
+    peak_staging: AtomicUsize,
+}
+
 async fn continuous_group(
     table: Arc<BatchedTable>,
     index: usize,
     batch: RecordBatch,
     input_bytes: usize,
-    outstanding: Arc<AtomicUsize>,
-    peak_outstanding: Arc<AtomicUsize>,
-    staging: Arc<AtomicUsize>,
-    peak_staging: Arc<AtomicUsize>,
+    counters: Arc<ContinuousCounters>,
 ) -> Result<ContinuousResult> {
-    let active = staging.fetch_add(1, Ordering::SeqCst) + 1;
-    peak_staging.fetch_max(active, Ordering::SeqCst);
+    let active = counters.staging.fetch_add(1, Ordering::SeqCst) + 1;
+    counters.peak_staging.fetch_max(active, Ordering::SeqCst);
     let started = Instant::now();
     let group = table
         .stage_coalesced_publications(vec![(batch, format!("continuous-{index:04}"), 0, 1)])
         .await;
-    staging.fetch_sub(1, Ordering::SeqCst);
+    counters.staging.fetch_sub(1, Ordering::SeqCst);
     let group = group?;
     let stage = started.elapsed();
     ensure!(
@@ -690,11 +695,11 @@ async fn continuous_group(
     let started = Instant::now();
     let receipt = table.submit_prepared_group(group, false).await?;
     let admission = started.elapsed();
-    let active = outstanding.fetch_add(1, Ordering::SeqCst) + 1;
-    peak_outstanding.fetch_max(active, Ordering::SeqCst);
+    let active = counters.outstanding.fetch_add(1, Ordering::SeqCst) + 1;
+    counters.peak_outstanding.fetch_max(active, Ordering::SeqCst);
     let started = Instant::now();
     let result = receipt.wait().await;
-    outstanding.fetch_sub(1, Ordering::SeqCst);
+    counters.outstanding.fetch_sub(1, Ordering::SeqCst);
     let result = result?;
     Ok(ContinuousResult {
         index,
@@ -710,6 +715,9 @@ async fn continuous_group(
 }
 
 /// Run a fixed synthetic local-only component workload and independently verify its durable output.
+///
+/// # Errors
+/// Returns staging, publication, readback or verification failures.
 pub async fn continuous_component() -> Result<serde_json::Value> {
     let root = tempfile::tempdir()?;
     let table = BatchedTable::open(
@@ -721,29 +729,16 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         },
     )
     .await?;
-    let outstanding = Arc::new(AtomicUsize::new(0));
-    let peak_outstanding = Arc::new(AtomicUsize::new(0));
-    let staging = Arc::new(AtomicUsize::new(0));
-    let peak_staging = Arc::new(AtomicUsize::new(0));
+    let counters = Arc::new(ContinuousCounters::default());
     let warmup_batch = input(0)?;
     let warmup_bytes = warmup_batch.get_array_memory_size();
     ensure!(
         warmup_bytes <= MAX_IN_FLIGHT_INPUT_BYTES,
         "warmup exceeds input byte limit"
     );
-    let warmup = continuous_group(
-        Arc::clone(&table),
-        0,
-        warmup_batch,
-        warmup_bytes,
-        Arc::clone(&outstanding),
-        Arc::clone(&peak_outstanding),
-        Arc::clone(&staging),
-        Arc::clone(&peak_staging),
-    )
-    .await?;
-    peak_outstanding.store(0, Ordering::SeqCst);
-    peak_staging.store(0, Ordering::SeqCst);
+    let warmup = continuous_group(Arc::clone(&table), 0, warmup_batch, warmup_bytes, Arc::clone(&counters)).await?;
+    counters.peak_outstanding.store(0, Ordering::SeqCst);
+    counters.peak_staging.store(0, Ordering::SeqCst);
     let hz = ticks_per_second()?;
     let cpu_start = process_ticks()?;
     let wall_start = Instant::now();
@@ -768,10 +763,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
                 next,
                 batch,
                 bytes,
-                Arc::clone(&outstanding),
-                Arc::clone(&peak_outstanding),
-                Arc::clone(&staging),
-                Arc::clone(&peak_staging),
+                Arc::clone(&counters),
             ));
             peak_groups = peak_groups.max(pending.len());
             next += 1;
@@ -787,10 +779,13 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         .checked_sub(cpu_start)
         .context("process ticks went backwards")?;
     ensure!(in_flight_bytes == 0, "input reservations did not drain");
-    ensure!(outstanding.load(Ordering::SeqCst) == 0, "receipts did not drain");
-    ensure!(staging.load(Ordering::SeqCst) == 0, "staging did not drain");
     ensure!(
-        peak_outstanding.load(Ordering::SeqCst) > 1,
+        counters.outstanding.load(Ordering::SeqCst) == 0,
+        "receipts did not drain"
+    );
+    ensure!(counters.staging.load(Ordering::SeqCst) == 0, "staging did not drain");
+    ensure!(
+        counters.peak_outstanding.load(Ordering::SeqCst) > 1,
         "no overlapping submitted groups observed"
     );
 
@@ -948,8 +943,8 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         "max_in_flight_input_bytes": MAX_IN_FLIGHT_INPUT_BYTES,
         "peak_in_flight_input_bytes": peak_input_bytes,
         "peak_in_flight_groups": peak_groups,
-        "peak_submitted_unconsumed_receipts": peak_outstanding.load(Ordering::SeqCst),
-        "peak_staging_groups": peak_staging.load(Ordering::SeqCst),
+        "peak_submitted_unconsumed_receipts": counters.peak_outstanding.load(Ordering::SeqCst),
+        "peak_staging_groups": counters.peak_staging.load(Ordering::SeqCst),
         "timed_groups": CONTINUOUS_GROUPS,
         "timed_durable_rows": CONTINUOUS_GROUPS * ROWS,
         "timed_receipts": timed.len(),
