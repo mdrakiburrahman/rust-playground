@@ -65,6 +65,9 @@ pub struct DeltaRuntimeConfig {
     /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
     /// The waiting queue holds at most this many additional jobs.
     pub cpu_workers: usize,
+    /// Skip row-wise grouping for internally generated single ingestion partitions.
+    #[serde(default)]
+    pub generated_partition_fast_path: bool,
 }
 
 impl Default for DeltaRuntimeConfig {
@@ -86,6 +89,7 @@ impl DeltaRuntimeConfig {
             read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
+            generated_partition_fast_path: false,
         }
     }
 
@@ -137,6 +141,14 @@ impl DeltaRuntimeConfig {
                 "put_create" => UploadMode::PutCreate,
                 "buffered_multipart" => UploadMode::BufferedMultipart,
                 _ => anyhow::bail!("{mode_name} must be 'put_create' or 'buffered_multipart', got {raw:?}"),
+            };
+        }
+        let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH";
+        if let Some(raw) = lookup(name)? {
+            config.generated_partition_fast_path = match raw.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => anyhow::bail!("{name} must be 'true' or 'false', got {raw:?}"),
             };
         }
         if config.upload_mode == UploadMode::PutCreate {
@@ -605,6 +617,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn generated_partition_fast_path_is_strictly_opt_in() -> Result<()> {
+        let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH";
+        assert!(!DeltaRuntimeConfig::from_lookup(|_| Ok(None))?.generated_partition_fast_path);
+        for (raw, expected) in [("true", true), ("false", false)] {
+            let config = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))?;
+            assert_eq!(config.generated_partition_fast_path, expected);
+        }
+        for raw in ["", "1", "TRUE", "true "] {
+            assert!(DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned()))).is_err());
+        }
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

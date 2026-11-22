@@ -1566,6 +1566,68 @@ mod io_tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesced_generated_ingestion_preserves_rows_and_rejects_mismatches() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let url = Url::from_directory_path(fs::canonicalize(directory.path())?)
+            .map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let catalog = DeltaTable::open_catalog(url.clone())?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let partitions = vec![INGESTION_PARTITION.to_owned()];
+        let props = BTreeMap::from([("arrowcol.partition.granularity".into(), "day".into())]);
+        catalog.commit_catalog(None, Arc::clone(&schema), partitions.clone(), props, None)?;
+        let table = DeltaTable::open_url(url, Arc::clone(&schema), partitions)?;
+        let (staged, identities, committed, _, _) = table
+            .stage_coalesced_publications(
+                vec![
+                    (input_batch()?, "first".into(), 0, 3_600_000),
+                    (input_batch()?, "second".into(), 0, 3_600_000),
+                ],
+                2,
+            )
+            .await?;
+        assert_eq!(identities.len(), 2);
+        assert!(committed.is_empty());
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].file.rows, 2);
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged[0].file.path)?)?;
+        let decoded = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(decoded.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        let ids = decoded[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .context("ids")?;
+        assert_eq!(ids.values(), &[42, 42]);
+        table.commit_files(&staged)?;
+        let log = fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;
+        assert!(log.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|entry| entry["add"]["partitionValues"][INGESTION_PARTITION] == "1970-01-01")
+        }));
+        let supplied = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["1970-01-01", "1970-01-02"])),
+            ],
+        )?;
+        let error = match table
+            .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2)
+            .await
+        {
+            Ok(_) => bail!("mismatched ingestion partition was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match its admission stamp"));
+        Ok(())
+    }
+
     fn input_batch() -> Result<RecordBatch> {
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -3682,6 +3744,7 @@ impl DeltaTable {
         }
         let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
         let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
+        let generated_partition_fast_path = runtime_config()?.generated_partition_fast_path;
         let mut identities = Vec::with_capacity(entries.len());
         let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
@@ -3701,6 +3764,7 @@ impl DeltaTable {
             } else {
                 None
             };
+            let mut generated_ingestion = false;
             if let Some(expected) = &expected_ingestion
                 && batch.schema().field_with_name(INGESTION_PARTITION).is_err()
             {
@@ -3716,6 +3780,7 @@ impl DeltaTable {
                     batch.num_rows()
                 ])));
                 batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
+                generated_ingestion = true;
             }
             if let Some(schema) = &schema {
                 if schema.as_ref() != batch.schema().as_ref() {
@@ -3773,7 +3838,12 @@ impl DeltaTable {
                     register_partition(&values)?;
                     vec![(batch, values)]
                 } else {
-                    crate::partition::split_with_new_partition(&batch, &partitions, &mut register_partition)?
+                    crate::partition::split_with_generated_partition(
+                        &batch,
+                        &partitions,
+                        (generated_partition_fast_path && generated_ingestion).then_some(INGESTION_PARTITION),
+                        &mut register_partition,
+                    )?
                 }
             };
             if splits.is_empty() && batch_rows == 0 && !partitions.is_empty() {

@@ -12,6 +12,27 @@ pub(crate) fn split(batch: &RecordBatch, names: &[String]) -> Result<Vec<(Record
     split_with_new_partition(batch, names, |_| Ok(()))
 }
 
+pub(crate) fn split_with_generated_partition(
+    batch: &RecordBatch,
+    names: &[String],
+    generated: Option<&str>,
+    mut on_new_partition: impl FnMut(&PartitionValues) -> Result<()>,
+) -> Result<Vec<(RecordBatch, PartitionValues)>> {
+    let Some(name) = generated.filter(|name| names == [*name]) else {
+        return split_with_new_partition(batch, names, on_new_partition);
+    };
+    let column = batch
+        .schema()
+        .index_of(name)
+        .with_context(|| format!("missing partition column {name}"))?;
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let values = BTreeMap::from([(name.to_owned(), value(batch.column(column).as_ref(), 0)?)]);
+    on_new_partition(&values)?;
+    Ok(vec![(batch.clone(), values)])
+}
+
 pub(crate) fn split_with_new_partition(
     batch: &RecordBatch,
     names: &[String],
@@ -89,6 +110,70 @@ mod tests {
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn generated_partition_reuses_input_and_preserves_grouping() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("partition", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("one"), Some("one"), Some("one")])),
+                Arc::new(Int64Array::from(vec![3, 1, 2])),
+            ],
+        )?;
+        let names = ["partition".to_owned()];
+        let expected = split(&batch, &names)?;
+        let mut registrations = Vec::new();
+        let actual = split_with_generated_partition(&batch, &names, Some("partition"), |values| {
+            registrations.push(values.clone());
+            Ok(())
+        })?;
+        assert_eq!(actual, expected);
+        assert_eq!(registrations, vec![expected[0].1.clone()]);
+        assert!(Arc::ptr_eq(actual[0].0.column(1), batch.column(1)));
+        assert!(
+            split_with_generated_partition(&batch.slice(0, 0), &names, Some("partition"), |_| {
+                anyhow::bail!("unexpected empty-partition callback")
+            })?
+            .is_empty()
+        );
+        assert!(
+            split_with_generated_partition(&batch, &names, Some("partition"), |_| {
+                anyhow::bail!("registration failed")
+            })
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unproven_and_multi_column_partitions_use_full_grouping() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("partition", DataType::Utf8, true),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("a")])),
+                Arc::new(Int64Array::from(vec![1, 2, 1])),
+            ],
+        )?;
+        let names = ["partition".to_owned()];
+        assert_eq!(
+            split_with_generated_partition(&batch, &names, None, |_| Ok(()))?,
+            split(&batch, &names)?
+        );
+        let names = ["partition".to_owned(), "bucket".to_owned()];
+        assert_eq!(
+            split_with_generated_partition(&batch, &names, Some("bucket"), |_| Ok(()))?,
+            split(&batch, &names)?
+        );
+        Ok(())
+    }
 
     #[test]
     fn groups_actual_multi_column_values_and_nulls_without_reordering_rows() -> Result<()> {
