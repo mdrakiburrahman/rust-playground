@@ -98,8 +98,8 @@ async fn reset_fixture() -> anyhow::Result<()> {
     connection
         .execute(
             "DELETE FROM arrowcol.routing_table_leases WHERE holder_instance_id = @P1;
-         DELETE FROM arrowcol.routing_pressure_history WHERE instance_id = @P1;
-         DELETE FROM arrowcol.routing_pressure_latest WHERE instance_id = @P1;
+         DELETE FROM arrowcol.routing_pressure_history WHERE collector_instance_id = @P1;
+         DELETE FROM arrowcol.routing_pressure_latest WHERE collector_instance_id = @P1;
          DELETE FROM arrowcol.routing_collectors WHERE instance_id = @P1;",
             &[&uuid::Uuid::parse_str(INSTANCE)?],
         )
