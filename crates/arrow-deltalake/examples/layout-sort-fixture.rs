@@ -179,14 +179,14 @@ fn independent_checks(input: &[RecordBatch], output: &RecordBatch, stress: bool)
                     "secondary order"
                 );
             }
-            let indices = UInt32Array::from(source_indices);
-            for (source, actual) in original.columns().iter().zip(output.columns()) {
-                ensure!(
-                    take(source, &indices, None)?.as_ref() == actual.as_ref(),
-                    "source row contents changed"
-                );
-            }
         }
+    }
+    let indices = UInt32Array::from(source_indices);
+    for (source, actual) in original.columns().iter().zip(output.columns()) {
+        ensure!(
+            take(source, &indices, None)?.as_ref() == actual.as_ref(),
+            "source row contents changed"
+        );
     }
     Ok(())
 }
