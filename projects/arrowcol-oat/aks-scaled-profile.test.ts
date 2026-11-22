@@ -23,6 +23,20 @@ const registry = 'arrowcollector68590.azurecr.io';
 const sourceCommit = 'a'.repeat(40);
 const digest = 'sha256:' + 'b'.repeat(64);
 
+test('runtime accepts only the signed index or platform child while keeping both identities distinct', () => {
+  const child = 'sha256:' + 'c'.repeat(64);
+  const observation = { collectorPodUid: 'collector', collectorNodeName: 'n0',
+    collectorImageId: 'docker-pullable://registry/collector@' + digest,
+    clients: [{ jobName: 'job', podName: 'client', podUid: 'uid', nodeName: 'n1',
+      imageId: 'docker-pullable://registry/client@' + child }] };
+  assert.throws(() => assertScaledRuntimeObservation(['job'], observation, child, child), /image ID/);
+  assert.doesNotThrow(() => assertScaledRuntimeObservation(['job'], observation, child, child,
+    { client: digest, collector: digest }));
+  assert.throws(() => assertScaledRuntimeObservation(['job'], { ...observation,
+    collectorImageId: 'docker-pullable://registry/collector@sha256:' + 'd'.repeat(64) }, child, child,
+  { client: digest, collector: digest }), /image ID/);
+});
+
 test('client summary binds final half-open-window counters and preserves latency samples without averaging quantiles', () => {
   const binding = { podUid: 'uid-client', clientId: 'client-1', start: 1000, end: 601000, completedRows: 17, workers: 8, streamsPerWorker: 2 };
   const receipt = { version: 1, phase: 'completed', completion_semantics: 'validated_admission_response_not_delta_commit',

@@ -1,9 +1,9 @@
 #!/usr/bin/env -S npx --no-install tsx
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { parseAllDocuments } from 'yaml';
@@ -12,6 +12,8 @@ import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
 import { readDeltaAddWindow } from './aks-delta-preservation.js';
+import { reconcileCollectorWindow } from './aks-collector-window.js';
+import { assertProducedBuildStatement, verifyBuildEnvelope } from './aks-candidate-build.js';
 import { createKubeletNodeResourceReader, startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
 import {
   applyCandidateImageManifest, assertScaledRuntimeObservation, assertTrustedImageStatement, collectorShapes,
@@ -620,6 +622,8 @@ interface BenchmarkReport {
     image_binding: CandidateImageManifest;
     trusted_build_provenance_verified: boolean;
     trusted_signer_key_sha256: string;
+    collector_receipt_window?: ReturnType<typeof reconcileCollectorWindow>;
+    attested_platform_digests?: Record<string, string>;
     original_client_pool: ScaledPoolSettings;
     placement: ScaledRuntimeObservation;
     client_results: JsonObject[];
@@ -705,12 +709,14 @@ interface ScaledOptions {
   candidateCommit: string;
   imageManifestPath?: string;
   provenanceKey?: string;
+  provenanceBundle?: string;
 }
 
 interface ScaledInputs {
   manifest: string;
   poolName: string;
   binding: CandidateImageManifest;
+  platformDigests?: Record<string, string>;
 }
 
 async function scaledInputs(base: string, runId: string, registry: string, options: ScaledOptions): Promise<ScaledInputs> {
@@ -738,7 +744,33 @@ async function scaledInputs(base: string, runId: string, registry: string, optio
 
 async function verifyCandidateBuilds(registry: string, options: ScaledOptions, inputs: ScaledInputs): Promise<string> {
   if (!options.provenanceKey) throw new Error('Scaled run requires --provenance-key from a trusted build signer; self-declared sourceCommit is not proof.');
-  const keySha = createHash('sha256').update(await readFile(options.provenanceKey)).digest('hex');
+  const publicKey = await readFile(options.provenanceKey);
+  const keySha = createHash('sha256').update(publicKey).digest('hex');
+  if (options.provenanceBundle) {
+    const anchorPath = relative(await realpath(ROOT), await realpath(options.provenanceKey));
+    if (!isAbsolute(anchorPath) && anchorPath !== '..' && !anchorPath.startsWith('../')) {
+      throw new Error('Produced build trust anchor must be supplied outside candidate source.');
+    }
+    const bundle = requireRecord(parseJson(await readFile(options.provenanceBundle, 'utf8'), 'Produced build bundle'), 'Produced build bundle');
+    if (bundle.schema_version !== 1 || bundle.scope !== 'candidate' || bundle.source_commit !== options.candidateCommit ||
+        !Array.isArray(bundle.envelopes)) throw new Error('Local fixture or mismatched build bundle cannot authorize AKS.');
+    const statements = bundle.envelopes.map(envelope => verifyBuildEnvelope(envelope, publicKey));
+    inputs.platformDigests = {};
+    for (const [reference, digest] of Object.entries(inputs.binding.images)) {
+      const repository = registry + '/' + reference.split('@')[0];
+      const matches = statements.filter(statement => Array.isArray(statement.subject) && statement.subject.some(subject =>
+        isRecord(subject) && subject.name === repository && isRecord(subject.digest) && subject.digest.sha256 === digest.slice(7)));
+      if (matches.length !== 1) throw new Error('Build bundle must contain exactly one verified result for each candidate role/digest.');
+      const statement = matches[0]!;
+      assertProducedBuildStatement(statement, digest, options.candidateCommit, repository);
+      const output = requireRecord(requireRecord(statement.predicate, 'Produced predicate').output, 'Produced output');
+      if (!Array.isArray(output.platforms)) throw new Error('Missing attested platform manifest.');
+      const platform = requireRecord(output.platforms[0], 'Attested platform');
+      if (typeof platform.digest !== 'string') throw new Error('Missing attested platform digest.');
+      inputs.platformDigests[repository + '@' + digest] = platform.digest;
+    }
+    return keySha;
+  }
   for (const [reference, digest] of Object.entries(inputs.binding.images)) {
     const image = registry + '/' + reference.split('@')[0] + '@' + digest;
     const output = await command(['cosign', 'verify-attestation', '--key', options.provenanceKey, '--type', 'slsaprovenance',
@@ -856,7 +888,8 @@ async function assertNoQueuedForeignClients(config: Config): Promise<void> {
   if (blockers.length) throw new Error('Unrelated pending client workloads prevent pool expansion: ' + blockers.join(', '));
 }
 
-async function captureScaledPods(config: Config, namespace: string, runId: string, jobs: string[], manifest: string, finished = false): Promise<ScaledRuntimeObservation> {
+async function captureScaledPods(config: Config, namespace: string, runId: string, jobs: string[], manifest: string, finished = false,
+  platformDigests?: Record<string, string>): Promise<ScaledRuntimeObservation> {
   const list = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace, '-o', 'json'], 'Capture scaled pod placement'), 'Pod inventory'), 'Pod inventory');
   if (!Array.isArray(list.items)) throw new Error('Scaled pod inventory is invalid.');
   const measuredPods = list.items;
@@ -897,7 +930,10 @@ async function captureScaledPods(config: Config, namespace: string, runId: strin
   const clientImage = load?.getIn(['spec', 'template', 'spec', 'containers', 0, 'image']);
   const collectorImage = writer?.getIn(['spec', 'template', 'spec', 'containers', 0, 'image']);
   if (typeof clientImage !== 'string' || typeof collectorImage !== 'string') throw new Error('Rendered candidate images are absent.');
-  assertScaledRuntimeObservation(jobs, observation, clientImage.split('@')[1]!, collectorImage.split('@')[1]!);
+  assertScaledRuntimeObservation(jobs, observation, platformDigests?.[clientImage] ?? clientImage.split('@')[1]!,
+    platformDigests?.[collectorImage] ?? collectorImage.split('@')[1]!, platformDigests ? {
+      client: clientImage.split('@')[1]!, collector: collectorImage.split('@')[1]!,
+    } : undefined);
   const memoryBytes = (value: unknown): number => {
     if (typeof value !== 'string') throw new Error('Node memory quantity is unknown.');
     const match = /^(\d+)(Ki|Mi|Gi)?$/.exec(value);
@@ -1024,7 +1060,8 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     const hash = createHash('sha256');
     for (const path of ['projects/arrowcol-oat/aks-direct-benchmark.ts', 'projects/arrowcol-oat/aks-scaled-profile.ts',
       'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep', 'projects/arrowcol-oat/publish-images.ts',
-      'infra/azure/bootstrap.ts']) {
+      'infra/azure/bootstrap.ts', 'projects/arrowcol-oat/aks-candidate-build.ts',
+      'projects/arrowcol-oat/aks-delta-preservation.ts', 'projects/arrowcol-oat/aks-collector-window.ts']) {
       hash.update(path + '\0').update(await readFile(resolve(ROOT, path))).update('\0');
     }
     scaledSourcesSha = hash.digest('hex');
@@ -1067,6 +1104,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   let placement: ScaledRuntimeObservation | undefined;
   let observer: NodeObservationHandle | undefined;
   let nodeResources: NodeResourceObservation | undefined;
+  let collectorWindow: ReturnType<typeof reconcileCollectorWindow> | undefined;
   const clientResults: JsonObject[] = [];
   const clientJobs = options.scaled ? scaledClientJobs(runId, options.scaled.clientCount).map(job => job.name) : [];
   console.log('Run ' + runId + ': namespace ' + namespace + '; report ' + reportPath);
@@ -1159,7 +1197,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await applyStage(config, namespace, renderedPath, 'load');
       if (scaled) {
         await waitScaledClients(config, namespace, writer, clientJobs, true);
-        placement = await captureScaledPods(config, namespace, runId, clientJobs, rendered);
+        placement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, false, scaled?.platformDigests);
       } else await waitForReadyLoad(config, namespace, writer);
       const scheduleStart = now() + 130_000;
       if (scheduleStart - now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
@@ -1194,7 +1232,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         await waitScaledClients(config, namespace, writer, clientJobs, false);
         if (observer) { nodeResources = await observer.stop(); observer = undefined; }
         if (now() < measurementEnd) throw new Error('Scaled clients completed before the full common measurement window ended.');
-        const finalPlacement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, true);
+        const finalPlacement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, true, scaled?.platformDigests);
         if (JSON.stringify(finalPlacement) !== JSON.stringify(placement)) throw new Error('Scaled client/collector pod UID, image or node changed during the window.');
         for (const jobName of clientJobs) {
           const clientPlacement = finalPlacement.clients.find(client => client.jobName === jobName)!;
@@ -1229,7 +1267,23 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await verifyNamespace(config, namespace, runId, owner, namespaceUid);
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
       metrics = await (executionScope.getStore()?.readDelta ?? readDeltaAddWindow)(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
-        async () => { await verifyNamespace(config, namespace, runId, owner, namespaceUid); });
+        async () => { await verifyNamespace(config, namespace, runId, owner, namespaceUid); }, scaled ? { retainCommitSummaries: true } : undefined);
+      if (scaled && placement) {
+        const pods = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace, '-l', 'app=arrowcol', '-o', 'json'],
+          'Read collector receipt target'), 'Collector receipt target'), 'Collector receipt target');
+        if (!Array.isArray(pods.items) || pods.items.length !== 1) throw new Error('Missing collector receipt target.');
+        const metadata = requireRecord(requireRecord(pods.items[0], 'Collector receipt pod').metadata, 'Collector receipt identity');
+        if (metadata.uid !== placement.collectorPodUid || typeof metadata.name !== 'string') throw new Error('Collector receipt UID changed.');
+        const logs = await kubectl(config, ['logs', 'pod/' + metadata.name, '-n', namespace, '-c', 'dataflow'], 'Retain collector completion receipts');
+        await writePrivateFile(join(runDir, 'collector-completion.log'), logs);
+        const current = await getObject(config, 'pod', namespace, metadata.name);
+        if (!current || requireRecord(current.metadata, 'Collector receipt identity').uid !== placement.collectorPodUid) {
+          throw new Error('Collector UID changed while retaining completion receipts.');
+        }
+        collectorWindow = reconcileCollectorWindow(logs, metrics.table_id, metrics.commit_summaries,
+          measurementStart, measurementEnd, placement.collectorPodUid);
+        await writePrivateFile(join(runDir, 'collector-window.json'), JSON.stringify(collectorWindow, null, 2) + '\n');
+      }
       if (metrics.window_rows <= 0 || metrics.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
     });
   } catch (error) {
@@ -1350,6 +1404,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       runner_sources_sha256: scaledSourcesSha,
       candidate_source_commit: options.scaled.candidateCommit, image_binding: scaled.binding,
       trusted_build_provenance_verified: !!signerKeySha, trusted_signer_key_sha256: signerKeySha,
+      collector_receipt_window: collectorWindow, attested_platform_digests: scaled.platformDigests,
       original_client_pool: clientPoolPlan.original, placement, client_results: clientResults,
       collector_pool_removed: collectorRemoved, client_pool_restored: clientRestored,
     } } : {}),
@@ -1382,6 +1437,7 @@ async function executeMain(argv: string[]): Promise<number> {
       'candidate-commit': { type: 'string' },
       'image-manifest': { type: 'string' },
       'provenance-key': { type: 'string' },
+      'provenance-bundle': { type: 'string' },
       output: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     } });
@@ -1407,10 +1463,11 @@ async function executeMain(argv: string[]): Promise<number> {
       }
       scaled = { clientCount: count, collectorShape: shape, candidateCommit: values['candidate-commit'],
         imageManifestPath: values['image-manifest'] ? resolve(values['image-manifest']) : undefined,
-        provenanceKey: values['provenance-key'] ? resolve(values['provenance-key']) : undefined };
+        provenanceKey: values['provenance-key'] ? resolve(values['provenance-key']) : undefined,
+        provenanceBundle: values['provenance-bundle'] ? resolve(values['provenance-bundle']) : undefined };
       if (values.mode !== 'full') throw new Error('Scaled holdout requires the common full 600-second window.');
       if (positionals[0] === 'run' && !scaled.provenanceKey) throw new Error('Scaled run requires a trusted --provenance-key; image bindings alone are not build proof.');
-    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key']) {
+    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key'] || values['provenance-bundle']) {
       throw new Error('Scaled options require explicit --profile scaled; default behavior is unchanged.');
     }
     if (positionals[0] === 'check' || positionals[0] === 'render') {

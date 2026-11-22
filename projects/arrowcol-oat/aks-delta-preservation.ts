@@ -430,6 +430,14 @@ export interface DeltaAddWindow {
   last_version: number | null;
 }
 
+export interface DeltaCommitSummary {
+  version: number;
+  commit_info_timestamp_unix_ms: number;
+  rows: number;
+  files: number;
+  bytes: number;
+}
+
 export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: number, endUnixMs: number): DeltaAddWindow {
   requireThat(Number.isSafeInteger(startUnixMs) && Number.isSafeInteger(endUnixMs) && startUnixMs < endUnixMs,
     'invalid Delta measurement window');
@@ -476,7 +484,9 @@ export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: nu
 }
 
 export async function readDeltaAddWindow(azure: Azure, relativePath: string, startUnixMs: number, endUnixMs: number,
-  assertCurrent: () => Promise<void>): Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
+  assertCurrent: () => Promise<void>, options?: { retainCommitSummaries: boolean }): Promise<DeltaAddWindow & {
+    delta_version: number; active_rows: number; table_id?: string; commit_summaries?: DeltaCommitSummary[];
+  }> {
   let snapshot: Awaited<ReturnType<typeof capture>> | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -495,7 +505,15 @@ export async function readDeltaAddWindow(azure: Azure, relativePath: string, sta
   const adds = reconcileDeltaAdds(commits, startUnixMs, endUnixMs);
   if (adds.total_rows !== reference.row_count)
     throw new ReplayError('Delta Add row totals do not reconcile with the final active-file snapshot');
-  return { ...adds, delta_version: reference.version, active_rows: reference.row_count };
+  const retained = options?.retainCommitSummaries ? { table_id: reference.table_id,
+    commit_summaries: [...commits].flatMap(([version, actions]) => {
+      const total = reconcileDeltaAdds(new Map([[version, actions]]), 0, Number.MAX_SAFE_INTEGER);
+      if (!total.total_commits) return [];
+      const info = actions.find(action => action.commitInfo !== undefined)!.commitInfo;
+      return [{ version, commit_info_timestamp_unix_ms: integer(object(info, 'commitInfo').timestamp, 'Delta commit timestamp'),
+        rows: total.total_rows, files: total.total_files, bytes: total.total_bytes }];
+    }).sort((a, b) => a.version - b.version) } : {};
+  return { ...adds, delta_version: reference.version, active_rows: reference.row_count, ...retained };
 }
 
 export function parseDeltaReplayReference(input: unknown, azure: Azure, relativePath: string): DeltaReplayReference {

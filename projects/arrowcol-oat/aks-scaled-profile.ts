@@ -507,8 +507,10 @@ export function allScaledClientsReady(expectedJobs: readonly string[], observati
   return expectedJobs.every(name => byName.get(name)?.ready === true);
 }
 
-function requireImageDigest(imageId: string, expectedDigest: string, label: string): void {
-  if (!imageId || !/^sha256:[0-9a-f]{64}$/.test(expectedDigest) || !imageId.endsWith('@' + expectedDigest)) {
+function requireImageDigest(imageId: string, expectedDigest: string, label: string, attestedIndexDigest?: string): void {
+  const allowed = [expectedDigest, ...(attestedIndexDigest ? [attestedIndexDigest] : [])];
+  if (!imageId || allowed.some(digest => !/^sha256:[0-9a-f]{64}$/.test(digest)) ||
+      !allowed.some(digest => imageId.endsWith('@' + digest))) {
     throw new Error(`${label} image ID does not match the candidate image digest.`);
   }
 }
@@ -518,12 +520,13 @@ export function assertScaledRuntimeObservation(
   observation: ScaledRuntimeObservation,
   clientDigest: string,
   collectorDigest: string,
+  attestedIndexDigests?: { client: string; collector: string },
 ): void {
   if (!observation.collectorPodUid || !observation.collectorNodeName) throw new Error('Scaled runtime observation is missing collector pod identity or placement.');
   if (expectedJobs.length < 1 || expectedJobs.length > MAX_SCALED_CLIENTS || new Set(expectedJobs).size !== expectedJobs.length) {
     throw new Error('Expected scaled client Job set is invalid.');
   }
-  requireImageDigest(observation.collectorImageId, collectorDigest, 'Collector');
+  requireImageDigest(observation.collectorImageId, collectorDigest, 'Collector', attestedIndexDigests?.collector);
   if (observation.clients.length !== expectedJobs.length) throw new Error('Scaled runtime observation is missing or duplicating client pods.');
   const seenJobs = new Set<string>();
   const seenPods = new Set<string>();
@@ -534,7 +537,7 @@ export function assertScaledRuntimeObservation(
         seenPods.has(client.podName) || seenPodUids.has(client.podUid) || seenNodes.has(client.nodeName) || client.nodeName === observation.collectorNodeName) {
       throw new Error('Scaled client placement is missing, duplicated, or not on a distinct node.');
     }
-    requireImageDigest(client.imageId, clientDigest, `Client ${client.jobName}`);
+    requireImageDigest(client.imageId, clientDigest, `Client ${client.jobName}`, attestedIndexDigests?.client);
     seenJobs.add(client.jobName);
     seenPods.add(client.podName);
     seenPodUids.add(client.podUid);

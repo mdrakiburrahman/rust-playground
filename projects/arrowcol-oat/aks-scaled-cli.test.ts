@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -11,6 +11,7 @@ import { main, renderManifest, type BenchmarkDependencies } from './aks-direct-b
 import { collectorShapes, effectiveWorkloadConfig, renderScaledProfileManifest } from './aks-scaled-profile.js';
 import { clientRepository, imageBuilds, repositories } from './publish-images.js';
 import { POD_RESOURCE_SAMPLE_COMMAND } from './aks-node-observation.js';
+import { PRIMARY_REPOSITORY, PRODUCER_ID } from './aks-candidate-build.js';
 
 const azureEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   key.startsWith('AZURE_') || key.startsWith('ARROWCOL_AZURE_')));
@@ -90,13 +91,16 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
     now: () => time,
     sleep: async ms => { time += ms; },
     generation: async () => '22222222-2222-4222-8222-222222222222',
-    readDelta: async (_azure, _path, start, end) => {
+    readDelta: async (_azure, _path, start, end, _guard, options) => {
       assert.equal(end - start, 600_000);
-      if (scaled) assert.ok(events.includes('observer-stop'));
+      if (scaled) { assert.ok(events.includes('observer-stop')); assert.equal(options?.retainCommitSummaries, true); }
       events.push('delta-read');
       return { total_rows: 1200, total_files: 2, total_bytes: 2400, total_commits: 1,
         window_rows: 1200, window_files: 2, window_bytes: 2400, window_commits: 1,
-        first_version: 0, last_version: 0, delta_version: 0, active_rows: 1200 };
+        first_version: 0, last_version: 0, delta_version: 0, active_rows: 1200,
+        ...(scaled ? { table_id: 'table-id', commit_summaries: [
+          { version: 0, commit_info_timestamp_unix_ms: start, rows: 1200, files: 2, bytes: 2400 },
+        ] } : {}) };
     },
     startObservation: options => {
       assert.equal(options.targets.length, 3);
@@ -201,6 +205,11 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
         }
         if (args.includes('logs')) {
           const name = args[args.indexOf('logs') + 1]!.slice(4);
+          if (name === 'pod-0') {
+            events.push('collector-window-log');
+            return ok('arrowcol_data_commit ' + JSON.stringify({ schema_version: 1, outcome: 'committed', table_id: 'table-id',
+              delta_version: 0, rows: 1200, files: 2, parquet_bytes: 2400, finished_at_unix_ms: schedule + 60001 }));
+          }
           if (name.startsWith('pod-')) events.push('client-window-log');
           if (name === 'direct-catalog-verified') {
             return ok(JSON.stringify({ kind: 'oat_run_table_registered', schema_version: 1, catalog_table_count: 1,
@@ -316,6 +325,14 @@ test('actual opt-in CLI renders and runs all clients, binds candidate pods/large
     assert.ok(f.events.lastIndexOf('client-window-log') < f.events.indexOf('namespace-delete'));
     assert.equal(report.scaled_profile.placement.clients.length, 2);
     assert.equal(report.scaled_profile.trusted_build_provenance_verified, true);
+    const collectorWindow = JSON.parse(await readFile(join(dirname(f.reportPath), 'collector-window.json'), 'utf8'));
+    assert.deepEqual(collectorWindow, report.scaled_profile.collector_receipt_window);
+    assert.equal(collectorWindow.pod_uid, 'uid-0');
+    assert.equal(collectorWindow.joined_rows, 1200);
+    assert.deepEqual(collectorWindow.receipt_window_versions, [0]);
+    assert.deepEqual(collectorWindow.delta_window_versions, [0]);
+    assert.ok(f.events.indexOf('delta-read') < f.events.indexOf('collector-window-log'));
+    assert.ok(f.events.indexOf('collector-window-log') < f.events.indexOf('namespace-delete'));
     assert.equal(report.node_observation.schema_version, 2);
     assert.ok(f.events.includes('abortable-observer-read'));
     assert.deepEqual(report.scaled_profile.hardware, collectorShapes.e192);
@@ -328,6 +345,50 @@ test('actual opt-in CLI renders and runs all clients, binds candidate pods/large
     assert.equal(await main(f.args, f.dependencies), 1);
     assert.equal(f.commands.length, commandCount);
   } finally { await f.dispose(); }
+});
+
+test('actual CLI verifies independently anchored DSSE bundles, rejects fixture scope and records signed platform digests', async () => {
+  for (const scope of ['local-fixture', 'candidate']) {
+    const f = await fixture();
+    try {
+      const keys = generateKeyPairSync('ed25519');
+      const keyPath = f.args[f.args.indexOf('--provenance-key') + 1]!;
+      await writeFile(keyPath, keys.publicKey.export({ type: 'spki', format: 'pem' }));
+      const keyId = createHash('sha256').update(keys.publicKey.export({ type: 'spki', format: 'der' })).digest('hex');
+      const binding = JSON.parse(await readFile(f.imageFile, 'utf8'));
+      const commit = f.args[f.args.indexOf('--candidate-commit') + 1]!;
+      const envelopes = Object.entries(binding.images as Record<string, string>).map(([reference, imageDigest]) => {
+        const repo = reference.split('@')[0]!;
+        const build = imageBuilds.find(([role]) => (role === 'client' ? clientRepository : repositories[role]) === repo)!;
+        const repository = 'arrowcollector1.azurecr.io/' + repo;
+        const material = { path: '', uri: PRIMARY_REPOSITORY, digest: { sha1: commit, gitTree: 'e'.repeat(40) },
+          archive_sha256: 'f'.repeat(64), repository_verified: true };
+        const statement = { _type: 'https://in-toto.io/Statement/v0.1', predicateType: 'https://slsa.dev/provenance/v0.2',
+          subject: [{ name: repository, digest: { sha256: imageDigest.slice(7) } }],
+          predicate: { builder: { id: PRODUCER_ID }, scope: 'candidate',
+            invocation: { configSource: { uri: PRIMARY_REPOSITORY, digest: material.digest,
+              entryPoint: 'projects/arrowcol-oat/aks-candidate-build.ts#buildCandidateImages' },
+            parameters: { revision: commit, role: build[0], dockerfile: build[1], context: build[2], platform: 'linux/amd64' } },
+            materials: [material], output: { repository, digest: imageDigest, media_type: 'application/vnd.docker.distribution.manifest.v2+json',
+              platforms: [{ os: 'linux', architecture: 'amd64', digest: imageDigest, config_digest: 'sha256:' + 'd'.repeat(64) }] } } };
+        const payload = Buffer.from(JSON.stringify(statement));
+        const type = 'application/vnd.in-toto+json';
+        const pae = Buffer.concat([Buffer.from(`DSSEv1 ${Buffer.byteLength(type)} ${type} ${payload.length} `), payload]);
+        return { payloadType: type, payload: payload.toString('base64'), signatures: [{ keyid: keyId, sig: sign(null, pae, keys.privateKey).toString('base64') }] };
+      });
+      const bundlePath = join(f.directory, 'build-bundle.json');
+      await writeFile(bundlePath, JSON.stringify({ schema_version: 1, scope, source_commit: commit, envelopes }));
+      const args = [...f.args, '--provenance-bundle', bundlePath];
+      assert.equal(await main(args, f.dependencies), scope === 'candidate' ? 0 : 1);
+      if (scope === 'local-fixture') {
+        assert.ok(!f.events.some(event => event.startsWith('apply-')));
+        continue;
+      }
+      assert.ok(!f.commands.some(command => command[0] === 'cosign'));
+      const report = JSON.parse(await readFile(f.reportPath, 'utf8'));
+      assert.equal(Object.keys(report.scaled_profile.attested_platform_digests).length, Object.keys(binding.images).length);
+    } finally { await f.dispose(); }
+  }
 });
 
 for (const failure of ['missing-client', 'failed-client', 'partial-start', 'collector-create'] as const) {

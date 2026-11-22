@@ -125,6 +125,22 @@ test('Delta Add window retries one append that races its initial snapshot', asyn
   assert.equal(result.active_rows, 60);
 });
 
+test('opt-in per-version evidence reuses the same replay reads without changing historical timestamp totals', async () => {
+  const s = new Storage().seed(add('seed.parquet', 10));
+  s.put(1, info('INSERT', { timestamp: 999 }), add('first.parquet', 20));
+  s.put(2, info('INSERT', { timestamp: 1000 }), add('next.parquet', 30));
+  const legacy = await readDeltaAddWindow(s.azure, root, 1000, 2000, guard);
+  const calls = s.calls.length;
+  s.calls = [];
+  const retained = await readDeltaAddWindow(s.azure, root, 1000, 2000, guard, { retainCommitSummaries: true });
+  assert.equal(s.calls.length, calls);
+  const { table_id, commit_summaries, ...totals } = retained;
+  assert.deepEqual(totals, legacy);
+  assert.equal(table_id, meta().id);
+  assert.equal(legacy.window_rows, 30);
+  assert.deepEqual(commit_summaries?.map(commit => [commit.version, commit.rows]), [[0, 10], [1, 20], [2, 30]]);
+});
+
 test('fresh replay preserves explicit zero only for measured empty active-file sets; references round trip strictly', async () => {
   const s = new Storage().seed(), reference = await s.read();
   assert.equal(reference.row_count, 0);
