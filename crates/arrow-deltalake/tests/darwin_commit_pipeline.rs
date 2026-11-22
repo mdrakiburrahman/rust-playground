@@ -11,7 +11,7 @@ use futures::FutureExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -53,12 +53,12 @@ fn ticks_per_second() -> Result<u64> {
     Ok(value)
 }
 
-fn verify_snapshot(root: &Path, expected: usize) -> Result<(usize, u64)> {
+fn verify_snapshot(root: &Path, expected: &BTreeMap<PathBuf, u64>) -> Result<(usize, u64)> {
     let url = Url::from_directory_path(fs::canonicalize(root)?).map_err(|()| anyhow::anyhow!("table URL"))?;
     let engine = DefaultEngineBuilder::new(Arc::new(object_store::local::LocalFileSystem::new())).build();
     let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
     ensure!(
-        snapshot.version() == u64::try_from(expected)?,
+        snapshot.version() == u64::try_from(expected.len())?,
         "unexpected snapshot version"
     );
     let scan = snapshot.scan_builder().build()?;
@@ -86,7 +86,7 @@ fn verify_snapshot(root: &Path, expected: usize) -> Result<(usize, u64)> {
             );
         }
     }
-    ensure!(paths.len() == expected, "wrong active file count");
+    ensure!(paths.len() == expected.len(), "wrong active file count");
     let mut ids = BTreeSet::new();
     let mut bytes = 0_u64;
     for (name, size) in paths {
@@ -94,6 +94,7 @@ fn verify_snapshot(root: &Path, expected: usize) -> Result<(usize, u64)> {
             .join(&name)?
             .to_file_path()
             .map_err(|()| anyhow::anyhow!("active file URL"))?;
+        ensure!(expected.get(&path) == Some(&size), "active file differs from receipt");
         ensure!(fs::metadata(&path)?.len() == size, "active file size differs from Add");
         bytes += size;
         let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?.build()?;
@@ -104,14 +105,26 @@ fn verify_snapshot(root: &Path, expected: usize) -> Result<(usize, u64)> {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .context("id type")?;
-            for id in values.values() {
-                ensure!(ids.insert(*id), "duplicate durable row");
+            let payloads = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("payload type")?;
+            for row in 0..batch.num_rows() {
+                let id = values.value(row);
+                let id_usize = usize::try_from(id)?;
+                let expected_payload = format!("value-{:04}-{:08}", id_usize / ROWS, id_usize % ROWS);
+                ensure!(
+                    payloads.value(row) == expected_payload,
+                    "durable payload differs from input"
+                );
+                ensure!(ids.insert(id), "duplicate durable row");
             }
         }
     }
-    ensure!(ids.len() == expected * ROWS, "wrong active row count");
+    ensure!(ids.len() == expected.len() * ROWS, "wrong active row count");
     ensure!(
-        ids.iter().copied().eq(0..i64::try_from(expected * ROWS)?),
+        ids.iter().copied().eq(0..i64::try_from(expected.len() * ROWS)?),
         "wrong durable row identities"
     );
     Ok((ids.len(), bytes))
@@ -143,7 +156,11 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         "commit preceded barrier"
     );
     table.flush_pending();
-    ensure!(barrier_receipt.await?.version == 1, "barrier did not publish warmup");
+    let warmup_result = barrier_receipt.await?;
+    ensure!(warmup_result.version == 1, "barrier did not publish warmup");
+    ensure!(warmup_result.files.len() == 1, "wrong warmup receipt shape");
+    let mut expected_files = BTreeMap::new();
+    expected_files.insert(warmup_result.files[0].path.clone(), warmup_result.files[0].bytes);
 
     let batches = (1..=GROUPS).map(input).collect::<Result<Vec<_>>>()?;
     let ticks_hz = ticks_per_second()?;
@@ -199,6 +216,12 @@ async fn local_commit_pipeline_profile() -> Result<()> {
             "wrong receipt shape"
         );
         ensure!(result.file_observations[0].rows == ROWS, "wrong receipt row count");
+        ensure!(
+            expected_files
+                .insert(result.files[0].path.clone(), result.files[0].bytes)
+                .is_none(),
+            "duplicate file in receipts"
+        );
         ensure!(receipts.insert(id), "duplicate receipt identity");
         if let Some(duration) = result.commit_duration {
             commit += duration;
@@ -219,7 +242,9 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         "missing durable transaction"
     );
     drop(table);
-    let (active_rows, active_bytes) = verify_snapshot(root.path(), GROUPS + 1)?;
+    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files)?;
+    let root_url =
+        Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
     for version in 1..=GROUPS + 1 {
         let log = fs::read_to_string(root.path().join(format!("_delta_log/{version:020}.json")))?;
         let actions = log
@@ -234,7 +259,34 @@ async fn local_commit_pipeline_profile() -> Result<()> {
             actions.iter().filter(|action| action.get("txn").is_some()).count() == 1,
             "wrong transaction count"
         );
+        let txn = actions
+            .iter()
+            .find_map(|action| action.get("txn"))
+            .context("missing transaction")?;
+        let expected_id = if version == 1 {
+            "darwin-warmup".to_owned()
+        } else {
+            format!("darwin-group-{:04}", version - 2)
+        };
+        ensure!(
+            txn["appId"] == expected_id && txn["version"] == 0,
+            "wrong transaction identity"
+        );
+        let add = actions
+            .iter()
+            .find_map(|action| action.get("add"))
+            .context("missing Add")?;
+        let path = root_url
+            .join(add["path"].as_str().context("missing Add path")?)?
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("Add URL"))?;
+        let bytes = add["size"].as_u64().context("missing Add size")?;
+        ensure!(
+            expected_files.remove(&path) == Some(bytes),
+            "Add does not match a unique receipt"
+        );
     }
+    ensure!(expected_files.is_empty(), "receipt missing from committed Adds");
     println!(
         "backend=local_filesystem timed_groups={GROUPS} timed_durable_rows={} receipt_count={} wall_s={:.6} process_cpu_s={:.6} stage_wall_s={:.6} preparation_build_s={:.6} preparation_sort_s={:.6} encode_s={:.6} upload_samples={} upload_s={:.6} admission_s={:.6} receipt_wait_s={:.6} commit_samples={} commit_s={:.6} active_files={} active_rows={} active_bytes={} warmup_rows={} barrier=passed",
         GROUPS * ROWS,
