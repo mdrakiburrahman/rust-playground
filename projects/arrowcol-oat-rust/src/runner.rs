@@ -8001,7 +8001,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         platform.add_compose_environment(&mut migration);
         migration.args(["run", "--rm", "--no-deps"]);
         if config.platform.local.stable_image_build {
-            migration.arg("--no-build");
+            migration.args(["--pull", "never"]);
         }
         migration.arg(service);
         run_streaming_command(migration, &format!("run local OAT {service}")).await?;
