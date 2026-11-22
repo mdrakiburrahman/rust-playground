@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
 export interface FileFingerprint {
@@ -42,7 +42,9 @@ export async function checkCandidatePaths(
   root: string,
   baseline: Manifest,
   allowed: readonly string[],
+  submodules: Readonly<Record<string, string>> = {},
 ): Promise<string[]> {
+  root = await realpath(root);
   const problems: string[] = [];
   const allowedPaths = new Set(allowed);
   for (const relative of allowedPaths) {
@@ -58,6 +60,33 @@ export async function checkCandidatePaths(
   for (const relative of new Set(paths)) {
     if (!safePath(relative)) throw new Error(`unsafe candidate path: ${relative}`);
     seen.add(relative);
+    if (Object.hasOwn(submodules, relative)) {
+      try {
+        const directory = path.join(root, relative);
+        const stat = await lstat(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(directory) !== directory) {
+          problems.push(`invalid submodule: ${relative}`);
+          continue;
+        }
+        const git = (...args: string[]) => execFileSync(
+          "git", ["-C", directory, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        ).trimEnd();
+        if (git("rev-parse", "--show-toplevel") !== directory
+          || git("rev-parse", "HEAD") !== submodules[relative]
+          || git("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none") !== ""
+          || git("submodule", "status", "--recursive").split("\n").some((line) => line && !line.startsWith(" "))) {
+          problems.push(`changed or uninitialized submodule: ${relative}`);
+        }
+      } catch (error) {
+        if (error instanceof Error && (("code" in error && error.code === "ENOENT")
+          || ("status" in error && typeof error.status === "number"))) {
+          problems.push(`unavailable submodule: ${relative}`);
+          continue;
+        }
+        throw error;
+      }
+      continue;
+    }
     if (!Object.hasOwn(baseline, relative)) {
       problems.push(`extra file: ${relative}`);
       continue;
@@ -85,6 +114,12 @@ export async function checkCandidatePaths(
   for (const relative of Object.keys(baseline)) {
     if (!safePath(relative)) throw new Error(`unsafe baseline path: ${relative}`);
     if (!seen.has(relative)) problems.push(`missing file: ${relative}`);
+  }
+  for (const relative of Object.keys(submodules)) {
+    if (!safePath(relative) || Object.hasOwn(baseline, relative)) {
+      throw new Error(`invalid submodule path: ${relative}`);
+    }
+    if (!seen.has(relative)) problems.push(`missing submodule: ${relative}`);
   }
   return problems.sort();
 }

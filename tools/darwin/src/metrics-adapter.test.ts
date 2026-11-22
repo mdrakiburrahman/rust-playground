@@ -31,6 +31,7 @@ test("extracts commit-window rather than admission throughput", () => {
   assert.equal(result.durableRowsPerSecond, 10);
   assert.equal(result.memoryBytesMaxObserved, 200);
   assert.equal(result.cpuMillicoresMean, 200);
+  assert.equal(result.commitLatencySeconds.samples, 5);
   assert.equal(result.downstreamUnavailableReason, "Kustainer stopped");
 });
 

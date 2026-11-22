@@ -27,6 +27,16 @@ test("rejects compression regressions and requires evidence for the throughput f
   assert.equal(scoreCases([{ name: "improved", pairs: [pair(110, 30), pair(110, 30), pair(110, 30)] }], "parquet-bytes-per-row").accepted, true);
 });
 
+test("uses each paired local baseline for bytes while retaining the AKS headline guard", () => {
+  const baseline = { durableRowsPerSecond: 100, parquetBytesPerRow: 80 };
+  const candidate = { durableRowsPerSecond: 110, parquetBytesPerRow: 85 };
+  const pairs = Array.from({ length: 3 }, () => ({ baseline, candidate }));
+  assert.equal(scoreCases([{ name: "wide", pairs }], "durable-rate").accepted, true);
+  assert.equal(scoreCases([{ name: "wide", pairs }], "durable-rate", "aks-headline").accepted, false);
+  const worse = pairs.map((p) => ({ ...p, candidate: { ...p.candidate, parquetBytesPerRow: 89 } }));
+  assert.equal(scoreCases([{ name: "wide", pairs: worse }], "durable-rate").accepted, false);
+});
+
 test("rejects invalid measurements and too few independent pairs", () => {
   assert.throws(() => scoreCases([{ name: "few", pairs: [pair(110)] }], "durable-rate"));
   assert.throws(() => scoreCases([{ name: "invalid", pairs: [pair(NaN), pair(110), pair(110)] }], "durable-rate"));

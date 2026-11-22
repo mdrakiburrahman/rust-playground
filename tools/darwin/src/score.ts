@@ -1,4 +1,5 @@
 export type Objective = "durable-rate" | "parquet-bytes-per-row";
+export type EvidenceScope = "local" | "aks-headline";
 
 export interface Measurement {
   durableRowsPerSecond: number;
@@ -54,10 +55,11 @@ function summarize(logRatios: number[]): { ratio: number; uncertainty: number } 
   return result;
 }
 
-export function scoreCases(cases: Case[], objective: Objective): Score {
+export function scoreCases(cases: Case[], objective: Objective, scope: EvidenceScope = "local"): Score {
   if (cases.length === 0 || !["durable-rate", "parquet-bytes-per-row"].includes(objective)) {
     throw new Error("at least one case and a supported objective are required");
   }
+  if (scope !== "local" && scope !== "aks-headline") throw new Error("unsupported evidence scope");
   const names = new Set<string>();
   const results = cases.map(({ name, pairs }): CaseScore => {
     if (!name || names.has(name) || pairs.length < MIN_PAIRS) {
@@ -77,7 +79,8 @@ export function scoreCases(cases: Case[], objective: Objective): Score {
       objectiveLogs.push(objective === "durable-rate"
         ? throughput
         : Math.log(baseline.parquetBytesPerRow) - Math.log(candidate.parquetBytesPerRow));
-      bytesGuardPassed &&= candidate.parquetBytesPerRow <= MAX_BYTES_PER_ROW;
+      bytesGuardPassed &&= candidate.parquetBytesPerRow <= baseline.parquetBytesPerRow * 1.1
+        && (scope !== "aks-headline" || candidate.parquetBytesPerRow <= MAX_BYTES_PER_ROW);
     }
     const throughput = summarize(throughputLogs);
     const result = summarize(objectiveLogs);

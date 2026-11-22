@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -37,6 +37,31 @@ test("enforces protected files and rejects extras, removals and symlinks", async
       "extra file: extra.ts", "missing file: protected.ts",
     ]);
     await assert.rejects(() => checkCandidatePaths(root, baseline, ["../other"]), /invalid allowed path/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("requires a clean initialized submodule at the pinned revision", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "darwin-submodule-"));
+  try {
+    const submodule = path.join(root, "sub");
+    execFileSync("git", ["init", "-q", root]);
+    await mkdir(submodule);
+    execFileSync("git", ["init", "-q", submodule]);
+    await writeFile(path.join(submodule, "file"), "pinned");
+    execFileSync("git", ["-C", submodule, "add", "file"]);
+    execFileSync("git", [
+      "-C", submodule, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+      "commit", "-qm", "base",
+    ]);
+    const revision = execFileSync("git", ["-C", submodule, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["-C", root, "-c", "advice.addEmbeddedRepo=false", "add", "sub"]);
+    assert.deepEqual(await checkCandidatePaths(root, {}, [], { sub: revision }), []);
+    await writeFile(path.join(submodule, "file"), "changed");
+    assert.deepEqual(await checkCandidatePaths(root, {}, [], { sub: revision }), [
+      "changed or uninitialized submodule: sub",
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

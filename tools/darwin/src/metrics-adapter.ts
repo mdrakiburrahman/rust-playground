@@ -7,7 +7,7 @@ export interface OatMeasurement extends Measurement {
   endUnixMs: number;
   rows: number;
   parquetBytes: number;
-  commitLatencySeconds: { p50: number; p99: number };
+  commitLatencySeconds: { p50: number; p99: number; samples: number };
   cpuMillicoresMean: number | null;
   memoryBytesMaxObserved: number | null;
   downstreamUnavailableReason: string | null;
@@ -87,7 +87,8 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
   const latency = object(output.commit_latency_seconds, "commit latency");
   const p50 = number(latency.p50, "commit p50");
   const p99 = number(latency.p99, "commit p99");
-  if (p99 < p50 || integer(latency.samples, "commit latency samples", 1) < 1) {
+  const latencySamples = integer(latency.samples, "commit latency samples", 1);
+  if (p99 < p50) {
     throw new Error("invalid commit latency distribution");
   }
   const resources = object(evidence.resources, "resources");
@@ -114,7 +115,7 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
     parquetBytes: bytes,
     durableRowsPerSecond: rate,
     parquetBytesPerRow: bytesPerRow,
-    commitLatencySeconds: { p50, p99 },
+    commitLatencySeconds: { p50, p99, samples: latencySamples },
     cpuMillicoresMean: resources.samples.length ? cpuTotal / resources.samples.length : null,
     memoryBytesMaxObserved: resources.samples.length ? memoryMax : null,
     downstreamUnavailableReason,
