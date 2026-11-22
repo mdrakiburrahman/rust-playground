@@ -8276,6 +8276,9 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
                 outcome["exit_code"].as_i64(),
                 config.tunables.wal.is_some(),
             );
+            if config.platform.local.snapshot_root.is_some() {
+                outcome["stopped_commit_output"] = stopped_collector_commit_output(config, log)?;
+            }
         } else if service == "delta-maintenance" {
             let incomplete_log = ProcessLog {
                 role: ComponentRole::Maintenance,
@@ -8305,6 +8308,21 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     }
     Ok(outcomes)
 }
+
+fn stopped_collector_commit_output(config: &OatConfig, log: &ProcessLog) -> Result<Value> {
+    let logs = std::slice::from_ref(log);
+    let evidence = durable_commit_evidence_for_cell(config, logs, logs, Some((0, 1)), None)?;
+    let mut tables = serde_json::Map::new();
+    for table in &config.tables {
+        let output = evidence.get(table).context("stopped collector commit evidence missing")?;
+        tables.insert(canonical_dmv_table_name(table)?, output["run_cumulative_output"].clone());
+    }
+    Ok(json!({
+        "source": if log.complete { "complete_stopped_collector_logs" } else { "incomplete_stopped_collector_logs" },
+        "tables": tables,
+    }))
+}
+
 fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str) -> Result<Vec<Value>> {
     validate_owned_local_containers(before, project)?;
     validate_owned_local_containers(after, project)?;

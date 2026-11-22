@@ -1019,6 +1019,24 @@ mod commit_evidence_tests {
     }
 
     #[test]
+    fn stopped_collector_output_includes_drain_and_marks_incomplete_logs() -> Result<()> {
+        let config = config()?;
+        let commit = event(&config, 100, 199)?;
+        let mut drain = event(&config, 210, 220)?;
+        drain["delta_version"] = json!(8);
+        let mut full = log(&[commit, drain]);
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let stopped = stopped_collector_commit_output(&config, &full)?;
+        assert_eq!(stopped["source"], "complete_stopped_collector_logs");
+        assert_eq!(stopped["tables"][&table]["commits_by_version"].as_array().unwrap().len(), 2);
+        full.complete = false;
+        let incomplete = stopped_collector_commit_output(&config, &full)?;
+        assert_eq!(incomplete["source"], "incomplete_stopped_collector_logs");
+        assert_eq!(incomplete["tables"][&table]["unavailable_reason"], "collector_commit_log_incomplete");
+        Ok(())
+    }
+
+    #[test]
     fn cumulative_commit_receipts_without_finish_time_are_unavailable() -> Result<()> {
         let config = config()?;
         let mut commit = event(&config, 100, 199)?;

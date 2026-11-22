@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
@@ -21,6 +21,43 @@ function imageId(value: unknown): string {
 export interface ClientEvidence {
   payloadCorpusSha256: string;
   cpu: { coreEquivalents: number | null; sampleStartUnixMs: number | null; sampleEndUnixMs: number | null; unavailableReason: string | null };
+}
+
+export function extractStoppedReceipts(
+  input: unknown, stoppedInput: unknown, runId: string, table: string, measurement: OatMeasurement,
+) {
+  const evidence = object(input, "OAT evidence");
+  const stopped = object(stoppedInput, "stopped snapshot");
+  if (stopped.schema_version !== 1 || stopped.run_id !== runId || !Array.isArray(stopped.writers)) {
+    throw new CoverageUnavailableError("stopped receipt snapshot identity is unavailable");
+  }
+  const collectors = stopped.writers.map(writer => object(writer, "stopped writer"))
+    .filter(writer => typeof writer.service === "string" && /^dataflow-\d+$/.test(writer.service));
+  if (collectors.length !== 1 || collectors[0]!.was_running !== true || collectors[0]!.oom_killed !== false
+    || collectors[0]!.exit_code !== 0 || typeof collectors[0]!.finished_at !== "string"
+    || !(Date.parse(collectors[0]!.finished_at) > 0)) {
+    throw new CoverageUnavailableError("stopped collector identity or clean exit is unavailable");
+  }
+  const output = object(collectors[0]!.stopped_commit_output, "stopped commit output");
+  if (output.source !== "complete_stopped_collector_logs") {
+    throw new CoverageUnavailableError("complete stopped collector receipts are unavailable");
+  }
+  const tables = object(output.tables, "stopped receipt tables");
+  const before = extractTimedReceipts(evidence, table, measurement);
+  const commits = object(evidence.durable_commits, "durable commits");
+  const after = extractTimedReceipts({
+    ...evidence, durable_commits: { ...commits, run_cumulative_output: tables[table] },
+  }, table, measurement);
+  const byVersion = new Map(after.all.map(receipt => [`${receipt.tableId}\0${receipt.version}`, receipt]));
+  for (const receipt of before.all) {
+    if (JSON.stringify(byVersion.get(`${receipt.tableId}\0${receipt.version}`)) !== JSON.stringify(receipt)) {
+      throw new CoverageUnavailableError("stopped receipts disagree with pre-stop receipt evidence");
+    }
+  }
+  if (JSON.stringify(before.selected) !== JSON.stringify(after.selected)) {
+    throw new CoverageUnavailableError("stopped receipts disagree with measured-window receipts");
+  }
+  return after;
 }
 
 export function extractClientEvidence(raw: unknown): ClientEvidence {
@@ -97,7 +134,13 @@ export async function readReconciledOatResult(
   images.sort();
   const measurement = adaptOatEvidence(evidence);
   const canonicalTable = `telemetry.sqlserver.${table}`;
-  const receipts = extractTimedReceipts(evidence, canonicalTable, measurement);
+  const stoppedPath = join(snapshotRoot, row.run_id, "stopped.json");
+  const stoppedStat = await lstat(stoppedPath);
+  if (!stoppedStat.isFile() || stoppedStat.isSymbolicLink() || stoppedStat.size > 64 * 1024 * 1024) {
+    throw new CoverageUnavailableError("invalid stopped receipt evidence file");
+  }
+  const stopped = JSON.parse(await readFile(stoppedPath, "utf8"));
+  const receipts = extractStoppedReceipts(evidence, stopped, row.run_id, canonicalTable, measurement);
   if (typeof evidence.preload_delta !== "object" || evidence.preload_delta === null || Array.isArray(evidence.preload_delta)) {
     throw new CoverageUnavailableError("pre-load Delta evidence is unavailable");
   }

@@ -46,6 +46,8 @@ collector samples, with its own sampling interval or an unavailable reason.
 The hourly ingestion-partitioned table is checked against catalog metadata
 before the clients are armed. Each pre-load Delta log is hashed and must have
 no Adds or Removes; all later versions need cumulative collector receipts.
+The stopped collector's complete log extends the pre-stop ledger through
+shutdown drain. Overlapping receipts and the measured window must agree.
 Gaps produce a null unattributed-row count, an explicit reason and a nonzero
 evaluator exit.
 
