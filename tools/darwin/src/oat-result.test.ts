@@ -25,14 +25,29 @@ function reportFor(profile: ClientDataProfile) {
 test("passes stage evidence through and marks missing evidence unavailable", () => {
   const collector = { schema_version: 1, samples: [{ rows: 4 }] };
   const client = { enabled: true, transport_stall_count: null, transport_stall_unavailable_reason: "not observable" };
+  const responseLatency = { p50: 100, p99: 200, samples: 3 };
   const commit = { log_write: { p50: 0.1, p99: 0.2, samples: 3 } };
   const stages = extractStageEvidence({
     collector_stage_telemetry: collector,
-    client_phase_reports: [{ phase_counters: { measurement_window: { client_stage_telemetry: client } } }],
+    client_phase_reports: [{ phase_counters: {
+      send_latency_scope: "request_metadata_protobuf_grpc_compression_network_and_acknowledgement_excluding_interval",
+      measurement_window: {
+        client_stage_telemetry: client,
+        windows: [{ start_unix_ms: 1000, end_unix_ms: 31000, send_latency_us: responseLatency }],
+      },
+    } }],
     durable_commits: { output_throughput: { commit_stage_latency_seconds: commit } },
   });
   assert.deepEqual(stages.collector, { value: collector, unavailableReason: null });
   assert.deepEqual(stages.client, { value: client, unavailableReason: null });
+  assert.deepEqual(stages.clientFlightResponseLatency, {
+    value: {
+      scope: "request_metadata_protobuf_grpc_compression_network_and_acknowledgement_excluding_interval",
+      semantics: "client_observed_attempt_to_validated_flight_admission_response_not_delta_commit",
+      windows: [{ start_unix_ms: 1000, end_unix_ms: 31000, send_latency_us: responseLatency }],
+    },
+    unavailableReason: null,
+  });
   assert.deepEqual(stages.commit, { value: commit, unavailableReason: null });
   for (const stage of Object.values(extractStageEvidence({}))) {
     assert.equal(stage.value, null);

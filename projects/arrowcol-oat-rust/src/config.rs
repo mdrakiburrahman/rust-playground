@@ -933,9 +933,6 @@ impl OatConfig {
         if self.stage_telemetry_interval_ms.is_some_and(|value| !(100..=60_000).contains(&value)) {
             bail!("stage_telemetry_interval_ms must be an integer in 100..=60000, or null to disable");
         }
-        if self.stage_telemetry_interval_ms.is_some() {
-            bail!("stage_telemetry_interval_ms is not yet supported; stage evidence remains unavailable");
-        }
         if self
             .platform
             .local
@@ -1592,7 +1589,7 @@ mod tests {
         }
         for value in [100, 1_000, 60_000] {
             config.stage_telemetry_interval_ms = Some(value);
-            assert!(config.validate().unwrap_err().to_string().contains("not yet supported"));
+            config.validate()?;
         }
         Ok(())
     }

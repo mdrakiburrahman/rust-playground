@@ -32,6 +32,7 @@ type OptionalStageEvidence = { value: JsonObject | null; unavailableReason: stri
 export interface StageEvidence {
   collector: OptionalStageEvidence;
   client: OptionalStageEvidence;
+  clientFlightResponseLatency: OptionalStageEvidence;
   commit: OptionalStageEvidence;
 }
 
@@ -49,9 +50,18 @@ export function extractStageEvidence(input: unknown): StageEvidence {
   const window = optionalObject(phase?.measurement_window);
   const commits = optionalObject(evidence.durable_commits);
   const output = optionalObject(commits?.output_throughput);
+  const latencyWindows = Array.isArray(window?.windows) ? window.windows : undefined;
+  const latencyScope = phase?.send_latency_scope;
   return {
     collector: stage(evidence.collector_stage_telemetry, "collector"),
     client: stage(window?.client_stage_telemetry, "client"),
+    clientFlightResponseLatency: typeof latencyScope === "string" && latencyWindows
+      ? stage({
+        scope: latencyScope,
+        semantics: "client_observed_attempt_to_validated_flight_admission_response_not_delta_commit",
+        windows: latencyWindows,
+      }, "client Flight response latency")
+      : { value: null, unavailableReason: "client Flight response latency windows unavailable" },
     commit: stage(output?.commit_stage_latency_seconds, "commit"),
   };
 }

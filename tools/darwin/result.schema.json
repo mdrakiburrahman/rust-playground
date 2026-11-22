@@ -70,6 +70,7 @@
           "properties": {
             "collector": { "$ref": "#/$defs/optionalStageEvidence" },
             "client": { "$ref": "#/$defs/optionalStageEvidence" },
+            "clientFlightResponseLatency": { "$ref": "#/$defs/optionalStageEvidence" },
             "commit": { "$ref": "#/$defs/optionalStageEvidence" }
           }
         },

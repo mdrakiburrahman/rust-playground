@@ -75,13 +75,14 @@ RSS and downstream throughput are reported as null with reasons.
 Stage evidence is diagnostic only and does not affect scoring. Darwin results
 preserve the OAT collector, client and commit stage objects under
 `stageEvidence`, with null and a reason when an object is unavailable. The
-OAT `stage_telemetry_interval_ms` option defaults to null; enabled values are
-currently rejected while the remaining instrumentation is incomplete.
+OAT `stage_telemetry_interval_ms` option defaults to null (disabled); enabled
+values must be integers in `100..=60000` milliseconds. Unsupported or incomplete
+measurements stay null with a reason.
 
 | Evidence | Scope and limitations |
 | --- | --- |
 | Collector | Sampled table-level waiting, flushing and written-not-durable cohorts, flush-slot occupancy and admission wait. Partition attribution is null when lineage is unavailable. |
-| Client | Sampled unsent and body-yielded bytes per stream; body-yield gaps can include scheduler delay and are not transport stalls. Actual network in-flight bytes and transport stalls are null when unobserved. |
+| Client | Sampled unsent and body-yielded bytes per stream; body-yield gaps can include scheduler delay and are not transport stalls. Actual network in-flight bytes and transport stalls are null when unobserved. Client Flight response latency is labeled separately and retained per 30-second measurement window; do not combine percentiles across windows. |
 | Commit | Sampled conflict/retry, filesystem committer invocation and local durability sync; each includes its scope and sample count. Local sync does not measure a response ACK. |
 
 Flight response latency is client-observed admission or buffer response latency,
