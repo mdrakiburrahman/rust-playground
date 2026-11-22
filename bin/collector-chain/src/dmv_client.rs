@@ -8,7 +8,6 @@ use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fmt::Write;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -526,6 +525,9 @@ struct ContinuousAdmission<P, E, W> {
 }
 
 struct Counters {
+    identity_rows_prepared: AtomicU64,
+    identity_wall_ns: AtomicU64,
+    ipc_wall_ns: AtomicU64,
     attempted_rows: AtomicU64,
     attempted_bytes: AtomicU64,
     completed_rows: AtomicU64,
@@ -550,6 +552,9 @@ struct Counters {
 impl Default for Counters {
     fn default() -> Self {
         Self {
+            identity_rows_prepared: AtomicU64::new(0),
+            identity_wall_ns: AtomicU64::new(0),
+            ipc_wall_ns: AtomicU64::new(0),
             attempted_rows: AtomicU64::new(0),
             attempted_bytes: AtomicU64::new(0),
             completed_rows: AtomicU64::new(0),
@@ -595,6 +600,10 @@ impl Counters {
             Some(u64::MAX)
         };
         serde_json::json!({
+            "identity_rows_prepared": self.identity_rows_prepared.load(Ordering::Relaxed),
+            "identity_wall_ns": self.identity_wall_ns.load(Ordering::Relaxed),
+            "ipc_wall_ns": self.ipc_wall_ns.load(Ordering::Relaxed),
+            "preparation_timing_scope": "worker_cumulative_logical_batch_preparation_wall_time_including_warmup_not_thread_CPU",
             "attempted_rows": self.attempted_rows.load(Ordering::Relaxed),
             "attempted_bytes": self.attempted_bytes.load(Ordering::Relaxed),
             "completed_rows": self.completed_rows.load(Ordering::Relaxed),
@@ -1488,10 +1497,25 @@ impl PreparedClient {
         }
         let live_batch_permit = live_batch_permit.context("realistic logical batch requires a memory reservation")?;
         let sequence = self.next_logical_batch_sequence(worker)?;
+        let identity_start = Instant::now();
         let batch =
             batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
+        let counters = &self.counters[worker];
+        counters.identity_wall_ns.fetch_add(
+            u64::try_from(identity_start.elapsed().as_nanos())
+                .context("identity preparation elapsed time exceeds u64")?,
+            Ordering::Relaxed,
+        );
+        let ipc_start = Instant::now();
         let (data, raw_arrow_bytes, encoded_bytes) =
             encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
+        counters.ipc_wall_ns.fetch_add(
+            u64::try_from(ipc_start.elapsed().as_nanos()).context("IPC preparation elapsed time exceeds u64")?,
+            Ordering::Relaxed,
+        );
+        counters
+            .identity_rows_prepared
+            .fetch_add(template.rows, Ordering::Relaxed);
         anyhow::ensure!(
             data.iter()
                 .all(|message| message.encoded_len() <= self.options.max_message_bytes),
@@ -2743,7 +2767,18 @@ fn batch_with_logical_identity(
     value.reserve(row_digits);
     for row in 0..batch.num_rows() {
         value.truncate(prefix_len);
-        write!(&mut value, "{row}")?;
+        let mut ordinal = row as u32;
+        let mut digits = [b'0'; 10];
+        let mut offset = digits.len();
+        loop {
+            offset -= 1;
+            digits[offset] = b'0' + (ordinal % 10) as u8;
+            ordinal /= 10;
+            if ordinal == 0 {
+                break;
+            }
+        }
+        value.extend(digits[offset..].iter().copied().map(char::from));
         builder.append_value(&value);
     }
     let identity: ArrayRef = Arc::new(builder.finish());
