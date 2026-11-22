@@ -54,7 +54,7 @@ env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$home" DARWIN_HOME=${shellQuote(p
 async function check(home: string, candidate: string, experiment: string): Promise<number> {
   const manifest = JSON.parse(await readFile(path.join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
   const relativeHome = path.relative(candidate, home).split(path.sep).join("/");
-  const stateDirectory = /^\.darwin\/[A-Za-z0-9_-]+$/.test(relativeHome) ? relativeHome : undefined;
+  const stateDirectory = /^(\.darwin\/[A-Za-z0-9_-]+)(?:\/[A-Za-z0-9_-]+)*$/.exec(relativeHome)?.[1];
   const problems = await checkCandidatePaths(candidate, manifest.files, experimentPathsFor(experiment), manifest.submodules, stateDirectory);
   return problems.length;
 }

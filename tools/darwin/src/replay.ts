@@ -25,7 +25,11 @@ function cleanEnv(home: string, stackBytes: number): NodeJS.ProcessEnv {
 }
 
 function git(workspace: string, env: NodeJS.ProcessEnv, ...args: string[]): string {
-  return execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8", env, maxBuffer: 64 * 1024 * 1024 }).trim();
+  return execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8", env, maxBuffer: 64 * 1024 * 1024 }).trimEnd();
+}
+
+export function hasPinnedSubmodules(workspace: string, env: NodeJS.ProcessEnv): boolean {
+  return !git(workspace, env, "submodule", "status", "--recursive").split("\n").some(line => line && !line.startsWith(" "));
 }
 
 async function checkDependencyLinks(runtime: string, directory: string): Promise<void> {
@@ -60,7 +64,7 @@ async function prepareRuntime(repo: string, home: string, manifest: SnapshotMani
   if (git(runtime, env, "rev-parse", "--show-toplevel") !== runtime
     || git(runtime, env, "rev-parse", "HEAD") !== producerRevision
     || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
-    || git(runtime, env, "submodule", "status", "--recursive").split("\n").some(line => line && !line.startsWith(" "))) {
+    || !hasPinnedSubmodules(runtime, env)) {
     throw new Error("trusted OAT runtime is not clean at the frozen source revision");
   }
   await checkDependencyLinks(runtime, join(runtime, "node_modules"));
