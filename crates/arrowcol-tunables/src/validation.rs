@@ -1244,13 +1244,25 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
     let table_batches = per_table.batches.unwrap_or(1_024);
     for (name, value) in [
         ("collector.batching.global_capacity.bytes", global_bytes),
-        ("collector.batching.global_capacity.rows", global_rows),
-        ("collector.batching.global_capacity.batches", global_batches),
+        ("collector.batching.global_capacity.rows", u64::from(global_rows)),
+        ("collector.batching.global_capacity.batches", u64::from(global_batches)),
         ("collector.batching.per_table_capacity.bytes", table_bytes),
-        ("collector.batching.per_table_capacity.rows", table_rows),
-        ("collector.batching.per_table_capacity.batches", table_batches),
+        ("collector.batching.per_table_capacity.rows", u64::from(table_rows)),
+        (
+            "collector.batching.per_table_capacity.batches",
+            u64::from(table_batches),
+        ),
     ] {
         positive(name, Some(value))?;
+    }
+    if global_bytes > MAX_QUEUE_CAPACITY_BYTES || table_bytes > MAX_QUEUE_CAPACITY_BYTES {
+        bail!("collector.batching byte capacity exceeds the exact semaphore limit");
+    }
+    if [global_rows, global_batches, table_rows, table_batches]
+        .into_iter()
+        .any(|value| u64::from(value) > (usize::MAX >> 3) as u64)
+    {
+        bail!("collector.batching row or batch capacity exceeds Semaphore::MAX_PERMITS");
     }
     if table_bytes > global_bytes || table_rows > global_rows || table_batches > global_batches {
         bail!("collector.batching per_table_capacity must not exceed global_capacity");
@@ -1275,10 +1287,7 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
         bail!("collector.batching.pipeline_depth > 1 requires coalesce_publications=true");
     }
     validate_duration("collector.batching.max_age", batching.max_age.as_deref(), "30s")?;
-    if flush_bytes > u64::from(table_bytes)
-        || flush_rows > u64::from(table_rows)
-        || flush_batches > u64::from(table_batches)
-    {
+    if flush_bytes > table_bytes || flush_rows > u64::from(table_rows) || flush_batches > u64::from(table_batches) {
         bail!("collector.batching flush limits must not exceed per_table_capacity");
     }
 

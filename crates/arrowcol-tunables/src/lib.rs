@@ -263,10 +263,17 @@ pub struct ExporterTunables {
     pub authority_timeout: Option<String>,
 }
 
+/// Largest exact JSON byte budget that also fits a Tokio semaphore on this target.
+pub const MAX_QUEUE_CAPACITY_BYTES: u64 = if ((usize::MAX >> 3) as u64) < 9_007_199_254_740_991 {
+    (usize::MAX >> 3) as u64
+} else {
+    9_007_199_254_740_991
+};
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueCapacityTunables {
-    pub bytes: Option<u32>,
+    pub bytes: Option<u64>,
     pub rows: Option<u32>,
     pub batches: Option<u32>,
 }
