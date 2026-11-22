@@ -194,6 +194,7 @@ export async function verifyActiveParquetIdentitySet(input: SnapshotInput, optio
   }
   if (await fileIdentity(decoder) !== decoderIdentity || await digestFile(decoder) !== decoderHash
     || await verifierArtifactSha256() !== verifierHash) throw new Error("frozen executable/verifier artifact changed during verification");
+  options.signal?.throwIfAborted();
   return {
     ...verdict,
     activeFileCount: files.length, activeFileRows, activeFileBindingsSha256: fileBindings.digest("hex"),
