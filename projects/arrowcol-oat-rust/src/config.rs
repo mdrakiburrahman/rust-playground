@@ -452,6 +452,9 @@ pub struct LocalOptions {
     pub snapshot_root: Option<String>,
     #[serde(default)]
     pub partitioned_table_bootstrap: bool,
+    #[serde(default)]
+    pub stable_image_build: bool,
+    pub expected_image_ids: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -936,6 +939,25 @@ impl OatConfig {
         {
             bail!("platform.local.collector_memory_limit_bytes must be integer bytes in 8388608..=1099511627776");
         }
+        if let Some(images) = &self.platform.local.expected_image_ids {
+            if !self.platform.local.stable_image_build
+                || images.len() != 6
+                || !["catalog", "client", "collector", "maintenance", "router", "sqlserver"]
+                    .iter()
+                    .all(|role| {
+                        images.get(*role).is_some_and(|image| {
+                            image.strip_prefix("sha256:").is_some_and(|hash| {
+                                hash.len() == 64
+                                    && hash
+                                        .bytes()
+                                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                            })
+                        })
+                    })
+            {
+                bail!("expected local image IDs require six immutable role IDs and a stable image build");
+            }
+        }
         if !self.overload_guard.cap_fraction.is_finite()
             || self.overload_guard.cap_fraction <= 0.0
             || self.overload_guard.cap_fraction > 0.90
@@ -1125,6 +1147,8 @@ impl OatConfig {
                     || self.platform.local.endpoint_host.is_some()
                     || self.platform.local.snapshot_root.is_some()
                     || self.platform.local.partitioned_table_bootstrap
+                    || self.platform.local.stable_image_build
+                    || self.platform.local.expected_image_ids.is_some()
                     || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");

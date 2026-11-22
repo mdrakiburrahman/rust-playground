@@ -14,6 +14,26 @@ function object(value: unknown, label: string): JsonObject {
   return value as JsonObject;
 }
 
+export function parityImageIds(log: string, resultImages: unknown): Record<string, string> {
+  const prefix = "[oat] immutable local images: ";
+  const lines = log.split("\n").filter(line => line.startsWith(prefix));
+  if (lines.length !== 1) throw new Error("expected exactly one immutable image admission record");
+  const images = object(JSON.parse(lines[0]!.slice(prefix.length)), "immutable images");
+  const roles = ["catalog", "client", "collector", "maintenance", "router", "sqlserver"];
+  if (Object.keys(images).sort().join(",") !== roles.join(",")) throw new Error("invalid immutable image admission record");
+  const pinned: Record<string, string> = {};
+  for (const role of roles) {
+    const image = images[role];
+    if (typeof image !== "string" || !/^sha256:[a-f0-9]{64}$/.test(image)) throw new Error("invalid immutable image admission record");
+    pinned[role] = image;
+  }
+  if (!Array.isArray(resultImages) || resultImages.length !== 4
+    || !["client", "collector", "maintenance", "router"].every(role => resultImages.includes(`${role}:${pinned[role]}`))) {
+    throw new Error("runtime image evidence differs from immutable admission");
+  }
+  return pinned;
+}
+
 function git(runtime: string, env: NodeJS.ProcessEnv, ...args: string[]): string {
   return execFileSync("git", ["-C", runtime, ...args], { encoding: "utf8", env }).trimEnd();
 }
@@ -75,6 +95,20 @@ export async function replayParityArm(
     if (platform.kind !== "local") throw new Error("parity replay requires local mode");
     platform.compose_state_root = join(runRoot, "state");
     platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
+    const identityPath = join(data, "ladder-identity.json");
+    let identity: JsonObject | undefined;
+    try {
+      identity = object(JSON.parse(await readFile(identityPath, "utf8")), "ladder identity");
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    if (identity) {
+      if (identity.source_revision !== producer.revision || identity.seed_sha256 !== seedHash
+        || typeof identity.payload_corpus_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(identity.payload_corpus_sha256)) {
+        throw new Error("ladder identity does not match the trusted producer and seed");
+      }
+      object(platform.local, "local").expected_image_ids = object(identity.images, "ladder images");
+    }
     config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
     config.website_url = pathToFileURL(join(runRoot, "site", "results.parquet")).href;
     const configPath = join(runRoot, "config.json");
@@ -102,6 +136,11 @@ export async function replayParityArm(
       join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states",
       producer.revision, null, "diagnostic", { config, decodeFile },
     );
+    const images = parityImageIds(await readFile(join(runRoot, "run.log"), "utf8"), result.images);
+    const payload = result.clientEvidence.payloadCorpusSha256;
+    if (typeof payload !== "string" || !/^[a-f0-9]{64}$/.test(payload)) throw new Error("parity corpus identity missing");
+    if (identity && (JSON.stringify(identity.images) !== JSON.stringify(images)
+      || identity.payload_corpus_sha256 !== payload)) throw new Error("ladder image or corpus identity changed");
     if (await sha256(join(runtime, "target", "release", "arrowcol-oat-rust")) !== binaryHash
       || git(runtime, env, "rev-parse", "HEAD") !== producer.revision
       || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
@@ -114,6 +153,11 @@ export async function replayParityArm(
       ...result,
     };
     await writeFile(join(runRoot, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
+    if (!identity) {
+      await writeFile(identityPath, `${JSON.stringify({
+        source_revision: producer.revision, seed_sha256: seedHash, images, payload_corpus_sha256: payload,
+      }, null, 2)}\n`, { flag: "wx", mode: 0o400 });
+    }
     completed = true;
     return receipt;
   } finally {

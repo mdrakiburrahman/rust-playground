@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { assertParityCollectorReadback, assertParityEvidence, assertParityTableLayout, parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
+import { parityImageIds } from "./parity-replay.js";
 
 const meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n";
 const timestamp = "2026-11-22T09:00:00Z";
+
+test("parity images are bound to admission and actual role evidence", () => {
+  const images = Object.fromEntries(["catalog", "client", "collector", "maintenance", "router", "sqlserver"]
+    .map((role, index) => [role, `sha256:${String(index).repeat(64)}`]));
+  const log = `[oat] immutable local images: ${JSON.stringify(images)}\n`;
+  const actual = ["client", "collector", "maintenance", "router"].map(role => `${role}:${images[role]}`);
+  assert.deepEqual(parityImageIds(log, actual), images);
+  assert.throws(() => parityImageIds(log + log, actual), /exactly one/);
+  assert.throws(() => parityImageIds(log, actual.slice(1)), /differs/);
+  assert.throws(() => parityImageIds(log, actual.map(value => value.replace("sha256:1", "sha256:f"))), /differs/);
+});
 
 test("records a bounded one-box host preflight and refuses stale unsafe caps", () => {
   const receipt = parityHostReceipt(meminfo, 32, 16, 1048576, 300000000, timestamp);

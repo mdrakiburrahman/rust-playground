@@ -12,7 +12,8 @@
     "compose_state_root": "out/arrowcol-oat/historical-parity",
     "local": {
       "collector_memory_limit_bytes": 92341796864,
-      "partitioned_table_bootstrap": true
+      "partitioned_table_bootstrap": true,
+      "stable_image_build": true
     }
   },
   "warmup_seconds": 60,

@@ -7808,6 +7808,110 @@ async fn initialize_local_maintenance_table(config: &OatConfig, platform: &Local
         .context("setup local table before starting Dataflow or any DMV client")
 }
 
+async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if !maintenance_enabled(config) {
+        bail!("stable local images require the maintenance role");
+    }
+    let maintenance = config
+        .maintenance_image
+        .as_deref()
+        .unwrap_or("arrowcol-oat/maintenance:local");
+    let sources = [
+        (
+            "catalog",
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev",
+        ),
+        ("client", "arrowcol-oat-client:local"),
+        (
+            "collector",
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev",
+        ),
+        ("maintenance", maintenance),
+        (
+            "router",
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust:dev",
+        ),
+        ("sqlserver", "arrowcol-loadtest/sqlserver:2022-cu27"),
+    ];
+    let mut images = BTreeMap::new();
+    for (role, source) in sources {
+        let mut inspect = Command::new("docker");
+        inspect.args(["image", "inspect", "--format", "{{.Id}}", source]);
+        let output = run_command(inspect, "resolve stable local image").await?;
+        let image = String::from_utf8(output.stdout)?;
+        images.insert(role.to_owned(), local_client_image_id(&image)?.to_owned());
+    }
+    let path = platform.state_dir.join("tunables.compose.json");
+    let mut overlay: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+    apply_stable_local_images(&mut overlay, &images, config.platform.local.expected_image_ids.as_ref())?;
+    tokio::fs::write(&path, serde_json::to_vec(&overlay)?).await?;
+    println!("[oat] immutable local images: {}", serde_json::to_string(&images)?);
+    Ok(())
+}
+
+fn apply_stable_local_images(
+    overlay: &mut Value,
+    images: &BTreeMap<String, String>,
+    expected: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    if expected.is_some_and(|expected| expected != images) {
+        bail!("local image IDs differ from the pinned ladder identity");
+    }
+    let services = overlay["services"]
+        .as_object_mut()
+        .context("local Compose services missing")?;
+    for (service, role) in [
+        ("arrowcol-catalog", "catalog"),
+        ("oat-client", "client"),
+        ("oat-pin-init", "client"),
+        ("dataflow-1", "collector"),
+        ("delta-maintenance", "maintenance"),
+        ("router", "router"),
+        ("sqlserver", "sqlserver"),
+        ("database-bootstrap", "sqlserver"),
+        ("arrowcol-migrate", "sqlserver"),
+    ] {
+        let image = images.get(role).context("stable local image role missing")?;
+        let service = services.entry(service.to_owned()).or_insert_with(|| json!({}));
+        service
+            .as_object_mut()
+            .context("invalid local Compose service")?
+            .insert("image".to_owned(), json!(image));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn stable_local_images_pin_roles_and_refuse_drift_before_overlay_changes() -> Result<()> {
+    let images: BTreeMap<String, String> = ["catalog", "client", "collector", "maintenance", "router", "sqlserver"]
+        .into_iter()
+        .map(|role| (role.to_owned(), format!("sha256:{}", "a".repeat(64))))
+        .collect();
+    let mut overlay = json!({"services": {"dataflow-1": {"environment": {"KEEP": "yes"}}}});
+    let original = overlay.clone();
+    let mut changed = images.clone();
+    changed.insert("collector".to_owned(), format!("sha256:{}", "b".repeat(64)));
+    assert!(apply_stable_local_images(&mut overlay, &images, Some(&changed)).is_err());
+    assert_eq!(overlay, original);
+    apply_stable_local_images(&mut overlay, &images, Some(&images))?;
+    for (service, role) in [
+        ("arrowcol-catalog", "catalog"),
+        ("oat-client", "client"),
+        ("oat-pin-init", "client"),
+        ("dataflow-1", "collector"),
+        ("delta-maintenance", "maintenance"),
+        ("router", "router"),
+        ("sqlserver", "sqlserver"),
+        ("database-bootstrap", "sqlserver"),
+        ("arrowcol-migrate", "sqlserver"),
+    ] {
+        assert_eq!(overlay["services"][service]["image"], images[role]);
+    }
+    assert_eq!(overlay["services"]["dataflow-1"]["environment"]["KEEP"], "yes");
+    Ok(())
+}
+
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     run_npx_runtime(
         &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
@@ -7835,10 +7939,15 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         .as_deref()
         .context("local compose file is missing")?;
     let project = scoped_compose_project(base_project, &platform.run_id);
+    let build_project = if config.platform.local.stable_image_build {
+        format!("{base_project}-images")
+    } else {
+        project.clone()
+    };
     let mut build_client = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
-        &project,
+        &build_project,
         "oat",
     );
     platform.add_compose_environment(&mut build_client);
@@ -7847,7 +7956,21 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         build_client.arg("delta-maintenance");
     }
     run_streaming_command(build_client, "build OAT client container").await?;
+    if config.platform.local.stable_image_build {
+        let mut build_stack = compose_command(
+            compose_file,
+            config.platform.compose_override_file.as_deref(),
+            &build_project,
+            "benchmark",
+        );
+        platform.add_compose_environment(&mut build_stack);
+        build_stack.args(["build", "sqlserver", "arrowcol-catalog", "dataflow-1", "router"]);
+        run_streaming_command(build_stack, "build stable local OAT images").await?;
+    }
     pin_local_maintenance_image(config, platform).await?;
+    if config.platform.local.stable_image_build {
+        pin_stable_local_images(config, platform).await?;
+    }
     verify_local_bind_mount(config, platform).await?;
 
     let mut up = compose_command(
@@ -7857,15 +7980,13 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
-    up.args([
-        "up",
-        "--detach",
-        "--build",
-        "--wait",
-        "--wait-timeout",
-        "600",
-        "sqlserver",
-    ]);
+    up.args(["up", "--detach"]);
+    up.arg(if config.platform.local.stable_image_build {
+        "--no-build"
+    } else {
+        "--build"
+    });
+    up.args(["--wait", "--wait-timeout", "600", "sqlserver"]);
     run_streaming_command(up, "start local OAT SQL Server")
         .await
         .context("start local OAT stack")?;
@@ -7878,7 +7999,11 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             "benchmark",
         );
         platform.add_compose_environment(&mut migration);
-        migration.args(["run", "--rm", "--no-deps", service]);
+        migration.args(["run", "--rm", "--no-deps"]);
+        if config.platform.local.stable_image_build {
+            migration.arg("--no-build");
+        }
+        migration.arg(service);
         run_streaming_command(migration, &format!("run local OAT {service}")).await?;
     }
 
@@ -7889,10 +8014,13 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
+    up.args(["up", "--detach"]);
+    up.arg(if config.platform.local.stable_image_build {
+        "--no-build"
+    } else {
+        "--build"
+    });
     up.args([
-        "up",
-        "--detach",
-        "--build",
         "--wait",
         "--wait-timeout",
         "600",
@@ -7961,9 +8089,11 @@ async fn scale_local_arrowcols(
     );
     platform.add_compose_environment(&mut up);
     up.env("LOADTEST_CPUS", concurrency.to_string());
+    up.args(["up", "--detach"]);
+    if config.platform.local.stable_image_build {
+        up.arg("--no-build");
+    }
     up.args([
-        "up",
-        "--detach",
         "--wait",
         "--wait-timeout",
         "600",

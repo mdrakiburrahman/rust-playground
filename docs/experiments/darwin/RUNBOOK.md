@@ -54,7 +54,10 @@ ambiguous sends. Flight acknowledgements are admission evidence, not durable
 commits or proof of unique delivery. Missing counters invalidate the arm.
 An individual arm is diagnostic and cannot qualify a winner. Preserve each
 receipt and compare identical image and corpus identities before interpreting
-a ladder or A/A. A failed arm retains its lock until owned-cell recovery.
+a ladder or A/A. Parity builds use a stable Compose build project and pin each
+role to its immutable image ID. The first reconciled arm records the image and
+corpus identity; subsequent arms refuse an image mismatch before starting.
+A failed arm retains its lock until owned-cell recovery.
 
 Confirm Realistic codec, dictionary and compression winners on historical
 parity at AKS-like file sizes (approximately 2 million rows/file) before
