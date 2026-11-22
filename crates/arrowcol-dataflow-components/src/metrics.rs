@@ -1010,6 +1010,241 @@ impl PublicationBacklog {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CapacityScope {
+    Global,
+    Table,
+}
+
+impl CapacityScope {
+    const ALL: [Self; 2] = [Self::Global, Self::Table];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Table => "table",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CapacityResource {
+    Bytes,
+    Rows,
+    Batches,
+}
+
+impl CapacityResource {
+    const ALL: [Self; 3] = [Self::Bytes, Self::Rows, Self::Batches];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Rows => "rows",
+            Self::Batches => "batches",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExporterGroupState {
+    Pipeline,
+    FlushWait,
+    FlushSlot,
+    Preparing,
+    CommitWait,
+}
+
+impl ExporterGroupState {
+    const ALL: [Self; 5] = [
+        Self::Pipeline,
+        Self::FlushWait,
+        Self::FlushSlot,
+        Self::Preparing,
+        Self::CommitWait,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pipeline => "pipeline",
+            Self::FlushWait => "flush_wait",
+            Self::FlushSlot => "flush_slot",
+            Self::Preparing => "preparing",
+            Self::CommitWait => "commit_wait",
+        }
+    }
+}
+
+#[derive(Default)]
+struct CapacityObservation {
+    reserved: AtomicU64,
+    waiters: AtomicU64,
+    attempts: AtomicU64,
+    acquire_nanos: AtomicU64,
+}
+
+#[derive(Default)]
+struct GroupObservation {
+    active: AtomicU64,
+    elapsed_nanos: AtomicU64,
+}
+
+#[derive(Default)]
+pub(crate) struct ExporterOccupancy {
+    capacity: [[CapacityObservation; 3]; 2],
+    groups: [GroupObservation; 5],
+}
+
+impl ExporterOccupancy {
+    pub(crate) fn reserve(&self, scope: CapacityScope, resource: CapacityResource, amount: u64) {
+        self.capacity[scope.index()][resource.index()]
+            .reserved
+            .fetch_add(amount, Ordering::Relaxed);
+    }
+
+    pub(crate) fn release(&self, scope: CapacityScope, resource: CapacityResource, amount: u64) {
+        self.capacity[scope.index()][resource.index()]
+            .reserved
+            .fetch_sub(amount, Ordering::Relaxed);
+    }
+
+    pub(crate) fn wait(&self, scope: CapacityScope, resource: CapacityResource) -> AdmissionWait<'_> {
+        let observation = &self.capacity[scope.index()][resource.index()];
+        observation.waiters.fetch_add(1, Ordering::Relaxed);
+        AdmissionWait {
+            observation,
+            started: Instant::now(),
+        }
+    }
+
+    pub(crate) fn group(self: &Arc<Self>, state: ExporterGroupState) -> ExporterGroupGuard {
+        self.groups[state.index()].active.fetch_add(1, Ordering::Relaxed);
+        ExporterGroupGuard {
+            occupancy: Arc::clone(self),
+            state,
+            started: Instant::now(),
+        }
+    }
+
+    fn write(&self, output: &mut String) {
+        for (index, (name, kind, help)) in [
+            (
+                "arrowcol_exporter_capacity_reserved",
+                "gauge",
+                "Logical permits currently reserved; table scope sums all table pools.",
+            ),
+            (
+                "arrowcol_exporter_capacity_waiters",
+                "gauge",
+                "In-progress semaphore acquisition attempts.",
+            ),
+            (
+                "arrowcol_exporter_capacity_acquire_seconds_total",
+                "counter",
+                "Elapsed acquisition time including immediate and cancelled attempts.",
+            ),
+            (
+                "arrowcol_exporter_capacity_acquire_attempts_total",
+                "counter",
+                "Finished or cancelled semaphore acquisition attempts.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for scope in CapacityScope::ALL {
+                for resource in CapacityResource::ALL {
+                    let value = &self.capacity[scope.index()][resource.index()];
+                    let sample = match index {
+                        0 => value.reserved.load(Ordering::Acquire) as f64,
+                        1 => value.waiters.load(Ordering::Acquire) as f64,
+                        2 => value.acquire_nanos.load(Ordering::Acquire) as f64 / 1e9,
+                        _ => value.attempts.load(Ordering::Acquire) as f64,
+                    };
+                    let _ = writeln!(
+                        output,
+                        "{name}{{scope=\"{}\",resource=\"{}\"}} {sample}",
+                        scope.label(),
+                        resource.label()
+                    );
+                }
+            }
+        }
+        for (index, (name, kind, help)) in [
+            (
+                "arrowcol_exporter_group_occupancy",
+                "gauge",
+                "Groups in each overlapping exporter state.",
+            ),
+            (
+                "arrowcol_exporter_group_occupancy_seconds_total",
+                "counter",
+                "Finished or cancelled time spent in each exporter state.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for state in ExporterGroupState::ALL {
+                let value = &self.groups[state.index()];
+                let sample = if index == 0 {
+                    value.active.load(Ordering::Acquire) as f64
+                } else {
+                    value.elapsed_nanos.load(Ordering::Acquire) as f64 / 1e9
+                };
+                let _ = writeln!(output, "{name}{{state=\"{}\"}} {sample}", state.label());
+            }
+        }
+    }
+}
+
+pub(crate) struct AdmissionWait<'a> {
+    observation: &'a CapacityObservation,
+    started: Instant,
+}
+
+impl Drop for AdmissionWait<'_> {
+    fn drop(&mut self) {
+        self.observation.waiters.fetch_sub(1, Ordering::Relaxed);
+        self.observation.attempts.fetch_add(1, Ordering::Relaxed);
+        self.observation.acquire_nanos.fetch_add(
+            self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+pub(crate) struct ExporterGroupGuard {
+    occupancy: Arc<ExporterOccupancy>,
+    state: ExporterGroupState,
+    started: Instant,
+}
+
+impl Drop for ExporterGroupGuard {
+    fn drop(&mut self) {
+        let observation = &self.occupancy.groups[self.state.index()];
+        observation.active.fetch_sub(1, Ordering::Relaxed);
+        observation.elapsed_nanos.fetch_add(
+            self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 /// Atomic process-wide counters shared by receiver, exporter, admin, and registration.
 pub struct RuntimeMetrics {
     instance_id: CollectorInstanceId,
@@ -1028,6 +1263,7 @@ pub struct RuntimeMetrics {
     buffered_batches: AtomicU64,
     pending_commits: AtomicU64,
     publication_backlog: Mutex<PublicationBacklog>,
+    pub(crate) exporter_occupancy: Arc<ExporterOccupancy>,
     admitted_streams: AtomicU64,
     aborted_streams: AtomicU64,
     downstream_acks: AtomicU64,
@@ -1080,6 +1316,7 @@ impl RuntimeMetrics {
             buffered_batches: AtomicU64::new(0),
             pending_commits: AtomicU64::new(0),
             publication_backlog: Mutex::new(PublicationBacklog::default()),
+            exporter_occupancy: Arc::new(ExporterOccupancy::default()),
             admitted_streams: AtomicU64::new(0),
             aborted_streams: AtomicU64::new(0),
             downstream_acks: AtomicU64::new(0),
@@ -1770,6 +2007,7 @@ impl RuntimeMetrics {
     pub fn prometheus(&self) -> String {
         let mut output = String::new();
         self.publication_backlog_snapshot().write(&mut output);
+        self.exporter_occupancy.write(&mut output);
         self.otel.record_pressure(
             self.buffered_rows.load(Ordering::Acquire),
             self.buffered_batches.load(Ordering::Acquire),
@@ -2210,6 +2448,45 @@ mod tests {
     use arrowcol_protocol::{CatalogName, SchemaName, TableName};
 
     use super::*;
+
+    #[test]
+    fn exporter_group_guards_release_on_completion_error_and_cancellation() {
+        use futures::FutureExt;
+
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        let occupancy = &metrics.exporter_occupancy;
+        {
+            let _slot = occupancy.group(ExporterGroupState::FlushSlot);
+            assert!(
+                metrics
+                    .prometheus()
+                    .contains("arrowcol_exporter_group_occupancy{state=\"flush_slot\"} 1")
+            );
+        }
+        let fail = || -> Result<(), ()> {
+            let _guard = occupancy.group(ExporterGroupState::Preparing);
+            Err(())
+        };
+        assert!(fail().is_err());
+        let mut future = Box::pin(async {
+            let _guard = occupancy.group(ExporterGroupState::CommitWait);
+            futures::future::pending::<()>().await;
+        });
+        assert!(future.as_mut().now_or_never().is_none());
+        assert!(
+            metrics
+                .prometheus()
+                .contains("arrowcol_exporter_group_occupancy{state=\"commit_wait\"} 1")
+        );
+        drop(future);
+        for state in ["flush_slot", "preparing", "commit_wait"] {
+            assert!(
+                metrics
+                    .prometheus()
+                    .contains(&format!("arrowcol_exporter_group_occupancy{{state=\"{state}\"}} 0"))
+            );
+        }
+    }
 
     #[test]
     fn process_cpu_pressure_ratio_uses_effective_cores_and_clamps() {
