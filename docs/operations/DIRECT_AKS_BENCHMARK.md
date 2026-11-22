@@ -45,3 +45,16 @@ npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run \
 ## Cleanup
 
 Cleanup is automatic on success and failure after owned resources are created. The entrypoint deletes only the namespace whose labels, annotations, and UID still match this run and removes only its run-scoped FIC after namespace absence. For each non-zero workload pool, it waits up to 25 minutes for any non-DaemonSet pods, including completed pods, to leave or for the autoscaler to drain the pool naturally. Only when no such pods remain does it temporarily disable autoscaling, scale the pool to zero, and restore autoscaling min 0/max 1; already-empty pools are left unchanged. It never removes Delta data, the shared identity, the stamp, other namespaces, or other FICs. If ownership verification, namespace deletion, FIC cleanup, a remaining workload pod, scale-down, or autoscaler restoration fails, the command exits nonzero and preserves the private receipt/report for recovery; do not broaden cleanup to shared resources.
+
+## Offline scaled-profile contract
+
+The checked-in runner and manifest remain the default one-writer/one-client path. `projects/arrowcol-oat/aks-scaled-profile.ts` is an offline integration contract only; it is not exposed as a live runner option and does not authorize or verify an AKS run.
+
+| Guard | Scaled-profile requirement |
+| --- | --- |
+| Clients | Render 1–8 separate Jobs with distinct run-scoped client IDs, unchanged shared generation arguments, and required hostname anti-affinity. All use the existing shared start schedule; the schedule is not advanced until every client is ready, and any failed client aborts. |
+| Pool | Snapshot `benchd64` autoscaler settings only when autoscaling is enabled, min is 0, and both configured and observed node counts are 0. Temporarily cap max at the client count; restore the exact original min/max only after the pool drains and the active settings have not drifted. |
+| Workload identity | Hash the effective `diagnostic-replay` / `diagnostic` / IPC `none` profile, client count, and every generator argument except per-client IDs. The existing diagnostic parity context includes batch/corpus 65,536; the historical 528,220 rows/s result is comparable only with the same profile and tunables. Any realistic profile must be labeled separately. |
+| Images and observation | Bind all exact source image references (including distinct digests sharing one repository) to candidate digests and the same source commit/config hash. Runtime evidence must retain each client pod UID-to-node/image-ID mapping, distinct node placement, and collector pod UID-to-node/image-ID mapping. |
+
+These helpers have only been exercised with local fixtures. Candidate image builds/attestations, live pool mutation/restoration, pod observation, quota/SKU availability, and end-to-end scaled execution remain unverified; no Azure or AKS writes or image pushes were performed.
