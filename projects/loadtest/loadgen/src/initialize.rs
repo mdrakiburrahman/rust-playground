@@ -451,6 +451,10 @@ fn checked_root(raw: &str, account: &str, container: &str) -> Result<Url> {
 }
 
 fn partitioned_schema(statement: &SchemaStatement) -> Result<Arc<Schema>> {
+    local_schema(statement, true)
+}
+
+fn local_schema(statement: &SchemaStatement, partitioned: bool) -> Result<Arc<Schema>> {
     let parser = DdlParser::default();
     let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
         bail!("canonical fixture contains a non-CREATE statement");
@@ -460,7 +464,9 @@ fn partitioned_schema(statement: &SchemaStatement) -> Result<Arc<Schema>> {
         .iter()
         .map(arrowcol_catalog::CatalogField::to_arrow)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    fields.push(Field::new(INGESTION, DataType::Utf8, false));
+    if partitioned {
+        fields.push(Field::new(INGESTION, DataType::Utf8, false));
+    }
     Ok(Arc::new(Schema::new(fields)))
 }
 
@@ -533,25 +539,34 @@ pub fn canonical_table_delta_schema(table: &str) -> Result<serde_json::Value> {
 
 /// Initialize only selected, fresh local table directories; existing tables are never opened.
 pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statements: &[SchemaStatement]) -> Result<()> {
+    initialize_fresh_local_with_partition(root, selected, statements, true)
+}
+
+fn initialize_fresh_local_with_partition(
+    root: &Path,
+    selected: &[String],
+    statements: &[SchemaStatement],
+    partitioned: bool,
+) -> Result<()> {
     let requested = selected.iter().cloned().collect::<BTreeSet<_>>();
     if requested.is_empty() || requested.len() != selected.len() {
-        bail!("partitioned local initialization requires explicit, unique --table selections");
+        bail!("local initialization requires explicit, unique --table selections");
     }
     let targets = statements
         .iter()
         .filter(|statement| requested.contains(&statement.identity.to_string()))
         .collect::<Vec<_>>();
     if targets.len() != requested.len() {
-        bail!("partitioned local initialization contains an unknown table");
+        bail!("local initialization contains an unknown table");
     }
-    let root_metadata = fs::symlink_metadata(root).context("partitioned local Dataflow root must already exist")?;
+    let root_metadata = fs::symlink_metadata(root).context("local Dataflow root must already exist")?;
     if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        bail!("partitioned local Dataflow root must be a real directory");
+        bail!("local Dataflow root must be a real directory");
     }
     let root = fs::canonicalize(root)?;
     let mut prepared = Vec::new();
     for statement in targets {
-        let schema = partitioned_schema(statement)?;
+        let schema = local_schema(statement, partitioned)?;
         let mut parent = root.clone();
         for component in [
             statement.identity.catalog().as_str(),
@@ -579,7 +594,12 @@ pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statement
     for (path, schema) in prepared {
         fs::create_dir(&path).with_context(|| format!("claim fresh local table {}", path.display()))?;
         let url = Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("invalid local table directory"))?;
-        DeltaTable::initialize_url_for_bootstrap(url, schema, vec![INGESTION.to_owned()])
+        let partitions = if partitioned {
+            vec![INGESTION.to_owned()]
+        } else {
+            Vec::new()
+        };
+        DeltaTable::initialize_url_for_bootstrap(url, schema, partitions)
             .with_context(|| format!("initialize fresh local table {}", path.display()))?;
     }
     Ok(())
@@ -589,16 +609,21 @@ pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statement
 ///
 /// # Errors
 ///
-/// Requires the explicit partition flag, an absolute existing local root, and one known table whose
+/// Requires exactly one explicit partition mode, an absolute existing local root, and one known table whose
 /// destination does not already exist.
 pub fn initialize_local(args: InitializeLocalArgs) -> Result<()> {
-    if !args.partition_by_ingestion_date {
-        bail!("setup-only local initialization requires --partition-by-ingestion-date");
+    if args.partition_by_ingestion_date == args.unpartitioned {
+        bail!("setup-only local initialization requires exactly one partition mode");
     }
     if !args.dataflow_root.is_absolute() {
         bail!("setup-only local initialization requires an absolute --dataflow-root");
     }
-    initialize_fresh_local(&args.dataflow_root, &[args.table], &schema_statements()?)
+    initialize_fresh_local_with_partition(
+        &args.dataflow_root,
+        &[args.table],
+        &schema_statements()?,
+        args.partition_by_ingestion_date,
+    )
 }
 
 /// Initializes existing-or-empty roots and publishes a manifest only after every table succeeds.
@@ -735,6 +760,46 @@ mod tests {
         );
         assert_eq!(maintenance.version()?, version);
         assert!(initialize_fresh_local(root.path(), &[table], &fixture).is_err());
+        assert_eq!(fs::read(log)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_unpartitioned_table_has_canonical_schema_and_never_overwrites() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let table = "telemetry.sqlserver.sqlserver_active_sessions".to_owned();
+        let args = || InitializeLocalArgs {
+            partition_by_ingestion_date: false,
+            unpartitioned: true,
+            table: table.clone(),
+            dataflow_root: root.path().to_owned(),
+        };
+        initialize_local(args())?;
+        let log = root
+            .path()
+            .join("telemetry/sqlserver/sqlserver_active_sessions/_delta_log/00000000000000000000.json");
+        let original = fs::read(&log)?;
+        let actions = std::str::from_utf8(&original)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let metadata = actions
+            .iter()
+            .find_map(|action| action.get("metaData"))
+            .context("missing metadata")?;
+        assert_eq!(metadata["partitionColumns"], serde_json::json!([]));
+        let schema: serde_json::Value =
+            serde_json::from_str(metadata["schemaString"].as_str().context("missing schema")?)?;
+        let statement = schema_statements()?
+            .into_iter()
+            .find(|item| item.identity.to_string() == table)
+            .context("missing table")?;
+        let expected = arrow_deltalake::normalize::schema(&local_schema(&statement, false)?)?;
+        assert_eq!(
+            schema,
+            serde_json::to_value(delta_kernel::schema::StructType::try_from_arrow(expected.as_ref())?)?
+        );
+        assert!(initialize_local(args()).is_err());
         assert_eq!(fs::read(log)?, original);
         Ok(())
     }

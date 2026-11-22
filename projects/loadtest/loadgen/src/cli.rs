@@ -33,7 +33,7 @@ pub enum Command {
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
     AzureManifest(InitializeAzureArgs),
-    /// Create one fresh local ingestion-partitioned table without connecting to Flight or sending rows.
+    /// Create one fresh local table without connecting to Flight or sending rows.
     InitializeLocal(InitializeLocalArgs),
     /// Create one fresh owned-run table only through an explicitly supplied storage bridge.
     InitializeOwnedRunTable(InitializeOwnedRunTableArgs),
@@ -127,8 +127,11 @@ pub struct InitializeAzureArgs {
 #[derive(Clone, Debug, Args)]
 pub struct InitializeLocalArgs {
     /// Explicitly opt into the supported ingestion-date partition.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "unpartitioned")]
     pub partition_by_ingestion_date: bool,
+    /// Explicitly select an unpartitioned table.
+    #[arg(long, conflicts_with = "partition_by_ingestion_date")]
+    pub unpartitioned: bool,
     /// One fully qualified table from the canonical public schema fixture.
     #[arg(long = "table")]
     pub table: String,

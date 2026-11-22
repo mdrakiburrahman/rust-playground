@@ -7602,11 +7602,15 @@ fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Res
 }
 
 fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result<Vec<String>> {
+    local_initializer_args(table, dataflow_root, true)
+}
+
+fn local_initializer_args(table: &str, dataflow_root: &Path, partitioned: bool) -> Result<Vec<String>> {
     if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
         bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
     }
     let canonical_table = canonical_dmv_table_name(table)?;
-    if canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
+    if partitioned && canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
         bail!("local partition initialization only supports the campaign hot table");
     }
     let dataflow_root = dataflow_root
@@ -7614,7 +7618,12 @@ fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result
         .context("local run-owned Dataflow directory is not valid UTF-8")?;
     Ok(vec![
         "initialize-local".to_owned(),
-        "--partition-by-ingestion-date".to_owned(),
+        if partitioned {
+            "--partition-by-ingestion-date"
+        } else {
+            "--unpartitioned"
+        }
+        .to_owned(),
         "--table".to_owned(),
         canonical_table,
         "--dataflow-root".to_owned(),
@@ -7622,15 +7631,20 @@ fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result
     ])
 }
 
-async fn initialize_local_partitioned_campaign_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
-    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+async fn initialize_local_maintenance_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable);
+    if !partitioned && (config.campaign_profile.is_some() || !maintenance_enabled(config) || config.tables.len() != 1) {
         return Ok(());
     }
     let [table] = config.tables.as_slice() else {
-        bail!("local partition initialization requires exactly one campaign table");
+        bail!("local initialization requires exactly one table");
     };
     let dataflow_root = platform.state_dir.join("dataflow");
-    let arguments = local_partition_initializer_args(table, &dataflow_root)?;
+    let arguments = if partitioned {
+        local_partition_initializer_args(table, &dataflow_root)?
+    } else {
+        local_initializer_args(table, &dataflow_root, false)?
+    };
     let workspace = std::env::current_dir()?;
     let mut build = Command::new("cargo");
     build.args([
@@ -7642,14 +7656,14 @@ async fn initialize_local_partitioned_campaign_table(config: &OatConfig, platfor
         "arrowcol-loadgen",
     ]);
     build.current_dir(&workspace);
-    run_streaming_command(build, "build setup-only local partition initializer").await?;
+    run_streaming_command(build, "build setup-only local table initializer").await?;
 
     let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
     initialize.args(arguments);
     initialize.current_dir(workspace);
     run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
         .await
-        .context("setup local partitioned table before starting Dataflow or any DMV client")
+        .context("setup local table before starting Dataflow or any DMV client")
 }
 
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
@@ -7667,7 +7681,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     )
     .await
     .context("render run-owned dataflow profile before starting local workloads")?;
-    initialize_local_partitioned_campaign_table(config, platform).await?;
+    initialize_local_maintenance_table(config, platform).await?;
     let base_project = config
         .platform
         .compose_project
@@ -13992,6 +14006,18 @@ mod tests {
             ]
         );
         assert!(super::local_partition_initializer_args("sqlserver_wait_stats", &root).is_err());
+        assert_eq!(
+            super::local_initializer_args("sqlserver_active_sessions", &root, false)?,
+            [
+                "initialize-local",
+                "--unpartitioned",
+                "--table",
+                "telemetry.sqlserver.sqlserver_active_sessions",
+                "--dataflow-root",
+                root.to_str().context("temp root is not valid UTF-8")?,
+            ]
+        );
+        assert!(super::local_initializer_args("not_a_table", &root, false).is_err());
         assert!(
             super::local_partition_initializer_args(
                 "sqlserver_availability_replica_states",
