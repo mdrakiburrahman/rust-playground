@@ -26,6 +26,17 @@ overrides cannot change identities, endpoints, authentication or fencing.
 Readback includes safe catalog/routing backend names and resolved timeouts,
 never backend addresses or credentials.
 
+Exporter `global_capacity.bytes` and `per_table_capacity.bytes` are logical
+Arrow byte budgets held through durable completion, not process RSS limits.
+Defaults and byte-exact accounting for representable small budgets are
+unchanged. Larger budgets use 1,024-byte quanta: each budget is rounded down
+and each batch charge up. The exporter startup `/batching/effective_capacity`
+reports both effective byte limits and quanta alongside the configured values.
+The per-table budget cannot exceed the global budget, and the flush byte limit
+cannot exceed the effective per-table budget. Row, batch, receiver pressure
+and RSS limits remain independent; increasing byte budgets requires a matched
+memory and throughput experiment.
+
 Example (workload-dependent, not a universal performance recommendation):
 
 ```bash

@@ -3579,6 +3579,70 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "bounded local durable A/B diagnostic"]
+    async fn local_durable_byte_capacity_ab() {
+        let charge = arrow_deltalake::record_batch_logical_bytes(&fixture_batch()).expect("logical bytes");
+        for pair in 0..=6 {
+            let order = if pair % 2 == 0 { [3_u64, 4] } else { [4_u64, 3] };
+            for table_groups in order {
+                let directory = tempfile::tempdir().expect("directory");
+                let store = Arc::new(MemoryRoutingStore::default());
+                let holder = CollectorInstanceId::new();
+                let lease = lease(&store, holder).await;
+                let exporter = GenericDeltaExporter::with_batching(
+                    directory.path().to_path_buf(),
+                    store as Arc<dyn RoutingStore>,
+                    arrow_deltalake::commit::CommitOptions {
+                        batch_window: std::time::Duration::from_millis(100),
+                        max_files_per_commit: 16,
+                        max_pending_files: 16,
+                    },
+                    FileBatchConfig {
+                        coalesce_publications: true,
+                        pipeline_depth: 5,
+                        max_batches_per_flush: 1,
+                        global_capacity: BatchCapacity {
+                            bytes: charge * 4,
+                            rows: 8,
+                            batches: 8,
+                        },
+                        per_table_capacity: BatchCapacity {
+                            bytes: charge * table_groups,
+                            rows: 8,
+                            batches: 8,
+                        },
+                        max_arrow_memory_per_flush: charge,
+                        max_rows_per_flush: 2,
+                        ..Default::default()
+                    },
+                    Arc::new(RuntimeMetrics::new(holder)),
+                )
+                .expect("exporter");
+                let inputs = (0..4).map(|_| envelope_pdata(envelope_for(&lease))).collect::<Vec<_>>();
+                let start = std::time::Instant::now();
+                let receipts = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    futures::future::join_all(inputs.into_iter().map(|input| exporter.stage(input))).await
+                })
+                .await
+                .expect("admission");
+                for receipt in receipts {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), receipt.expect("stage").wait())
+                        .await
+                        .expect("receipt")
+                        .expect("durable");
+                }
+                let elapsed = start.elapsed();
+                let files = add_file_count(&directory.path().join("demo/generated/events"));
+                assert_eq!(files, 4);
+                println!(
+                    "local_ab,pair={pair},table_groups={table_groups},batch_bytes={charge},files={files},rows=8,elapsed_us={}",
+                    elapsed.as_micros()
+                );
+            }
+        }
+    }
+
     /// Scenario: One scheduled group exceeds the commit worker's pending-file
     /// capacity while the collection window would otherwise take a minute.
     /// Guarantees: Bounded forced waves commit without deadlocking admission.
