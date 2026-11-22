@@ -99,13 +99,40 @@ async function sha256(path: string): Promise<string> {
   return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
+export async function prepareReplayRuntime(repo: string, home: string, stackBytes: number): Promise<{ runtime: string; binaryHash: string }> {
+  const manifest = JSON.parse(await readFile(join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
+  const producer = object(JSON.parse(await readFile(join(home, "trusted", "producer.json"), "utf8")), "producer binding");
+  if (typeof producer.revision !== "string" || !Number.isSafeInteger(stackBytes)
+    || stackBytes < 2 * 1024 * 1024 || stackBytes > 128 * 1024 * 1024) throw new Error("invalid producer or controller stack setting");
+  const runtime = await prepareRuntime(repo, home, manifest, producer.revision, stackBytes);
+  const output = execFileSync(join(home, "trusted", "bin", "cargo"), [
+    "build", "--locked", "--package", "arrowcol-oat-rust", "--bin", "arrowcol-oat-rust", "--message-format=json-render-diagnostics",
+  ], {
+    cwd: runtime, env: cleanEnv(join(home, "trusted", "prepare-home"), stackBytes),
+    encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "inherit"],
+  });
+  const executables: string[] = [];
+  for (const line of output.split("\n").filter(Boolean)) {
+    const entry = object(JSON.parse(line), "Cargo message");
+    if (entry.reason === "compiler-artifact" && entry.manifest_path === join(runtime, "projects", "arrowcol-oat-rust", "Cargo.toml")
+      && typeof entry.executable === "string" && object(entry.target, "Cargo target").name === "arrowcol-oat-rust") {
+      executables.push(await realpath(entry.executable));
+    }
+  }
+  const expected = join(runtime, "target", "release", "arrowcol-oat-rust");
+  if (executables.length !== 1 || executables[0] !== expected) throw new Error("Cargo did not select the pinned release controller");
+  if (git(runtime, cleanEnv(join(home, "trusted", "prepare-home"), stackBytes), "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {
+    throw new Error("trusted OAT source changed while building the controller");
+  }
+  return { runtime, binaryHash: await sha256(expected) };
+}
+
 export async function replayCompressionPair(
   repo: string, home: string, candidate: unknown, bindHost: string, endpointHost: string, stackBytes: number,
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
   }
-  const manifest = JSON.parse(await readFile(join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
   const producer = object(JSON.parse(await readFile(join(home, "trusted", "producer.json"), "utf8")), "producer binding");
   if (typeof producer.revision !== "string" || !Number.isSafeInteger(stackBytes)
     || stackBytes < 2 * 1024 * 1024 || stackBytes > 128 * 1024 * 1024) throw new Error("invalid producer or controller stack setting");
@@ -120,10 +147,7 @@ export async function replayCompressionPair(
   await mkdir(lock);
   let completed = false;
   try {
-    const runtime = await prepareRuntime(repo, home, manifest, producer.revision, stackBytes);
-    execFileSync("/usr/local/cargo/bin/cargo", [
-      "build", "--locked", "--release", "--package", "arrowcol-oat-rust", "--bin", "arrowcol-oat-rust",
-    ], { cwd: runtime, env: cleanEnv(join(home, "trusted", "prepare-home"), stackBytes), stdio: "inherit" });
+    const { runtime, binaryHash: preparedBinaryHash } = await prepareReplayRuntime(repo, home, stackBytes);
     const results = [];
     for (const [label, raw, level] of [["baseline", seed, baselineLevel], ["candidate", candidate, candidateLevel]] as const) {
       const runRoot = await mkdtemp(join(data, `${label}-`));
@@ -146,6 +170,7 @@ export async function replayCompressionPair(
         join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_active_sessions", producer.revision, level,
       );
       const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
+      if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");
       const env = cleanEnv(runHome, stackBytes);
       if (git(runtime, env, "rev-parse", "HEAD") !== producer.revision
         || git(runtime, env, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")) {

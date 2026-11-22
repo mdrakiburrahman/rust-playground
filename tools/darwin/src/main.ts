@@ -4,7 +4,7 @@ import path from "node:path";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
-import { replayCompressionPair } from "./replay.js";
+import { prepareReplayRuntime, replayCompressionPair } from "./replay.js";
 import { snapshot, type SnapshotManifest } from "./snapshot.js";
 
 function option(args: string[], name: string, fallback?: string): string {
@@ -75,6 +75,11 @@ async function main(args: string[]): Promise<void> {
   const home = path.resolve(option(args, "--home", process.env.DARWIN_HOME));
   if (command === "setup") {
     await setup(repo, home, args.includes("--producer") ? option(args, "--producer") : undefined);
+    return;
+  }
+  if (command === "prepare") {
+    const prepared = await prepareReplayRuntime(repo, home, Number(option(args, "--controller-stack-bytes")));
+    console.log(`Prepared release OAT controller SHA-256 ${prepared.binaryHash}.`);
     return;
   }
   if (command !== "preflight" && command !== "evaluate") throw new Error("unsupported operation");
