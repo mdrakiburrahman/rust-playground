@@ -128,7 +128,12 @@ function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function trustedInputs(context: TrustedMaintenanceContext): Promise<{ repo: string; home: string; src: string }> {
+async function trustedInputs(context: TrustedMaintenanceContext): Promise<{
+  repo: string; home: string; src: string; snapshotCommit: string; hashes: Record<string, string>;
+}> {
+  if (Object.keys(record(context, "trusted runner context")).sort().join(",") !== "home,repo") {
+    throw new Error("invalid trusted runner context");
+  }
   const repo = path.resolve(context.repo);
   const home = path.resolve(context.home);
   if (await realpath(repo) !== repo || await realpath(home) !== home) throw new Error("trusted roots must not traverse symlinks");
@@ -141,6 +146,7 @@ async function trustedInputs(context: TrustedMaintenanceContext): Promise<{ repo
   }
   const files = record(manifest.files, "trusted snapshot files");
   const src = path.join(home, "trusted", "src");
+  const hashes: Record<string, string> = {};
   for (const [file, pinned] of [[FIXTURE, FIXTURE_REVISION], [MAINTENANCE, FIXTURE_REVISION],
     [COMPARATOR, SUPPORT_REVISION], [SANDBOX, SUPPORT_REVISION]] as const) {
     const full = path.join(src, file);
@@ -152,8 +158,9 @@ async function trustedInputs(context: TrustedMaintenanceContext): Promise<{ repo
       || sha256(git("show", `${pinned}:${file}`)) !== digest) {
       throw new Error(`trusted input differs from pinned source: ${file}`);
     }
+    hashes[file] = digest;
   }
-  return { repo, home, src };
+  return { repo, home, src, snapshotCommit: manifest.commit, hashes };
 }
 
 export async function dispatchMaintenanceControl(context: TrustedMaintenanceContext, request: ControlRequest): Promise<void> {
@@ -164,7 +171,7 @@ export async function dispatchMaintenanceControl(context: TrustedMaintenanceCont
     || input.experiments.some((name: unknown) => name !== "maintenance-active" && name !== "maintenance-idle")) {
     throw new Error("only fixed same-source maintenance controls are enabled; native admission is unavailable");
   }
-  const { repo, home, src } = await trustedInputs(context);
+  const { repo, home, src, snapshotCommit, hashes } = await trustedInputs(context);
   const data = path.join(home, "data");
   await mkdir(data, { recursive: true });
   if (await realpath(data) !== data) throw new Error("trusted data root must not traverse symlinks");
@@ -173,6 +180,11 @@ export async function dispatchMaintenanceControl(context: TrustedMaintenanceCont
     comparatorSource: path.join(src, COMPARATOR), sandboxSource: path.join(src, SANDBOX),
     output: path.join(data, "maintenance-control"),
   });
+  if (prepared.bindings.baselineMaintenanceSha256 !== hashes[MAINTENANCE]
+    || prepared.bindings.comparatorSourceSha256 !== hashes[COMPARATOR]
+    || prepared.bindings.sandboxSourceSha256 !== hashes[SANDBOX]) {
+    throw new Error("trusted inputs changed during preparation");
+  }
   for (const name of request.experiments) {
     const lane: MaintenanceLane = name === "maintenance-active" ? "active" : "idle";
     const raw = await evaluateMaintenance(prepared, lane);
@@ -183,7 +195,7 @@ export async function dispatchMaintenanceControl(context: TrustedMaintenanceCont
       scope: "local-file-maintenance-only", valid: 1, combined_score: score.ratio,
       log_uncertainty: score.logUncertainty, accepted: false, mode: "same-source-control",
       durable_rows_per_second: null, object_store_counts: "fixture-reported, not independent transient-write proof",
-      admission: "unavailable",
+      admission: "unavailable", snapshot_commit: snapshotCommit, evidence: raw,
     })}`);
   }
 }

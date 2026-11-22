@@ -79,6 +79,13 @@ test("real trusted control and missing protected file", {
     files[name] = { sha256: createHash("sha256").update(bytes).digest("hex") };
   }
   await writeFile(path.join(home, "trusted", "manifest.json"), JSON.stringify({ commit: SUPPORT_REVISION, files }));
+  const omitted = { ...files };
+  delete omitted[INPUTS[2]];
+  await writeFile(path.join(home, "trusted", "manifest.json"), JSON.stringify({ commit: SUPPORT_REVISION, files: omitted }));
+  await assert.rejects(dispatchMaintenanceControl({ repo, home }, {
+    mode: "control", experiments: ["maintenance-active"],
+  }), /manifest entry/);
+  await writeFile(path.join(home, "trusted", "manifest.json"), JSON.stringify({ commit: SUPPORT_REVISION, files }));
   const lines: string[] = [];
   const original = console.log;
   console.log = (line: string) => { lines.push(line); original(line); };
@@ -98,6 +105,8 @@ test("real trusted control and missing protected file", {
     assert.equal(result.accepted, false);
     assert.equal(result.durable_rows_per_second, null);
     assert.equal(result.admission, "unavailable");
+    assert.equal(result.snapshot_commit, SUPPORT_REVISION);
+    assert.ok(result.evidence);
     assert.ok(typeof result.combined_score === "number" && Number.isFinite(result.combined_score));
   }
   const root = path.join(home, "data", "maintenance-control");
