@@ -2216,6 +2216,7 @@ fn fitting_sort_chunk(
                     column.data_type(),
                     arrow::datatypes::DataType::Utf8
                         | arrow::datatypes::DataType::Int16
+                        | arrow::datatypes::DataType::Int64
                         | arrow::datatypes::DataType::Timestamp(_, _)
                 )
         })
