@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { availableParallelism, cpus } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 
 type JsonObject = Record<string, unknown>;
 
@@ -23,6 +24,23 @@ export function parityLadderConfig(seed: unknown, workers: number): JsonObject {
   }
   client.workers = workers;
   return config;
+}
+
+export function assertParityCollectorReadback(seed: unknown, actual: unknown): void {
+  const config = object(seed, "parity seed");
+  const expected = object(object(config.tunables, "tunables").collector, "collector");
+  const effective = object(actual, "collector readback");
+  for (const section of ["batching", "commit", "pressure"] as const) {
+    const requested = object(expected[section], `collector.${section}`);
+    const observed = object(effective[section], `readback.${section}`);
+    for (const [key, value] of Object.entries(requested)) {
+      if (!isDeepStrictEqual(observed[key], value)) throw new Error(`collector readback differs at ${section}.${key}`);
+    }
+  }
+  const runtime = object(expected.runtime, "collector.runtime");
+  if (object(effective.runtime, "readback.runtime").cpu_workers !== runtime.cpu_workers) {
+    throw new Error("collector readback differs at runtime.cpu_workers");
+  }
 }
 
 export interface ParityHostReceipt {

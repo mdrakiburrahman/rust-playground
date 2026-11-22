@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
+import { assertParityCollectorReadback, parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
 
 const meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n";
 const timestamp = "2026-11-22T09:00:00Z";
@@ -29,4 +29,21 @@ test("the parity ladder changes only offered worker count", () => {
   assert.equal(seed.tunables.client.workers, 8);
   assert.throws(() => parityLadderConfig(seed, 3), /worker count/);
   assert.throws(() => parityLadderConfig({ ...seed, replica_counts: [2] }, 4), /parity seed/);
+});
+
+test("collector parity readback rejects drift in historical limits and local pressure", () => {
+  const collector = {
+    batching: { global_capacity: { bytes: 4290000000 }, pipeline_depth: 8 },
+    commit: { batch_window: "2s" },
+    pressure: { rss_limit_bytes: 92341796864 },
+    runtime: { cpu_workers: 32 },
+  };
+  const seed = { tunables: { collector } };
+  assert.doesNotThrow(() => assertParityCollectorReadback(seed, collector));
+  assert.throws(() => assertParityCollectorReadback(seed, {
+    ...collector, batching: { ...collector.batching, pipeline_depth: 1 },
+  }), /batching.pipeline_depth/);
+  assert.throws(() => assertParityCollectorReadback(seed, {
+    ...collector, pressure: { rss_limit_bytes: 4294967296 },
+  }), /pressure.rss_limit_bytes/);
 });
