@@ -2880,6 +2880,12 @@ mod tests {
         rows: AtomicU64,
         capture_identities: AtomicBool,
         identities: Mutex<Vec<String>>,
+        expected_payload: Mutex<Option<Arc<RecordBatch>>>,
+        validated_rows: AtomicU64,
+        validated_batches: AtomicU64,
+        acknowledged_rows: AtomicU64,
+        acknowledged_batches: AtomicU64,
+        payload_mismatches: AtomicU64,
     }
 
     struct SmokeAdmission(Arc<SmokeState>);
@@ -2915,6 +2921,23 @@ mod tests {
     #[async_trait::async_trait]
     impl StreamLifecycle for SmokeStream {
         async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
+            {
+                let expected = self
+                    .state
+                    .expected_payload
+                    .lock()
+                    .map_err(|_| RuntimeError::internal())?;
+                if let Some(expected) = expected.as_deref() {
+                    if expected != &batch {
+                        self.state.payload_mismatches.fetch_add(1, Ordering::Relaxed);
+                        return Err(RuntimeError::internal());
+                    }
+                    self.state
+                        .validated_rows
+                        .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                    self.state.validated_batches.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.rows += batch.num_rows() as u64;
             if self.state.capture_identities.load(Ordering::Relaxed)
                 && let Ok(index) = batch.schema().index_of("endpoint_url")
@@ -2934,6 +2957,17 @@ mod tests {
             } else {
                 self.state.fast_completions.fetch_add(1, Ordering::Relaxed);
             }
+            let expected_rows = self
+                .state
+                .expected_payload
+                .lock()
+                .map_err(|_| RuntimeError::internal())?
+                .as_deref()
+                .map(|batch| batch.num_rows() as u64);
+            if expected_rows.is_some_and(|expected| self.rows != expected) {
+                self.state.payload_mismatches.fetch_add(1, Ordering::Relaxed);
+                return Err(RuntimeError::internal());
+            }
             self.state.rows.fetch_add(self.rows, Ordering::Relaxed);
             if self
                 .state
@@ -2943,6 +2977,8 @@ mod tests {
             {
                 return Err(RuntimeError::deadline_exceeded());
             }
+            self.state.acknowledged_rows.fetch_add(self.rows, Ordering::Relaxed);
+            self.state.acknowledged_batches.fetch_add(1, Ordering::Relaxed);
             Ok(StreamCompletion::best_effort())
         }
         async fn abort(self: Box<Self>, _: StreamAbortReason) {}
@@ -2958,6 +2994,102 @@ mod tests {
         Cli::try_parse_from(["test", "--workers", "2", "--data-profile", "diagnostic"])?
             .options
             .resolve(100, 1)
+    }
+
+    fn diagnostic_ceiling_options(workers: usize) -> Result<Options> {
+        let mut options = options()?;
+        options.data_mode = DataMode::Shared;
+        options.data_profile = DataProfile::Diagnostic;
+        options.string_length_distribution = Some(StringLengthDistribution::Fixed);
+        options.value_variation = Some(ValueVariation::Cardinality);
+        options.guid_uniqueness = Some(GuidUniqueness::Cardinality);
+        options.string_width = 0;
+        options.cardinality = 1024;
+        options.null_fraction = 0.0;
+        options.skew = 0.0;
+        options.entropy = 1.0;
+        options.seed = 20_260_923;
+        options.pod_ordinal = 0;
+        options.workers = workers;
+        options.runtime_threads = 12;
+        options.streams_per_worker = 2;
+        options.connections_per_worker = 1;
+        options.interval_us = 0;
+        options.batch_rows = 65_536;
+        options.corpus_rows = 65_536;
+        options.corpus_bytes = 0;
+        options.max_flight_data_bytes = 67_108_864;
+        options.max_message_bytes = 134_217_728;
+        options.max_memory_bytes = 1_073_741_824;
+        options.ipc_compression = IpcCompression::None;
+        options.grpc_send_compression = GrpcCompression::None;
+        options.grpc_accept_compression = GrpcCompression::None;
+        let options = options.resolve(8192, 32)?;
+        assert_eq!(options.workers, workers);
+        assert_eq!(options.runtime_threads, 12);
+        assert_eq!(options.batch_rows, 65_536);
+        assert_eq!(options.corpus_rows, 65_536);
+        assert_eq!(options.streams_per_worker, 2);
+        assert_eq!(options.data_mode, DataMode::Shared);
+        assert_eq!(options.data_profile, DataProfile::Diagnostic);
+        assert_eq!(
+            options.string_length_distribution,
+            Some(StringLengthDistribution::Fixed)
+        );
+        assert_eq!(options.value_variation, Some(ValueVariation::Cardinality));
+        assert_eq!(options.guid_uniqueness, Some(GuidUniqueness::Cardinality));
+        assert_eq!(options.ipc_compression, IpcCompression::None);
+        assert_eq!(options.grpc_send_compression, GrpcCompression::None);
+        assert_eq!(options.grpc_accept_compression, GrpcCompression::None);
+        assert_eq!(options.max_flight_data_bytes, 67_108_864);
+        assert_eq!(options.max_message_bytes, 134_217_728);
+        assert_eq!(options.max_memory_bytes, 1_073_741_824);
+        Ok(options)
+    }
+
+    fn diagnostic_ceiling_duration(name: &str, default_ms: u64, min_ms: u64, max_ms: u64) -> Result<u64> {
+        let value = match std::env::var(name) {
+            Ok(value) => value
+                .parse::<u64>()
+                .with_context(|| format!("{name} must be an integer"))?,
+            Err(std::env::VarError::NotPresent) => default_ms,
+            Err(error) => return Err(error).with_context(|| format!("read {name}")),
+        };
+        anyhow::ensure!(
+            (min_ms..=max_ms).contains(&value),
+            "{name} must be in {min_ms}..={max_ms}"
+        );
+        Ok(value)
+    }
+
+    fn diagnostic_process_rss() -> Result<serde_json::Value> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").context("read process RSS")?;
+            let read_kib = |name: &str| -> Result<u64> {
+                let value = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .with_context(|| format!("missing {name} in process status"))?;
+                let mut fields = value.split_whitespace();
+                let kib = fields.next().context("missing RSS value")?.parse::<u64>()?;
+                anyhow::ensure!(fields.next() == Some("kB"), "unexpected RSS unit");
+                kib.checked_mul(1024).context("RSS byte conversion overflow")
+            };
+            Ok(serde_json::json!({
+                "rss_bytes_at_settlement": read_kib("VmRSS:")?,
+                "peak_rss_bytes_process_lifetime": read_kib("VmHWM:")?,
+                "scope": "test_process_includes_loopback_sink"
+            }))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(serde_json::json!({
+                "rss_bytes_at_settlement": null,
+                "peak_rss_bytes_process_lifetime": null,
+                "unavailable_reason": "process_rss_not_supported_on_this_platform"
+            }))
+        }
     }
 
     fn manifest_test_client() -> Result<PreparedClient> {
@@ -4324,7 +4456,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
     #[ignore = "explicit client-ceiling measurement against an in-memory Flight sink"]
     async fn null_flight_sink_client_ceiling_across_worker_counts() -> Result<()> {
         use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
@@ -4338,12 +4470,21 @@ mod tests {
         )?;
         let auth = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(1)?, None)?;
         let state = Arc::new(SmokeState::default());
+        let expected_options = diagnostic_ceiling_options(8)?;
+        let table = Arc::new(table_named("sqlserver_availability_replica_states")?);
+        let expected_payload = synthetic_batch(&table, "direct-e64-confirmwide", 65_536, 0, 0, &expected_options)?;
+        *state
+            .expected_payload
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sink payload lock poisoned"))? = Some(Arc::new(expected_payload));
+        let mut limits = RuntimeLimits::default();
+        limits.max_message_bytes = 134_217_728;
         let service = ArrowColFlightService::new(
             ImplementationPool::Dataflow,
             Arc::clone(&store),
             Arc::new(AllowAllAuthenticator::new(auth)),
             Arc::new(SmokeAdmission(Arc::clone(&state))),
-            RuntimeLimits::default(),
+            limits,
         )?
         .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
         .into_tonic_service();
@@ -4362,28 +4503,30 @@ mod tests {
                 .await
         });
 
-        for workers in [1, 2, 4, 8, 16, 32] {
-            let mut options = options()?;
-            options.data_profile = DataProfile::Realistic;
-            options.workers = workers;
-            options.corpus_rows = 4_096;
-            options.batch_rows = 4_096;
-            options.streams_per_worker = 2;
-            options.interval_us = 0;
+        let warmup_ms = diagnostic_ceiling_duration("DIAGNOSTIC_CEILING_WARMUP_MS", 10_000, 0, 60_000)?;
+        let window_ms = diagnostic_ceiling_duration("DIAGNOSTIC_CEILING_WINDOW_MS", 150_000, 1_000, 600_000)?;
+        for (sample, workers) in [8].into_iter().enumerate() {
+            let options = diagnostic_ceiling_options(workers)?;
             let client = PreparedClient::prepare(
                 &endpoint,
-                "ceiling",
+                "direct-e64-confirmwide",
                 Some("sqlserver_availability_replica_states"),
                 None,
                 options,
             )
             .await?;
+            let validated_rows_before = state.validated_rows.load(Ordering::Relaxed);
+            let validated_batches_before = state.validated_batches.load(Ordering::Relaxed);
+            let acknowledged_rows_before = state.acknowledged_rows.load(Ordering::Relaxed);
+            let acknowledged_batches_before = state.acknowledged_batches.load(Ordering::Relaxed);
+            let payload_mismatches_before = state.payload_mismatches.load(Ordering::Relaxed);
             let scheduled_start = unix_ms()? + 100;
-            let measurement_start = scheduled_start + 50;
-            let measurement_end = measurement_start + 1_000;
-            client
+            let measurement_start = scheduled_start + warmup_ms;
+            let measurement_end = measurement_start + window_ms;
+            let report = client
                 .run_continuous(scheduled_start, measurement_start, measurement_end)
                 .await?;
+            let settled_unix_ms = unix_ms()?;
             let snapshot = client.metrics("completed")?;
             client.ensure_terminal_manifest_complete()?;
             let window = &snapshot["measurement_window"];
@@ -4394,14 +4537,140 @@ mod tests {
             let configured_bytes = window["completed_flight_data_bytes_configured_ipc_compression"]
                 .as_u64()
                 .context("missing configured-compression FlightData bytes")?;
+            let workers_snapshot = snapshot["workers"].as_array().context("missing worker metrics")?;
+            let sum_worker = |field: &str| -> Result<u64> {
+                workers_snapshot.iter().try_fold(0_u64, |total, worker| {
+                    total
+                        .checked_add(
+                            worker[field]
+                                .as_u64()
+                                .with_context(|| format!("missing worker counter {field}"))?,
+                        )
+                        .context("worker counter sum overflow")
+                })
+            };
+            let attempted_rows = sum_worker("attempted_rows")?;
+            let process_completed_rows = sum_worker("completed_rows")?;
+            let mut unexpected_error_rows = 0_u64;
+            for field in [
+                "error_rows",
+                "rejected_rows",
+                "retried_rows",
+                "given_up_rows",
+                "ambiguous_rows",
+                "cancelled_rows",
+            ] {
+                unexpected_error_rows = unexpected_error_rows
+                    .checked_add(sum_worker(field)?)
+                    .context("unexpected error row count overflow")?;
+            }
+            let validated_rows = state
+                .validated_rows
+                .load(Ordering::Relaxed)
+                .checked_sub(validated_rows_before)
+                .context("validated row counter reset")?;
+            let validated_batches = state
+                .validated_batches
+                .load(Ordering::Relaxed)
+                .checked_sub(validated_batches_before)
+                .context("validated batch counter reset")?;
+            let acknowledged_rows = state
+                .acknowledged_rows
+                .load(Ordering::Relaxed)
+                .checked_sub(acknowledged_rows_before)
+                .context("acknowledged row counter reset")?;
+            let acknowledged_batches = state
+                .acknowledged_batches
+                .load(Ordering::Relaxed)
+                .checked_sub(acknowledged_batches_before)
+                .context("acknowledged batch counter reset")?;
+            let payload_mismatches = state
+                .payload_mismatches
+                .load(Ordering::Relaxed)
+                .checked_sub(payload_mismatches_before)
+                .context("payload mismatch counter reset")?;
+            let preparation = &snapshot["preparation"];
+            let corpus_rows = preparation["corpus_rows"]
+                .as_u64()
+                .context("missing generated corpus rows")?;
+            let corpus_flight_data_bytes = preparation["corpus_configured_ipc_compression_flight_data_bytes"]
+                .as_u64()
+                .context("missing encoded corpus FlightData bytes")?;
+            let memory_reservation_bytes = preparation["memory_reservation_bytes"]
+                .as_u64()
+                .context("missing corpus memory reservation")?;
             let measurement_seconds = (measurement_end - measurement_start) as f64 / 1000.0;
+            let resources = &window["client_resources"];
+            let rss = diagnostic_process_rss()?;
+            let cpu_unavailable_reason = resources["process_cpu_seconds"]
+                .is_null()
+                .then_some("process_cpu_clock_or_boundary_sample_unavailable");
             eprintln!(
-                "W2_CLIENT_SINK_PROBE tokio_runtime_threads=8 workers={workers} aggregate_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6}",
-                rows as f64 / measurement_seconds,
-                uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
-                configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                "W2_DIAGNOSTIC_SINK_SAMPLE {}",
+                serde_json::json!({
+                    "sample": sample + 1,
+                    "workers": workers,
+                    "runtime_threads": 12,
+                    "legacy_rows": 8192,
+                    "legacy_concurrency": 32,
+                    "warmup_ms": warmup_ms,
+                    "scheduled_start_unix_ms": scheduled_start,
+                    "measurement_start_unix_ms": measurement_start,
+                    "measurement_start_observed_unix_ms": report.measurement_started_unix_ms,
+                    "measurement_end_unix_ms": measurement_end,
+                    "settled_unix_ms": settled_unix_ms,
+                    "measurement_duration_ms": window_ms,
+                    "windows": window["windows"].clone(),
+                    "process_cpu": resources.clone(),
+                    "process_cpu_unavailable_reason": cpu_unavailable_reason,
+                    "process_cpu_scope": "test_process_includes_loopback_sink",
+                    "process_rss": rss,
+                    "attempted_rows_process_cumulative": attempted_rows,
+                    "client_completed_rows_process_cumulative": process_completed_rows,
+                    "measurement_window_client_completed_rows": rows,
+                    "sink_payload_validated_rows": validated_rows,
+                    "sink_payload_validated_batches": validated_batches,
+                    "sink_acknowledged_rows": acknowledged_rows,
+                    "sink_acknowledged_batches": acknowledged_batches,
+                    "payload_mismatches": payload_mismatches,
+                    "unexpected_error_rows": unexpected_error_rows,
+                    "measurement_window_flight_data_protobuf_bytes_ipc_none": configured_bytes,
+                    "measurement_window_flight_data_protobuf_bytes_uncompressed": uncompressed_bytes,
+                    "corpus_generated_rows": corpus_rows,
+                    "corpus_flight_data_protobuf_bytes_ipc_none": corpus_flight_data_bytes,
+                    "memory_reservation_bytes": memory_reservation_bytes,
+                    "configured_memory_cap_bytes": client.options.max_memory_bytes,
+                    "aggregate_rows_per_second": rows as f64 / measurement_seconds,
+                    "flight_data_protobuf_bytes_per_second": configured_bytes as f64 / measurement_seconds,
+                    "effective_config": serde_json::to_value(&client.options)?,
+                    "completion_semantics": snapshot["completion_semantics"].clone(),
+                    "bytes_semantics": snapshot["bytes_semantics"].clone(),
+                }),
             );
+            assert_eq!(corpus_rows, 65_536, "unexpected generated corpus size");
+            assert!(memory_reservation_bytes <= client.options.max_memory_bytes);
+            assert!(attempted_rows > 0, "client attempted no rows with {workers} workers");
+            assert_eq!(
+                unexpected_error_rows, 0,
+                "unexpected send errors with {workers} workers"
+            );
+            assert_eq!(payload_mismatches, 0, "sink observed a payload mismatch");
+            assert_eq!(validated_rows, acknowledged_rows, "sink acknowledged unchecked rows");
+            assert_eq!(
+                validated_batches, acknowledged_batches,
+                "sink acknowledged unchecked batches"
+            );
+            assert_eq!(
+                process_completed_rows, acknowledged_rows,
+                "client/sink completion disagreement"
+            );
+            assert_eq!(attempted_rows, process_completed_rows, "unsettled attempted rows");
+            assert_eq!(report.completed_rows, rows, "measurement report and snapshot disagree");
             assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
+            assert_eq!(
+                configured_bytes, uncompressed_bytes,
+                "IPC None must preserve the protobuf byte count"
+            );
         }
 
         shutdown
