@@ -10,6 +10,8 @@ use url::Url;
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
     #[serde(default)]
+    pub stage_telemetry_interval_ms: Option<u64>,
+    #[serde(default)]
     pub overload_guard: OverloadGuardConfig,
     #[serde(default, deserialize_with = "deserialize_oat_tunables")]
     pub tunables: Tunables,
@@ -928,6 +930,9 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        if self.stage_telemetry_interval_ms.is_some_and(|value| !(100..=60_000).contains(&value)) {
+            bail!("stage_telemetry_interval_ms must be an integer in 100..=60000, or null to disable");
+        }
         if self
             .platform
             .local
@@ -1568,6 +1573,28 @@ mod tests {
     }
 
     #[test]
+    fn stage_telemetry_interval_defaults_off_and_is_strictly_bounded() -> Result<()> {
+        let mut request: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        assert_eq!(serde_json::from_value::<OatConfig>(request.clone())?.stage_telemetry_interval_ms, None);
+        for value in [serde_json::json!("1000"), serde_json::json!(1.5), serde_json::json!(-1), serde_json::json!(true)] {
+            request["stage_telemetry_interval_ms"] = value;
+            assert!(serde_json::from_value::<OatConfig>(request.clone()).is_err());
+        }
+        let mut config = valid();
+        for value in [0, 99, 60_001] {
+            config.stage_telemetry_interval_ms = Some(value);
+            assert!(config.validate().is_err());
+        }
+        for value in [100, 1_000, 60_000] {
+            config.stage_telemetry_interval_ms = Some(value);
+            config.validate()?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn schedule_lead_is_strict_bounded_and_fits_the_actual_client_wait_limit() -> Result<()> {
         let mut request: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
@@ -1625,6 +1652,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("write isolated OAT config fixture {}: {error}", path.display()));
         }
         let config = OatConfig {
+            stage_telemetry_interval_ms: None,
             overload_guard: OverloadGuardConfig::default(),
             tunables: Tunables::default(),
             campaign_profile: None,
