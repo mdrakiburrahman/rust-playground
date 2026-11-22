@@ -1,5 +1,5 @@
 //! Run with `cargo run --locked --release -p arrow-deltalake --no-default-features
-//! --example layout-sort-fixture -- parity|nulls|stress ITERATIONS`.
+//! --example layout-sort-fixture -- constant|parity|nulls|stress ITERATIONS`.
 //! The parity corpus models per-batch constant customer IDs; the other cases
 //! are synthetic nullable-key stress cases. Arrow's ordering is unstable for
 //! ties. CPU ticks use Linux process accounting (`getconf CLK_TCK` for units);
@@ -46,7 +46,7 @@ fn schema(stress: bool) -> SchemaRef {
     ))
 }
 
-fn corpus(stress: bool) -> Result<Vec<RecordBatch>> {
+fn corpus(stress: bool, constant: bool) -> Result<Vec<RecordBatch>> {
     let schema = schema(stress);
     (0..BATCHES)
         .map(|batch| {
@@ -63,10 +63,12 @@ fn corpus(stress: bool) -> Result<Vec<RecordBatch>> {
                 let id = batch * BATCH_ROWS + row;
                 let key = if stress {
                     (id * 17 + batch) % 13
+                } else if constant {
+                    0
                 } else {
                     (batch * 7) % 11
                 };
-                customers.push(if stress && id % 19 == 0 {
+                customers.push(if stress && id.is_multiple_of(19) {
                     None
                 } else {
                     Some(format!("customer-{key:02}"))
@@ -74,14 +76,14 @@ fn corpus(stress: bool) -> Result<Vec<RecordBatch>> {
                 times.push(1_700_000_000_000_i64 + id as i64);
                 instances.push(format!("sql-instance-{:02}", id % 16));
                 machines.push(format!("machine-{:02}", id % 32));
-                databases.push(if stress && id % 23 == 0 {
+                databases.push(if stress && id.is_multiple_of(23) {
                     None
                 } else {
                     Some((id % 17) as i16)
                 });
                 names.push(format!("database-{:02}", id % 17));
                 sessions.push((id % 1000) as i16);
-                statuses.push(if id % 2 == 0 { "running" } else { "sleeping" });
+                statuses.push(if id.is_multiple_of(2) { "running" } else { "sleeping" });
                 connections.push(format!("connection-{id:08}"));
             }
             RecordBatch::try_new(
@@ -235,13 +237,13 @@ fn high_water_kib() -> Result<u64> {
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     ensure!(
-        args.len() == 3 && (args[1] == "parity" || args[1] == "nulls" || args[1] == "stress"),
-        "usage: layout-sort-fixture parity|nulls|stress iterations"
+        args.len() == 3 && (args[1] == "constant" || args[1] == "parity" || args[1] == "nulls" || args[1] == "stress"),
+        "usage: layout-sort-fixture constant|parity|nulls|stress iterations"
     );
     let iterations: usize = args[2].parse()?;
     ensure!((1..=100).contains(&iterations), "iterations must be 1..=100");
     let stress = args[1] == "stress";
-    let batches = corpus(args[1] != "parity")?;
+    let batches = corpus(args[1] == "nulls" || stress, args[1] == "constant")?;
     let input_bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
     let policy = LayoutPolicy {
         sort_columns: if stress {
@@ -263,6 +265,33 @@ fn main() -> Result<()> {
     let input = concat_batches(&batches[0].schema(), &batches)?;
     let input_hash = hash(&input)?;
     let output_hash = hash(&expected)?;
+    let options = Some(SortOptions {
+        descending: false,
+        nulls_first: false,
+    });
+    let sort_indices = if stress {
+        lexsort_to_indices(
+            &[
+                SortColumn {
+                    values: Arc::clone(input.column(0)),
+                    options,
+                },
+                SortColumn {
+                    values: Arc::clone(input.column(4)),
+                    options,
+                },
+            ],
+            None,
+        )?
+    } else {
+        sort_to_indices(input.column(0), options, None)?
+    };
+    let identity_positions = sort_indices
+        .values()
+        .iter()
+        .enumerate()
+        .filter(|(index, value)| **value as usize == *index)
+        .count();
 
     let variable = vec![
         input.slice(0, 1),
@@ -316,11 +345,12 @@ fn main() -> Result<()> {
     ensure!(oversized.try_push(&batches[0]).is_err(), "oversized batch accepted");
 
     println!(
-        "case={} batches={} rows={} retained_input_bytes={} input_sha256={} output_sha256={}",
+        "case={} batches={} rows={} retained_input_bytes={} identity_positions={} input_sha256={} output_sha256={}",
         args[1],
         BATCHES,
         input.num_rows(),
         input_bytes,
+        identity_positions,
         input_hash,
         output_hash
     );
