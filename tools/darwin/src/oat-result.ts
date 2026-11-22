@@ -28,6 +28,34 @@ export interface ClientEvidence {
   cpu: { coreEquivalents: number | null; sampleStartUnixMs: number | null; sampleEndUnixMs: number | null; unavailableReason: string | null };
 }
 
+type OptionalStageEvidence = { value: JsonObject | null; unavailableReason: string | null };
+export interface StageEvidence {
+  collector: OptionalStageEvidence;
+  client: OptionalStageEvidence;
+  commit: OptionalStageEvidence;
+}
+
+export function extractStageEvidence(input: unknown): StageEvidence {
+  const evidence = object(input, "OAT evidence");
+  const optionalObject = (value: unknown): JsonObject | undefined =>
+    typeof value === "object" && value !== null && !Array.isArray(value) ? value as JsonObject : undefined;
+  const stage = (value: unknown, name: string): OptionalStageEvidence => {
+    const data = optionalObject(value);
+    return data ? { value: data, unavailableReason: null }
+      : { value: null, unavailableReason: `${name} stage evidence unavailable` };
+  };
+  const reports = Array.isArray(evidence.client_phase_reports) ? evidence.client_phase_reports : [];
+  const phase = optionalObject(optionalObject(reports[0])?.phase_counters);
+  const window = optionalObject(phase?.measurement_window);
+  const commits = optionalObject(evidence.durable_commits);
+  const output = optionalObject(commits?.output_throughput);
+  return {
+    collector: stage(evidence.collector_stage_telemetry, "collector"),
+    client: stage(window?.client_stage_telemetry, "client"),
+    commit: stage(output?.commit_stage_latency_seconds, "commit"),
+  };
+}
+
 export function extractStoppedReceipts(
   input: unknown, stoppedInput: unknown, runId: string, table: string, measurement: OatMeasurement,
 ) {
@@ -115,7 +143,7 @@ export async function readReconciledOatResult(
   resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number | null,
   requestedProfile: ClientDataProfile, parity?: { config: unknown; inspectActiveFooter: (path: string) => Promise<void> },
 ): Promise<{
-  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
+  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; stageEvidence: StageEvidence; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   cellRunId: string; snapshotReconciled: true;
@@ -204,7 +232,7 @@ export async function readReconciledOatResult(
     parity ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.inspectActiveFooter,
   );
   return {
-    measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
+    measurement, images, clientEvidence, stageEvidence: extractStageEvidence(evidence), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows,
     cellRunId: row.run_id, snapshotReconciled: true,
   };

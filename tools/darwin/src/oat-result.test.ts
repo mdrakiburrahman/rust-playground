@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractClientEvidence, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
+import { extractClientEvidence, extractStageEvidence, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
 import type { OatMeasurement } from "./metrics-adapter.js";
 
 function reportFor(profile: ClientDataProfile) {
@@ -21,6 +21,24 @@ function reportFor(profile: ClientDataProfile) {
   };
   return { phase_counters: { preparation, payload_manifest: payloadManifest, measurement_window: { client_resources: clientResources } } };
 }
+
+test("passes stage evidence through and marks missing evidence unavailable", () => {
+  const collector = { schema_version: 1, samples: [{ rows: 4 }] };
+  const client = { enabled: true, transport_stall_count: null, transport_stall_unavailable_reason: "not observable" };
+  const commit = { log_write: { p50: 0.1, p99: 0.2, samples: 3 } };
+  const stages = extractStageEvidence({
+    collector_stage_telemetry: collector,
+    client_phase_reports: [{ phase_counters: { measurement_window: { client_stage_telemetry: client } } }],
+    durable_commits: { output_throughput: { commit_stage_latency_seconds: commit } },
+  });
+  assert.deepEqual(stages.collector, { value: collector, unavailableReason: null });
+  assert.deepEqual(stages.client, { value: client, unavailableReason: null });
+  assert.deepEqual(stages.commit, { value: commit, unavailableReason: null });
+  for (const stage of Object.values(extractStageEvidence({}))) {
+    assert.equal(stage.value, null);
+    assert.match(stage.unavailableReason!, /unavailable/);
+  }
+});
 
 test("refuses a diagnostic result without the physical parity gate", async () => {
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "diagnostic"),
