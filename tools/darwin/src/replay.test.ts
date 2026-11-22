@@ -4,7 +4,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { cleanEnv, hasPinnedSubmodules } from "./replay.js";
+import { cleanEnv, hasPinnedSubmodules, localReplayOptions } from "./replay.js";
+
+test("keeps the frozen collector hard cap when wiring replay endpoints", () => {
+  const local = localReplayOptions({ collector_memory_limit_bytes: 4294967296 }, "127.0.0.1", "127.0.0.1", "/snapshot");
+  assert.equal(local.collector_memory_limit_bytes, 4294967296);
+  assert.throws(() => localReplayOptions({}, "127.0.0.1", "127.0.0.1", "/snapshot"), /memory limit/);
+});
 
 test("the isolated runtime can execute npx without inheriting credentials", async () => {
   const home = await mkdtemp(join(tmpdir(), "darwin-home-"));

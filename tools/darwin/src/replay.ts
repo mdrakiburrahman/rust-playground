@@ -15,6 +15,14 @@ function object(value: unknown, label: string): JsonObject {
   return value as JsonObject;
 }
 
+export function localReplayOptions(raw: unknown, bindHost: string, endpointHost: string, snapshotRoot: string): JsonObject {
+  const local = object(raw, "local platform");
+  if (!Number.isSafeInteger(local.collector_memory_limit_bytes) || Number(local.collector_memory_limit_bytes) <= 0) {
+    throw new Error("local replay requires a frozen collector memory limit");
+  }
+  return { ...local, bind_host: bindHost, endpoint_host: endpointHost, snapshot_root: snapshotRoot };
+}
+
 export function cleanEnv(home: string, stackBytes: number): NodeJS.ProcessEnv {
   return {
     HOME: home, USER: userInfo().username, LANG: "C.UTF-8",
@@ -158,7 +166,7 @@ export async function replayCompressionPair(
       if (platform.kind !== "local" || !Array.isArray(config.tables) || config.tables.length !== 1
         || config.tables[0] !== "sqlserver_active_sessions") throw new Error("unsupported replay topology or fixture");
       platform.compose_state_root = join(runRoot, "state");
-      platform.local = { bind_host: bindHost, endpoint_host: endpointHost, snapshot_root: join(runRoot, "snapshots") };
+      platform.local = localReplayOptions(platform.local, bindHost, endpointHost, join(runRoot, "snapshots"));
       config.result_url = pathToFileURL(join(runRoot, "results.parquet")).href;
       config.website_url = pathToFileURL(join(runRoot, "site", "results.parquet")).href;
       const configPath = join(runRoot, "config.json");

@@ -4,7 +4,10 @@
     "compose_file": "projects/loadtest/compose.yaml",
     "compose_override_file": "projects/loadtest/compose.oat.yaml",
     "compose_project": "arrowcol-oat-tuned",
-    "compose_state_root": "out/arrowcol-oat/tuned"
+    "compose_state_root": "out/arrowcol-oat/tuned",
+    "local": {
+      "collector_memory_limit_bytes": 4294967296
+    }
   },
   "warmup_seconds": 60,
   "measure_seconds": 150,
