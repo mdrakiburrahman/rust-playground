@@ -1217,9 +1217,9 @@ impl RuntimeMetrics {
             && let Some(entry) = backlog.entries.get_mut(&id)
             && let Some(state) = entry.stage.as_mut()
         {
-            if entry.pending_admissions != 1 || state.stage == PublicationStage::Replay {
+            if entry.pending_admissions != 1 {
                 state.stage = PublicationStage::Replay;
-            } else {
+            } else if !matches!(state.stage, PublicationStage::Unknown | PublicationStage::Replay) {
                 state.stage = stage;
             }
         }
@@ -2587,17 +2587,27 @@ mod tests {
     fn stage_saturation_unknown_partial_commit_and_lost_tracking_stay_unknown() {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_publication_backlog(2).expect("capacity");
+        let id = PublicationId::new();
         let token = metrics
-            .publication_backlog_start(PublicationId::new(), 4, 256, Instant::now())
+            .publication_backlog_start(id, 4, 256, Instant::now())
             .expect("admit");
         metrics.stage_admitted(token, &table());
         metrics.stage_transition(token, PublicationStage::Unknown);
         let snapshot = metrics.stage_saturation_snapshot();
         assert!(snapshot["tables"][0]["flushing"]["logical_bytes"].is_null());
         assert!(snapshot["tables"][0]["written_not_durable"]["rows"].is_null());
+        metrics.stage_transition(token, PublicationStage::Flushing);
         metrics.stage_transition(token, PublicationStage::Written);
+        let snapshot = metrics.stage_saturation_snapshot();
+        assert!(snapshot["tables"][0]["flushing"]["rows"].is_null());
+        assert!(snapshot["tables"][0]["written_not_durable"]["rows"].is_null());
+        metrics.publication_backlog_commit(token).expect("settle");
+        let next = metrics
+            .publication_backlog_start(id, 4, 256, Instant::now())
+            .expect("new generation");
+        metrics.stage_admitted(next, &table());
         assert_eq!(
-            metrics.stage_saturation_snapshot()["tables"][0]["written_not_durable"]["rows"],
+            metrics.stage_saturation_snapshot()["tables"][0]["admitted_waiting"]["rows"],
             4
         );
         metrics.publication_backlog_mark_unknown();

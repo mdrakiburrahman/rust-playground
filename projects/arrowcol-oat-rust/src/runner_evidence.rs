@@ -233,7 +233,9 @@ mod official_cell_measurement_tests {
             },
             started_at_ms: 1_000, qap: QapMetrics::default(), resources: None, resource_evidence: None,
         })?;
-        let output = commit_window_output(&BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None)?;
+        let output = commit_window_output(
+            &BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None, config.stage_telemetry_interval_ms.is_some(),
+        )?;
         rows[0].evidence_json = Some(serde_json::to_string(&json!({
             "version": 1, "commit_window_output_throughput": output,
         }))?);
