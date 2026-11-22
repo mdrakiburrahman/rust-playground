@@ -82,20 +82,38 @@ mod tests {
     use parquet::{
         arrow::ArrowWriter,
         file::properties::{EnabledStatistics, WriterProperties},
+        schema::types::ColumnPath,
     };
 
     use super::*;
 
-    fn fixture(compression: Compression, dictionary: bool, statistics: EnabledStatistics) -> std::path::PathBuf {
+    fn fixture(
+        compression: Compression,
+        dictionary: bool,
+        statistics: EnabledStatistics,
+        second_codec: Option<Compression>,
+    ) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("parity-footer-{}.parquet", uuid::Uuid::new_v4()));
-        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 1, 2]))]).unwrap();
-        let props = WriterProperties::builder()
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new("second", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1, 2])),
+                Arc::new(Int32Array::from(vec![2, 3, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let mut props = WriterProperties::builder()
             .set_compression(compression)
             .set_dictionary_enabled(dictionary)
-            .set_statistics_enabled(statistics)
-            .build();
-        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+            .set_statistics_enabled(statistics);
+        if let Some(codec) = second_codec {
+            props = props.set_column_compression(ColumnPath::from("second"), codec);
+        }
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props.build())).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         path
@@ -115,9 +133,17 @@ mod tests {
             (Compression::UNCOMPRESSED, true, EnabledStatistics::Chunk, false),
             (Compression::UNCOMPRESSED, true, EnabledStatistics::None, false),
         ] {
-            let path = fixture(compression, dictionary, statistics);
+            let path = fixture(compression, dictionary, statistics, None);
             assert_eq!(inspect(&path).is_ok(), valid);
             fs::remove_file(path).unwrap();
         }
+        let path = fixture(
+            Compression::UNCOMPRESSED,
+            true,
+            EnabledStatistics::Page,
+            Some(Compression::ZSTD(Default::default())),
+        );
+        assert!(inspect(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 }
