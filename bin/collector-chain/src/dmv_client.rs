@@ -12,7 +12,9 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use std::{pin::Pin, vec::IntoIter};
 use tokio::task::JoinSet;
 
 const MAX_LOGICAL_BATCH_RECORDS: usize = 1_000_000;
@@ -650,6 +652,8 @@ enum ClientTelemetryUnavailable {
     StreamIdOverflow = 3,
     ByteAccountingInconsistent = 4,
     DurationOverflow = 5,
+    ClockUnavailable = 6,
+    MeasurementWindowElapsedBeforeFirstSample = 7,
 }
 
 impl ClientTelemetryUnavailable {
@@ -660,6 +664,8 @@ impl ClientTelemetryUnavailable {
             Self::StreamIdOverflow => "telemetry_stream_id_overflow",
             Self::ByteAccountingInconsistent => "telemetry_byte_accounting_inconsistent",
             Self::DurationOverflow => "telemetry_duration_overflow",
+            Self::ClockUnavailable => "unix_clock_unavailable",
+            Self::MeasurementWindowElapsedBeforeFirstSample => "measurement_window_elapsed_before_first_sample",
         }
     }
 }
@@ -730,6 +736,12 @@ impl ClientStageTelemetry {
             }
             value if value == ClientTelemetryUnavailable::ByteAccountingInconsistent as u8 => {
                 Some(ClientTelemetryUnavailable::ByteAccountingInconsistent.reason())
+            }
+            value if value == ClientTelemetryUnavailable::ClockUnavailable as u8 => {
+                Some(ClientTelemetryUnavailable::ClockUnavailable.reason())
+            }
+            value if value == ClientTelemetryUnavailable::MeasurementWindowElapsedBeforeFirstSample as u8 => {
+                Some(ClientTelemetryUnavailable::MeasurementWindowElapsedBeforeFirstSample.reason())
             }
             _ => Some(ClientTelemetryUnavailable::DurationOverflow.reason()),
         }
@@ -859,7 +871,7 @@ impl ClientStageTelemetry {
         }
         let now = Instant::now();
         let interval = Duration::from_millis(self.interval_ms);
-        let mut active_streams = match self.active_streams.lock() {
+        let active_streams = match self.active_streams.lock() {
             Ok(active_streams) => active_streams,
             Err(_) => {
                 self.mark_unavailable(ClientTelemetryUnavailable::LockPoisoned);
@@ -1175,23 +1187,48 @@ impl Drop for ClientStreamGuard {
     }
 }
 
-fn client_request_body(
-    data: Vec<FlightData>,
-    guard: Option<&ClientStreamGuard>,
-) -> impl futures::Stream<Item = FlightData> + Send + 'static {
-    match guard {
-        Some(guard) => {
-            let telemetry = Arc::clone(&guard.telemetry);
-            let progress = Arc::clone(&guard.progress);
-            futures::stream::Either::Left(stream::iter(data).inspect(move |message| {
-                ClientStreamGuard::record_yield(
-                    &telemetry,
-                    &progress,
-                    u64::try_from(message.encoded_len()).unwrap_or(u64::MAX),
-                );
-            }))
+enum ClientRequestBody {
+    Untracked(IntoIter<FlightData>),
+    Tracked {
+        messages: IntoIter<FlightData>,
+        telemetry: Arc<ClientStageTelemetry>,
+        progress: Arc<Mutex<StageStreamProgress>>,
+    },
+}
+
+impl futures::Stream for ClientRequestBody {
+    type Item = FlightData;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Untracked(messages) => Poll::Ready(messages.next()),
+            Self::Tracked {
+                messages,
+                telemetry,
+                progress,
+            } => {
+                let message = messages.next();
+                if let Some(message) = &message {
+                    ClientStreamGuard::record_yield(
+                        telemetry,
+                        progress,
+                        u64::try_from(message.encoded_len()).unwrap_or(u64::MAX),
+                    );
+                }
+                Poll::Ready(message)
+            }
         }
-        None => futures::stream::Either::Right(stream::iter(data)),
+    }
+}
+
+fn client_request_body(data: Vec<FlightData>, guard: Option<&ClientStreamGuard>) -> ClientRequestBody {
+    match guard {
+        Some(guard) => ClientRequestBody::Tracked {
+            messages: data.into_iter(),
+            telemetry: Arc::clone(&guard.telemetry),
+            progress: Arc::clone(&guard.progress),
+        },
+        None => ClientRequestBody::Untracked(data.into_iter()),
     }
 }
 
@@ -2154,12 +2191,13 @@ impl PreparedClient {
                     let now_unix_ms = match unix_ms() {
                         Ok(now) => now,
                         Err(_) => {
-                            telemetry.set_sampling_unavailable("unix_clock_unavailable");
+                            telemetry.mark_unavailable(ClientTelemetryUnavailable::ClockUnavailable);
                             return;
                         }
                     };
                     if now_unix_ms >= end_unix_ms {
-                        telemetry.set_sampling_unavailable("measurement_window_elapsed_before_first_sample");
+                        telemetry
+                            .mark_unavailable(ClientTelemetryUnavailable::MeasurementWindowElapsedBeforeFirstSample);
                         return;
                     }
                     if now_unix_ms >= start_unix_ms {
@@ -2176,7 +2214,7 @@ impl PreparedClient {
                     let now_unix_ms = match unix_ms() {
                         Ok(now) => now,
                         Err(_) => {
-                            telemetry.set_sampling_unavailable("unix_clock_unavailable");
+                            telemetry.mark_unavailable(ClientTelemetryUnavailable::ClockUnavailable);
                             return;
                         }
                     };
@@ -2195,7 +2233,7 @@ impl PreparedClient {
                     let sample_unix_ms = match unix_ms() {
                         Ok(now) => now,
                         Err(_) => {
-                            telemetry.set_sampling_unavailable("unix_clock_unavailable");
+                            telemetry.mark_unavailable(ClientTelemetryUnavailable::ClockUnavailable);
                             return;
                         }
                     };
