@@ -45,10 +45,13 @@ function summarize(logRatios: number[]): { ratio: number; uncertainty: number } 
   const mean = logRatios.reduce((sum, value) => sum + value, 0) / logRatios.length;
   const variance = logRatios.reduce((sum, value) => sum + (value - mean) ** 2, 0)
     / (logRatios.length - 1);
-  return {
+  const result = {
     ratio: Math.exp(mean),
     uncertainty: T_95_DF_2 * Math.sqrt(variance / logRatios.length),
   };
+  assertPositive(result.ratio, "paired ratio");
+  if (!Number.isFinite(result.uncertainty)) throw new Error("invalid paired uncertainty");
+  return result;
 }
 
 export function scoreCases(cases: Case[], objective: Objective): Score {
@@ -69,11 +72,11 @@ export function scoreCases(cases: Case[], objective: Objective): Score {
         assertPositive(measurement.durableRowsPerSecond, `${label} durable rows/s`);
         assertPositive(measurement.parquetBytesPerRow, `${label} Parquet bytes/row`);
       }
-      const throughput = Math.log(candidate.durableRowsPerSecond / baseline.durableRowsPerSecond);
+      const throughput = Math.log(candidate.durableRowsPerSecond) - Math.log(baseline.durableRowsPerSecond);
       throughputLogs.push(throughput);
       objectiveLogs.push(objective === "durable-rate"
         ? throughput
-        : Math.log(baseline.parquetBytesPerRow / candidate.parquetBytesPerRow));
+        : Math.log(baseline.parquetBytesPerRow) - Math.log(candidate.parquetBytesPerRow));
       bytesGuardPassed &&= candidate.parquetBytesPerRow <= MAX_BYTES_PER_ROW;
     }
     const throughput = summarize(throughputLogs);
@@ -90,6 +93,7 @@ export function scoreCases(cases: Case[], objective: Objective): Score {
   const combinedScore = Math.exp(results.reduce(
     (sum, result) => sum + Math.log(result.objectiveRatio), 0,
   ) / results.length);
+  assertPositive(combinedScore, "combined score");
   const accepted = results.every((result) => {
     const objectiveEffect = Math.log(result.objectiveRatio);
     const throughputEffect = Math.log(result.throughputRatio);

@@ -31,4 +31,9 @@ test("rejects invalid measurements and too few independent pairs", () => {
   assert.throws(() => scoreCases([{ name: "few", pairs: [pair(110)] }], "durable-rate"));
   assert.throws(() => scoreCases([{ name: "invalid", pairs: [pair(NaN), pair(110), pair(110)] }], "durable-rate"));
   assert.throws(() => scoreCases([{ name: "zero", pairs: [pair(0), pair(110), pair(110)] }], "durable-rate"));
+  assert.throws(() => scoreCases([{ name: "overflow", pairs: [
+    pair(Number.MAX_VALUE, 34.7, Number.MIN_VALUE),
+    pair(Number.MAX_VALUE, 34.7, Number.MIN_VALUE),
+    pair(Number.MAX_VALUE, 34.7, Number.MIN_VALUE),
+  ] }], "durable-rate"));
 });
