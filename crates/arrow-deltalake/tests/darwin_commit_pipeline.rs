@@ -177,6 +177,15 @@ fn verify_physical_files(root: &Path, expected: &BTreeMap<PathBuf, u64>) -> Resu
     Ok(())
 }
 
+#[test]
+fn physical_verification_rejects_an_uncommitted_parquet_file() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let file = root.path().join("uncommitted.parquet");
+    fs::write(&file, b"orphan")?;
+    ensure!(verify_physical_files(root.path(), &BTreeMap::new()).is_err());
+    verify_physical_files(root.path(), &BTreeMap::from([(file, 6)]))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "explicit local component profile"]
 async fn local_commit_pipeline_profile() -> Result<()> {
