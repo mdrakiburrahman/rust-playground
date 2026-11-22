@@ -1,0 +1,29 @@
+{
+  "name": "darwin-code-regions",
+  "projectType": "library",
+  "root": "tools/darwin-code-regions",
+  "targets": {
+    "build-parser": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --release --manifest-path tools/darwin-code-regions/parser/Cargo.toml --target-dir tools/darwin-code-regions/parser/target"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build-parser"],
+      "options": {
+        "command": "npx --no-install tsx --test tools/darwin-code-regions/check.test.ts"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsc -p tools/darwin-code-regions/tsconfig.json"
+      }
+    }
+  }
+}
