@@ -17,10 +17,10 @@ use arrow_deltalake::commit::{BatchedTable, CommitOptions};
 use delta_kernel::Snapshot;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel_default_engine::DefaultEngineBuilder;
-use fs2::FileExt;
 #[cfg(test)]
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
+use fs2::FileExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -174,6 +174,22 @@ fn verify_physical_files(root: &Path, expected: &BTreeMap<PathBuf, u64>) -> Resu
         physical.iter().eq(expected.keys()),
         "physical Parquet files differ from committed Adds"
     );
+    Ok(())
+}
+
+fn sync_tree(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        ensure!(!file_type.is_symlink(), "unexpected symlink in retained table");
+        if file_type.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            ensure!(file_type.is_file(), "unexpected non-file in retained table");
+            fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -727,10 +743,20 @@ async fn continuous_group(
 ///
 /// # Errors
 /// Returns staging, publication, readback or verification failures.
-pub async fn continuous_component() -> Result<serde_json::Value> {
-    let root = tempfile::tempdir()?;
+pub async fn continuous_component(retained_root: Option<&Path>) -> Result<serde_json::Value> {
+    let temporary_root;
+    let root = if let Some(path) = retained_root {
+        ensure!(path.is_absolute(), "table root must be absolute");
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(), "table root must be a directory");
+        ensure!(fs::read_dir(path)?.next().is_none(), "table root must be empty");
+        path
+    } else {
+        temporary_root = tempfile::tempdir()?;
+        temporary_root.path()
+    };
     let table = BatchedTable::open(
-        root.path(),
+        root,
         CommitOptions {
             batch_window: Duration::from_secs(2),
             max_files_per_commit: 128,
@@ -741,11 +767,15 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
     let counters = Arc::new(ContinuousCounters::default());
     let warmup_batch = input(0)?;
     let warmup_bytes = warmup_batch.get_array_memory_size();
-    ensure!(
-        warmup_bytes <= MAX_IN_FLIGHT_INPUT_BYTES,
-        "warmup exceeds input byte limit"
-    );
-    let warmup = continuous_group(Arc::clone(&table), 0, warmup_batch, warmup_bytes, Arc::clone(&counters)).await?;
+    ensure!(warmup_bytes <= MAX_IN_FLIGHT_INPUT_BYTES, "warmup exceeds input byte limit");
+    let warmup = continuous_group(
+        Arc::clone(&table),
+        0,
+        warmup_batch,
+        warmup_bytes,
+        Arc::clone(&counters),
+    )
+    .await?;
     counters.peak_outstanding.store(0, Ordering::SeqCst);
     counters.peak_staging.store(0, Ordering::SeqCst);
     let hz = ticks_per_second()?;
@@ -788,25 +818,15 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         .checked_sub(cpu_start)
         .context("process ticks went backwards")?;
     ensure!(in_flight_bytes == 0, "input reservations did not drain");
-    ensure!(
-        counters.outstanding.load(Ordering::SeqCst) == 0,
-        "receipts did not drain"
-    );
+    ensure!(counters.outstanding.load(Ordering::SeqCst) == 0, "receipts did not drain");
     ensure!(counters.staging.load(Ordering::SeqCst) == 0, "staging did not drain");
-    ensure!(
-        counters.peak_outstanding.load(Ordering::SeqCst) > 1,
-        "no overlapping submitted groups observed"
-    );
+    ensure!(counters.peak_outstanding.load(Ordering::SeqCst) > 1, "no overlapping submitted groups observed");
 
     let identities = (0..=CONTINUOUS_GROUPS)
         .map(|index| (format!("continuous-{index:04}"), 0))
         .collect::<Vec<_>>();
     ensure!(
-        table
-            .lookup_publications(identities.clone())
-            .await?
-            .into_iter()
-            .all(|found| found),
+        table.lookup_publications(identities.clone()).await?.into_iter().all(|found| found),
         "missing durable transaction"
     );
     let replay = table
@@ -829,34 +849,23 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
         ensure!(seen.insert(record.index), "duplicate receipt");
         let result = &record.result;
         ensure!(
-            result.files.len() == 1 && result.file_observations.len() == 1 && result.file_observations[0].rows == ROWS,
+            result.files.len() == 1 && result.file_observations.len() == 1
+                && result.file_observations[0].rows == ROWS,
             "unexpected receipt shape"
         );
         let file = &result.files[0];
-        ensure!(
-            expected_files.insert(file.path.clone(), file.bytes).is_none(),
-            "duplicate receipt file"
-        );
+        ensure!(expected_files.insert(file.path.clone(), file.bytes).is_none(), "duplicate receipt file");
         expected_groups.insert(file.path.clone(), record.index);
         cohort_ids
             .entry(result.version)
             .or_default()
             .insert(format!("continuous-{:04}", record.index));
-        cohort_files
-            .entry(result.version)
-            .or_default()
-            .insert(file.path.clone(), file.bytes);
+        cohort_files.entry(result.version).or_default().insert(file.path.clone(), file.bytes);
         if let Some(duration) = result.commit_duration {
-            ensure!(
-                commits.insert(result.version, duration).is_none(),
-                "duplicate commit timing"
-            );
+            ensure!(commits.insert(result.version, duration).is_none(), "duplicate commit timing");
         }
     }
-    ensure!(
-        seen.iter().copied().eq(0..=CONTINUOUS_GROUPS),
-        "missing receipt identity"
-    );
+    ensure!(seen.iter().copied().eq(0..=CONTINUOUS_GROUPS), "missing receipt identity");
     let last_version = *cohort_ids.keys().next_back().context("missing durable version")?;
     ensure!(replay_result.version == last_version, "replay changed version");
     ensure!(commits.len() == cohort_ids.len(), "missing commit timing");
@@ -866,7 +875,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(root.path().join(arrow_deltalake::delta::WRITER_LOCK))?;
+        .open(root.join(arrow_deltalake::delta::WRITER_LOCK))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match FileExt::try_lock_exclusive(&lock) {
@@ -877,13 +886,13 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
             Err(error) => return Err(error).context("writer did not stop before verification"),
         }
     }
-    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, &expected_groups, last_version)?;
-    verify_physical_files(root.path(), &expected_files)?;
+    let (active_rows, active_bytes) = verify_snapshot(root, &expected_files, &expected_groups, last_version)?;
+    verify_physical_files(root, &expected_files)?;
     let root_url =
-        Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
+        Url::from_directory_path(fs::canonicalize(root)?).map_err(|()| anyhow::anyhow!("table URL"))?;
     let mut remaining = expected_files;
     for version in 1..=last_version {
-        let log = fs::read_to_string(root.path().join(format!("_delta_log/{version:020}.json")))?;
+        let log = fs::read_to_string(root.join(format!("_delta_log/{version:020}.json")))?;
         let mut ids = BTreeSet::new();
         let mut files = BTreeMap::new();
         for line in log.lines() {
@@ -891,10 +900,7 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
             ensure!(action.get("remove").is_none(), "unexpected Remove action");
             if let Some(txn) = action.get("txn") {
                 ensure!(txn["version"] == 0, "wrong transaction version");
-                ensure!(
-                    ids.insert(txn["appId"].as_str().context("missing appId")?.to_owned()),
-                    "duplicate txn"
-                );
+                ensure!(ids.insert(txn["appId"].as_str().context("missing appId")?.to_owned()), "duplicate txn");
             }
             if let Some(add) = action.get("add") {
                 let path = root_url
@@ -902,35 +908,30 @@ pub async fn continuous_component() -> Result<serde_json::Value> {
                     .to_file_path()
                     .map_err(|()| anyhow::anyhow!("Add URL"))?;
                 let bytes = add["size"].as_u64().context("missing Add size")?;
-                ensure!(
-                    remaining.remove(&path) == Some(bytes),
-                    "Add does not match a unique receipt"
-                );
+                ensure!(remaining.remove(&path) == Some(bytes), "Add does not match a unique receipt");
                 ensure!(files.insert(path, bytes).is_none(), "duplicate Add");
             }
         }
-        ensure!(
-            cohort_ids.get(&version) == Some(&ids),
-            "committed identities differ from receipts"
-        );
-        ensure!(
-            cohort_files.get(&version) == Some(&files),
-            "committed files differ from receipts"
-        );
+        ensure!(cohort_ids.get(&version) == Some(&ids), "committed identities differ from receipts");
+        ensure!(cohort_files.get(&version) == Some(&files), "committed files differ from receipts");
     }
     ensure!(remaining.is_empty(), "receipt missing from committed Adds");
     let engine = DefaultEngineBuilder::new(Arc::new(object_store::local::LocalFileSystem::new())).build();
     let snapshot = Snapshot::builder_for(root_url.as_str()).build(&engine)?;
     ensure!(snapshot.version() == last_version, "replay changed snapshot version");
     for (id, version) in &identities {
-        ensure!(
-            snapshot.get_app_id_version(id, &engine)? == Some(*version),
-            "snapshot lost transaction"
-        );
+        ensure!(snapshot.get_app_id_version(id, &engine)? == Some(*version), "snapshot lost transaction");
+    }
+    if retained_root.is_some() {
+        sync_tree(root)?;
+        fs::File::open(root.parent().context("table root has no parent")?)?.sync_all()?;
     }
 
     let timed = records.iter().filter(|record| record.index != 0).collect::<Vec<_>>();
-    let timed_output_bytes = timed.iter().map(|record| record.result.files[0].bytes).sum::<u64>();
+    let timed_output_bytes = timed
+        .iter()
+        .map(|record| record.result.files[0].bytes)
+        .sum::<u64>();
     let timed_commits = commits
         .iter()
         .filter(|(version, _)| **version != records[0].result.version)
