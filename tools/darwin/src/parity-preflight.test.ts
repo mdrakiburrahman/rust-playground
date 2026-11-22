@@ -64,11 +64,17 @@ test("collector parity readback rejects drift in historical limits and local pre
   }]), /table layout differs at row_group_rows/);
   const evidence = {
     processes: [{ component: "collector", log_complete: true, effective_config_source: "consumer_startup_readback",
+      image_id: "sha256:" + "a".repeat(64),
       effective_config: readback, layout_table_policies: [policy],
       writer_policy_overrides: { defaults: { compression: null, compression_level: null },
         columns: {}, max_row_group_rows: null } }],
     client_phase_reports: [{ consumer_effective_config: { ...client, ...transport },
       phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 0 } } }],
+    client_schedule: { effective: { run_start_unix_ms: 2000 } },
+    parity_admission_readback: { status: "verified_before_schedule", observed_at_unix_ms: 1000,
+      collector_image_id: "sha256:" + "a".repeat(64),
+      collector: { ...readback, parquet_writer: { defaults: { compression: null }, columns: {} } },
+      client: { ...client, ...transport } },
     overload_guard: { status: "complete", requested_container_memory_limit_bytes: 92341796864,
       settings: { enabled: true, cap_fraction: 0.9, zero_progress_windows: 2 },
       last_caps: [{ metric: "container_memory_bytes", confirmed: true, cap: 92341796864 }] },
@@ -81,9 +87,12 @@ test("collector parity readback rejects drift in historical limits and local pre
   }), /memory cap is unconfirmed/);
   assert.throws(() => assertParityEvidence(seed, {
     ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0], consumer_effective_config: { ...client, ...transport, workers: 8 } }],
-  }), /client readback differs at workers/);
+  }), /pre-admission client readback changed/);
   assert.throws(() => assertParityEvidence(seed, {
     ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0],
       phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 1 } } }],
   }), /delivery evidence is ambiguous/);
+  assert.throws(() => assertParityEvidence(seed, {
+    ...evidence, parity_admission_readback: { ...evidence.parity_admission_readback, observed_at_unix_ms: 2000 },
+  }), /pre-admission collector identity or timing/);
 });

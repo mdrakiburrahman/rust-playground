@@ -93,11 +93,26 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
     return true;
   }
   if (hasOverride(writer)) throw new Error("collector writer readback contains an override");
+  const admission = object(evidence.parity_admission_readback, "pre-admission readback");
+  const schedule = object(object(evidence.client_schedule, "client schedule").effective, "effective client schedule");
+  if (admission.status !== "verified_before_schedule" || !Number.isSafeInteger(admission.observed_at_unix_ms)
+    || !Number.isSafeInteger(schedule.run_start_unix_ms)
+    || Number(admission.observed_at_unix_ms) >= Number(schedule.run_start_unix_ms)
+    || typeof admission.collector_image_id !== "string" || admission.collector_image_id !== collectors[0]!.image_id) {
+    throw new Error("pre-admission collector identity or timing is unavailable");
+  }
+  const admissionCollector = object(admission.collector, "pre-admission collector");
+  assertParityCollectorReadback(seed, admissionCollector);
+  if (hasOverride(object(admissionCollector.parquet_writer, "pre-admission writer"))) {
+    throw new Error("pre-admission writer readback contains an override");
+  }
   if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
     throw new Error("client readback is unavailable");
   }
   const report = object(evidence.client_phase_reports[0], "client");
   const client = object(report.consumer_effective_config, "client readback");
+  const admissionClient = object(admission.client, "pre-admission client");
+  if (!isDeepStrictEqual(admissionClient, client)) throw new Error("pre-admission client readback changed");
   for (const [key, value] of Object.entries(object(tunables.client, "client tunables"))) {
     if (!isDeepStrictEqual(client[key], value)) throw new Error(`client readback differs at ${key}`);
   }

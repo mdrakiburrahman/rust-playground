@@ -42,6 +42,7 @@ include!("runner_pin_init_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
 include!("runner_process_evidence.rs");
+include!("runner_parity_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_catalog_registration.rs");
@@ -4943,7 +4944,7 @@ async fn run_clients_inner(
         }
     }
 
-    loop {
+    let ready_clients = loop {
         let progress = match poll_clients(platform, config, &handles).await {
             Ok(progress) => progress,
             Err(error) => {
@@ -4961,7 +4962,7 @@ async fn run_clients_inner(
             readiness_started.elapsed(),
             Duration::from_secs(config.client_ready_timeout_seconds),
         ) {
-            Ok(true) => break,
+            Ok(true) => break progress,
             Ok(false) => {}
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
@@ -4974,6 +4975,26 @@ async fn run_clients_inner(
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    if std::env::var("OAT_DARWIN_PARITY_PRECHECK").as_deref() == Ok("1") {
+        let readback = async {
+            let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
+            parity_admission_readback(config, &logs, &ready_clients)
+        }
+        .await;
+        match readback {
+            Ok(proof) => evidence.parity_admission_readback = Some(proof),
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                return match cleanup {
+                    Ok(()) => Err(error).context("verify parity readback before admission"),
+                    Err(cleanup_error) => Err(error.context(format!(
+                        "cancelling clients after parity readback failure also failed: {cleanup_error:#}"
+                    ))),
+                };
+            }
+        }
     }
 
     // Delta metadata is committed during preflight, so QAP binding must precede arming.
