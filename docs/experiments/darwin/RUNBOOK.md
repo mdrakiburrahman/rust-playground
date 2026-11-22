@@ -68,6 +68,10 @@ historical queue limits. Pipeline depth 8 causes the exporter to use
 `force_commit=false`. The sorted-layout limits are 2 million rows, 1 GiB and
 262,144 rows per group; table-effective readback must confirm them. Those
 limits do not guarantee files reach 2 million rows.
+On Unix, the local guard verifies the private cgroup directly at admission,
+then samples Docker's one-shot cgroup accounting with a fresh timestamp and
+container identity/cap checks before and after each sample. A missing or
+stale sample still fails closed at the unchanged three-second deadline.
 Label measurements **local one-box scale**, not AKS-equivalent; record host
 memory and vCPUs, chosen cap and sampled collector peak RSS, using null when
 unmeasured.

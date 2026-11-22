@@ -463,6 +463,8 @@ struct GuardProbe {
     instance_id: String,
     rss_cap: u64,
     buffer_cap: u64,
+    #[cfg(unix)]
+    local_memory: Option<LocalGuardMemory>,
     collector_instance: Option<arrowcol_protocol::CollectorInstanceId>,
     expected_scale_out_identity: Option<GuardCollectorBinding>,
     api: Option<Arc<GuardApi>>,
@@ -477,6 +479,88 @@ struct GuardApi {
     namespace: String,
     deployment: String,
     pod: String,
+}
+
+#[cfg(unix)]
+struct LocalGuardMemory {
+    client: reqwest::Client,
+    instance_id: String,
+    started_at: String,
+    cap: u64,
+}
+
+#[cfg(unix)]
+impl LocalGuardMemory {
+    async fn get(&self, suffix: &str) -> Result<Value> {
+        let url = format!("http://localhost/v1.41/containers/{}{}", self.instance_id, suffix);
+        let mut response = self.client.get(url).send().await?.error_for_status()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                bail!("Docker guard response exceeds byte bound");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn inspect(&self, value: &Value) -> Result<()> {
+        if value["Id"].as_str() != Some(self.instance_id.as_str())
+            || value["RestartCount"].as_u64() != Some(0)
+            || value.pointer("/State/Running").and_then(Value::as_bool) != Some(true)
+            || value.pointer("/State/StartedAt").and_then(Value::as_str) != Some(self.started_at.as_str())
+            || value.pointer("/HostConfig/Memory").and_then(Value::as_u64) != Some(self.cap)
+            || value.pointer("/HostConfig/CgroupnsMode").and_then(Value::as_str) != Some("private")
+        {
+            bail!("Docker collector identity, cgroup namespace or memory cap changed");
+        }
+        Ok(())
+    }
+
+    async fn read(&self) -> Result<GuardCap> {
+        self.inspect(&self.get("/json").await?)?;
+        let started_ms = unix_time_ms_u64()?;
+        let stats = self.get("/stats?stream=false&one-shot=true").await?;
+        let finished_ms = unix_time_ms_u64()?;
+        let cap = self.stats(&stats, started_ms, finished_ms)?;
+        self.inspect(&self.get("/json").await?)?;
+        Ok(cap)
+    }
+
+    fn stats(&self, stats: &Value, started_ms: u64, finished_ms: u64) -> Result<GuardCap> {
+        let read = stats["read"].as_str().context("Docker stats timestamp missing")?;
+        let read_ms = DateTime::parse_from_rfc3339(read)?.timestamp_millis();
+        if read_ms < 0 || (read_ms as u64) < started_ms || (read_ms as u64) > finished_ms {
+            bail!("Docker cgroup sample is stale or has a future timestamp");
+        }
+        let used = stats.pointer("/memory_stats/usage").and_then(Value::as_u64)
+            .context("Docker cgroup usage missing")?;
+        let limit = stats.pointer("/memory_stats/limit").and_then(Value::as_u64)
+            .context("Docker cgroup limit missing")?;
+        guard_container_memory(&format!("0::/\n{used}\n{limit}\n"), Some(self.cap))
+    }
+
+    async fn prepare(instance_id: &str, requested: Option<u64>) -> Result<Self> {
+        if instance_id.len() != 64 || !instance_id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+            bail!("Docker collector ID is not immutable");
+        }
+        let mut command = Command::new("docker");
+        command.args(["exec", instance_id, "cat", "/proc/self/cgroup", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"]);
+        let direct = guard_cgroup_output(command).await?;
+        let cap = guard_container_memory(&String::from_utf8(direct.stdout)?, requested)?.cap;
+        let client = reqwest::Client::builder()
+            .unix_socket("/var/run/docker.sock")
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut memory = Self { client, instance_id: instance_id.to_owned(), started_at: String::new(), cap };
+        let inspect = memory.get("/json").await?;
+        memory.started_at = inspect.pointer("/State/StartedAt").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("Docker collector start identity missing")?.to_owned();
+        memory.inspect(&inspect)?;
+        memory.read().await?;
+        Ok(memory)
+    }
 }
 
 impl GuardApi {
@@ -772,6 +856,15 @@ impl PreparedGuard {
             Some(binding) => Some(Arc::new(GuardApi::start(config, &binding.identities[0].pod).await?)),
             None => None,
         };
+        #[cfg(unix)]
+        let local_memory = if platform.kind() == crate::config::OatMode::Local {
+            Some(tokio::time::timeout(
+                GUARD_READ_TIMEOUT,
+                LocalGuardMemory::prepare(&log.instance_id, config.platform.local.collector_memory_limit_bytes),
+            ).await.context("Docker guard admission deadline exceeded")??)
+        } else {
+            None
+        };
         let mut prepared = Self {
             scraper: PublicationBacklogScraper::start(&source, config).await?,
             probe: GuardProbe {
@@ -786,6 +879,8 @@ impl PreparedGuard {
                     .and_then(Value::as_u64)
                     .filter(|cap| *cap > 0)
                     .context("buffer hard-cap readback missing")?,
+                #[cfg(unix)]
+                local_memory,
                 collector_instance: None,
                 expected_scale_out_identity,
                 api,
@@ -797,6 +892,10 @@ impl PreparedGuard {
         prepared.engine.proof["requested_container_memory_limit_bytes"] =
             json!(config.platform.local.collector_memory_limit_bytes);
         prepared.engine.proof["collector_rss_limit_source"] = json!("registration_configuration_not_cgroup");
+        #[cfg(unix)]
+        if prepared.probe.local_memory.is_some() {
+            prepared.engine.proof["container_memory_source"] = json!("docker_one_shot_cgroup_with_identity_fence");
+        }
         prepared.engine.proof["commit_log_sampling"] = json!({"mode":"incremental_since_with_dedupe",
             "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
         let expected = prepared.probe.expected_scale_out_identity.clone();
@@ -936,7 +1035,17 @@ impl GuardProbe {
         pressure_url.set_query(None);
         let (memory, logs, pressure) = tokio::join!(
             guard_read_leg(deadline, async {
-                guard_cgroup_output(self.command(config, false)?).await
+                #[cfg(unix)]
+                if let Some(local) = &self.local_memory {
+                    return local.read().await;
+                }
+                let output = guard_cgroup_output(self.command(config, false)?).await?;
+                let memory = String::from_utf8(output.stdout)?;
+                guard_container_memory(&memory, if self.local {
+                    config.platform.local.collector_memory_limit_bytes
+                } else {
+                    None
+                })
             }),
             guard_read_leg(deadline, async {
                 match &self.api {
@@ -958,15 +1067,7 @@ impl GuardProbe {
         let memory = memory.into_result().context("cgroup memory leg failed")?;
         let logs = logs.into_result().context("collector log leg failed")?;
         let pressure = pressure.into_result().context("pressure HTTP leg failed")?;
-        let memory = String::from_utf8(memory.stdout)?;
-        let container_cap = guard_container_memory(
-            &memory,
-            if self.local {
-                config.platform.local.collector_memory_limit_bytes
-            } else {
-                None
-            },
-        )?;
+        let container_cap = memory;
         let pressure: Value = serde_json::from_str(&pressure)?;
         if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
             verify_scale_out_buffering_mode(&pressure)?;
@@ -1446,6 +1547,8 @@ mod overload_guard_tests {
             instance_id: "collector".to_owned(),
             rss_cap: 1000,
             buffer_cap: 1000,
+            #[cfg(unix)]
+            local_memory: None,
             collector_instance: None,
             expected_scale_out_identity: None,
             api: None,
@@ -1469,6 +1572,50 @@ mod overload_guard_tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.contains(&"--since-time=1970-01-01T00:09:55.000Z".to_owned()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_docker_guard_rejects_stale_stats_and_changed_identity() -> Result<()> {
+        let guard = LocalGuardMemory {
+            client: reqwest::Client::builder().unix_socket("/var/run/docker.sock").build()?,
+            instance_id: "a".repeat(64),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            cap: 1000,
+        };
+        let inspect = json!({
+            "Id": guard.instance_id, "RestartCount": 0,
+            "State": {"Running": true, "StartedAt": guard.started_at},
+            "HostConfig": {"Memory": 1000, "CgroupnsMode": "private"}
+        });
+        guard.inspect(&inspect)?;
+        for (path, value) in [
+            ("/Id", json!("replacement")),
+            ("/RestartCount", json!(1)),
+            ("/State/Running", json!(false)),
+            ("/State/StartedAt", json!("replacement")),
+            ("/HostConfig/Memory", json!(0)),
+            ("/HostConfig/CgroupnsMode", json!("host")),
+        ] {
+            let mut changed = inspect.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            assert!(guard.inspect(&changed).is_err(), "{path}");
+        }
+        let stats = json!({
+            "read": "2026-01-01T00:00:00.500Z",
+            "memory_stats": {"usage": 123, "limit": 1000}
+        });
+        let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?.timestamp_millis() as u64;
+        assert_eq!(guard.stats(&stats, timestamp, timestamp + 1000)?.observed_value, 123);
+        assert!(guard.stats(&stats, timestamp + 501, timestamp + 1000).is_err());
+        assert!(guard.stats(&stats, timestamp, timestamp + 499).is_err());
+        let mut changed = stats.clone();
+        changed["memory_stats"]["limit"] = json!(999);
+        assert!(guard.stats(&changed, timestamp, timestamp + 1000).is_err());
+        changed["memory_stats"]["limit"] = json!(1000);
+        changed["memory_stats"]["usage"] = Value::Null;
+        assert!(guard.stats(&changed, timestamp, timestamp + 1000).is_err());
         Ok(())
     }
 
