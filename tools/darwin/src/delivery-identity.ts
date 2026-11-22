@@ -1,7 +1,7 @@
 const U64_MAX = (1n << 64n) - 1n;
 const IDENTITY_FORMAT = "https://x.invalid/v1/{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}/{row_ordinal_decimal}";
 const COHORT_RULE = "first_send_unix_ms < start => warmup; start <= first_send_unix_ms < end => measurement; otherwise post_window; bounds are [start,end)";
-const COHORTS = ["warmup", "measurement", "post_window"] as const;
+const COHORTS = ["unscheduled", "warmup", "measurement", "post_window"] as const;
 type Cohort = typeof COHORTS[number];
 type ObjectValue = Record<string, unknown>;
 
@@ -111,12 +111,15 @@ function indexManifests(manifests: readonly unknown[], options: IdentityOptions)
     if (typeof manifest.payload_corpus_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(manifest.payload_corpus_sha256)
       || manifest.payload_corpus_hash_version !== 2 || typeof manifest.payload_corpus_hash_scope !== "string"
       || manifest.payload_corpus_hash_scope.length === 0) throw new Error("unsupported business corpus evidence");
-    const bounds = object(manifest.measurement_bounds, "measurement bounds");
-    const start = integer(bounds.start_unix_ms_inclusive, "measurement start");
-    const end = integer(bounds.end_unix_ms_exclusive, "measurement end", start + 1);
-    const binding = `${start}:${end}`;
-    if (sharedBounds !== null && sharedBounds !== binding) throw new Error("manifests have different shared windows");
-    sharedBounds = binding;
+    const unscheduled = manifest.measurement_bounds === null;
+    if (!unscheduled) {
+      const bounds = object(manifest.measurement_bounds, "measurement bounds");
+      const start = integer(bounds.start_unix_ms_inclusive, "measurement start");
+      const end = integer(bounds.end_unix_ms_exclusive, "measurement end", start + 1);
+      const binding = `${start}:${end}`;
+      if (sharedBounds !== null && sharedBounds !== binding) throw new Error("manifests have different shared windows");
+      sharedBounds = binding;
+    }
     if (!Array.isArray(manifest.ranges) || manifest.ranges.length === 0) throw new Error("manifest has no acknowledged ranges");
     const count = integer(manifest.record_count, "record count", 1, 1_000_000);
     if (manifest.record_cap !== 1_000_000) throw new Error("unsupported manifest record cap");
@@ -141,6 +144,7 @@ function indexManifests(manifests: readonly unknown[], options: IdentityOptions)
       const rowsPerBatch = integer(range.rows_per_batch, "rows per batch", 1, 4_294_967_295);
       const rows = integer(rowsPerBatch * batches, "range row count", 1);
       const rangeCohort = cohort(range.cohort);
+      if (unscheduled !== (rangeCohort === "unscheduled")) throw new Error("range cohort contradicts scheduled/unscheduled manifest bounds");
       if (range.first_send_unix_ns === null || range.first_send_unix_ns === undefined
         || range.last_outcome_unix_ms === null || range.last_outcome_unix_ms === undefined) throw new Error("acknowledged range lacks send/outcome evidence");
       if (typeof range.first_send_unix_ns === "number") {
@@ -192,7 +196,7 @@ export async function verifyDeliveryIdentitySet(
 ): Promise<IdentityVerdict> {
   const indexed = indexManifests(manifests, options);
   let observedRows = 0;
-  const cohortRows: Record<Cohort, number> = { warmup: 0, measurement: 0, post_window: 0 };
+  const cohortRows: Record<Cohort, number> = { unscheduled: 0, warmup: 0, measurement: 0, post_window: 0 };
   for await (const value of endpointUrls) {
     if (typeof value !== "string" || value.length > 160) throw new Error("malformed delivery identity");
     const match = /^https:\/\/x\.invalid\/v1\/([a-f0-9]{32})\/([a-f0-9]{32})\/(0|[1-9][0-9]{0,4})\/([0-9a-z]{1,13})\/(0|[1-9][0-9]{0,9})$/.exec(value);

@@ -49,7 +49,16 @@ test("whole snapshot includes warmup/drain, permits file reordering and independ
   const verdict = await verifyDeliveryIdentitySet([manifest(), second], stream(values), options);
   assert.equal(verdict.expectedRows, 14);
   assert.equal(verdict.observedRows, 14);
-  assert.deepEqual(verdict.cohortRows, { warmup: 4, measurement: 6, post_window: 4 });
+  assert.deepEqual(verdict.cohortRows, { unscheduled: 0, warmup: 4, measurement: 6, post_window: 4 });
+});
+
+test("legitimate one-shot v1 deliveries are included separately without inventing a measurement window", async () => {
+  const oneShot = { ...manifest([range(0, 0, 2, "unscheduled")]), run_uuid: "d".repeat(32), measurement_bounds: null };
+  const values = [...rows, identity(0, 0).replace(run, "d".repeat(32)), identity(0, 1).replace(run, "d".repeat(32))];
+  const result = await verifyDeliveryIdentitySet([manifest(), oneShot], stream(values), options);
+  assert.equal(result.observedRows, 9);
+  assert.deepEqual(result.cohortRows, { unscheduled: 2, warmup: 2, measurement: 3, post_window: 2 });
+  await assert.rejects(verifyDeliveryIdentitySet([{ ...oneShot, measurement_bounds: manifest().measurement_bounds }], stream(values), options), /contradicts/);
 });
 
 test("rejects duplicate replacement even when row count matches, missing rows and foreign namespaces/ordinals", async () => {
@@ -81,7 +90,7 @@ test("rejects incomplete/truncated/diagnostic manifests, retries, ambiguity, mis
     await assert.rejects(verifyDeliveryIdentitySet([{ ...manifest(), ...change }], stream(rows), options));
   }
   await assert.rejects(verifyDeliveryIdentitySet([manifest()], stream(rows), { ...options, rewriteCommitCount: 1 }), /rewrite/);
-  for (const change of [{ attempts: 2 }, { outcome: "ambiguous" }, { cohort: "unscheduled" },
+  for (const change of [{ attempts: 2 }, { outcome: "ambiguous" }, { cohort: "unsupported" },
     { batch_count: 2 }, { first_sequence: Number.MAX_SAFE_INTEGER + 1 }, { first_send_unix_ns: null },
     { extra_range_field: 1 }]) {
     const value = manifest();
@@ -135,7 +144,7 @@ test("stream adapter keeps original nanosecond bytes/cohorts and rejects aliasin
     const result = await verifyActiveParquetIdentitySet(input, config);
     assert.equal(result.activeFileCount, 3);
     assert.equal(result.activeFileRows, 7);
-    assert.deepEqual(result.cohortRows, { warmup: 2, measurement: 3, post_window: 2 });
+    assert.deepEqual(result.cohortRows, { unscheduled: 0, warmup: 2, measurement: 3, post_window: 2 });
     assert.equal(result.manifestSources[0]!.sha256, createHash("sha256").update(await readFile(manifestPath)).digest("hex"));
     await assert.rejects(verifyActiveParquetIdentitySet({ ...input, active_parquet_paths: [paths[0]!, paths[0]!] }, config), /aliased/);
     await assert.rejects(verifyActiveParquetIdentitySet(input, { ...config, expectedDecoderSha256: "0".repeat(64) }), /hash differs/);

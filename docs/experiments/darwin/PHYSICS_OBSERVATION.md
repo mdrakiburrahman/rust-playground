@@ -6,6 +6,7 @@
 | Terminal manifest | Complete identity-bearing Realistic v1, all prepared batches ACKed exactly once, with no retry, ambiguity, error or truncation. Preserve original serialized bytes: JavaScript reserialization may round nanosecond integers. |
 | Exact equality | Complete unique run/incarnation/worker/sequence/row identities. Missing, foreign, duplicate, rewritten or aliased input fails. |
 | Scope | Whole active ingestion snapshot including warmup and drain; producer first-send cohorts are not Delta commit-window membership. Physical Add/history reconciliation and business payload checks are separate. |
+| One-shot v1 | Complete ACKed `unscheduled` ranges with null bounds use a separate cohort; no window is invented. Scheduled ranges require matching client windows. |
 | Memory | Default bitmaps <=512 MiB, <=65,536 ranges and <=64 MiB manifest sources. The reader projects only `endpoint_url`, one file and 8,192-row batch at a time; Parquet buffers are additional. |
 | Frozen artifacts | Pin reader SHA256 and framed SHA256 of both TypeScript modules. Original manifest and snapshot bytes are hashed; file and artifact identities are checked before and after verification. |
 | Result | Compact counts and hashes; nonzero exit on failure. This tool does not discover files, read Delta history or qualify throughput. |
