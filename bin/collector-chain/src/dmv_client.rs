@@ -3030,7 +3030,7 @@ mod tests {
         assert_eq!(options.batch_rows, 65_536);
         assert_eq!(options.corpus_rows, 65_536);
         assert_eq!(options.streams_per_worker, 2);
-        assert_eq!(options.data_mode, DataMode::Shared);
+        assert!(matches!(options.data_mode, DataMode::Shared));
         assert_eq!(options.data_profile, DataProfile::Diagnostic);
         assert_eq!(
             options.string_length_distribution,
@@ -3038,9 +3038,9 @@ mod tests {
         );
         assert_eq!(options.value_variation, Some(ValueVariation::Cardinality));
         assert_eq!(options.guid_uniqueness, Some(GuidUniqueness::Cardinality));
-        assert_eq!(options.ipc_compression, IpcCompression::None);
-        assert_eq!(options.grpc_send_compression, GrpcCompression::None);
-        assert_eq!(options.grpc_accept_compression, GrpcCompression::None);
+        assert!(matches!(options.ipc_compression, IpcCompression::None));
+        assert!(matches!(options.grpc_send_compression, GrpcCompression::None));
+        assert!(matches!(options.grpc_accept_compression, GrpcCompression::None));
         assert_eq!(options.max_flight_data_bytes, 67_108_864);
         assert_eq!(options.max_message_bytes, 134_217_728);
         assert_eq!(options.max_memory_bytes, 1_073_741_824);
