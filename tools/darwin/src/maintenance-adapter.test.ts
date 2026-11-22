@@ -4,7 +4,7 @@ import { cp, link, lstat, mkdir, mkdtemp, readdir, rm, symlink, unlink, writeFil
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { checkCadence, compareStopped, evaluateMaintenance, FIXTURE_REVISION, prepareMaintenance, treeHash } from "./maintenance-adapter.js";
+import { checkCadence, compareStopped, evaluateMaintenance, FIXTURE_REVISION, prepareMaintenance, scoreMaintenancePairs, treeHash } from "./maintenance-adapter.js";
 
 test("cadence verifier rejects a missing operation", () => {
   const operations = [...Array.from({ length: 90 }, () => [0, 1, 2, 3, 4]).flat(), 0, 0, 1, 1, 1];
@@ -25,6 +25,14 @@ test("snapshot hashing rejects symbolic and hard links", async () => {
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+test("paired screening requires a distinct source and a stable effect", () => {
+  const improvement = Array.from({ length: 3 }, () => ({ baseline: 1.2, candidate: 1 }));
+  assert.equal(scoreMaintenancePairs(improvement, false).screenPassed, false);
+  assert.equal(scoreMaintenancePairs(improvement, true).screenPassed, true);
+  assert.equal(scoreMaintenancePairs([{ baseline: 1.8, candidate: 1 }, { baseline: 0.8, candidate: 1 }, { baseline: 1.1, candidate: 1 }], true).screenPassed, false);
+  assert.throws(() => scoreMaintenancePairs(improvement.slice(0, 2), true), /three positive finite/);
 });
 
 test("real maintenance control and missing protected file", {
@@ -56,11 +64,12 @@ test("real maintenance control and missing protected file", {
   console.log("Sandbox probe: no effective/permitted capabilities; external write denied");
   for (const lane of ["active", "idle"] as const) {
     const result = await evaluateMaintenance(prepared, lane) as {
-      lane: string; scope: string; accepted: boolean; pairs: unknown[]; audits: unknown[];
+      lane: string; scope: string; accepted: boolean; screenPassed: boolean; pairs: unknown[]; audits: unknown[];
     };
     assert.equal(result.lane, `maintenance-${lane}`);
     assert.equal(result.scope, "maintenance-only");
     assert.equal(result.accepted, false);
+    assert.equal(result.screenPassed, false);
     assert.equal(result.pairs.length, 3);
     assert.equal(result.audits.length, 2);
   }

@@ -338,6 +338,22 @@ function objectStoreCounts(stdout: string): unknown {
   }));
 }
 
+export function scoreMaintenancePairs(pairs: Array<{ baseline: number; candidate: number }>, differentSource: boolean): {
+  ratio: number; logUncertainty: number; screenPassed: boolean;
+} {
+  if (pairs.length !== 3 || pairs.some(({ baseline, candidate }) =>
+    !Number.isFinite(baseline) || !Number.isFinite(candidate) || baseline <= 0 || candidate <= 0)) {
+    throw new Error("three positive finite maintenance elapsed pairs are required");
+  }
+  const logs = pairs.map(({ baseline, candidate }) => Math.log(baseline / candidate));
+  const mean = logs.reduce((sum, value) => sum + value, 0) / logs.length;
+  const variance = logs.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (logs.length - 1);
+  const ratio = Math.exp(mean);
+  const logUncertainty = 4.303 * Math.sqrt(variance / logs.length);
+  if (!Number.isFinite(ratio) || !Number.isFinite(logUncertainty)) throw new Error("invalid maintenance score");
+  return { ratio, logUncertainty, screenPassed: differentSource && ratio >= 1.05 && mean > logUncertainty };
+}
+
 export async function evaluateMaintenance(prepared: PreparedMaintenance, lane: MaintenanceLane): Promise<unknown> {
   if (lane !== "active" && lane !== "idle") throw new Error("unsupported maintenance lane");
   await assertBindings(prepared);
@@ -376,10 +392,13 @@ export async function evaluateMaintenance(prepared: PreparedMaintenance, lane: M
     if (!baseline || !candidate) throw new Error("incomplete maintenance pair");
     pairs.push({ baseline, candidate });
   }
-  const ratio = Math.exp(pairs.reduce((sum, pair) => sum + Math.log(pair.baseline.elapsedSeconds / pair.candidate.elapsedSeconds), 0) / pairs.length);
+  const screen = scoreMaintenancePairs(
+    pairs.map(({ baseline, candidate }) => ({ baseline: baseline.elapsedSeconds, candidate: candidate.elapsedSeconds })),
+    prepared.bindings.baselineMaintenanceSha256 !== prepared.bindings.candidateMaintenanceSha256,
+  );
   const result = {
     lane: `maintenance-${lane}`, storage: "local-file", scope: "maintenance-only",
-    objective: "inverse full fixture process elapsed", ratio, pairs, audits, bindings: prepared.bindings,
+    objective: "inverse full fixture process elapsed", ...screen, pairs, audits, bindings: prepared.bindings,
     accepted: false, qualification: "three-pair screening only; not durable ingestion",
     objectStoreCounts: "self-reported fixture instrumentation, not independent write proof",
   };
