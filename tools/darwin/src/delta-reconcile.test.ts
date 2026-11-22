@@ -37,7 +37,10 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       schema_version: 1, run_id: "abc-123", tables: ["orders"],
       manifests: [{ path: "orders/manifest.json", size: manifest.length, sha256: sha(manifest) }],
     }));
-    await writeFile(join(root, "stopped.json"), JSON.stringify({ schema_version: 1, run_id: "abc-123", writers: [{ id: "collector" }] }));
+    await writeFile(join(root, "stopped.json"), JSON.stringify({ schema_version: 1, run_id: "abc-123", writers: [{
+      id: "collector", service: "dataflow-1", was_running: true, exit_code: 0,
+      finished_at: "2026-01-01T00:00:00Z", oom_killed: false,
+    }] }));
     const measurement: OatMeasurement = {
       startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: one.length,
       durableRowsPerSecond: 3 / 150, parquetBytesPerRow: one.length / 3,

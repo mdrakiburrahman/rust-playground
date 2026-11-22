@@ -80,6 +80,14 @@ export async function reconcileStoppedSnapshot(
   if (complete.schema_version !== 1 || complete.run_id !== runId || stopped.schema_version !== 1 || stopped.run_id !== runId
     || !Array.isArray(complete.tables) || complete.tables.length !== 1 || complete.tables[0] !== table
     || !Array.isArray(stopped.writers) || stopped.writers.length === 0) throw new Error("snapshot completion or stopped identity mismatch");
+  const writers = stopped.writers.map(writer => object(writer, "stopped writer"));
+  const collectors = writers.filter(writer => typeof writer.service === "string" && /^dataflow-\d+$/.test(writer.service));
+  if (collectors.length !== 1 || collectors[0]!.was_running !== true
+    || (collectors[0]!.exit_code !== 0 && collectors[0]!.exit_code !== 143)
+    || writers.some(writer => typeof writer.id !== "string" || !writer.id || writer.oom_killed !== false
+      || typeof writer.finished_at !== "string" || !(Date.parse(writer.finished_at) > 0))) {
+    throw new Error("snapshot collector stop is not proven");
+  }
   const manifests = entries(complete.manifests);
   if (manifests.length !== 1 || manifests[0]!.path !== `${table}/manifest.json`) throw new Error("snapshot manifest reference mismatch");
   const manifestPath = join(root, table, "manifest.json");
@@ -100,6 +108,7 @@ export async function reconcileStoppedSnapshot(
     if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw new Error("snapshot file digest mismatch");
   }
   const active = new Map<string, Add>();
+  const referenced = new Map<string, Add>();
   const selected = new Map<number, TimedReceipt>();
   for (const receipt of receipts) {
     if (receipt.tableName !== canonicalTableName || receipt.tableId !== expectedTableId || selected.has(receipt.version)
@@ -128,6 +137,9 @@ export async function reconcileStoppedSnapshot(
           throw new Error("unsupported Delta Add");
         }
         const add: Add = { path: safePath(value.path), size: uint(value.size, "Delta Add size"), version, dataChange: value.dataChange !== false };
+        const previous = referenced.get(add.path);
+        if (previous && previous.size !== add.size) throw new Error("historical Delta Add changed size");
+        referenced.set(add.path, add);
         active.set(add.path, add);
         if (selected.has(version) && add.dataChange) {
           const adds = selectedAdds.get(version) ?? [];
@@ -145,13 +157,13 @@ export async function reconcileStoppedSnapshot(
   if (!schemaSeen || !active.size) throw new Error("snapshot has no schema or active files");
   const decoded = new Map<string, number>();
   let activeRows = 0;
-  for (const add of active.values()) {
+  for (const add of referenced.values()) {
     const path = join(tableRoot, add.path);
     const stat = await lstat(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== add.size) throw new Error("active Parquet file size mismatch");
     const rows = tableFromIPC(readParquet(await readFile(path)).intoIPCStream()).numRows;
     decoded.set(add.path, rows);
-    activeRows = uint(activeRows + rows, "active rows");
+    if (active.has(add.path)) activeRows = uint(activeRows + rows, "active rows");
   }
   if (activeRows !== expectedActiveRows) throw new Error("decoded active snapshot rows do not match manifest");
   let rows = 0;
