@@ -198,6 +198,9 @@ export async function observe(options: Options): Promise<void> {
   };
   await writeFile(join(output, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, { flag: "wx" });
   const auxiliaryJobs: Auxiliary[] = [];
+  const threadCpu = new Map<string, { tid: string; start_ticks: string; first_cpu_ns: bigint; last_cpu_ns: bigint; first_wait_ns: bigint; last_wait_ns: bigint; samples: number }>();
+  let observedStart: number | null = null;
+  let observedEnd: number | null = null;
   let failure: unknown = null;
   const abort = new AbortController();
   const interrupt = (): void => { abort.abort(new Error("observer interrupted")); };
@@ -236,6 +239,28 @@ export async function observe(options: Options): Promise<void> {
           stat: stable ? currentStat : { value: null, unavailable_reason: "thread exited or TID was reused during sample" },
         };
       }));
+      for (const thread of threadSamples) {
+        if (thread.schedstat.value === null) continue;
+        const fields = thread.schedstat.value.trim().split(/\s+/);
+        if (!/^[0-9]+$/.test(fields[0] ?? "") || !/^[0-9]+$/.test(fields[1] ?? "")) {
+          throw new Error("invalid thread CPU/runqueue accounting");
+        }
+        const cpu = BigInt(fields[0]!);
+        const wait = BigInt(fields[1]!);
+        const key = `${thread.tid}:${thread.startTicks}`;
+        const prior = threadCpu.get(key);
+        if (prior) {
+          if (cpu < prior.last_cpu_ns || wait < prior.last_wait_ns) throw new Error("thread CPU counters moved backwards");
+          prior.last_cpu_ns = cpu;
+          prior.last_wait_ns = wait;
+          prior.samples += 1;
+        } else {
+          threadCpu.set(key, {
+            tid: thread.tid, start_ticks: thread.startTicks, first_cpu_ns: cpu, last_cpu_ns: cpu,
+            first_wait_ns: wait, last_wait_ns: wait, samples: 1,
+          });
+        }
+      }
       let metrics: Observation<string> = { value: null, unavailable_reason: "no collector metrics URL configured; queue/flush/commit waits unavailable here" };
       if (options.metricsUrl !== null) {
         try {
@@ -254,8 +279,10 @@ export async function observe(options: Options): Promise<void> {
         system_cpu_stat: await readFile("/proc/stat", "utf8"), system_diskstats: await optionalText("/proc/diskstats"),
         collector_namespace_netdev: await optionalText(`${target}/net/dev`), collector_metrics: metrics,
       };
+      observedStart ??= sampleStart;
+      observedEnd = Date.now();
       await appendFile(join(output, "samples.ndjson"), `${JSON.stringify({
-        ...sample, sample_end_unix_ms: Date.now(), monotonic_ns: process.hrtime.bigint().toString(),
+        ...sample, sample_end_unix_ms: observedEnd, monotonic_ns: process.hrtime.bigint().toString(),
       })}\n`);
       await new Promise<void>(accept => setTimeout(accept, Math.max(0, Math.min(options.sampleMs - (Date.now() - sampleStart), end - Date.now()))));
     }
@@ -268,10 +295,20 @@ export async function observe(options: Options): Promise<void> {
     process.removeListener("SIGTERM", interrupt);
     for (const job of auxiliaryJobs) job.stop();
     const auxiliaryResults = Object.fromEntries(await Promise.all(auxiliaryJobs.map(async job => [job.name, await job.result])));
+    const elapsedNs = observedStart !== null && observedEnd !== null ? (observedEnd - observedStart) * 1_000_000 : 0;
+    const hotThreads = [...threadCpu.values()].map(thread => ({
+      tid: thread.tid, start_ticks: thread.start_ticks, samples: thread.samples,
+      observed_cpu_ns: (thread.last_cpu_ns - thread.first_cpu_ns).toString(),
+      observed_runqueue_wait_ns: (thread.last_wait_ns - thread.first_wait_ns).toString(),
+      observed_cpu_percent_of_full_capture: elapsedNs > 0
+        ? Number(thread.last_cpu_ns - thread.first_cpu_ns) / elapsedNs * 100 : null,
+    })).sort((a, b) => (b.observed_cpu_percent_of_full_capture ?? 0) - (a.observed_cpu_percent_of_full_capture ?? 0));
     await writeFile(join(output, "completion.json"), `${JSON.stringify({
       complete: failure === null,
       failure: failure instanceof Error ? failure.message : failure === null ? null : String(failure),
       end_unix_ms: Date.now(), auxiliary: auxiliaryResults, cgroup_after: await capturedCgroup(),
+      thread_cpu: hotThreads, thread_cpu_scope: "observed cumulative deltas between surviving same-start-tick samples; CPU before first/after last sample and single-sample threads excluded",
+      observed_interval: { start_unix_ms: observedStart, end_unix_ms: observedEnd },
     }, null, 2)}\n`, { flag: "wx" });
   }
   if (failure !== null) throw failure;
