@@ -7683,7 +7683,8 @@ fn verify_preload_delta(log_dir: &Path, canonical_table: &str) -> Result<Value> 
 #[cfg(test)]
 #[test]
 fn preload_delta_rejects_data_actions_and_wrong_layout() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = std::env::temp_dir().join(format!("oat-preload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&temp)?;
     let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
     let schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
     let metadata = json!({
@@ -7693,16 +7694,17 @@ fn preload_delta_rejects_data_actions_and_wrong_layout() -> Result<()> {
             "configuration": {"catalog.schemaHistory": "[]"}
         }
     });
-    fs::write(temp.path().join("00000000000000000000.json"), format!("{metadata}\n"))?;
-    fs::write(temp.path().join("00000000000000000001.json"), format!("{metadata}\n"))?;
-    let proof = verify_preload_delta(temp.path(), table)?;
+    fs::write(temp.join("00000000000000000000.json"), format!("{metadata}\n"))?;
+    fs::write(temp.join("00000000000000000001.json"), format!("{metadata}\n"))?;
+    let proof = verify_preload_delta(&temp, table)?;
     assert_eq!(proof["latest_version"], 1);
-    fs::write(temp.path().join("00000000000000000001.json"), "{\"add\":{}}\n")?;
-    assert!(verify_preload_delta(temp.path(), table).is_err());
+    fs::write(temp.join("00000000000000000001.json"), "{\"add\":{}}\n")?;
+    assert!(verify_preload_delta(&temp, table).is_err());
     let mut wrong = metadata;
     wrong["metaData"]["partitionColumns"] = json!([]);
-    fs::write(temp.path().join("00000000000000000001.json"), format!("{wrong}\n"))?;
-    assert!(verify_preload_delta(temp.path(), table).is_err());
+    fs::write(temp.join("00000000000000000001.json"), format!("{wrong}\n"))?;
+    assert!(verify_preload_delta(&temp, table).is_err());
+    fs::remove_dir_all(temp)?;
     Ok(())
 }
 

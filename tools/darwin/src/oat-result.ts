@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
-import { adaptOatEvidence, extractTimedReceipts, type OatMeasurement } from "./metrics-adapter.js";
+import { adaptOatEvidence, CoverageUnavailableError, extractTimedReceipts, type OatMeasurement } from "./metrics-adapter.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -98,11 +98,14 @@ export async function readReconciledOatResult(
   const measurement = adaptOatEvidence(evidence);
   const canonicalTable = `telemetry.sqlserver.${table}`;
   const receipts = extractTimedReceipts(evidence, canonicalTable, measurement);
+  if (typeof evidence.preload_delta !== "object" || evidence.preload_delta === null || Array.isArray(evidence.preload_delta)) {
+    throw new CoverageUnavailableError("pre-load Delta evidence is unavailable");
+  }
   const preload = object(evidence.preload_delta, "pre-load Delta evidence");
   const schedule = object(object(evidence.client_schedule, "client schedule").effective, "effective client schedule");
   if (!Number.isSafeInteger(schedule.run_start_unix_ms) || typeof preload.observed_at_unix_ms !== "number"
     || preload.observed_at_unix_ms >= Number(schedule.run_start_unix_ms)) {
-    throw new Error("pre-load Delta evidence was not captured before client admission");
+    throw new CoverageUnavailableError("pre-load Delta evidence was not captured before client admission");
   }
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
   const proof = await reconcileStoppedSnapshot(
