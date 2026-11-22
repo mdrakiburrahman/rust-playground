@@ -265,7 +265,11 @@ async function auditCadence(prepared: PreparedMaintenance, lane: MaintenanceLane
 
 export async function compareStopped(prepared: PreparedMaintenance, lane: MaintenanceLane, arm: string): Promise<unknown> {
   if (lane !== "active" && lane !== "idle") throw new Error("unsupported maintenance lane");
+  if (dirname(resolve(arm)) !== resolve(prepared.root) || await realpath(arm) !== resolve(arm)) {
+    throw new Error("stopped arm must be a direct, non-symlinked child of the evidence root");
+  }
   await assertBindings(prepared);
+  await treeHash(arm);
   const env = buildEnv(join(prepared.root, "home"), join(prepared.root, "target"));
   const output = run(prepared.comparatorBinary, [lane, prepared.seed, arm], prepared.root, env);
   if (lane === "idle") {

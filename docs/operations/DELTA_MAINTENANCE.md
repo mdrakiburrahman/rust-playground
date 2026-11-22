@@ -194,3 +194,15 @@ These fixtures use disposable local Delta tables, not Azure. `seed` requires a n
 | `cp -a <seed> <new-copy> && target/release/examples/darwin_maintenance idle <new-copy>` | Measures equal-cadence passes separately for empty, quiescent and protected tables; checks no commits or counted store writes and detects work becoming due after negative probes. |
 
 Use sequential, alternating baseline/candidate copies and retain the seed and binary hashes. The 4x rewrite-input bound is a fixture guard, not a production policy. Active rates measure maintenance convergence, **not ingestion**. Idle I/O counts cover instrumented object-store calls, not direct filesystem sidecars; CPU time uses Linux process ticks. Neither fixture establishes Azure behavior.
+
+## Maintenance Tier-1 component adapter
+
+Run on Linux x86-64 in the devcontainer, with user, PID, mount and network namespaces, Landlock ABI 3+, LLDB, Rust and the pinned submodules available. **Use a new private evidence directory outside the checkout; every arm rewrites a fresh disposable seed copy.**
+
+| Command | Result |
+| --- | --- |
+| `DARWIN_MAINTENANCE_E2E=1 DARWIN_EVIDENCE_ROOT=/tmp/<new-directory> npx --no-install tsx --test tools/darwin/src/maintenance-adapter.test.ts` | Builds the pinned fixture and trusted comparator, runs active and idle controls as three alternating pairs each, and rejects a stopped snapshot missing a protected file. |
+
+`prepareMaintenance` accepts a trusted source checkout and revision, trusted comparator and sandbox sources, an unused evidence directory and, only after separate native-code admission, an optional `maintenance.rs` candidate. It builds from that revision in an isolated worktree, pins the fixture and lock hashes, records source, submodule and binary hashes, and seeds once. `evaluateMaintenance(prepared, "active" | "idle")` returns physical checks and three pairs; it does not change `main.ts` or authorize a candidate.
+
+Each binary receives a separate debugger-observed cadence audit on a fresh copy; timed runs use the same bound binary without debugger overhead. A restricted, network-isolated candidate can write only its own copy, and the trusted comparator runs after the PID namespace has stopped. Active checks real Parquet rows, protected bytes, Delta actions and eligible-debt convergence; idle checks stopped table contents and independently observes the fixed probe sequence. Due-work assertions run in the pinned driver, while the comparator verifies the resulting fixed input and actual debt. Inverse full-process elapsed and reported object-store calls are **maintenance-only**, not durable ingestion. Store-call counts are fixture instrumentation, not independent proof of transient writes. Three pairs are screening only and never automatically accept a candidate; Azure behavior is not measured.
