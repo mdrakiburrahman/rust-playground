@@ -3633,8 +3633,31 @@ mod tests {
                         .expect("durable");
                 }
                 let elapsed = start.elapsed();
-                let files = add_file_count(&directory.path().join("demo/generated/events"));
+                let root = directory.path().join("demo/generated/events");
+                let files = add_file_count(&root);
                 assert_eq!(files, 4);
+                let mut ids = Vec::new();
+                for entry in std::fs::read_dir(&root).expect("table directory") {
+                    let path = entry.expect("entry").path();
+                    if path.extension().is_some_and(|extension| extension == "parquet") {
+                        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).expect("file"))
+                            .expect("parquet")
+                            .build()
+                            .expect("reader");
+                        for batch in reader {
+                            let batch = batch.expect("batch");
+                            let column = batch
+                                .column_by_name("id")
+                                .expect("id")
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .expect("u64 id");
+                            ids.extend(column.values().iter().copied());
+                        }
+                    }
+                }
+                ids.sort_unstable();
+                assert_eq!(ids, [1, 1, 1, 1, 2, 2, 2, 2]);
                 println!(
                     "local_ab,pair={pair},table_groups={table_groups},batch_bytes={charge},files={files},rows=8,elapsed_us={}",
                     elapsed.as_micros()
