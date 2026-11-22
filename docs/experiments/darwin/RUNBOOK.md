@@ -35,13 +35,26 @@ active Adds and decoded Parquet, and reports latency sample counts. A candidate
 must meet its own frozen baseline's 10% bytes-per-row guard. The separate
 historical comparable AKS headline guard is 38.17 B/row.
 
+| Local profile | Purpose |
+| --- | --- |
+| `candidate.oat.json` | V9 Realistic seed; its unique per-row identity is high entropy. |
+| `historical-parity.oat.json` | Diagnostic client with historical AKS batching, commit and CPU-worker settings, on the same hourly-partitioned table. Config validation is not a runtime readback. The compression replay does not yet support this profile. |
+
+Confirm Realistic codec, dictionary and compression winners on historical
+parity at AKS-like file sizes (approximately 2 million rows/file) before
+promotion. The parity collector's 4.29 GB queue budget is not headroom inside
+its 4 GiB container limit; confirm the effective cap and use the overload guard
+before load. Pipeline depth 8 causes the exporter to use `force_commit=false`.
+
 Resource memory is a sampled container value, not peak process RSS; unavailable
 RSS and downstream throughput are reported as null with reasons.
 
 The client uses the fixed business customer ID `direct-e64-confirmwide` while
 delivery and row identities remain unique per run. Its manifest hashes the
 generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
-must report the same hash. Client process CPU is reported separately from
+must report the same hash. This contract applies to the Realistic seed only;
+Diagnostic parity requires the pending profile-aware digest and extractor.
+Client process CPU is reported separately from
 collector samples, with its own sampling interval or an unavailable reason.
 The hourly ingestion-partitioned table is checked against catalog metadata
 before the clients are armed. Each pre-load Delta log is hashed and must have
