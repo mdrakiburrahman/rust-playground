@@ -30,7 +30,13 @@ fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::coll
         };
         validate_collector_pipeline_log_level(pipeline)?;
     }
-    config.tunables.environment_for(role)
+    let mut environment = config.tunables.environment_for(role)?;
+    if matches!(role, ComponentRole::Client | ComponentRole::Collector)
+        && let Some(interval) = config.stage_telemetry_interval_ms
+    {
+        environment.insert("ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS".to_owned(), interval.to_string());
+    }
+    Ok(environment)
 }
 
 fn validate_collector_pipeline_log_level(pipeline_yaml: &str) -> Result<()> {
@@ -561,6 +567,23 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         Ok(serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?)
+    }
+
+    #[test]
+    fn stage_telemetry_interval_is_scoped_to_collector_and_client() -> Result<()> {
+        let mut config = config()?;
+        let name = "ARROWCOL_STAGE_TELEMETRY_INTERVAL_MS";
+        for role in [ComponentRole::Client, ComponentRole::Collector, ComponentRole::Router, ComponentRole::Maintenance] {
+            assert!(!role_environment(&config, role)?.contains_key(name));
+        }
+        config.stage_telemetry_interval_ms = Some(1_000);
+        for role in [ComponentRole::Client, ComponentRole::Collector] {
+            assert_eq!(role_environment(&config, role)?.get(name).map(String::as_str), Some("1000"));
+        }
+        for role in [ComponentRole::Router, ComponentRole::Maintenance] {
+            assert!(!role_environment(&config, role)?.contains_key(name));
+        }
+        Ok(())
     }
 
     #[test]
