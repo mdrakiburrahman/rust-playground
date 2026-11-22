@@ -475,7 +475,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let root = TempRoot(root);
         let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
         arrowcol_loadgen::initialize::initialize_local(arrowcol_loadgen::cli::InitializeLocalArgs {
-            partition_by_ingestion_date: true, table: table.to_owned(), dataflow_root: root.0.clone(),
+            partition_by_ingestion_date: true, unpartitioned: false, table: table.to_owned(), dataflow_root: root.0.clone(),
         })?;
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
