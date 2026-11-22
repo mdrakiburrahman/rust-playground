@@ -23,14 +23,14 @@ function containers(image: string) {
 function evidence(image: string) {
   return { processes: [
     { component: "collector", image, image_id: image, log_complete: true, effective_config_source: "consumer_startup_readback", effective_config: { layout: true }, writer_policy_overrides: {}, layout_table_policies: [
-      { table_id: "f".repeat(64), table_name: "telemetry.sqlserver.sqlserver_active_sessions", scope: "table_effective_at_file_construction_not_full_run_history", config: { enabled: true, sort_columns: ["session_id"] } },
+      { table_id: "f".repeat(64), table_name: "telemetry.sqlserver.sqlserver_availability_replica_states", scope: "table_effective_at_file_construction_not_full_run_history", config: { enabled: true, sort_columns: ["replica_id"] } },
     ] },
     { component: "router", image_id: router, log_complete: true, effective_config: {}, writer_policy_overrides: null },
   ], client_phase_reports: [{ execution_image: { source: "docker_container_inspect", image_id: client } }] };
 }
 function config(root: string) {
   return { platform: { kind: "local", compose_state_root: `${root}/state`, local: { collector_memory_limit_bytes: 4096, snapshot_root: `${root}/snapshots` } },
-    replica_counts: [1], tables: ["sqlserver_active_sessions"], warmup_seconds: 60, measure_seconds: 150,
+    replica_counts: [1], tables: ["sqlserver_availability_replica_states"], warmup_seconds: 60, measure_seconds: 150,
     result_url: pathToFileURL(`${root}/results.parquet`).href, website_url: pathToFileURL(`${root}/site/results.parquet`).href };
 }
 
@@ -85,11 +85,13 @@ test("permits only run-owned paths to differ in otherwise identical local settin
   assert.throws(() => comparableRunConfig(invalid, "/tmp/b"));
   const unsafe = config("/tmp/b"); unsafe.replica_counts = [2];
   assert.throws(() => comparableRunConfig(unsafe, "/tmp/b"));
+  const wrongTable = config("/tmp/b"); wrongTable.tables = ["sqlserver_active_sessions"];
+  assert.throws(() => comparableRunConfig(wrongTable, "/tmp/b"));
   const altered = config("/tmp/b"); altered.measure_seconds = 151;
   assert.notDeepEqual(comparableRunConfig(config("/tmp/a"), "/tmp/a"), comparableRunConfig(altered, "/tmp/b"));
 });
 
-test("refuses a source revision other than the pinned baseline before creating snapshots", async () => {
+test("refuses a source revision other than the pinned producer before creating snapshots", async () => {
   const root = await mkdtemp(join(tmpdir(), "layout-source-"));
   try {
     const repo = join(root, "repo");
@@ -97,7 +99,30 @@ test("refuses a source revision other than the pinned baseline before creating s
     await writeFile(join(repo, "file"), "not the baseline");
     execFileSync("git", ["-C", repo, "add", "file"]);
     execFileSync("git", ["-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "not baseline"]);
-    await assert.rejects(LayoutCodeTrial.prepare(repo, join(root, "home")), /exact pinned baseline/);
+    await assert.rejects(LayoutCodeTrial.prepare(repo, join(root, "home"), "f9b87c9ec9b7d8fc9b1bd82c17dd0d2057f19c62"), /exact pinned producer/);
+    await assert.rejects(LayoutCodeTrial.prepare(repo, join(root, "home"), "HEAD"), /exact pinned producer/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("refuses a producer outside the trusted ancestry or with an unreviewed layout blob", async () => {
+  const root = await mkdtemp(join(tmpdir(), "layout-producer-"));
+  try {
+    const repo = join(root, "repo");
+    execFileSync("git", ["clone", "-q", "--shared", "--no-checkout", "--no-tags", ".", repo]);
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    const ancestor = "f9b87c9ec9b7d8fc9b1bd82c17dd0d2057f19c62";
+    const parent = git("rev-parse", `${ancestor}^`);
+    git("update-ref", "--no-deref", "HEAD", parent);
+    await assert.rejects(LayoutCodeTrial.prepare(repo, join(root, "old"), parent), /trusted ancestor/);
+
+    git("read-tree", ancestor);
+    const unreviewed = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: "unreviewed\n", encoding: "utf8" }).trim();
+    git("update-index", "--cacheinfo", `100644,${unreviewed},crates/arrow-deltalake/src/layout.rs`);
+    const tree = git("write-tree");
+    const producer = execFileSync("git", ["-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+      "commit-tree", tree, "-p", ancestor], { input: "unreviewed layout\n", encoding: "utf8" }).trim();
+    git("update-ref", "--no-deref", "HEAD", producer);
+    await assert.rejects(LayoutCodeTrial.prepare(repo, join(root, "changed"), producer), /reviewed pair/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

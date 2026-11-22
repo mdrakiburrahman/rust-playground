@@ -10,10 +10,13 @@ import { readReconciledOatResult } from "./oat-result.js";
 import { snapshot, type SnapshotManifest } from "./snapshot.js";
 import type { Manifest } from "./paths.js";
 
-const BASE = "f9b87c9ec9b7d8fc9b1bd82c17dd0d2057f19c62";
+const ANCESTOR = "f9b87c9ec9b7d8fc9b1bd82c17dd0d2057f19c62";
 const REVIEWED = "f3c4425c93d394632af0f0c1f11c631d23fe7811";
 const LAYOUT = "crates/arrow-deltalake/src/layout.rs";
 const DOCKERFILE = "projects/arrowcol-dataflow-rust/Dockerfile";
+const BASE_LAYOUT = "d274027a5d0aa18c1e464f2ca7d82567412f142f";
+const REVIEWED_LAYOUT = "074cb80e6a7d12ac55c27b15a3d31e0a74c2af1e";
+const TABLE = "sqlserver_availability_replica_states";
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{64}$/;
 type Arm = "baseline" | "candidate";
@@ -126,7 +129,7 @@ export function compareLayoutReadbacks(baseline: unknown, candidate: unknown): v
     if (!Array.isArray(policies) || policies.length !== 1) throw new Error("missing or ambiguous table layout proof");
     const policy = object(policies[0], "table layout");
     const config = object(policy.config, "table layout config");
-    if (policy.table_name !== "telemetry.sqlserver.sqlserver_active_sessions"
+    if (policy.table_name !== `telemetry.sqlserver.${TABLE}`
       || typeof policy.table_id !== "string" || !SHA.test(policy.table_id)
       || policy.scope !== "table_effective_at_file_construction_not_full_run_history"
       || config.enabled !== true || !Array.isArray(config.sort_columns) || !config.sort_columns.length
@@ -212,7 +215,7 @@ export function comparableRunConfig(raw: unknown, runRoot: string): JsonObject {
   const platform = object(config.platform, "platform");
   const local = object(platform.local, "local platform");
   if (platform.kind !== "local" || !isDeepStrictEqual(config.replica_counts, [1])
-    || !isDeepStrictEqual(config.tables, ["sqlserver_active_sessions"])
+    || !isDeepStrictEqual(config.tables, [TABLE])
     || !Number.isSafeInteger(local.collector_memory_limit_bytes) || Number(local.collector_memory_limit_bytes) <= 0
     || platform.compose_state_root !== join(runRoot, "state") || local.snapshot_root !== join(runRoot, "snapshots")
     || config.result_url !== pathToFileURL(join(runRoot, "results.parquet")).href
@@ -245,6 +248,7 @@ export function assertDisjointRunRoots(first: string, second: string): void {
 }
 export class LayoutCodeTrial {
   readonly #home: string;
+  readonly #producer: string;
   readonly #source: Record<Arm, string>;
   readonly #expected: Record<Arm, Manifest>;
   #images?: Record<Arm, string>;
@@ -255,34 +259,39 @@ export class LayoutCodeTrial {
   readonly #captures = new Map<Arm, Capture>();
   readonly #rechecked = new Set<Arm>();
   readonly #finished = new Map<Arm, Finished>();
-  private constructor(home: string, source: Record<Arm, string>, expected: Record<Arm, Manifest>) {
-    this.#home = home; this.#source = source; this.#expected = expected;
+  private constructor(home: string, producer: string, source: Record<Arm, string>, expected: Record<Arm, Manifest>) {
+    this.#home = home; this.#producer = producer; this.#source = source; this.#expected = expected;
   }
-  static async prepare(repo: string, home: string): Promise<LayoutCodeTrial> {
+  static async prepare(repo: string, home: string, producer: string): Promise<LayoutCodeTrial> {
     repo = await realpath(repo);
     home = resolve(home);
-    if (git(repo, "rev-parse", "HEAD").toString("utf8").trim() !== BASE) throw new Error("layout source must be the exact pinned baseline");
-    const parentLayout = git(repo, "show", `${REVIEWED}^:${LAYOUT}`);
-    const baseLayout = git(repo, "show", `${BASE}:${LAYOUT}`);
-    const replacement = git(repo, "show", `${REVIEWED}:${LAYOUT}`);
-    const names = git(repo, "diff", "--name-only", `${REVIEWED}^`, REVIEWED).toString("utf8").trim();
-    if (!parentLayout.equals(baseLayout) || baseLayout.equals(replacement) || names !== LAYOUT) {
-      throw new Error("reviewed production-only patch does not apply to the pinned baseline");
+    if (!/^[a-f0-9]{40}$/.test(producer)
+      || git(repo, "rev-parse", "HEAD").toString("utf8").trim() !== producer) {
+      throw new Error("layout source must be the exact pinned producer");
     }
+    if (git(repo, "merge-base", ANCESTOR, producer).toString("utf8").trim() !== ANCESTOR) {
+      throw new Error("layout producer must descend from the trusted ancestor");
+    }
+    if (git(repo, "rev-parse", `${producer}:${LAYOUT}`).toString("utf8").trim() !== BASE_LAYOUT
+      || git(repo, "rev-parse", `${REVIEWED}:${LAYOUT}`).toString("utf8").trim() !== REVIEWED_LAYOUT) {
+      throw new Error("layout blobs differ from the reviewed pair");
+    }
+    const baseLayout = git(repo, "show", `${producer}:${LAYOUT}`);
+    const replacement = git(repo, "show", `${REVIEWED}:${LAYOUT}`);
     const sourceHome = join(home, "layout-trial");
     const manifest: SnapshotManifest = await snapshot(repo, sourceHome);
-    if (manifest.commit !== BASE) throw new Error("layout source must be the exact pinned baseline");
+    if (manifest.commit !== producer) throw new Error("layout source must be the exact pinned producer");
     const all: Manifest = { ...manifest.files, ...manifest.submoduleFiles };
     if (!all[LAYOUT] || all[LAYOUT].sha256 !== digest(baseLayout) || !all[DOCKERFILE]) throw new Error("trusted source manifest mismatch");
     const baseline = join(sourceHome, "trusted", "src");
     const candidate = join(sourceHome, "trusted", "candidate-src");
     await verifyTree(baseline, all);
-    verifyGitBlobs(repo, BASE, baseline);
+    verifyGitBlobs(repo, producer, baseline);
     await cp(baseline, candidate, { recursive: true, errorOnExist: true, force: false });
     await writeFile(join(candidate, LAYOUT), replacement);
     const candidateManifest: Manifest = { ...all, [LAYOUT]: { ...all[LAYOUT], sha256: digest(replacement) } };
     await verifyTree(candidate, candidateManifest);
-    return new LayoutCodeTrial(home, { baseline, candidate }, { baseline: all, candidate: candidateManifest });
+    return new LayoutCodeTrial(home, producer, { baseline, candidate }, { baseline: all, candidate: candidateManifest });
   }
   sourceManifests(): Record<Arm, string> {
     const fingerprint = (manifest: Manifest) => digest(Buffer.from(JSON.stringify(Object.entries(manifest).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))));
@@ -301,7 +310,7 @@ export class LayoutCodeTrial {
       const builder = "layout-" + randomUUID();
       execFileSync("docker", ["buildx", "create", "--name", builder, "--driver", "docker-container"], { env, stdio: "inherit" });
       try {
-        execFileSync("docker", ["buildx", "build", "--builder", builder, "--load", "--iidfile", iid, "--file", join(root, DOCKERFILE), "--build-arg", "VCS_REF=" + BASE, root], { env, stdio: "inherit" });
+        execFileSync("docker", ["buildx", "build", "--builder", builder, "--load", "--iidfile", iid, "--file", join(root, DOCKERFILE), "--build-arg", "VCS_REF=" + this.#producer, root], { env, stdio: "inherit" });
       } finally {
         execFileSync("docker", ["buildx", "rm", builder], { env, stdio: "inherit" });
       }
@@ -318,7 +327,7 @@ export class LayoutCodeTrial {
   #verifyRuntime(): void {
     const runtime = join(this.#home, "trusted", "runtime");
     const output = (...args: string[]) => git(runtime, ...args).toString("utf8").trimEnd();
-    if (output("rev-parse", "--show-toplevel") !== runtime || output("rev-parse", "HEAD") !== BASE
+    if (output("rev-parse", "--show-toplevel") !== runtime || output("rev-parse", "HEAD") !== this.#producer
       || output("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
       || output("submodule", "status", "--recursive").split("\n").some(line => line && !line.startsWith(" "))) {
       throw new Error("trusted controller runtime is not clean at the pinned baseline");
@@ -383,7 +392,7 @@ export class LayoutCodeTrial {
     const path = join(capture.runRoot, "results.parquet");
     const bytes = await readFile(path);
     if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("invalid result size");
-    const result = await readReconciledOatResult(path, join(capture.runRoot, "snapshots"), "sqlserver_active_sessions", BASE, Number(defaults.compression_level));
+    const result = await readReconciledOatResult(path, join(capture.runRoot, "snapshots"), TABLE, this.#producer, Number(defaults.compression_level));
     if (digest(await readFile(path)) !== digest(bytes)) throw new Error("OAT result changed during reconciliation");
     const table = tableFromIPC(readParquet(bytes).intoIPCStream());
     if (table.numRows !== 1) throw new Error("invalid OAT evidence rows");
