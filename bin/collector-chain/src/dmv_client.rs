@@ -2472,26 +2472,27 @@ fn hash_payload_batch(
     total_rows: usize,
     profile: DataProfile,
 ) -> Result<()> {
-    ensure!(
+    anyhow::ensure!(
         batch.schema().as_ref() == table.schema.as_ref(),
         "payload batch schema changed"
     );
-    ensure!(
+    anyhow::ensure!(
         offset
             .checked_add(batch.num_rows())
             .is_some_and(|end| end <= total_rows),
         "payload batch exceeds table row count"
     );
-    let fields = batch.schema().fields();
+    let schema = batch.schema();
+    let fields = schema.fields();
     let include_field =
         |field: &arrow_schema::Field| profile != DataProfile::Realistic || field.name() != "endpoint_url";
     let field_count = fields.iter().filter(|field| include_field(field)).count();
     if offset == 0 {
         hasher.update([0x10]);
         hash_u64(hasher, copy)?;
-        hash_bytes(hasher, table.identity.catalog().as_bytes())?;
-        hash_bytes(hasher, table.identity.schema().as_bytes())?;
-        hash_bytes(hasher, table.identity.table().as_bytes())?;
+        hash_bytes(hasher, table.identity.catalog().to_string().as_bytes())?;
+        hash_bytes(hasher, table.identity.schema().to_string().as_bytes())?;
+        hash_bytes(hasher, table.identity.table().to_string().as_bytes())?;
         hash_u64(hasher, total_rows)?;
         hash_u64(hasher, field_count)?;
         for (index, field) in fields.iter().enumerate().filter(|(_, field)| include_field(field)) {
