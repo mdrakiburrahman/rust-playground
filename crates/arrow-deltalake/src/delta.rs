@@ -2203,6 +2203,35 @@ fn fitting_sort_chunk(
     let remaining = batch.num_rows().saturating_sub(start);
     let mut low = 0;
     let mut high = max_rows.min(remaining);
+    // Probe the same first prefix as the reference; if the next prefix borrows
+    // its buffers, all larger scalar prefixes borrow them and have the same charge.
+    if start == 0
+        && high == batch.num_rows()
+        && high > 1
+        && u32::try_from(high).is_ok()
+        && batch.columns().iter().all(|column| {
+            column.null_count() == 0
+                && matches!(
+                    column.data_type(),
+                    arrow::datatypes::DataType::Utf8
+                        | arrow::datatypes::DataType::Int16
+                        | arrow::datatypes::DataType::Int64
+                        | arrow::datatypes::DataType::Timestamp(_, _)
+                )
+        })
+        && batch.get_array_memory_size() <= max_bytes
+    {
+        let first = high.div_ceil(2);
+        if owned_for_sort(batch.slice(0, first))?.get_array_memory_size() <= max_bytes {
+            let second = first + (high - first).div_ceil(2);
+            let prefix = batch.slice(0, second);
+            let charged = u64::try_from(prefix.get_array_memory_size()).context("Arrow memory charge exceeds u64")?;
+            let logical = crate::record_batch_logical_bytes(&prefix)?;
+            if charged <= logical.saturating_mul(2) {
+                return Ok(Some(owned_for_sort(batch.slice(0, high))?));
+            }
+        }
+    }
     while low < high {
         let rows = low + (high - low).div_ceil(2);
         let candidate = owned_for_sort(batch.slice(start, rows))?;
