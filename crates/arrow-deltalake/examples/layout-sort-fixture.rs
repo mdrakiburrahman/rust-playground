@@ -257,6 +257,24 @@ fn main() -> Result<()> {
     let input_hash = hash(&input)?;
     let output_hash = hash(&expected)?;
 
+    let variable = vec![
+        input.slice(0, 1),
+        input.slice(1, 8_191),
+        input.slice(8_192, 16_385),
+        input.slice(24_577, input.num_rows() - 24_577),
+    ];
+    let variable_expected = reference(&variable, stress)?;
+    let mut variable_buffer = FileSortBuffer::new(input.schema(), policy.clone())?;
+    for batch in &variable {
+        ensure!(variable_buffer.try_push(batch)?, "variable-size batch rejected");
+    }
+    let variable_actual = variable_buffer.finish()?;
+    ensure!(
+        variable_actual == variable_expected,
+        "variable-size sliced batches differ from Arrow reference"
+    );
+    independent_checks(&variable, &variable_actual, stress)?;
+
     let mut row_limited = FileSortBuffer::new(
         batches[0].schema(),
         LayoutPolicy {
