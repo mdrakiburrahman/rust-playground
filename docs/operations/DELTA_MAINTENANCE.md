@@ -181,3 +181,16 @@ Run these inside the repository devcontainer on a leased devbox:
 For a bug bash, first create a disposable table using the catalog, capture the `_delta_log` and `_arrowcol_maintenance` file inventory, run two idle passes, and compare names, sizes, hashes and modification times. Set `arrowcol.optimize.minFiles` above the sealed partition's file count: no compaction should occur. Lower it to two and add two small files in an older partition plus one newest partition: only the sealed pair may compact. An unknown property or a retention below seven days must be rejected before table metadata changes.
 
 Catalog policy is refreshed each scheduling pass. Changes to typed policy immediately reconsider a table's interval instead of retaining its previous deadline; failed passes remain retryable. Catalog history and purge bookkeeping are not user policy, but changed registered tunables must match current Delta metadata before a negative probe can report success.
+
+## Local maintenance component fixtures
+
+These fixtures use disposable local Delta tables, not Azure. `seed` requires a new directory; `active` rewrites its input and `idle` deliberately appends to the due-work case. **Run either measurement only on a fresh copy of the seed**, never on a production table.
+
+| Command | Result |
+| --- | --- |
+| `cargo build --locked --release -p arrow-deltalake --example darwin_maintenance` | Builds the local fixture. |
+| `target/release/examples/darwin_maintenance seed <new-directory>` | Creates one immutable seed containing active, empty, quiescent, protected and due-work tables. |
+| `cp -a <seed> <new-copy> && target/release/examples/darwin_maintenance active <new-copy>` | Measures fixed initial logical rows per time to eligible-debt convergence, rewrite bytes/files and protected backlog; verifies actual rows, metadata, `dataChange=false`, and the post-convergence no-op. |
+| `cp -a <seed> <new-copy> && target/release/examples/darwin_maintenance idle <new-copy>` | Measures equal-cadence passes separately for empty, quiescent and protected tables; checks no commits or counted store writes and detects work becoming due after negative probes. |
+
+Use sequential, alternating baseline/candidate copies and retain the seed and binary hashes. The 4x rewrite-input bound is a fixture guard, not a production policy. Active rates measure maintenance convergence, **not ingestion**. Idle I/O counts cover instrumented object-store calls, not direct filesystem sidecars; CPU time uses Linux process ticks. Neither fixture establishes Azure behavior.
