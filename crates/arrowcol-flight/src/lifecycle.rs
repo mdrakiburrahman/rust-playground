@@ -28,6 +28,7 @@ pub struct StreamContext {
     alignment: SchemaAlignmentPlan,
     actual_fingerprint: SchemaFingerprint,
     deadline: Option<Instant>,
+    trusted_client_send_observation: Option<(String, u64)>,
 }
 
 impl StreamContext {
@@ -41,6 +42,7 @@ impl StreamContext {
         alignment: SchemaAlignmentPlan,
         actual_fingerprint: SchemaFingerprint,
         deadline: Option<Instant>,
+        trusted_client_send_observation: Option<(String, u64)>,
     ) -> Self {
         Self {
             metadata,
@@ -51,6 +53,7 @@ impl StreamContext {
             alignment,
             actual_fingerprint,
             deadline,
+            trusted_client_send_observation,
         }
     }
 
@@ -94,6 +97,14 @@ impl StreamContext {
     #[must_use]
     pub const fn actual_fingerprint(&self) -> SchemaFingerprint {
         self.actual_fingerprint
+    }
+
+    /// Returns the authenticated client DoPut observation, if supplied by a trusted forwarder.
+    #[must_use]
+    pub fn trusted_client_send_observation(&self) -> Option<(&str, u64)> {
+        self.trusted_client_send_observation
+            .as_ref()
+            .map(|(id, timestamp)| (id.as_str(), *timestamp))
     }
 
     /// Returns the effective stream deadline.

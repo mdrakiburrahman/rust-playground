@@ -62,6 +62,8 @@ binary hex ordering to implement the same contract.
 
 ## Run-scoped AKS federation
 
+For the staged direct throughput experiment, see [Direct AKS benchmark](DIRECT_AKS_BENCHMARK.md). It uses the run-FIC lifecycle below and preserves all Delta data.
+
 All commands use the existing private Azure/stamp configuration and run from
 the repository's leased Linux devcontainer. The namespace and ServiceAccount
 must already exist with the run's ownership labels and annotations.

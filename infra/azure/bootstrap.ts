@@ -10,6 +10,7 @@ import { Failure, HttpFailure, ControlConflict, NotReady, DeploymentFailed, cano
   canonical_json, publisher_registry, require_released, uuid, type Metadata } from './authority.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
 import { assertNoStampNetworkOverlap, defaultStampConfig, loadStampConfig, type StampConfig } from './stamp.js';
+import { dispatchExternalEffect, EffectBoundaryRefused, processEffectRequest } from './effect-boundary.js';
 export * from './authority.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -33,7 +34,7 @@ export const service_name = (resource: string): string => SERVICE_NAMES[resource
 export const runtime = {
   sleep: (seconds: number) => new Promise<void>(resolve => setTimeout(resolve, seconds * 1000)),
   now: () => performance.now() / 1000,
-  run_tree,
+  run_tree: (...args: Parameters<typeof run_tree>) => dispatchExternalEffect(processEffectRequest(args[0]), () => run_tree(...args)),
 };
 export function load_env(filename: string): Record<string, string> {
   if (!fs.existsSync(filename) || !fs.statSync(filename).isFile())
@@ -265,11 +266,14 @@ export function write_private(filename: string, values: Record<string, string>):
 }
 export interface ProcessResult { returncode: number; stdout: string; stderr: string }
 export async function run_tree(command: string[], timeout: number, cwd?: string,
-  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void): Promise<ProcessResult> {
+  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void, maxOutputBytes?: number): Promise<ProcessResult> {
+  if (maxOutputBytes !== undefined && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1))
+    throw new Failure('maxOutputBytes must be a positive safe integer before command admission.');
   return new Promise((resolve, reject) => {
     const child = spawn(command[0], command.slice(1), { detached: true, cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', failure: Failure | undefined;
+    let stdout = '', stderr = '', failure: Failure | undefined, outputBytes = 0, overflow = false;
     const kill = (message: string) => {
+      if (failure) return;
       failure = new Failure(message);
       if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure = new Failure('Process group could not be terminated; outcome unknown.');
@@ -278,8 +282,19 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
     const interrupt = () => kill('Command interrupted; outcome unknown and process group killed. Authority stays blocking; no automatic clear.');
     const timer = setTimeout(() => kill('Command timed out; outcome unknown and process group killed. Authority stays blocking; no automatic clear.'), timeout * 1000);
     process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
-    child.stdout.on('data', data => { stdout += data.toString(); });
+    const accept = (data: Buffer): boolean => {
+      if (overflow) return false;
+      if (maxOutputBytes !== undefined && data.byteLength > maxOutputBytes - outputBytes) {
+        overflow = true;
+        kill('Command output exceeded its fixed byte bound; outcome unknown and process group killed.');
+        return false;
+      }
+      outputBytes += data.byteLength;
+      return true;
+    };
+    child.stdout.on('data', (data: Buffer) => { if (accept(data)) stdout += data.toString(); });
     child.stderr.on('data', data => {
+      if (!accept(data)) return;
       const chunk = data.toString();
       stderr += chunk;
       onStderr?.(chunk);
@@ -297,9 +312,11 @@ export class Azure {
   tokens = new Map<string, { at: number; token: string; lifetime: number }>();
   token_pending = new Map<string, Promise<string>>();
   snapshots = new Map<string, Metadata>();
-  constructor(public c: Config) {}
+  constructor(public c: Config, private readonly cliTimeoutSeconds: number | (() => number) = 3600) {}
   async cli(...args: string[]): Promise<any> {
-    const result = await runtime.run_tree(['az', ...args, '--only-show-errors', '--output', 'json'], 3600);
+    const timeout = typeof this.cliTimeoutSeconds === 'function' ? this.cliTimeoutSeconds() : this.cliTimeoutSeconds;
+    if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Failure('Azure CLI timeout must be a positive safe integer.');
+    const result = await runtime.run_tree(['az', ...args, '--only-show-errors', '--output', 'json'], timeout);
     if (result.returncode) throw new Failure(this.c.redact(result.stderr));
     return result.stdout.trim() ? JSON.parse(result.stdout) : null;
   }
@@ -338,7 +355,7 @@ export class Azure {
     for (let attempt = 0; attempt < attempts; attempt++) {
       try { return await this._request_once(method, url, resource, body, headers, missing_ok, capture); }
       catch (error) {
-        if (!(error instanceof Failure) || attempt + 1 === attempts ||
+        if (error instanceof EffectBoundaryRefused || !(error instanceof Failure) || attempt + 1 === attempts ||
             (error instanceof HttpFailure && !TRANSIENT_HTTP.has(error.code))) throw error;
         console.error(`Transient ${method} ${service_name(resource)} failure; retry ${attempt + 1}/${attempts - 1}: ` +
           error.message.slice(0, 200));
@@ -350,25 +367,31 @@ export class Azure {
   async _request_once(method: string, url: string, resource: string, body?: string | Buffer | null,
     headers: Headers = {}, missing_ok = false, capture?: (receipt: HttpReceipt) => void): Promise<[Buffer | null, Headers]> {
     const token = await this.token(resource);
-    let response: Response;
     try {
-      response = await fetch(url, { method, body: body == null ? undefined : body as BodyInit,
-        signal: AbortSignal.timeout(30_000), redirect: 'error',
-        headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
-          { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
-      const bytes = Buffer.from(await response.arrayBuffer());
-      capture?.({ status: response.status, bodyBase64: bytes.toString('base64'),
-        headers: Object.fromEntries([...response.headers.entries()].filter(([name]) =>
+      const parsedUrl = new URL(url);
+      const response = await dispatchExternalEffect({ transport: 'azure-rest', method, resource: parsedUrl.origin + '|' + resource,
+        path: parsedUrl.pathname + parsedUrl.search, body }, async () => {
+        const received = await fetch(url, { method, body: body == null ? undefined : body as BodyInit,
+          signal: AbortSignal.timeout(30_000), redirect: 'error',
+          headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
+            { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
+        const bytes = Buffer.from(await received.arrayBuffer());
+        const responseHeaders = Object.fromEntries(received.headers.entries());
+        const receiptHeaders = Object.fromEntries(Object.entries(responseHeaders).filter(([name]) =>
           ['x-ms-request-id', 'x-ms-correlation-request-id', 'x-ms-client-request-id',
-            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name))) });
+            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name)));
+        capture?.({ status: received.status, bodyBase64: bytes.toString('base64'), headers: receiptHeaders });
+        return { status: received.status, bytes, headers: responseHeaders };
+      });
       if (missing_ok && response.status === 404) return [null, {}];
-      if (!response.ok) throw new HttpFailure(response.status, `HTTP ${response.status}: ${this.c.redact(bytes.toString())}`);
-      return [bytes, { ...Object.fromEntries(response.headers.entries()), ':status': String(response.status) }];
+      if (response.status < 200 || response.status >= 300)
+        throw new HttpFailure(response.status, 'HTTP ' + response.status + ': ' + this.c.redact(response.bytes.toString()));
+      return [response.bytes, { ...response.headers, ':status': String(response.status) }];
     } catch (error) {
-      if (error instanceof HttpFailure) throw error;
+      if (error instanceof HttpFailure || error instanceof EffectBoundaryRefused) throw error;
       const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
-      throw new Failure(this.c.redact(`${method} ${service_name(resource)} request failed: ${String(error)}` +
-        (typeof code === 'string' ? ` (${code})` : '')), { cause: error });
+      throw new Failure(this.c.redact(method + ' ' + service_name(resource) + ' request failed: ' + String(error) +
+        (typeof code === 'string' ? ' (' + code + ')' : '')), { cause: error });
     }
   }
   async arm(method: string, resourcePath: string, body?: any, missing_ok = false, api = API): Promise<any> {
@@ -507,15 +530,16 @@ export async function exchange_workload_identity_assertion(resource: string, cli
   const scope = resource.replace(/\/+$/, '') + '/.default';
   let response: Response;
   try {
-    response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
-        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion }),
-      signal: AbortSignal.timeout(timeoutMs),
-      redirect: 'error',
-    });
+    const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
+    const parsedUrl = new URL(tokenUrl);
+    const body = new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
+      client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion });
+    response = await dispatchExternalEffect({ transport: 'azure-auth', method: 'POST', resource: parsedUrl.origin,
+      path: parsedUrl.pathname + parsedUrl.search, body: body.toString() }, () => fetch(tokenUrl, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
+      signal: AbortSignal.timeout(timeoutMs), redirect: 'error' }));
   } catch (error) {
+    if (error instanceof EffectBoundaryRefused) throw error;
     throw new Failure('Workload identity token exchange request failed.', { cause: error });
   }
   if (!response.ok) {
@@ -1875,18 +1899,20 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         'occupancy-id': { type: 'string', default: '' }, 'reset-generation': { type: 'string', default: '' },
         'wait-seconds': { type: 'string', default: '0' }, help: { type: 'boolean', short: 'h' },
         'run-id': { type: 'string' }, namespace: { type: 'string' },
-        'service-account': { type: 'string' }, record: { type: 'string' },
+        'service-account': { type: 'string' }, record: { type: 'string' }, 'identity-plan': { type: 'string' },
         manifest: { type: 'string' }, 'workload-record': { type: 'string' }, 'workload-stop-record': { type: 'string' },
+        reference: { type: 'string' },
         'preview-before-create': { type: 'boolean', default: false },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--preview-before-create] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|plan-run-fic|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap|oat-qap-reference|recover-oat-qap|recover-oat-qap-stop|observe-custody-capacity> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--preview-before-create] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH --identity-plan PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH --reference PATH] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
     if (positionals.length !== 1 || !['config', 'preflight', 'what-if', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
-      'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap'].includes(command))
+      'plan-run-fic', 'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap',
+      'oat-qap-reference', 'recover-oat-qap', 'recover-oat-qap-stop', 'observe-custody-capacity'].includes(command))
       throw new Failure('A valid Azure bootstrap command is required.');
     const mode = azure_mode(args.mode!);
-    if (args['read-only'] && command !== 'preflight' && command !== 'what-if')
-      throw new Failure('--read-only is only supported for preflight and what-if.');
+    if (args['read-only'] && !['preflight', 'what-if', 'plan-run-fic', 'oat-qap-reference', 'recover-oat-qap', 'recover-oat-qap-stop', 'observe-custody-capacity'].includes(command))
+      throw new Failure('--read-only is only supported for preflight, what-if, FIC planning, QAP reference/recovery and custody capacity observation.');
     if (args['preview-before-create'] && command !== 'provision')
       throw new Failure('--preview-before-create is only supported for provision.');
     if (mode === 'schema-evolution' && args['stamp-config'])
@@ -1900,6 +1926,34 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       throw new Failure('--wait-seconds must be in the range 0..600.');
     const azure = new Azure(c), generation = args['reset-generation'] || values.ARROWCOL_RESET_GENERATION;
     switch (command) {
+      case 'oat-qap-reference': {
+        if (!args.record) throw new Failure('QAP reference requires --record.');
+        const { oat_qap_reference } = await import('./oat_qap.js');
+        console.log(canonical_json(await oat_qap_reference(azure, args.record)));
+        break;
+      }
+      case 'recover-oat-qap': case 'recover-oat-qap-stop': {
+        if (!args.reference || (command === 'recover-oat-qap' ? !args.record : !args['workload-stop-record']))
+          throw new Failure('QAP recovery requires --reference and --record or --workload-stop-record.');
+        const { read_oat_qap_reference, recover_oat_qap_record, recover_oat_workload_stop } = await import('./oat_qap.js');
+        const reference = read_oat_qap_reference(args.reference);
+        if (command === 'recover-oat-qap') await recover_oat_qap_record(azure, reference, args.record!);
+        else await recover_oat_workload_stop(azure, reference, args['workload-stop-record']!);
+        console.log(canonical_json({ status: 'recovered', run_id: reference.run_id }));
+        break;
+      }
+      case 'observe-custody-capacity': {
+        const { observe_custody_idle_capacity } = await import('./aks-safe-idle.js');
+        console.log(canonical_json(await observe_custody_idle_capacity(azure)));
+        break;
+      }
+      case 'plan-run-fic': {
+        if (!args['run-id'] || !args.namespace || !args['service-account'])
+          throw new Failure('Run FIC planning requires --run-id, --namespace and --service-account.');
+        const { plan_run_fic } = await import('./run_fic.js');
+        console.log(canonical_json(await plan_run_fic(azure, args['run-id'], args.namespace, args['service-account'])));
+        break;
+      }
       case 'bind-oat-qap': {
         if (!args['run-id'] || !args.manifest || !args.record || !args['workload-record'])
           throw new Failure('QAP binding requires --run-id, --manifest, --record and --workload-record.');
@@ -1927,10 +1981,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (!args['run-id'] || !args.record ||
             (command !== 'cleanup-run-fic' && (!args.namespace || !args['service-account'])))
           throw new Failure('Run FIC helpers require --run-id and --record, plus --namespace and --service-account for prepare/probe.');
-        const { prepare_run_fic, probe_run_fic, cleanup_run_fic } = await import('./run_fic.js');
+        const { prepare_run_fic, probe_run_fic, cleanup_run_fic, private_run_fic_json } = await import('./run_fic.js');
         if (command === 'cleanup-run-fic') await cleanup_run_fic(azure, args['run-id'], args.record);
         else if (command === 'prepare-run-fic')
-          await prepare_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record);
+          await prepare_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record,
+            args['identity-plan'] ? private_run_fic_json(args['identity-plan']) : undefined);
         else await probe_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record, wait);
         break;
       }

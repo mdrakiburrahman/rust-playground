@@ -59,6 +59,19 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.workers", "0 (available parallelism)"),
     capability!("client.runtime_threads", "0 (automatic)"),
     capability!("client.data_mode", "shared"),
+    capability!("client.data_profile", "diagnostic"),
+    capability!(
+        "client.string_length_distribution",
+        "uniform (realistic), fixed (diagnostic)"
+    ),
+    capability!(
+        "client.value_variation",
+        "per_row (realistic), cardinality (diagnostic)"
+    ),
+    capability!(
+        "client.guid_uniqueness",
+        "per_row (realistic), cardinality (diagnostic)"
+    ),
     capability!("client.string_width", "0 (canonical fallback)"),
     capability!("client.cardinality", "1024"),
     capability!("client.null_fraction", "0"),
@@ -68,6 +81,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.max_memory_bytes", "536870912"),
     capability!("client.interval_us", "0"),
     capability!("client.connections_per_worker", "1"),
+    capability!("client.pod_ordinal", "0 (per-client GUID salt; u32)"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
     capability!("client.max_rows", "component default"),
     capability!("client.stream_retry_max_attempts", "4"),
@@ -151,7 +165,9 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.upstream_total_connection_timeout_ms", "3000"),
     capability!("router.upstream_idle_timeout_seconds", "60"),
     capability!("router.upstream_ping_interval_seconds", "15; 0 disables"),
+    capability!("collector.shutdown_drain_timeout_seconds", "60"),
     capability!("collector.batching.coalesce_publications", "false"),
+    capability!("collector.batching.age_flush_policy", "immediate"),
     capability!("collector.batching.global_capacity.bytes", "2147483648"),
     capability!("collector.batching.global_capacity.rows", "10000000"),
     capability!("collector.batching.global_capacity.batches", "4096"),
@@ -163,6 +179,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.max_batches_per_flush", "512"),
     capability!("collector.batching.max_age", "30s"),
     capability!("collector.batching.max_concurrent_flushes", "4"),
+    capability!("collector.batching.pipeline_depth", "1"),
     capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
     capability!("collector.batching.adaptive_file.min_input_bytes", "16777216"),
     capability!("collector.batching.adaptive_file.max_input_bytes", "1073741824"),
@@ -194,6 +211,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!("collector.limits.max_metadata_bytes", "16384"),
+    capability!("collector.limits.grpc_accept_compression", "none"),
+    capability!("collector.limits.grpc_send_compression", "none"),
     capability!("collector.limits.max_schema_bytes", "1048576"),
     capability!("collector.limits.max_message_bytes", "16777216"),
     capability!("collector.limits.batch_channel_capacity", "4"),
@@ -220,6 +239,9 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.upload.mode", "put_create"),
+    capability!("collector.upload.buffer_capacity_bytes", "8388608"),
+    capability!("collector.upload.request_concurrency", "2"),
     capability!("parquet_writer.defaults.compression", "inherit component default"),
     capability!("parquet_writer.defaults.compression_level", "codec default"),
     capability!("parquet_writer.defaults.encoding", "inherit component default"),
@@ -315,9 +337,16 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.enabled", "false"),
     capability!("maintenance.operations", "unset"),
     capability!("maintenance.apply", "false"),
+    capability!("maintenance.parquet_writer", "inherit shared parquet_writer"),
+    capability!("maintenance.optimize_upload_mode", "put_create"),
+    capability!(
+        "maintenance.optimize_upload_buffer_bytes",
+        "8388608; buffered_multipart only"
+    ),
     capability!("maintenance.interval_secs", "one-shot"),
     capability!("maintenance.max_idle_backoff_secs", "3600"),
     capability!("maintenance.max_cycles", "unlimited"),
+    capability!("maintenance.max_consecutive_stale_plans", "8; inclusive 1..=1024"),
     capability!("maintenance.max_concurrent_tables", "1"),
     capability!("maintenance.max_concurrent_decoded_bytes", "unset"),
     capability!("maintenance.operation_timeout_secs", "900"),
@@ -357,6 +386,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.max_active_files", "1000000"),
     capability!("maintenance.latest_partitions", "all"),
     capability!("maintenance.sealed_final", "false"),
+    capability!(
+        "maintenance.sealed_partitions_only",
+        "true; table property overrides process preference"
+    ),
     capability!("maintenance.checkpoint_every_commits", "100"),
     capability!("maintenance.log_retention_secs", "table policy or 2592000"),
     capability!("maintenance.max_prune_files", "10000"),
@@ -378,6 +411,16 @@ pub fn capability_table() -> &'static [Capability] {
 }
 
 impl Tunables {
+    /// Parses and validates a complete OAT tunables object using the typed registry.
+    ///
+    /// # Errors
+    /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
+    pub fn parse_oat_json(value: Value) -> Result<Self> {
+        let tunables: Self = serde_json::from_value(value).context("parse OAT tunables")?;
+        tunables.validate_for_oat()?;
+        Ok(tunables)
+    }
+
     /// Validates values and verifies every configured section can be projected to process environments.
     ///
     /// # Errors
@@ -553,6 +596,7 @@ impl Tunables {
             validate_limits(collector.limits.as_ref())?;
             validate_pressure(collector.pressure.as_ref())?;
             validate_runtime(collector.runtime.as_ref())?;
+            validate_collector_upload(collector)?;
         }
         if let Some(writer) = &self.parquet_writer {
             writer.validate()?;
@@ -612,6 +656,18 @@ impl Tunables {
                 }
             })
             .collect();
+        if matches!(role, ComponentRole::Maintenance)
+            && let Some(writer) = self
+                .maintenance
+                .as_ref()
+                .filter(|settings| settings.enabled == Some(true))
+                .and_then(|settings| settings.parquet_writer.as_ref())
+        {
+            selected.insert(
+                "ARROWCOL_PARQUET_CONFIG".to_owned(),
+                canonicalize(serde_json::to_value(writer)?).to_string(),
+            );
+        }
         if matches!(role, ComponentRole::Router) {
             let level = self
                 .logging
@@ -665,6 +721,12 @@ impl Tunables {
                 let Some(collector) = self.collector.as_ref() else {
                     bail!("collector section serialized without typed settings");
                 };
+                if let Some(seconds) = collector.shutdown_drain_timeout_seconds {
+                    output.insert(
+                        "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS".to_owned(),
+                        seconds.to_string(),
+                    );
+                }
                 if let Some(value) = &collector.batching {
                     let mut value = value.clone();
                     canonicalize_optional_duration(&mut value.max_age, "collector.batching.max_age")?;
@@ -753,6 +815,19 @@ impl Tunables {
                         if let Some(value) = value {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
+                        if let Some(upload) = &collector.upload {
+                            if let Some(mode) = upload.mode {
+                                output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
+                            }
+                            for (field, value) in [
+                                ("UPLOAD_BUFFER_CAPACITY_BYTES", upload.buffer_capacity_bytes),
+                                ("UPLOAD_REQUEST_CONCURRENCY", upload.request_concurrency),
+                            ] {
+                                if let Some(value) = value {
+                                    output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(value) = collector.cpu_pressure {
@@ -766,6 +841,7 @@ impl Tunables {
                     object.remove("enabled");
                     object.remove("apply");
                     object.remove("operations");
+                    object.remove("parquet_writer");
                 }
                 flatten_environment(&value, "ARROWCOL_MAINT", &mut output);
                 continue;
@@ -1036,7 +1112,14 @@ fn validate_h2_window(field: &str, window: u32) -> Result<()> {
 }
 
 fn validate_duration(name: &str, value: Option<&str>, default: &str) -> Result<Duration> {
-    let value = value.unwrap_or(default);
+    parse_tunable_duration(name, value.unwrap_or(default))
+}
+
+/// Parses a positive, representable tunable duration.
+///
+/// # Errors
+/// Returns an error for malformed, zero, or out-of-range durations.
+pub fn parse_tunable_duration(name: &str, value: &str) -> Result<Duration> {
     let duration =
         humantime::parse_duration(value).with_context(|| format!("{name} must be a valid humantime duration"))?;
     if duration.is_zero() || Instant::now().checked_add(duration).is_none() {
@@ -1094,27 +1177,24 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
     ] {
         positive(name, Some(value))?;
     }
-    for (name, columns, required) in [
-        ("collector.layout.sort_columns", layout.sort_columns.as_deref(), true),
-        ("collector.layout.bloom_columns", layout.bloom_columns.as_deref(), false),
+    for (name, columns) in [
+        ("collector.layout.sort_columns", layout.sort_columns.as_deref()),
+        ("collector.layout.bloom_columns", layout.bloom_columns.as_deref()),
     ] {
         if let Some(columns) = columns {
-            if required && columns.is_empty() {
-                bail!("{name} must not be empty");
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            if columns
-                .iter()
-                .any(|column| column.trim().is_empty() || column.contains(',') || !seen.insert(column))
-            {
-                bail!("{name} must contain unique nonempty column names without commas");
-            }
+            validate_column_list(name, columns, false)?;
         }
     }
     Ok(())
 }
 
 fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
+    if collector
+        .shutdown_drain_timeout_seconds
+        .is_some_and(|seconds| !(1..=MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS).contains(&seconds))
+    {
+        bail!("collector.shutdown_drain_timeout_seconds must be in 1..={MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS}");
+    }
     if let Some(catalog) = &collector.catalog {
         validate_millisecond_duration(
             "collector.catalog.maximum_cache_age",
@@ -1178,6 +1258,13 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
     positive("collector.batching.max_concurrent_flushes", Some(flushes))?;
     if flushes > (usize::MAX >> 3) {
         bail!("collector.batching.max_concurrent_flushes exceeds Semaphore::MAX_PERMITS");
+    }
+    let depth = batching.pipeline_depth.unwrap_or(1);
+    if !(1..=64).contains(&depth) {
+        bail!("collector.batching.pipeline_depth must be in 1..=64");
+    }
+    if depth > 1 && batching.coalesce_publications != Some(true) {
+        bail!("collector.batching.pipeline_depth > 1 requires coalesce_publications=true");
     }
     validate_duration("collector.batching.max_age", batching.max_age.as_deref(), "30s")?;
     if flush_bytes > u64::from(table_bytes)
@@ -1330,6 +1417,40 @@ fn validate_pressure(pressure: Option<&PressureTunables>) -> Result<()> {
     Ok(())
 }
 
+fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
+    let Some(upload) = &collector.upload else {
+        return Ok(());
+    };
+    if upload.mode.unwrap_or_default() == CollectorUploadMode::PutCreate {
+        if upload.buffer_capacity_bytes.is_some() || upload.request_concurrency.is_some() {
+            bail!("collector.upload buffer_capacity_bytes and request_concurrency require buffered_multipart mode");
+        }
+        return Ok(());
+    }
+    let capacity = upload.buffer_capacity_bytes.unwrap_or(8_388_608);
+    let concurrency = upload.request_concurrency.unwrap_or(2);
+    if !(1_048_576..=67_108_864).contains(&capacity) {
+        bail!("collector.upload.buffer_capacity_bytes must be between 1048576 and 67108864");
+    }
+    if !(1..=16).contains(&concurrency) {
+        bail!("collector.upload.request_concurrency must be between 1 and 16");
+    }
+    let limit = collector
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.upload_limit)
+        .unwrap_or(32);
+    let bytes = capacity
+        .checked_mul(concurrency + 1)
+        .and_then(|bytes| bytes.checked_add(65_536))
+        .and_then(|bytes| bytes.checked_mul(limit))
+        .context("aggregate collector upload buffering size overflow")?;
+    if bytes > 1_073_741_824 {
+        bail!("aggregate collector upload buffering must not exceed 1073741824 bytes, got {bytes}");
+    }
+    Ok(())
+}
+
 fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
     let Some(runtime) = runtime else {
         return Ok(());
@@ -1380,6 +1501,25 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         bail!("maintenance.apply=true requires maintenance.enabled=true");
     }
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
+    if maintenance.optimize_upload_mode.is_some() || maintenance.optimize_upload_buffer_bytes.is_some() {
+        if !has_optimize {
+            bail!("maintenance optimize upload settings require optimize");
+        }
+        if let Some(bytes) = maintenance.optimize_upload_buffer_bytes {
+            if maintenance.optimize_upload_mode != Some(MaintenanceUploadMode::BufferedMultipart) {
+                bail!("maintenance.optimize_upload_buffer_bytes requires buffered_multipart mode");
+            }
+            if !(4_194_304..=67_108_864).contains(&bytes) {
+                bail!("maintenance.optimize_upload_buffer_bytes must be between 4194304 and 67108864");
+            }
+        }
+    }
+    if let Some(writer) = &maintenance.parquet_writer {
+        if !has_optimize {
+            bail!("maintenance.parquet_writer requires optimize");
+        }
+        writer.validate().context("maintenance.parquet_writer")?;
+    }
     let has_purge = has_operation(MaintenanceOperation::Purge);
     let has_vacuum = has_operation(MaintenanceOperation::Vacuum);
     let has_checkpoint = has_operation(MaintenanceOperation::Checkpoint);
@@ -1502,6 +1642,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             has_optimize,
         ),
         ("sealed_final", maintenance.sealed_final.is_some(), has_optimize),
+        (
+            "sealed_partitions_only",
+            maintenance.sealed_partitions_only.is_some(),
+            has_optimize,
+        ),
     ] {
         if present && !operation {
             bail!("maintenance.{name} requires its corresponding operation");
@@ -1513,6 +1658,15 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         maintenance.max_idle_backoff_secs.or(Some(3_600)),
     )?;
     positive("maintenance.max_cycles", maintenance.max_cycles)?;
+    if maintenance
+        .max_consecutive_stale_plans
+        .is_some_and(|limit| !(1..=1024).contains(&limit))
+    {
+        bail!("maintenance.max_consecutive_stale_plans must be between 1 and 1024");
+    }
+    if maintenance.sealed_final.is_some() && maintenance.sealed_partitions_only.is_some() {
+        bail!("maintenance.sealed_final and sealed_partitions_only cannot be combined");
+    }
     let concurrent_tables = maintenance.max_concurrent_tables.unwrap_or(1);
     positive("maintenance.max_concurrent_tables", Some(concurrent_tables))?;
     if concurrent_tables > 16 {
@@ -1855,6 +2009,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
+        let valid = serde_json::json!({"collector":{"batching":{
+            "coalesce_publications":true,"pipeline_depth":4
+        }}});
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
+        let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert_eq!(batching["pipeline_depth"], 4);
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(65),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+        ] {
+            let mut candidate = valid.clone();
+            candidate["collector"]["batching"]["pipeline_depth"] = value;
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        let mut no_coalescing = valid;
+        no_coalescing["collector"]["batching"]["coalesce_publications"] = serde_json::json!(false);
+        assert!(Tunables::parse_oat_json(no_coalescing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn collector_upload_validation_and_projection() -> Result<()> {
+        let valid = serde_json::json!({"collector": {
+            "runtime": {"upload_limit": 1},
+            "upload": {"mode": "buffered_multipart", "buffer_capacity_bytes": 1048576, "request_concurrency": 16}
+        }});
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_MODE"], "buffered_multipart");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"], "1048576");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"], "16");
+
+        for (field, value) in [
+            ("mode", serde_json::json!("stream")),
+            ("buffer_capacity_bytes", serde_json::json!(1048575)),
+            ("buffer_capacity_bytes", serde_json::json!(67108865)),
+            ("request_concurrency", serde_json::json!(0)),
+            ("request_concurrency", serde_json::json!(17)),
+        ] {
+            let mut candidate = valid.clone();
+            candidate["collector"]["upload"][field] = value;
+            assert!(Tunables::parse_oat_json(candidate).is_err(), "{field}");
+        }
+        let mut create = valid.clone();
+        create["collector"]["upload"]["mode"] = serde_json::json!("put_create");
+        assert!(Tunables::parse_oat_json(create).is_err());
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector": {
+                "runtime": {"upload_limit": 256}, "upload": {"mode": "put_create"}
+            }}))
+            .is_ok()
+        );
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector": {
+                "runtime": {"upload_limit": 256}, "upload": {"mode": "buffered_multipart"}
+            }}))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collector_shutdown_drain_timeout_rejects_bad_json_and_projects_only_to_collector() -> Result<()> {
+        let name = "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS";
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("240"),
+            Value::Null,
+            serde_json::json!(1_501),
+            serde_json::json!(u32::MAX),
+        ] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({
+                    "collector": {"shutdown_drain_timeout_seconds": bad}
+                }))
+                .is_err(),
+                "{bad}"
+            );
+        }
+        for seconds in [1, 240, 1_500] {
+            let tunables = Tunables::parse_oat_json(serde_json::json!({
+                "collector": {"shutdown_drain_timeout_seconds": seconds}
+            }))?;
+            assert_eq!(
+                tunables.environment_for(ComponentRole::Collector)?[name],
+                seconds.to_string()
+            );
+            assert!(!tunables.environment_for(ComponentRole::Router)?.contains_key(name));
+        }
+        assert!(
+            !Tunables::default()
+                .environment_for(ComponentRole::Collector)?
+                .contains_key(name)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cpu_pressure_mode_is_strict_and_projects_to_collector_env() -> Result<()> {
         assert_eq!(
             serde_json::from_str::<CpuPressureMode>("\"process\"")?,
@@ -1872,6 +2128,46 @@ mod tests {
         assert_eq!(
             tunables.environment_for(ComponentRole::Collector)?["ARROWCOL_COLLECTOR_CPU_PRESSURE"],
             "process"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_compression_is_strict_and_projected_separately_from_client() -> Result<()> {
+        for codec in ["none", "gzip", "zstd"] {
+            let tunables = Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"limits":{"grpc_accept_compression":codec,"grpc_send_compression":"none"}},
+                "transport":{"grpc_send_compression":"none","grpc_accept_compression":"zstd"}
+            }))?;
+            let environment = tunables.environment_for(ComponentRole::Collector)?;
+            let limits: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_LIMITS_CONFIG"])?;
+            assert_eq!(limits["grpc_accept_compression"], codec);
+            assert_eq!(limits["grpc_send_compression"], "none");
+            let client = tunables.environment_for(ComponentRole::Client)?;
+            assert_eq!(client["ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION"], "none");
+            assert_eq!(client["ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION"], "zstd");
+            assert!(!client.contains_key("ARROWCOL_COLLECTOR_LIMITS_CONFIG"));
+        }
+        for field in ["grpc_accept_compression", "grpc_send_compression"] {
+            for invalid in [
+                serde_json::json!("brotli"),
+                serde_json::json!("Gzip"),
+                serde_json::json!(""),
+                serde_json::json!(true),
+                serde_json::json!(["gzip"]),
+            ] {
+                assert!(
+                    Tunables::parse_oat_json(serde_json::json!({
+                        "collector":{"limits":{field:invalid}}
+                    }))
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            !Tunables::default()
+                .environment_for(ComponentRole::Collector)?
+                .contains_key("ARROWCOL_COLLECTOR_LIMITS_CONFIG")
         );
         Ok(())
     }
@@ -1896,6 +2192,45 @@ mod tests {
             let mut invalid = ParquetWriterConfig::default();
             invalid.defaults.bloom_filter_fpp = Some(probability);
             assert!(invalid.validate().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oat_registry_parses_every_existing_codec_and_rejects_bad_candidates() -> Result<()> {
+        for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4_raw", "lz4"] {
+            let value = serde_json::json!({"parquet_writer":{"defaults":{"compression":codec}}});
+            let tunables = Tunables::parse_oat_json(value)?;
+            let env = tunables.environment_for(ComponentRole::Collector)?;
+            let projected: Value = serde_json::from_str(&env["ARROWCOL_PARQUET_CONFIG"])?;
+            assert_eq!(projected["defaults"]["compression"], codec);
+        }
+        for value in [
+            serde_json::json!({"parquet_writer":{"defaults":{"compression":"invalid"}}}),
+            serde_json::json!({"collector":{"commit":{"staging_overlap":true}}}),
+            serde_json::json!({"client":{"workers":1025}}),
+            serde_json::json!({"client":{"workers":"16"}}),
+        ] {
+            assert!(Tunables::parse_oat_json(value).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_layout_column_lists_project_without_defaulting() -> Result<()> {
+        let value = serde_json::json!({"collector":{"layout":{
+            "enabled":true, "sort_columns":[], "bloom_columns":[]
+        }}});
+        let tunables = Tunables::parse_oat_json(value)?;
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_SORT_COLUMNS"], "");
+        assert_eq!(env["ARROWCOL_COLLECTOR_BLOOM_COLUMNS"], "");
+        for field in ["sort_columns", "bloom_columns"] {
+            for columns in [vec![""], vec!["a", "a"], vec!["a,b"], vec![" a"]] {
+                let mut value = serde_json::json!({"collector":{"layout":{"enabled":true}}});
+                value["collector"]["layout"][field] = serde_json::json!(columns);
+                assert!(Tunables::parse_oat_json(value).is_err());
+            }
         }
         Ok(())
     }
@@ -1937,6 +2272,83 @@ mod tests {
             ..Default::default()
         };
         assert!(disabled.environment_for(ComponentRole::Maintenance)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_writer_override_is_strict_and_role_isolated() -> Result<()> {
+        let value = serde_json::json!({
+            "parquet_writer": {"defaults": {"compression": "zstd"}},
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "parquet_writer": {"defaults": {"compression": "snappy"}}}
+        });
+        let tunables = Tunables::parse_oat_json(value.clone())?;
+        let collector = tunables.environment_for(ComponentRole::Collector)?;
+        let maintenance = tunables.environment_for(ComponentRole::Maintenance)?;
+        let collector_writer: Value = serde_json::from_str(&collector["ARROWCOL_PARQUET_CONFIG"])?;
+        let maintenance_writer: Value = serde_json::from_str(&maintenance["ARROWCOL_PARQUET_CONFIG"])?;
+        assert_eq!(collector_writer["defaults"]["compression"], "zstd");
+        assert_eq!(maintenance_writer["defaults"]["compression"], "snappy");
+        assert!(
+            !maintenance
+                .keys()
+                .any(|key| key.starts_with("ARROWCOL_MAINT_PARQUET_WRITER"))
+        );
+        let mut inherited = value.clone();
+        inherited["maintenance"]
+            .as_object_mut()
+            .context("maintenance fixture must be an object")?
+            .remove("parquet_writer");
+        let inherited = Tunables::parse_oat_json(inherited)?;
+        assert_eq!(
+            inherited.environment_for(ComponentRole::Maintenance)?["ARROWCOL_PARQUET_CONFIG"],
+            collector["ARROWCOL_PARQUET_CONFIG"]
+        );
+        let mut invalid = value.clone();
+        invalid["maintenance"]["parquet_writer"]["defaults"]["compression"] = serde_json::json!("invalid");
+        assert!(Tunables::parse_oat_json(invalid).is_err());
+        let mut no_optimize = value;
+        no_optimize["maintenance"]["operations"] = serde_json::json!(["vacuum"]);
+        assert!(Tunables::parse_oat_json(no_optimize).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_upload_controls_reject_invalid_or_inactive_settings() -> Result<()> {
+        let value = serde_json::json!({"maintenance": {
+            "enabled": true, "operations": ["optimize"],
+            "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4_194_304
+        }});
+        for bytes in [4_194_304_u64, 67_108_864] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_buffer_bytes"] = serde_json::json!(bytes);
+            let settings = Tunables::parse_oat_json(candidate)?;
+            let env = settings.environment_for(ComponentRole::Maintenance)?;
+            assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE"], "buffered_multipart");
+            assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES"], bytes.to_string());
+        }
+        for bytes in [
+            serde_json::json!(4_194_303),
+            serde_json::json!(67_108_865),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_buffer_bytes"] = bytes;
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        for mode in ["stream", "unknown", "put_create"] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_mode"] = serde_json::json!(mode);
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        let mut create = value;
+        create["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
+        create["maintenance"]
+            .as_object_mut()
+            .context("maintenance fixture must be an object")?
+            .remove("optimize_upload_buffer_bytes");
+        assert!(Tunables::parse_oat_json(create).is_ok());
         Ok(())
     }
 
@@ -2310,6 +2722,8 @@ mod tests {
                 max_concurrent_decoded_bytes: Some(200),
                 commit_attempts: Some(12),
                 commit_budget_secs: Some(15),
+                max_consecutive_stale_plans: Some(4),
+                sealed_partitions_only: Some(false),
                 input_read_strategy: Some(MaintenanceInputReadStrategy::Spool),
                 catalog_runtime_threads: Some(4),
                 catalog_rpc_timeout_secs: Some(45),
@@ -2323,6 +2737,33 @@ mod tests {
         assert_eq!(env["ARROWCOL_MAINT_MAX_CONCURRENT_DECODED_BYTES"], "200");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_ATTEMPTS"], "12");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_BUDGET_SECS"], "15");
+        assert_eq!(env["ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS"], "4");
+        assert_eq!(env["ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY"], "false");
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(1025),
+            serde_json::json!("8"),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({"maintenance":{
+                    "enabled":true, "operations":["optimize"], "max_consecutive_stale_plans": value
+                }}))
+                .is_err()
+            );
+        }
+        for value in [1, 1024] {
+            Tunables::parse_oat_json(serde_json::json!({"maintenance":{
+                "enabled":true, "operations":["optimize"], "max_consecutive_stale_plans": value
+            }}))?;
+        }
+        for settings in [
+            serde_json::json!({"enabled":true,"operations":["optimize"],"sealed_partitions_only":"false"}),
+            serde_json::json!({"enabled":true,"operations":["vacuum"],"sealed_partitions_only":false}),
+            serde_json::json!({"enabled":true,"operations":["optimize"],"sealed_partitions_only":false,"sealed_final":true}),
+        ] {
+            assert!(Tunables::parse_oat_json(serde_json::json!({"maintenance":settings})).is_err());
+        }
         assert_eq!(env["ARROWCOL_MAINT_INPUT_READ_STRATEGY"], "spool");
         let range = Tunables {
             maintenance: Some(MaintenanceTunables {
@@ -2392,6 +2833,7 @@ mod tests {
         let tunables = Tunables {
             collector: Some(CollectorTunables {
                 batching: Some(BatchingTunables {
+                    age_flush_policy: Some(AgeFlushPolicy::DrainReady),
                     max_age: Some("250ms".to_owned()),
                     global_capacity: Some(QueueCapacityTunables {
                         rows: Some(20_000_000),
@@ -2430,6 +2872,7 @@ mod tests {
         let env = tunables.environment_for(ComponentRole::Collector)?;
         let batching: serde_json::Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
         assert_eq!(batching["max_age"], "250ms");
+        assert_eq!(batching["age_flush_policy"], "drain_ready");
         assert_eq!(batching["global_capacity"]["rows"], 20_000_000);
         assert_eq!(env["ARROWCOL_COLLECTOR_COMMIT_CONFIG"], r#"{"batch_window":"1s"}"#);
         assert_eq!(env["ARROWCOL_COLLECTOR_LIMITS_CONFIG"], r#"{"admission_timeout":"5s"}"#);
@@ -2443,6 +2886,14 @@ mod tests {
         assert_eq!(env["ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS"], "100000");
         assert_eq!(env["ARROWCOL_COLLECTOR_RUNTIME_WORKERS"], "8");
         assert_eq!(env["ARROWCOL_COLLECTOR_BATCH_ROWS"], "16384");
+        for invalid in [serde_json::json!("drain_forever"), serde_json::json!(true)] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"batching":{"age_flush_policy":invalid}}
+                }))
+                .is_err()
+            );
+        }
         Ok(())
     }
 
@@ -2676,6 +3127,79 @@ mod tests {
             ..Default::default()
         };
         assert!(error_text(invalid.validate()).contains("entropy"));
+    }
+
+    #[test]
+    fn client_profile_and_pod_ordinal_are_strict_and_projected() -> Result<()> {
+        assert_eq!(ClientDataProfile::default(), ClientDataProfile::Diagnostic);
+        let defaults = Tunables::parse_oat_json(serde_json::json!({"client": {}}))?;
+        assert!(
+            !defaults
+                .environment_for(ComponentRole::Client)?
+                .contains_key("ARROWCOL_CLIENT_DATA_PROFILE")
+        );
+        assert_eq!(
+            capability_table()
+                .iter()
+                .find(|capability| capability.name == "client.data_profile")
+                .map(|capability| capability.default),
+            Some("diagnostic")
+        );
+
+        let config: Tunables = serde_json::from_str(
+            r#"{"client":{"data_profile":"realistic","string_length_distribution":"uniform","value_variation":"per_row","guid_uniqueness":"per_row","pod_ordinal":3}}"#,
+        )?;
+        config.validate_for_oat()?;
+        let env = config.environment_for(ComponentRole::Client)?;
+        for (name, value) in [
+            ("ARROWCOL_CLIENT_DATA_PROFILE", "realistic"),
+            ("ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", "uniform"),
+            ("ARROWCOL_CLIENT_VALUE_VARIATION", "per_row"),
+            ("ARROWCOL_CLIENT_GUID_UNIQUENESS", "per_row"),
+            ("ARROWCOL_CLIENT_POD_ORDINAL", "3"),
+        ] {
+            assert_eq!(env[name], value);
+        }
+
+        for (field, value) in [
+            ("data_profile", "realistic-ish"),
+            ("string_length_distribution", "zipf"),
+            ("value_variation", "unique"),
+            ("guid_uniqueness", "unique"),
+        ] {
+            let input = serde_json::json!({"client": {field: value}});
+            assert!(
+                serde_json::from_value::<Tunables>(input).is_err(),
+                "{field} accepted {value}"
+            );
+        }
+
+        for (field, value) in [
+            ("shard_index_mode", serde_json::json!("fixed")),
+            ("fixed_shard_index", serde_json::json!(1)),
+        ] {
+            let input = serde_json::json!({"client": {field: value}});
+            assert!(
+                serde_json::from_value::<Tunables>(input).is_err(),
+                "removed key {field} was accepted"
+            );
+        }
+
+        let max_ordinal = Tunables {
+            client: Some(ClientTunables {
+                pod_ordinal: Some(u32::MAX),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        max_ordinal.validate()?;
+        assert!(
+            serde_json::from_value::<Tunables>(serde_json::json!({
+                "client": {"pod_ordinal": 4_294_967_296_u64}
+            }))
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

@@ -41,7 +41,7 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 | `arrowcol.optimize.maxBatchSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Maximum decoded Arrow bytes per input batch. |
 | `arrowcol.optimize.batchRows` | Integer | `8192` | `Positive` | Table | 0.1 | Rows read per input batch. |
 | `arrowcol.layout.enabled` | Bool | `false` | `Any` | Table | 0.1 | Enable bounded sorted-file layout. |
-| `arrowcol.layout.sortColumns` | StringList | `customer_id` | `Positive` | Table | 0.1 | Comma-separated sort columns; names must exist in the table schema. |
+| `arrowcol.layout.sortColumns` | StringList | `customer_id` | `Any` | Table | 0.1 | Comma-separated sort columns; empty disables sorting and names must exist in the table schema. |
 | `arrowcol.layout.bloomColumns` | StringList | `customer_id` | `Any` | Table | 0.1 | Comma-separated Bloom-filter columns; empty disables Bloom filters. |
 | `arrowcol.layout.maxRows` | Integer | `262144` | `Range(1.0, 4294967295.0)` | Table | 0.1 | Maximum rows buffered per sorted file. |
 | `arrowcol.layout.maxInputSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Maximum Arrow input retained per sorted file. |
@@ -54,5 +54,26 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 | `arrowcol.writer.ewmaWeight` | Float | `0.2` | `Range(2.2250738585072014e-308, 0.5)` | Table | 0.1 | Weight of each successfully committed file observation in the group-scheduling estimator. |
 | `arrowcol.writer.minParquetRatio` | Float | `0.015625` | `Positive` | Table | 0.1 | Lower compression-ratio clamp. |
 | `arrowcol.writer.maxParquetRatio` | Float | `4` | `Positive` | Table | 0.1 | Upper compression-ratio clamp. |
+| `arrowcol.collector.upload.mode` | Enum | `put_create` | `OneOf(["put_create", "buffered_multipart"])` | Process | 0.1 | Upload strategy; buffered multipart is opt-in and relies on UUID object names rather than conditional create. |
+| `arrowcol.collector.upload.bufferCapacityBytes` | Bytes | `8 MiB` | `Range(1048576.0, 67108864.0)` | Process | 0.1 | Per-upload multipart part buffer, active only with buffered_multipart mode. |
+| `arrowcol.collector.upload.requestConcurrency` | Integer | `2` | `Range(1.0, 16.0)` | Process | 0.1 | In-flight multipart part requests per upload, active only with buffered_multipart mode. |
+| `arrowcol.maintenance.optimizeUploadMode` | Enum | `put_create` | `OneOf(["put_create", "buffered_multipart"])` | Table | 0.1 | OPTIMIZE upload mode; buffered multipart is unqualified and not for scored cells. |
+| `arrowcol.maintenance.optimizeUploadBufferBytes` | Integer | `8388608` | `Range(4194304.0, 67108864.0)` | Table | 0.1 | Buffered multipart upload buffer bytes; effective only in buffered_multipart mode. |
+| `arrowcol.client.corpusRows` | Integer | `0` | `Any` | Process | 0.1 | Prepared synthetic corpus row target; zero preserves the legacy rows-derived default and cannot be combined with corpusBytes. |
+| `arrowcol.client.corpusBytes` | Bytes | `0` | `Any` | Process | 0.1 | Prepared synthetic corpus byte target; zero uses row-based sizing and cannot be combined with corpusRows. |
+| `arrowcol.client.batchRows` | Integer | `0` | `Range(0.0, 2147483647.0)` | Process | 0.1 | Rows encoded per prepared batch; zero inherits the legacy rows option. |
+| `arrowcol.client.workers` | Integer | `0` | `Range(0.0, 1024.0)` | Process | 0.1 | Concurrent client workers; zero resolves to available parallelism. |
+| `arrowcol.client.runtimeThreads` | Integer | `0` | `Range(0.0, 1024.0)` | Process | 0.1 | Tokio runtime worker threads; zero resolves to available parallelism. |
+| `arrowcol.client.dataMode` | Enum | `shared` | `OneOf(["shared", "independent"])` | Process | 0.1 | Whether workers reuse one prepared corpus or each own an independent prepared corpus. |
+| `arrowcol.client.stringWidth` | Integer | `0` | `Range(0.0, 65536.0)` | Process | 0.1 | Synthetic UTF-8 string width in bytes; zero uses each fixture field's canonical width. |
+| `arrowcol.client.cardinality` | Integer | `1024` | `Positive` | Process | 0.1 | Maximum generated key cardinality for non-identity synthetic fields. |
+| `arrowcol.client.skew` | Float | `0` | `Range(0.0, 1.0)` | Process | 0.1 | Synthetic key skew fraction; zero is uniform and one is maximally skewed. |
+| `arrowcol.client.entropy` | Float | `1` | `Range(0.0, 1.0)` | Process | 0.1 | Fraction of synthetic string positions varied by the deterministic generator. |
+| `arrowcol.client.seed` | Integer | `20260923` | `Any` | Process | 0.1 | Deterministic synthetic corpus seed. |
+| `arrowcol.client.maxMemoryBytes` | Bytes | `536870912` | `Positive` | Process | 0.1 | Maximum memory reservation for prepared corpus and encoding scratch; must fit the process address space. |
+| `arrowcol.client.intervalUs` | Integer | `0` | `Range(0.0, 86400000000.0)` | Process | 0.1 | Delay between continuous send attempts in microseconds; zero continuously blasts the prepared corpus. |
+| `arrowcol.client.connectionsPerWorker` | Integer | `1` | `Range(1.0, 256.0)` | Process | 0.1 | Persistent Flight connections per worker; total connections are capped at 4096. |
+| `arrowcol.client.streamsPerWorker` | Integer | `0` | `Range(0.0, 1024.0)` | Process | 0.1 | Concurrent continuous send streams per worker; zero inherits legacy concurrency and total streams are capped at 65536. |
+| `arrowcol.client.ipcCompression` | Enum | `none` | `OneOf(["none", "lz4_frame", "zstd"])` | Process | 0.1 | Arrow IPC payload compression; invalid codec names are rejected. |
 
 See [Delta maintenance](../operations/DELTA_MAINTENANCE.md) for operation ordering, negative probes and retention safety.

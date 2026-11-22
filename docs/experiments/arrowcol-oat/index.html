@@ -262,7 +262,9 @@ function outputMetrics(row) {
       process.effective_config?.commit_telemetry?.schema_version === 1 &&
       process.effective_config.commit_telemetry.scope === 'new_ingestion_addfiles_after_sync' &&
       process.effective_config.commit_telemetry.clock === 'system_unix_ms');
-    if (evidence?.version === 1 && proven && output &&
+    const reconciliationAllowsRanking = evidence?.evidence_class !== 'd53_exploratory' ||
+      (evidence.ranking_eligible !== false && evidence.durable_commits?.delta_log_reconciliation?.status === 'matched');
+    if (evidence?.version === 1 && reconciliationAllowsRanking && proven && output &&
         output.scope === 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort' &&
         !output.unavailable_reason) {
       const metric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;

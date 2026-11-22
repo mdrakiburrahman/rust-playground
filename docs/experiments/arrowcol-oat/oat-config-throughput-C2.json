@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "cohort": "C2",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "seed-only-not-capability-registry",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
+  "baseline_overrides": {
+    "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
+    "tables": [
+      "sqlserver_availability_replica_states"
+    ],
+    "replica_counts": [
+      1
+    ],
+    "rows_per_table": 65536,
+    "warmup_seconds": 10,
+    "measure_seconds": 150
+  },
+  "invariants": {
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "interval_secs": 15,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000,
+      "continuous": true
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 15,
+      "target_file_mib": 128,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000
+    }
+  },
+  "comparisons": [
+    {
+      "id": "dictionary-encoding",
+      "factor": "parquet_writer.columns",
+      "candidates": [
+        {
+          "id": "availability-group-name-dictionary-off",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "availability-group-name-dictionary-on",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "last-connect-error-delta-binary-packed",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "last_connect_error_number": {
+                    "dictionary_enabled": false,
+                    "encoding": "delta_binary_packed"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "last-connect-error-byte-stream-split",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "last_connect_error_number": {
+                    "dictionary_enabled": false,
+                    "encoding": "byte_stream_split"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "string-encoding",
+      "factor": "parquet_writer.columns.availability_group_name.encoding",
+      "candidates": [
+        {
+          "id": "plain",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false,
+                    "encoding": "plain"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "delta-length-byte-array",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false,
+                    "encoding": "delta_length_byte_array"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "delta-byte-array",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false,
+                    "encoding": "delta_byte_array"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    }
+  ],
+  "parquet_enum_coverage": {
+    "kind": "value_encoding",
+    "accepted": [
+      "plain",
+      "rle",
+      "delta_binary_packed",
+      "delta_length_byte_array",
+      "delta_byte_array",
+      "byte_stream_split"
+    ],
+    "configured": [
+      "plain",
+      "delta_binary_packed",
+      "delta_length_byte_array",
+      "delta_byte_array",
+      "byte_stream_split"
+    ],
+    "excluded": {
+      "rle": "BOOLEAN-only; frozen table has no Boolean column"
+    },
+    "pending": [],
+    "status": "configured-not-runtime-screened"
+  },
+  "source_enum_coverage": {
+    "dictionary_handling": {
+      "path": "tunables.transport.dictionary_handling",
+      "accepted": [
+        "hydrate",
+        "resend"
+      ],
+      "configured": [],
+      "baseline_requested": null,
+      "effective_default": "hydrate (bin/collector-chain/src/dmv_client.rs::Options)",
+      "consumer": "ARROWCOL_CLIENT_DICTIONARY_HANDLING -> bin/collector-chain/src/dmv_client.rs::Options.dictionary_handling",
+      "excluded": {
+        "resend": "Pinned Tunables validation rejects resend for the frozen plain DMV schema."
+      },
+      "pending": [],
+      "status": "single-runtime-compatible-value-no-contrast"
+    }
+  },
+  "runnable": false,
+  "config_validation": {
+    "status": "config-validated",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 7,
+    "pass_count": 8,
+    "fail_count": 0
+  },
+  "runtime_qualification": "unqualified"
+}

@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, ensure};
 use arrowcol_oat_rust::config::{OatConfig, OatMode};
 use arrowcol_oat_rust::model::{AppState, CancelRunError, RunState, RunStatus, unix_time_ms};
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use futures_util::TryStreamExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +25,11 @@ struct Args {
     allow_insecure_non_loopback: bool,
     #[arg(long)]
     validate_config: Option<PathBuf>,
+    /// Fixture-only zero-row Kubernetes setup. Requires the per-command NDJSON bridge.
+    #[arg(long, conflicts_with = "validate_config")]
+    fixture_setup: Option<PathBuf>,
+    #[arg(long, requires = "fixture_setup")]
+    fixture_bridge_stdio: bool,
 }
 
 #[derive(Serialize)]
@@ -36,10 +44,18 @@ struct ApiError {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    if let Some(path) = args.fixture_setup {
+        let result = arrowcol_oat_rust::runner::run_fixture_setup(&path, args.fixture_bridge_stdio).await;
+        if let Err(error) = &result {
+            eprintln!("{error:#}");
+        }
+        // Tokio's stdin reader may still block after a bridge timeout; this dedicated CLI owns no background work.
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let args = Args::parse();
     if let Some(path) = args.validate_config {
         let source = fs::read_to_string(&path)
             .await
@@ -77,8 +93,23 @@ async fn health() -> Json<Health> {
 
 async fn start_run(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<OatConfig>,
-) -> Result<(StatusCode, Json<RunStatus>), (StatusCode, Json<ApiError>)> {
+    request: Request,
+) -> Result<(StatusCode, Json<RunStatus>), Response> {
+    let hasher = Arc::new(tokio::sync::Mutex::new(Sha256::new()));
+    let body_hasher = Arc::clone(&hasher);
+    let request = request.map(|body| {
+        axum::body::Body::from_stream(body.into_data_stream().and_then(move |chunk| {
+            let body_hasher = Arc::clone(&body_hasher);
+            async move {
+                body_hasher.lock().await.update(&chunk);
+                Ok(chunk)
+            }
+        }))
+    });
+    let Json(config) = Json::<OatConfig>::from_request(request, &state)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let config_sha256 = format!("{:x}", hasher.lock().await.clone().finalize());
     config.validate().map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -86,6 +117,7 @@ async fn start_run(
                 error: format!("{error:#}"),
             }),
         )
+            .into_response()
     })?;
     let permit = state.try_start_run().ok_or_else(|| {
         (
@@ -94,17 +126,10 @@ async fn start_run(
                 error: "an OAT run is already active".to_owned(),
             }),
         )
+            .into_response()
     })?;
     let id = uuid::Uuid::new_v4().to_string();
-    let status = RunStatus {
-        id: id.clone(),
-        state: RunState::Queued,
-        progress: "queued".to_owned(),
-        result_count: 0,
-        error: None,
-        started_at_unix_ms: unix_time_ms(),
-        finished_at_unix_ms: None,
-    };
+    let status = RunStatus::queued(id.clone(), config_sha256);
     state.runs.lock().await.insert(id.clone(), status.clone());
 
     let local = config.platform.kind == OatMode::Local;
@@ -136,14 +161,7 @@ async fn start_run(
             }
             Err(error) => {
                 tracing::error!(run_id = %id, error = %error, "OAT run failed");
-                task_state
-                    .update(&id, |status| {
-                        status.state = RunState::Failed;
-                        status.progress = "failed".to_owned();
-                        status.error = Some(format!("{error:#}"));
-                        status.finished_at_unix_ms = Some(unix_time_ms());
-                    })
-                    .await;
+                task_state.finish_failed_run(&id, format!("{error:#}")).await;
             }
         }
     });
@@ -185,4 +203,66 @@ async fn get_run(
             }),
         )
     })
+}
+
+#[cfg(test)]
+mod config_hash_tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_and_get_attest_raw_bytes_before_the_runner_is_scheduled() -> Result<()> {
+        let raw = include_bytes!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+        let expected = format!("{:x}", Sha256::digest(raw));
+        let state = Arc::new(AppState::default());
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(raw.as_slice()))?;
+        // All awaits are immediately ready on this thread; the spawned workload is never polled.
+        let (code, Json(status)) = start_run(State(Arc::clone(&state)), request)
+            .await
+            .map_err(|response| anyhow::anyhow!("run rejected: {}", response.status()))?;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(status.config_sha256, expected);
+        let Json(observed) = get_run(State(state), Path(status.id.clone()))
+            .await
+            .map_err(|(code, _)| anyhow::anyhow!("missing accepted run: {code}"))?;
+        assert_eq!(observed.id, status.id);
+        assert_eq!(observed.config_sha256, expected);
+        let parsed: serde_json::Value = serde_json::from_slice(raw)?;
+        assert_ne!(expected, format!("{:x}", Sha256::digest(serde_json::to_vec(&parsed)?)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_capture_preserves_json_extractor_rejections() -> Result<()> {
+        for (content_type, body) in [
+            ("text/plain", "{}".to_owned()),
+            ("application/json", "{".to_owned()),
+            ("application/json", r#"{"platform":42}"#.to_owned()),
+            ("application/json", " ".repeat(2 * 1024 * 1024 + 1)),
+        ] {
+            let request = || {
+                Request::builder()
+                    .header("content-type", content_type)
+                    .body(Body::from(body.clone()))
+            };
+            let state = Arc::new(AppState::default());
+            let Err(expected) = Json::<OatConfig>::from_request(request()?, &state).await else {
+                anyhow::bail!("JSON extractor unexpectedly accepted the request");
+            };
+            let expected = expected.into_response();
+            let Err(actual) = start_run(State(state), request()?).await else {
+                anyhow::bail!("run handler unexpectedly accepted the request");
+            };
+            assert_eq!(actual.status(), expected.status());
+            assert_eq!(actual.headers(), expected.headers());
+            assert_eq!(
+                to_bytes(actual.into_body(), usize::MAX).await?,
+                to_bytes(expected.into_body(), usize::MAX).await?
+            );
+        }
+        Ok(())
+    }
 }

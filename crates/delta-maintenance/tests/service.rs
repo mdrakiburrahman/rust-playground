@@ -89,7 +89,7 @@ fn service(root: &Path) -> Result<Command> {
 }
 
 #[test]
-fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
+fn effective_configuration_is_reported_with_protected_partition_debt() -> Result<()> {
     let root = tempfile::tempdir()?;
     table(&root.path().join("events"))?;
     let output = service(root.path())?
@@ -99,7 +99,12 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
         .args(["--operation", "optimize", "--min-files", "3"])
         .output()?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(lines(&output.stdout)?[0]["negative_probe"], true);
+    let results = lines(&output.stdout)?;
+    assert_eq!(results[0]["negative_probe"], false);
+    assert_eq!(
+        results[0]["report"]["compaction_debt"]["protected_partition_backlog"]["files"],
+        2
+    );
     let stderr = std::str::from_utf8(&output.stderr)?;
     let event = |prefix: &str| -> Result<serde_json::Value> {
         let json = stderr
@@ -136,6 +141,90 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
         .args(["--operation", "optimize", "--input-read-strategy", "invalid"])
         .output()?;
     assert!(!invalid.status.success());
+    Ok(())
+}
+
+#[test]
+fn scheduled_open_partition_policy_is_explicit_strict_and_read_back() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let before = version(&path)?;
+    let config_event = |output: &[u8]| -> Result<serde_json::Value> {
+        let json = std::str::from_utf8(output)?
+            .lines()
+            .find_map(|line| line.strip_prefix("arrowcol_maintenance_effective_config "))
+            .context("effective config")?;
+        Ok(serde_json::from_str(json)?)
+    };
+    let default = service(root.path())?.args(["--operation", "optimize"]).output()?;
+    assert!(default.status.success());
+    let default_config = config_event(&default.stderr)?;
+    assert_eq!(
+        default_config["startup"]["sealed_partitions_only"],
+        serde_json::Value::Null
+    );
+    assert_eq!(default_config["operation_settings"]["sealed_partitions_only"], true);
+    let baseline = lines(&default.stdout)?;
+    assert_eq!(baseline[0]["optimize"]["plan"]["protected_partitions"], 1);
+    for (name, value) in [
+        ("ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY", "disabled"),
+        ("ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS", "0"),
+        ("ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS", "1025"),
+    ] {
+        let invalid = service(root.path())?
+            .env(name, value)
+            .args(["--operation", "optimize", "--apply"])
+            .output()?;
+        assert!(!invalid.status.success(), "{name}={value}");
+        assert_eq!(version(&path)?, before);
+    }
+    let conflict = service(root.path())?
+        .args([
+            "--operation",
+            "optimize",
+            "--sealed-final",
+            "--sealed-partitions-only",
+            "false",
+        ])
+        .output()?;
+    assert!(!conflict.status.success());
+    let applied = service(root.path())?
+        .env("ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY", "false")
+        .env("ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS", "4")
+        .args([
+            "--operation",
+            "optimize",
+            "--apply",
+            "--interval-secs",
+            "1",
+            "--max-cycles",
+            "1",
+            "--no-metrics-listener",
+        ])
+        .output()?;
+    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+    let config = config_event(&applied.stderr)?;
+    assert_eq!(config["startup"]["sealed_partitions_only"], false);
+    assert_eq!(config["operation_settings"]["sealed_partitions_only"], false);
+    assert_eq!(config["table_policy"]["arrowcol.optimize.sealedPartitionsOnly"], false);
+    assert_eq!(config["startup"]["max_consecutive_stale_plans"], 4);
+    let applied = lines(&applied.stdout)?;
+    assert_eq!(applied[0]["optimize"]["config"]["sealed_final"], true);
+    assert_eq!(applied[0]["optimize"]["plan"]["protected_partitions"], 0);
+    assert_eq!(applied[0]["report"]["outcome"], "committed");
+    assert_eq!(applied[0]["report"]["files_removed"], 8);
+    assert_eq!(applied[0]["report"]["files_added"], 4);
+    assert_eq!(version(&path)?, before + 1);
+    println!(
+        "maintenance_open_partition_serde_fixture={}",
+        serde_json::json!({
+            "default_configuration": default_config,
+            "default_result": baseline[0],
+            "opt_in_configuration": config,
+            "opt_in_result": applied[0],
+        })
+    );
     Ok(())
 }
 
@@ -689,6 +778,91 @@ fn scrape(port: u16) -> Result<String> {
     let mut body = String::new();
     stream.read_to_string(&mut body)?;
     Ok(body)
+}
+
+#[test]
+fn scheduled_health_resolves_initialized_target_before_any_data_commit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root_url = Url::from_directory_path(root.path()).map_err(|()| anyhow!("root URL"))?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("delta-maintenance"))
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .args([
+            "--root",
+            root_url.as_str(),
+            "--table",
+            "telemetry.sqlserver.events",
+            "--operation",
+            "optimize",
+            "--interval-secs",
+            "1",
+            "--max-cycles",
+            "5",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let observation = (|| -> Result<()> {
+        let read_target = || -> Result<serde_json::Value> {
+            let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            let (_, body) = response.split_once("\r\n\r\n").context("health HTTP body")?;
+            let health: serde_json::Value = serde_json::from_str(body)?;
+            Ok(health["delta_targets"][0].clone())
+        };
+        let wait_for = |state: &str| -> Result<serde_json::Value> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(target) = read_target()
+                    && target["state"] == state
+                {
+                    return Ok(target);
+                }
+                anyhow::ensure!(Instant::now() < deadline, "health never reached {state}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let pending = wait_for("unresolved")?;
+        anyhow::ensure!(pending.get("normalized_root").is_none(), "{pending}");
+        anyhow::ensure!(pending.get("delta_table_id").is_none(), "{pending}");
+        let table_path = root.path().join("telemetry/sqlserver/events");
+        let table_url = Url::from_directory_path(&table_path).map_err(|()| anyhow!("table URL"))?;
+        DeltaTable::initialize_url_for_bootstrap(table_url.clone(), schema(), vec![INGESTION_PARTITION.into()])?;
+        let resolved = wait_for("resolved")?;
+        anyhow::ensure!(
+            resolved["table"]
+                == serde_json::json!({
+                    "catalog": "telemetry", "schema": "sqlserver", "table": "events",
+                }),
+            "{resolved}"
+        );
+        anyhow::ensure!(
+            resolved["normalized_root"] == table_url.as_str().trim_end_matches('/'),
+            "{resolved}"
+        );
+        let metadata_id = std::fs::read_to_string(table_path.join("_delta_log/00000000000000000000.json"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|action| action["metaData"]["id"].as_str().map(str::to_owned))
+            .context("initialized metadata ID")?;
+        anyhow::ensure!(resolved["delta_table_id"] == metadata_id, "{resolved}");
+        anyhow::ensure!(version(&table_path)? == 1, "readback created another commit");
+        Ok(())
+    })();
+    if observation.is_err() && child.try_wait()?.is_none() {
+        child.kill()?;
+    }
+    let status = child.wait()?;
+    observation?;
+    assert!(status.success());
+    Ok(())
 }
 
 /// Scenario: scheduled mode with a metrics listener.

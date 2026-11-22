@@ -1,0 +1,338 @@
+{
+  "schema_version": 1,
+  "cohort": "C1",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "seed-only-not-capability-registry",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
+  "baseline_overrides": {
+    "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
+    "tables": [
+      "sqlserver_availability_replica_states"
+    ],
+    "replica_counts": [
+      1
+    ],
+    "rows_per_table": 65536,
+    "warmup_seconds": 10,
+    "measure_seconds": 150
+  },
+  "invariants": {
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "interval_secs": 15,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000,
+      "continuous": true
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 15,
+      "target_file_mib": 128,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000
+    }
+  },
+  "comparisons": [
+    {
+      "id": "codec-zstd-levels",
+      "factor": "parquet_writer.defaults.compression+compression_level",
+      "candidates": [
+        {
+          "id": "uncompressed",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "uncompressed",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "zstd-1",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "zstd",
+                  "compression_level": 1
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "zstd-3",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "zstd",
+                  "compression_level": 3
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "zstd-6",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "zstd",
+                  "compression_level": 6
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4,
+      "matched_control": "uncompressed",
+      "comparison_family": "codec"
+    },
+    {
+      "id": "codec-snappy-lz4raw",
+      "factor": "parquet_writer.defaults.compression+compression_level",
+      "candidates": [
+        {
+          "id": "uncompressed",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "uncompressed",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "snappy",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "snappy",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "lz4-raw",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "lz4_raw",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4,
+      "matched_control": "uncompressed",
+      "comparison_family": "codec"
+    },
+    {
+      "id": "codec-gzip-brotli",
+      "factor": "parquet_writer.defaults.compression+compression_level",
+      "candidates": [
+        {
+          "id": "uncompressed",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "uncompressed",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "gzip",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "gzip",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "brotli",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "brotli",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4,
+      "matched_control": "uncompressed",
+      "comparison_family": "codec"
+    }
+  ],
+  "parquet_enum_coverage": {
+    "kind": "compression",
+    "accepted": [
+      "uncompressed",
+      "snappy",
+      "gzip",
+      "brotli",
+      "lz4",
+      "lz4_raw",
+      "zstd"
+    ],
+    "configured": [
+      "uncompressed",
+      "snappy",
+      "gzip",
+      "brotli",
+      "lz4_raw",
+      "zstd"
+    ],
+    "excluded": {
+      "lz4": "legacy Hadoop framing; accepted for compatibility but excluded by campaign consumer/deprecation policy"
+    },
+    "pending": [],
+    "status": "configured-not-runtime-screened"
+  },
+  "runnable": false,
+  "config_validation": {
+    "status": "config-validated",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 10,
+    "pass_count": 11,
+    "fail_count": 0
+  },
+  "runtime_qualification": "unqualified",
+  "refinement": {
+    "comparison": "codec",
+    "factor": "parquet_writer.defaults.compression_level",
+    "trigger": "zstd wins the coarse codec comparison",
+    "selection": "winner plus up to three adjacent levels accepted by the E1 registry bounds",
+    "max_candidates": 4
+  }
+}

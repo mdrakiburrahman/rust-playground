@@ -173,6 +173,7 @@ mod failure_evidence_tests {
                 started_at_ms: 1_794_173_400_000,
                 qap: QapMetrics::default(),
                 resources: None,
+                resource_evidence: None,
             },
         )
     }
@@ -277,6 +278,7 @@ mod failure_evidence_tests {
                 started_at_ms: 0,
                 qap: QapMetrics::default(),
                 resources: None,
+                resource_evidence: None,
             },
         )?;
         assert_eq!(rows[0].status, "failed");
@@ -556,12 +558,16 @@ http.createServer((request, response) => {
         config.kubectl_context = None;
         let mut platform = AksPlatform {
             run_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: false,
             namespace_create_attempted: false,
             namespace_owner_token: "test-owner".to_owned(),
             namespace_uid: None,
             runtime_dir: None,
             qap_relative_data_root: None,
+            delta_root: None,
             router_metrics_url: None,
             router_tunnel: None,
             fic_record_path: None,
@@ -569,12 +575,16 @@ http.createServer((request, response) => {
             fic_prepare_attempted: false,
             qap_record_path: None,
             qap_bind_attempted: false,
+            qap_cleanup_confirmed: false,
             qap_outcome_unresolved: false,
+            run_table_initialization_attempted: false,
+            run_table_initialization_drained: false,
             workload_stop_record_path: None,
             schedule_configmap_name: "oat-schedule-test".to_owned(),
             service_account: None,
             router_yaml: None,
             shutdown_drain_evidence: None,
+            campaign_cli_paths: None,
         };
         let script = script_path.clone();
         let mut command = || {

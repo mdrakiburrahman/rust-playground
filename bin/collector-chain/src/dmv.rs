@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -14,9 +15,34 @@ use arrow_flight::sql::{CommandStatementUpdate, ProstMessageExt};
 use arrow_flight::{FlightData, FlightDescriptor};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use arrowcol_catalog::{DdlCommand, DdlParser};
-use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
+use arrowcol_flight::{DdlCompletionMetadata, DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
 const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
 const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
+static CLIENT_SEND_OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct SendObservation {
+    id: String,
+    send_unix_ns: u64,
+}
+
+impl SendObservation {
+    fn fresh() -> Result<Self> {
+        let send_unix_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos()
+            .try_into()
+            .context("client send timestamp exceeds u64 nanoseconds")?;
+        let sequence = CLIENT_SEND_OBSERVATION_SEQUENCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .map_err(|_| anyhow::anyhow!("client send observation sequence exhausted"))?;
+        Ok(Self {
+            id: format!("{}-{sequence}-{send_unix_ns}", std::process::id()),
+            send_unix_ns,
+        })
+    }
+}
+const CLIENT_SEND_OBSERVATION_ID_HEADER: &str = "x-arrowcol-client-observation-id";
+const CLIENT_SEND_UNIX_NS_HEADER: &str = "x-arrowcol-client-send-unix-ns";
 use arrowcol_protocol::{
     ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, SchemaFingerprint, TableIdentity,
     UnixMillis, fingerprint_schema,
@@ -233,6 +259,37 @@ fn edge_signer_from_file(path: &std::path::Path) -> Result<EdgeRequestSigner> {
     EdgeRequestSigner::new(secret).map_err(anyhow::Error::from)
 }
 
+/// Registers one canonical DMV table through the normal trusted-edge Flight SQL route without sending rows.
+///
+/// # Errors
+/// Rejects unknown identities, invalid signing keys, transport errors and mismatched DDL completions.
+pub async fn register_table_authenticated(
+    endpoint: &str,
+    table_name: &str,
+    edge_secret_file: &std::path::Path,
+) -> Result<DdlCompletionMetadata> {
+    let table = tables()?
+        .into_iter()
+        .find(|table| table.identity.to_string() == table_name)
+        .context("registration requires a canonical embedded DMV table identity")?;
+    let signer = edge_signer_from_file(edge_secret_file)?;
+    let channel = Endpoint::from_shared(endpoint.to_owned())?
+        .connect_timeout(RPC_TIMEOUT)
+        .timeout(RPC_TIMEOUT)
+        .connect()
+        .await
+        .with_context(|| format!("connect registration endpoint {endpoint}"))?;
+    let completion = register_completion(&mut FlightServiceClient::new(channel), &table, Some(&signer)).await?;
+    if completion.catalog() != table.identity.catalog().as_str()
+        || completion.schema() != table.identity.schema().as_str()
+        || completion.table() != table.identity.table().as_str()
+        || completion.schema_fingerprint() != table.fingerprint
+    {
+        bail!("DMV registration response does not match the canonical logical ingress schema");
+    }
+    Ok(completion)
+}
+
 fn table_named(table_name: &str) -> Result<DmvTable> {
     tables()?
         .into_iter()
@@ -330,7 +387,12 @@ fn batch_slices(rows: usize, concurrency: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Option<&EdgeRequestSigner>) -> Result<()> {
+fn request_metadata<T>(
+    request: &mut Request<T>,
+    table: &DmvTable,
+    signer: Option<&EdgeRequestSigner>,
+    observation: Option<&SendObservation>,
+) -> Result<()> {
     let metadata = IngestMetadata::new(
         ProtocolVersion::CURRENT,
         ImplementationPool::Dataflow,
@@ -350,6 +412,16 @@ fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Optio
         headers.insert(
             http::header::HeaderName::from_static(OAT_RUN_ID_HEADER),
             http::HeaderValue::try_from(run_id)?,
+        );
+    }
+    if let Some(observation) = observation {
+        headers.insert(
+            http::header::HeaderName::from_static(CLIENT_SEND_OBSERVATION_ID_HEADER),
+            http::HeaderValue::try_from(observation.id.as_str())?,
+        );
+        headers.insert(
+            http::header::HeaderName::from_static(CLIENT_SEND_UNIX_NS_HEADER),
+            http::HeaderValue::try_from(observation.send_unix_ns.to_string())?,
         );
     }
     // Tonic sets this exact content type on the wire, after constructing the request.
@@ -390,6 +462,17 @@ async fn register(
     table: &DmvTable,
     signer: Option<&EdgeRequestSigner>,
 ) -> Result<String> {
+    Ok(format!(
+        "v{}",
+        register_completion(client, table, signer).await?.schema_version()
+    ))
+}
+
+async fn register_completion(
+    client: &mut FlightServiceClient<Channel>,
+    table: &DmvTable,
+    signer: Option<&EdgeRequestSigner>,
+) -> Result<DdlCompletionMetadata> {
     let command = CommandStatementUpdate {
         query: table.ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
         transaction_id: None,
@@ -403,12 +486,12 @@ async fn register(
         flight_descriptor: Some(descriptor),
         ..FlightData::default()
     }]));
-    request_metadata(&mut request, table, signer)?;
+    request_metadata(&mut request, table, signer, None)?;
     let response = client.do_put(request).await?;
     let completion = decode_ddl_completion_metadata(response.metadata())?;
     let mut results = response.into_inner();
     while results.message().await?.is_some() {}
-    Ok(format!("v{}", completion.schema_version()))
+    Ok(completion)
 }
 
 async fn put(
@@ -436,7 +519,7 @@ async fn put(
         .try_collect::<Vec<_>>()
         .await?;
     let mut request = Request::new(stream::iter(encoded));
-    request_metadata(&mut request, table, signer)?;
+    request_metadata(&mut request, table, signer, None)?;
     completed_admission(client.do_put(request).await?.into_inner()).await
 }
 
@@ -510,8 +593,9 @@ mod tests {
         let verifier = arrowcol_router_rust::EdgeVerifier::new(key, 30_000)?;
         for _ in 0..2 {
             let mut request = Request::new(());
-            request_metadata(&mut request, &table, Some(&signer))?;
+            request_metadata(&mut request, &table, Some(&signer), None)?;
             let headers = request.metadata().clone().into_headers();
+            assert!(!headers.contains_key("x-arrowcol-shard"));
             let now = UnixMillis::new(u64::try_from(
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             )?)?;
@@ -542,7 +626,8 @@ mod tests {
         std::fs::remove_dir_all(&directory)?;
         let verifier = arrowcol_router_rust::EdgeVerifier::new(router_key?, 30_000)?;
         let mut request = Request::new(());
-        request_metadata(&mut request, &table, Some(&signer?))?;
+        request_metadata(&mut request, &table, Some(&signer?), None)?;
+        assert!(!request.metadata().contains_key("x-arrowcol-shard"));
         let now = UnixMillis::new(u64::try_from(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
         )?)?;

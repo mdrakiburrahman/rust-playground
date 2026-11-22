@@ -11,6 +11,10 @@ use crate::{RuntimeError, RuntimeResult};
 /// Resource and timeout limits enforced by the shared runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeLimits {
+    /// Optional accepted request compression; identity is always accepted.
+    pub grpc_accept_compression: Option<tonic::codec::CompressionEncoding>,
+    /// Optional response compression, used only when advertised by the client.
+    pub grpc_send_compression: Option<tonic::codec::CompressionEncoding>,
     /// Maximum aggregate gRPC metadata bytes inspected before the body.
     pub max_metadata_bytes: usize,
     /// Maximum encoded Arrow schema header and body bytes.
@@ -32,6 +36,8 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
+            grpc_accept_compression: None,
+            grpc_send_compression: None,
             max_metadata_bytes: 16 * 1_024,
             max_schema_bytes: 1_024 * 1_024,
             max_message_bytes: 16 * 1_024 * 1_024,

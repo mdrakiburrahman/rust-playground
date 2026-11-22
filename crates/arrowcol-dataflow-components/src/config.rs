@@ -7,6 +7,7 @@ use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDd
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
+use arrowcol_tunables::AgeFlushPolicy;
 use serde::{Deserialize, Serialize};
 
 static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
@@ -14,6 +15,45 @@ static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 mod override_tests {
     use super::*;
+
+    #[test]
+    fn receiver_compression_projects_typed_oat_json_into_actual_runtime_limits() -> Result<(), String> {
+        let defaults = RuntimeLimitsConfig::default()
+            .build()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(defaults.grpc_accept_compression, None);
+        assert_eq!(defaults.grpc_send_compression, None);
+        for (name, expected) in [
+            ("none", None),
+            ("gzip", Some(tonic::codec::CompressionEncoding::Gzip)),
+            ("zstd", Some(tonic::codec::CompressionEncoding::Zstd)),
+        ] {
+            let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"limits":{"grpc_accept_compression":name,"grpc_send_compression":name}}
+            }))
+            .map_err(|error| error.to_string())?;
+            let environment = tunables
+                .environment_for(arrowcol_tunables::ComponentRole::Collector)
+                .map_err(|error| error.to_string())?;
+            let config = merge_config(
+                &RuntimeLimitsConfig::default(),
+                &environment["ARROWCOL_COLLECTOR_LIMITS_CONFIG"],
+                None,
+            )?;
+            let limits = config.build().map_err(|error| error.to_string())?;
+            assert_eq!(limits.grpc_accept_compression, expected);
+            assert_eq!(limits.grpc_send_compression, expected);
+            assert_eq!(limits.max_message_bytes, defaults.max_message_bytes);
+            assert_eq!(limits.batch_channel_capacity, defaults.batch_channel_capacity);
+        }
+        for field in ["grpc_accept_compression", "grpc_send_compression"] {
+            for value in ["brotli", "deflate", "Gzip", ""] {
+                let invalid = serde_json::json!({field:value}).to_string();
+                assert!(merge_config(&RuntimeLimitsConfig::default(), &invalid, None).is_err());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn nested_override_preserves_yaml_values_and_validates_final_budget() -> Result<(), String> {
@@ -35,6 +75,10 @@ mod override_tests {
         assert!(merge_config(&config, r#"{"max_row_per_flush":10}"#, None).is_err());
         assert!(merge_config(&config, r#"{"per_table_capacity":{"extra":1}}"#, None).is_err());
         assert!(merge_config(&config, "[]", None).is_err());
+        let merged = merge_config(&config, r#"{"age_flush_policy":"drain_ready"}"#, None)?;
+        assert_eq!(merged.age_flush_policy, AgeFlushPolicy::DrainReady);
+        assert!(merge_config(&config, r#"{"age_flush_policy":"drain_forever"}"#, None).is_err());
+        assert!(merge_config(&config, r#"{"age_flush_policy":true}"#, None).is_err());
         Ok(())
     }
 
@@ -50,6 +94,34 @@ mod override_tests {
             ..Default::default()
         };
         assert!(batching.validate().is_err());
+        for depth in [0, 65] {
+            assert!(
+                FileBatchConfig {
+                    pipeline_depth: depth,
+                    coalesce_publications: true,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            FileBatchConfig {
+                pipeline_depth: 2,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            FileBatchConfig {
+                pipeline_depth: 64,
+                coalesce_publications: true,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]
@@ -141,6 +213,16 @@ mod override_tests {
         config.authority_timeout = resolved.authority_timeout;
         config.validate()?;
         assert_eq!(config.effective_config_json()["authority_timeout"], "250ms");
+        assert_eq!(
+            config.effective_config_json()["batching"]["age_flush_policy"],
+            "immediate"
+        );
+        config.batching = merge_config(&config.batching, r#"{"age_flush_policy":"drain_ready"}"#, None)?;
+        config.validate()?;
+        assert_eq!(
+            config.effective_config_json()["batching"]["age_flush_policy"],
+            "drain_ready"
+        );
         assert!(config.effective_config_json().get("base_path").is_none());
         assert!(merge_config(&current, r#"{"base_path":"replacement"}"#, None).is_err());
         config.authority_timeout = Duration::MAX;
@@ -538,6 +620,10 @@ impl RoutingStoreConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeLimitsConfig {
+    /// Accepted request compression; uncompressed requests remain accepted.
+    pub grpc_accept_compression: arrowcol_tunables::GrpcCompression,
+    /// Response compression when supported by the requesting client.
+    pub grpc_send_compression: arrowcol_tunables::GrpcCompression,
     /// Maximum aggregate gRPC metadata bytes.
     pub max_metadata_bytes: usize,
     /// Maximum encoded Arrow schema bytes.
@@ -563,6 +649,8 @@ impl Default for RuntimeLimitsConfig {
         let limits = RuntimeLimits::default();
         Self {
             max_metadata_bytes: limits.max_metadata_bytes,
+            grpc_accept_compression: arrowcol_tunables::GrpcCompression::None,
+            grpc_send_compression: arrowcol_tunables::GrpcCompression::None,
             max_schema_bytes: limits.max_schema_bytes,
             max_message_bytes: limits.max_message_bytes,
             batch_channel_capacity: limits.batch_channel_capacity,
@@ -577,6 +665,8 @@ impl Default for RuntimeLimitsConfig {
 impl RuntimeLimitsConfig {
     pub(crate) fn build(&self) -> RuntimeResult<RuntimeLimits> {
         let limits = RuntimeLimits {
+            grpc_accept_compression: grpc_compression_encoding(self.grpc_accept_compression),
+            grpc_send_compression: grpc_compression_encoding(self.grpc_send_compression),
             max_metadata_bytes: self.max_metadata_bytes,
             max_schema_bytes: self.max_schema_bytes,
             max_message_bytes: self.max_message_bytes,
@@ -603,6 +693,16 @@ impl RuntimeLimitsConfig {
             ));
         }
         Ok(limits)
+    }
+}
+
+fn grpc_compression_encoding(
+    compression: arrowcol_tunables::GrpcCompression,
+) -> Option<tonic::codec::CompressionEncoding> {
+    match compression {
+        arrowcol_tunables::GrpcCompression::None => None,
+        arrowcol_tunables::GrpcCompression::Gzip => Some(tonic::codec::CompressionEncoding::Gzip),
+        arrowcol_tunables::GrpcCompression::Zstd => Some(tonic::codec::CompressionEncoding::Zstd),
     }
 }
 
@@ -892,11 +992,13 @@ pub struct BatchCapacity {
 pub struct FileBatchConfig {
     /// Combine publications only through replay-safe atomic file groups.
     pub coalesce_publications: bool,
+    /// Optionally collect a finite snapshot of ready commands at the age cutoff.
+    pub age_flush_policy: AgeFlushPolicy,
     /// Process-wide queued and in-flight capacity.
     pub global_capacity: BatchCapacity,
     /// Per-table queued and in-flight capacity.
     pub per_table_capacity: BatchCapacity,
-    /// Maximum logical Arrow bytes in a file.
+    /// Maximum logical Arrow bytes retained per file before flush; not compressed Parquet bytes.
     pub max_arrow_memory_per_flush: u64,
     /// Maximum rows in a file.
     pub max_rows_per_flush: u64,
@@ -907,6 +1009,8 @@ pub struct FileBatchConfig {
     pub max_age: Duration,
     /// Maximum simultaneous file publications.
     pub max_concurrent_flushes: usize,
+    /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
+    pub pipeline_depth: usize,
     /// Compressed Parquet target and estimator limits.
     pub adaptive_file: AdaptiveFileConfig,
 }
@@ -915,6 +1019,7 @@ impl Default for FileBatchConfig {
     fn default() -> Self {
         Self {
             coalesce_publications: false,
+            age_flush_policy: AgeFlushPolicy::Immediate,
             global_capacity: BatchCapacity {
                 bytes: 2 * 1024 * 1024 * 1024,
                 rows: 10_000_000,
@@ -930,6 +1035,7 @@ impl Default for FileBatchConfig {
             max_batches_per_flush: 512,
             max_age: Duration::from_secs(30),
             max_concurrent_flushes: 4,
+            pipeline_depth: 1,
             adaptive_file: AdaptiveFileConfig::default(),
         }
     }
@@ -961,6 +1067,8 @@ impl FileBatchConfig {
             || tokio::time::Instant::now().checked_add(self.max_age).is_none()
             || self.max_concurrent_flushes == 0
             || self.max_concurrent_flushes > tokio::sync::Semaphore::MAX_PERMITS
+            || !(1..=64).contains(&self.pipeline_depth)
+            || (self.pipeline_depth > 1 && !self.coalesce_publications)
         {
             return Err("invalid bounded Arrow file batching capacities or flush policy".to_owned());
         }

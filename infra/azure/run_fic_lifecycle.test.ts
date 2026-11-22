@@ -4,7 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, mock, test, type TestContext } from 'node:test';
 import { Azure, Config, Failure, HttpFailure, TAGS, runtime, type HttpReceipt } from './bootstrap.js';
-import { cleanup_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
+import { assert_run_fic_plan, cleanup_run_fic, delete_run_namespace, plan_run_fic, prepare_run_fic, read_run_fic_record, recover_run_fic_record, run_fic_ledger_path } from './run_fic.js';
+import { createOwnedRunCleanupActions } from '../../projects/arrowcol-oat/aks-cleanup-executor.js';
+import { create_namespace_deletion_journal } from './aks-namespace-custody.js';
+import { discoverOwnedRunInventory } from '../../projects/arrowcol-oat/aks-setup-cleanup.js';
+import { observeStampHealth } from '../../projects/arrowcol-oat/aks-default-providers.js';
+import { CUSTODY_CLEANUP_STEPS, newCampaignState, type CampaignState, type CampaignStore, type RunInventory } from '../../projects/arrowcol-oat/aks-campaign.js';
 
 const id = '00000000-0000-0000-0000-000000000001';
 const runId = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
@@ -16,7 +21,7 @@ const issuer = 'https://fixture.oic.prod-aks.azure.com/tenant/cluster/';
 const ownerToken = 'fixture-private-owner-token';
 afterEach(() => mock.restoreAll());
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, namespaceOwner = ownerToken) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-fic-lifecycle-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const recordPath = path.join(directory, 'owned.json');
@@ -159,8 +164,8 @@ function fixture(t: TestContext) {
       if (args.includes('--ignore-not-found'))
         return { returncode: 0, stdout: state.absentNamespaces.has(currentNamespace) ? '' : 'namespace/' + currentNamespace, stderr: '' };
       return { returncode: 0, stdout: JSON.stringify({ metadata: { name: currentNamespace, uid: id,
-        labels: { 'arrowcol-oat/run-id': currentRun, 'arrowcol-oat/owner-token': ownerToken },
-        annotations: { 'arrowcol-oat/run-id': currentRun, 'arrowcol-oat/owner-token': ownerToken },
+        labels: { 'arrowcol-oat/run-id': currentRun, 'arrowcol-oat/owner-token': namespaceOwner },
+        annotations: { 'arrowcol-oat/run-id': currentRun, 'arrowcol-oat/owner-token': namespaceOwner },
       } }), stderr: '' };
     }
     assert.ok(args.includes('serviceaccount'));
@@ -169,6 +174,199 @@ function fixture(t: TestContext) {
   });
   return { azure, c, state, recordPath, unrelated, native };
 }
+
+async function setupCustody(f: ReturnType<typeof fixture>) {
+  const plan = await plan_run_fic(f.azure, runId, namespace, serviceAccount), now = Date.now();
+  const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
+  const inventory: RunInventory = { schema_version: 1, campaign_id: id, owner_id: runId, fencing_token: 1,
+    orchestration_run_id: id, cell_run_id: runId, load_admission: 'not_authorized', namespace: { name: namespace, uid: id, owner_token: runId }, resources: [],
+    fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan }, qap: null,
+    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
+  const state: CampaignState = { ...newCampaignState(id, runId, now - 240_000), mode: 'armed', status: 'cleaning',
+    fencingToken: 2, fenceReason: 'heartbeat-expired', fencedAtMs: now - 60_000, cleanupStatus: 'running', runInventory: inventory,
+    cleanupSteps: CUSTODY_CLEANUP_STEPS.map((step, index) => ({ step, idempotencyKey: `${id}:2:${step}`,
+      status: index < 5 ? 'complete' : index === 5 ? 'running' : 'pending' })) };
+  const store: CampaignStore = { read: async () => ({ state: structuredClone(state), etag: '"state"' }),
+    write: async () => { throw new Error('Unexpected campaign write by provider'); } };
+  const authority = { campaignId: id, ownerId: runId, fencingToken: 2, assertCurrent: async () => {} };
+  return { plan, inventory, state, store, authority };
+}
+
+for (const createdFic of [false, true]) test(`setup-loss cleanup without QAP ${createdFic ? 'recovers original FIC proof' : 'requires no invented SA/FIC record'}`, async t => {
+  const f = fixture(t, runId);
+  if (createdFic) await prepare_run_fic(f.azure, runId, namespace, serviceAccount, f.recordPath);
+  const c = await setupCustody(f);
+  if (createdFic) c.inventory.fic!.state = 'observed';
+  const blob = f.azure.blob.bind(f.azure), journals = new Map<string, { bytes: Buffer; etag: string }>();
+  mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+    const name = args[2] ?? '';
+    if (!name.startsWith('_arrowcol-custody/namespaces/')) return blob(...args);
+    const previous = journals.get(name);
+    if (args[0] === 'GET') return [previous?.bytes ?? null, previous ? { etag: previous.etag } : {}];
+    assert.equal(args[0], 'PUT');
+    assert.equal(args[5]?.[previous ? 'If-Match' : 'If-None-Match'], previous?.etag ?? '*');
+    const bytes = Buffer.from(String(args[4])), etag = `"${journals.size}-${bytes.length}"`;
+    journals.set(name, { bytes, etag });
+    args[8]?.({ status: 201, headers: { etag }, bodyBase64: '' });
+    return [null, { ':status': '201', etag }];
+  });
+  let deletes = 0, pending = true;
+  const kubectl = runtime.run_tree.bind(runtime);
+  mock.method(runtime, 'run_tree', async (args: string[], timeout?: number) => {
+    if (!args.includes('--raw')) return kubectl(args, timeout ?? 30);
+    deletes++;
+    const journal = JSON.parse([...journals.values()][0].bytes.toString());
+    assert.equal(journal.phase, 'intent');
+    assert.equal(journal.intent.workload_record.namespaceUid, id);
+    assert.equal(journal.intent.workload_record.serviceAccountUid, undefined);
+    if (!pending) f.state.absentNamespaces.add(namespace);
+    return { returncode: 0, stdout: JSON.stringify({ kind: 'Namespace',
+      metadata: { name: namespace, uid: id, deletionTimestamp: new Date().toISOString() } }), stderr: '' };
+  });
+  const actions = createOwnedRunCleanupActions(c.store, f.azure, null, path.dirname(f.recordPath), c.plan);
+  await assert.rejects(actions.deleteNamespaceIfUidAndOwnerMatch(c.inventory.namespace, 'delete', c.authority), /still pending/);
+  assert.equal(deletes, 1);
+  assert.equal(JSON.parse([...journals.values()][0].bytes.toString()).phase, 'responded');
+  const identity = JSON.parse([...journals.values()][0].bytes.toString()).intent.workload_record;
+  await assert.rejects(create_namespace_deletion_journal(f.azure, identity, c.authority).complete({
+    schema_version: 1, namespace_record: identity, delete_succeeded: true, absence_confirmed: true, observed_at_unix_ms: -1,
+  }), /observation time/);
+  assert.equal(JSON.parse([...journals.values()][0].bytes.toString()).phase, 'responded');
+  pending = false;
+  f.state.absentNamespaces.add(namespace);
+  await actions.deleteNamespaceIfUidAndOwnerMatch(c.inventory.namespace, 'delete', c.authority);
+  assert.equal(deletes, 1);
+  assert.equal(JSON.parse([...journals.values()][0].bytes.toString()).phase, 'complete');
+  if (createdFic) {
+    await actions.deleteFicIfExact(c.inventory.fic!, id, 'delete-fic', c.authority);
+    assert.deepEqual(f.state.mutations, ['PUT', 'DELETE']);
+  } else assert.deepEqual(f.state.mutations, []);
+  c.state.fencingToken++;
+  await assert.rejects(actions.deleteNamespaceIfUidAndOwnerMatch(c.inventory.namespace, 'delete', c.authority), /fenced/);
+});
+
+test('exact discovery adopts null UIDs only from matching metadata origin markers and never from API failure', async t => {
+  const f = fixture(t, runId), c = await setupCustody(f), resourceUid = '33333333-3333-4333-8333-333333333333';
+  c.inventory.namespace.uid = null;
+  c.inventory.resources.push({ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'collector',
+    uid: null, role: 'collector', state: 'planned', absence: null });
+  let marked = false, fail = false, missing = false;
+  const markers = { 'arrowcol-oat/run-id': runId, 'arrowcol-oat/owner-token': runId };
+  mock.method(runtime, 'run_tree', async (args: string[]) => {
+    if (fail) return { returncode: 1, stdout: '', stderr: 'permission denied' };
+    const isNamespace = args.includes('namespace');
+    if (!isNamespace && missing) return { returncode: 0, stdout: '', stderr: '' };
+    return { returncode: 0, stdout: JSON.stringify({ apiVersion: isNamespace ? 'v1' : 'apps/v1',
+      kind: isNamespace ? 'Namespace' : 'Deployment', metadata: { name: isNamespace ? namespace : 'collector',
+        namespace: isNamespace ? undefined : namespace, uid: isNamespace ? id : resourceUid,
+        ...((isNamespace || marked) ? { labels: markers, annotations: markers } : {}) } }), stderr: '' };
+  });
+  await assert.rejects(discoverOwnedRunInventory(f.azure, c.inventory, c.authority), /UNKNOWN|origin marker/);
+  marked = true;
+  const discovered = await discoverOwnedRunInventory(f.azure, c.inventory, c.authority);
+  assert.equal(discovered.namespace.uid, id);
+  assert.equal(discovered.resources[0].uid, resourceUid);
+  assert.equal(discovered.resources[0].state, 'observed');
+  assert.equal(discovered.fic!.state, 'absent');
+  fail = true;
+  await assert.rejects(discoverOwnedRunInventory(f.azure, c.inventory, c.authority), /errors are not absence/);
+  fail = false; missing = true;
+  const absent = await discoverOwnedRunInventory(f.azure, c.inventory, c.authority);
+  assert.equal(absent.resources[0].state, 'absent');
+  assert.equal(absent.resources[0].absence!.namespace_uid, id);
+  assert.deepEqual(f.state.mutations, []);
+});
+
+test('stamp health requires authoritative server identity and positive current pod/PDB observations', async t => {
+  const f = fixture(t, runId), c = await setupCustody(f);
+  let stalePdb = false, calls = 0;
+  mock.method(runtime, 'run_tree', async (args: string[]) => {
+    calls++;
+    const namespace = args[args.indexOf('--namespace') + 1], pod = args.includes('pods');
+    return { returncode: 0, stdout: JSON.stringify({ kind: pod ? 'PodList' : 'PodDisruptionBudgetList',
+      metadata: { resourceVersion: 'positive-version' }, items: [{ metadata: { name: 'stamp', uid: id, namespace, generation: 1 },
+        status: pod ? { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }, { type: 'PodScheduled', status: 'True' }] } :
+          { observedGeneration: stalePdb ? 0 : 1, disruptionsAllowed: 1 } }] }), stderr: '' };
+  });
+  const healthy = await observeStampHealth(f.azure, c.state, c.authority);
+  assert.ok(healthy.pods.length > 0 && healthy.pods.every(pod => pod.ready && pod.scheduled));
+  assert.equal(healthy.pdb_blocked, false);
+  stalePdb = true;
+  await assert.rejects(observeStampHealth(f.azure, c.state, c.authority), /has not observed its generation/);
+  c.state.runInventory!.fic!.plan!.server = 'https://other.azmk8s.io';
+  calls = 0;
+  await assert.rejects(observeStampHealth(f.azure, c.state, c.authority), /authoritative ARM identity differs/);
+  assert.equal(calls, 0);
+});
+
+test('FIC plan is read-only and prepare rejects drift before any mutation', async t => {
+  const { azure, c, state, recordPath } = fixture(t);
+  const kubernetes = mock.method(runtime, 'run_tree', async () => { throw new Error('planning must not query Kubernetes'); });
+  const plan = await plan_run_fic(azure, runId, namespace, serviceAccount);
+  assert.equal(plan.identityId, c.identity_id);
+  assert.equal(plan.resourceId, c.identity_id + '/federatedIdentityCredentials/' + plan.credentialName);
+  assert.equal(plan.clientId, id);
+  assert.equal(kubernetes.mock.callCount(), 0);
+  assert.deepEqual(state.mutations, []);
+  kubernetes.mock.restore();
+  await assert.rejects(prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath,
+    { ...plan, clientId: nextRunId }), /pre-side-effect plan/);
+  assert.deepEqual(state.mutations, []);
+  assert.equal(fs.existsSync(recordPath), false);
+  await prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath, plan);
+  assert_run_fic_plan(plan, read_run_fic_record(recordPath, c));
+});
+
+test('namespace deletion checks original UID, enforces cleanup fence, and never mints a receipt from absence alone', async t => {
+  const { azure, c, state, recordPath } = fixture(t);
+  await prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath);
+  const record = read_run_fic_record(recordPath, c), stopPath = recordPath + '.stop';
+  const base = runtime.run_tree;
+  let deletes = 0, fenced = true;
+  mock.method(runtime, 'run_tree', async (args: string[], timeout?: number) => {
+    if (args.includes('get') && args.includes('namespace') && state.absentNamespaces.has(namespace) &&
+        !args.includes('--ignore-not-found')) return { returncode: 1, stdout: '', stderr: 'not found' };
+    if (!args.includes('--raw')) return base(args, timeout ?? 15);
+    deletes++;
+    assert.deepEqual(JSON.parse(fs.readFileSync(args[args.indexOf('-f') + 1], 'utf8')),
+      { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: record.namespaceUid } });
+    state.absentNamespaces.add(namespace);
+    return { returncode: 0, stdout: JSON.stringify({ kind: 'Namespace',
+      metadata: { name: namespace, uid: record.namespaceUid, deletionTimestamp: new Date().toISOString() } }), stderr: '' };
+  });
+  const authority = { assertCurrent: async () => { if (fenced) throw new Error('stale cleanup actor'); } };
+  await assert.rejects(delete_run_namespace(azure, record, stopPath, authority), /stale cleanup actor/);
+  assert.equal(deletes, 0);
+  fenced = false;
+  const receipt = await delete_run_namespace(azure, record, stopPath, authority);
+  assert.equal(receipt.namespace_uid, record.namespaceUid);
+  assert.equal(receipt.delete_succeeded, true);
+  assert.deepEqual(await delete_run_namespace(azure, record, stopPath, authority), receipt);
+  assert.equal(deletes, 1);
+  const otherStopPath = recordPath + '.unproven-stop';
+  await assert.rejects(delete_run_namespace(azure, record, otherStopPath, authority));
+  assert.equal(fs.existsSync(otherStopPath), false);
+  assert.equal(deletes, 1);
+});
+
+test('unknown namespace DELETE cannot be replayed or inferred successful from later absence', async t => {
+  const { azure, c, state, recordPath } = fixture(t);
+  await prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath);
+  const record = read_run_fic_record(recordPath, c), stopPath = recordPath + '.stop';
+  const base = runtime.run_tree;
+  let deletes = 0;
+  mock.method(runtime, 'run_tree', async (args: string[], timeout?: number) => {
+    if (!args.includes('--raw')) return base(args, timeout ?? 15);
+    deletes++;
+    state.absentNamespaces.add(namespace);
+    throw new Error('lost response');
+  });
+  const authority = { assertCurrent: async () => {} };
+  await assert.rejects(delete_run_namespace(azure, record, stopPath, authority), /lost response/);
+  await assert.rejects(delete_run_namespace(azure, record, stopPath, authority), /outcome is unknown/);
+  assert.equal(deletes, 1);
+  assert.equal(fs.existsSync(stopPath), false);
+});
 
 test('create and cleanup keep definitive receipts and preserve unrelated/native trusts', async t => {
   const f = fixture(t);
@@ -189,6 +387,44 @@ test('create and cleanup keep definitive receipts and preserve unrelated/native 
   assert.ok(fs.existsSync(f.recordPath + '.create-receipt.json'));
   assert.ok(fs.existsSync(f.recordPath + '.delete-receipt.json'));
   assert.deepEqual(await f.azure.collection(f.c.identity_id + '/federatedIdentityCredentials'), [f.native, f.unrelated]);
+});
+test('controller FIC recovery retains original ledger proof, rejects stale authority and reuses a completed delete', async t => {
+  const f = fixture(t);
+  await prepare_run_fic(f.azure, runId, namespace, serviceAccount, f.recordPath);
+  const original = read_run_fic_record(f.recordPath, f.c);
+  let stale = true;
+  const authority = { assertCurrent: async () => { if (stale) throw new Error('stale cleanup token'); } };
+  const recovered = path.join(path.dirname(f.recordPath), 'recovered.json');
+  await assert.rejects(recover_run_fic_record(f.azure, original, recovered, authority), /stale cleanup token/);
+  assert.equal(fs.existsSync(recovered), false);
+  stale = false;
+  await recover_run_fic_record(f.azure, original, recovered, authority);
+  assert.deepEqual(read_run_fic_record(recovered, f.c), original);
+  f.state.absentNamespaces.add(namespace);
+  stale = true;
+  await assert.rejects(cleanup_run_fic(f.azure, runId, recovered, authority), /stale cleanup token/);
+  assert.deepEqual(f.state.mutations, ['PUT']);
+  stale = false;
+  await cleanup_run_fic(f.azure, runId, recovered, authority);
+  const anotherHost = path.join(path.dirname(f.recordPath), 'after-delete.json');
+  await recover_run_fic_record(f.azure, original, anotherHost, authority);
+  assert.equal(read_run_fic_record(anotherHost, f.c).phase, 'deleted');
+  await cleanup_run_fic(f.azure, runId, anotherHost, authority);
+  assert.deepEqual(f.state.mutations, ['PUT', 'DELETE']);
+  f.state.credentials.set(runId, { id: original.identityId + '/federatedIdentityCredentials/' + original.credentialName });
+  await assert.rejects(cleanup_run_fic(f.azure, runId, anotherHost, authority), /never delete a successor/);
+  assert.deepEqual(f.state.mutations, ['PUT', 'DELETE']);
+});
+test('controller FIC deletion rechecks authority after durable intent and before ARM DELETE', async t => {
+  const f = fixture(t);
+  await prepare_run_fic(f.azure, runId, namespace, serviceAccount, f.recordPath);
+  f.state.absentNamespaces.add(namespace);
+  const authority = { assertCurrent: async () => {
+    if (fs.existsSync(f.recordPath + '.delete-intent.json')) throw new Error('actor replaced after intent');
+  } };
+  await assert.rejects(cleanup_run_fic(f.azure, runId, f.recordPath, authority), /actor replaced after intent/);
+  assert.deepEqual(f.state.mutations, ['PUT']);
+  assert.equal(read_run_fic_record(f.recordPath, f.c).phase, 'delete-submitted');
 });
 test('an ambiguous lease acquisition reserves the ledger without admitting an ARM request', async t => {
   const f = fixture(t); f.state.ambiguousAcquire = true;

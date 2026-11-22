@@ -37,6 +37,7 @@ function fixture(t: test.TestContext) {
     oatRunId: '00000000-0000-0000-0000-000000000003',
     workloadIdentityClientId: client, subscriptionId: subscription,
     deltaRoot: `abfss://arrowcol@${registry}.dfs.core.windows.net/dataflow`,
+    effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
     images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished' },
   }));
   return options;

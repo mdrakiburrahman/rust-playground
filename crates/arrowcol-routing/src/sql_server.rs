@@ -552,7 +552,8 @@ impl RoutingStore for RawSqlStore {
                      lease_expires_at_utc = CASE WHEN lease_expires_at_utc > @P3 \
                         THEN lease_expires_at_utc ELSE @P3 END \
                  OUTPUT INSERTED.instance_id \
-                 WHERE instance_id = @P1 AND state IN ('ready', 'draining') AND @P3 > @P2;",
+                 WHERE instance_id = @P1 AND @P3 > @P2 \
+                   AND (state = 'ready' OR (state = 'draining' AND lease_expires_at_utc > @P2));",
                     &[&id, &heartbeat, &expiry],
                 )
                 .await
@@ -563,7 +564,7 @@ impl RoutingStore for RawSqlStore {
             if row.is_none() {
                 return Err(RoutingError::new(
                     RoutingErrorKind::Conflict,
-                    "collector heartbeat was fenced: the instance is missing or terminal",
+                    "collector heartbeat was fenced: the instance is missing, terminal, or expired while draining",
                 ));
             }
             Ok(())
@@ -597,8 +598,9 @@ impl RoutingStore for RawSqlStore {
                     // instance's own concurrent writers cannot lose on clock
                     // order, and nothing regresses or leaves a terminal state.
                     "UPDATE arrowcol.routing_collectors \
-                 SET state = @P2, heartbeat_at_utc = CASE WHEN heartbeat_at_utc > @P3 \
-                        THEN heartbeat_at_utc ELSE @P3 END \
+                 SET state = @P2, heartbeat_at_utc = CASE \
+                        WHEN @P3 > heartbeat_at_utc AND @P3 < lease_expires_at_utc \
+                        THEN @P3 ELSE heartbeat_at_utc END \
                  OUTPUT INSERTED.instance_id \
                  WHERE instance_id = @P1 \
                    AND (state = @P2 OR state = 'ready' \

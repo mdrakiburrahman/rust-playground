@@ -1,0 +1,573 @@
+{
+  "schema_version": 1,
+  "cohort": "C3",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "seed-only-not-capability-registry",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
+  "baseline_overrides": {
+    "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
+    "tables": [
+      "sqlserver_availability_replica_states"
+    ],
+    "replica_counts": [
+      1
+    ],
+    "rows_per_table": 65536,
+    "warmup_seconds": 10,
+    "measure_seconds": 150
+  },
+  "invariants": {
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "interval_secs": 15,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000,
+      "continuous": true
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 15,
+      "target_file_mib": 128,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000
+    }
+  },
+  "comparisons": [
+    {
+      "id": "row-groups",
+      "factor": "parquet_writer.max_row_group_rows",
+      "candidates": [
+        {
+          "id": "row-group-16384",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 16384
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 16384
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-65536",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 65536
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 65536
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-131072",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 131072
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 131072
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-1000000",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 1000000
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 1000000
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "max-rows",
+      "factor": "collector.layout.max_rows",
+      "candidates": [
+        {
+          "id": "max-rows-16384",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 16384
+                },
+                "batching": {
+                  "max_rows_per_flush": 16384
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-65536",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 65536
+                },
+                "batching": {
+                  "max_rows_per_flush": 65536
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-131072",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 131072
+                },
+                "batching": {
+                  "max_rows_per_flush": 131072
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-1000000",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 1000000
+                },
+                "batching": {
+                  "max_rows_per_flush": 1000000
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "page-rows",
+      "factor": "collector.layout.page_rows",
+      "candidates": [
+        {
+          "id": "page-1024",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "page_rows": 1024
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "page-2048",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "page_rows": 2048
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "page-4096",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "page_rows": 4096
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "rollover-cap",
+      "factor": "collector.layout.max_input_bytes",
+      "candidates": [
+        {
+          "id": "input-134217728",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 134217728
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 134217728,
+                  "adaptive_file": {
+                    "max_input_bytes": 134217728
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "input-268435456",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 268435456
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 268435456,
+                  "adaptive_file": {
+                    "max_input_bytes": 268435456
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "input-536870912",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 536870912
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 536870912,
+                  "adaptive_file": {
+                    "max_input_bytes": 536870912
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "coalescing",
+      "factor": "collector.batching.coalesce_publications",
+      "candidates": [
+        {
+          "id": "coalesce-false",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "coalesce_publications": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "coalesce-true",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "coalesce_publications": true
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "flush-age",
+      "factor": "collector.batching.max_age",
+      "candidates": [
+        {
+          "id": "age-1s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "max_age": "1s"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "age-5s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "max_age": "5s"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "age-15s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "max_age": "15s"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "age-60s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "max_age": "60s"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "age-flush-policy",
+      "factor": "collector.batching.age_flush_policy",
+      "candidates": [
+        {
+          "id": "age-policy-immediate",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "age_flush_policy": "immediate"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "age-policy-drain_ready",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "age_flush_policy": "drain_ready"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    }
+  ],
+  "source_enum_coverage": {
+    "age_flush_policy": {
+      "path": "tunables.collector.batching.age_flush_policy",
+      "accepted": [
+        "immediate",
+        "drain_ready"
+      ],
+      "configured": [
+        "immediate",
+        "drain_ready"
+      ],
+      "baseline_requested": null,
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    }
+  },
+  "flush_age_semantics": {
+    "requested_path": "tunables.collector.batching.max_age",
+    "baseline_requested": "1s",
+    "candidate_requests": [
+      {
+        "candidate": "age-1s",
+        "requested": "1s"
+      },
+      {
+        "candidate": "age-5s",
+        "requested": "5s"
+      },
+      {
+        "candidate": "age-15s",
+        "requested": "15s"
+      },
+      {
+        "candidate": "age-60s",
+        "requested": "60s"
+      }
+    ],
+    "effective_readback_path": "consumer_effective_config.batching.max_age",
+    "effective_status": "requires-runtime-startup-readback",
+    "flush_reason_metric": "arrowcol_pipeline_flushes_total",
+    "flush_reason_labels": [
+      "age",
+      "target_parquet_bytes",
+      "min_input_bytes",
+      "max_input_bytes",
+      "row_cap",
+      "batch_cap",
+      "memory_cap",
+      "schema_change",
+      "explicit",
+      "shutdown_drain"
+    ],
+    "interpretation": "Compare per-run counter deltas and physical file sizes; the first satisfied time, row, input-byte, or memory cap determines flush behavior."
+  },
+  "runnable": false,
+  "config_validation": {
+    "status": "config-validated",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 22,
+    "pass_count": 23,
+    "fail_count": 0
+  },
+  "runtime_qualification": "unqualified"
+}

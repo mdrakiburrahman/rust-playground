@@ -28,8 +28,10 @@ controller and its drained table owners have been dropped. Closure runs on the
 main thread before metric flush. A refused close is logged, leaves its registry
 member registered, and exits nonzero without retrying unregister. Startup or
 controller errors retain the publisher registry for reconciliation.
-The receiver records `draining` during `DrainIngress`; it does not mark the
-process stopped while downstream exporters can still publish. After the
+The receiver records `draining` before waiting for admitted streams and renews
+its live registration through publisher close. This prevents crash succession
+during an orderly drain. Terminal writes do not revive expired registrations.
+The receiver does not mark the process stopped while exporters can still publish. After the
 controller and publisher close finish, the embedding main-thread hook persists
 `stopped` for every registered routing identity only on a clean drain and close.
 An unclean drain, unpublished identity, retired worker, or refused close instead persists `failed`;
@@ -163,6 +165,22 @@ Routing transfers a dead predecessor's lease to its same-instance-key
 successor, so replayed batches become publishable once the restarted process
 holds the lease.
 
+## Age cutoff collection
+
+| `batching.age_flush_policy` | Behavior |
+| --- | --- |
+| `immediate` (default) | Keep the existing receive/age-timer race. |
+| `drain_ready` | At age expiry, snapshot the number of queued commands and collect at most that many before publishing. |
+
+Set OAT `tunables.collector.batching.age_flush_policy`, or the collector's
+`ARROWCOL_COLLECTOR_BATCHING_CONFIG` JSON. Unknown values fail configuration
+parsing; startup readback reports the effective policy. The opt-in policy can
+extend collection past `max_age` by finite ready work, never by later arrivals.
+Existing adaptive/row/memory/batch caps, schema boundaries, explicit flushes and
+shutdown drain still apply. Admission timestamps and publication identities do
+not change. Combine with `coalesce_publications: true` to combine compatible
+publications into files; this policy alone does not change file identity.
+
 ## Pressure
 
 The pressure document counts active Flight streams, Ack-tracked DFE batches,
@@ -220,6 +238,11 @@ plane. Use it only for a single collector that owns every table it receives.
 - `RuntimeMetrics` supplies registration, rich pressure, capability, and
   Prometheus snapshots; `process_instance_id` and `process_instance_key`
   expose the process identity that replay rebinding uses.
+
+`/v1/pressure` reports `resolved_buffering_mode: memory_only` only from a ready
+receiver in the SDK-validated, immutable singleton Flight-to-Delta graph.
+Other topologies report `unknown`; `native_quiver_enabled` remains separate
+delivery evidence and does not prove a direct graph.
 
 ## Validation
 

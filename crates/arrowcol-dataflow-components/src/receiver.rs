@@ -12,7 +12,7 @@ use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CollectorInstanceId, ErrorCode, ImplementationPool,
     PositiveMeasurement, PrincipalId, PrincipalIssuer,
 };
-use arrowcol_routing::{CollectorRegistration, CollectorState, RoutingStore};
+use arrowcol_routing::{CollectorRegistration, RoutingStore};
 use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -43,7 +43,7 @@ use tonic::transport::Server;
 
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
-use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
+use crate::envelope::ArrowcolBatchEnvelope;
 use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
@@ -210,6 +210,9 @@ impl BatchAdmission for DfeAdmission {
             .acquire_owned()
             .await
             .map_err(|_| RuntimeError::draining())?;
+        let client_send_observation = context
+            .trusted_client_send_observation()
+            .map(|(id, timestamp)| (id.to_owned(), timestamp));
         let envelope = ArrowcolBatchEnvelope {
             publication_id: None,
             ingested_at_ms: None,
@@ -227,6 +230,7 @@ impl BatchAdmission for DfeAdmission {
             pending: Arc::clone(&self.pending),
             metrics: Arc::clone(&self.metrics),
             envelope,
+            client_send_observation,
             permit: Some(permit),
             finished: false,
             durable: self.durable_timeout.map(DurableAdmission::new),
@@ -294,6 +298,7 @@ struct DfeStreamLifecycle {
     pending: Arc<PendingTracker>,
     metrics: Arc<RuntimeMetrics>,
     envelope: ArrowcolBatchEnvelope,
+    client_send_observation: Option<(String, u64)>,
     permit: Option<OwnedSemaphorePermit>,
     finished: bool,
     durable: Option<DurableAdmission>,
@@ -351,6 +356,7 @@ impl Drop for DfeStreamLifecycle {
 #[async_trait]
 impl StreamLifecycle for DfeStreamLifecycle {
     async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
+        let ingested_at_ms = now_unix_millis().map_err(|_| RuntimeError::internal())?;
         if let Some(durable) = &self.durable {
             // A rejected batch already fails the stream; stop accepting more of it.
             durable.ensure_not_rejected()?;
@@ -361,8 +367,13 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let mut envelope = self.envelope.clone();
         let publication_id = arrowcol_protocol::PublicationId::new();
         envelope.publication_id = Some(publication_id);
-        envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
-        let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
+        envelope.ingested_at_ms = Some(ingested_at_ms);
+        let records = crate::envelope::encode_record_batch_with_trusted_client_observation(
+            envelope,
+            batch,
+            self.client_send_observation.clone(),
+        )
+        .map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
             .pending
             .insert_for_stream(
@@ -377,26 +388,30 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let mut pending_send = PendingSendGuard::new(Arc::clone(&self.pending), correlation_id);
         let pdata = OtapPdata::new_todo_context(OtapPayload::from_pdata_arrow(records));
         crate::shutdown::PROCESS_ROUTING_SHUTDOWN
-            .publication_finished(publication_id, false)
-            .map_err(|_| RuntimeError::internal())?;
-        match self.sender.send(correlation_id, pdata).await {
-            Ok(()) => {
-                pending_send.disarm();
-                Ok(())
-            }
-            Err(error) => Err(match error {
-                PdataSendError::Closed => RuntimeError::new(
-                    ErrorCode::PoolUnavailable,
-                    tonic::Code::Unavailable,
-                    "DFE downstream route closed after admission",
-                ),
-                PdataSendError::Unavailable => RuntimeError::new(
-                    ErrorCode::CapacityExhausted,
-                    tonic::Code::Unavailable,
-                    "DFE downstream admission is unavailable",
-                ),
-            }),
-        }
+            .admit_publication(publication_id, async {
+                let sent = self.sender.send(correlation_id, pdata).await;
+                if sent.is_ok() {
+                    pending_send.disarm();
+                }
+                sent
+            })
+            .await
+            .map_err(|_| RuntimeError::internal())?
+            .map_err(|error| {
+                self.metrics.enqueue_failed();
+                match error {
+                    PdataSendError::Closed => RuntimeError::new(
+                        ErrorCode::PoolUnavailable,
+                        tonic::Code::Unavailable,
+                        "DFE downstream route closed after admission",
+                    ),
+                    PdataSendError::Unavailable => RuntimeError::new(
+                        ErrorCode::CapacityExhausted,
+                        tonic::Code::Unavailable,
+                        "DFE downstream admission is unavailable",
+                    ),
+                }
+            })
     }
 
     async fn complete(&mut self, _summary: StreamSummary) -> RuntimeResult<StreamCompletion> {
@@ -423,6 +438,7 @@ struct ArrowFlightReceiver {
     routing: Arc<dyn RoutingStore>,
     metrics: Arc<RuntimeMetrics>,
     permits: Arc<Semaphore>,
+    direct_topology: bool,
 }
 
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
@@ -432,7 +448,7 @@ fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_
 }
 
 fn create_receiver(
-    _pipeline: PipelineContext,
+    pipeline: PipelineContext,
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     receiver_config: &ReceiverConfig,
@@ -477,6 +493,8 @@ fn create_receiver(
     );
     Ok(ReceiverWrapper::shared(
         ArrowFlightReceiver {
+            direct_topology: crate::topology::is_direct_collector(&pipeline, &pipeline.node_id())
+                && !config.native_quiver,
             config,
             routing,
             metrics,
@@ -587,6 +605,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
         let admin_state = AdminState {
             metrics: Arc::clone(&self.metrics),
             max_request_bytes: u64::try_from(limits.max_message_bytes).unwrap_or(u64::MAX),
+            direct_topology: self.direct_topology,
         };
         let mut admin = tokio::spawn(async move {
             axum::serve(admin_listener, admin_router(admin_state))
@@ -611,14 +630,12 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                         Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
                             self.metrics.set_accepting(false);
                             shutdown.cancel();
+                            begin_registration_drain(&self.routing, instance_id, &self.config).await;
                             let remaining = deadline.saturating_duration_since(Instant::now());
                             drain_streams(&drain, remaining, &mut control, &admission).await;
-                            finalize_registration(
-                                &self.routing,
-                                instance_id,
-                                CollectorState::Draining,
-                                &self.metrics,
-                            ).await;
+                            if self.metrics.publish_pressure(self.routing.as_ref()).await.is_err() {
+                                self.metrics.set_registered(false);
+                            }
                             let _ = effect_handler.notify_receiver_drained().await;
                             await_tasks(flight, admin, registration, remaining).await;
                             return Ok(TerminalState::default());
@@ -626,14 +643,12 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
                             self.metrics.set_accepting(false);
                             shutdown.cancel();
+                            begin_registration_drain(&self.routing, instance_id, &self.config).await;
                             let remaining = deadline.saturating_duration_since(Instant::now());
                             drain_streams(&drain, remaining, &mut control, &admission).await;
-                            finalize_registration(
-                                &self.routing,
-                                instance_id,
-                                CollectorState::Draining,
-                                &self.metrics,
-                            ).await;
+                            if self.metrics.publish_pressure(self.routing.as_ref()).await.is_err() {
+                                self.metrics.set_registered(false);
+                            }
                             await_tasks(flight, admin, registration, remaining).await;
                             return Ok(TerminalState::default());
                         }
@@ -878,25 +893,22 @@ async fn registration_loop(
     }
 }
 
-async fn finalize_registration(
+async fn begin_registration_drain(
     store: &Arc<dyn RoutingStore>,
     instance_id: CollectorInstanceId,
-    state: CollectorState,
-    metrics: &Arc<RuntimeMetrics>,
+    config: &FlightReceiverConfig,
 ) {
-    let result = match now_unix_millis() {
-        Ok(now) => store
-            .set_collector_state(instance_id, state, now)
-            .await
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error),
-    };
+    let result = crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+        .begin_drain(
+            Arc::clone(store),
+            instance_id,
+            config.registration.heartbeat_interval,
+            config.registration.registration_ttl,
+        )
+        .await;
     if let Err(error) = result {
         crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
         tracing::error!(%error, "dataflow could not persist ingress drain state");
-    }
-    if metrics.publish_pressure(store.as_ref()).await.is_err() {
-        metrics.set_registered(false);
     }
 }
 
@@ -904,6 +916,7 @@ async fn finalize_registration(
 struct AdminState {
     metrics: Arc<RuntimeMetrics>,
     max_request_bytes: u64,
+    direct_topology: bool,
 }
 
 fn admin_router(state: AdminState) -> Router {
@@ -964,7 +977,12 @@ async fn admin_capabilities(State(state): State<AdminState>) -> impl IntoRespons
 
 async fn admin_pressure(State(state): State<AdminState>) -> Response {
     match state.metrics.pressure() {
-        Ok(pressure) => Json(pressure).into_response(),
+        Ok(mut pressure) => {
+            if state.direct_topology && state.metrics.ready() {
+                pressure.resolved_buffering_mode = "memory_only";
+            }
+            Json(pressure).into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -980,6 +998,34 @@ async fn admin_metrics(State(state): State<AdminState>) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::expect_used)]
+
+    #[tokio::test]
+    async fn pressure_attests_only_ready_direct_receivers() -> anyhow::Result<()> {
+        async fn mode(state: AdminState) -> anyhow::Result<serde_json::Value> {
+            let response = admin_pressure(State(state)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+            Ok(serde_json::from_slice::<serde_json::Value>(&body)?["resolved_buffering_mode"].clone())
+        }
+
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        let mut state = AdminState {
+            metrics: Arc::clone(&metrics),
+            max_request_bytes: 4096,
+            direct_topology: true,
+        };
+        metrics.set_healthy(true);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
+        metrics.set_accepting(true);
+        assert_eq!(mode(state.clone()).await?, "memory_only");
+        metrics.set_accepting(false);
+        assert_eq!(mode(state.clone()).await?, "unknown");
+        metrics.set_accepting(true);
+        state.direct_topology = false;
+        assert_eq!(mode(state).await?, "unknown");
+        Ok(())
+    }
 
     use std::sync::Mutex;
 
@@ -1227,6 +1273,7 @@ pub(crate) mod tests {
             pending,
             metrics: Arc::clone(&metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1252,6 +1299,7 @@ pub(crate) mod tests {
             pending,
             metrics,
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1282,6 +1330,7 @@ pub(crate) mod tests {
             pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
             metrics: Arc::clone(&metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1313,6 +1362,7 @@ pub(crate) mod tests {
             pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
             metrics: Arc::clone(&metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1523,6 +1573,7 @@ pub(crate) mod tests {
             pending: Arc::clone(&pending),
             metrics: Arc::clone(metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: timeout.map(DurableAdmission::new),

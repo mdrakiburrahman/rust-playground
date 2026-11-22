@@ -1,0 +1,492 @@
+{
+  "schema_version": 1,
+  "cohort": "C5",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "seed-only-not-capability-registry",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
+  "baseline_overrides": {
+    "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
+    "tables": [
+      "sqlserver_availability_replica_states"
+    ],
+    "replica_counts": [
+      1
+    ],
+    "rows_per_table": 65536,
+    "warmup_seconds": 10,
+    "measure_seconds": 150
+  },
+  "invariants": {
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "interval_secs": 15,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000,
+      "continuous": true
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 15,
+      "target_file_mib": 128,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000
+    }
+  },
+  "comparisons": [
+    {
+      "id": "workers",
+      "factor": "tunables.client.workers",
+      "candidates": [
+        {
+          "id": "workers-8",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "workers": 8
+              }
+            }
+          }
+        },
+        {
+          "id": "workers-16",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "workers": 16
+              }
+            }
+          }
+        },
+        {
+          "id": "workers-32",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "workers": 32
+              }
+            }
+          }
+        },
+        {
+          "id": "workers-64",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "workers": 64
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "streams",
+      "factor": "tunables.client.streams_per_worker",
+      "candidates": [
+        {
+          "id": "streams-1",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "streams_per_worker": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "streams-2",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "streams_per_worker": 2
+              }
+            }
+          }
+        },
+        {
+          "id": "streams-4",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "streams_per_worker": 4
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "connections",
+      "factor": "tunables.client.connections_per_worker",
+      "candidates": [
+        {
+          "id": "connections-1",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "connections_per_worker": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "connections-2",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "connections_per_worker": 2
+              }
+            }
+          }
+        },
+        {
+          "id": "connections-4",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "connections_per_worker": 4
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "data-mode",
+      "factor": "tunables.client.data_mode",
+      "candidates": [
+        {
+          "id": "data-mode-shared",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "data_mode": "shared"
+              }
+            }
+          }
+        },
+        {
+          "id": "data-mode-independent",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "data_mode": "independent"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4,
+      "matched_control": "data-mode-shared",
+      "comparison_family": "data-mode"
+    },
+    {
+      "id": "corpus",
+      "factor": "tunables.client.corpus_rows",
+      "candidates": [
+        {
+          "id": "corpus-16384",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "corpus_rows": 16384
+              }
+            }
+          }
+        },
+        {
+          "id": "corpus-65536",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "corpus_rows": 65536
+              }
+            }
+          }
+        },
+        {
+          "id": "corpus-262144",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "corpus_rows": 262144
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "interval",
+      "factor": "tunables.client.interval_us",
+      "candidates": [
+        {
+          "id": "interval-0",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "interval_us": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "interval-1000",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "interval_us": 1000
+              }
+            }
+          }
+        },
+        {
+          "id": "interval-10000",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "interval_us": 10000
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "ipc-compression",
+      "factor": "tunables.transport.ipc_compression",
+      "candidates": [
+        {
+          "id": "ipc-none",
+          "overrides": {
+            "tunables": {
+              "transport": {
+                "ipc_compression": "none"
+              }
+            }
+          }
+        },
+        {
+          "id": "ipc-lz4_frame",
+          "overrides": {
+            "tunables": {
+              "transport": {
+                "ipc_compression": "lz4_frame"
+              }
+            }
+          }
+        },
+        {
+          "id": "ipc-zstd",
+          "overrides": {
+            "tunables": {
+              "transport": {
+                "ipc_compression": "zstd"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    }
+  ],
+  "source_enum_coverage": {
+    "data_mode": {
+      "path": "tunables.client.data_mode",
+      "accepted": [
+        "shared",
+        "independent"
+      ],
+      "configured": [
+        "shared",
+        "independent"
+      ],
+      "baseline_requested": null,
+      "effective_default": "shared (bin/collector-chain/src/dmv_client.rs::Options)",
+      "consumer": "ARROWCOL_CLIENT_DATA_MODE -> bin/collector-chain/src/dmv_client.rs::Options.data_mode; shared uses one corpus copy and independent uses workers copies under max_memory_bytes",
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "ipc_compression": {
+      "path": "tunables.transport.ipc_compression",
+      "accepted": [
+        "none",
+        "lz4_frame",
+        "zstd"
+      ],
+      "configured": [
+        "none",
+        "lz4_frame",
+        "zstd"
+      ],
+      "baseline_requested": "zstd",
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "grpc_send_compression": {
+      "path": "tunables.transport.grpc_send_compression",
+      "accepted": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "configured": [],
+      "baseline_requested": "none",
+      "effective_default": "none (bin/collector-chain/src/dmv_client.rs::Options)",
+      "client_build_supported": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "consumer": "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::send_compressed",
+      "excluded": {
+        "gzip": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; gzip is enabled only by a test server in dmv_client.rs.",
+        "zstd": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; client build support alone does not establish receiver compatibility."
+      },
+      "pending": [],
+      "status": "client-supported-but-production-receiver-incompatible"
+    },
+    "grpc_accept_compression": {
+      "path": "tunables.transport.grpc_accept_compression",
+      "accepted": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "configured": [],
+      "baseline_requested": null,
+      "effective_default": "none (bin/collector-chain/src/dmv_client.rs::Options)",
+      "client_build_supported": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "consumer": "ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::accept_compressed",
+      "excluded": {
+        "gzip": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting.",
+        "zstd": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting."
+      },
+      "pending": [],
+      "status": "no-production-receiver-response-compression"
+    }
+  },
+  "runnable": false,
+  "config_validation": {
+    "status": "config-validated",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 21,
+    "pass_count": 22,
+    "fail_count": 0
+  },
+  "runtime_qualification": "unqualified"
+}

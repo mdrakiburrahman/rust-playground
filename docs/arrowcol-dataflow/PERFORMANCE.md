@@ -35,8 +35,11 @@ cargo run --locked --package arrowcol-dataflow-rust -- --config projects/arrowco
 ```
 
 Parquet compression accepts uncompressed, snappy, gzip (0..9), brotli (0..11),
-zstd (1..22), lz4_raw and legacy lz4. Levels are forbidden on codecs without a
-level. `defaults` and `columns` accept the same `ColumnOptions`; column selectors
+zstd (1..22), lz4_raw and legacy lz4. `lz4` uses deprecated Hadoop framing and
+is retained only for compatibility; prefer `lz4_raw`, which uses the Parquet
+spec framing, only when every downstream reader supports it. Selecting `lz4`
+emits a process-once warning. Levels are forbidden on codecs without a level.
+`defaults` and `columns` accept the same `ColumnOptions`; column selectors
 must uniquely resolve to an actual physical Parquet leaf, after normalization
 and partition projection. Dictionary encoding is controlled separately from
 fallback encoding. FPP must be finite and strictly between zero and one.
@@ -60,6 +63,13 @@ for partial output. Partition lookup is keyed and staging checks file caps early
 encoding high-cardinality output. Schema, partition, retention, fencing,
 no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.
+
+`batching.pipeline_depth` defaults to `1` (serialized publication). With coalescing
+enabled, `2..=64` permits bounded groups to prepare/upload using the same opened
+table while its single commit worker publishes earlier groups. The existing
+`max_concurrent_flushes`, Arrow capacities, CPU workers and upload limit still
+apply. Pipelined groups use `commit.batch_window` and `max_files_per_commit`
+rather than forcing a version per group. See the [control contracts](../experiments/arrowcol-oat/TUNABLES.md#single-table-preparation-and-commit-overlap).
 
 ## Layout readback
 

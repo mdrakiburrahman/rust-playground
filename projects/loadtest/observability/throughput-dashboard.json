@@ -1,0 +1,286 @@
+{
+  "annotations": {
+    "list": [{
+      "builtIn": 1,
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "enable": true,
+      "hide": true,
+      "iconColor": "rgba(0, 211, 255, 1)",
+      "name": "Annotations & Alerts",
+      "type": "dashboard"
+    }]
+  },
+  "description": "Single-writer OAT bottleneck view. A PASS verdict comes only from a valid OAT receipt; absent telemetry is UNKNOWN. PR #125 metrics are the initial baseline, with stage, queue, file and maintenance series appearing as their instrumented producers land.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Campaign verdict (OAT receipt)",
+      "description": "Grafana telemetry cannot award PASS. Use the OAT cell receipt and its committed-window reconciliation; no receipt or incomplete evidence is UNKNOWN.",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 6},
+      "options": {"mode": "markdown", "content": "### Verdict: use the OAT receipt\n\nThis dashboard does not calculate PASS. Use the OAT cell receipt with committed-window reconciliation; no receipt or incomplete evidence is UNKNOWN."}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Committed new rows / s",
+      "description": "PR #125's arrowcol_delta_rows_total is the primary starting series. The authoritative score remains the OAT durable-commit window, deduplicated by table identity and Delta version, excluding rewrites and retries.",
+      "gridPos": {"x": 6, "y": 0, "w": 18, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "rps", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"refId": "A", "expr": "rate(arrowcol_delta_rows_total{run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[30s])", "legendFormat": "committed {{component}} / {{variant}}"}]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Row-to-commit latency (p50 / p95 / p99)",
+      "description": "Histogram quantiles from instrumented row/publication-to-durable-commit metrics. Do not substitute QAP refresh age for row latency.",
+      "gridPos": {"x": 0, "y": 6, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*(row|publication|commit).*_seconds_bucket\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "p50 {{component}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*(row|publication|commit).*_seconds_bucket\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "p95 {{component}}"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*(row|publication|commit).*_seconds_bucket\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "p99 {{component}}"}
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Queue age (oldest pending, seconds)",
+      "description": "Oldest work age, not just queue depth. A sustained positive age/backlog slope is not a stable throughput result.",
+      "gridPos": {"x": 12, "y": 6, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"refId": "A", "expr": "max by (component,run,variant) ({__name__=~\"arrowcol_.*(queue|pending).*age.*_seconds\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"})", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Stage: collect (p95)",
+      "description": "Ordered stage timing: collect.",
+      "gridPos": {"x": 0, "y": 14, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*stage.*_seconds_bucket\",stage=\"collect\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Stage: build (p95)",
+      "description": "Ordered stage timing: build.",
+      "gridPos": {"x": 8, "y": 14, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*stage.*_seconds_bucket\",stage=\"build\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Stage: sort (p95)",
+      "description": "Ordered stage timing: sort.",
+      "gridPos": {"x": 16, "y": 14, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*stage.*_seconds_bucket\",stage=\"sort\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Stage: encode (p95)",
+      "description": "Ordered stage timing: encode.",
+      "gridPos": {"x": 0, "y": 21, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*stage.*_seconds_bucket\",stage=\"encode\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Stage: upload (p95)",
+      "description": "Ordered stage timing: upload.",
+      "gridPos": {"x": 8, "y": 21, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*stage.*_seconds_bucket\",stage=\"upload\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Stage: commit (p95)",
+      "description": "Ordered stage timing: commit.",
+      "gridPos": {"x": 16, "y": 21, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*stage.*_seconds_bucket\",stage=\"commit\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m])))", "legendFormat": "{{component}}"}]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "CPU saturation by service",
+      "description": "Container CPU across the Compose benchmark services. This local observer is not a claim about AKS resource saturation.",
+      "gridPos": {"x": 0, "y": 28, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service!=\"\"}[1m]))", "legendFormat": "{{container_label_com_docker_compose_service}}"}]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Working set by service",
+      "description": "Container working set across the Compose benchmark services.",
+      "gridPos": {"x": 12, "y": 28, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "max by (container_label_com_docker_compose_service) (container_memory_working_set_bytes{container_label_com_docker_compose_service!=\"\"})", "legendFormat": "{{container_label_com_docker_compose_service}}"}]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Physical Parquet file-size distribution",
+      "description": "Histogram buckets must represent committed physical object lengths, including the Parquet footer. Per-file identities are never metric labels.",
+      "gridPos": {"x": 0, "y": 36, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"refId": "A", "expr": "sum by (le,component,run,variant) (rate({__name__=~\"arrowcol_.*(file|parquet).*_bytes_bucket\",run=~\"$run\",variant=~\"$variant\",component=~\"$component\"}[1m]))", "legendFormat": "{{component}} ≤ {{le}} bytes"}]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Maintenance candidates and skips",
+      "description": "Operation counts only; no-work log-write invariants and due work must be checked in maintenance evidence.",
+      "gridPos": {"x": 0, "y": 45, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (__name__,operation) (rate({__name__=~\".*maintenance.*(candidate|skip).*_total\"}[1m]))", "legendFormat": "{{__name__}} {{operation}}"}]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Maintenance log I/O",
+      "description": "Instrumented maintenance log reads/writes. No-work idle log writes/commits must remain zero; eligibility reads are minimized and measured.",
+      "gridPos": {"x": 8, "y": 45, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (__name__) (rate({__name__=~\".*maintenance.*(log|read|write).*(total|bytes).*\"}[1m]))", "legendFormat": "{{__name__}}"}]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Checkpoint debt and progress",
+      "description": "Checkpoint version/debt and maintenance progress. Missing metrics are not evidence of zero debt.",
+      "gridPos": {"x": 16, "y": 45, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "max by (__name__,operation) ({__name__=~\".*maintenance.*(checkpoint|debt).*\"})", "legendFormat": "{{__name__}} {{operation}}"}]
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "QAP accelerated (%)",
+      "description": "Native AccelerationCompletePercentage. Percent accelerated is not row completeness. Stale/incomplete observations are suppressed.",
+      "gridPos": {"x": 0, "y": 53, "w": 5, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"refId": "A", "expr": "qap_completion_percent and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}"}]
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "QAP pending files",
+      "description": "Native AccelerationPendingDataFilesCount. Missing, stale, or partial observations remain empty, not zero.",
+      "gridPos": {"x": 5, "y": 53, "w": 5, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"refId": "A", "expr": "qap_pending_artifacts and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}"}]
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "QAP pending size (bytes)",
+      "description": "Reserved for the native pending-data size field. PR #125's observer does not export pending size; qap_cached_bytes is HotSize, not pending bytes, so this panel intentionally has no fallback.",
+      "gridPos": {"x": 10, "y": 53, "w": 5, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"refId": "A", "expr": "qap_pending_bytes and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}"}]
+    },
+    {
+      "id": 20,
+      "type": "stat",
+      "title": "LastUpdatedDateTime age (refresh, not row latency)",
+      "description": "Age derived from native LastUpdatedDateTime. This is accelerator refresh age, never per-row latency.",
+      "gridPos": {"x": 15, "y": 53, "w": 5, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"refId": "A", "expr": "qap_lag_seconds and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}"}]
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "QAP unhealthy catalogs (count)",
+      "description": "Count derived from native health state. PR #125's observer does not export NotHealthyReason text.",
+      "gridPos": {"x": 20, "y": 53, "w": 4, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"refId": "A", "expr": "qap_unhealthy_catalogs and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}"}]
+    },
+    {
+      "id": 22,
+      "type": "text",
+      "title": "Native NotHealthyReason",
+      "description": "Structured native QAP reason is not exported by the PR #125 observer and cannot be recovered from the unhealthy count.",
+      "gridPos": {"x": 0, "y": 59, "w": 24, "h": 4},
+      "options": {"mode": "markdown", "content": "**NotHealthyReason is not present in the current observer contract.** The count panel above does not expose or imply a reason. Keep this field UNKNOWN until the QAP observer exports the native reason as a bounded structured log or status artifact."}
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Scrape health (all targets)",
+      "description": "Prometheus target availability. `up=0` is a scrape failure; a healthy scrape does not prove complete OAT evidence.",
+      "gridPos": {"x": 0, "y": 63, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "max": 1}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "up", "legendFormat": "{{job}} / {{instance}}"}]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "OTel export failures",
+      "description": "Collector export failures when the OTel Collector exposes its standard exporter counters. Missing series are not a zero-failure guarantee.",
+      "gridPos": {"x": 12, "y": 63, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (service_name) (rate(otelcol_exporter_send_failed_metric_points[1m]))", "legendFormat": "{{service_name}}"}]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["arrowcol", "throughput", "oat"],
+  "templating": {
+    "list": [
+      {"name": "run", "label": "Run ID", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}, "options": [], "hide": 0, "skipUrlSync": false},
+      {"name": "variant", "label": "Variant", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}, "options": [], "hide": 0, "skipUrlSync": false},
+      {"name": "component", "label": "Component", "type": "textbox", "query": ".*", "current": {"text": ".*", "value": ".*"}, "options": [], "hide": 0, "skipUrlSync": false}
+    ]
+  },
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {"refresh_intervals": ["5s", "10s", "30s", "1m", "5m"], "time_options": ["5m", "15m", "30m", "1h", "6h"]},
+  "timezone": "browser",
+  "title": "ArrowCol: Throughput and Bottlenecks",
+  "uid": "arrowcol-throughput",
+  "version": 1
+}

@@ -52,11 +52,13 @@ fn process_log_complete(role: &ComponentRole, text: &str) -> bool {
 fn is_process_evidence_line(line: &str) -> bool {
     [
         "arrowcol_effective_config ",
+        "df_engine_effective_config ",
         "arrowcol_router_effective_config ",
         "arrowcol_wal_effective_config ",
         "arrowcol_layout_",
         "arrowcol_data_commit ",
         "arrowcol_maintenance_",
+        "delta-maintenance ",
         "OAT_CLIENT_",
         "otel.controller.main::shutdown.signal_received",
         "otel.processor.durable_buffer::durable_buffer.shutdown.",
@@ -64,7 +66,7 @@ fn is_process_evidence_line(line: &str) -> bool {
     ]
     .iter()
     .any(|prefix| line.contains(prefix))
-        || (line.trim_start().starts_with('{') && line.contains("\"operation\"") && line.contains("\"applied\""))
+        || line.trim_start().starts_with('{')
 }
 
 fn append_process_evidence_line(
@@ -93,7 +95,12 @@ fn append_process_record(bytes: &[u8], output: &mut String, retained_bytes: &mut
     let without_lf = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let line = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
     let line = std::str::from_utf8(line).context("process log contains a non-UTF-8 line")?;
-    append_process_evidence_line(line, output, retained_bytes, action)
+    let before = output.len();
+    append_process_evidence_line(line, output, retained_bytes, action)?;
+    if output.len() > before && !bytes.ends_with(b"\n") {
+        output.pop();
+    }
+    Ok(())
 }
 
 async fn filtered_process_command_output(mut command: Command, action: &str) -> Result<FilteredProcessOutput> {
@@ -166,8 +173,8 @@ async fn filtered_process_command_output(mut command: Command, action: &str) -> 
 fn filter_process_evidence_text(text: &str) -> Result<String> {
     let mut filtered = String::new();
     let mut retained_bytes = 0;
-    for line in text.lines() {
-        append_process_evidence_line(line, &mut filtered, &mut retained_bytes, "process log filtering")?;
+    for line in text.split_inclusive('\n') {
+        append_process_record(line.as_bytes(), &mut filtered, &mut retained_bytes, "process log filtering")?;
     }
     Ok(filtered)
 }
@@ -303,6 +310,7 @@ fn process_configurations(text: &str) -> Result<Value> {
         }
         let value = [
             "arrowcol_effective_config ",
+            "df_engine_effective_config ",
             "arrowcol_router_effective_config ",
             "arrowcol_maintenance_effective_config ",
             "OAT_CLIENT_EFFECTIVE_CONFIG ",
@@ -367,6 +375,29 @@ fn contains_requested(observed: &Value, requested: &Value) -> bool {
         }),
         _ => observed == requested,
     }
+}
+
+fn matches_collector_pressure(observed: &Value, requested: &Value) -> Result<bool> {
+    let (Some(observed), Some(requested)) = (observed.as_object(), requested.as_object()) else {
+        return Ok(false);
+    };
+    for (field, expected) in requested {
+        let Some(actual) = observed.get(field) else {
+            return Ok(false);
+        };
+        if matches!(field.as_str(), "pressure_interval" | "heartbeat_interval" | "registration_ttl") {
+            let parse = |value: &Value| {
+                let value = value.as_str().with_context(|| format!("collector pressure {field} must be a duration string"))?;
+                arrowcol_tunables::parse_tunable_duration(field, value)
+            };
+            if parse(actual)? != parse(expected)? {
+                return Ok(false);
+            }
+        } else if !contains_requested(actual, expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn client_sentinel_value(
@@ -485,6 +516,15 @@ fn router_readback_path(variable: &str) -> Result<String> {
 }
 
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
+    verify_process_configuration_recording(config, role, observed, &mut None)
+}
+
+fn verify_process_configuration_recording(
+    config: &OatConfig,
+    role: ComponentRole,
+    observed: &Value,
+    diff: &mut Option<Value>,
+) -> Result<()> {
     if matches!(role, ComponentRole::Collector) {
         verify_wal_configuration(config, observed)?;
     }
@@ -504,9 +544,13 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
         if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
             expected = Value::Null;
         }
+        if matches!(role, ComponentRole::Maintenance) && name == "ARROWCOL_MAINT_OPERATION_TIMEOUT_SECS" {
+            continue;
+        }
         if matches!(role, ComponentRole::Maintenance) && name.starts_with("ARROWCOL_MAINT_") {
             let (actual, expected) = maintenance_readback_value(observed, &name, expected)?;
             if !contains_requested(&actual, &expected) {
+                *diff = Some(startup_mismatch(role, &name, &expected, Some(&actual)));
                 bail!("maintenance startup does not match applied tunable {name}");
             }
             continue;
@@ -522,6 +566,9 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
+            "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
+                "/engine/shutdown_drain_timeout_seconds".to_owned()
+            }
             "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
@@ -562,10 +609,19 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             ),
             _ => bail!("no effective readback adapter for {name}"),
         };
-        let actual = observed
-            .pointer(&path)
-            .with_context(|| format!("{} startup readback omitted applied tunable {name}", role_name(role)))?;
-        if !contains_requested(actual, &expected) {
+        let Some(actual) = observed.pointer(&path) else {
+            *diff = Some(startup_mismatch(role, &name, &expected, None));
+            bail!("{} startup readback omitted applied tunable {name}", role_name(role));
+        };
+        let matches = if name == "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" {
+            matches_collector_pressure(actual, &expected)
+        } else {
+            Ok(contains_requested(actual, &expected))
+        };
+        if !matches.as_ref().is_ok_and(|equal| *equal) {
+            *diff = Some(startup_mismatch(role, &name, &expected, Some(actual)));
+        }
+        if !matches? {
             bail!(
                 "{} startup readback does not match applied tunable {name}",
                 role_name(role)
@@ -715,14 +771,19 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             text: format!("arrowcol_router_effective_config {{\"log_filter\":{}}}\n", serde_json::to_string(&log_filter)?),
         });
     }
-    let mut evidence = process_evidence_for_cell(config, &logs, &[])?;
+    let mut evidence = process_evidence_for_cell(config, &logs, &[], &mut None)?;
     if added_router && let Some(entries) = evidence.as_array_mut() {
         entries.retain(|entry| entry["component"] != "router");
     }
     Ok(evidence)
 }
 
-fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_logs: &[ProcessLog]) -> Result<Value> {
+fn process_evidence_for_cell(
+    config: &OatConfig,
+    logs: &[ProcessLog],
+    baseline_logs: &[ProcessLog],
+    diff: &mut Option<Value>,
+) -> Result<Value> {
     let mut result = Vec::new();
     for role in [
         ComponentRole::Router,
@@ -745,7 +806,7 @@ fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_l
                 bail!("maintenance operation log was truncated; safety outcomes cannot be established");
             }
             let resolved = process_configurations(&log.text)?;
-            verify_process_configuration(config, role, &resolved)?;
+            verify_process_configuration_recording(config, role, &resolved, diff)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
             let maintenance_tables = if matches!(role, ComponentRole::Maintenance) {
                 Some(maintenance_table_evidence(config, &log.text)?)
@@ -830,7 +891,10 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
             "status": "unavailable",
             "cell_scope": "unavailable",
             "operation_count": null,
+            "operation_failure": null,
+            "retry_kind_counts": null,
             "error_kind_counts": null,
+            "operations": null,
             "comment": comment,
         })
     };
@@ -843,6 +907,9 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     if !baseline.complete || !log.complete {
         return unavailable("Maintenance process logs were truncated, so cell outcomes could not be isolated.");
     }
+    if [&baseline.stdout, &baseline.stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+        return unavailable("Maintenance baseline ended in a partial record; cell outcomes are unknown.");
+    }
     let Some(stdout) = log.stdout.strip_prefix(&baseline.stdout) else {
         return unavailable("Maintenance stdout changed or rotated, so cell outcomes could not be isolated.");
     };
@@ -851,25 +918,53 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     };
     let appended = format!("{stdout}\n{stderr}");
     let mut operation_count = 0_u64;
+    let mut retry_kind_counts = serde_json::Map::new();
     let mut error_kind_counts = serde_json::Map::new();
+    let mut operations = serde_json::Map::new();
+    if [stdout, stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+        return unavailable("Maintenance log ended in a partial record; cell outcomes are unknown.");
+    }
     for line in appended.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
+            if line.trim_start().starts_with('{') {
+                return unavailable("A maintenance JSON record was malformed; cell outcomes are unknown.");
+            }
             continue;
         };
-        if !value["operation"].is_string() || !value["applied"].is_boolean() {
+        if value.get("operation").is_none() {
             continue;
         }
+        let Some(operation) = value["operation"].as_str().filter(|operation| {
+            ["optimize", "checkpoint", "purge", "vacuum", "prune_log"].contains(operation)
+        }) else {
+            return unavailable("A maintenance operation identity was missing or invalid.");
+        };
+        let record_outcome = maintenance_record_outcome(&value);
+        if !value["applied"].is_boolean() || !value["table"].is_string() || record_outcome.is_none() {
+            return unavailable("A maintenance operation record was partial; cell outcomes are unknown.");
+        }
         operation_count = operation_count.saturating_add(1);
+        let operation_counts = operations.entry(operation.to_owned()).or_insert_with(|| json!({
+            "operation_count": 0, "retry_kind_counts": {}, "error_kind_counts": {},
+        }));
+        operation_counts["operation_count"] = json!(operation_counts["operation_count"].as_u64().unwrap_or(0) + 1);
         let error_kind = value.get("error_kind").and_then(Value::as_str);
-        let failed = error_kind.is_some() || value.get("error").is_some_and(|error| !error.is_null());
+        let failed = record_outcome != Some(MaintenanceRecordOutcome::Succeeded);
         if failed {
             let kind = sanitized_maintenance_error_kind(error_kind);
-            let count = error_kind_counts.entry(kind).or_insert_with(|| json!(0));
+            let retry = record_outcome == Some(MaintenanceRecordOutcome::Retry);
+            let counts = if retry { &mut retry_kind_counts } else { &mut error_kind_counts };
+            let count = counts.entry(kind.clone()).or_insert_with(|| json!(0));
             *count = json!(count.as_u64().unwrap_or(0).saturating_add(1));
+            let field = if retry { "retry_kind_counts" } else { "error_kind_counts" };
+            operation_counts[field][&kind] = json!(operation_counts[field][&kind].as_u64().unwrap_or(0) + 1);
         }
     }
+    if operation_count == 0 {
+        return unavailable("No complete maintenance operation records were available for this cell.");
+    }
     let comment = if error_kind_counts.is_empty() {
-        "No maintenance operation errors were observed during this cell."
+        "No operation failures in the complete cell records; optimistic-concurrency replans are counted separately."
     } else {
         "Cell-scoped maintenance errors are counted by sanitized error_kind; raw error text is omitted."
     };
@@ -877,8 +972,33 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
         "status": "observed",
         "cell_scope": "stdout_stderr_append_offsets",
         "operation_count": operation_count,
+        "operation_failure": !error_kind_counts.is_empty(),
+        "retry_kind_counts": retry_kind_counts,
         "error_kind_counts": error_kind_counts,
+        "operations": operations,
         "comment": comment,
+    })
+}
+
+fn maintenance_exit_classification(log: &ProcessLog, exit: Option<i64>) -> Value {
+    if log.text.contains("delta-maintenance stale-plan starvation ")
+        || log.text.contains("delta-maintenance pending-table status failed:")
+    {
+        return json!("unhealthy");
+    }
+    if exit == Some(1) {
+        return json!("nonzero_health_exit");
+    }
+    let mut baseline = log.clone();
+    baseline.stdout.clear();
+    baseline.stderr.clear();
+    baseline.complete = true;
+    let lifetime = maintenance_cell_outcome_evidence(log, &[baseline]);
+    let failure = lifetime["operation_failure"].as_bool();
+    json!(match (exit, failure) {
+        (_, Some(true)) => "operation_failure",
+        (Some(0 | 143), Some(false)) => "no_operation_failures",
+        _ => "unknown",
     })
 }
 
@@ -1286,11 +1406,111 @@ mod startup_readback_tests {
         );
         assert!(!evidence.to_string().contains("private"));
 
+        let retry = json!({"table":"t","operation":"vacuum","applied":true,
+            "error_kind":"stale_plan","error":"private retry error"});
+        let mut retry_log = baseline.clone();
+        retry_log.stdout.push_str(&format!("{retry}\n"));
+        let retried = maintenance_cell_outcome_evidence(&retry_log, std::slice::from_ref(&baseline));
+        assert_eq!(retried["operation_failure"], false);
+        assert_eq!(retried["error_kind_counts"], json!({}));
+        assert_eq!(retried["operations"]["vacuum"]["retry_kind_counts"], json!({"stale_plan":1}));
+        assert_eq!(maintenance_exit_classification(&retry_log, Some(0)), "operation_failure",
+            "a prior lifetime failure must not be hidden by cell-only retries");
+        let mut only_retry = retry_log.clone();
+        only_retry.stdout = format!("{retry}\n");
+        assert_eq!(maintenance_exit_classification(&only_retry, Some(1)), "nonzero_health_exit");
+        let mut unhealthy = only_retry.clone();
+        unhealthy.text.push_str("delta-maintenance stale-plan starvation table=t operation=vacuum consecutive=8 limit=8\n");
+        assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
+        unhealthy.text = "delta-maintenance pending-table status failed: private discovery error\n".to_owned();
+        assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
+        only_retry.stdout = format!("{}\n", json!({"table":"t","operation":"vacuum","applied":true}));
+        assert_eq!(maintenance_exit_classification(&only_retry, Some(0)), "unknown");
+        for suffix in ["{\"operation\":", "{\"operation\":\"vacuum\",\"applied\":true}\n"] {
+            let mut partial = baseline.clone();
+            append_process_record(suffix.as_bytes(), &mut partial.stdout, &mut 0, "partial regression")?;
+            let outcome = maintenance_cell_outcome_evidence(&partial, std::slice::from_ref(&baseline));
+            assert_eq!(outcome["status"], "unavailable");
+            assert!(outcome["operation_failure"].is_null() && outcome["error_kind_counts"].is_null());
+        }
+        assert!(maintenance_cell_outcome_evidence(&baseline, std::slice::from_ref(&baseline))["operation_count"].is_null());
+
         current.stderr = "rotated stderr\n".to_owned();
         let unavailable = maintenance_cell_outcome_evidence(&current, std::slice::from_ref(&baseline));
         assert_eq!(unavailable["status"], "unavailable");
         assert!(unavailable["error_kind_counts"].is_null());
         assert!(unavailable["comment"].as_str().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_semantically_incomplete_success_is_unknown() -> Result<()> {
+        let producer: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-operation-results.json"))?;
+        let success = producer["operation_results"].as_array().context("producer operations")?
+            .iter().find(|record| record["operation"] == "vacuum").context("producer vacuum")?.clone();
+        let baseline = ProcessLog {
+            role: ComponentRole::Maintenance, instance_id: "semantic-test".to_owned(),
+            image: None, image_id: None, source_revision: None, complete: true,
+            raw_log_bytes: 0, raw_log_lines: 0, stdout: String::new(),
+            stderr: String::new(), text: String::new(),
+        };
+        let observe = |record: &Value| {
+            let mut log = baseline.clone();
+            log.stdout = format!("{record}\n");
+            maintenance_cell_outcome_evidence(&log, std::slice::from_ref(&baseline))
+        };
+        assert_eq!(observe(&success)["operation_failure"], false);
+        for field in ["report", "outcome", "interrupted", "error_kind", "error"] {
+            let mut malformed = success.clone();
+            match field {
+                "report" => { malformed.as_object_mut().context("record")?.remove(field); }
+                "outcome" | "interrupted" => {
+                    malformed["report"].as_object_mut().context("report")?.remove(field);
+                }
+                _ => malformed[field] = json!(17),
+            }
+            let evidence = observe(&malformed);
+            assert_eq!(evidence["status"], "unavailable", "{field}");
+            assert!(evidence["operation_failure"].is_null(), "{field}");
+            assert!(evidence["error_kind_counts"].is_null(), "{field}");
+        }
+        let mut omitted_optional = success.clone();
+        for field in ["error", "error_kind"] {
+            omitted_optional.as_object_mut().context("record")?.remove(field);
+        }
+        assert_eq!(observe(&omitted_optional)["operation_failure"], false);
+        omitted_optional.as_object_mut().context("record")?.remove("report");
+        omitted_optional["error_kind"] = json!("stale_plan");
+        assert_eq!(observe(&omitted_optional)["operation_failure"], false);
+        assert_eq!(observe(&omitted_optional)["retry_kind_counts"]["stale_plan"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_nonzero_health_does_not_become_retry_success_after_recovery() -> Result<()> {
+        let producer: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-operation-results.json"))?;
+        let operations = producer["operation_results"].as_array().context("producer operations")?;
+        let mut stale = operations[0].clone();
+        stale.as_object_mut().context("record")?.remove("report");
+        stale["error_kind"] = json!("stale_plan");
+        for limit in [1, 8] {
+            let mut log = ProcessLog {
+                role: ComponentRole::Maintenance, instance_id: "health-test".to_owned(),
+                image: None, image_id: None, source_revision: None, complete: true,
+                raw_log_bytes: 0, raw_log_lines: 0,
+                stdout: format!("{}\n{stale}\n",
+                    json!({"startup":{"max_consecutive_stale_plans":limit}})),
+                stderr: String::new(), text: String::new(),
+            };
+            for record in operations {
+                log.stdout.push_str(&format!("{record}\n"));
+            }
+            assert_eq!(maintenance_exit_classification(&log, Some(0)), "no_operation_failures");
+            assert_eq!(maintenance_exit_classification(&log, Some(1)), "nonzero_health_exit",
+                "limit {limit}: recovery or a benign retry cannot prove terminal health");
+        }
         Ok(())
     }
 
@@ -1507,6 +1727,34 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn maintenance_writer_readback_is_independent_of_collector() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "parquet_writer": {"defaults": {"compression": "zstd"}},
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "parquet_writer": {"defaults": {"compression": "snappy"}}}
+        }))?;
+        let collector: Value = serde_json::from_str(
+            &role_environment(&config, ComponentRole::Collector)?["ARROWCOL_PARQUET_CONFIG"],
+        )?;
+        let maintenance: Value = serde_json::from_str(
+            &role_environment(&config, ComponentRole::Maintenance)?["ARROWCOL_PARQUET_CONFIG"],
+        )?;
+        verify_process_configuration(&config, ComponentRole::Collector, &json!({"parquet_writer": collector}))?;
+        let observed = json!({
+            "startup": {"apply": false, "operations": ["optimize"], "interval_secs": 60},
+            "parquet_writer_overrides": maintenance
+        });
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        let mut mismatch = observed;
+        mismatch["parquet_writer_overrides"]["defaults"]["compression"] = json!("zstd");
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &mismatch).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn real_router_and_collector_control_plane_shapes_preserve_public_tunables() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -1532,6 +1780,35 @@ mod startup_readback_tests {
         ))?;
         verify_process_configuration(&config, ComponentRole::Collector, &collector)?;
         Ok(())
+    }
+
+    #[test]
+    fn collector_pressure_readback_compares_only_typed_durations_semantically() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(json!({"collector":{"pressure":{
+            "registration_ttl":"15m", "heartbeat_interval":"1m 5s", "pressure_interval":"1m",
+            "buffered_bytes_limit":2147483648_u64
+        }}}))?;
+        let pressure = json!({
+            "registration_ttl":"900s", "heartbeat_interval":"65s", "pressure_interval":"60s",
+            "buffered_bytes_limit":2147483648_u64
+        });
+        for (field, invalid) in [
+            ("registration_ttl", json!("899s")),
+            ("heartbeat_interval", json!("unrecognized duration")),
+            ("pressure_interval", json!(60)),
+            ("buffered_bytes_limit", json!("2147483648")),
+        ] {
+            let mut observed = json!({"pressure":pressure.clone()});
+            observed["pressure"][field] = invalid;
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        }
+        let mut missing = pressure.clone();
+        missing.as_object_mut().context("test pressure object")?.remove("registration_ttl");
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({"pressure":missing})).is_err());
+        verify_process_configuration(&config, ComponentRole::Collector, &json!({"pressure":pressure}))
     }
 
     #[test]

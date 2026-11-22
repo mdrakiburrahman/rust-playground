@@ -3,7 +3,7 @@ import { run_tree } from '../../infra/azure/bootstrap.js';
 import * as launch from './launch.js';
 import { cliExitCode, OatCliError } from './launch.js';
 
-type AksSubcommand = 'destroy' | 'deploy' | 'setup';
+type AksSubcommand = 'destroy' | 'deploy' | 'setup' | 'scale' | 'fleet';
 type CommandLoader = (subcommand: AksSubcommand) => Promise<{
   main(args: string[], runner: typeof run_tree): Promise<void>;
 }>;
@@ -11,20 +11,22 @@ type CommandLoader = (subcommand: AksSubcommand) => Promise<{
 export async function main(
   argv: string[],
   runner: typeof run_tree = run_tree,
-  loadCommand: CommandLoader = (subcommand) => import(`./aks-${subcommand}.js`),
+  loadCommand: CommandLoader = (subcommand) => import(subcommand === 'fleet' ? './aks-fleet-cli.js' : `./aks-${subcommand}.js`),
 ): Promise<void> {
   if (argv[0] !== 'aks') return launch.main(argv, runner);
   if (argv[1] === '-h' || argv[1] === '--help') {
-    console.log('Usage: arrowcol-oat aks <destroy|deploy|setup> [options]');
+    console.log('Usage: arrowcol-oat aks <destroy|deploy|setup|scale|fleet> [options]');
     return;
   }
   switch (argv[1]) {
     case 'destroy':
     case 'deploy':
     case 'setup':
+    case 'scale':
+    case 'fleet':
       return (await loadCommand(argv[1])).main(argv.slice(2), runner);
     default:
-      throw new OatCliError('Usage: arrowcol-oat aks <destroy|deploy|setup> [options]');
+      throw new OatCliError('Usage: arrowcol-oat aks <destroy|deploy|setup|scale|fleet> [options]');
   }
 }
 

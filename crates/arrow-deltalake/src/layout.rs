@@ -13,6 +13,8 @@ use parquet::basic::Compression;
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
+#[cfg(feature = "delta")]
+use sha2::Digest;
 use std::sync::Arc;
 
 /// Configurable controls applied at the actual Parquet file boundary.
@@ -46,9 +48,25 @@ impl LayoutPolicy {
     /// # Errors
     /// Returns property type or platform-size conversion errors.
     pub fn from_properties(props: &arrowcol_props::ResolvedProps) -> Result<Self> {
+        let mut sort_columns = props.string_list("arrowcol.layout.sortColumns")?.to_vec();
+        if sort_columns.len() == 1 && sort_columns[0].is_empty() {
+            sort_columns.clear();
+        }
+        ensure!(
+            sort_columns.iter().all(|column| !column.is_empty()),
+            "arrowcol.layout.sortColumns cannot contain empty items"
+        );
+        let mut bloom_columns = props.string_list("arrowcol.layout.bloomColumns")?.to_vec();
+        if bloom_columns.len() == 1 && bloom_columns[0].is_empty() {
+            bloom_columns.clear();
+        }
+        ensure!(
+            bloom_columns.iter().all(|column| !column.is_empty()),
+            "arrowcol.layout.bloomColumns cannot contain empty items"
+        );
         let policy = Self {
-            sort_columns: props.string_list("arrowcol.layout.sortColumns")?.to_vec(),
-            bloom_columns: props.string_list("arrowcol.layout.bloomColumns")?.to_vec(),
+            sort_columns,
+            bloom_columns,
             max_rows: usize::try_from(props.unsigned("arrowcol.layout.maxRows")?)?,
             max_input_bytes: usize::try_from(props.unsigned("arrowcol.layout.maxInputSize")?)?,
             row_group_rows: usize::try_from(props.unsigned("arrowcol.layout.rowGroupRows")?)?,
@@ -69,6 +87,15 @@ impl LayoutPolicy {
             "row_group_rows": self.row_group_rows,
             "page_rows": self.page_rows,
         })
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn fingerprint(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(&self.config_json(None))?;
+        Ok(sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
     }
 
     /// Validate names and nonzero resource limits against the supplied schema.
@@ -102,7 +129,6 @@ impl LayoutPolicy {
             self.row_group_rows > 0 && self.page_rows > 0,
             "row group and page limits must be positive"
         );
-        ensure!(!self.sort_columns.is_empty(), "at least one sort column is required");
         Ok(())
     }
 
@@ -120,23 +146,28 @@ impl LayoutPolicy {
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_offset_index_disabled(false);
         let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
-        let sorting = self
-            .sort_columns
-            .iter()
-            .map(|name| {
-                let index = descriptor
-                    .columns()
+        let sorting = if self.sort_columns.is_empty() {
+            None
+        } else {
+            Some(
+                self.sort_columns
                     .iter()
-                    .position(|column| column.path().parts() == [name.as_str()])
-                    .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
-                Ok(SortingColumn {
-                    column_idx: i32::try_from(index)?,
-                    descending: false,
-                    nulls_first: false,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        builder = builder.set_sorting_columns(Some(sorting));
+                    .map(|name| {
+                        let index = descriptor
+                            .columns()
+                            .iter()
+                            .position(|column| column.path().parts() == [name.as_str()])
+                            .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
+                        Ok(SortingColumn {
+                            column_idx: i32::try_from(index)?,
+                            descending: false,
+                            nulls_first: false,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
+        builder = builder.set_sorting_columns(sorting);
         for column in &self.bloom_columns {
             builder = builder
                 .set_column_bloom_filter_enabled(ColumnPath::from(column.as_str()), true)
@@ -202,6 +233,17 @@ impl FileSortBuffer {
         Ok(true)
     }
 
+    #[cfg(any(feature = "delta", test))]
+    pub(crate) fn at_budget(&self) -> bool {
+        self.rows >= self.policy.max_rows || self.input_bytes >= self.policy.max_input_bytes
+    }
+
+    /// A rejected batch cannot make this buffer reusable as full.
+    #[cfg(any(feature = "delta", test))]
+    pub(crate) fn full_for_next(&self, _batch: &RecordBatch) -> bool {
+        self.at_budget()
+    }
+
     #[must_use]
     pub const fn rows(&self) -> usize {
         self.rows
@@ -214,6 +256,9 @@ impl FileSortBuffer {
     pub fn finish(self) -> Result<RecordBatch> {
         let batch = concat_batches(&self.schema, &self.batches)?;
         if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        if self.policy.sort_columns.is_empty() {
             return Ok(batch);
         }
         let columns = self
@@ -246,6 +291,7 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
 
@@ -281,6 +327,55 @@ mod tests {
     }
 
     #[test]
+    fn empty_sort_policy_keeps_input_order_without_sorting_metadata() -> Result<()> {
+        let input = batch(vec!["z", "a"], vec![2, 1])?;
+        let policy = LayoutPolicy {
+            sort_columns: Vec::new(),
+            bloom_columns: Vec::new(),
+            ..LayoutPolicy::default()
+        };
+        let properties = policy.writer_properties(&input.schema())?;
+        assert!(properties.sorting_columns().is_none());
+
+        let mut buffer = FileSortBuffer::new(input.schema(), policy)?;
+        assert!(buffer.try_push(&input)?);
+        let output = buffer.finish()?;
+        assert_eq!(output.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(output.column(1).as_ref(), input.column(1).as_ref());
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("empty-sort.parquet");
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&path)?, input.schema(), Some(properties))?;
+        writer.write(&output)?;
+        writer.close()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+        assert!(reader.metadata().row_group(0).sorting_columns().is_none());
+        let batches = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let readback = concat_batches(&input.schema(), &batches)?;
+        assert_eq!(readback.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(readback.column(1).as_ref(), input.column(1).as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_campaign_caps_and_empty_layout_lists_from_properties() -> Result<()> {
+        let process = std::collections::BTreeMap::from([
+            ("arrowcol.layout.sortColumns".to_owned(), String::new()),
+            ("arrowcol.layout.bloomColumns".to_owned(), String::new()),
+            ("arrowcol.layout.maxRows".to_owned(), "1000000".to_owned()),
+            ("arrowcol.layout.maxInputSize".to_owned(), "1 GiB".to_owned()),
+        ]);
+        let properties = arrowcol_props::resolve(&std::collections::BTreeMap::new(), &process)?;
+        let policy = LayoutPolicy::from_properties(&properties)?;
+        assert!(policy.sort_columns.is_empty());
+        assert!(policy.bloom_columns.is_empty());
+        assert_eq!(policy.max_rows, 1_000_000);
+        assert_eq!(policy.max_input_bytes, 1024 * 1024 * 1024);
+        policy.validate(&batch(vec!["a"], vec![1])?.schema())?;
+        Ok(())
+    }
+
+    #[test]
     fn budget_backpressures_without_losing_or_retaining_rejected_rows() -> Result<()> {
         let a = batch(vec!["z", "a"], vec![2, 1])?;
         let policy = LayoutPolicy {
@@ -304,11 +399,53 @@ mod tests {
     }
 
     #[test]
+    fn rejected_batches_do_not_prove_reusable_saturation() -> Result<()> {
+        let rows_before_rejection = batch(vec!["x"; 6], (0..6).collect())?;
+        let row_rejection = batch(vec!["y"; 5], (0..5).collect())?;
+        let mut row_buffer = FileSortBuffer::new(
+            rows_before_rejection.schema(),
+            LayoutPolicy {
+                max_rows: 10,
+                max_input_bytes: 1024 * 1024,
+                ..LayoutPolicy::default()
+            },
+        )?;
+        assert!(row_buffer.try_push(&rows_before_rejection)?);
+        assert!(!row_buffer.try_push(&row_rejection)?);
+        let row_marked_full = row_buffer.full_for_next(&row_rejection);
+
+        let large_value = "x".repeat(128);
+        let bytes_before_rejection = batch(vec![large_value.as_str(); 2], vec![0, 1])?;
+        let byte_rejection = batch(vec!["y"; 2], vec![2, 3])?;
+        let large_bytes = bytes_before_rejection.get_array_memory_size();
+        let next_bytes = byte_rejection.get_array_memory_size();
+        assert!(large_bytes > next_bytes);
+        let max_input_bytes = large_bytes + next_bytes - 1;
+        let mut byte_buffer = FileSortBuffer::new(
+            bytes_before_rejection.schema(),
+            LayoutPolicy {
+                max_rows: 100,
+                max_input_bytes,
+                ..LayoutPolicy::default()
+            },
+        )?;
+        assert!(byte_buffer.try_push(&bytes_before_rejection)?);
+        assert!(!byte_buffer.try_push(&byte_rejection)?);
+        let byte_marked_full = byte_buffer.full_for_next(&byte_rejection);
+        assert!(
+            !row_marked_full && !byte_marked_full,
+            "row_marked_full={row_marked_full}, byte_marked_full={byte_marked_full}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn writes_real_row_groups_statistics_page_indexes_and_bloom_filters() -> Result<()> {
         let a = batch(vec!["z", "a", "z", "a"], vec![4, 2, 3, 1])?;
         let policy = LayoutPolicy {
             row_group_rows: 2,
             page_rows: 1,
+            bloom_columns: vec!["customer_id".into()],
             ..LayoutPolicy::default()
         };
         let properties = policy.writer_properties(&a.schema())?;

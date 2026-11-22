@@ -1,0 +1,45 @@
+{
+  "offline_protocol_fixture_only": true,
+  "request": {
+    "schema_version": 1,
+    "kind": "command_request",
+    "request_id": 3,
+    "authority": {
+      "campaign_id": "00000000-0000-0000-0000-000000000001",
+      "cell_run_id": "00000000-0000-0000-0000-000000000004",
+      "owner_id": "00000000-0000-0000-0000-000000000002",
+      "fencing_token": 7,
+      "namespace": "fixture-00000000000000000000000000000004",
+      "server": "https://offline.invalid",
+      "context": "reviewed-offline-context"
+    },
+    "original_deadline_unix_ms": 1900000000000,
+    "remaining_timeout_ms": 30000,
+    "executable": "kubectl",
+    "argv": [
+      "--context",
+      "reviewed-offline-context",
+      "--server",
+      "https://offline.invalid",
+      "create",
+      "-f",
+      "-",
+      "-o",
+      "json"
+    ],
+    "current_dir": null,
+    "stdin": "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"fixture-00000000000000000000000000000004\"}}",
+    "stdin_sha256": "a8dd90125ae0aa4d85067fab200e590698b1c390d6528b6fa63f7d989336b67d",
+    "request_sha256": "37bbf4ac58a96f7810868236a675b47988e59fcd8b985e933a076716bfdec0e9"
+  },
+  "response": {
+    "schema_version": 1,
+    "kind": "command_response",
+    "request_id": 3,
+    "request_sha256": "37bbf4ac58a96f7810868236a675b47988e59fcd8b985e933a076716bfdec0e9",
+    "exit_code": 0,
+    "stdout": "{\"offline_protocol_fixture_only\":true}",
+    "stderr": "",
+    "truncated": false
+  }
+}

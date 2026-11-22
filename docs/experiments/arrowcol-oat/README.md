@@ -1,16 +1,24 @@
 # ArrowCol OAT benchmark results
 
-| File                                              | Purpose                                                                                                                                  |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html`                                      | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping. |
-| `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                         |
-| `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                        |
-| `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                    |
-| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                |
-| [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |
-| [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                   |
+| File                                              | Purpose                                                                                                                                                                  |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `index.html`                                      | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping.                                 |
+| `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                                                         |
+| `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                                                        |
+| `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                                                    |
+| `oat-config.aks.max-rows.json`                    | Exploratory one-collector AKS client sweep (1..128); replace image placeholders and use stamp-generated runtime/bootstrap inputs before launch.                          |
+| `oat-config.aks.full-fleet.json`                  | Full-fleet sizing template: one explicit collector pool and one node-pinned DMV client per Ready client node; see [fleet operation](RUNTIME.md#heterogeneous-aks-fleet). |
+| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                                                |
+| `throughput-pipeline.drawio` / `.png`             | Single-writer throughput campaign dataflow and observability pipeline.                                                                                                   |
+| [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.                                              |
+| [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                                                   |
+| [Throughput campaign](THROUGHPUT-CAMPAIGN.md)     | C1-C8 manifests, stability and stop gates, campaign verdict policy, and SVG result pictures.                                                                             |
 
 The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
+
+## Capacity qualification
+
+PR #125's final qualification supports only **16 workers x 1 stream**. It does not qualify 8x16 or extreme 16x16; treat both as unproven sweep candidates, not capacity recommendations.
 
 ## Parquet contract
 
@@ -100,6 +108,21 @@ Use `--no-viewer` with local benchmark runs to exit after cleanup without starti
 Run `npx --no-install arrowcol-oat --help` for the supported options. Unknown options fail before startup with exit code 2. Failed or rejected runs exit without opening the viewer; use `--viewer-only` to inspect any previously published results, including partial failure evidence. If the local ownership marker cannot be written (for example, disk full), the CLI cancels the accepted run and waits for cleanup before reporting the write failure. In local mode, SIGINT, SIGTERM and SIGHUP request cancellation and wait for the local Compose cleanup; a second signal forces a fast exit. If only the CLI process is killed, the next local run checks its ownership marker and asks the still-running OAT server to cancel and clean up.
 
 If the OAT server is no longer running, remove one abandoned local cell with `npx --no-install arrowcol-oat --cleanup-local <cell-run-uuid> --config <config-path>`. Get the cell UUID from its directory under `platform.compose_state_root`; relative state roots resolve from the repository root, matching the owned Rust server, even when invoking the CLI from another directory. This command is local-only and removes only that cell's Compose resources and state; it does not operate on AKS.
+
+A failed AKS benchmark remains failed even when the owned runner confirms cleanup
+for the same run and submitted configuration. Without that confirmation the launcher
+preserves the owned server and blocks another run; it does not attempt local cancellation.
+Only receipts bound to a local submission are automatically reconciled. For an
+unresolved AKS or unverified receipt, retain the original receipt and exact run
+identity for operator review. Do not edit the receipt or reroute around it.
+`--recover-failed-aks <invocation-id> <approved-evidence-path>` is an offline
+disposition for one separately approved, single-cell failure before load. It
+requires the exact original receipt, independently verified current resource
+absence after fencing the old writers, and an exact evidence digest pinned in
+the reviewed launcher. Replay and admission also require the original Linux
+boot and namespaces, no original listener, and both original processes exited.
+The exact unreaped Rust server is accepted only with no other tasks. The command
+never stops processes, deletes resources, changes the receipt, or ranks the run.
 
 Old Compose projects named with only the first eight UUID characters are ambiguous. Cleanup refuses them without deleting resources or state; inspect ownership and clean up those legacy projects manually.
 
