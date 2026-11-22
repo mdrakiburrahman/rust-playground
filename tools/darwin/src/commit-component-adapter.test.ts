@@ -136,6 +136,10 @@ test("refuses failed, unsettled or mismatched executions and incomplete results"
   await assert.rejects(evaluateCommitComponent(incomplete), /timed physical bytes/);
   const missing = fakeHost(root, async () => {});
   await assert.rejects(evaluateCommitComponent(missing), /ENOENT/);
+  const oversized = fakeHost(root, async ({ resultPath }) => {
+    await writeFile(resultPath, "x".repeat(64 * 1024 + 1), { flag: "wx" });
+  });
+  await assert.rejects(evaluateCommitComponent(oversized), /bounded regular file/);
 });
 
 test("rejects foreign fixture pins and symlink results", async (t) => {

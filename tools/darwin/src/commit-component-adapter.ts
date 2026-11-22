@@ -149,13 +149,19 @@ async function readResult(file: string): Promise<unknown> {
     if (!before.isFile() || before.nlink !== 1 || before.size === 0 || before.size > MAX_RESULT_BYTES) {
       throw new Error("component result must be a bounded regular file");
     }
-    const bytes = await handle.readFile();
+    const bytes = Buffer.alloc(before.size + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
     const after = await handle.stat();
-    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || bytes.length !== before.size) {
+    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || length !== before.size) {
       throw new Error("component result changed during reading");
     }
     try {
-      return JSON.parse(bytes.toString("utf8")) as unknown;
+      return JSON.parse(bytes.toString("utf8", 0, length)) as unknown;
     } catch {
       throw new Error("component result is not valid JSON");
     }
