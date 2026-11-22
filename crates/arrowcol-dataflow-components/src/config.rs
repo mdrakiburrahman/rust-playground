@@ -82,6 +82,53 @@ mod override_tests {
         Ok(())
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn large_byte_capacities_round_trip_through_oat_and_runtime_validation() -> Result<(), String> {
+        let values = serde_json::json!({
+            "global_capacity":{"bytes":6_000_000_000_u64},
+            "per_table_capacity":{"bytes":5_000_000_000_u64}
+        });
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"batching":values}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        let config = merge_config(
+            &FileBatchConfig::default(),
+            &environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"],
+            None,
+        )?;
+        config.validate()?;
+        assert_eq!(config.global_capacity.bytes, 6_000_000_000);
+        assert_eq!(config.per_table_capacity.bytes, 5_000_000_000);
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"batching":{"global_capacity":{"bytes":invalid}}}
+                }))
+                .is_err()
+            );
+        }
+        let oversized = format!(
+            r#"{{"global_capacity":{{"bytes":{}}}}}"#,
+            arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1
+        );
+        assert!(
+            merge_config(&FileBatchConfig::default(), &oversized, None)?
+                .validate()
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn channels_reject_capacity_that_would_panic_at_startup() {
         let limits = RuntimeLimitsConfig {
@@ -979,7 +1026,7 @@ impl DeltaExporterConfig {
 #[serde(deny_unknown_fields)]
 pub struct BatchCapacity {
     /// Logical Arrow bytes.
-    pub bytes: u32,
+    pub bytes: u64,
     /// Rows.
     pub rows: u32,
     /// Batches.
@@ -1045,20 +1092,19 @@ impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         let global = self.global_capacity;
         let table = self.per_table_capacity;
-        if [
-            global.bytes,
-            global.rows,
-            global.batches,
-            table.bytes,
-            table.rows,
-            table.batches,
-        ]
-        .contains(&0)
+        if [global.rows, global.batches, table.rows, table.batches].contains(&0)
+            || global.bytes == 0
+            || table.bytes == 0
+            || global.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || table.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || [global.rows, global.batches, table.rows, table.batches]
+                .into_iter()
+                .any(|value| u64::from(value) > tokio::sync::Semaphore::MAX_PERMITS as u64)
             || table.bytes > global.bytes
             || table.rows > global.rows
             || table.batches > global.batches
             || self.max_arrow_memory_per_flush == 0
-            || self.max_arrow_memory_per_flush > u64::from(table.bytes)
+            || self.max_arrow_memory_per_flush > table.bytes
             || self.max_rows_per_flush == 0
             || self.max_rows_per_flush > u64::from(table.rows)
             || self.max_batches_per_flush == 0

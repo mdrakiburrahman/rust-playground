@@ -54,6 +54,7 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 
 | Setting | Contract |
 | --- | --- |
+| `collector.batching.global_capacity.bytes` / `per_table_capacity.bytes` | Exact logical-byte pools may exceed 4 GiB, up to the smaller of Tokio's target-specific semaphore limit and 9,007,199,254,740,991 (the largest exact JSON integer). Each individual batch still cannot reserve more than `u32::MAX` bytes; reservations remain held through the durable receipt. |
 | `collector.batching.pipeline_depth` | Integer `1..=64`, default `1`. Bounds in-flight preparation/publication groups per logical table through durable receipts. Values above `1` require `coalesce_publications: true`. Projected unchanged inside `ARROWCOL_COLLECTOR_BATCHING_CONFIG`; exporter startup readback reports the resolved value. |
 | `collector.batching.max_concurrent_flushes` | Existing exporter-backend semaphore, shared across cores using the same root. Bounds active file groups including their commit wait; independent of the per-table pipeline depth. |
 | `collector.commit.max_files_per_commit` | Existing maximum add actions per version (default `64`). A coalesced group remains indivisible; separate groups may share a version only when their identities do not overlap and their combined file count fits. |

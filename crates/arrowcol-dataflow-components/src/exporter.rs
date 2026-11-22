@@ -77,7 +77,7 @@ impl GenericDeltaExporter {
             base_path: config.base_path.clone(),
             options,
             batching: config.batching.clone(),
-            capacity: Capacity::new(config.batching.global_capacity),
+            capacity: Capacity::new(config.batching.global_capacity)?,
             flush_slots: Arc::new(Semaphore::new(config.batching.max_concurrent_flushes)),
             draining: std::sync::atomic::AtomicBool::new(false),
             backlog_capacity,
@@ -135,7 +135,7 @@ impl GenericDeltaExporter {
                 )?,
                 leases: LeaseBinder::new(store, LEASE_VIEW_TTL),
                 options,
-                capacity: Capacity::new(batching.global_capacity),
+                capacity: Capacity::new(batching.global_capacity)?,
                 flush_slots: Arc::new(Semaphore::new(batching.max_concurrent_flushes)),
                 batching,
                 backlog_capacity,
@@ -269,7 +269,7 @@ impl DeltaBackend {
         let owner = Arc::new(TableOwner {
             sender,
             drain,
-            capacity: Capacity::new(self.batching.per_table_capacity),
+            capacity: Capacity::new(self.batching.per_table_capacity).map_err(ExportFailure::Permanent)?,
             fence,
             state: Mutex::new(OwnerState { evidence, pending: 0 }),
             retired: Arc::clone(&retired),
@@ -511,19 +511,27 @@ struct Capacity {
 }
 
 impl Capacity {
-    fn new(limits: BatchCapacity) -> Self {
-        Self {
+    fn new(limits: BatchCapacity) -> Result<Self, String> {
+        if limits.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || [limits.rows, limits.batches]
+                .into_iter()
+                .any(|value| u64::from(value) > Semaphore::MAX_PERMITS as u64)
+        {
+            return Err("Arrow file buffering capacity exceeds the semaphore limit".to_owned());
+        }
+        let bytes = usize::try_from(limits.bytes).map_err(|error| error.to_string())?;
+        Ok(Self {
             limits,
-            bytes: Arc::new(Semaphore::new(limits.bytes as usize)),
+            bytes: Arc::new(Semaphore::new(bytes)),
             rows: Arc::new(Semaphore::new(limits.rows as usize)),
             batches: Arc::new(Semaphore::new(limits.batches as usize)),
-        }
+        })
     }
 
     async fn acquire(&self, rows: u64, bytes: u64) -> Result<Vec<OwnedSemaphorePermit>, ExportFailure> {
         let rows = u32::try_from(rows).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
         let bytes = u32::try_from(bytes).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-        if rows > self.limits.rows || bytes > self.limits.bytes {
+        if rows > self.limits.rows || u64::from(bytes) > self.limits.bytes {
             return Err(ExportFailure::Transient(
                 "Arrow file buffering capacity exhausted: batch exceeds configured capacity".to_owned(),
             ));
@@ -3415,11 +3423,14 @@ mod tests {
     /// Guarantees: Work waits without a NACK, and cancellation refunds partial reservations.
     #[tokio::test]
     async fn temporary_capacity_waits_and_cancellation_refunds_reservations() {
-        let capacity = Arc::new(Capacity::new(BatchCapacity {
-            bytes: 16,
-            rows: 2,
-            batches: 2,
-        }));
+        let capacity = Arc::new(
+            Capacity::new(BatchCapacity {
+                bytes: 16,
+                rows: 2,
+                batches: 2,
+            })
+            .expect("valid capacity"),
+        );
         let held = capacity.acquire(1, 8).await.expect("first reservation");
         let mut queued = Box::pin(capacity.acquire(2, 8));
         assert!(queued.as_mut().now_or_never().is_none());
@@ -3439,6 +3450,47 @@ mod tests {
         assert_eq!(capacity.bytes.available_permits(), 16);
         assert_eq!(capacity.rows.available_permits(), 2);
         assert_eq!(capacity.batches.available_permits(), 2);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    async fn large_byte_pool_keeps_exact_reservations_and_cancellation() {
+        let capacity = Capacity::new(BatchCapacity {
+            bytes: 6_000_000_000,
+            rows: 2,
+            batches: 2,
+        })
+        .expect("valid capacity");
+        let first = capacity.acquire(1, 3_000_000_000).await.expect("first reservation");
+        let mut queued = Box::pin(capacity.acquire(2, 3_000_000_000));
+        assert!(queued.as_mut().now_or_never().is_none());
+        assert_eq!(capacity.bytes.available_permits(), 0);
+        drop(queued);
+        assert_eq!(capacity.bytes.available_permits(), 3_000_000_000);
+        let second = capacity.acquire(1, 3_000_000_000).await.expect("second reservation");
+        assert_eq!(capacity.bytes.available_permits(), 0);
+        assert!(matches!(
+            capacity.acquire(1, u64::from(u32::MAX) + 1).await,
+            Err(ExportFailure::Permanent(_))
+        ));
+        assert_eq!(capacity.bytes.available_permits(), 0);
+        drop(first);
+        drop(second);
+        assert_eq!(capacity.bytes.available_permits(), 6_000_000_000);
+        assert_eq!(capacity.rows.available_permits(), 2);
+        assert_eq!(capacity.batches.available_permits(), 2);
+
+        let smaller = Capacity::new(BatchCapacity {
+            bytes: 2_000_000_000,
+            rows: 2,
+            batches: 2,
+        })
+        .expect("valid capacity");
+        assert!(matches!(
+            smaller.acquire(1, 3_000_000_000).await,
+            Err(ExportFailure::Transient(_))
+        ));
+        assert_eq!(smaller.bytes.available_permits(), 2_000_000_000);
     }
 
     /// Scenario: One scheduled group exceeds the commit worker's pending-file
