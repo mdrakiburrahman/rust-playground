@@ -193,6 +193,7 @@ fn rows_and_bytes(root: &Path) -> Result<(Vec<Row>, u64, usize)> {
             let ids = ids.as_any().downcast_ref::<Int64Array>().context("id array")?;
             let names = names.as_any().downcast_ref::<StringArray>().context("name array")?;
             for row in 0..batch.num_rows() {
+                ensure!(ids.is_valid(row), "required id is null");
                 rows.push((
                     ids.value(row),
                     names.is_valid(row).then(|| names.value(row).to_owned()),
