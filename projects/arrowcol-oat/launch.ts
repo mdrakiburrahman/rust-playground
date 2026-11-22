@@ -426,9 +426,8 @@ export class OatLauncherDeadline {
         !identity || !isLocalRunRuntimeIdentity(identity) ||
         identity.compose_project !== localProjectForRun(config, receipt.run_id) ||
         identity.compose_state_root !== localStateRoot(isRecord(config) ? config : {}) ||
-        identity.owner_pid <= 0 ||
         receipt.server_pid === null || receipt.server_start_ticks === null || receipt.server_executable === null) {
-      throw new Error('Local runtime identity does not match the accepted local run');
+      throw new Error('Local runtime identity does not match the accepted local run and submitted Compose config');
     }
     if (receipt.local_runtime_identity && !isDeepStrictEqual(receipt.local_runtime_identity, identity)) {
       throw new Error('Local runtime identity changed for the accepted run');
@@ -544,10 +543,15 @@ function hasConfirmedAksFailure(status: OatRunStatus | undefined): boolean {
     Number.isSafeInteger(status.finished_at_unix_ms) && status.finished_at_unix_ms > 0;
 }
 
+function isDockerEngineId(value: unknown): value is string {
+  return typeof value === 'string' &&
+    (/^[a-f0-9]{12,128}$/i.test(value) || /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value));
+}
+
 function isLocalRunRuntimeIdentity(value: unknown): value is LocalRunRuntimeIdentity {
   return isRecord(value) &&
     Object.keys(value).sort().join(',') === 'compose_project,compose_state_root,docker_engine_id,owner_pid,owner_start_ticks' &&
-    typeof value.docker_engine_id === 'string' && /^[a-f0-9]{12,128}$/i.test(value.docker_engine_id) &&
+    isDockerEngineId(value.docker_engine_id) &&
     typeof value.compose_project === 'string' && /^[a-z0-9][a-z0-9_-]{0,62}$/.test(value.compose_project) &&
     typeof value.compose_state_root === 'string' && isAbsolute(value.compose_state_root) &&
     !/[\r\n\0]/.test(value.compose_state_root) &&
@@ -1322,7 +1326,7 @@ function localProjectForRun(config: unknown, runId: string): string {
 
 function readDockerEngineId(docker: DockerCommand = runDocker): string {
   const engineId = docker(['info', '--format', '{{.ID}}']).trim();
-  if (!/^[a-f0-9]{12,128}$/i.test(engineId)) throw new Error('Docker did not return a valid engine ID');
+  if (!isDockerEngineId(engineId)) throw new Error('Docker did not return a valid engine ID');
   return engineId;
 }
 
@@ -1575,7 +1579,7 @@ async function assertLocalRunStateAbsent(
 function isLocalDeadRunCleanupDisposition(value: unknown): value is LocalDeadRunCleanupDisposition {
   if (!isRecord(value) ||
       Object.keys(value).sort().join(',') !==
-        'cleanup_only,compose_project,compose_state_root,docker_engine_id,deadline_reset,evidence,invocation_id,kind,metric_usable,original_deadline,original_error,original_receipt_name,original_receipt_sha256,original_run_state,owner_pid,owner_start_ticks,outcome,recorded_at_unix_ms,run_id,run_state_store,schema_version,service_executable,service_pid,service_start_ticks,service_url' ||
+        'cleanup_only,compose_project,compose_state_root,deadline_reset,docker_engine_id,evidence,invocation_id,kind,metric_usable,original_deadline,original_error,original_receipt_name,original_receipt_sha256,original_run_state,outcome,owner_pid,owner_start_ticks,recorded_at_unix_ms,run_id,run_state_store,schema_version,service_executable,service_pid,service_start_ticks,service_url' ||
       value.schema_version !== 1 || value.kind !== 'dead_local_controller_cleanup_only' ||
       typeof value.invocation_id !== 'string' || typeof value.run_id !== 'string' ||
       typeof value.original_receipt_name !== 'string' || typeof value.original_receipt_sha256 !== 'string' ||
@@ -1606,30 +1610,33 @@ function validateLocalDeadRunDisposition(
   dispositionName: string,
 ): asserts disposition is LocalDeadRunCleanupDisposition {
   const identity = receipt.local_runtime_identity;
-  if (!isLocalDeadRunCleanupDisposition(disposition) || !identity || !receipt.run_id ||
-      receiptName !== `${receipt.invocation_id}.json` ||
+  if (!isLocalDeadRunCleanupDisposition(disposition)) {
+    throw new Error(`Invalid local cleanup-only disposition schema ${dispositionName}`);
+  }
+  if (!identity || !receipt.run_id) throw new Error(`Local cleanup-only disposition has no receipt identity ${dispositionName}`);
+  const mismatches: string[] = [];
+  if (receiptName !== `${receipt.invocation_id}.json` ||
       dispositionName !== receiptName + localDeadCleanupDispositionSuffix ||
       disposition.invocation_id !== receipt.invocation_id || disposition.run_id !== receipt.run_id ||
       disposition.original_receipt_name !== receiptName ||
-      disposition.original_receipt_sha256 !== createHash('sha256').update(receiptBytes).digest('hex') ||
-      disposition.original_run_state !== (receipt.run_state ?? 'unknown') ||
+      disposition.original_receipt_sha256 !== createHash('sha256').update(receiptBytes).digest('hex')) mismatches.push('receipt-link');
+  if (disposition.original_run_state !== (receipt.run_state ?? 'unknown') ||
       disposition.original_error !== receipt.error ||
       !isDeepStrictEqual(disposition.original_deadline, {
         deadline_at_unix_ms: receipt.deadline_at_unix_ms,
         deadline_seconds: receipt.deadline_seconds,
         overrun: receipt.overrun,
         overrun_at_unix_ms: receipt.overrun_at_unix_ms,
-      }) ||
-      disposition.service_pid !== receipt.server_pid || disposition.service_start_ticks !== receipt.server_start_ticks ||
+      })) mismatches.push('original-outcome');
+  if (disposition.service_pid !== receipt.server_pid || disposition.service_start_ticks !== receipt.server_start_ticks ||
       disposition.service_executable !== receipt.server_executable || disposition.service_url !== receipt.server_url ||
       disposition.owner_pid !== identity.owner_pid || disposition.owner_start_ticks !== identity.owner_start_ticks ||
       disposition.docker_engine_id !== identity.docker_engine_id ||
       disposition.compose_project !== identity.compose_project ||
-      disposition.compose_state_root !== identity.compose_state_root ||
-      receipt.cleanup_state !== 'unsettled' || receipt.terminal_observation !== null ||
-      receipt.error === null || submittedPlatform(receipt.submitted_config_body) !== 'local') {
-    throw new Error(`Invalid or conflicting local cleanup-only disposition ${dispositionName}`);
-  }
+      disposition.compose_state_root !== identity.compose_state_root) mismatches.push('runtime-identity');
+  if (receipt.cleanup_state !== 'unsettled' || receipt.terminal_observation !== null ||
+      receipt.error === null || submittedPlatform(receipt.submitted_config_body) !== 'local') mismatches.push('receipt-state');
+  if (mismatches.length) throw new Error(`Conflicting local cleanup-only disposition ${dispositionName}: ${mismatches.join(', ')}`);
 }
 
 async function writeExclusiveJson(path: string, value: unknown): Promise<void> {

@@ -2108,9 +2108,9 @@ test('dead local disposition verifies absence after a real stopped disposable wo
   const docker = (args: string[]) => execFileSync('docker', args, { encoding: 'utf8', timeout: 30_000 });
   try {
     docker(['info', '--format', '{{.ID}}']);
-    docker(['image', 'inspect', 'busybox:latest']);
+    docker(['image', 'inspect', 'alpine:3.20']);
   } catch {
-    t.skip('Docker engine or cached busybox image is unavailable');
+    t.skip('Docker engine or cached alpine image is unavailable');
     return;
   }
   const probe = createServer();
@@ -2166,7 +2166,7 @@ test('dead local disposition verifies absence after a real stopped disposable wo
     containerId = docker([
       'run', '--detach', '--name', containerName, '--network', 'none',
       '--label', `com.docker.compose.project=${fixture.project}`,
-      'busybox:latest', 'sleep', '300',
+      'alpine:3.20', 'sleep', '300',
     ]).trim();
     assert.ok(containerId);
     docker(['stop', containerId]);
@@ -2219,7 +2219,8 @@ test('local recovery and cleanup resolve relative state beside the owned server,
   process.chdir(callerDirectory);
   try {
     const runner = async () => { throw new Error('startup must remain blocked'); };
-    await assert.rejects(main(['--config', configPath], runner, undefined, path.join(directory, 'receipts')), /Interrupted OAT server is gone/);
+    await assert.rejects(main(['--config', configPath], runner, undefined, path.join(directory, 'receipts'),
+      undefined, undefined, undefined, { docker: () => 'a'.repeat(64) }), /Interrupted OAT server is gone/);
     await main(['--config', configPath, '--cleanup-local', runId], runner,
       (value, id) => cleanupLocalComposeProjects(value, id, () => ''));
     await assert.rejects(stat(cellState), { code: 'ENOENT' });
@@ -2420,7 +2421,8 @@ server.listen(Number(process.argv[2]), '127.0.0.1');
       submitted_config_body: '{}', submitted_config_sha256: '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', source_config_sha256: 'b'.repeat(64),
     }));
     const runner = async () => { throw new Error('startup must remain blocked'); };
-    await assert.rejects(main(['--config', configPath], runner, undefined, path.join(directory, 'receipts')), /synthetic Compose cleanup failure/);
+    await assert.rejects(main(['--config', configPath], runner, undefined, path.join(directory, 'receipts'),
+      undefined, undefined, undefined, { docker: () => 'a'.repeat(64) }), /synthetic Compose cleanup failure/);
     assert.ok((await stat(markerPath)).isFile());
     assert.ok((await stat(cellState)).isDirectory());
     assert.equal((await fetch(new URL('/runs/123e4567-e89b-42d3-a456-426614174000', serverUrl))).ok, true);
