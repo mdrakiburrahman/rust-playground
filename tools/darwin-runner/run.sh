@@ -94,7 +94,7 @@ build_images() {
 
 make_clean_checkout() {
   local destination commit
-  destination=$(mktemp -d "${TMPDIR:-/tmp}/darwin-runner-workspace.XXXXXX")
+  destination=$(mktemp -d "$repo/.darwin-runner-workspace.XXXXXX")
   commit=$(git -C "$repo" rev-parse --verify HEAD)
   if ! git clone --quiet --no-hardlinks --no-local --no-checkout "$repo" "$destination" \
       || ! git -C "$destination" checkout --quiet --detach "$commit" \
@@ -111,13 +111,21 @@ make_clean_checkout() {
     fi
   done
   if find "$destination" \( -type f -o -type l \) \( \
-      -name '.env' -o -name '.env.*' -o -name '.envrc' -o -name '*.age' \
-      -o -name '*.pem' -o -name '*.key' -o -name '.netrc' -o -name '.npmrc' \
-      -o -name '.git-credentials' -o -name '.gitconfig' \) -print -quit | grep -q .; then
+      -name '.env' -o -name '.envrc' -o -name '*.age' -o -name '*.pem' -o -name '*.key' \
+      -o -name '.netrc' -o -name '.git-credentials' -o -name '.gitconfig' \
+      -o \( -name '.env.*' ! -name '.env.example' ! -name '.env.sample' ! -name '.env.template' \) \) \
+      -print -quit | grep -q .; then
     echo "credential-like file found in clean checkout" >&2
     rm -rf -- "$destination"
     return 1
   fi
+  while IFS= read -r -d "" npmrc; do
+    if grep -Eiq "(^|:)[[:space:]]*(_auth|authToken|password|token|secret)[[:space:]]*=" "$npmrc"; then
+      echo "authentication setting found in clean checkout .npmrc" >&2
+      rm -rf -- "$destination"
+      return 1
+    fi
+  done < <(find "$destination" -type f -name .npmrc -print0)
   workspace=$destination
 }
 

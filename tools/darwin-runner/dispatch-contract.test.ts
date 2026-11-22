@@ -18,7 +18,7 @@ function commit(root: string, message: string): string {
   return git(root, "rev-parse", "HEAD");
 }
 
-function createFixture(): { root: string; base: string; level3: string; level7: string; extra: string; invalid: string } {
+function createFixture(): { root: string; base: string; level3: string; level7: string; extra: string; invalid: string; large: string } {
   const root = mkdtempSync(path.join(tmpdir(), "darwin-dispatch-contract-"));
   git(root, "init", "-q");
   git(root, "config", "user.name", "Darwin contract test");
@@ -40,7 +40,10 @@ function createFixture(): { root: string; base: string; level3: string; level7: 
   git(root, "checkout", "-q", "--detach", base);
   writeFileSync(path.join(root, CONFIG_PATH), '{"compression_level":0,"other":"fixed"}\n');
   const invalid = commit(root, "invalid level");
-  return { root, base, level3, level7, extra, invalid };
+  git(root, "checkout", "-q", "--detach", base);
+  writeFileSync(path.join(root, CONFIG_PATH), `${JSON.stringify({ compression_level: 5, other: "x".repeat(20_000) })}\n`);
+  const large = commit(root, "oversized config");
+  return { root, base, level3, level7, extra, invalid, large };
 }
 
 const validateConfig: ConfigValidator = (baseline, candidate) => {
@@ -71,7 +74,7 @@ test("dispatches two committed refs with their distinct validated levels", async
   } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
-test("rejects protected changes and invalid levels before workload start", async () => {
+test("rejects protected changes, invalid levels and oversized configs before workload start", async () => {
   const fixture = createFixture();
   try {
     let starts = 0;
@@ -82,6 +85,9 @@ test("rejects protected changes and invalid levels before workload start", async
     await assert.rejects(dispatchRequest(
       fixture.root, fixture.base, CONFIG_PATH, encodeDispatchRequest(fixture.invalid), validateConfig, start,
     ), /outside the inert compression-only/);
+    await assert.rejects(dispatchRequest(
+      fixture.root, fixture.base, CONFIG_PATH, encodeDispatchRequest(fixture.large), validateConfig, start,
+    ), /exceeds the size limit/);
     assert.equal(starts, 0);
   } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });

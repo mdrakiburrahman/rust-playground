@@ -3,6 +3,7 @@ import path from "node:path";
 
 export const DISPATCH_LANE = "compression-config" as const;
 export const MAX_REQUEST_BYTES = 4096;
+export const MAX_CONFIG_BYTES = 16_384;
 export const MIN_COMPRESSION_LEVEL = 1;
 export const MAX_COMPRESSION_LEVEL = 22;
 
@@ -21,8 +22,11 @@ export interface ValidatedDispatch {
 export type ConfigValidator = (baseline: Buffer, candidate: Buffer) => number;
 export type Workload = (dispatch: ValidatedDispatch) => Promise<unknown> | unknown;
 
-function runGit(repoRoot: string, args: string[], binary = false): Buffer {
-  const output = execFileSync("git", ["-C", repoRoot, ...args], { encoding: binary ? undefined : "utf8" });
+function runGit(repoRoot: string, args: string[], binary = false, maxBuffer = 1024 * 1024): Buffer {
+  const output = execFileSync("git", ["-C", repoRoot, ...args], {
+    encoding: binary ? undefined : "utf8",
+    maxBuffer,
+  });
   return Buffer.isBuffer(output) ? output : Buffer.from(output);
 }
 
@@ -77,8 +81,12 @@ export function validateDispatch(
     throw new Error("candidate commit may change only the trusted compression config file");
   }
 
-  const baseline = runGit(repoRoot, ["show", `${producerCommit}:${configPath}`], true);
-  const candidate = runGit(repoRoot, ["show", `${request.candidateCommit}:${configPath}`], true);
+  const configReadLimit = MAX_CONFIG_BYTES * 4;
+  const baseline = runGit(repoRoot, ["show", `${producerCommit}:${configPath}`], true, configReadLimit);
+  const candidate = runGit(repoRoot, ["show", `${request.candidateCommit}:${configPath}`], true, configReadLimit);
+  if (baseline.length > MAX_CONFIG_BYTES || candidate.length > MAX_CONFIG_BYTES) {
+    throw new Error("trusted compression config exceeds the size limit");
+  }
   const compressionLevel = validateConfig(baseline, candidate);
   if (!Number.isInteger(compressionLevel)
     || compressionLevel < MIN_COMPRESSION_LEVEL || compressionLevel > MAX_COMPRESSION_LEVEL) {
