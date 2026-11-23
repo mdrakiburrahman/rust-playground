@@ -94,6 +94,7 @@ export async function replayParityArm(
   collectorCpus?: number[],
   profile: ParityProfile = "historical-parity-diagnostic",
   generatedPartitionFastPath?: boolean,
+  diagnosticPrelaunchOnly = false,
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
@@ -184,8 +185,13 @@ export async function replayParityArm(
     }
     const host = await inspectParityHost(Number(client.max_memory_bytes), Number(local.collector_memory_limit_bytes));
     await writeFile(join(runRoot, "host.json"), `${JSON.stringify(host, null, 2)}\n`, { flag: "wx" });
-    await runOat(runtime, configPath, runHome, join(trusted, "bin"), join(runRoot, "run.log"), stackBytes, true);
+    await runOat(runtime, configPath, runHome, join(trusted, "bin"), join(runRoot, "run.log"), stackBytes, true, undefined, diagnosticPrelaunchOnly);
     if (await sha256(configPath) !== configHash || await sha256(seedPath) !== seedHash) throw new Error("parity configuration changed during the run");
+    if (diagnosticPrelaunchOnly) {
+      completed = true;
+      return { profile, source_revision: producer.revision, trusted_revision: manifest.commit,
+        config_sha256: configHash, runRoot, prelaunch_only: true, qualification: "not-evaluated" };
+    }
     const decodeFile = async (path: string, active: boolean): Promise<number> => {
       if (await sha256(footer.path) !== footer.sha256) throw new Error("trusted footer inspector changed");
       const output = execFileSync(footer.path, [active ? "--active" : "--decode", path], {
@@ -236,6 +242,6 @@ export async function replayParityArm(
     completed = true;
     return receipt;
   } finally {
-    if (completed) await rmdir(lock);
+    if (completed || diagnosticPrelaunchOnly) await rmdir(lock);
   }
 }

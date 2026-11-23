@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +11,7 @@ import { Table as WasmTable, readParquet, writeParquet } from 'parquet-wasm';
 import { assertLocalFailedDisposition, inspectPinnedPreloadFailure, localDispositionSuffix, recordLocalFailedDisposition } from './local-failed-disposition.js';
 import { main as launchMain } from './launch.js';
 import { readReconciledOatResult } from '../../tools/darwin/src/oat-result.js';
+import { runOat } from '../../tools/darwin/src/replay.js';
 
 for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${resultStatus} disposition preserves evidence and refuses changed or live custody`, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oat-local-disposition-'));
@@ -36,10 +37,10 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
   if (resultStatus === 'failed') await t.test('pinned pre-load inspection is read-only and rejects mismatched or post-load evidence', async t => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'oat-preload-proof-'));
     t.after(() => rm(root, { recursive: true, force: true }));
-    const receiptRoot = path.join(root, 'receipts');
+    const receiptRoot = path.join(root, '.darwin', 'pressure-diagnostic', 'trusted', 'runtime', 'out', 'arrowcol-oat', 'deadline-receipts');
     const runRoot = path.join(root, 'run');
     const stateRoot = path.join(runRoot, 'state');
-    await mkdir(receiptRoot);
+    await mkdir(receiptRoot, { recursive: true });
     await mkdir(stateRoot, { recursive: true });
     const invocation = '123e4567-e89b-42d3-a456-426614174001';
     const run = '123e4567-e89b-42d3-a456-426614174002';
@@ -59,7 +60,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     const hash = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex');
     const configHash = hash(body);
     const marker = {
-      version: 1, runId: run, ownerPid: 123, ownerStartTicks: '100', serverPid: 124, serverStartTicks: '200',
+      version: 1, runId: run, ownerPid: 2147483611, ownerStartTicks: '100', serverPid: 2147483612, serverStartTicks: '200',
       serverUrl: 'http://127.0.0.1:1234/', serverExecutable: '/tmp/oat',
       submitted_config_body: body, submitted_config_sha256: configHash, source_config_sha256: 'a'.repeat(64),
     };
@@ -70,7 +71,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
       deadline_seconds: null, deadline_at_monotonic_ms: null, cleanup_deadline_at_unix_ms: null,
       overrun: false, overrun_at_unix_ms: null, cancellation_attempts: 0, last_cancel_result: null, error: null,
       cleanup_state: 'unsettled', config_binding_error: null,
-      server_pid: 124, server_start_ticks: '200', server_executable: '/tmp/oat', server_url: marker.serverUrl,
+      server_pid: 2147483612, server_start_ticks: '200', server_executable: '/tmp/oat', server_url: marker.serverUrl,
       submitted_config_body: body, submitted_config_sha256: configHash, source_config_sha256: marker.source_config_sha256,
       terminal_observation: {
         observed_at_unix_ms: 10, status: { id: run, state: 'failed', config_sha256: configHash, progress: 'failed', result_count: 1,
@@ -125,7 +126,9 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     await writeFile(modulePath, fixtureSource);
     const fixture: typeof import('./local-failed-disposition.js') = await import(pathToFileURL(modulePath).href);
     const readonlyCommands: string[][] = [];
-    const recordingEnv = { ...env, docker: (args: string[]) => {
+    const recordingEnv = { ...env, bootId: process.platform === 'linux'
+      ? async () => (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() : env.bootId,
+      docker: (args: string[]) => {
       assert.ok(args[0] === 'ps' || (args[0] === 'network' && args[1] === 'ls') ||
         (args[0] === 'volume' && args[1] === 'ls'));
       readonlyCommands.push(args);
@@ -164,6 +167,99 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     const savedRow = tableFromIPC(readParquet(await readFile(resultPath)).intoIPCStream()).toArray()[0];
     assert.equal(savedRow.status, 'failed');
     assert.equal(JSON.parse(savedRow.evidence_json).durable_rows_per_second, null);
+    await t.test('actual diagnostic launcher checks the original nonempty ledger before workloads', { skip: process.platform !== 'linux' }, async () => {
+      const sourceRoot = path.resolve(path.dirname(sourcePath), '../..');
+      const trusted = path.join(root, '.darwin', 'pressure-diagnostic', 'trusted');
+      const runtime = path.join(root, '.darwin', 'pressure-diagnostic-v2', 'trusted', 'runtime');
+      const toolDir = path.join(root, 'tools');
+      const home = path.join(root, 'home');
+      await mkdir(path.join(runtime, 'projects'), { recursive: true });
+      await mkdir(path.join(runtime, 'infra'), { recursive: true });
+      await mkdir(toolDir);
+      await mkdir(home);
+      await cp(path.join(sourceRoot, 'projects', 'arrowcol-oat'), path.join(runtime, 'projects', 'arrowcol-oat'), { recursive: true });
+      await cp(path.join(sourceRoot, 'infra', 'azure'), path.join(runtime, 'infra', 'azure'), { recursive: true });
+      await writeFile(path.join(runtime, 'package.json'), '{"type":"module"}\n');
+      await symlink(path.resolve(fileURLToPath(import.meta.resolve('tsx')), '../../..'), path.join(runtime, 'node_modules'));
+      await writeFile(path.join(runtime, 'projects', 'arrowcol-oat', 'local-failed-disposition.ts'), fixtureSource);
+      const launcherPath = path.join(runtime, 'projects', 'arrowcol-oat', 'launch.ts');
+      const launcherSource = await readFile(launcherPath, 'utf8');
+      await writeFile(launcherPath, launcherSource.replaceAll('89fdefa5-855d-46ea-93ea-481fd77cbd2e', invocation));
+      const revision = '86eb8ebe07d876c925e027c0c656a69917269f22';
+      await writeFile(path.join(trusted, 'manifest.json'), JSON.stringify({ commit: revision }));
+      await writeFile(path.join(trusted, 'producer.json'), JSON.stringify({ revision }));
+      const git = path.join(toolDir, 'git');
+      await writeFile(git, `#!/bin/sh\ncase "$3 $4" in\n  "rev-parse --show-toplevel") echo "$2";;\n  "rev-parse HEAD") echo ${revision};;\n  "status --porcelain"|"submodule status") :;;\n  *) exit 1;;\nesac\n`);
+      const docker = path.join(toolDir, 'docker');
+      await writeFile(docker, '#!/bin/sh\nexit 0\n');
+      await chmod(git, 0o755);
+      await chmod(docker, 0o755);
+      const config = path.join(root, 'config.json');
+      await writeFile(config, JSON.stringify({ platform: { kind: 'local', local: { bind_host: '127.0.0.1', endpoint_host: '127.0.0.1' } } }));
+      const check = (name: string) => runOat(runtime, config, home, toolDir, path.join(root, `${name}.log`), 8 * 1024 * 1024, true, undefined, true);
+      const v2 = path.join(root, '.darwin', 'pressure-diagnostic-v2');
+      const v2Trusted = path.join(v2, 'trusted');
+      const seedDir = path.join(v2Trusted, 'src', 'experiments', 'darwin');
+      await mkdir(seedDir, { recursive: true });
+      await cp(toolDir, path.join(v2Trusted, 'bin'), { recursive: true });
+      const seed = await readFile(path.join(sourceRoot, 'experiments', 'darwin', 'historical-parity.oat.json'));
+      await writeFile(path.join(seedDir, 'historical-parity.oat.json'), seed);
+      const newRevision = 'd'.repeat(40);
+      await writeFile(path.join(v2Trusted, 'manifest.json'), JSON.stringify({
+        commit: newRevision, files: { 'experiments/darwin/historical-parity.oat.json': { sha256: hash(seed) } },
+      }));
+      await writeFile(path.join(v2Trusted, 'producer.json'), JSON.stringify({ revision: newRevision }));
+      const tools = path.join(runtime, 'tools', 'darwin', 'src');
+      await mkdir(path.dirname(tools), { recursive: true });
+      await cp(path.join(sourceRoot, 'tools', 'darwin', 'src'), tools, { recursive: true });
+      const parityPath = path.join(tools, 'parity-replay.ts');
+      let paritySource = await readFile(parityPath, 'utf8');
+      const substitutions: Array<[string, string]> = [
+        ['const { runtime, binaryHash } = await prepareReplayRuntime(repo, home, stackBytes);',
+          `const runtime = ${JSON.stringify(runtime)}; const binaryHash = "fixture";`],
+        ['const footer = await buildFooterInspector(runtime, join(trusted, "prepare-home"), stackBytes);',
+          'const footer = { path: "unused", sha256: "unused" };'],
+        ['const host = await inspectParityHost(Number(client.max_memory_bytes), Number(local.collector_memory_limit_bytes));',
+          'const host = { fixture: true };'],
+        ['return execFileSync("git", ["-C", runtime, ...args], { encoding: "utf8", env }).trimEnd();',
+          `return args[0] === "rev-parse" ? ${JSON.stringify(newRevision)} : "";`],
+        ['|| !hasPinnedSubmodules(runtime, env)) throw new Error("trusted parity runtime changed while building");',
+          ') throw new Error("trusted parity runtime changed while building");'],
+      ];
+      for (const [from, to] of substitutions) {
+        assert.ok(paritySource.includes(from), `fixture substitution not found: ${from}`);
+        paritySource = paritySource.replace(from, to);
+      }
+      await writeFile(parityPath, paritySource);
+      const parity: typeof import('../../tools/darwin/src/parity-replay.js') = await import(pathToFileURL(parityPath).href);
+      const preflight = () => parity.replayParityArm(sourceRoot, v2, 1, '127.0.0.1', '127.0.0.1',
+        8 * 1024 * 1024, undefined, undefined, undefined, undefined, true);
+      await check('intact');
+      assert.match(await readFile(path.join(root, 'intact.log'), 'utf8'), /ledger prelaunch gate passed/);
+      const parityResult = await preflight();
+      assert.equal(parityResult.prelaunch_only, true);
+      assert.equal(parityResult.qualification, 'not-evaluated');
+      await assert.rejects(readFile(path.join(runtime, 'out', 'arrowcol-oat', 'deadline-receipts', `${invocation}.json`)), { code: 'ENOENT' });
+      await unlink(dispositionPath);
+      await assert.rejects(check('missing'), /OAT run failed/);
+      assert.match(await readFile(path.join(root, 'missing.log'), 'utf8'), /ENOENT/);
+      await assert.rejects(runOat(runtime, config, home, toolDir, path.join(root, 'normal-missing.log'),
+        8 * 1024 * 1024, true), /OAT run failed/);
+      assert.match(await readFile(path.join(root, 'normal-missing.log'), 'utf8'), /ENOENT/);
+      await assert.rejects(preflight(), /OAT run failed/);
+      await writeFile(dispositionPath, JSON.stringify({ ...disposition, qualification: 'qualified' }));
+      await assert.rejects(check('changed-proof'), /OAT run failed/);
+      assert.match(await readFile(path.join(root, 'changed-proof.log'), 'utf8'), /evidence changed/);
+      await assert.rejects(preflight(), /OAT run failed/);
+      await writeFile(dispositionPath, savedDisposition);
+      await writeFile(logPath, 'changed');
+      await assert.rejects(check('changed-original'), /OAT run failed/);
+      assert.match(await readFile(path.join(root, 'changed-original.log'), 'utf8'), /hash mismatch/);
+      await assert.rejects(preflight(), /OAT run failed/);
+      await writeFile(logPath, original[3]!);
+      assert.deepEqual(await Promise.all(files.map(file => readFile(file))), original);
+      assert.deepEqual(await readFile(dispositionPath), savedDisposition);
+    });
     await assert.rejects(fixture.recordLocalFailedDisposition(receiptRoot, invocation, markerPath, recordingEnv), { code: 'EEXIST' });
     assert.deepEqual(await readFile(dispositionPath), savedDisposition);
     await writeFile(dispositionPath, JSON.stringify({ ...disposition, qualification: 'qualified' }));
@@ -183,7 +279,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
       ...env, docker: () => 'residual-container',
     }), /resources remain/);
     await assert.rejects(inspectPinnedPreloadFailure(receiptPath, markerPath, pins, {
-      ...env, processStartTicks: async pid => pid === 123 ? '100' : undefined,
+      ...env, processStartTicks: async pid => pid === 2147483611 ? '100' : undefined,
     }), /still active/);
     await assert.rejects(inspectPinnedPreloadFailure(receiptPath, markerPath, {
       ...pins, collectorImage: `sha256:${'d'.repeat(64)}`,
