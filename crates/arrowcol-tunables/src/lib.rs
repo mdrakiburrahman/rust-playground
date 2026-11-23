@@ -14,6 +14,69 @@ pub use arrowcol_routing::AdmissionPressureGauge;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::str::FromStr;
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CollectorCpuQuota {
+    Cores(f64),
+    Unlimited(UnlimitedCpuQuota),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlimitedCpuQuota {
+    Unlimited,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMemoryMetric {
+    #[default]
+    Usage,
+    WorkingSet,
+}
+
+impl ContainerMemoryMetric {
+    #[must_use]
+    pub fn is_usage(&self) -> bool {
+        *self == Self::Usage
+    }
+
+    #[must_use]
+    pub fn metric_name(self) -> &'static str {
+        match self {
+            Self::Usage => "container_memory_bytes",
+            Self::WorkingSet => "container_working_set_bytes",
+        }
+    }
+}
+
+impl CollectorCpuQuota {
+    /// # Errors
+    /// Rejects nonpositive, nonfinite, oversized or sub-nanocore quotas.
+    pub fn nano_cpus(self) -> Result<u64, &'static str> {
+        match self {
+            Self::Unlimited(_) => Ok(0),
+            Self::Cores(cores) if cores.is_finite() && (0.000_000_001..=4096.0).contains(&cores) => {
+                let decimal = cores.to_string();
+                let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
+                if fraction.len() > 9 {
+                    return Err("platform.local.collector_cpu_quota supports at most nanocore precision");
+                }
+                let whole = whole
+                    .parse::<u64>()
+                    .map_err(|_| "platform.local.collector_cpu_quota is invalid")?;
+                let fraction = format!("{fraction:0<9}")
+                    .parse::<u64>()
+                    .map_err(|_| "platform.local.collector_cpu_quota is invalid")?;
+                Ok(whole * 1_000_000_000 + fraction)
+            }
+            Self::Cores(_) => Err(
+                "platform.local.collector_cpu_quota must be a positive decimal (nanocore precision, at most 4096) or \"unlimited\"",
+            ),
+        }
+    }
+}
+
 /// Payload customer IDs are bounded printable identifiers, not delivery identities.
 #[must_use]
 pub fn valid_payload_customer_id(value: &str) -> bool {

@@ -978,6 +978,29 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     {
         effective.optimize.use_default_layout = false;
     }
+    let physical = arrowcol_props::resolve(properties, &BTreeMap::new())?;
+    let log_floor = physical.unsigned("delta.logRetentionDuration")?;
+    // Sub-seven-day CLI requests retain operation-level unsafe-request reports
+    // and disposable-root checks; OAT rejects them before projection.
+    if effective.operations.contains(&Operation::PruneLog)
+        && !settings.unsafe_short_vacuum_for_tests
+        && let Some(retention) = settings.log_retention_ms
+        && retention >= arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+        && u64::try_from(retention)? < log_floor
+    {
+        bail!("maintenance.log_retention_secs is below physical table delta.logRetentionDuration");
+    }
+    let vacuum_retention = settings.vacuum_retention_ms.min(effective.vacuum_retention_ms);
+    if effective.operations.contains(&Operation::Vacuum)
+        && !effective.allow_short_vacuum_retention
+        && !settings.unsafe_short_vacuum_for_tests
+        && vacuum_retention >= arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+        && u64::try_from(vacuum_retention)? < physical.unsigned("delta.deletedFileRetentionDuration")?
+    {
+        bail!(
+            "maintenance.vacuum_retention_secs is below physical table delta.deletedFileRetentionDuration; requires maintenance.allow_short_vacuum_retention"
+        );
+    }
     effective.optimize.validate()?;
     Ok((effective, props))
 }
@@ -1048,7 +1071,13 @@ fn configuration_evidence(
         .get("arrowcol.optimize.sealedPartitionsOnly")
         .map(|value| value.parse::<bool>())
         .transpose()?;
+    let physical = arrowcol_props::resolve(table_properties, &BTreeMap::new())?;
     let mut evidence = serde_json::json!({
+        "physical_retention_floor": {
+            "source": "table_properties_over_registry_defaults_not_process_overrides",
+            "delta.logRetentionDuration": physical.unsigned("delta.logRetentionDuration")?,
+            "delta.deletedFileRetentionDuration": physical.unsigned("delta.deletedFileRetentionDuration")?,
+        },
         "startup": {
             "apply": startup.apply,
             "anchor_ms": startup.anchor_ms,

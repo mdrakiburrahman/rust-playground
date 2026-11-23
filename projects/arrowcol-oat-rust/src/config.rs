@@ -162,6 +162,31 @@ pub struct OverloadGuardConfig {
     pub zero_progress_windows: u32,
     #[serde(skip_serializing_if = "OverloadRssSignal::is_process_rss")]
     pub memory_signal: OverloadRssSignal,
+    #[serde(
+        skip_serializing_if = "arrowcol_tunables::ContainerMemoryMetric::is_usage",
+        deserialize_with = "deserialize_container_memory_metric"
+    )]
+    pub container_memory_metric: arrowcol_tunables::ContainerMemoryMetric,
+}
+
+fn deserialize_container_memory_metric<'de, D>(
+    deserializer: D,
+) -> std::result::Result<arrowcol_tunables::ContainerMemoryMetric, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    arrowcol_tunables::ContainerMemoryMetric::deserialize(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("overload_guard.container_memory_metric: {error}")))
+}
+
+fn deserialize_collector_cpu_quota<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<arrowcol_tunables::CollectorCpuQuota>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<arrowcol_tunables::CollectorCpuQuota>::deserialize(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("platform.local.collector_cpu_quota: {error}")))
 }
 
 impl Default for OverloadGuardConfig {
@@ -171,6 +196,7 @@ impl Default for OverloadGuardConfig {
             cap_fraction: 0.90,
             zero_progress_windows: 2,
             memory_signal: OverloadRssSignal::ProcessRss,
+            container_memory_metric: arrowcol_tunables::ContainerMemoryMetric::Usage,
         }
     }
 }
@@ -541,6 +567,8 @@ pub struct LocalOptions {
     pub expected_image_ids: Option<std::collections::BTreeMap<String, String>>,
     pub collector_image_override: Option<CollectorImageOverride>,
     pub collector_cpus: Option<Vec<u32>>,
+    #[serde(default, deserialize_with = "deserialize_collector_cpu_quota")]
+    pub collector_cpu_quota: Option<arrowcol_tunables::CollectorCpuQuota>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1209,6 +1237,9 @@ impl OatConfig {
                 bail!("collector image override requires a stable build, immutable image ID and full source revision");
             }
         }
+        if let Some(quota) = self.platform.local.collector_cpu_quota {
+            quota.nano_cpus().map_err(anyhow::Error::msg)?;
+        }
         if let Some(cpus) = &self.platform.local.collector_cpus
             && (!self.platform.local.stable_image_build
                 || cpus.is_empty()
@@ -1229,6 +1260,19 @@ impl OatConfig {
         }
         if self.overload_guard.memory_signal == OverloadRssSignal::CgroupMemory {
             self.cgroup_guard_requested_limits()?;
+        }
+        if !self.overload_guard.container_memory_metric.is_usage() && !self.overload_guard.enabled {
+            bail!("overload_guard.container_memory_metric requires overload_guard.enabled=true");
+        }
+        if self.overload_guard.enabled
+            && self.platform.kind == OatMode::Local
+            && (self.overload_guard.memory_signal == OverloadRssSignal::CgroupMemory
+                || !self.overload_guard.container_memory_metric.is_usage())
+            && self.platform.local.collector_memory_limit_bytes.is_none()
+        {
+            bail!(
+                "container-based overload_guard requires platform.local.collector_memory_limit_bytes to be an explicit finite cap"
+            );
         }
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;
@@ -1421,6 +1465,7 @@ impl OatConfig {
                     || self.platform.local.expected_image_ids.is_some()
                     || self.platform.local.collector_image_override.is_some()
                     || self.platform.local.collector_cpus.is_some()
+                    || self.platform.local.collector_cpu_quota.is_some()
                     || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");

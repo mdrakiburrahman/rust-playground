@@ -12,7 +12,9 @@ const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) as {
   after: Record<string, number>;
 };
 if (args[0] === 'inspect') {
-  console.log(state.routerExited ? 'exited|17' : 'running|0');
+  console.log(args.includes('{{json .HostConfig.NanoCpus}}') ? '1000000000' : state.routerExited ? 'exited|17' : 'running|0');
+} else if (args[0] === 'exec') {
+  console.log('100000 100000\nnr_periods 10\nnr_throttled 0\nthrottled_usec 0');
 } else if (args[0] === 'logs') {
   console.log('fixture router failed');
 } else if (args.includes('ps')) {

@@ -1125,6 +1125,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-deltalake",
+ "arrowcol-props",
  "arrowcol-routing",
  "humantime",
  "serde",
