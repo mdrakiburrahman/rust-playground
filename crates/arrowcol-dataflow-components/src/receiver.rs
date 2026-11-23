@@ -981,8 +981,12 @@ async fn admin_pressure(State(state): State<AdminState>) -> Response {
     let mut diagnostic = PressureDiagnosticSample::start();
     let handler_started = diagnostic.as_ref().map(|_| Instant::now());
     let span = tracing::Span::current();
+    let blocking_submitted = diagnostic.as_ref().map(|_| Instant::now());
     pressure_task_response(tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
+        if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), blocking_submitted) {
+            diagnostic.record_blocking_queue(started.elapsed());
+        }
         let response = match state.metrics.pressure_for_admin(diagnostic.as_mut()) {
             Ok(mut pressure) => {
                 if state.direct_topology && state.metrics.ready() {
