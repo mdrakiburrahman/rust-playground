@@ -3164,7 +3164,7 @@ groups:
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row","string_width":31,"string_length_distribution":"uniform"}
+            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row","string_width":31,"string_length_distribution":"uniform","entropy":0.8}
         }))?;
         let observed = actual_client_startup(&binary, &config)?;
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(0);
@@ -3175,6 +3175,8 @@ groups:
         prepared["generator_applicability"]["tables"][0]["value_variation"] =
             json!({"eligible_columns":1,"eligible_rows":8});
         prepared["generator_applicability"]["tables"][0]["string_width"] =
+            json!({"eligible_columns":1,"eligible_rows":8});
+        prepared["generator_applicability"]["tables"][0]["entropy"] =
             json!({"eligible_columns":1,"eligible_rows":8});
         let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
         let initial = tunable_leaf_evidence(&config)?;
@@ -3194,12 +3196,21 @@ groups:
             .iter().any(|entry| entry["path"] == "client.string_width"));
         assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
             .iter().any(|entry| entry["path"] == "client.string_length_distribution"));
+        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.entropy"));
         let mut absent = report.clone();
         absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
         let mut uncovered = initial.clone();
         promote_client_readback(&config, &mut uncovered, Some(&vec![absent]))?;
         assert!(uncovered["projection_only"].as_array().context("projection_only array")?
             .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
+        let mut no_body = report.clone();
+        no_body["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["entropy"] =
+            json!({"eligible_columns":0,"eligible_rows":0});
+        let mut unproven = initial.clone();
+        promote_client_readback(&config, &mut unproven, Some(&vec![no_body]))?;
+        assert!(unproven["projection_only"].as_array().context("projection_only array")?
+            .iter().any(|entry| entry["path"] == "client.entropy"));
         let mut zero = report;
         zero["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] =
             json!({"eligible_columns":0,"eligible_rows":0});

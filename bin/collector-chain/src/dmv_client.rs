@@ -549,6 +549,8 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
         variation_rows: u64,
         width_columns: std::collections::BTreeSet<String>,
         width_rows: u64,
+        entropy_columns: std::collections::BTreeSet<String>,
+        entropy_rows: u64,
     }
     let mut tables = std::collections::BTreeMap::<String, Counts>::new();
     for batches in corpus {
@@ -574,6 +576,31 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
                         .width_rows
                         .checked_add(u64::try_from(array.len() - array.null_count())?)
                         .context("corpus width row count overflow")?;
+                    let fallback = options.string_width == 0
+                        && options.data_profile == DataProfile::Diagnostic
+                        && options.string_length_distribution == Some(StringLengthDistribution::Fixed);
+                    let width = if options.string_width == 0 {
+                        field.name().len() + 32
+                    } else {
+                        options.string_width
+                    };
+                    let min_width = if options.string_length_distribution == Some(StringLengthDistribution::Uniform) {
+                        width.div_ceil(2)
+                    } else {
+                        width
+                    };
+                    let (prefix, suffix) = if options.data_profile == DataProfile::Realistic {
+                        realistic_name_parts(field.name(), u64::MAX).unwrap_or_default()
+                    } else {
+                        (String::new(), "")
+                    };
+                    if !fallback && min_width > prefix.len() + suffix.len() {
+                        counts.entropy_columns.insert(field.name().to_owned());
+                        counts.entropy_rows = counts
+                            .entropy_rows
+                            .checked_add(u64::try_from(array.len() - array.null_count())?)
+                            .context("corpus entropy row count overflow")?;
+                    }
                 }
                 if matches!(
                     field.data_type(),
@@ -646,6 +673,10 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
             "string_width": {
                 "eligible_columns": counts.width_columns.len(),
                 "eligible_rows": counts.width_rows,
+            },
+            "entropy": {
+                "eligible_columns": counts.entropy_columns.len(),
+                "eligible_rows": counts.entropy_rows,
             },
         })).collect::<Vec<_>>(),
     }))
@@ -4623,6 +4654,10 @@ mod tests {
             .context("string array")?;
         assert!(strings.iter().flatten().any(|value| value.len() < 23));
         options.string_length_distribution = Some(StringLengthDistribution::Fixed);
+        options.entropy = 1.0;
+        let varied = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(repeated.column_by_name("text"), varied.column_by_name("text"));
+        options.entropy = 0.0;
         let values = repeated
             .column(2)
             .as_any()
@@ -5023,6 +5058,8 @@ mod tests {
         assert!(applicability["value_variation"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
         assert!(applicability["string_width"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
         assert!(applicability["string_width"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
+        assert!(applicability["entropy"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
+        assert!(applicability["entropy"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()

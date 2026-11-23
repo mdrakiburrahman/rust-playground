@@ -537,6 +537,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.value_variation") => ("value_variation", "ARROWCOL_CLIENT_VALUE_VARIATION"),
             Some("client.string_width") => ("string_width", "ARROWCOL_CLIENT_STRING_WIDTH"),
             Some("client.string_length_distribution") => ("string_length_distribution", "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION"),
+            Some("client.entropy") => ("entropy", "ARROWCOL_CLIENT_ENTROPY"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -591,7 +592,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }
             return true;
         }
-        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution") {
+        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy") {
             let counts = reports.iter().map(|report| {
                 let name = report["table"].as_str()?;
                 let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
@@ -605,6 +606,9 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }).collect::<Option<Vec<_>>>();
             let Some(counts) = counts else { return true; };
             if counts.iter().all(|&(columns, rows)| columns == 0 && rows == 0) {
+                if field == "entropy" {
+                    return true;
+                }
                 inert.push(json!({"path": entry["path"], "reason": "no_eligible_generated_rows"}));
                 return false;
             }
@@ -643,7 +647,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         {
             return true;
         }
-        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution") {
+        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy") {
             "consumer_startup_and_prepared_corpus"
         } else { "consumer_startup_readback" }}));
         false
