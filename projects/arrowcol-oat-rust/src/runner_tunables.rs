@@ -47,6 +47,16 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
     let table_policies = collectors.iter()
         .flat_map(|process| process["layout_table_policies"].as_array().into_iter().flatten())
         .collect::<Vec<_>>();
+    let observed_tables = table_policies.iter()
+        .filter_map(|policy| policy["table_name"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let tables_covered = !expected_tables.is_empty()
+        && collectors.iter().all(|process| process["layout_table_policies"].is_array())
+        && expected_tables.iter().all(|table| observed_tables.contains(table.as_str()))
+        && table_policies.iter().all(|policy| {
+            policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
+                && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
+        });
     let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
@@ -60,6 +70,52 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        let codec = if path == "parquet_writer.defaults.compression" {
+            Some((None, "compression"))
+        } else if path == "parquet_writer.defaults.compression_level" {
+            Some((None, "compression_level"))
+        } else if let Some(column) = path.strip_prefix("parquet_writer.columns.") {
+            column.strip_suffix(".compression_level").map(|column| (Some(column), "compression_level"))
+                .or_else(|| column.strip_suffix(".compression").map(|column| (Some(column), "compression")))
+        } else {
+            None
+        };
+        if let Some((column, field)) = codec {
+            let Some(policy) = parquet_policy.as_ref() else { return true; };
+            let options = if let Some(column) = column {
+                policy.get("columns").and_then(|columns| columns.get(column))
+            } else {
+                policy.get("defaults")
+            };
+            let Some(requested) = options.and_then(|options| options.get(field)).filter(|value| !value.is_null()) else {
+                return true;
+            };
+            let Some(requested_codec) = options.and_then(|options| options.get("compression")).filter(|value| value.is_string()) else {
+                return true;
+            };
+            let matches = tables_covered && table_policies.iter().all(|record| {
+                let Some(columns) = record["parquet_columns"].as_object().filter(|columns| !columns.is_empty()) else {
+                    return false;
+                };
+                let agrees = |actual: &Value| {
+                    actual.get(field) == Some(requested) && actual.get("compression") == Some(requested_codec)
+                };
+                if let Some(column) = column {
+                    columns.get(column).is_some_and(agrees)
+                } else {
+                    let effective = columns.iter().filter(|(name, _)| {
+                        policy.get("columns").and_then(|columns| columns.get(*name))
+                            .and_then(|options| options.get("compression")).is_none_or(Value::is_null)
+                    }).collect::<Vec<_>>();
+                    !effective.is_empty() && effective.iter().all(|(_, actual)| agrees(actual))
+                }
+            });
+            if matches {
+                promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
+                return false;
+            }
+            return true;
+        }
         let parquet_field = match path {
             "parquet_writer.max_row_group_rows" => Some(("max_row_group_rows", "row_group_rows")),
             "parquet_writer.data_page_row_count_limit" => Some(("data_page_row_count_limit", "page_rows")),
@@ -70,16 +126,9 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 .filter(|value| value.as_u64().is_some_and(|number| number > 0)) else {
                 return true;
             };
-            let observed_tables = table_policies.iter()
-                .filter_map(|policy| policy["table_name"].as_str())
-                .collect::<std::collections::BTreeSet<_>>();
-            if !expected_tables.is_empty()
-                && collectors.iter().all(|process| process["layout_table_policies"].is_array())
-                && expected_tables.iter().all(|table| observed_tables.contains(table.as_str()))
+            if tables_covered
                 && table_policies.iter().all(|policy| {
-                    policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
-                        && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
-                        && policy["config"]["enabled"] == true
+                    policy["config"]["enabled"] == true
                         && policy["config"][observed_field] == *requested
                 })
             {
