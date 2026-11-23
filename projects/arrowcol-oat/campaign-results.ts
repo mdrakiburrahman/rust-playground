@@ -308,6 +308,10 @@ const proofReasonPaths: Readonly<Record<string, readonly string[]>> = {
     'client.string_length_distribution', 'client.entropy', 'client.cardinality', 'client.seed', 'client.skew',
   ],
   committed_table_metadata_readback: ['collector.commit.delta_stats_columns'],
+  consumer_linux_thp_flag_readback: ['collector.thp_disabled'],
+  consumer_linux_listener_buffer_readback: ['collector.socket.recv_buffer_bytes', 'collector.socket.send_buffer_bytes'],
+  consumer_accepted_socket_readback: ['collector.socket.tcp_nodelay'],
+  consumer_cpu_pool_readback: ['collector.runtime.cpu_thread_stack_size'],
 };
 
 function factorCoverage(row: CampaignMeasurement): FactorCoverage {

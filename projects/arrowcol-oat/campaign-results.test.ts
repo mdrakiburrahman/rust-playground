@@ -1194,6 +1194,52 @@ test('accepts committed table metadata proof for a stats factor and unrelated fa
   }
 });
 
+test('accepts G2a readback only for its producer paths, including unrelated factors', () => {
+  const cases = [
+    ['collector.thp_disabled', 'consumer_linux_thp_flag_readback'],
+    ['collector.socket.recv_buffer_bytes', 'consumer_linux_listener_buffer_readback'],
+    ['collector.socket.send_buffer_bytes', 'consumer_linux_listener_buffer_readback'],
+    ['collector.socket.tcp_nodelay', 'consumer_accepted_socket_readback'],
+    ['collector.runtime.cpu_thread_stack_size', 'consumer_cpu_pool_readback'],
+  ] as const;
+  for (const [index, [path, reason]] of cases.entries()) {
+    for (const varied of [true, false]) {
+      const candidate = generatorCandidate('socket-proof', 800, 450 + index * 6 + Number(varied) * 3).map(row => {
+        Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+          thp_disabled: true,
+          socket: { recv_buffer_bytes: 32768, send_buffer_bytes: 32768, tcp_nodelay: true },
+          runtime: { cpu_thread_stack_size: 2097152 },
+        } });
+        return { ...row, factorConfigPaths: [varied ? `tunables.${path}` : 'client.string_width', 'client.guid_uniqueness'] };
+      });
+      for (const row of candidate) {
+        mutateFactorEvidence(row, evidence => {
+          evidence.consumer_verified = [
+            { path, reason },
+            { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+            { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+          ];
+        });
+      }
+      assert.match(renderCampaignResults(candidate, 'C1'), /socket-proof \(3\/3\)/);
+      const wrongPath = path === 'collector.thp_disabled' ? 'collector.socket.tcp_nodelay' : 'collector.thp_disabled';
+      for (const row of candidate) {
+        if (varied) row.factorConfigPaths = [wrongPath, 'client.guid_uniqueness'];
+        mutateFactorEvidence(row, evidence => {
+          evidence.consumer_verified = [
+            { path: wrongPath, reason },
+            { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+            { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+          ];
+        });
+      }
+      const svg = renderCampaignResults(candidate, 'C1');
+      assert.match(svg, /varied factor coverage unknown/);
+      assert.doesNotMatch(svg, /socket-proof \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+    }
+  }
+});
+
 test('rejects recognized proof reasons on paths their producers cannot emit', () => {
   const cases = [
     ['consumer_verified', 'client.string_width', 'committed_table_metadata_readback'],
