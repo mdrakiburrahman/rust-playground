@@ -2146,13 +2146,31 @@ groups:
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let output = std::fs::read_to_string(&log_path)?;
-                if let Some(status) = child.0.try_wait()? {
-                    if output.contains("Address already in use") && attempt < 2 {
+                if output.contains("Address already in use") {
+                    if attempt < 2 {
+                        child.stop().context("stop collector after bind collision")?;
                         break;
                     }
+                    bail!("collector bind collision after three attempts: {output}");
+                }
+                if let Some(status) = child.0.try_wait()? {
                     bail!("collector exited before both readbacks ({status}): {output}");
                 }
-                if output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#) {
+                let listening = [flight_port, admin_port].into_iter().all(|port| {
+                    std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                        Duration::from_millis(100),
+                    ).is_ok()
+                });
+                if listening && output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Some(status) = child.0.try_wait()? {
+                        let output = std::fs::read_to_string(&log_path)?;
+                        if output.contains("Address already in use") && attempt < 2 {
+                            break;
+                        }
+                        bail!("collector exited during listener startup ({status}): {output}");
+                    }
                     child.stop().context("stop isolated collector")?;
                     text = Some(output);
                     break;
