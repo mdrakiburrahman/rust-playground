@@ -173,7 +173,7 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
             }
             let tasks = work.into_iter().map(|(mut column, leaf)| {
                 crate::delta_io::run_cpu_async(move || {
-                    column.write(std::slice::from_ref(&leaf))?;
+                    column.write(&leaf)?;
                     Ok(column)
                 })
             });
