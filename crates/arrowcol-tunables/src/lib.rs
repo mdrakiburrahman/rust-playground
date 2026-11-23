@@ -414,7 +414,10 @@ pub struct RuntimeTunables {
     pub generated_partition_fast_path: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_binding")]
     pub generated_partition_binding: Option<arrow_deltalake::GeneratedPartitionBinding>,
-    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_file_mapping_cache")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_file_mapping_cache"
+    )]
     pub file_mapping_cache: Option<bool>,
 }
 
@@ -466,7 +469,9 @@ where
 }
 
 fn deserialize_file_mapping_cache<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
-    bool::deserialize(d).map(Some).map_err(|_| serde::de::Error::custom("collector.runtime.file_mapping_cache must be a boolean"))
+    bool::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.runtime.file_mapping_cache must be a boolean"))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

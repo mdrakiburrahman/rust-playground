@@ -288,7 +288,10 @@ fn file_mapping_modes_preserve_values_and_validate_later_batches() -> Result<()>
         // Runtime configuration is process-wide. Do not mutate the test runner's environment.
         for mode in ["false", "true"] {
             let status = std::process::Command::new(std::env::current_exe()?)
-                .args(["--exact", "file_mapping_modes_preserve_values_and_validate_later_batches"])
+                .args([
+                    "--exact",
+                    "file_mapping_modes_preserve_values_and_validate_later_batches",
+                ])
                 .env(CHILD, "1")
                 .env(KNOB, mode)
                 .status()?;
