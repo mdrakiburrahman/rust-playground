@@ -57,6 +57,8 @@ pub struct ClientTunables {
     pub runtime_threads: Option<usize>,
     pub data_mode: Option<DataMode>,
     pub data_profile: Option<ClientDataProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_iter: Option<ClientSendIter>,
     pub string_length_distribution: Option<ClientStringLengthDistribution>,
     pub value_variation: Option<ClientValueVariation>,
     pub guid_uniqueness: Option<ClientGuidUniqueness>,
@@ -428,6 +430,13 @@ pub enum ClientDataProfile {
     #[default]
     Diagnostic,
     Realistic,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSendIter {
+    CloneVec,
+    ArcCursor,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]

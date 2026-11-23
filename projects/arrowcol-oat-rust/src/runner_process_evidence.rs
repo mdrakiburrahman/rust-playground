@@ -2771,6 +2771,7 @@ groups:
             (json!({"client":{"runtime_threads":5}}), "runtime_threads"),
             (json!({"client":{"data_mode":"independent"}}), "data_mode"),
             (json!({"client":{"data_profile":"realistic"}}), "data_profile"),
+            (json!({"client":{"send_iter":"arc_cursor"}}), "send_iter"),
             (json!({"client":{"string_length_distribution":"uniform"}}), "string_length_distribution"),
             (json!({"client":{"value_variation":"per_row"}}), "value_variation"),
             (json!({"client":{"guid_uniqueness":"per_row"}}), "guid_uniqueness"),
@@ -2848,7 +2849,7 @@ groups:
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
                 | "payload_customer_id" | "corpus_rows" | "corpus_bytes"
                 | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
-                | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "max_memory_bytes"
+                | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "send_iter" | "max_memory_bytes"
                 | "stream_retry_max_attempts" | "stream_retry_base_backoff_ms" | "stream_retry_max_backoff_ms"
                 | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
                 | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"

@@ -33,6 +33,46 @@ pub enum DataMode {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
+pub enum SendIter {
+    #[default]
+    #[value(name = "clone_vec")]
+    CloneVec,
+    #[value(name = "arc_cursor")]
+    ArcCursor,
+}
+
+enum SendFrames {
+    Owned(std::vec::IntoIter<FlightData>),
+    Shared { frames: Arc<Vec<FlightData>>, index: usize },
+}
+
+impl Iterator for SendFrames {
+    type Item = FlightData;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(frames) => frames.next(),
+            Self::Shared { frames, index } => {
+                let frame = frames.get(*index)?.clone();
+                *index += 1;
+                Some(frame)
+            }
+        }
+    }
+}
+
+fn send_frames(frames: &Arc<Vec<FlightData>>, mode: SendIter) -> SendFrames {
+    match mode {
+        SendIter::CloneVec => SendFrames::Owned(frames.as_ref().clone().into_iter()),
+        SendIter::ArcCursor => SendFrames::Shared {
+            frames: Arc::clone(frames),
+            index: 0,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 pub enum IpcCompression {
     #[default]
     None,
@@ -112,6 +152,8 @@ pub struct Options {
     pub data_mode: DataMode,
     #[arg(long, env = "ARROWCOL_CLIENT_DATA_PROFILE", value_enum, default_value_t = DataProfile::Diagnostic)]
     pub data_profile: DataProfile,
+    #[arg(long, env = "ARROWCOL_CLIENT_SEND_ITER", value_enum, default_value_t = SendIter::CloneVec)]
+    pub send_iter: SendIter,
     #[arg(long, env = "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", value_enum)]
     pub string_length_distribution: Option<StringLengthDistribution>,
     #[arg(long, env = "ARROWCOL_CLIENT_VALUE_VARIATION", value_enum)]
@@ -1769,7 +1811,7 @@ impl PreparedClient {
             finished: false,
         };
         let observation = SendObservation::fresh()?;
-        let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
+        let mut request = Request::new(stream::iter(send_frames(&batch.data, self.options.send_iter)));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
             request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
@@ -3195,6 +3237,40 @@ mod tests {
         Cli::try_parse_from(["test", "--workers", "2", "--data-profile", "diagnostic"])?
             .options
             .resolve(100, 1)
+    }
+
+    #[test]
+    fn send_cursor_replays_identical_frames_without_eager_cloning() -> Result<()> {
+        use prost::Message;
+        let frames = Arc::new(vec![
+            FlightData {
+                data_header: vec![1, 2].into(),
+                ..Default::default()
+            },
+            FlightData {
+                data_body: vec![3, 4, 5].into(),
+                ..Default::default()
+            },
+        ]);
+        let expected = send_frames(&frames, SendIter::CloneVec)
+            .map(|frame| frame.encode_to_vec())
+            .collect::<Vec<_>>();
+        let mut cursor = send_frames(&frames, SendIter::ArcCursor);
+        assert_eq!(Arc::strong_count(&frames), 2);
+        assert_eq!(
+            cursor.next().context("missing first frame")?.encode_to_vec(),
+            expected[0]
+        );
+        assert_eq!(
+            cursor.next().context("missing second frame")?.encode_to_vec(),
+            expected[1]
+        );
+        assert!(cursor.next().is_none());
+        let retry = send_frames(&frames, SendIter::ArcCursor)
+            .map(|frame| frame.encode_to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(retry, expected);
+        Ok(())
     }
 
     fn hash_test_batches(
