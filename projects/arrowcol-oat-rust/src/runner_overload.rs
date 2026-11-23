@@ -1693,7 +1693,7 @@ mod overload_guard_tests {
     #[test]
     fn overload_cgroup_accounting_and_incremental_cursor_refuse_invented_limits() -> Result<()> {
         assert_eq!(guard_container_memory("0::/\n100\n1000\n", Some(1000))?.cap, 1000);
-        let unlimited = guard_container_memory("0::/\n100\nmax\n", None).expect_err("unlimited memory must fail");
+        let unlimited = guard_container_memory("0::/\n100\nmax\n", None).err().context("unlimited memory must fail")?;
         assert_eq!(classify_guard_error(&unlimited).kind, "container_memory_unlimited");
         assert!(validate_rendered_guard_memory_cap(&json!({"services":{"dataflow-1":{}}})).is_err());
         assert!(validate_rendered_guard_memory_cap(&json!({"services":{"dataflow-1":{"mem_limit":0}}})).is_err());
