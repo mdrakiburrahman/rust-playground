@@ -236,7 +236,7 @@ fn diagnostic_window_js_rust_js_roundtrip() -> Result<()> {
     };
     // Router ns and actual boundary timestamps from the e75 pressure observer.
     let js = run_node(
-        "const start={at:1795416733476,ns:15183032000},end={at:1795416793471,ns:73956466000}; console.log(JSON.stringify({start,end,router_cores:(end.ns-start.ns)/((end.at-start.at)*1e6)}));",
+        "const start={at:1795416733476,ns:15183032000},end={at:1795416793471,ns:73956466000}; console.log(JSON.stringify({start,end,support:1.4168206119208677,router_cores:(end.ns-start.ns)/((end.at-start.at)*1e6)}));",
         "",
     )?;
     let text = diagnostic_window_json(&js)?;
@@ -244,6 +244,11 @@ fn diagnostic_window_js_rust_js_roundtrip() -> Result<()> {
     run_node(
         "const {start,end,router_cores}=JSON.parse(process.argv[1]); require('node:assert/strict').equal(router_cores,(end.ns-start.ns)/((end.at-start.at)*1e6));",
         text,
+    )?;
+    let serialized = serde_json::to_string(&serde_json::from_slice::<Value>(&js)?)?;
+    run_node(
+        "const v=JSON.parse(process.argv[1]); require('node:assert/strict').deepEqual([v.router_cores,v.support],[0.9796388699058255,1.4168206119208677]);",
+        &serialized,
     )?;
     assert!(diagnostic_window_json(b"{}\n{}").is_err());
     Ok(())
