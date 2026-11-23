@@ -695,6 +695,7 @@ async fn run_batch_worker(
         stage_metrics: &stage_metrics,
         max_pending_files,
         coalesce_publications: policy.coalesce_publications,
+        stage_file_concurrency: policy.stage_file_concurrency,
         adaptive_defaults: policy.adaptive_file.build(),
         adaptive_readback: Arc::new(Mutex::new(None)),
         pipeline_depth: policy.pipeline_depth,
@@ -891,6 +892,7 @@ struct GroupPublisher<'a> {
     stage_metrics: &'a StageMetrics,
     max_pending_files: usize,
     coalesce_publications: bool,
+    stage_file_concurrency: usize,
     adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
     adaptive_readback: Arc<Mutex<Option<AdaptiveFileSizeConfig>>>,
     pipeline_depth: usize,
@@ -1001,6 +1003,7 @@ impl GroupPublisher<'_> {
         let stage_metrics = self.stage_metrics.clone();
         let max_pending_files = self.max_pending_files;
         let coalesce_publications = self.coalesce_publications;
+        let stage_file_concurrency = self.stage_file_concurrency;
         let adaptive_defaults = self.adaptive_defaults;
         let adaptive_readback = Arc::clone(&self.adaptive_readback);
         let flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1015,6 +1018,7 @@ impl GroupPublisher<'_> {
                 stage_metrics: &stage_metrics,
                 max_pending_files,
                 coalesce_publications,
+                stage_file_concurrency,
                 adaptive_defaults,
                 adaptive_readback,
                 pipeline_depth: 1,
@@ -1157,7 +1161,10 @@ impl GroupPublisher<'_> {
                 let mut pending_groups = VecDeque::from([inputs]);
                 let mut version = 0;
                 while let Some(mut inputs) = pending_groups.pop_front() {
-                    let prepared = match table.stage_coalesced_publications(inputs.clone()).await {
+                    let prepared = match table
+                        .stage_coalesced_publications_with_concurrency(inputs.clone(), self.stage_file_concurrency)
+                        .await
+                    {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             let capacity = error.downcast_ref::<CommitReceiptError>().and_then(|error| match error {

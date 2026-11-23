@@ -117,6 +117,7 @@ mod override_tests {
                 .is_err()
             );
         }
+
         let oversized = format!(
             r#"{{"global_capacity":{{"bytes":{}}}}}"#,
             arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1
@@ -127,6 +128,26 @@ mod override_tests {
                 .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn stage_file_concurrency_validates_the_merged_batch_policy() {
+        let config = FileBatchConfig::default();
+        assert_eq!(config.stage_file_concurrency, 1);
+        for (raw, valid) in [
+            ("1", true),
+            ("16", true),
+            ("0", false),
+            ("17", false),
+            ("-1", false),
+            ("1.5", false),
+            ("\"2\"", false),
+            ("null", false),
+        ] {
+            let json = format!(r#"{{"stage_file_concurrency":{raw}}}"#);
+            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+            assert_eq!(result.is_ok(), valid, "{json}");
+        }
     }
 
     #[test]
@@ -1113,6 +1134,8 @@ pub struct FileBatchConfig {
     pub max_age: Duration,
     /// Maximum simultaneous file publications.
     pub max_concurrent_flushes: usize,
+    /// Maximum sibling files staged concurrently within one coalesced publication.
+    pub stage_file_concurrency: usize,
     /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
     pub pipeline_depth: usize,
     /// Compressed Parquet target and estimator limits.
@@ -1139,6 +1162,7 @@ impl Default for FileBatchConfig {
             max_batches_per_flush: 512,
             max_age: Duration::from_secs(30),
             max_concurrent_flushes: 4,
+            stage_file_concurrency: 1,
             pipeline_depth: 1,
             adaptive_file: AdaptiveFileConfig::default(),
         }
@@ -1149,6 +1173,9 @@ impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         let global = self.global_capacity;
         let table = self.per_table_capacity;
+        if !(1..=16).contains(&self.stage_file_concurrency) {
+            return Err("stage_file_concurrency must be in 1..=16".to_owned());
+        }
         if [global.rows, global.batches, table.rows, table.batches].contains(&0)
             || global.bytes == 0
             || table.bytes == 0

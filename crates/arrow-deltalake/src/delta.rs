@@ -1091,6 +1091,32 @@ mod io_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn sibling_failure_stops_admission_but_drains_the_inflight_file() -> Result<()> {
+        use std::cell::Cell;
+        use tokio::sync::oneshot;
+        let (finish_first, first) = oneshot::channel::<Result<()>>();
+        let (fail_second, second) = oneshot::channel();
+        let (_finish_third, third) = oneshot::channel();
+        let started = Cell::new(0);
+        let mut stage = Box::pin(stage_bounded([first, second, third].into_iter(), 2, |wait| {
+            started.set(started.get() + 1);
+            async move { wait.await? }
+        }));
+        assert!(futures::poll!(stage.as_mut()).is_pending());
+        assert_eq!(started.get(), 2);
+        assert!(fail_second.send(Err(anyhow::anyhow!("file failed"))).is_ok());
+        assert!(futures::poll!(stage.as_mut()).is_pending());
+        assert_eq!(started.get(), 2);
+        assert!(finish_first.send(Ok(())).is_ok());
+        assert_eq!(
+            stage.await.err().context("missing file error")?.to_string(),
+            "file failed"
+        );
+        assert_eq!(started.get(), 2);
+        Ok(())
+    }
+
     /// Scenario: staging awaits a real, paused object-store put from a current-thread runtime.
     /// Guarantees: another caller task progresses and releases the put before its independent deadline.
     #[tokio::test(flavor = "current_thread")]
@@ -1866,6 +1892,7 @@ mod io_tests {
                     ),
                 ],
                 2,
+                2,
             )
             .await?;
         assert_eq!(identities.len(), 2);
@@ -1934,7 +1961,7 @@ mod io_tests {
         assert!(error.to_string().contains("differs from bound write context"));
         drop(direct);
         let error = match table
-            .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2)
+            .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2, 2)
             .await
         {
             Ok(_) => bail!("mismatched ingestion partition was accepted"),
@@ -2685,6 +2712,85 @@ struct CoalescedPartitionOutput {
     files: Vec<Vec<(RecordBatch, Option<GeneratedIngestion>)>>,
     file_rows: Vec<usize>,
     file_bytes: Vec<usize>,
+}
+
+struct CoalescedStagePolicy {
+    schema: SchemaRef,
+    table_properties: BTreeMap<String, String>,
+    resolved: arrowcol_props::ResolvedProps,
+    layout: Option<crate::layout::LayoutPolicy>,
+    mode: SortExecution,
+}
+
+type PublicationIds = Vec<(String, i64, i64)>;
+
+struct CoalescedPlan {
+    output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput>,
+    policy: CoalescedStagePolicy,
+    identities: PublicationIds,
+    committed_identities: PublicationIds,
+    build: Duration,
+    sort: Duration,
+}
+
+// A CPU job survives cancellation of its awaiting future. Each admitted job
+// therefore owns this guard until it has finished writing and registered its file.
+#[derive(Default)]
+struct UnpublishedStages(Mutex<BTreeMap<usize, StagedAppend>>);
+
+async fn stage_bounded<I, F, Fut>(mut jobs: I, width: usize, mut start: F) -> Result<()>
+where
+    I: Iterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use futures::StreamExt;
+    let mut pending = futures::stream::FuturesUnordered::new();
+    let mut first_error = None;
+    loop {
+        while first_error.is_none() && pending.len() < width {
+            let Some(job) = jobs.next() else { break };
+            pending.push(start(job));
+        }
+        match pending.next().await {
+            Some(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Some(Ok(())) => {}
+            None => return first_error.map_or(Ok(()), Err),
+        }
+    }
+}
+
+impl UnpublishedStages {
+    fn take(&self) -> Vec<StagedAppend> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+            .into_values()
+            .collect()
+    }
+
+    fn reclaim(files: &[StagedAppend]) {
+        if let Some(first) = files.first() {
+            first.table.reclaim_unsubmitted(files);
+        }
+    }
+}
+
+impl Drop for UnpublishedStages {
+    fn drop(&mut self) {
+        reclaim_abandoned_group(self.take());
+    }
+}
+
+pub(crate) fn reclaim_abandoned_group(files: Vec<StagedAppend>) {
+    if !files.is_empty() {
+        // Cancellation may drop the last reference on the shared I/O runtime.
+        // Cleanup calls synchronous Kernel APIs; keep it off the I/O threads.
+        let _cleanup =
+            spawn_shared_io(
+                async move { crate::delta_io::run_cpu_async(move || UnpublishedStages::reclaim(&files)).await },
+            );
+    }
 }
 
 // Bound every prefix produced by Arrow's flat-array take kernels, including
@@ -4336,6 +4442,7 @@ impl DeltaTable {
         self: &Arc<Self>,
         entries: Vec<(RecordBatch, String, i64, i64)>,
         max_files: usize,
+        concurrency: usize,
     ) -> Result<(
         Vec<StagedAppend>,
         Vec<(String, i64, i64)>,
@@ -4343,6 +4450,69 @@ impl DeltaTable {
         Duration,
         Duration,
     )> {
+        anyhow::ensure!(
+            (1..=16).contains(&concurrency),
+            "stage_file_concurrency must be in 1..=16"
+        );
+        let table = Arc::clone(self);
+        let plan = crate::delta_io::run_cpu_async(move || {
+            let executor = shared_executor()?;
+            let _guard = executor.enter();
+            table.plan_coalesced_publications(entries, max_files)
+        })
+        .await??;
+        let policy = Arc::new(plan.policy);
+        let staged = Arc::new(UnpublishedStages::default());
+        let jobs = plan.output.into_values().flat_map(|partition| {
+            partition
+                .files
+                .into_iter()
+                .map(move |batches| (partition.values.clone(), batches))
+        });
+        let result = stage_bounded(jobs.enumerate(), concurrency, |(index, (values, batches))| {
+            let staged = Arc::clone(&staged);
+            let table = Arc::clone(self);
+            let policy = Arc::clone(&policy);
+            async move {
+                crate::delta_io::run_cpu_async(move || {
+                    let executor = shared_executor()?;
+                    let _guard = executor.enter();
+                    // Kernel snapshot reads may themselves enter futures::block_on.
+                    let append = tokio::runtime::Handle::current().block_on(table.stage_coalesced_file(
+                        &policy,
+                        values,
+                        batches,
+                        index == 0,
+                    ))?;
+                    staged
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(index, append);
+                    Ok(())
+                })
+                .await?
+            }
+        })
+        .await;
+        if let Err(error) = result {
+            crate::delta_io::run_cpu_async(move || UnpublishedStages::reclaim(&staged.take())).await?;
+            return Err(error);
+        }
+        Ok((
+            staged.take(),
+            plan.identities,
+            plan.committed_identities,
+            plan.build,
+            plan.sort,
+        ))
+    }
+
+    fn plan_coalesced_publications(
+        &self,
+        entries: Vec<(RecordBatch, String, i64, i64)>,
+        max_files: usize,
+    ) -> Result<CoalescedPlan> {
         let preparation_started = Instant::now();
         let mut preparation_sort = Duration::ZERO;
         let Some((first_batch, _, _, _)) = entries.first() else {
@@ -4622,55 +4792,71 @@ impl DeltaTable {
             bail!("coalesced publications produced no replay identities");
         }
         let preparation_build = preparation_started.elapsed().saturating_sub(preparation_sort);
-        let mut staged = Vec::with_capacity(planned_files);
-        for partition in output.into_values() {
-            for batches in partition.files {
-                let properties = layout
-                    .as_ref()
-                    .map(|policy| policy.writer_properties(&physical_writer_schema(&schema, &partition.values)))
-                    .transpose()?;
-                let result = async {
-                    let mut writer =
-                        self.new_file_bound(Arc::clone(&schema), partition.values.clone(), properties, true)?;
-                    if writer.table_properties != table_properties {
-                        writer.discard_empty()?;
-                        bail!("table properties changed while preparing coalesced publication; retry");
-                    }
-                    if let Some(policy) = &layout {
-                        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                        writer.sorter = Some(PublicationSorter::new(physical, policy.clone(), mode)?);
-                    }
-                    if staged.is_empty() {
-                        self.record_layout_readback(
-                            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-                            &resolved,
-                            &table_properties,
-                            layout.is_some(),
-                            mode,
-                        )?;
-                    }
-                    for (batch, proof) in &batches {
-                        writer.write_bound(batch, proof.as_ref()).await?;
-                    }
-                    writer.stage().await
-                }
-                .await;
-                match result {
-                    Ok(append) => staged.push(append),
-                    Err(error) => {
-                        self.reclaim_unsubmitted(&staged);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        Ok((
-            staged,
+        Ok(CoalescedPlan {
+            output,
+            policy: CoalescedStagePolicy {
+                schema,
+                table_properties,
+                resolved,
+                layout,
+                mode,
+            },
             identities,
             committed_identities,
-            preparation_build,
-            preparation_sort,
-        ))
+            build: preparation_build,
+            sort: preparation_sort,
+        })
+    }
+
+    async fn stage_coalesced_file(
+        self: &Arc<Self>,
+        policy: &CoalescedStagePolicy,
+        values: crate::partition::PartitionValues,
+        batches: Vec<(RecordBatch, Option<GeneratedIngestion>)>,
+        first: bool,
+    ) -> Result<StagedAppend> {
+        let properties = policy
+            .layout
+            .as_ref()
+            .map(|layout| layout.writer_properties(&physical_writer_schema(&policy.schema, &values)))
+            .transpose()?;
+        let mut writer = self.new_file_bound(Arc::clone(&policy.schema), values, properties, true)?;
+        let local = writer.parquet.path.clone();
+        let result = async {
+            anyhow::ensure!(
+                writer.table_properties == policy.table_properties,
+                "table properties changed while preparing coalesced publication; retry"
+            );
+            if let Some(layout) = &policy.layout {
+                let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                writer.sorter = Some(PublicationSorter::new(physical, layout.clone(), policy.mode)?);
+            }
+            if first {
+                self.record_layout_readback(
+                    Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+                    &policy.resolved,
+                    &policy.table_properties,
+                    policy.layout.is_some(),
+                    policy.mode,
+                )?;
+            }
+            for (batch, proof) in &batches {
+                writer.write_bound(batch, proof.as_ref()).await?;
+            }
+            writer.stage().await
+        }
+        .await;
+        if result.is_err() {
+            // No transaction ever received this writer. Don't assume ownership
+            // of a remote object on an ambiguous upload failure.
+            if let Err(error) = self.discard_output(&local, &self.url, false) {
+                tracing::warn!(
+                    failure = cleanup_failure_class(&error),
+                    "failed to reclaim incomplete stage"
+                );
+            }
+        }
+        result
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
