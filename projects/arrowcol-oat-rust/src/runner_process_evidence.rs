@@ -2438,6 +2438,7 @@ groups:
             }
         }
         let observed = process_configurations(&text.context("collector did not produce readback")?)?;
+        assert_eq!(observed["dfe_worker_concurrency"], 1);
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
             "component": "collector", "instance_id": "collector-1", "log_complete": true,
