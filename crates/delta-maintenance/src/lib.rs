@@ -924,7 +924,12 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     Ok((effective, props))
 }
 
-fn configuration_evidence(startup: &Settings, settings: &Settings, props: &ResolvedProps) -> Result<serde_json::Value> {
+fn configuration_evidence(
+    startup: &Settings,
+    settings: &Settings,
+    props: &ResolvedProps,
+    table_properties: &BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
     let mut policy = serde_json::Map::new();
     for key in arrowcol_props::REGISTRY {
         let name = key.name;
@@ -978,7 +983,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
         .get("arrowcol.optimize.sealedPartitionsOnly")
         .map(|value| value.parse::<bool>())
         .transpose()?;
-    Ok(serde_json::json!({
+    let mut evidence = serde_json::json!({
         "startup": {
             "apply": startup.apply,
             "anchor_ms": startup.anchor_ms,
@@ -1017,7 +1022,13 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "allow_short_vacuum_retention": settings.allow_short_vacuum_retention,
             "unsafe_short_vacuum_for_tests": settings.unsafe_short_vacuum_for_tests,
         })),
-    }))
+    });
+    if startup.process_properties.contains_key("arrowcol.layout.sortOptions")
+        || table_properties.contains_key("arrowcol.layout.sortOptions")
+    {
+        evidence["layout_sources"] = layout_policy_sources(startup, table_properties);
+    }
+    Ok(evidence)
 }
 
 /// Validated startup defaults, before any table-level overrides.
@@ -1027,7 +1038,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
 pub fn startup_configuration(settings: &Settings) -> Result<serde_json::Value> {
     settings.validate()?;
     let (effective, props) = effective_settings(settings, &BTreeMap::new())?;
-    configuration_evidence(settings, &effective, &props)
+    configuration_evidence(settings, &effective, &props, &BTreeMap::new())
 }
 
 fn policy_matches(settings: &Settings, actual: &BTreeMap<String, String>, expected: &ResolvedProps) -> Result<bool> {
@@ -2479,7 +2490,7 @@ fn maintain_table(
             eprintln!("delta-maintenance target metadata refresh failed; identity unresolved table={name}");
         }
         discovered.log_token = Some(token);
-        let config = configuration_evidence(settings, &effective, &props)?;
+        let config = configuration_evidence(settings, &effective, &props, &discovered.properties)?;
         eprintln!(
             "arrowcol_maintenance_table_config {}",
             serde_json::json!({ "table": name, "config": config })

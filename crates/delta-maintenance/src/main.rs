@@ -116,6 +116,8 @@ struct Cli {
     layout_enabled: Option<bool>,
     #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_SORT_COLUMNS")]
     layout_sort_columns: Option<String>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS")]
+    layout_sort_options: Option<String>,
     #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_BLOOM_COLUMNS")]
     layout_bloom_columns: Option<String>,
     #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_MAX_ROWS")]
@@ -232,6 +234,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         ),
         ("arrowcol.layout.enabled", cli.layout_enabled.map(|v| v.to_string())),
         ("arrowcol.layout.sortColumns", cli.layout_sort_columns.clone()),
+        ("arrowcol.layout.sortOptions", cli.layout_sort_options.clone()),
         ("arrowcol.layout.bloomColumns", cli.layout_bloom_columns.clone()),
         ("arrowcol.layout.maxRows", cli.layout_max_rows.map(|v| v.to_string())),
         (

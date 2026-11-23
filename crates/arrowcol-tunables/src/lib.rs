@@ -556,6 +556,8 @@ pub struct MaintenanceTunables {
     pub vacuum_max_listed_files: Option<usize>,
     pub layout_enabled: Option<bool>,
     pub layout_sort_columns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_sort_options: Option<Vec<arrow_deltalake::layout::SortKeyOptions>>,
     pub layout_bloom_columns: Option<Vec<String>>,
     pub layout_max_rows: Option<usize>,
     pub layout_max_input_bytes: Option<usize>,

@@ -780,7 +780,7 @@ impl OatConfig {
                         maintenance.and_then(|settings| settings.parquet_writer.as_ref()),
                         maintenance.and_then(|settings| settings.layout_enabled),
                         maintenance.and_then(|settings| settings.layout_sort_columns.as_ref()),
-                        None,
+                        maintenance.and_then(|settings| settings.layout_sort_options.as_ref()),
                     ),
                 ] {
                     if let Some(writer) = writer {
@@ -816,6 +816,25 @@ impl OatConfig {
     }
 
     fn validate_selected_layout_schemas(&self) -> Result<()> {
+        if let Some(options) = self
+            .tunables
+            .maintenance
+            .as_ref()
+            .and_then(|settings| settings.layout_sort_options.as_ref())
+        {
+            let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
+            for table in collector_chain::dmv::tables()? {
+                let name = table.identity().table().as_str();
+                if selected.contains(name) {
+                    for option in options {
+                        table
+                            .schema()
+                            .index_of(&option.column)
+                            .with_context(|| format!("maintenance layout is invalid for selected DMV table {name}"))?;
+                    }
+                }
+            }
+        }
         let Some(layout) = self
             .tunables
             .collector

@@ -300,6 +300,61 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
 }
 
 #[test]
+fn oat_projected_maintenance_sort_options_drive_real_optimize() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+        "maintenance": {
+            "enabled": true, "operations": ["optimize"],
+            "layout_enabled": true, "layout_sort_columns": ["id"], "layout_bloom_columns": [],
+            "layout_sort_options": [{"column":"id","direction":"descending","nulls":"first"}]
+        }
+    }))?;
+    let env = tunables.environment_for(arrowcol_tunables::ComponentRole::Maintenance)?;
+    let output = service(root.path())?
+        .envs(&env)
+        .args(["--operation", "optimize", "--sealed-final", "--apply"])
+        .output()?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let reports = lines(&output.stdout)?;
+    let outputs = reports[0]["report"]["outputs"].as_array().context("missing outputs")?;
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(
+        reports[0]["optimize"]["config"]["layout_sources"]["arrowcol.layout.sortOptions"],
+        "process"
+    );
+    for output in outputs {
+        let relative = output.as_str().context("output path")?;
+        let url = Url::from_directory_path(&path)
+            .map_err(|()| anyhow!("table URL"))?
+            .join(relative)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(
+            url.to_file_path().map_err(|()| anyhow!("output file path"))?,
+        )?)?;
+        for group in reader.metadata().row_groups() {
+            let sorting = group.sorting_columns().context("missing sorting metadata")?;
+            assert_eq!(sorting.len(), 1);
+            assert_eq!(sorting[0].column_idx, 0);
+            assert!(sorting[0].descending && sorting[0].nulls_first);
+        }
+        let mut ids = Vec::new();
+        for batch in reader.build()? {
+            let batch = batch?;
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("id array")?;
+            ids.extend(values.values().iter().copied());
+        }
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1] + 1);
+    }
+    Ok(())
+}
+
+#[test]
 fn invalid_parquet_policy_fails_before_maintenance_mutates_tables() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("events");

@@ -437,6 +437,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.vacuum_max_listed_files", "100000"),
     capability!("maintenance.layout_enabled", "automatic"),
     capability!("maintenance.layout_sort_columns", "customer_id"),
+    capability!(
+        "maintenance.layout_sort_options",
+        "ascending, nulls last per sort column"
+    ),
     capability!("maintenance.layout_bloom_columns", "customer_id"),
     capability!("maintenance.layout_max_rows", "262144"),
     capability!("maintenance.layout_max_input_bytes", "67108864"),
@@ -871,6 +875,24 @@ impl Tunables {
         validate_wal(self.wal.as_ref())?;
         if let Some(maintenance) = &self.maintenance {
             validate_maintenance(maintenance)?;
+            if maintenance.enabled == Some(true)
+                && maintenance.layout_enabled != Some(false)
+                && maintenance
+                    .operations
+                    .as_ref()
+                    .is_some_and(|operations| operations.contains(&MaintenanceOperation::Optimize))
+                && maintenance.layout_sort_options.is_none()
+                && self
+                    .collector
+                    .as_ref()
+                    .and_then(|collector| collector.layout.as_ref())
+                    .and_then(|layout| layout.sort_options.as_ref())
+                    .is_some()
+            {
+                bail!(
+                    "collector.layout.sort_options requires explicit maintenance.layout_sort_options when maintenance automatic layout is enabled"
+                );
+            }
         }
         Ok(())
     }
@@ -1138,8 +1160,23 @@ impl Tunables {
                     object.remove("apply");
                     object.remove("operations");
                     object.remove("parquet_writer");
+                    object.remove("layout_sort_options");
                 }
                 flatten_environment(&value, "ARROWCOL_MAINT", &mut output);
+                if let Some(options) = self
+                    .maintenance
+                    .as_ref()
+                    .and_then(|settings| settings.layout_sort_options.as_ref())
+                {
+                    output.insert(
+                        "ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS".to_owned(),
+                        options
+                            .iter()
+                            .map(|option| option.to_property())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                }
                 continue;
             }
             if section == "parquet_writer" {
@@ -1884,6 +1921,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             has_optimize,
         ),
         (
+            "layout_sort_options",
+            maintenance.layout_sort_options.is_some(),
+            has_optimize,
+        ),
+        (
             "layout_bloom_columns",
             maintenance.layout_bloom_columns.is_some(),
             has_optimize,
@@ -2185,6 +2227,24 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     }
     if let Some(columns) = &maintenance.layout_sort_columns {
         validate_column_list("maintenance.layout_sort_columns", columns, true)?;
+    }
+    if let Some(options) = &maintenance.layout_sort_options {
+        if maintenance.layout_enabled == Some(false) {
+            bail!("maintenance.layout_sort_options requires maintenance.layout_enabled to be enabled");
+        }
+        let columns = maintenance
+            .layout_sort_columns
+            .as_ref()
+            .context("maintenance.layout_sort_options requires explicit maintenance.layout_sort_columns")?;
+        if options.is_empty()
+            || options.len() != columns.len()
+            || options
+                .iter()
+                .zip(columns)
+                .any(|(option, column)| option.column != *column)
+        {
+            bail!("maintenance.layout_sort_options must match maintenance.layout_sort_columns exactly in order");
+        }
     }
     if let Some(columns) = &maintenance.layout_bloom_columns {
         validate_column_list("maintenance.layout_bloom_columns", columns, false)?;
@@ -2629,6 +2689,51 @@ mod tests {
         ] {
             assert!(Tunables::parse_oat_json(invalid).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_sort_options_validate_and_project() -> Result<()> {
+        let option = serde_json::json!({"column":"customer_id","direction":"descending","nulls":"first"});
+        let valid = serde_json::json!({"maintenance":{
+            "enabled":true, "operations":["optimize"], "layout_enabled":true,
+            "layout_sort_columns":["customer_id"], "layout_sort_options":[option.clone()]
+        }});
+        let tunables = Tunables::parse_oat_json(valid.clone())?;
+        assert_eq!(
+            tunables.environment_for(ComponentRole::Maintenance)?["ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS"],
+            "customer_id:descending:first"
+        );
+        let mut bad = valid.clone();
+        bad["maintenance"]["layout_sort_options"][0]["direction"] = serde_json::json!("sideways");
+        assert!(Tunables::parse_oat_json(bad).is_err());
+        let mut bad = valid.clone();
+        bad["maintenance"]["layout_sort_options"][0]["nulls"] = serde_json::json!("middle");
+        assert!(Tunables::parse_oat_json(bad).is_err());
+        let mut bad = valid.clone();
+        bad["maintenance"]["layout_sort_columns"] = serde_json::json!(["other"]);
+        assert!(Tunables::parse_oat_json(bad).is_err());
+        let mut bad = valid.clone();
+        bad["maintenance"]
+            .as_object_mut()
+            .context("maintenance")?
+            .remove("layout_sort_columns");
+        assert!(Tunables::parse_oat_json(bad).is_err());
+        let mut bad = valid.clone();
+        bad["maintenance"]["layout_enabled"] = serde_json::json!(false);
+        assert!(Tunables::parse_oat_json(bad).is_err());
+        let mut divergence = valid.clone();
+        divergence["collector"] =
+            serde_json::json!({"layout":{"sort_columns":["customer_id"],"sort_options":[option]}});
+        divergence["maintenance"]
+            .as_object_mut()
+            .context("maintenance")?
+            .remove("layout_sort_options");
+        let error = error_text(Tunables::parse_oat_json(divergence.clone()));
+        assert!(error.contains("collector.layout.sort_options") && error.contains("maintenance.layout_sort_options"));
+        divergence["maintenance"]["layout_sort_options"] =
+            serde_json::json!([{"column":"customer_id","direction":"ascending","nulls":"last"}]);
+        Tunables::parse_oat_json(divergence)?;
         Ok(())
     }
 

@@ -385,6 +385,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         "VACUUM_MAX_LISTED_FILES" => ("/table_policy/arrowcol.vacuum.maxListedFiles".to_owned(), 1, false),
         "LAYOUT_ENABLED" => ("/table_policy/arrowcol.layout.enabled".to_owned(), 1, false),
         "LAYOUT_SORT_COLUMNS" => ("/table_policy/arrowcol.layout.sortColumns".to_owned(), 1, false),
+        "LAYOUT_SORT_OPTIONS" => ("/table_policy/arrowcol.layout.sortOptions".to_owned(), 1, false),
         "LAYOUT_BLOOM_COLUMNS" => ("/table_policy/arrowcol.layout.bloomColumns".to_owned(), 1, false),
         "LAYOUT_MAX_ROWS" => ("/table_policy/arrowcol.layout.maxRows".to_owned(), 1, false),
         "LAYOUT_MAX_INPUT_BYTES" => ("/table_policy/arrowcol.layout.maxInputSize".to_owned(), 1, false),
@@ -439,13 +440,24 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
     } else {
         expected
     };
-    Ok((
-        observed
+    let actual = observed
             .pointer(&path)
             .with_context(|| format!("maintenance startup omitted {variable}"))?
-            .clone(),
-        expected,
-    ))
+            .clone();
+    if field == "LAYOUT_SORT_OPTIONS" {
+        let parse = |values: Vec<&str>| -> Result<Value> {
+            let options = values.into_iter()
+                .map(arrow_deltalake::layout::SortKeyOptions::from_property)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(serde_json::to_value(options)?)
+        };
+        let actual = actual.as_array().context("maintenance sort options readback must be an array")?
+            .iter().map(|value| value.as_str().context("maintenance sort option must be a string"))
+            .collect::<Result<Vec<_>>>()?;
+        let expected = expected.as_str().context("maintenance sort options must be comma separated")?;
+        return Ok((parse(actual)?, parse(expected.split(',').collect())?));
+    }
+    Ok((actual, expected))
 }
 
 fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<()> {
@@ -785,6 +797,27 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance table readback omitted resolved table policy");
         }
         verify_maintenance_controls(config, &policy)?;
+        if config.tunables.maintenance.as_ref().and_then(|settings| settings.layout_sort_options.as_ref()).is_some() {
+            let source = policy.pointer("/layout_sources/arrowcol.layout.sortOptions")
+                .and_then(Value::as_str).context("maintenance sort options source missing")?;
+            let expected = config.tunables.environment_for(ComponentRole::Maintenance)?
+                .remove("ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS")
+                .context("maintenance sort options projection missing")?;
+            let (actual, requested) = maintenance_readback_value(&policy, "ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS", json!(expected))?;
+            let columns = policy.pointer("/table_policy/arrowcol.layout.sortColumns")
+                .and_then(Value::as_array).context("maintenance effective sort columns missing")?;
+            let options = actual.as_array().context("maintenance effective sort options missing")?;
+            if options.len() != columns.len() || options.iter().zip(columns)
+                .any(|(option, column)| option.get("column") != Some(column))
+            {
+                bail!("maintenance effective sort options do not match sort columns");
+            }
+            match source {
+                "process" if actual == requested => {},
+                "table" if !options.is_empty() => {},
+                _ => bail!("maintenance effective sort options do not match their source"),
+            }
+        }
         verify_effective_maintenance_stop_budget(config, &policy["table_policy"])?;
         if let Some(previous) = tables.insert(table.to_owned(), policy.clone())
             && previous != policy
@@ -1033,6 +1066,39 @@ mod maintenance_topology_tests {
                 other => bail!("unexpected fixture eligibility: {other:?}"),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_sort_options_require_startup_and_effective_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"operations":["optimize"],
+                "layout_sort_columns":["customer_id"],
+                "layout_sort_options":[{"column":"customer_id","direction":"descending","nulls":"first"}]}
+        }))?;
+        let mut observed = json!({
+            "startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
+            "table_policy":{"arrowcol.maintenance.operationTimeout":300_000,
+                "arrowcol.layout.sortColumns":["customer_id"],
+                "arrowcol.layout.sortOptions":["customer_id:descending:first"]},
+            "layout_sources":{"arrowcol.layout.sortOptions":"process"}, "active":true
+        });
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let event = |policy: &Value| format!("arrowcol_maintenance_table_config {}\n", json!({"table":table,"config":policy}));
+        maintenance_table_evidence(&config, &event(&observed))?;
+        observed["table_policy"]["arrowcol.layout.sortOptions"] = json!(["customer_id:ascending:last"]);
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
+        assert!(maintenance_table_evidence(&config, &event(&observed)).is_err());
+        observed["layout_sources"]["arrowcol.layout.sortOptions"] = json!("table");
+        maintenance_table_evidence(&config, &event(&observed))?;
+        observed["table_policy"].as_object_mut().context("policy")?.remove("arrowcol.layout.sortOptions");
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
+        assert!(maintenance_table_evidence(&config, &event(&observed)).is_err());
         Ok(())
     }
 
