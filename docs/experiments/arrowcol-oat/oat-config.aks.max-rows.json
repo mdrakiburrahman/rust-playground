@@ -42,7 +42,6 @@
   ],
   "rows_per_table": 1000000,
   "clients_per_table": 1,
-  "dmv_concurrency": 64,
   "qap_endpoint": "https://arrow-collector-00000.canadacentral.kusto.windows.net",
   "qap_database": null,
   "qap_timeout_seconds": 180,

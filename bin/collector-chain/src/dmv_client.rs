@@ -336,9 +336,12 @@ impl Options {
         if self.runtime_threads == 0 {
             self.runtime_threads = available_parallelism;
         }
-        if self.streams_per_worker == 0 {
+        let streams_per_worker_source = if self.streams_per_worker == 0 {
             self.streams_per_worker = concurrency;
-        }
+            "legacy_concurrency"
+        } else {
+            "explicit_streams_per_worker"
+        };
         self.string_length_distribution.get_or_insert(match self.data_profile {
             DataProfile::Diagnostic => StringLengthDistribution::Fixed,
             DataProfile::Realistic => StringLengthDistribution::Uniform,
@@ -461,6 +464,7 @@ impl Options {
                 "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
             },
             "corpus_rows_source": corpus_rows_source,
+            "streams_per_worker_source": streams_per_worker_source,
         });
         Ok((self, evidence))
     }
@@ -4380,7 +4384,20 @@ mod tests {
         assert_eq!(evidence["resolved"]["batch_rows"], 123);
         assert_eq!(evidence["resolved"]["corpus_rows"], 123);
         assert_eq!(evidence["resolved"]["streams_per_worker"], 7);
+        assert_eq!(evidence["streams_per_worker_source"], "legacy_concurrency");
         assert_eq!(evidence["corpus_rows_source"], "legacy_rows");
+        for mode in [DataMode::Shared, DataMode::Independent] {
+            for profile in [DataProfile::Diagnostic, DataProfile::Realistic] {
+                let mut options = options()?;
+                options.data_mode = mode;
+                options.data_profile = profile;
+                options.workers = 14;
+                options.streams_per_worker = 0;
+                let (resolved, proof) = options.resolve_with_evidence(123, 2)?;
+                assert_eq!(resolved.workers * resolved.streams_per_worker, 28);
+                assert_eq!(proof["streams_per_worker_source"], "legacy_concurrency");
+            }
+        }
 
         let mut options = options()?;
         options.corpus_rows = 0;
