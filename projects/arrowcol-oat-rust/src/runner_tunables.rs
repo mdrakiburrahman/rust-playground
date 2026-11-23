@@ -296,8 +296,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 && collectors.iter().all(|process| {
                     let config = &process["effective_config"];
                     let requested = config["socket"][field].as_u64();
-                    let observed = config["socket_listener_effective"][field].as_u64();
-                    config["socket_listener_effective"]["scope"] == "linux_flight_listener"
+                    let observed = config["socket_buffer_effective"][field].as_u64();
+                    config["socket_buffer_effective"]["scope"] == "linux_flight_listener"
                         && requested.zip(observed).is_some_and(|(requested, observed)| {
                             requested.checked_mul(2).is_some_and(|minimum| observed >= minimum)
                         })
@@ -1268,7 +1268,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         });
         for observed in [None, Some(32768), Some(65536)] {
             if let Some(value) = observed {
-                process["effective_config"]["socket_listener_effective"] =
+                process["effective_config"]["socket_buffer_effective"] =
                     json!({"recv_buffer_bytes":value,"scope":"linux_flight_listener"});
             }
             let mut evidence = tunable_leaf_evidence(&config)?;

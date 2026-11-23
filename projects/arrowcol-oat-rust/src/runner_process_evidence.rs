@@ -2438,8 +2438,8 @@ groups:
         assert_eq!(observed["dfe_worker_concurrency"], 2);
         assert_eq!(observed["socket_effective"]["tcp_nodelay"], true);
         if cfg!(target_os = "linux") {
-            assert!(observed["socket_listener_effective"]["recv_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
-            assert!(observed["socket_listener_effective"]["send_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
+            assert!(observed["socket_buffer_effective"]["recv_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
+            assert!(observed["socket_buffer_effective"]["send_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
         }
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({

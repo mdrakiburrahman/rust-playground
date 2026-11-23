@@ -591,7 +591,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
         {
             eprintln!(
                 "arrowcol_effective_config {}",
-                serde_json::json!({"socket_listener_effective":actual})
+                serde_json::json!({"socket_buffer_effective":actual})
             );
         }
         let admin_listener = effect_handler.tcp_listener(self.config.admin_listening_addr)?;
