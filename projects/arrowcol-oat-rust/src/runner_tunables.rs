@@ -397,6 +397,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.send_iter") => ("send_iter", "ARROWCOL_CLIENT_SEND_ITER"),
             Some("client.identity_builder") => ("identity_builder", "ARROWCOL_CLIENT_IDENTITY_BUILDER"),
             Some("client.null_fraction") => ("null_fraction", "ARROWCOL_CLIENT_NULL_FRACTION"),
+            Some("client.pod_ordinal") => ("pod_ordinal", "ARROWCOL_CLIENT_POD_ORDINAL"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -450,6 +451,28 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
                 return false;
             }
             return true;
+        }
+        if field == "pod_ordinal" {
+            let counts = reports.iter().map(|report| {
+                let name = report["table"].as_str()?;
+                let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
+                if tables.len() != 1 || !tables[0]["table"].as_str()?.eq_ignore_ascii_case(name) {
+                    return None;
+                }
+                let columns = tables[0].pointer("/pod_ordinal/eligible_columns")?.as_u64()?;
+                let rows = tables[0].pointer("/pod_ordinal/eligible_rows")?.as_u64()?;
+                Some((columns, rows))
+            }).collect::<Option<Vec<_>>>();
+            let Some(counts) = counts else { return true; };
+            if counts.iter().all(|&(columns, rows)| columns == 0 && rows == 0) {
+                inert.push(json!({"path": entry["path"], "reason": "no_pod_ordinal_guid_rows"}));
+                return false;
+            }
+            if counts.iter().any(|&(columns, rows)| columns == 0 || rows == 0)
+                || reports.iter().any(|report| report["consumer_effective_config"]["guid_uniqueness"] != "per_row")
+            {
+                return true;
+            }
         }
         if !environment.contains_key(variable)
             || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())

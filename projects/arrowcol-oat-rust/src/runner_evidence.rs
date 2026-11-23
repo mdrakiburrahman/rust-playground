@@ -2380,6 +2380,17 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
             if columns > fields || rows.checked_mul(columns) != Some(eligible_rows) || null_rows > eligible_rows {
                 bail!("inconsistent client generator_applicability null counts");
             }
+            if let Some(guid) = table.get("pod_ordinal") {
+                let columns = guid["eligible_columns"].as_u64()
+                    .context("client generator_applicability pod_ordinal eligible_columns must be unsigned")?;
+                let eligible_rows = guid["eligible_rows"].as_u64()
+                    .context("client generator_applicability pod_ordinal eligible_rows must be unsigned")?;
+                if columns > fields || rows.checked_mul(columns).is_none_or(|maximum| eligible_rows > maximum)
+                    || (columns == 0) != (eligible_rows == 0)
+                {
+                    bail!("inconsistent client generator_applicability pod_ordinal counts");
+                }
+            }
             total_rows = total_rows.checked_add(rows).context("client generator_applicability row overflow")?;
         }
         if object.get("corpus_rows").and_then(Value::as_u64) != Some(total_rows) {
