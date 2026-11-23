@@ -200,9 +200,11 @@ pub struct Options {
     pub connect_retries: u32,
     #[arg(long, env = "ARROWCOL_CLIENT_RETRY_BACKOFF_MS", default_value_t = 100)]
     pub retry_backoff_ms: u64,
-    /// Zero disables the per-connection token-bucket request limit.
+    /// Zero disables the per-connection request limit; otherwise this is the number per period.
     #[arg(long, env = "ARROWCOL_CLIENT_RATE_LIMIT_RPS", default_value_t = 0)]
     pub rate_limit_rps: u64,
+    #[arg(long, env = "ARROWCOL_CLIENT_RATE_LIMIT_PERIOD_MS", default_value_t = 1000)]
+    pub rate_limit_period_ms: u64,
 }
 
 impl Options {
@@ -356,6 +358,10 @@ impl Options {
             self.interval_us <= 86_400_000_000,
             "interval-us must not exceed one day"
         );
+        anyhow::ensure!(
+            (1..=86_400_000).contains(&self.rate_limit_period_ms),
+            "rate-limit-period-ms must be between 1 and 86400000"
+        );
         for value in [
             self.connect_timeout_ms,
             self.request_timeout_ms,
@@ -411,7 +417,7 @@ impl Options {
             endpoint = endpoint.http2_keep_alive_interval(Duration::from_millis(self.keepalive_interval_ms));
         }
         if self.rate_limit_rps > 0 {
-            endpoint = endpoint.rate_limit(self.rate_limit_rps, Duration::from_secs(1));
+            endpoint = endpoint.rate_limit(self.rate_limit_rps, Duration::from_millis(self.rate_limit_period_ms));
         }
         Ok(endpoint)
     }
@@ -3603,6 +3609,8 @@ mod tests {
             vec!["--stream-window-bytes", "2147483648"],
             vec!["--dictionary-handling", "resend"],
             vec!["--stream-retry-max-attempts", "0"],
+            vec!["--rate-limit-period-ms", "0"],
+            vec!["--rate-limit-period-ms", "86400001"],
             vec![
                 "--stream-retry-base-backoff-ms",
                 "100",
@@ -4670,6 +4678,33 @@ mod tests {
             "late slow acknowledgement must be drained but excluded from measurement"
         );
         drop(client);
+        let mut limited_options = Cli::try_parse_from(["test", "--workers", "1"])?
+            .options
+            .resolve(100, 1)?;
+        limited_options.workers = 1;
+        limited_options.corpus_rows = 16;
+        limited_options.batch_rows = 8;
+        limited_options.streams_per_worker = 1;
+        limited_options.max_rows = 16;
+        limited_options.rate_limit_rps = 1;
+        limited_options.rate_limit_period_ms = 3000;
+        let limited = PreparedClient::prepare(
+            &endpoint,
+            "rate-limited",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            limited_options,
+        )
+        .await?;
+        let rows_before_limit = state.rows.load(Ordering::Relaxed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), limited.send_once())
+                .await
+                .is_err(),
+            "two requests completed before the configured rate-limit period"
+        );
+        assert_eq!(state.rows.load(Ordering::Relaxed) - rows_before_limit, 8);
+        drop(limited);
         shutdown
             .send(())
             .map_err(|()| anyhow::anyhow!("smoke server stopped early"))?;

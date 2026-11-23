@@ -102,6 +102,8 @@ pub struct TransportTunables {
     pub tcp_keepalive_interval_ms: Option<u64>,
     pub tcp_keepalive_retries: Option<u32>,
     pub rate_limit_rps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_period_ms: Option<u64>,
     pub endpoint_concurrency_limit: Option<usize>,
     pub endpoint_buffer_size: Option<usize>,
     pub connect_retries: Option<u32>,

@@ -26,6 +26,7 @@ enum ApplicabilityGate {
     Http2Keepalive,
     FixedHttp2Window,
     TcpKeepalive,
+    RateLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,7 +163,15 @@ const CAPABILITIES: &[Capability] = &[
         "0; inert when tcp_keepalive_ms is 0",
         TcpKeepalive
     ),
-    capability!("transport.rate_limit_rps", "disabled"),
+    capability!(
+        "transport.rate_limit_rps",
+        "0 (disabled); otherwise requests per rate_limit_period_ms"
+    ),
+    gated_capability!(
+        "transport.rate_limit_period_ms",
+        "1000; inert when rate_limit_rps is 0",
+        RateLimit
+    ),
     capability!("transport.endpoint_concurrency_limit", "256"),
     capability!("transport.endpoint_buffer_size", "1024"),
     capability!("transport.connect_retries", "component default"),
@@ -490,6 +499,11 @@ impl Tunables {
         let adaptive_http2_window = requested.pointer("/transport/adaptive_window") == Some(&Value::Bool(true));
         let tcp_keepalive_disabled =
             requested.pointer("/transport/tcp_keepalive_ms").and_then(Value::as_u64) == Some(0);
+        let rate_limit_disabled = requested
+            .pointer("/transport/rate_limit_rps")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0;
         let mut inert_fields = Vec::new();
         let mut projection_only = Vec::new();
         let mut runner_controls = Vec::new();
@@ -500,6 +514,7 @@ impl Tunables {
             http2_keepalive_disabled: bool,
             adaptive_http2_window: bool,
             tcp_keepalive_disabled: bool,
+            rate_limit_disabled: bool,
         }
         fn visit(
             value: &Value,
@@ -554,6 +569,8 @@ impl Tunables {
                 (inert, "adaptive_http2_window")
             } else if capability.gate == Some(ApplicabilityGate::TcpKeepalive) && context.tcp_keepalive_disabled {
                 (inert, "tcp_keepalive_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::RateLimit) && context.rate_limit_disabled {
+                (inert, "rate_limit_disabled")
             } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
                 (inert, "dictionary_disabled")
             } else if matches!(
@@ -578,6 +595,7 @@ impl Tunables {
                 http2_keepalive_disabled,
                 adaptive_http2_window,
                 tcp_keepalive_disabled,
+                rate_limit_disabled,
             },
             false,
             &mut inert_fields,
@@ -708,6 +726,12 @@ impl Tunables {
             bail!("configure Arrow IPC compression in arrow_ipc.compression, not in both sections");
         }
         if let Some(transport) = &self.transport {
+            if transport
+                .rate_limit_period_ms
+                .is_some_and(|period| !(1..=86_400_000).contains(&period))
+            {
+                bail!("transport.rate_limit_period_ms must be between 1 and 86400000");
+            }
             let message_bytes = transport.max_message_bytes.unwrap_or(default_message_bytes);
             let flight_bytes = transport.max_flight_data_bytes.unwrap_or(default_flight_bytes);
             if message_bytes == 0 || message_bytes > i32::MAX as u64 {

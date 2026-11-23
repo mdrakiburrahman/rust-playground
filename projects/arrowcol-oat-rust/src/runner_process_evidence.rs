@@ -2395,6 +2395,7 @@ groups:
             (json!({"transport":{"tcp_keepalive_interval_ms":500}}), "tcp_keepalive_interval_ms"),
             (json!({"transport":{"tcp_keepalive_retries":3}}), "tcp_keepalive_retries"),
             (json!({"transport":{"rate_limit_rps":123}}), "rate_limit_rps"),
+            (json!({"transport":{"rate_limit_rps":123,"rate_limit_period_ms":250}}), "rate_limit_period_ms"),
             (json!({"transport":{"connect_retries":3}}), "connect_retries"),
             (json!({"transport":{"retry_backoff_ms":1}}), "retry_backoff_ms"),
             (json!({"transport":{"endpoint_concurrency_limit":23}}), "endpoint_concurrency_limit"),
@@ -2435,6 +2436,7 @@ groups:
                 | "keepalive_timeout_ms" | "keepalive_while_idle"
                 | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
                 | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
+                | "rate_limit_period_ms"
                 | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
                 config.clients_per_table = 1;
                 let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
@@ -2464,7 +2466,8 @@ groups:
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
             "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
             "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false,
-            "tcp_keepalive_ms":0, "tcp_keepalive_interval_ms":500, "tcp_keepalive_retries":3
+            "tcp_keepalive_ms":0, "tcp_keepalive_interval_ms":500, "tcp_keepalive_retries":3,
+            "rate_limit_period_ms":250
         }}))?;
         let observed = actual_client_startup(&binary, &config)?;
         let mut coverage = tunable_leaf_evidence(&config)?;
@@ -2473,7 +2476,8 @@ groups:
         })]))?;
         for field in ["transport.stream_window_bytes", "transport.connection_window_bytes",
             "transport.keepalive_timeout_ms", "transport.keepalive_while_idle",
-            "transport.tcp_keepalive_interval_ms", "transport.tcp_keepalive_retries"] {
+            "transport.tcp_keepalive_interval_ms", "transport.tcp_keepalive_retries",
+            "transport.rate_limit_period_ms"] {
             assert!(coverage["inert_fields"].as_array().context("missing inert fields")?
                 .iter().any(|entry| entry["path"] == field));
             assert!(!coverage["consumer_verified"].as_array().context("missing verified fields")?

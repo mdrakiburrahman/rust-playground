@@ -43,7 +43,8 @@ test("inert tunable evidence is distinguished from unavailable or malformed evid
     { path: "transport.stream_window_bytes", reason: "adaptive_http2_window" },
     { path: "transport.keepalive_timeout_ms", reason: "http2_keepalive_disabled" },
     { path: "transport.tcp_keepalive_retries", reason: "tcp_keepalive_disabled" },
-  ] })?.map(entry => entry.reason), ["adaptive_http2_window", "http2_keepalive_disabled", "tcp_keepalive_disabled"]);
+    { path: "transport.rate_limit_period_ms", reason: "rate_limit_disabled" },
+  ] })?.map(entry => entry.reason), ["adaptive_http2_window", "http2_keepalive_disabled", "tcp_keepalive_disabled", "rate_limit_disabled"]);
   assert.deepEqual(extractInertTunableFields({ inert_fields: [field, {
     path: "parquet_writer.columns.customer_id.dictionary_page_size_limit", reason: "dictionary_disabled",
   }] })?.map(entry => entry.reason), ["maintenance_disabled", "dictionary_disabled"]);

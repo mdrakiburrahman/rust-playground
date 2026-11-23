@@ -108,6 +108,38 @@ fn tcp_keepalive_options_follow_the_enable_setting() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn rate_limit_period_is_strict_and_inert_when_disabled() -> Result<()> {
+    let unchanged = Tunables::parse_oat_json(json!({"transport":{"rate_limit_rps": 2}}))?;
+    assert!(
+        serde_json::to_value(unchanged)?["transport"]
+            .get("rate_limit_period_ms")
+            .is_none()
+    );
+    for bad in [json!(0), json!(86_400_001), json!(-1), json!(1.5), json!("1000")] {
+        assert!(Tunables::parse_oat_json(json!({"transport":{"rate_limit_period_ms":bad}})).is_err());
+    }
+    for (rps, inert) in [(0, true), (2, false)] {
+        let tunables =
+            Tunables::parse_oat_json(json!({"transport":{"rate_limit_rps":rps,"rate_limit_period_ms":250}}))?;
+        assert_eq!(
+            tunables.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_RATE_LIMIT_PERIOD_MS"],
+            "250"
+        );
+        let evidence = tunables.classify_oat_leaves()?;
+        assert_eq!(
+            evidence["inert_fields"]
+                .as_array()
+                .context("missing inert fields")?
+                .iter()
+                .any(|entry| entry["path"] == "transport.rate_limit_period_ms"
+                    && entry["reason"] == "rate_limit_disabled"),
+            inert
+        );
+    }
+    Ok(())
+}
+
 // The scanner deliberately fails on unfamiliar field syntax rather than silently skipping it.
 // Vecs of scalar values and sorting_columns are treated as atomic values. The latter's
 // element schema is guarded separately below.

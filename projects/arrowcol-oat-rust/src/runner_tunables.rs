@@ -136,6 +136,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("transport.tcp_keepalive_ms") => ("tcp_keepalive_ms", "ARROWCOL_CLIENT_TCP_KEEPALIVE_MS"),
             Some("transport.tcp_keepalive_interval_ms") => ("tcp_keepalive_interval_ms", "ARROWCOL_CLIENT_TCP_KEEPALIVE_INTERVAL_MS"),
             Some("transport.tcp_keepalive_retries") => ("tcp_keepalive_retries", "ARROWCOL_CLIENT_TCP_KEEPALIVE_RETRIES"),
+            Some("transport.rate_limit_period_ms") => ("rate_limit_period_ms", "ARROWCOL_CLIENT_RATE_LIMIT_PERIOD_MS"),
             Some("transport.endpoint_concurrency_limit") => ("endpoint_concurrency_limit", "ARROWCOL_CLIENT_ENDPOINT_CONCURRENCY_LIMIT"),
             Some("transport.endpoint_buffer_size") => ("endpoint_buffer_size", "ARROWCOL_CLIENT_ENDPOINT_BUFFER_SIZE"),
             _ => return true,
