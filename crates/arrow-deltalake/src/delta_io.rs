@@ -1,5 +1,6 @@
 //! Process-wide Kernel I/O runtime, independent of the caller's Tokio runtime.
 
+use crate::{CpuDispatch, CpuPlacement};
 use anyhow::{Context, Result};
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_default_engine::executor::TaskExecutor;
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use tokio::runtime::{EnterGuard, Runtime};
 
@@ -72,6 +74,10 @@ pub struct DeltaRuntimeConfig {
     pub batch_rows: usize,
     /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
     pub cpu_workers: usize,
+    #[serde(default)]
+    pub cpu_dispatch: CpuDispatch,
+    #[serde(default)]
+    pub cpu_placement: CpuPlacement,
     /// Maximum concurrent Parquet leaf-column encoders; 1 preserves AsyncArrowWriter.
     #[serde(default = "default_parquet_column_workers")]
     pub parquet_column_workers: u8,
@@ -136,6 +142,8 @@ impl DeltaRuntimeConfig {
             read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
+            cpu_dispatch: CpuDispatch::default(),
+            cpu_placement: CpuPlacement::default(),
             parquet_column_workers: default_parquet_column_workers(),
             cpu_queue_jobs: None,
             partition_grouping: crate::PartitionGrouping::default(),
@@ -214,6 +222,14 @@ impl DeltaRuntimeConfig {
         if let Some(raw) = lookup(name)? {
             config.timestamp_kernel =
                 serde_json::from_value(serde_json::Value::String(raw)).with_context(|| format!("parse {name}"))?;
+        }
+        let name = "ARROWCOL_COLLECTOR_CPU_DISPATCH";
+        if let Some(raw) = lookup(name)? {
+            config.cpu_dispatch = CpuDispatch::try_from(raw).map_err(|why| anyhow::anyhow!("{name}: {why}"))?;
+        }
+        let name = "ARROWCOL_COLLECTOR_CPU_PLACEMENT";
+        if let Some(raw) = lookup(name)? {
+            config.cpu_placement = CpuPlacement::try_from(raw).map_err(|why| anyhow::anyhow!("{name}: {why}"))?;
         }
         for (suffix, value) in [
             ("EVENT_INTERVAL", &mut config.event_interval),
@@ -371,7 +387,14 @@ static CONFIG: OnceLock<std::result::Result<DeltaRuntimeConfig, String>> = OnceL
 /// Returns invalid startup configuration; initialization errors remain sticky.
 pub fn runtime_config() -> Result<&'static DeltaRuntimeConfig> {
     CONFIG
-        .get_or_init(|| DeltaRuntimeConfig::from_env().map_err(|error| format!("{error:#}")))
+        .get_or_init(|| {
+            let config = DeltaRuntimeConfig::from_env().map_err(|error| format!("{error:#}"))?;
+            if config.cpu_dispatch != CpuDispatch::SharedFifo || config.cpu_placement != CpuPlacement::Os {
+                // Do not advertise an opt-in CPU policy until every worker acknowledged startup.
+                configured_cpu_pool(&config, "runtime_initialization").map_err(|error| format!("{error:#}"))?;
+            }
+            Ok(config)
+        })
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
@@ -379,7 +402,141 @@ pub fn runtime_config() -> Result<&'static DeltaRuntimeConfig> {
 type CpuJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct CpuPool {
-    sender: tokio::sync::mpsc::Sender<CpuJob>,
+    queues: CpuQueues,
+    worker_cpu_ids: Vec<Option<usize>>,
+}
+
+type ShardJob = (tokio::sync::OwnedSemaphorePermit, CpuJob);
+
+enum CpuQueues {
+    Shared(tokio::sync::mpsc::Sender<CpuJob>),
+    Shards {
+        senders: Vec<mpsc::SyncSender<ShardJob>>,
+        next: AtomicUsize,
+        slots: Arc<tokio::sync::Semaphore>,
+    },
+}
+
+enum WorkerQueue {
+    Shared(Arc<Mutex<tokio::sync::mpsc::Receiver<CpuJob>>>),
+    Shard(mpsc::Receiver<ShardJob>),
+}
+
+impl WorkerQueue {
+    fn receive(&mut self) -> Option<CpuJob> {
+        match self {
+            Self::Shared(rx) => rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .blocking_recv(),
+            Self::Shard(rx) => rx.recv().ok().map(|(_queued_slot, job)| job),
+        }
+    }
+}
+
+impl CpuQueues {
+    fn new(dispatch: CpuDispatch, workers: usize, capacity: usize) -> (Self, Vec<WorkerQueue>) {
+        match dispatch {
+            CpuDispatch::SharedFifo => {
+                let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+                let rx = Arc::new(Mutex::new(rx));
+                (
+                    Self::Shared(tx),
+                    (0..workers).map(|_| WorkerQueue::Shared(Arc::clone(&rx))).collect(),
+                )
+            }
+            CpuDispatch::BoundedShards => {
+                let (senders, receivers) = (0..workers)
+                    .map(|_| {
+                        let (tx, rx) = mpsc::sync_channel(capacity);
+                        (tx, WorkerQueue::Shard(rx))
+                    })
+                    .unzip();
+                (
+                    Self::Shards {
+                        senders,
+                        next: AtomicUsize::new(0),
+                        slots: Arc::new(tokio::sync::Semaphore::new(capacity)),
+                    },
+                    receivers,
+                )
+            }
+        }
+    }
+
+    async fn send(&self, job: CpuJob) -> Result<()> {
+        match self {
+            Self::Shared(tx) => tx
+                .send(job)
+                .await
+                .map_err(|_| anyhow::anyhow!("Delta CPU pool stopped")),
+            Self::Shards { senders, next, slots } => {
+                // All shards share one queue budget. Even a hot shard can accept any
+                // job holding a permit without waiting or blocking an async caller.
+                let permit = Arc::clone(slots).acquire_owned().await?;
+                let shard = next.fetch_add(1, AtomicOrdering::Relaxed) % senders.len();
+                senders[shard]
+                    .try_send((permit, job))
+                    .map_err(|_| anyhow::anyhow!("Delta CPU shard unavailable"))
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Self::Shared(_) => 1,
+            Self::Shards { senders, .. } => senders.len(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_cpus() -> Result<Vec<usize>> {
+    use rustix::thread::{CpuSet, sched_getaffinity};
+    let mask = sched_getaffinity(None).context("read effective CPU affinity")?;
+    let cpus: Vec<_> = (0..CpuSet::MAX_CPU).filter(|&id| mask.is_set(id)).collect();
+    anyhow::ensure!(!cpus.is_empty(), "effective CPU affinity is empty");
+    Ok(cpus)
+}
+
+fn worker_targets(placement: CpuPlacement, workers: usize) -> Result<Vec<Option<usize>>> {
+    if placement == CpuPlacement::Os {
+        return Ok(vec![None; workers]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let allowed = effective_cpus()?;
+        Ok((0..workers)
+            .map(|i| Some(allowed[placement_index(placement, i, workers, allowed.len())]))
+            .collect())
+    }
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("ARROWCOL_COLLECTOR_CPU_PLACEMENT requires Linux for explicit placement")
+}
+
+#[cfg(target_os = "linux")]
+fn placement_index(policy: CpuPlacement, worker: usize, workers: usize, allowed: usize) -> usize {
+    match policy {
+        CpuPlacement::ScatterAllowed => (worker % allowed) * allowed / workers.min(allowed),
+        CpuPlacement::CompactAllowed => worker % allowed,
+        CpuPlacement::Os => unreachable!("OS placement does not select CPUs"),
+    }
+}
+
+fn start_on_cpu(target: Option<usize>) -> Result<Option<usize>> {
+    let Some(cpu) = target else { return Ok(None) };
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
+        let mut requested = CpuSet::new();
+        requested.set(cpu);
+        sched_setaffinity(None, &requested).with_context(|| format!("pin CPU worker to {cpu}"))?;
+        let observed = sched_getaffinity(None).context("verify CPU worker affinity")?;
+        anyhow::ensure!(observed == requested, "CPU worker affinity mismatch for CPU {cpu}");
+        Ok(Some(cpu))
+    }
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("cannot pin CPU worker to {cpu} on this OS")
 }
 
 thread_local! {
@@ -387,32 +544,49 @@ thread_local! {
 }
 
 impl CpuPool {
+    #[cfg(test)]
     fn new(workers: usize, queue_jobs: usize, stack_size: Option<usize>) -> Result<Self> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<CpuJob>(queue_jobs);
-        let receiver = Arc::new(Mutex::new(receiver));
-        for index in 0..workers {
-            let receiver = Arc::clone(&receiver);
+        Self::start(
+            workers,
+            queue_jobs,
+            stack_size,
+            CpuDispatch::SharedFifo,
+            CpuPlacement::Os,
+        )
+    }
+
+    fn start(
+        workers: usize,
+        queue_jobs: usize,
+        stack_size: Option<usize>,
+        dispatch: CpuDispatch,
+        placement: CpuPlacement,
+    ) -> Result<Self> {
+        let targets = worker_targets(placement, workers)?;
+        let (queues, receivers) = CpuQueues::new(dispatch, workers, queue_jobs);
+        let mut worker_cpu_ids = Vec::with_capacity(workers);
+        for (index, (mut receiver, target)) in receivers.into_iter().zip(targets).enumerate() {
+            let (started, ready) = mpsc::sync_channel(1);
             let mut builder = std::thread::Builder::new().name(format!("delta-cpu-{index}"));
             if let Some(size) = stack_size {
                 builder = builder.stack_size(size);
             }
             builder
                 .spawn(move || {
+                    let result = start_on_cpu(target);
+                    let ok = result.is_ok();
+                    if started.send(result).is_err() || !ok {
+                        return;
+                    }
                     CPU_WORKER.set(true);
-                    loop {
-                        let job = receiver
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .blocking_recv();
-                        match job {
-                            Some(job) => job(),
-                            None => break,
-                        }
+                    while let Some(job) = receiver.receive() {
+                        job();
                     }
                 })
                 .context("create Delta CPU worker")?;
+            worker_cpu_ids.push(ready.recv().context("CPU worker stopped during startup")??);
         }
-        Ok(Self { sender })
+        Ok(Self { queues, worker_cpu_ids })
     }
 
     #[cfg(test)]
@@ -437,13 +611,12 @@ impl CpuPool {
             return Ok(task());
         }
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.sender
+        self.queues
             .send(Box::new(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
                 let _ = sender.send(result);
             }))
-            .await
-            .map_err(|_| anyhow::anyhow!("Delta CPU pool stopped"))?;
+            .await?;
         match receiver.await.context("Delta CPU worker stopped")? {
             Ok(output) => Ok(output),
             Err(panic) => std::panic::resume_unwind(panic),
@@ -454,18 +627,30 @@ impl CpuPool {
 static CPU_POOL: OnceLock<std::result::Result<CpuPool, String>> = OnceLock::new();
 
 fn cpu_pool() -> Result<&'static CpuPool> {
-    let config = runtime_config()?;
+    configured_cpu_pool(runtime_config()?, "lazy_pool_initialization")
+}
+
+fn configured_cpu_pool(config: &DeltaRuntimeConfig, scope: &str) -> Result<&'static CpuPool> {
     let workers = config.cpu_workers;
     let queue_jobs = config.cpu_queue_jobs.unwrap_or(workers);
     match CPU_POOL.get_or_init(|| {
-        let pool =
-            CpuPool::new(workers, queue_jobs, config.cpu_thread_stack_size).map_err(|error| format!("{error:#}"))?;
-        if let Some(size) = config.cpu_thread_stack_size {
-            eprintln!(
-                "arrowcol_effective_config {}",
-                serde_json::json!({"cpu_pool":{"thread_stack_size":size,"scope":"lazy_pool_initialization"}})
-            );
-        }
+        let pool = CpuPool::start(
+            workers,
+            queue_jobs,
+            config.cpu_thread_stack_size,
+            config.cpu_dispatch,
+            config.cpu_placement,
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        eprintln!(
+            "arrowcol_effective_config {}",
+            serde_json::json!({"cpu_pool":{
+                "thread_stack_size":config.cpu_thread_stack_size, "scope":scope,
+                "cpu_dispatch":config.cpu_dispatch, "cpu_placement":config.cpu_placement,
+                "shard_count":pool.queues.count(), "queue_jobs":queue_jobs,
+                "workers_started":pool.worker_cpu_ids.len(), "worker_cpu_ids":pool.worker_cpu_ids,
+            }})
+        );
         Ok(pool)
     }) {
         Ok(pool) => Ok(pool),
@@ -813,6 +998,7 @@ pub(crate) fn assert_worker_bound() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1000,6 +1186,85 @@ mod tests {
     }
 
     #[test]
+    fn cpu_policy_environment_is_strict() -> Result<()> {
+        let defaults = DeltaRuntimeConfig::from_lookup(|_| Ok(None))?;
+        assert_eq!(
+            (defaults.cpu_dispatch, defaults.cpu_placement),
+            (CpuDispatch::SharedFifo, CpuPlacement::Os)
+        );
+        let dispatch = "ARROWCOL_COLLECTOR_CPU_DISPATCH";
+        let placement = "ARROWCOL_COLLECTOR_CPU_PLACEMENT";
+        let config = DeltaRuntimeConfig::from_lookup(|name| {
+            Ok(match name {
+                n if n == dispatch => Some("bounded_shards".into()),
+                n if n == placement => Some("compact_allowed".into()),
+                _ => None,
+            })
+        })?;
+        assert_eq!(config.cpu_dispatch, CpuDispatch::BoundedShards);
+        assert_eq!(config.cpu_placement, CpuPlacement::CompactAllowed);
+        for (key, raw) in [(dispatch, "shared"), (placement, "scatter_allowed "), (placement, "OS")] {
+            let err = DeltaRuntimeConfig::from_lookup(|name| Ok((name == key).then(|| raw.to_owned())))
+                .err()
+                .context("invalid CPU policy must fail")?;
+            assert!(err.to_string().contains(key));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shard_admission_budget_is_shared_even_when_smaller_than_worker_count() -> Result<()> {
+        let (queues, workers) = CpuQueues::new(CpuDispatch::BoundedShards, 3, 1);
+        for worker in workers {
+            queues
+                .send(Box::new(|| {}))
+                .now_or_never()
+                .context("expected admission")??;
+            assert!(queues.send(Box::new(|| {})).now_or_never().is_none());
+            let WorkerQueue::Shard(rx) = worker else {
+                anyhow::bail!("expected shard")
+            };
+            drop(rx.try_recv().context("expected round-robin delivery")?);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sharded_workers_pin_within_inherited_mask_and_reenter_inline() -> Result<()> {
+        use rustix::thread::{CpuSet, sched_setaffinity};
+        assert_eq!(placement_index(CpuPlacement::CompactAllowed, 1, 2, 8), 1);
+        assert_eq!(placement_index(CpuPlacement::ScatterAllowed, 1, 2, 8), 4);
+        // Narrow only a disposable thread, never the runner's own affinity.
+        std::thread::spawn(|| -> Result<()> {
+            let allowed = effective_cpus()?;
+            let mut mask = CpuSet::new();
+            mask.set(allowed[0]);
+            mask.set(*allowed.last().context("empty mask")?);
+            sched_setaffinity(None, &mask)?;
+            let inherited = effective_cpus()?;
+            for placement in [CpuPlacement::CompactAllowed, CpuPlacement::ScatterAllowed] {
+                let pool = Arc::new(CpuPool::start(3, 1, None, CpuDispatch::BoundedShards, placement)?);
+                for i in 0..3 {
+                    let nested = Arc::clone(&pool);
+                    let (outer, inner, observed) = pool.run(move || -> Result<_> {
+                        let outer = std::thread::current().id();
+                        let inner = nested.run(|| std::thread::current().id())?;
+                        Ok((outer, inner, effective_cpus()?))
+                    })??;
+                    let cpu = inherited[i % inherited.len()];
+                    assert_eq!(observed, vec![cpu]);
+                    assert_eq!(pool.worker_cpu_ids[i], Some(cpu));
+                    assert_eq!(inner, outer);
+                }
+            }
+            Ok(())
+        })
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    #[test]
     fn runtime_scheduler_settings_parse_and_create_consumers() -> Result<()> {
         let config = DeltaRuntimeConfig::from_lookup(|name| {
             Ok(match name {
@@ -1027,34 +1292,57 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cpu_pool_readback_follows_worker_creation() -> Result<()> {
-        if std::env::var_os("ARROWCOL_TEST_CPU_POOL_CHILD").is_some() {
-            assert_eq!(run_cpu(|| 42)?, 42);
+        if let Ok(mode) = std::env::var("ARROWCOL_TEST_CPU_POOL_CHILD") {
+            let _ = runtime_config()?;
+            if mode == "lazy" {
+                assert_eq!(run_cpu(|| 42)?, 42);
+            }
             return Ok(());
         }
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "delta_io::tests::cpu_pool_readback_follows_worker_creation",
-                "--nocapture",
-            ])
-            .env_clear()
-            .env("ARROWCOL_TEST_CPU_POOL_CHILD", "1")
-            .env("ARROWCOL_COLLECTOR_CPU_WORKERS", "1")
-            .env("ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE", "4194304")
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "CPU pool child failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stderr = String::from_utf8(output.stderr)?;
-        let readback = stderr
-            .lines()
-            .find_map(|line| line.strip_prefix("arrowcol_effective_config "))
-            .context("CPU pool readback missing")?;
-        let readback: serde_json::Value = serde_json::from_str(readback)?;
-        assert_eq!(readback["cpu_pool"]["thread_stack_size"], 4194304);
-        assert_eq!(readback["cpu_pool"]["scope"], "lazy_pool_initialization");
+        for (mode, dispatch, placement, scope) in [
+            ("lazy", "shared_fifo", "os", "lazy_pool_initialization"),
+            ("startup", "bounded_shards", "scatter_allowed", "runtime_initialization"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "delta_io::tests::cpu_pool_readback_follows_worker_creation",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("ARROWCOL_TEST_CPU_POOL_CHILD", mode)
+                .env("ARROWCOL_COLLECTOR_CPU_WORKERS", "2")
+                .env("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "1")
+                .env("ARROWCOL_COLLECTOR_CPU_DISPATCH", dispatch)
+                .env("ARROWCOL_COLLECTOR_CPU_PLACEMENT", placement)
+                .env("ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE", "4194304")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "CPU pool child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr)?;
+            let readback = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("arrowcol_effective_config "))
+                .context("CPU pool readback missing")?;
+            let readback: serde_json::Value = serde_json::from_str(readback)?;
+            assert_eq!(readback["cpu_pool"]["thread_stack_size"], 4194304);
+            let pool = &readback["cpu_pool"];
+            assert_eq!(pool["scope"], scope);
+            assert_eq!(pool["cpu_dispatch"], dispatch);
+            assert_eq!(pool["cpu_placement"], placement);
+            assert_eq!(pool["workers_started"], 2);
+            assert_eq!(pool["queue_jobs"], 1);
+            assert_eq!(pool["shard_count"], if mode == "lazy" { 1 } else { 2 });
+            let ids = pool["worker_cpu_ids"].as_array().context("worker CPU IDs")?;
+            assert_eq!(ids.len(), 2);
+            assert!(
+                ids.iter()
+                    .all(|cpu| if mode == "lazy" { cpu.is_null() } else { cpu.is_u64() })
+            );
+        }
         Ok(())
     }
 
@@ -1191,13 +1479,11 @@ mod tests {
             })?
         });
         wait_started.recv_timeout(Duration::from_secs(5))?;
-        pool.sender
-            .try_send(Box::new(|| {}))
-            .map_err(|_| anyhow::anyhow!("expected room for one queued CPU job"))?;
-        assert!(matches!(
-            pool.sender.try_send(Box::new(|| {})),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-        ));
+        pool.queues
+            .send(Box::new(|| {}))
+            .now_or_never()
+            .context("expected room in queue")??;
+        assert!(pool.queues.send(Box::new(|| {})).now_or_never().is_none());
         release.send(())?;
         caller.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
         assert_eq!(pool.run(|| 42)?, 42);
@@ -1218,9 +1504,10 @@ mod tests {
             })?
         });
         wait_started.recv_timeout(Duration::from_secs(5))?;
-        pool.sender
-            .try_send(Box::new(|| {}))
-            .map_err(|_| anyhow::anyhow!("expected room for one queued CPU job"))?;
+        pool.queues
+            .send(Box::new(|| {}))
+            .now_or_never()
+            .context("expected room in queue")??;
         let pending = tokio::spawn(async move { pool.run_async(|| 42).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!pending.is_finished());
