@@ -33,7 +33,7 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, 
     source_revision: 'a'.repeat(40),
     official_result: { run_id: cellId, table: 'synthetic_offline_table', status: 'succeeded', git_sha: 'a'.repeat(40),
       tunables: { orchestration_run_id: orchestrationId }, evidence: { version: 1, teardown_outcome: 'succeeded',
-        durable_commits: { run_cumulative_output: { teardown_outcome: 'succeeded' },
+        durable_commits: { collector_teardown_admissions: { status: 'clear', cancelled_ambiguous: 0 }, run_cumulative_output: { teardown_outcome: 'succeeded' },
           complete_30_second_commit_windows: [{ teardown_outcome: 'succeeded' }],
           post_teardown_delta_reconciliation: { status: 'matched' } },
         reconciliation: { status: 'within_bound', settled: true, ambiguous_rows: 0 }, commit_window_output_throughput: {
@@ -568,7 +568,7 @@ test('actual Rust immutable producer bytes remain an original window with unavai
 
 
 test('official reader never reports failed or nonfinal cells as performance', async t => {
-  for (const defect of ['failed', 'missing-teardown', 'unsettled', 'ambiguous', 'delta-mismatch'] as const) {
+  for (const defect of ['failed', 'missing-teardown', 'unsettled', 'ambiguous', 'delta-mismatch', 'admissions-missing', 'admissions-ambiguous'] as const) {
     await t.test(defect, async t => {
       const f = syntheticAuthenticatedTransport(t);
       const result = f.document.official_result;
@@ -577,6 +577,8 @@ test('official reader never reports failed or nonfinal cells as performance', as
       if (defect === 'unsettled') result.evidence.reconciliation.settled = false;
       if (defect === 'ambiguous') result.evidence.reconciliation.ambiguous_rows = 1;
       if (defect === 'delta-mismatch') result.evidence.durable_commits.post_teardown_delta_reconciliation.status = 'mismatch';
+      if (defect === 'admissions-missing') result.evidence.durable_commits.collector_teardown_admissions.status = 'unavailable';
+      if (defect === 'admissions-ambiguous') result.evidence.durable_commits.collector_teardown_admissions.status = 'ambiguous';
       f.publishSyntheticDocument();
       const read = await f.read();
       assert.equal(read.committedRowsPerSecond, null);

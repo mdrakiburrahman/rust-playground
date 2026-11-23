@@ -171,12 +171,14 @@ export async function readOfficialCellMeasurement(options: {
   const cumulative = commits?.run_cumulative_output as JsonRecord | null | undefined;
   const delta = commits?.post_teardown_delta_reconciliation as JsonRecord | null | undefined;
   const reconciliation = evidence.reconciliation as JsonRecord | null | undefined;
+  const admissions = commits?.collector_teardown_admissions as JsonRecord | null | undefined;
   const windows = commits?.complete_30_second_commit_windows;
   const finalEvidence = evidence.teardown_outcome === 'succeeded' && output.teardown_outcome === 'succeeded' &&
     cumulative?.teardown_outcome === 'succeeded' && Array.isArray(windows) &&
     windows.every(window => window && typeof window === 'object' && window.teardown_outcome === 'succeeded') &&
     delta?.status === 'matched' && reconciliation?.status === 'within_bound' &&
-    reconciliation?.settled === true && reconciliation?.ambiguous_rows === 0;
+    reconciliation?.settled === true && reconciliation?.ambiguous_rows === 0 &&
+    admissions?.status === 'clear' && admissions?.cancelled_ambiguous === 0;
   if (!finalEvidence) unavailableReasons.push('final_teardown_or_delivery_evidence_unavailable');
   const complete = integer(start) && integer(end) && start >= before.startedAtMs && end > start && end <= now() &&
     start === reference.measurement_start_unix_ms && end === reference.measurement_end_unix_ms &&

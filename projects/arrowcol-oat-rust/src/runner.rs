@@ -3749,9 +3749,10 @@ async fn run_isolated_cell(
     });
     let cleanup_succeeded = cleanup.is_ok();
     let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    let stopped_logs = platform.stopped_commit_logs();
     if let Ok(rows) = &mut result
-        && let Some((logs, baseline)) = platform.stopped_commit_logs()
-        && let Err(error) = attach_stopped_commit_evidence(&config, rows, &logs, &baseline)
+        && let Some((logs, baseline)) = &stopped_logs
+        && let Err(error) = attach_stopped_commit_evidence(&config, rows, logs, baseline)
     {
         for row in rows {
             row.status = "failed".to_owned();
@@ -3760,6 +3761,18 @@ async fn run_isolated_cell(
                 Some(previous) => format!("{previous}; {message}"),
                 None => message,
             });
+        }
+    }
+    if let Ok(rows) = &mut result
+        && let Err(error) = attach_collector_teardown_admissions(
+            rows,
+            stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()),
+            cleanup_succeeded,
+        )
+    {
+        for row in rows {
+            row.status = "failed".to_owned();
+            row.failure = Some(format!("capture collector teardown admissions evidence: {error:#}"));
         }
     }
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
@@ -3921,7 +3934,9 @@ fn apply_final_aks_delta_reconciliation(
         && final_delta["status"] == "matched"
         && reconciliation["status"] == "within_bound"
         && reconciliation["settled"] == true
-        && reconciliation["ambiguous_rows"] == 0;
+        && reconciliation["ambiguous_rows"] == 0
+        && evidence["durable_commits"]["collector_teardown_admissions"]["status"] == "clear"
+        && evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"] == 0;
     if !evidence["durable_commits"].is_object() {
         evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
     }
@@ -3941,6 +3956,60 @@ fn apply_final_aks_delta_reconciliation(
         });
     }
     row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    Ok(())
+}
+
+fn attach_collector_teardown_admissions(
+    rows: &mut [OatResult],
+    logs: Option<&[ProcessLog]>,
+    cleanup_succeeded: bool,
+) -> Result<()> {
+    for row in rows {
+        let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+        if !evidence["durable_commits"].is_object() {
+            evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
+        }
+        let warned = logs.is_some_and(|logs| {
+            logs.iter().any(|log| {
+                log.text
+                    .contains("cancelled admissions had no observed publication outcome")
+            })
+        });
+        let complete = logs.is_some_and(|logs| {
+            let identities = logs.iter().map(|log| &log.instance_id).collect::<BTreeSet<_>>();
+            cleanup_succeeded
+                && logs.len() == row.replicas as usize
+                && !logs.is_empty()
+                && identities.len() == logs.len()
+                && logs
+                    .iter()
+                    .all(|log| log.role == ComponentRole::Collector && log.complete)
+        });
+        let status = if warned {
+            "ambiguous"
+        } else if complete {
+            "clear"
+        } else {
+            "unavailable"
+        };
+        evidence["durable_commits"]["collector_teardown_admissions"] = json!({
+            "status": status,
+            "cancelled_ambiguous": if status == "clear" { Some(0_u64) } else { None },
+        });
+        if status != "clear" {
+            row.status = "failed".to_owned();
+            let reason = if warned {
+                "teardown_delivery_ambiguous"
+            } else {
+                "post_stop_collector_admission_evidence_unavailable"
+            };
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {reason}"),
+                None => reason.to_owned(),
+            });
+        }
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    }
     Ok(())
 }
 
@@ -4068,6 +4137,9 @@ fn attach_teardown_outcome(outcome: &mut MatrixOutcome, status: &str) -> Result<
             evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
         }
         let commits = &mut evidence["durable_commits"];
+        if !commits["collector_teardown_admissions"].is_object() {
+            commits["collector_teardown_admissions"] = json!({"status": "unavailable", "cancelled_ambiguous": null});
+        }
         if !commits["run_cumulative_output"].is_object() {
             commits["run_cumulative_output"] = unavailable_cumulative_output("commit_evidence_unavailable");
         }

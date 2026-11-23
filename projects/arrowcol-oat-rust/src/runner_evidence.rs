@@ -88,7 +88,9 @@ fn official_measurement_bytes(
         || evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"] != "matched"
         || evidence["reconciliation"]["status"] != "within_bound"
         || evidence["reconciliation"]["settled"] != true
-        || evidence["reconciliation"]["ambiguous_rows"] != 0)
+        || evidence["reconciliation"]["ambiguous_rows"] != 0
+        || evidence["durable_commits"]["collector_teardown_admissions"]["status"] != "clear"
+        || evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"] != 0)
     {
         bail!("successful official result lacks final settled unambiguous delivery evidence");
     }
@@ -379,11 +381,22 @@ mod official_cell_measurement_tests {
         row.evidence_json = Some(json!({
             "client_phase_reports": [{"phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}}],
             "durable_commits": {
+                "collector_teardown_admissions": {"status": "clear", "cancelled_ambiguous": 0},
                 "run_cumulative_output": {"rows": 10, "settled": true, "commits_by_version": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]},
                 "output_throughput": {"rows": 10}, "complete_30_second_commit_windows": [{"rows": 10}]
             }
         }).to_string());
         let delta = json!({"rows": 10, "versions": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]});
+        for status in ["unavailable", "ambiguous"] {
+            let mut candidate = row.clone();
+            let mut evidence: Value = serde_json::from_str(candidate.evidence_json.as_deref().context("missing fixture evidence")?)?;
+            evidence["durable_commits"]["collector_teardown_admissions"] = json!({"status": status, "cancelled_ambiguous": null});
+            candidate.evidence_json = Some(evidence.to_string());
+            apply_final_aks_delta_reconciliation(&config, &mut candidate, Some(&delta), true)?;
+            let evidence: Value = serde_json::from_str(candidate.evidence_json.as_deref().context("missing final evidence")?)?;
+            assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
+            assert_eq!(candidate.status, "failed");
+        }
         apply_final_aks_delta_reconciliation(&config, row, Some(&delta), true)?;
         let mut outcome = finish_matrix_cell(&config, &inventory.orchestration_run_id, &inventory.cell_run_id, 1, 1, Ok(rows), Ok(()));
         attach_teardown_outcome(&mut outcome, "succeeded")?;

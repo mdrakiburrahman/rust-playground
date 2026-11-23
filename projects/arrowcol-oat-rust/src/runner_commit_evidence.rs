@@ -1327,6 +1327,34 @@ mod commit_evidence_tests {
             replicas: 1, dfe_worker_concurrency: 1, table: table.clone(), rows: Some(20), duration_ms: Some(60_000),
             rows_per_second: Some(1.0), cpu_millicores: None, memory_bytes: None, qap: QapMetrics::default(),
         };
+        let mut warned = stopped.clone();
+        warned.text.push_str("WARN cancelled admissions had no observed publication outcome; delivery remains ambiguous cancelled_ambiguous=2\n");
+        let mut incomplete_admissions = stopped.clone();
+        incomplete_admissions.complete = false;
+        for (logs, cleanup, expected) in [
+            (None, true, "unavailable"),
+            (Some(std::slice::from_ref(&incomplete_admissions)), true, "unavailable"),
+            (Some(std::slice::from_ref(&stopped)), false, "unavailable"),
+            (Some(std::slice::from_ref(&warned)), true, "ambiguous"),
+            (Some(std::slice::from_ref(&stopped)), true, "clear"),
+        ] {
+            let mut candidate = row.clone();
+            attach_collector_teardown_admissions(std::slice::from_mut(&mut candidate), logs, cleanup)?;
+            let evidence: Value = serde_json::from_str(candidate.evidence_json.as_deref().context("missing admissions evidence")?)?;
+            assert_eq!(evidence["durable_commits"]["collector_teardown_admissions"]["status"], expected);
+            if expected == "clear" {
+                assert_eq!(candidate.status, "succeeded");
+                assert_eq!(evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"], 0);
+            } else {
+                assert_eq!(candidate.status, "failed");
+                assert!(evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"].is_null());
+                let mut outcome = finish_matrix_cell(&config, "orchestration", "run", 1, 1, Ok(vec![candidate]), Ok(()));
+                attach_teardown_outcome(&mut outcome, "succeeded")?;
+                let evidence: Value = serde_json::from_str(outcome.rows[0].evidence_json.as_deref().context("missing final evidence")?)?;
+                assert_eq!(evidence["ranking_eligible"], false);
+                assert!(outcome.rows[0].rows_per_second.is_none());
+            }
+        }
         let mut partial_row = row.clone();
         let mut incomplete = stopped.clone();
         incomplete.complete = false;
