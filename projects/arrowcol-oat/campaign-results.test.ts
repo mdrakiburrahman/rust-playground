@@ -1162,16 +1162,18 @@ test('accepts table-writer readback for active Parquet limits', () => {
 
 test('accepts table-adaptive readback for an active sizing factor', () => {
   const candidate = coveredCandidate('adaptive-sizing', 800, 260).map(row => ({
-    ...row, factorConfigPaths: ['tunables.collector.batching.adaptive_file.target_parquet_bytes'],
+    ...row, factorConfigPaths: ['tunables.collector.batching.adaptive_file.target_parquet_bytes',
+      'tunables.collector.batching.adaptive_file.min_input_bytes'],
   }));
   for (const row of candidate) {
     Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
-      batching: { adaptive_file: { target_parquet_bytes: 134217728 } },
+      batching: { adaptive_file: { target_parquet_bytes: 134217728, min_input_bytes: 16777216 } },
     } });
     mutateFactorEvidence(row, evidence => {
       evidence.projection_only = [];
       evidence.consumer_verified = [
         { path: 'collector.batching.adaptive_file.target_parquet_bytes', reason: 'consumer_table_adaptive_readback' },
+        { path: 'collector.batching.adaptive_file.min_input_bytes', reason: 'consumer_table_adaptive_readback' },
       ];
     });
   }
