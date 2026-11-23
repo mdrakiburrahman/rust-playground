@@ -4628,6 +4628,20 @@ fn result_rows(
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let mut table_tunables = tunables.clone();
+        let mut table_leaf_evidence = leaf_evidence.clone();
+        promote_client_readback(
+            config,
+            &mut table_leaf_evidence,
+            client_run.evidence.client_reports.get(&table),
+        )?;
+        for field in [
+            "inert_fields",
+            "projection_only",
+            "runner_controls",
+            "consumer_verified",
+        ] {
+            table_tunables[field] = table_leaf_evidence[field].clone();
+        }
         if let Some((_, reason)) = reconciliation_failure {
             table_tunables["failure"] = json!(reason);
         }
@@ -4677,10 +4691,10 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
-                evidence["inert_fields"] = leaf_evidence["inert_fields"].clone();
-                evidence["projection_only"] = leaf_evidence["projection_only"].clone();
-                evidence["runner_controls"] = leaf_evidence["runner_controls"].clone();
-                evidence["consumer_verified"] = leaf_evidence["consumer_verified"].clone();
+                evidence["inert_fields"] = table_leaf_evidence["inert_fields"].clone();
+                evidence["projection_only"] = table_leaf_evidence["projection_only"].clone();
+                evidence["runner_controls"] = table_leaf_evidence["runner_controls"].clone();
+                evidence["consumer_verified"] = table_leaf_evidence["consumer_verified"].clone();
                 evidence["ownership_samples"] = json!(client_run.pinning.samples);
                 if let Some(fleet) = &config.platform.fleet {
                     let mut pool_rates = BTreeMap::<String, f64>::new();
@@ -5411,7 +5425,9 @@ async fn run_clients_inner(
                     }
                 };
                 let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
-                if let Err(error) = evidence.record_client(&effective_client_config, &handle.table, &output) {
+                if let Err(error) =
+                    evidence.record_client(&effective_client_config, &handle.table, &handle.client_id, &output)
+                {
                     let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
                     return match cleanup {
                         Ok(()) => Err(error),

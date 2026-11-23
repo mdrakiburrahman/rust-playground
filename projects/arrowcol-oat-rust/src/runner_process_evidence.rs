@@ -2429,6 +2429,22 @@ groups:
             anyhow::ensure!(Some(actual) != baseline.get(field), "{field} did not differ from baseline for {input}");
             verify_process_configuration(&config, ComponentRole::Client, &observed)
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
+            if matches!(field, "max_message_bytes" | "max_flight_data_bytes") {
+                config.clients_per_table = 1;
+                let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
+                let initial = tunable_leaf_evidence(&config)?;
+                let mut covered = initial.clone();
+                promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
+                assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 1);
+                let mut wrong_report = report.clone();
+                wrong_report["consumer_effective_config"][field] = json!("wrong");
+                for reports in [vec![], vec![wrong_report], vec![report.clone(), report]] {
+                    let mut uncovered = initial.clone();
+                    config.clients_per_table = if reports.len() == 2 { 2 } else { 1 };
+                    promote_client_readback(&config, &mut uncovered, Some(&reports))?;
+                    assert_eq!(uncovered, initial);
+                }
+            }
             let mut missing = observed.clone();
             missing.as_object_mut().context("consumer startup is not an object")?.remove(field);
             anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &missing).is_err(),

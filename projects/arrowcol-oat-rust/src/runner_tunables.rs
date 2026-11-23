@@ -101,6 +101,40 @@ fn promote_router_readback(config: &OatConfig, evidence: &mut Value, processes: 
     Ok(())
 }
 
+fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Option<&Vec<Value>>) -> Result<()> {
+    let Some(reports) = reports else {
+        return Ok(());
+    };
+    let ids = reports.iter()
+        .filter_map(|report| report["client_id"].as_str().filter(|id| !id.is_empty()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if reports.len() != config.clients_per_table || ids.len() != reports.len()
+        || reports.is_empty()
+        || reports.iter().any(|report| verify_process_configuration(config, ComponentRole::Client, &report["consumer_effective_config"]).is_err())
+    {
+        return Ok(());
+    }
+    let environment = role_environment(config, ComponentRole::Client)?;
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
+    let mut promoted = Vec::new();
+    projection.retain(|entry| {
+        let (field, variable) = match entry["path"].as_str() {
+            Some("transport.max_message_bytes") => ("max_message_bytes", "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES"),
+            Some("transport.max_flight_data_bytes") => ("max_flight_data_bytes", "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES"),
+            _ => return true,
+        };
+        if !environment.contains_key(variable)
+            || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
+        {
+            return true;
+        }
+        promoted.push(json!({"path": entry["path"], "reason": "consumer_startup_readback"}));
+        false
+    });
+    evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
+    Ok(())
+}
+
 #[cfg(test)]
 fn inert_tunable_fields(config: &OatConfig) -> Result<Vec<Value>> {
     Ok(tunable_leaf_evidence(config)?["inert_fields"]
