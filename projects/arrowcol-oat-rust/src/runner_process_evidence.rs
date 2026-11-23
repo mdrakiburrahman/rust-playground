@@ -2057,10 +2057,18 @@ mod consumer_startup_projection_tests {
             }
         }
         struct Child(std::process::Child);
+        impl Child {
+            fn stop(&mut self) -> Result<()> {
+                if self.0.try_wait()?.is_none() {
+                    self.0.kill()?;
+                    self.0.wait()?;
+                }
+                Ok(())
+            }
+        }
         impl Drop for Child {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                let _ = self.stop();
             }
         }
 
@@ -2143,7 +2151,7 @@ groups:
             anyhow::ensure!(std::time::Instant::now() < deadline, "collector readback timed out: {text}");
             std::thread::sleep(Duration::from_millis(100));
         };
-        drop(child);
+        child.stop().context("stop isolated collector")?;
         let observed = process_configurations(&text)?;
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         for (group, fields) in [
