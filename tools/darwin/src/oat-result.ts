@@ -28,7 +28,7 @@ export interface RunnerControlField {
 
 export interface ConsumerVerifiedField {
   path: string;
-  reason: "consumer_startup_readback" | "consumer_table_writer_readback";
+  reason: "consumer_startup_readback" | "consumer_table_writer_readback" | "consumer_table_adaptive_readback";
 }
 
 function extractFields<R extends string>(evidence: JsonObject, key: string, reasons: readonly R[]): { path: string; reason: R }[] | null {
@@ -317,7 +317,7 @@ export async function readReconciledOatResult(
   const inertFields = extractInertTunableFields(evidence);
   const projectionOnly = extractFields(evidence, "projection_only", ["consumer_startup_proof_unverified"] as const);
   const runnerControls = extractFields(evidence, "runner_controls", ["maintenance_runner_control", "router_log_filter_inheritance"] as const);
-  const consumerVerified = extractFields(evidence, "consumer_verified", ["consumer_startup_readback", "consumer_table_writer_readback"] as const);
+  const consumerVerified = extractFields(evidence, "consumer_verified", ["consumer_startup_readback", "consumer_table_writer_readback", "consumer_table_adaptive_readback"] as const);
   const coveragePaths = [inertFields, projectionOnly, runnerControls, consumerVerified]
     .flatMap(fields => fields?.map(field => field.path) ?? []);
   if (new Set(coveragePaths).size !== coveragePaths.length) throw new Error("duplicate tunable coverage path");

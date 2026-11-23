@@ -186,6 +186,7 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       consumer_verified: [
         { path: "client.workers", reason: "consumer_startup_readback" },
         { path: "parquet_writer.max_row_group_rows", reason: "consumer_table_writer_readback" },
+        { path: "collector.batching.adaptive_file.target_parquet_bytes", reason: "consumer_table_adaptive_readback" },
       ],
       processes: [{ component: "collector", source_revision: revision, log_complete: true,
         image_id: `sha256:${"b".repeat(64)}`, effective_config_source: "consumer_startup_readback",

@@ -754,6 +754,46 @@ fn parquet_column_options_readback(value: &Value) -> Option<Value> {
     Some(value.clone())
 }
 
+fn collector_adaptive_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
+    let tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let mut records = Vec::new();
+    for line in text.lines().filter_map(|line| line.strip_prefix("arrowcol_adaptive_config ")) {
+        let value: Value = serde_json::from_str(line).context("invalid adaptive policy readback")?;
+        let Some(table) = value["table_name"].as_str().filter(|table| tables.contains(*table)) else {
+            continue;
+        };
+        if value["scope"] != "installed_estimator_not_full_run_history" {
+            bail!("invalid adaptive policy readback scope");
+        }
+        let fields = value["config"].as_object().context("missing adaptive policy config")?;
+        if fields.len() != 7 {
+            bail!("invalid adaptive policy fields");
+        }
+        let integer = |name| fields.get(name).and_then(Value::as_u64).context("invalid adaptive policy integer");
+        let ratio = |name| fields.get(name).and_then(Value::as_f64).context("invalid adaptive policy ratio");
+        let policy = arrow_deltalake::sizing::AdaptiveFileSizeConfig {
+            target_parquet_bytes: integer("target_parquet_bytes")?,
+            min_input_bytes: integer("min_input_bytes")?,
+            max_input_bytes: integer("max_input_bytes")?,
+            cold_start_parquet_ratio: ratio("cold_start_parquet_ratio")?,
+            ewma_weight: ratio("ewma_weight")?,
+            min_parquet_ratio: ratio("min_parquet_ratio")?,
+            max_parquet_ratio: ratio("max_parquet_ratio")?,
+        };
+        policy.validate().context("invalid adaptive policy readback")?;
+        let record = json!({"table_name":table, "scope":"installed_estimator_not_full_run_history",
+            "config":value["config"]});
+        if !records.contains(&record) {
+            if records.len() >= 256 {
+                bail!("adaptive policy history exceeded evidence bound");
+            }
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
     let tables = config
         .tables
@@ -917,6 +957,11 @@ fn process_evidence_for_cell(
             } else {
                 None
             };
+            let adaptive_tables = if matches!(role, ComponentRole::Collector) {
+                Some(collector_adaptive_records(config, &log.text)?)
+            } else {
+                None
+            };
             let mut effective = resolved;
             let fields = effective
                 .as_object_mut()
@@ -951,6 +996,7 @@ fn process_evidence_for_cell(
                 "maintenance_table_policies": maintenance_tables,
                 "maintenance_operation_outcomes": maintenance_outcomes,
                 "layout_table_policies": layout_tables,
+                "adaptive_table_policies": adaptive_tables,
                 "layout_policy_scope": "startup_process_policy_only_table_properties_and_parquet_overlays_may_override",
             }));
         }
@@ -1443,6 +1489,57 @@ async fn aks_process_logs_for_role(config: &OatConfig, role_filter: Option<Compo
 #[cfg(test)]
 mod startup_readback_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_policy_requires_matching_installed_readback_for_every_table() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.push("sqlserver_availability_replica_states".to_owned());
+        let policy = json!({
+            "target_parquet_bytes": 1000, "min_input_bytes": 100, "max_input_bytes": 4000,
+            "cold_start_parquet_ratio": 0.5, "ewma_weight": 0.25,
+            "min_parquet_ratio": 0.1, "max_parquet_ratio": 2.0
+        });
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"batching":{"adaptive_file":policy}}
+        }))?;
+        let env = role_environment(&config, ComponentRole::Collector)?;
+        let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        let log = config.tables.iter().map(|table| Ok(format!("arrowcol_adaptive_config {}\n", json!({
+            "table_name":canonical_dmv_table_name(table)?,
+            "scope":"installed_estimator_not_full_run_history",
+            "config":policy
+        })))).collect::<Result<String>>()?;
+        let records = collector_adaptive_records(&config, &log)?;
+        let process = json!({"component":"collector", "instance_id":"one", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"batching":batching}, "adaptive_table_policies":records});
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        for field in policy.as_object().context("policy object")?.keys() {
+            let path = format!("collector.batching.adaptive_file.{field}");
+            assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
+                .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_adaptive_readback"));
+            let mut changed = process.clone();
+            changed["adaptive_table_policies"][1]["config"][field] = json!("wrong");
+            let mut result = initial.clone();
+            promote_collector_readback(&config, &mut result, Some(&json!([changed])), 1)?;
+            assert!(result["projection_only"].as_array().context("missing projection fields")?
+                .iter().any(|entry| entry["path"] == path));
+        }
+        let mut missing = process.clone();
+        missing["adaptive_table_policies"].as_array_mut().context("missing policies")?.pop();
+        let mut result = initial.clone();
+        promote_collector_readback(&config, &mut result, Some(&json!([missing])), 1)?;
+        assert_eq!(result, initial);
+        let mut bad = json!({"table_name":canonical_dmv_table_name(&config.tables[0])?,
+            "scope":"installed_estimator_not_full_run_history", "config":policy});
+        bad["config"]["ewma_weight"] = json!("0.25");
+        assert!(collector_adaptive_records(&config, &format!("arrowcol_adaptive_config {bad}\n")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn aks_inherited_router_filter_uses_image_config() -> Result<()> {
