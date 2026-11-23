@@ -305,6 +305,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
     capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
+    capability!("collector.runtime.partition_grouping", "scalar_map"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
@@ -1108,6 +1109,12 @@ impl Tunables {
                     }
                 }
                 if let Some(runtime) = &collector.runtime {
+                    if let Some(grouping) = runtime.partition_grouping {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_PARTITION_GROUPING".to_owned(),
+                            grouping.as_str().to_owned(),
+                        );
+                    }
                     if let Some(enabled) = runtime.generated_partition_fast_path {
                         output.insert(
                             "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH".to_owned(),

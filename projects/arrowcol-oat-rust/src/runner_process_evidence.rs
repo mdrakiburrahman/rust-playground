@@ -2335,7 +2335,7 @@ mod consumer_startup_projection_tests {
                     "buffered_batches_limit":123,"pressure_interval":"3s",
                     "heartbeat_interval":"4s","registration_ttl":"30s"},
                 "runtime":{"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
-                    "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4}
+                    "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4,"partition_grouping":"typed_runs"}
             }
         }))?;
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2439,7 +2439,7 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 33);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 34);
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
@@ -2465,7 +2465,7 @@ groups:
                 "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
                 "heartbeat_interval", "registration_ttl"][..]),
             ("runtime", &["runtime_workers", "blocking_workers", "blocking_fs_reserve", "task_limit",
-                "read_ahead", "batch_rows", "cpu_workers", "cpu_queue_jobs"][..]),
+                "read_ahead", "batch_rows", "cpu_workers", "cpu_queue_jobs", "partition_grouping"][..]),
         ] {
             for field in fields {
                 let mut missing = observed.clone();

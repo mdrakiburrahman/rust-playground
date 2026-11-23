@@ -72,6 +72,9 @@ pub struct DeltaRuntimeConfig {
     /// CPU queue capacity, 1..=128; absent means the resolved CPU worker count.
     #[serde(default)]
     pub cpu_queue_jobs: Option<usize>,
+    /// Partition grouping algorithm; the default preserves row-wise grouping.
+    #[serde(default)]
+    pub partition_grouping: crate::PartitionGrouping,
     /// Skip row-wise grouping for internally generated single ingestion partitions.
     #[serde(default)]
     pub generated_partition_fast_path: bool,
@@ -107,6 +110,7 @@ impl DeltaRuntimeConfig {
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
             cpu_queue_jobs: None,
+            partition_grouping: crate::PartitionGrouping::default(),
             generated_partition_fast_path: false,
         }
     }
@@ -170,6 +174,12 @@ impl DeltaRuntimeConfig {
                 "buffered_multipart" => UploadMode::BufferedMultipart,
                 _ => anyhow::bail!("{mode_name} must be 'put_create' or 'buffered_multipart', got {raw:?}"),
             };
+        }
+        let name = "ARROWCOL_COLLECTOR_PARTITION_GROUPING";
+        if let Some(raw) = lookup(name)? {
+            config.partition_grouping = raw
+                .try_into()
+                .map_err(|message: &str| anyhow::anyhow!("{name}: {message}"))?;
         }
         let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH";
         if let Some(raw) = lookup(name)? {
@@ -669,6 +679,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn partition_grouping_env_is_strict() -> Result<()> {
+        let name = "ARROWCOL_COLLECTOR_PARTITION_GROUPING";
+        assert_eq!(
+            DeltaRuntimeConfig::from_lookup(|_| Ok(None))?.partition_grouping,
+            crate::PartitionGrouping::ScalarMap
+        );
+        for raw in ["scalar_map", "typed_runs"] {
+            assert_eq!(
+                DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))?
+                    .partition_grouping
+                    .as_str(),
+                raw
+            );
+        }
+        for raw in ["", "TYPED_RUNS", "typed_runs ", "auto"] {
+            assert!(DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned()))).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn generated_partition_fast_path_is_strictly_opt_in() -> Result<()> {

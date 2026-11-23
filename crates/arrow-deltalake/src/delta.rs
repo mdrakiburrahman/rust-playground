@@ -3919,7 +3919,12 @@ impl DeltaTable {
                 }
             }
         }
-        let groups = crate::partition::split(&normalized, partitions)?;
+        let groups = crate::partition::split_with_new_partition(
+            &normalized,
+            partitions,
+            runtime_config()?.partition_grouping,
+            |_| Ok(()),
+        )?;
         let mut files: Vec<(DeltaFileWriter, RecordBatch)> = Vec::with_capacity(groups.len());
         for (batch, values) in groups {
             let result = (|| -> Result<DeltaFileWriter> {
@@ -4012,7 +4017,6 @@ impl DeltaTable {
         let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
         let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
         let runtime = runtime_config()?;
-        let generated_partition_fast_path = runtime.generated_partition_fast_path;
         let mut identities = Vec::with_capacity(entries.len());
         let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
@@ -4109,7 +4113,8 @@ impl DeltaTable {
                     crate::partition::split_with_generated_partition(
                         &batch,
                         &partitions,
-                        (generated_partition_fast_path && generated_ingestion).then_some(INGESTION_PARTITION),
+                        (runtime.generated_partition_fast_path && generated_ingestion).then_some(INGESTION_PARTITION),
+                        runtime.partition_grouping,
                         &mut register_partition,
                     )?
                 }

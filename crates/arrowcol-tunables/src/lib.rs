@@ -4,6 +4,7 @@ pub use validation::{
     ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table, parse_tunable_duration,
 };
 
+pub use arrow_deltalake::PartitionGrouping;
 pub use arrow_deltalake::writer::{
     Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
     Statistics as ParquetStatistics, ValueEncoding as ParquetValueEncoding, Version as ParquetWriterVersion,
@@ -395,6 +396,11 @@ pub struct RuntimeTunables {
         deserialize_with = "deserialize_present_usize"
     )]
     pub cpu_queue_jobs: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_partition_grouping"
+    )]
+    pub partition_grouping: Option<PartitionGrouping>,
     pub generated_partition_fast_path: Option<bool>,
 }
 
@@ -405,6 +411,12 @@ where
     let value = u8::deserialize(deserializer)
         .map_err(|err| serde::de::Error::custom(format!("collector.layout.detach_ratio: {err}")))?;
     Ok(Some(value))
+}
+
+fn deserialize_present_partition_grouping<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PartitionGrouping>, D::Error> {
+    PartitionGrouping::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
