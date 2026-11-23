@@ -13,7 +13,7 @@ test("derives the common Realistic lane without weakening the historical guard",
   const tunables = config.tunables as { client: { workers: number; max_memory_bytes: number };
     collector: { batching: { per_table_capacity: { bytes: number } }; runtime: Record<string, unknown> } };
   assert.equal(tunables.client.workers, 14);
-  assert.equal(tunables.client.max_memory_bytes, 16 * 1024 ** 3);
+  assert.equal(tunables.client.max_memory_bytes, 5_368_709_120);
   assert.equal(tunables.collector.batching.per_table_capacity.bytes, 2_500_000_000);
   assert.equal("generated_partition_fast_path" in tunables.collector.runtime, false);
   assert.equal(seed.tunables.client.data_profile, "diagnostic");

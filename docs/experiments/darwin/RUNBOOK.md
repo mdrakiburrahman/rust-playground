@@ -23,9 +23,10 @@ required before relying on this path.
 `nonCollectorImages` object with immutable image IDs for `catalog`, `client`,
 `maintenance`, `router`, and `sqlserver`. Build and retain provenance for
 both collector images; labels alone do not prove source provenance. The two
-collector roles must differ, while all other roles remain fixed. The generated
-partition shortcut is not requested. This profile uses 14 client workers and
-a 16 GiB client budget, not the historical 1 GiB client profile.
+collector roles must differ, while all other roles remain fixed. The baseline
+does not request the generated partition shortcut; the candidate enables it.
+This profile uses 14 client workers and a 5 GiB client budget, not the
+historical 1 GiB client profile.
 
 The codec smoke copies only `compression` and `compression_level` from the
 allowlisted candidate into the guarded qualification profile; it does not
