@@ -390,7 +390,15 @@ fn cpu_pool() -> Result<&'static CpuPool> {
     let workers = config.cpu_workers;
     let queue_jobs = config.cpu_queue_jobs.unwrap_or(workers);
     match CPU_POOL.get_or_init(|| {
-        CpuPool::new(workers, queue_jobs, config.cpu_thread_stack_size).map_err(|error| format!("{error:#}"))
+        let pool =
+            CpuPool::new(workers, queue_jobs, config.cpu_thread_stack_size).map_err(|error| format!("{error:#}"))?;
+        if let Some(size) = config.cpu_thread_stack_size {
+            eprintln!(
+                "arrowcol_effective_config {}",
+                serde_json::json!({"cpu_pool":{"thread_stack_size":size}})
+            );
+        }
+        Ok(pool)
     }) {
         Ok(pool) => Ok(pool),
         Err(error) => anyhow::bail!("{error}"),
@@ -886,6 +894,39 @@ mod tests {
         assert!(format!("{builder:?}").contains("thread_stack_size: Some(2097152)"));
         let runtime = builder.build()?;
         assert_eq!(runtime.block_on(async { 42 }), 42);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_pool_readback_follows_worker_creation() -> Result<()> {
+        if std::env::var_os("ARROWCOL_TEST_CPU_POOL_CHILD").is_some() {
+            assert_eq!(run_cpu(|| 42)?, 42);
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "delta_io::tests::cpu_pool_readback_follows_worker_creation",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("ARROWCOL_TEST_CPU_POOL_CHILD", "1")
+            .env("ARROWCOL_COLLECTOR_CPU_WORKERS", "1")
+            .env("ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE", "4194304")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "CPU pool child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        let readback = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("arrowcol_effective_config "))
+            .context("CPU pool readback missing")?;
+        let readback: serde_json::Value = serde_json::from_str(readback)?;
+        assert_eq!(readback["cpu_pool"]["thread_stack_size"], 4194304);
         Ok(())
     }
 
