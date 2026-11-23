@@ -5467,7 +5467,7 @@ async fn run_clients_inner(
     if let Some(child) = cpu_observer {
         let output = child.wait_with_output().await?;
         ensure!(output.status.success(), "diagnostic CPU window observer failed");
-        let window: Value = serde_json::from_slice(&output.stdout)?;
+        let window = diagnostic_window_json(&output.stdout)?;
         println!("[oat] diagnostic CPU window: {window}");
     }
     let final_sample = sample_router_metrics(platform, config, &metrics_client, tables).await;

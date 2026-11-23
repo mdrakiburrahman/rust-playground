@@ -48,3 +48,24 @@ test('e75 pressure receipt accepts serialization drift in derived values only',(
   assert.throws(()=>cpuWindowReceipt(p,{...window,limited_by:['support']},schedule));
   window.start.counters['0'].ns=0.25;assert.throws(()=>cpuWindowReceipt(p,window,schedule));
 });
+
+test('integer deltas decide saturation and zero residual, not the rounded receipt',()=>{
+  const p=plan(), duration=1_000_000, scale=duration*1e6;
+  const boundary=(end:boolean,client:number,support:number,collector:number)=>({target:end?duration:0,host_at:end?duration:0,
+    ticks:cpuTicks([0,24,25,26,27,28,29,30,31].map(i=>`cpu${i} ${end?1:0} 0 0 ${end?1:0} 0 0 0 0`).join('\n')),
+    counters:Object.fromEntries(p.containers.map(c=>[c.id,{at:end?duration:0,ns:c.state==='exited'?null:!end?0:({'dataflow-1':collector,'oat-client':client,router:support}[c.service]??0)}]))});
+  const schedule={measurement_start_unix_ms:0,measurement_end_unix_ms:duration};
+  for(const group of ['client','support','collector'] as const) for(const offset of [-1,0,1]){
+    const w=summarize(p,boundary(false,0,0,0),boundary(true,group==='client'?5.4*scale+offset:0,group==='support'?1.8*scale+offset:0,0.5*scale+(group==='collector'?offset:0)));
+    const limited=group!=='collector' && offset>=0;
+    assert.deepEqual(w.limited_by,limited?[group]:[]);assert.equal(w.collector_cpu_evidence,group==='collector'?offset<=0:!limited);
+    if(group!=='collector') w.group_cores[group]=group==='client'?5.4:1.8; // rounded onto the boundary
+    cpuWindowReceipt(p,w,schedule);
+    assert.throws(()=>cpuWindowReceipt(p,{...w,collector_cpu_evidence:!w.collector_cpu_evidence},schedule));
+    assert.throws(()=>cpuWindowReceipt(p,{...w,limited_by:limited?[]:['support']},schedule));
+    if(group==='collector'){
+      const residual=w.non_collector_busy_on_collector_cpus;assert.equal(Math.sign(residual.estimated_cores),offset===0?0:-offset);
+      assert.throws(()=>cpuWindowReceipt(p,{...w,non_collector_busy_on_collector_cpus:{...residual,estimated_cores:offset===0?Number.MIN_VALUE:0}},schedule));
+    }
+  }
+});

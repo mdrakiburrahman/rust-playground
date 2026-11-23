@@ -209,3 +209,42 @@ fn diagnostic_and_ordinary_local_startup_validate_first_cell_not_last() -> Resul
     assert!(first_local_concurrency(&[0, 7]).is_err());
     Ok(())
 }
+
+// Validate the observer's JSON while preserving its decimal tokens in the one-line receipt.
+fn diagnostic_window_json(output: &[u8]) -> Result<&str> {
+    let raw: &serde_json::value::RawValue = serde_json::from_slice(output)?;
+    let text = raw.get();
+    ensure!(
+        text.starts_with('{') && !text.contains(['\r', '\n']),
+        "invalid CPU window record"
+    );
+    Ok(text)
+}
+
+#[test]
+fn diagnostic_window_js_rust_js_roundtrip() -> Result<()> {
+    let run_node = |source: &str, argument: &str| -> Result<Vec<u8>> {
+        let output = std::process::Command::new("node")
+            .args(["-e", source, argument])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Node regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output.stdout)
+    };
+    // Router ns and actual boundary timestamps from the e75 pressure observer.
+    let js = run_node(
+        "const start={at:1795416733476,ns:15183032000},end={at:1795416793471,ns:73956466000}; console.log(JSON.stringify({start,end,router_cores:(end.ns-start.ns)/((end.at-start.at)*1e6)}));",
+        "",
+    )?;
+    let text = diagnostic_window_json(&js)?;
+    assert_eq!(text, std::str::from_utf8(&js)?.trim_end());
+    run_node(
+        "const {start,end,router_cores}=JSON.parse(process.argv[1]); require('node:assert/strict').equal(router_cores,(end.ns-start.ns)/((end.at-start.at)*1e6));",
+        text,
+    )?;
+    assert!(diagnostic_window_json(b"{}\n{}").is_err());
+    Ok(())
+}
