@@ -28,6 +28,20 @@ AKS already configures `platform.resources.collector.limits.cpu` independently
 of worker concurrency (including the existing explicit uncapped mode); it does
 not consume this local-only field.
 
+## Container memory guard metric
+
+| Setting | Type and range | Default | Apply boundary | Influence and interactions |
+| --- | --- | --- | --- | --- |
+| `overload_guard.container_memory_metric` | `usage` or `working_set` | `usage` | Per-cell guard creation | `usage` is page-cache-inclusive cgroup usage. `working_set` subtracts cgroup-v2 `memory.stat.inactive_file`, saturating at zero. Changes the container ceiling observation and the cgroup RSS signal, not the process-RSS signal. Requires an enabled guard; local working-set or cgroup-signal guards require an explicit finite `platform.local.collector_memory_limit_bytes`. |
+
+Guard evidence records the selected enum in `settings.container_memory_metric`
+and the effective metric name in cap observations. The standalone TypeScript
+resource sampler uses the same `usage` / `working_set` choices through
+`--container-memory-metric`, and records both raw values plus `metric` and
+`valueBytes`. Neither sampler substitutes RSS for missing cgroup counters.
+`memory.max=max` is classified as `container_memory_unlimited`, distinct from
+invalid or missing cap evidence.
+
 ## Collector build profile and image arms
 
 These controls are rebuild-only. The canonical profile key is `allocator=<value>;lto=<value>;codegen_units=<value>;opt_level=<value>;target_cpu=<value>`; its SHA-256 selects the profile-specific image tag and isolated BuildKit target cache. OAT selects the matching local image or digest-pinned AKS image; a missing or mismatched image fails before the arm starts. Omitted build fields preserve the Cargo release defaults and existing image path.

@@ -162,6 +162,8 @@ pub struct OverloadGuardConfig {
     pub zero_progress_windows: u32,
     #[serde(skip_serializing_if = "OverloadRssSignal::is_process_rss")]
     pub memory_signal: OverloadRssSignal,
+    #[serde(skip_serializing_if = "arrowcol_tunables::ContainerMemoryMetric::is_usage")]
+    pub container_memory_metric: arrowcol_tunables::ContainerMemoryMetric,
 }
 
 impl Default for OverloadGuardConfig {
@@ -171,6 +173,7 @@ impl Default for OverloadGuardConfig {
             cap_fraction: 0.90,
             zero_progress_windows: 2,
             memory_signal: OverloadRssSignal::ProcessRss,
+            container_memory_metric: arrowcol_tunables::ContainerMemoryMetric::Usage,
         }
     }
 }
@@ -1213,6 +1216,19 @@ impl OatConfig {
         }
         if self.overload_guard.memory_signal == OverloadRssSignal::CgroupMemory {
             self.cgroup_guard_requested_limits()?;
+        }
+        if !self.overload_guard.container_memory_metric.is_usage() && !self.overload_guard.enabled {
+            bail!("overload_guard.container_memory_metric requires overload_guard.enabled=true");
+        }
+        if self.overload_guard.enabled
+            && self.platform.kind == OatMode::Local
+            && (self.overload_guard.memory_signal == OverloadRssSignal::CgroupMemory
+                || !self.overload_guard.container_memory_metric.is_usage())
+            && self.platform.local.collector_memory_limit_bytes.is_none()
+        {
+            bail!(
+                "container-based overload_guard requires platform.local.collector_memory_limit_bytes to be an explicit finite cap"
+            );
         }
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;

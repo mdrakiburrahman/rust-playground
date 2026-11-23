@@ -373,7 +373,7 @@ impl GuardEngine {
         self.proof["last_confirmed_caps"] = self.proof["last_caps"].take();
         self.proof["last_caps"] = json!(
             [
-                "container_memory_bytes",
+                self.settings.container_memory_metric.metric_name(),
                 match self.settings.memory_signal {
                     crate::config::OverloadRssSignal::ProcessRss => "collector_rss_bytes",
                     crate::config::OverloadRssSignal::CgroupMemory => "collector_cgroup_memory_bytes",
@@ -546,6 +546,7 @@ struct LocalGuardMemory {
     instance_id: String,
     started_at: String,
     cap: u64,
+    metric: arrowcol_tunables::ContainerMemoryMetric,
 }
 
 #[cfg(unix)]
@@ -596,23 +597,30 @@ impl LocalGuardMemory {
             .context("Docker cgroup usage missing")?;
         let limit = stats.pointer("/memory_stats/limit").and_then(Value::as_u64)
             .context("Docker cgroup limit missing")?;
-        guard_container_memory(&format!("0::/\n{used}\n{limit}\n"), Some(self.cap))
+        let inactive_file = if self.metric.is_usage() {
+            0
+        } else {
+            stats.pointer("/memory_stats/stats/inactive_file").and_then(Value::as_u64)
+                .context("Docker cgroup-v2 inactive_file missing for overload_guard.container_memory_metric=working_set")?
+        };
+        guard_container_memory_metric(
+            &format!("0::/\n{used}\n{limit}\ninactive_file {inactive_file}\n"), Some(self.cap), self.metric)
     }
 
-    async fn prepare(instance_id: &str, requested: Option<u64>) -> Result<Self> {
+    async fn prepare(instance_id: &str, requested: Option<u64>, metric: arrowcol_tunables::ContainerMemoryMetric) -> Result<Self> {
         if instance_id.len() != 64 || !instance_id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
             bail!("Docker collector ID is not immutable");
         }
         let mut command = Command::new("docker");
-        command.args(["exec", instance_id, "cat", "/proc/self/cgroup", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"]);
+        command.args(["exec", instance_id, "cat", "/proc/self/cgroup", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.stat"]);
         let direct = guard_cgroup_output(command).await?;
-        let cap = guard_container_memory(&String::from_utf8(direct.stdout)?, requested)?.cap;
+        let cap = guard_container_memory_metric(&String::from_utf8(direct.stdout)?, requested, metric)?.cap;
         let client = reqwest::Client::builder()
             .unix_socket("/var/run/docker.sock")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let mut memory = Self { client, instance_id: instance_id.to_owned(), started_at: String::new(), cap };
+        let mut memory = Self { client, instance_id: instance_id.to_owned(), started_at: String::new(), cap, metric };
         let inspect = memory.get("/json").await?;
         memory.started_at = inspect.pointer("/State/StartedAt").and_then(Value::as_str)
             .filter(|value| !value.is_empty()).context("Docker collector start identity missing")?.to_owned();
@@ -923,7 +931,8 @@ impl PreparedGuard {
         let local_memory = if platform.kind() == crate::config::OatMode::Local {
             Some(tokio::time::timeout(
                 GUARD_READ_TIMEOUT,
-                LocalGuardMemory::prepare(&log.instance_id, config.platform.local.collector_memory_limit_bytes),
+                LocalGuardMemory::prepare(&log.instance_id, config.platform.local.collector_memory_limit_bytes,
+                    config.overload_guard.container_memory_metric),
             ).await.context("Docker guard admission deadline exceeded")??)
         } else {
             None
@@ -955,6 +964,7 @@ impl PreparedGuard {
         prepared.engine.proof["requested_container_memory_limit_bytes"] =
             json!(config.platform.local.collector_memory_limit_bytes);
         prepared.engine.proof["collector_rss_limit_source"] = json!("registration_configuration_not_cgroup");
+        prepared.engine.proof["container_memory_metric"] = json!(config.overload_guard.container_memory_metric);
         #[cfg(unix)]
         if prepared.probe.local_memory.is_some() {
             prepared.engine.proof["container_memory_source"] = json!("docker_one_shot_cgroup_with_identity_fence");
@@ -997,18 +1007,62 @@ impl PreparedGuard {
     }
 }
 
+#[cfg(test)]
 fn guard_container_memory(text: &str, requested: Option<u64>) -> Result<GuardCap> {
-    let lines = text.lines().collect::<Vec<_>>();
-    let [namespace, used, limit] = lines.as_slice() else {
-        bail!("cgroup memory readback is incomplete");
-    };
-    if *namespace != "0::/" {
+    guard_container_memory_metric(text, requested, arrowcol_tunables::ContainerMemoryMetric::Usage)
+}
+
+async fn preflight_local_container_memory_guard(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if !config.overload_guard.enabled {
+        return Ok(());
+    }
+    let project = scoped_compose_project(
+        config.platform.compose_project.as_deref().context("local Compose project missing")?,
+        &platform.run_id,
+    );
+    let mut render = compose_command(
+        config.platform.compose_file.as_deref().context("local Compose file missing")?,
+        config.platform.compose_override_file.as_deref(), &project, "benchmark",
+    );
+    platform.add_compose_environment(&mut render);
+    render.args(["config", "--format", "json"]);
+    let rendered: Value = serde_json::from_slice(&run_command(render, "preflight local guard memory cap").await?.stdout)?;
+    validate_rendered_guard_memory_cap(&rendered)?;
+    Ok(())
+}
+
+fn validate_rendered_guard_memory_cap(rendered: &Value) -> Result<u64> {
+    let value = &rendered["services"]["dataflow-1"]["mem_limit"];
+    let cap = value.as_u64().or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+        .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+        .context("overload_guard requires a finite dataflow-1 mem_limit; set platform.local.collector_memory_limit_bytes")?;
+    Ok(cap)
+}
+
+fn guard_container_memory_metric(text: &str, requested: Option<u64>, metric: arrowcol_tunables::ContainerMemoryMetric) -> Result<GuardCap> {
+    let mut lines = text.lines();
+    let namespace = lines.next().context("cgroup namespace readback is incomplete")?;
+    let used = lines.next().context("cgroup memory.current readback is incomplete")?;
+    let limit = lines.next().context("cgroup memory.max readback is incomplete")?;
+    if namespace != "0::/" {
         bail!("cgroup accounting is not scoped to the collector container: {namespace}");
     }
-    let observed_value = used.parse::<u64>().context("cgroup memory.current is invalid")?;
+    let mut observed_value = used.parse::<u64>().context("cgroup memory.current is invalid")?;
+    if limit == "max" {
+        return Err(GuardReadError::new("container_memory_unlimited").into());
+    }
     let cap = limit
         .parse::<u64>()
-        .context("container memory hard cap is unconfirmed or unlimited")?;
+        .context("container memory hard cap is invalid")?;
+    if !metric.is_usage() {
+        let inactive_file = lines.filter_map(|line| line.strip_prefix("inactive_file "))
+            .collect::<Vec<_>>();
+        let [inactive_file] = inactive_file.as_slice() else {
+            bail!("overload_guard.container_memory_metric=working_set requires one cgroup-v2 memory.stat inactive_file counter");
+        };
+        observed_value = observed_value.saturating_sub(inactive_file.parse::<u64>()
+            .context("cgroup memory.stat inactive_file is invalid")?);
+    }
     if cap == 0 || cap > i64::MAX as u64 {
         bail!("container memory hard cap is unavailable");
     }
@@ -1018,7 +1072,7 @@ fn guard_container_memory(text: &str, requested: Option<u64>) -> Result<GuardCap
         bail!("container memory hard cap mismatch: requested {requested}, effective {cap}");
     }
     Ok(GuardCap {
-        metric: "container_memory_bytes",
+        metric: metric.metric_name(),
         observed_value,
         cap,
         confirmed: true,
@@ -1049,6 +1103,7 @@ impl GuardProbe {
                     "/proc/self/cgroup",
                     "/sys/fs/cgroup/memory.current",
                     "/sys/fs/cgroup/memory.max",
+                    "/sys/fs/cgroup/memory.stat",
                 ]);
             }
             Ok(command)
@@ -1075,6 +1130,7 @@ impl GuardProbe {
                     "/proc/self/cgroup",
                     "/sys/fs/cgroup/memory.current",
                     "/sys/fs/cgroup/memory.max",
+                    "/sys/fs/cgroup/memory.stat",
                 ]);
             }
             Ok(command)
@@ -1114,11 +1170,11 @@ impl GuardProbe {
                 }
                 let output = guard_cgroup_output(self.command(config, false)?).await?;
                 let memory = String::from_utf8(output.stdout)?;
-                guard_container_memory(&memory, if self.local {
+                guard_container_memory_metric(&memory, if self.local {
                     config.platform.local.collector_memory_limit_bytes
                 } else {
                     None
-                })
+                }, config.overload_guard.container_memory_metric)
             }),
             guard_read_leg(deadline, async {
                 match &self.api {
@@ -1637,6 +1693,17 @@ mod overload_guard_tests {
     #[test]
     fn overload_cgroup_accounting_and_incremental_cursor_refuse_invented_limits() -> Result<()> {
         assert_eq!(guard_container_memory("0::/\n100\n1000\n", Some(1000))?.cap, 1000);
+        let unlimited = guard_container_memory("0::/\n100\nmax\n", None).expect_err("unlimited memory must fail");
+        assert_eq!(classify_guard_error(&unlimited).kind, "container_memory_unlimited");
+        assert!(validate_rendered_guard_memory_cap(&json!({"services":{"dataflow-1":{}}})).is_err());
+        assert!(validate_rendered_guard_memory_cap(&json!({"services":{"dataflow-1":{"mem_limit":0}}})).is_err());
+        assert_eq!(validate_rendered_guard_memory_cap(
+            &json!({"services":{"dataflow-1":{"mem_limit":1000}}}))?, 1000);
+        let working_set = guard_container_memory_metric("0::/\n800\n1000\nanon 200\ninactive_file 300\n",
+            Some(1000), arrowcol_tunables::ContainerMemoryMetric::WorkingSet)?;
+        assert_eq!((working_set.metric, working_set.observed_value), ("container_working_set_bytes", 500));
+        assert!(guard_container_memory_metric("0::/\n800\n1000\nanon 200\n",
+            Some(1000), arrowcol_tunables::ContainerMemoryMetric::WorkingSet).is_err());
         for text in ["0::/\n100\nmax\n", "0::/host\n100\n1000\n", "0::/\n100\n999\n"] {
             assert!(guard_container_memory(text, Some(1000)).is_err());
         }
@@ -1683,6 +1750,7 @@ mod overload_guard_tests {
             instance_id: "a".repeat(64),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             cap: 1000,
+            metric: arrowcol_tunables::ContainerMemoryMetric::Usage,
         };
         let inspect = json!({
             "Id": guard.instance_id, "RestartCount": 0,
@@ -1716,6 +1784,16 @@ mod overload_guard_tests {
         changed["memory_stats"]["limit"] = json!(1000);
         changed["memory_stats"]["usage"] = Value::Null;
         assert!(guard.stats(&changed, timestamp, timestamp + 1000).is_err());
+        let working_set = LocalGuardMemory {
+            metric: arrowcol_tunables::ContainerMemoryMetric::WorkingSet,
+            ..guard
+        };
+        assert!(working_set.stats(&stats, timestamp, timestamp + 1000).is_err());
+        let mut stats = stats;
+        stats["memory_stats"]["stats"] = json!({"inactive_file":100});
+        assert_eq!(working_set.stats(&stats, timestamp, timestamp + 1000)?.observed_value, 23);
+        assert!(serde_json::from_value::<crate::config::OverloadGuardConfig>(
+            json!({"container_memory_metric":"rss"})).is_err());
         Ok(())
     }
 

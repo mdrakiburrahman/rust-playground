@@ -738,6 +738,12 @@ fn capability_evidence() -> Vec<Value> {
             "boundary": "per_cell_runtime",
             "consumer_startup_proof": "docker_inspect_and_cgroup_v2",
         })))
+        .chain(std::iter::once(json!({
+            "name": "overload_guard.container_memory_metric",
+            "default": "usage",
+            "boundary": "per_cell_runtime",
+            "consumer_startup_proof": "overload_guard.settings_and_cgroup_v2_memory_stat",
+        })))
         .collect()
 }
 

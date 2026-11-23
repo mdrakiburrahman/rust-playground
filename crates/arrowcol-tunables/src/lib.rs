@@ -27,6 +27,29 @@ pub enum UnlimitedCpuQuota {
     Unlimited,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMemoryMetric {
+    #[default]
+    Usage,
+    WorkingSet,
+}
+
+impl ContainerMemoryMetric {
+    #[must_use]
+    pub fn is_usage(&self) -> bool {
+        *self == Self::Usage
+    }
+
+    #[must_use]
+    pub fn metric_name(self) -> &'static str {
+        match self {
+            Self::Usage => "container_memory_bytes",
+            Self::WorkingSet => "container_working_set_bytes",
+        }
+    }
+}
+
 impl CollectorCpuQuota {
     /// # Errors
     /// Rejects nonpositive, nonfinite, oversized or sub-nanocore quotas.

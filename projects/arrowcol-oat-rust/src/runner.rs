@@ -8638,6 +8638,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         pin_stable_local_images(config, platform).await?;
     }
     verify_local_bind_mount(config, platform).await?;
+    preflight_local_container_memory_guard(config, platform).await?;
 
     let mut up = compose_command(
         compose_file,
