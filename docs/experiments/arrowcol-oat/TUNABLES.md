@@ -12,6 +12,19 @@
 
 ## Client data profile and identity
 
+Generator settings below apply at **process startup**.
+
+| Setting | Type / allowed values | Diagnostic default | Realistic default |
+| --- | --- | --- | --- |
+| `client.string_length_distribution` | Enum: `fixed`, `uniform` | `fixed` | `uniform` |
+| `client.value_variation`, `client.guid_uniqueness` | Enum: `cardinality`, `per_row` | `cardinality` | `per_row` |
+| `client.string_width` | Integer: 0..65536 bytes | 0 (canonical fallback) | 0 (resolves to 96) |
+| `client.cardinality` | Positive integer fitting `usize` | 1024 | 1024 |
+| `client.null_fraction`, `client.skew` | Finite number: 0..1 | 0 | 0 |
+| `client.entropy` | Finite number: 0..1 | 1 | 1 |
+| `client.seed` | Unsigned 64-bit integer | 20260923 | 20260923 |
+| `client.pod_ordinal` | Unsigned 32-bit integer | 0 | 0 |
+
 | Setting | Contract |
 | --- | --- |
 | `client.data_profile` | Strict `diagnostic` (default) or `realistic`. Diagnostic preserves the older replayable values; `realistic` must be explicitly selected for D53 and uses documented field-specific Always On state categories, variable-width strings elsewhere, per-row numeric/timestamp values, GUID uniqueness, and a fresh row identity in `endpoint_url`. Diagnostic replay is not eligible for unique-delivery proof. |
