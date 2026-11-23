@@ -3099,21 +3099,26 @@ mod tests {
     }
 
     #[test]
-    fn client_identity_builder_rejects_invalid_values_and_profiles() {
+    fn client_identity_builder_rejects_invalid_values_and_profiles() -> Result<()> {
         for value in [
             serde_json::json!({"client":{"identity_builder":"unknown"}}),
             serde_json::json!({"client":{"identity_builder":"direct_utf8"}}),
         ] {
-            let error = Tunables::parse_oat_json(value).expect_err("invalid identity builder must fail");
+            let Err(error) = Tunables::parse_oat_json(value) else {
+                bail!("invalid identity builder must fail");
+            };
             assert!(error.to_string().contains("identity_builder"), "{error:#}");
         }
+        Ok(())
     }
 
     #[test]
-    fn client_send_iter_rejects_unknown_value() {
-        let error = Tunables::parse_oat_json(serde_json::json!({"client":{"send_iter":"cursor"}}))
-            .expect_err("unknown send iterator must fail");
+    fn client_send_iter_rejects_unknown_value() -> Result<()> {
+        let Err(error) = Tunables::parse_oat_json(serde_json::json!({"client":{"send_iter":"cursor"}})) else {
+            bail!("unknown send iterator must fail");
+        };
         assert!(error.to_string().contains("send_iter"), "{error:#}");
+        Ok(())
     }
 
     #[test]
