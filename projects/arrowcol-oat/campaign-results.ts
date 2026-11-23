@@ -295,6 +295,21 @@ function canonicalFactorPath(path: string): string | undefined {
   return parts.length ? parts.join('.') : undefined;
 }
 
+const proofReasonPaths: Readonly<Record<string, readonly string[]>> = {
+  no_nullable_generated_columns: ['client.null_fraction'],
+  no_eligible_generated_rows: [
+    'client.pod_ordinal', 'client.guid_uniqueness', 'client.value_variation',
+    'client.string_width', 'client.string_length_distribution',
+  ],
+  all_values_skewed: ['client.value_variation', 'client.cardinality'],
+  one_byte_maximum_width: ['client.string_length_distribution'],
+  consumer_startup_and_prepared_corpus: [
+    'client.pod_ordinal', 'client.guid_uniqueness', 'client.value_variation', 'client.string_width',
+    'client.string_length_distribution', 'client.entropy', 'client.cardinality', 'client.seed', 'client.skew',
+  ],
+  committed_table_metadata_readback: ['collector.commit.delta_stats_columns'],
+};
+
 function factorCoverage(row: CampaignMeasurement): FactorCoverage {
   const unknown: FactorCoverage = { status: 'unknown', reason: 'varied factor coverage unknown' };
   if (!row.factorConfigPaths || !row.officialRuns?.length) return unknown;
@@ -331,7 +346,8 @@ function factorCoverage(row: CampaignMeasurement): FactorCoverage {
           if (!path) { incomplete = true; continue; }
           if (seen.has(path)) incomplete = true;
           seen.add(path);
-          if (typeof entry.reason !== 'string' || !(allowedReasons as readonly string[]).includes(entry.reason)) {
+          if (typeof entry.reason !== 'string' || !(allowedReasons as readonly string[]).includes(entry.reason) ||
+              (Object.hasOwn(proofReasonPaths, entry.reason) && !proofReasonPaths[entry.reason]!.includes(path))) {
             incomplete = true;
             continue;
           }

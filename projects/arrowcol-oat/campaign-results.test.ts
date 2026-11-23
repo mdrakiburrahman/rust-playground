@@ -1194,6 +1194,44 @@ test('accepts committed table metadata proof for a stats factor and unrelated fa
   }
 });
 
+test('rejects recognized proof reasons on paths their producers cannot emit', () => {
+  const cases = [
+    ['consumer_verified', 'client.string_width', 'committed_table_metadata_readback'],
+    ['consumer_verified', 'collector.commit.delta_stats_columns', 'consumer_startup_and_prepared_corpus'],
+    ['inert_fields', 'client.string_width', 'no_nullable_generated_columns'],
+    ['inert_fields', 'client.cardinality', 'no_eligible_generated_rows'],
+    ['inert_fields', 'client.string_width', 'all_values_skewed'],
+    ['inert_fields', 'client.value_variation', 'one_byte_maximum_width'],
+  ] as const;
+  for (const [index, [classification, path, reason]] of cases.entries()) {
+    const candidate = generatorCandidate('wrong-proof-path', 800, 420 + index * 3).map(row => {
+      if (path === 'collector.commit.delta_stats_columns') {
+        Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+          commit: { delta_stats_columns: ['server_name'] },
+        } });
+        return { ...row, factorConfigPaths: ['collector.commit.delta_stats_columns', 'client.guid_uniqueness'] };
+      }
+      return row;
+    });
+    mutateFactorEvidence(candidate[1]!, evidence => {
+      if (classification === 'consumer_verified' && path === 'client.string_width') {
+        evidence.consumer_verified = [
+          { path, reason },
+          { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        ];
+      } else {
+        evidence[classification] = [
+          ...(evidence[classification] as Array<Record<string, unknown>>),
+          { path, reason },
+        ];
+      }
+    });
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /wrong-proof-path \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
 test('fails closed on duplicate or unknown classifications even with otherwise complete coverage', () => {
   for (const scenario of ['unknown', 'duplicate', 'verified'] as const) {
     const candidate = coveredCandidate('runner', 100, 230);
