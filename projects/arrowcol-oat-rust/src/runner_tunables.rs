@@ -42,6 +42,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
     let environment = role_environment(config, ComponentRole::Collector)?;
     let parquet_policy: Option<Value> = environment.get("ARROWCOL_PARQUET_CONFIG")
         .map(|value| serde_json::from_str(value)).transpose()?;
+    let layout_policy = config.tunables.collector.as_ref().and_then(|collector| collector.layout.as_ref())
+        .map(serde_json::to_value).transpose()?;
     let expected_tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
     let table_policies = collectors.iter()
@@ -71,6 +73,23 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        if let Some(field) = path.strip_prefix("collector.layout.")
+            && matches!(field, "enabled" | "sort_columns" | "bloom_columns" | "max_rows"
+                | "max_input_bytes" | "row_group_rows" | "page_rows")
+        {
+            let requested = layout_policy.as_ref().and_then(|policy| policy.get(field))
+                .filter(|value| !value.is_null());
+            if tables_covered && requested.is_some()
+                && table_policies.iter().all(|record| {
+                    (field == "enabled" || record["config"]["enabled"] == true)
+                        && record["config"].get(field) == requested
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
+                return false;
+            }
+            return true;
+        }
         if let Some(field) = path.strip_prefix("parquet_writer.")
             && matches!(field, "writer_version" | "max_row_group_bytes" | "write_batch_size"
                 | "offset_index_enabled" | "column_index_truncate_length" | "statistics_truncate_length")
