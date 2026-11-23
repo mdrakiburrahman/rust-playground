@@ -318,7 +318,7 @@ function factorCoverage(row: CampaignMeasurement): FactorCoverage {
         ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled', 'duration_based_run', 'collector_shutdown_after_measurement', 'connection_retries_disabled', 'stream_retries_disabled', 'http2_keepalive_disabled', 'adaptive_http2_window', 'tcp_keepalive_disabled', 'rate_limit_disabled']],
         ['projection_only', projected, ['consumer_startup_proof_unverified']],
         ['runner_controls', undefined, ['maintenance_runner_control', 'router_log_filter_inheritance']],
-        ['consumer_verified', undefined, ['consumer_startup_readback', 'consumer_table_writer_readback', 'consumer_table_adaptive_readback']],
+        ['consumer_verified', undefined, ['consumer_startup_readback', 'consumer_table_writer_readback', 'consumer_table_adaptive_readback', 'consumer_linux_thp_flag_readback', 'consumer_linux_listener_buffer_readback', 'consumer_accepted_socket_readback', 'consumer_cpu_pool_readback']],
       ] as const) {
         const entries = evidence[field];
         if (!Array.isArray(entries)) { incomplete = true; continue; }

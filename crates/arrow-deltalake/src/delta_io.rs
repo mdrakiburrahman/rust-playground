@@ -637,6 +637,18 @@ impl SharedExecutor {
         let runtime = configured_io_builder(config)
             .build()
             .context("create shared Delta I/O runtime")?;
+        eprintln!(
+            "ARROWCOL_DELTA_IO_RUNTIME_BUILT {}",
+            serde_json::json!({
+                "version": 1,
+                "runtime": {
+                    "event_interval": config.event_interval,
+                    "global_queue_interval": config.global_queue_interval,
+                    "thread_stack_size": config.thread_stack_size,
+                    "thread_keep_alive_ms": config.thread_keep_alive_ms,
+                }
+            })
+        );
         Ok(Self {
             runtime,
             admission: Arc::new(Admission::new(config.task_limit)),

@@ -459,7 +459,7 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
         ),
         "collector"
             if [
-                "batching", "catalog", "commit", "exporter", "limits", "pressure", "routing",
+                "batching", "catalog", "commit", "exporter", "limits", "pressure", "routing", "socket",
             ]
             .contains(&parts[1]) =>
         {

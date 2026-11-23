@@ -747,9 +747,12 @@ fn configure_flight_listener(
 }
 
 fn verify_linux_buffer_size(field: &str, requested: usize, observed: usize) -> Result<(), String> {
-    if observed < requested * 2 {
+    let expected = requested.checked_mul(2).ok_or_else(|| {
+        format!("{field}: requested {requested} bytes overflows Linux reporting; observed {observed} bytes")
+    })?;
+    if observed != expected {
         return Err(format!(
-            "{field}: OS clamped request {requested}; reported buffer is {observed} bytes"
+            "{field}: requested {requested} bytes, observed {observed} bytes; expected exactly {expected} bytes"
         ));
     }
     Ok(())
@@ -1273,10 +1276,15 @@ pub(crate) mod tests {
             socket.send_buffer_size()?,
             actual["send_buffer_bytes"].as_u64().ok_or("missing send readback")? as usize
         );
-        let error = verify_linux_buffer_size("collector.socket.recv_buffer_bytes", 32_768, 32_768)
-            .err()
-            .ok_or("clamped value was accepted")?;
-        assert!(error.contains("collector.socket.recv_buffer_bytes"));
+        assert!(verify_linux_buffer_size("collector.socket.recv_buffer_bytes", 32_768, 65_536).is_ok());
+        for observed in [32_768, 65_535, 65_537] {
+            let error = verify_linux_buffer_size("collector.socket.recv_buffer_bytes", 32_768, observed)
+                .err()
+                .ok_or("clamped value was accepted")?;
+            assert!(error.contains("collector.socket.recv_buffer_bytes"));
+            assert!(error.contains("requested 32768 bytes"));
+            assert!(error.contains(&format!("observed {observed} bytes")));
+        }
         Ok(())
     }
 

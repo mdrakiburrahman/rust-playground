@@ -299,6 +299,7 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
 fn process_configurations(text: &str) -> Result<Value> {
     let mut configuration = json!({});
     let mut resolution_seen = false;
+    let mut delta_io_runtime_build_seen = false;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("OAT_CLIENT_RESOLUTION ") {
             if resolution_seen {
@@ -311,6 +312,27 @@ fn process_configurations(text: &str) -> Result<Value> {
             }
             configuration["resolution"] =
                 public_tuning_value(&value).context("client resolution source was not public")?;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("ARROWCOL_DELTA_IO_RUNTIME_BUILT ") {
+            if delta_io_runtime_build_seen {
+                bail!("duplicate Delta I/O runtime build readback");
+            }
+            delta_io_runtime_build_seen = true;
+            let value: Value = serde_json::from_str(value).context("invalid Delta I/O runtime build readback")?;
+            let object = value.as_object().context("Delta I/O runtime build readback must be an object")?;
+            if object.len() != 2 || value["version"] != 1 {
+                bail!("unsupported Delta I/O runtime build readback");
+            }
+            let runtime = value.get("runtime").and_then(Value::as_object)
+                .context("Delta I/O runtime build readback omitted runtime settings")?;
+            let fields = ["event_interval", "global_queue_interval", "thread_stack_size", "thread_keep_alive_ms"];
+            if runtime.len() != fields.len() || fields.iter().any(|field| {
+                runtime.get(*field).is_none_or(|value| !value.is_null() && value.as_u64().is_none())
+            }) {
+                bail!("invalid Delta I/O runtime build settings");
+            }
+            configuration["delta_io_runtime_build"] = Value::Object(runtime.clone());
             continue;
         }
         let value = [
@@ -1984,6 +2006,19 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn delta_io_runtime_build_readback_is_unique_and_typed() -> Result<()> {
+        let record = "ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":1,\"runtime\":{\"event_interval\":7,\"global_queue_interval\":13,\"thread_stack_size\":2097152,\"thread_keep_alive_ms\":3000}}\n";
+        let observed = process_configurations(record)?;
+        assert_eq!(observed["delta_io_runtime_build"], json!({
+            "event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000
+        }));
+        assert!(process_configurations(&format!("{record}{record}")).is_err());
+        assert!(process_configurations("ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":2,\"runtime\":{}}\n").is_err());
+        assert!(process_configurations("ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":1,\"runtime\":{\"event_interval\":\"7\"}}\n").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn router_excluded_gauges_require_matching_startup_readback() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -2517,7 +2552,7 @@ groups:
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
         let verified = covered["consumer_verified"].as_array().context("consumer_verified array")?;
-        assert_eq!(verified.len(), if cfg!(target_os = "linux") { 51 } else { 49 });
+        assert_eq!(verified.len(), if cfg!(target_os = "linux") { 52 } else { 50 });
         for path in [
             "collector.socket.tcp_nodelay",
             "collector.runtime.file_mapping_cache",

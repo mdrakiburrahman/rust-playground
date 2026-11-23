@@ -1219,6 +1219,59 @@ test('an active cell retains its committed rate after Kustainer death', () => {
   assert.match(svg, />800\*?<\/text>/);
 });
 
+test('ranks a source-shaped receipt with G2a and G7 consumer readback reasons', () => {
+  const evidenceCases = [
+    { path: 'collector.thp_disabled', reason: 'consumer_linux_thp_flag_readback' },
+    { path: 'collector.socket.recv_buffer_bytes', reason: 'consumer_linux_listener_buffer_readback' },
+    { path: 'collector.socket.tcp_nodelay', reason: 'consumer_accepted_socket_readback' },
+    { path: 'collector.runtime.cpu_thread_stack_size', reason: 'consumer_cpu_pool_readback' },
+    { path: 'collector.runtime.event_interval', reason: 'consumer_startup_readback' },
+    { path: 'parquet_writer.max_row_group_rows', reason: 'consumer_table_writer_readback' },
+    { path: 'collector.batching.adaptive_file.target_parquet_bytes', reason: 'consumer_table_adaptive_readback' },
+  ];
+  const candidate = coveredCandidate('runtime-readbacks', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.collector.runtime.event_interval', 'tunables.parquet_writer.max_row_group_rows'],
+  }));
+  for (const row of candidate) {
+    const tunables = row.officialRuns[0]!.config.tunables;
+    Object.assign(tunables, { collector: {
+      thp_disabled: true,
+      socket: { recv_buffer_bytes: 32768, tcp_nodelay: true },
+      runtime: { cpu_thread_stack_size: 4194304, event_interval: 7 },
+      batching: { adaptive_file: { target_parquet_bytes: 134217728 } },
+    } });
+    Object.assign(tunables.parquet_writer, { max_row_group_rows: 1024 });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [];
+      evidence.projection_only = [];
+      evidence.runner_controls = [];
+      evidence.consumer_verified = evidenceCases;
+      const process = (evidence.processes as Array<Record<string, unknown>>)[0]!;
+      process.effective_config = {
+        process: { scope: 'linux_thp_disable_flag' },
+        socket: { recv_buffer_bytes: 32768, tcp_nodelay: true },
+        socket_buffer_effective: { recv_buffer_bytes: 65536, scope: 'linux_flight_listener' },
+        socket_effective: { tcp_nodelay: true, scope: 'accepted_flight_socket' },
+        runtime: { cpu_thread_stack_size: 4194304, event_interval: 7 },
+        cpu_pool: { thread_stack_size: 4194304, scope: 'lazy_pool_initialization' },
+        commit_telemetry: { schema_version: 1, scope: 'new_ingestion_addfiles_after_sync', clock: 'system_unix_ms' },
+      };
+      process.layout_table_policies = [{
+        table_name: 'telemetry.sqlserver.sqlserver_availability_replica_states',
+        scope: 'table_effective_at_file_construction_not_full_run_history',
+        config: { enabled: true, max_row_group_rows: 1024 },
+      }];
+      process.adaptive_table_policies = [{
+        table_name: 'telemetry.sqlserver.sqlserver_availability_replica_states',
+        scope: 'installed_estimator_not_full_run_history',
+        config: { target_parquet_bytes: 134217728 },
+      }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.ok(svg.includes('runtime-readbacks (3/3'));
+});
+
 test('fails closed on missing or malformed coverage and does not infer a legacy factor path', () => {
   const mutations: Array<(evidence: Record<string, unknown>) => void> = [
     evidence => { delete evidence.inert_fields; },

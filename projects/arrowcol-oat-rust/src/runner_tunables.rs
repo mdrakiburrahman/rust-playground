@@ -309,7 +309,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                     let observed = config["socket_buffer_effective"][field].as_u64();
                     config["socket_buffer_effective"]["scope"] == "linux_flight_listener"
                         && requested.zip(observed).is_some_and(|(requested, observed)| {
-                            requested.checked_mul(2).is_some_and(|minimum| observed >= minimum)
+                            requested.checked_mul(2).is_some_and(|minimum| observed == minimum)
                         })
                 })
             {
@@ -402,8 +402,16 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             _ => None,
         };
         if let Some((field, variable)) = runtime {
+            let requires_io_build_witness = matches!(field, "event_interval" | "global_queue_interval" | "thread_stack_size" | "thread_keep_alive_ms");
+            let io_build_matches = !requires_io_build_witness || collectors.iter().all(|process| {
+                let effective = &process["effective_config"];
+                effective["runtime"].get(field).is_some_and(|requested| {
+                    effective["delta_io_runtime_build"].get(field) == Some(requested)
+                })
+            });
             if environment.contains_key(variable)
                 && collectors.iter().all(|process| process["effective_config"]["runtime"].get(field).is_some())
+                && io_build_matches
                 && (field != "cpu_thread_stack_size" || collectors.iter().all(|process| {
                     process["effective_config"]["cpu_pool"]["thread_stack_size"]
                         == process["effective_config"]["runtime"][field]
@@ -1312,6 +1320,48 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     }
 
     #[test]
+    fn tokio_io_runtime_leaves_require_a_matching_successful_build_witness() -> Result<()> {
+        let mut config = config()?;
+        let runtime = json!({
+            "event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000
+        });
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"runtime":runtime}}))?;
+        let paths = [
+            "collector.runtime.event_interval",
+            "collector.runtime.global_queue_interval",
+            "collector.runtime.thread_stack_size",
+            "collector.runtime.thread_keep_alive_ms",
+        ];
+        let base = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"runtime":runtime}
+        });
+        let cases: Vec<(Option<Value>, [bool; 4])> = vec![
+            (None, [false; 4]),
+            (Some(json!({"event_interval":6,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000})), [false,true,true,true]),
+            (Some(runtime.clone()), [true; 4]),
+        ];
+        for (build, expected) in cases {
+            let mut process = base.clone();
+            if let Some(build) = build {
+                process["effective_config"]["delta_io_runtime_build"] = build;
+            }
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            let projected = evidence["projection_only"].as_array().context("projection_only array")?;
+            for (index, path) in paths.iter().enumerate() {
+                let is_verified = verified.iter().any(|entry| entry["path"] == *path);
+                let is_projected = projected.iter().any(|entry| entry["path"] == *path);
+                assert_eq!(is_verified, expected[index], "{path}");
+                assert_eq!(is_projected, !expected[index], "{path}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn cpu_stack_evidence_requires_the_started_pool() -> Result<()> {
         let mut config = config()?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
@@ -1372,7 +1422,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
             "effective_config":{"socket":{"recv_buffer_bytes":32768}}
         });
-        for observed in [None, Some(32768), Some(65536)] {
+        for observed in [None, Some(32768), Some(65535), Some(65536), Some(65537)] {
             if let Some(value) = observed {
                 process["effective_config"]["socket_buffer_effective"] =
                     json!({"recv_buffer_bytes":value,"scope":"linux_flight_listener"});
