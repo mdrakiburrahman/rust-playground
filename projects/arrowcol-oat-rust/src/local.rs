@@ -35,6 +35,36 @@ pub(crate) fn endpoint_host(host: &str) -> Result<String> {
     Ok(parsed.to_string())
 }
 
+pub(crate) fn validate_container_endpoints(
+    containerized: bool,
+    host_network: bool,
+    bind_host: Option<IpAddr>,
+    endpoint: Option<&str>,
+) -> Result<()> {
+    if !containerized || host_network {
+        return Ok(());
+    }
+    let bind_is_loopback = bind_host
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .is_loopback();
+    let endpoint_is_loopback = match endpoint {
+        Some(host) => match url::Host::parse(&endpoint_host(host)?)? {
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+            url::Host::Domain(domain) => {
+                let domain = domain.trim_end_matches('.');
+                domain.eq_ignore_ascii_case("localhost") || domain.to_ascii_lowercase().ends_with(".localhost")
+            }
+        },
+        None => bind_is_loopback,
+    };
+    ensure!(
+        !bind_is_loopback && !endpoint_is_loopback,
+        "containerized harness cannot reach Docker host loopback; set platform.local.bind_host and platform.local.endpoint_host to the Docker bridge gateway IP"
+    );
+    Ok(())
+}
+
 pub(crate) fn published_endpoint(binding: &str, host: Option<&str>, daemon: &str, path: &str) -> Result<String> {
     let binding = binding
         .trim()
@@ -529,6 +559,29 @@ where
 mod tests {
     use super::*;
     use anyhow::bail;
+
+    #[test]
+    fn container_loopback_is_rejected_but_host_native_and_gateway_work() -> Result<()> {
+        let gateway = "172.17.0.1".parse()?;
+        let loopback = "127.0.0.1".parse()?;
+        for (bind, endpoint) in [
+            (None, None),
+            (Some(loopback), Some("172.17.0.1")),
+            (Some(gateway), Some("localhost")),
+            (Some(gateway), Some("[::1]")),
+        ] {
+            let error = validate_container_endpoints(true, false, bind, endpoint)
+                .err()
+                .context("container loopback was accepted")?
+                .to_string();
+            assert!(error.contains("platform.local.bind_host") && error.contains("platform.local.endpoint_host"));
+            assert!(error.contains("gateway"));
+        }
+        validate_container_endpoints(false, false, None, None)?;
+        validate_container_endpoints(true, true, None, None)?;
+        validate_container_endpoints(true, false, Some(gateway), Some("172.17.0.1"))?;
+        Ok(())
+    }
 
     struct Fixture(PathBuf);
 

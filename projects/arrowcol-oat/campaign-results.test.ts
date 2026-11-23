@@ -706,6 +706,25 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
     run.rows[0]!.evidence_json = JSON.stringify(changed);
     assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
   }
+  Object.assign(run.config, { overload_guard: { memory_signal: 'cgroup_memory' } });
+  Object.assign(run.config.tunables, { collector: { pressure: { rss_limit_bytes: 1000 } } });
+  const cgroup = structuredClone(original);
+  cgroup.overload_guard.settings.memory_signal = 'cgroup_memory';
+  cgroup.overload_guard.last_caps[1].metric = 'collector_cgroup_memory_bytes';
+  run.rows[0]!.evidence_json = JSON.stringify(cgroup);
+  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  for (const change of [
+    (evidence: typeof cgroup) => { evidence.overload_guard.settings.memory_signal = 'process_rss'; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].metric = 'collector_rss_bytes'; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].observed_value = 0; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].cap = 2000; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].confirmed = false; },
+  ]) {
+    const changed = structuredClone(cgroup);
+    change(changed);
+    run.rows[0]!.evidence_json = JSON.stringify(changed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
   run.rows[0]!.status = 'failed';
   for (const reason of ['hard_cap_fraction', 'zero_ingestion_commit_progress']) {
     const stopped = structuredClone(original);

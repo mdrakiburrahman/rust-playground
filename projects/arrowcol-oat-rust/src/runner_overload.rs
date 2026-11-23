@@ -137,6 +137,33 @@ struct GuardCap {
     confirmed: bool,
 }
 
+fn rss_guard_cap(
+    signal: crate::config::OverloadRssSignal,
+    container: &GuardCap,
+    rss: u64,
+    rss_cap: u64,
+) -> Result<GuardCap> {
+    let (metric, observed_value) = match signal {
+        crate::config::OverloadRssSignal::ProcessRss => ("collector_rss_bytes", rss),
+        crate::config::OverloadRssSignal::CgroupMemory => {
+            if !container.confirmed || container.observed_value == 0 {
+                bail!("cgroup RSS guard measurement unavailable");
+            }
+            ("collector_cgroup_memory_bytes", container.observed_value)
+        }
+    };
+    Ok(GuardCap { metric, observed_value, cap: rss_cap, confirmed: true })
+}
+
+fn verify_cgroup_guard_readback(requested: (u64, u64), observed: &Value) -> Result<()> {
+    if observed.pointer("/pressure/rss_limit_bytes").and_then(Value::as_u64) != Some(requested.0)
+        || observed.pointer("/pressure/buffered_bytes_limit").and_then(Value::as_u64) != Some(requested.1)
+    {
+        bail!("cgroup RSS guard startup pressure limits do not match requested limits");
+    }
+    Ok(())
+}
+
 struct GuardReading {
     request_start_ms: u64,
     timestamp_ms: u64,
@@ -319,7 +346,10 @@ impl GuardEngine {
         self.proof["last_caps"] = json!(
             [
                 "container_memory_bytes",
-                "collector_rss_bytes",
+                match self.settings.memory_signal {
+                    crate::config::OverloadRssSignal::ProcessRss => "collector_rss_bytes",
+                    crate::config::OverloadRssSignal::CgroupMemory => "collector_cgroup_memory_bytes",
+                },
                 "collector_buffered_bytes"
             ]
             .map(|metric| json!({"metric":metric,"confirmed":false,"observed_value":null,"cap":null}))
@@ -843,9 +873,13 @@ impl PreparedGuard {
             };
         let observed = process_configurations(&log.text)?;
         let mut readback_diff = None;
-        let _ = verify_process_configuration_recording(config, ComponentRole::Collector, &observed, &mut readback_diff);
+        let verification = verify_process_configuration_recording(config, ComponentRole::Collector, &observed, &mut readback_diff);
         if let Some(diff) = readback_diff {
             diagnostics["startup_readback_diff"] = diff;
+        }
+        if config.overload_guard.memory_signal == crate::config::OverloadRssSignal::CgroupMemory {
+            verification?;
+            verify_cgroup_guard_readback(config.cgroup_guard_requested_limits()?, &observed)?;
         }
         if observed["commit_telemetry"]
             != json!({"schema_version":1,
@@ -1043,6 +1077,7 @@ impl GuardProbe {
         let mut pressure_url = Url::parse(&scraper.endpoint)?;
         pressure_url.set_path("/v1/pressure");
         pressure_url.set_query(None);
+        let mut http_timing = PressureHttpTiming::default();
         let (memory, logs, pressure) = tokio::join!(
             guard_read_leg(deadline, async {
                 #[cfg(unix)]
@@ -1064,12 +1099,35 @@ impl GuardProbe {
                 }
             }),
             guard_read_leg(deadline, async {
-                scraper.read_endpoint(pressure_url.as_str()).await
+                scraper.read_endpoint_timed(pressure_url.as_str(), Some((&mut http_timing, deadline))).await
             }),
         );
         record_guard_read_leg(diagnostics, "cgroup_memory", &memory);
         record_guard_read_leg(diagnostics, "collector_logs", &logs);
         record_guard_read_leg(diagnostics, "pressure_http", &pressure);
+        if diagnostics["pressure_http_timings"].is_null() {
+            diagnostics["pressure_http_timings"] = json!([]);
+            diagnostics["pressure_http_timing_dropped"] = json!(0);
+        }
+        let samples = diagnostics["pressure_http_timings"].as_array_mut()
+            .context("pressure HTTP timing evidence must be an array")?;
+        let dropped = samples.len() == 512;
+        if dropped {
+            samples.remove(0);
+        }
+        samples.push(json!({
+            "started_at_ms": request_start_ms,
+            "remaining_budget_at_first_poll_ms": http_timing.remaining_budget_at_first_poll_ms,
+            "headers_ms": http_timing.headers_ms,
+            "body_ms": http_timing.body_ms,
+            "status": pressure.status,
+            "elapsed_ms": pressure.elapsed_ms,
+        }));
+        if dropped {
+            let count = diagnostics["pressure_http_timing_dropped"].as_u64()
+                .context("pressure HTTP timing dropped counter missing")?;
+            diagnostics["pressure_http_timing_dropped"] = json!(count + 1);
+        }
         if let Ok(body) = &pressure.result {
             diagnostics["last_pressure"] = pressure_body_excerpt(body);
         }
@@ -1099,6 +1157,7 @@ impl GuardProbe {
             .as_u64()
             .filter(|value| *value > 0)
             .context("actual collector RSS unavailable")?;
+        let rss_guard = rss_guard_cap(config.overload_guard.memory_signal, &container_cap, rss, self.rss_cap)?;
         let text = format!("{}\n{}", logs.stdout, logs.stderr);
         if [&logs.stdout, &logs.stderr]
             .iter()
@@ -1145,12 +1204,7 @@ impl GuardProbe {
             commits,
             caps: vec![
                 container_cap,
-                GuardCap {
-                    metric: "collector_rss_bytes",
-                    observed_value: rss,
-                    cap: self.rss_cap,
-                    confirmed: true,
-                },
+                rss_guard,
                 GuardCap {
                     metric: "collector_buffered_bytes",
                     observed_value: rich.buffered_bytes.current().get(),
@@ -1734,6 +1788,17 @@ mod overload_guard_tests {
             );
             assert!(platform.collector_metrics_url.is_some());
 
+            state["fail"] = Value::Null;
+            state["routerExited"] = json!(true);
+            fs::write(root.join("state.json"), state.to_string())?;
+            let error = local_compose_endpoint(&config, &platform, "router", "50050", "/metrics")
+                .await
+                .err()
+                .context("exited router unexpectedly admitted")?;
+            assert!(error.to_string().contains("state=exited exit_code=17"));
+            assert!(error.to_string().contains("fixture router failed"));
+            state["routerExited"] = json!(false);
+
             state["fail"] = json!("router");
             fs::write(root.join("state.json"), state.to_string())?;
             assert!(
@@ -2316,6 +2381,51 @@ mod overload_guard_tests {
     }
 
     #[tokio::test]
+    async fn pressure_http_timing_distinguishes_complete_body_and_cancelled_read() -> Result<()> {
+        for incomplete in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}/v1/pressure", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0; 1024];
+                let received = socket.read(&mut request).await?;
+                if received == 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty request"));
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await?;
+                if incomplete {
+                    std::future::pending::<()>().await;
+                } else {
+                    socket.write_all(b"test").await?;
+                }
+                Ok::<(), std::io::Error>(())
+            });
+            let scraper = PublicationBacklogScraper {
+                endpoint: endpoint.clone(),
+                _tunnel: None,
+                client: reqwest::Client::builder().no_proxy().build()?,
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut timing = PressureHttpTiming::default();
+            let leg = guard_read_leg(deadline, async {
+                scraper.read_endpoint_timed(&endpoint, Some((&mut timing, deadline))).await
+            }).await;
+            server.abort();
+            assert!(timing.remaining_budget_at_first_poll_ms.is_some());
+            assert!(timing.headers_ms.is_some());
+            if incomplete {
+                assert_eq!(leg.status, "timeout");
+                assert!(leg.cancelled);
+                assert!(timing.body_ms.is_none());
+            } else {
+                assert_eq!(leg.into_result()?, "test");
+                assert!(timing.body_ms.is_some());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn guard_does_not_poll_expired_ready_leg() {
         let polled = std::cell::Cell::new(false);
         let result = guard_read_leg(tokio::time::Instant::now(), async {
@@ -2423,6 +2533,73 @@ mod overload_guard_tests {
         ] {
             assert!(verify_scale_out_buffering_mode(&pressure).is_err());
         }
+    }
+
+    #[test]
+    fn cgroup_guard_readback_and_unavailable_samples_fail_closed() -> Result<()> {
+        use crate::config::OverloadRssSignal;
+
+        let requested = (1000, 2000);
+        let good = json!({"pressure":{"rss_limit_bytes":1000,"buffered_bytes_limit":2000}});
+        verify_cgroup_guard_readback(requested, &good)?;
+        for bad in [json!({}), json!({"pressure":{"rss_limit_bytes":999,"buffered_bytes_limit":2000}}),
+            json!({"pressure":{"rss_limit_bytes":1000,"buffered_bytes_limit":0}})] {
+            assert!(verify_cgroup_guard_readback(requested, &bad).is_err());
+        }
+        let settings = crate::config::OverloadGuardConfig {
+            memory_signal: OverloadRssSignal::CgroupMemory,
+            ..Default::default()
+        };
+        let mut engine = GuardEngine::new(settings);
+        let mut sample = reading(0, 899);
+        sample.caps[0].cap = 2000;
+        sample.caps[1] = rss_guard_cap(OverloadRssSignal::CgroupMemory, &sample.caps[0], 10, 1000)?;
+        assert_eq!(sample.caps[1].metric, "collector_cgroup_memory_bytes");
+        engine.record(Ok(sample), &pending(0, 0));
+        assert!(engine.stop.is_none());
+        let mut sample = reading(1, 900);
+        sample.caps[0].cap = 2000;
+        sample.caps[1] = rss_guard_cap(OverloadRssSignal::CgroupMemory, &sample.caps[0], 10, 1000)?;
+        engine.record(Ok(sample), &pending(1, 0));
+        assert_eq!(engine.stop.as_ref().map(|stop| &stop["metric"]), Some(&json!("collector_cgroup_memory_bytes")));
+        assert_eq!(engine.stop.as_ref().map(|stop| &stop["fraction"]), Some(&json!(0.9)));
+        let settings = crate::config::OverloadGuardConfig {
+            memory_signal: OverloadRssSignal::CgroupMemory,
+            ..Default::default()
+        };
+        let mut unconfirmed = reading(0, 100).caps.remove(0);
+        unconfirmed.confirmed = false;
+        for unavailable in [rss_guard_cap(OverloadRssSignal::CgroupMemory, &reading(0, 0).caps[0], 10, 1000)
+            .map(|_| reading(0, 0)),
+            rss_guard_cap(OverloadRssSignal::CgroupMemory, &unconfirmed, 10, 1000).map(|_| reading(0, 0)),
+            Err(anyhow::anyhow!("cgroup read failed"))] {
+            let mut engine = GuardEngine::new(settings.clone());
+            engine.record(unavailable, &pending(0, 0));
+            assert_eq!(engine.proof["status"], "unavailable");
+            assert!(engine.proof["last_caps"][1]["observed_value"].is_null());
+            assert_eq!(engine.proof["last_caps"][1]["metric"], "collector_cgroup_memory_bytes");
+            assert!(engine.stop.is_none());
+        }
+        let default = rss_guard_cap(OverloadRssSignal::ProcessRss, &reading(0, 0).caps[0], 7, 1000)?;
+        assert_eq!((default.metric, default.observed_value, default.cap), ("collector_rss_bytes", 7, 1000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cgroup_guard_late_read_is_unavailable() {
+        let settings = crate::config::OverloadGuardConfig {
+            memory_signal: crate::config::OverloadRssSignal::CgroupMemory,
+            ..Default::default()
+        };
+        let mut engine = GuardEngine::new(settings);
+        let leg = guard_read_leg(tokio::time::Instant::now(), async {
+            Ok::<_, anyhow::Error>(reading(0, 500))
+        }).await;
+        assert_eq!(leg.status, "timeout");
+        engine.record(leg.into_result(), &pending(0, 0));
+        assert_eq!(engine.proof["status"], "unavailable");
+        assert_eq!(engine.proof["last_caps"][1]["metric"], "collector_cgroup_memory_bytes");
+        assert!(engine.proof["last_caps"][1]["observed_value"].is_null());
     }
 
     #[test]

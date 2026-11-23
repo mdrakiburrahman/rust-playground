@@ -96,7 +96,7 @@ mod tests {
 
     use super::*;
 
-    fn fixture(values: Vec<Option<&str>>) -> PathBuf {
+    fn fixture(values: Vec<Option<&str>>) -> Result<PathBuf> {
         let path = std::env::temp_dir().join(format!("delivery-reader-{}.parquet", uuid::Uuid::new_v4()));
         let schema = Arc::new(Schema::new(vec![
             Field::new("business_value", DataType::Int32, false),
@@ -104,36 +104,37 @@ mod tests {
         ]));
         let rows = values.len();
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            Arc::clone(&schema),
             vec![
                 Arc::new(Int32Array::from(vec![7; rows])),
                 Arc::new(StringArray::from(values)),
             ],
-        )
-        .unwrap();
-        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        path
+        )?;
+        let mut writer = ArrowWriter::try_new(File::create(&path)?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(path)
     }
 
     #[test]
-    fn projects_only_identity_and_decodes_all_bounded_batches() {
-        let path = fixture(vec![Some("first"), Some("second"), Some("third")]);
+    fn projects_only_identity_and_decodes_all_bounded_batches() -> Result<()> {
+        let path = fixture(vec![Some("first"), Some("second"), Some("third")])?;
         let mut output = Vec::new();
         let result = decode(&path, 1, &mut output);
-        fs::remove_file(path).unwrap();
-        assert_eq!(result.unwrap(), 3);
+        fs::remove_file(path)?;
+        assert_eq!(result?, 3);
         assert_eq!(output, b"first\nsecond\nthird\n");
+        Ok(())
     }
 
     #[test]
-    fn rejects_nulls_and_line_injection() {
+    fn rejects_nulls_and_line_injection() -> Result<()> {
         for values in [vec![None], vec![Some("first\nsecond")]] {
-            let path = fixture(values);
+            let path = fixture(values)?;
             let result = decode(&path, 1, &mut Vec::new());
-            fs::remove_file(path).unwrap();
+            fs::remove_file(path)?;
             assert!(result.is_err());
         }
+        Ok(())
     }
 }

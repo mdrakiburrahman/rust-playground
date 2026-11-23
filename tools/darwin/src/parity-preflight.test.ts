@@ -166,6 +166,23 @@ test("collector parity readback rejects drift in historical limits and local pre
         process_cumulative: { completed_rows: Number.MAX_SAFE_INTEGER, ambiguous_rows: 0 } } }],
   }), /overflow|safe integer/);
   assert.throws(() => assertParityEvidence(seed, { ...evidence, client_phase_reports: [] }), /client readback/);
+  const cgroupSeed = { ...seed, overload_guard: { memory_signal: "cgroup_memory" } };
+  const cgroupEvidence = { ...structuredClone(evidence), overload_guard: {
+    ...structuredClone(evidence.overload_guard),
+    settings: { ...evidence.overload_guard.settings, memory_signal: "cgroup_memory" },
+    last_caps: [...evidence.overload_guard.last_caps, {
+      metric: "collector_cgroup_memory_bytes", confirmed: true, cap: 92341796864, observed_value: 100,
+    }],
+  } };
+  assert.doesNotThrow(() => assertParityEvidence(cgroupSeed, cgroupEvidence));
+  assert.throws(() => assertParityEvidence(seed, cgroupEvidence), /overload guard evidence/);
+  assert.throws(() => assertParityEvidence(cgroupSeed, {
+    ...cgroupEvidence, overload_guard: { ...cgroupEvidence.overload_guard, last_caps: [
+      cgroupEvidence.overload_guard.last_caps[0], {
+        metric: "collector_cgroup_memory_bytes", confirmed: true, cap: 42, observed_value: 100,
+      },
+    ] },
+  }), /guard signal or RSS threshold/);
   const requestedWriter = { defaults: { compression: "zstd", compression_level: 3 }, max_row_group_rows: 262144 };
   const qualifiedSeed = { ...seed, tunables: { ...seed.tunables, parquet_writer: requestedWriter } };
   const qualifiedEvidence = {

@@ -1,5 +1,20 @@
 # ArrowCol Darwin evaluator
 
+## Versioned diagnostic recovery transition
+
+The reviewed pre-load cleanup exception is specific to invocation
+`89fdefa5-855d-46ea-93ea-481fd77cbd2e` and the original frozen producer
+`86eb8ebe07d876c925e027c0c656a69917269f22`. Prepare a separate trusted
+snapshot at `.darwin/pressure-diagnostic-v2`; do not change the original
+freeze or move, copy, or link its receipt ledger. The v2 runtime checks the
+original freeze and uses its canonical ledger for both the launch gate and
+new receipts. The reviewed sidecar and original evidence are revalidated.
+
+Use `parity --diagnostic-prelaunch-only` to execute the same parity-to-launcher
+gate without starting a workload. It builds the v2 controller and writes preflight files;
+it does not qualify a sample. A missing or changed proof fails closed.
+Other unsettled receipts also fail closed without automatic reconciliation.
+
 The current implementation supports a config-only compression smoke replay and
 individual local historical-parity arms. It
 does not yet qualify candidates, run Darwin, promote changes, or evaluate code
