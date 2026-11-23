@@ -4653,6 +4653,10 @@ mod tests {
         options.cardinality = 1;
         options.value_variation = Some(ValueVariation::Cardinality);
         let cardinal = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        options.cardinality = 3;
+        let more_cardinal = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(cardinal.column_by_name("value"), more_cardinal.column_by_name("value"));
+        options.cardinality = 1;
         options.value_variation = Some(ValueVariation::PerRow);
         let per_row = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
         assert_ne!(cardinal.column_by_name("value"), per_row.column_by_name("value"));
