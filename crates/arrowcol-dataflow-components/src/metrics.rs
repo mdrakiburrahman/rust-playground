@@ -2702,6 +2702,20 @@ mod tests {
         assert_eq!(note_censored_pressure_sample(&censored, &marker_reported), Some(1));
         assert_eq!(note_censored_pressure_sample(&censored, &marker_reported), None);
         assert_eq!(censored.load(Ordering::Relaxed), 2);
+
+        let mut diagnostic = PressureDiagnosticSample {
+            request_index: 1,
+            started: Instant::now(),
+            handler_total_ns: 0,
+            blocking_queue_ns: 0,
+            serialization_ns: 0,
+            procfs_ns: 0,
+            tables_lock_wait_ns: 0,
+            tables_lock_hold_ns: 0,
+            tables_lock_count: 0,
+        };
+        diagnostic.record_blocking_queue(Duration::from_millis(7));
+        assert_eq!(diagnostic.blocking_queue_ns, 7_000_000);
     }
 
     #[test]
