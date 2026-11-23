@@ -169,6 +169,8 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       version: 1,
       inert_fields: [{ path: "logging.maintenance", reason: "maintenance_disabled" }],
       projection_only: [{ path: "collector.upload.mode", reason: "consumer_startup_proof_unverified" }],
+      runner_controls: [{ path: "maintenance.enabled", reason: "maintenance_runner_control" }],
+      consumer_verified: [{ path: "client.workers", reason: "consumer_startup_readback" }],
       processes: [{ component: "collector", source_revision: revision, log_complete: true,
         image_id: `sha256:${"b".repeat(64)}`, effective_config_source: "consumer_startup_readback",
         effective_config: { commit_telemetry: { schema_version: 1, scope: "new_ingestion_addfiles_after_sync", clock: "system_unix_ms" } },
@@ -281,6 +283,8 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(result.kind, "diagnostic-only");
     assert.deepEqual(result.inert_fields, evidence.inert_fields);
     assert.deepEqual(result.projection_only, evidence.projection_only);
+    assert.deepEqual(result.runner_controls, evidence.runner_controls);
+    assert.deepEqual(result.consumer_verified, evidence.consumer_verified);
     assert.equal(result.diagnosticOnlyRealistic, true);
     assert.equal(result.diagnosticRealisticReconciliationVersion, 1);
     assert.equal(result.deliveryIdentity?.verified, true);
@@ -310,6 +314,15 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(result.activeRows, 5);
     assert.equal(result.measurement.durableRowsPerSecond, 3 / 150);
     assert.deepEqual(decoded.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
+    evidence.consumer_verified.push({ path: "client.workers", reason: "consumer_startup_readback" });
+    await writeResult();
+    await assert.rejects(read(), /invalid consumer_verified/);
+    evidence.consumer_verified.pop();
+    evidence.runner_controls.push({ path: "client.workers", reason: "maintenance_runner_control" });
+    await writeResult();
+    await assert.rejects(read(), /duplicate tunable coverage path/);
+    evidence.runner_controls.pop();
+    await writeResult();
     await assert.rejects(readReconciledOatResult(resultPath, join(root, "snapshots"), table, revision,
       { codec: "zstd", level: 3 }, "realistic", undefined, { tools, outputDir: root }, diagnostic),
     /requires the unchanged default writer/);

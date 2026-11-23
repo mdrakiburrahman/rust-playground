@@ -21,6 +21,16 @@ export interface ProjectionOnlyField {
   reason: "consumer_startup_proof_unverified";
 }
 
+export interface RunnerControlField {
+  path: string;
+  reason: "maintenance_runner_control" | "router_log_filter_inheritance";
+}
+
+export interface ConsumerVerifiedField {
+  path: string;
+  reason: "consumer_startup_readback";
+}
+
 function extractFields<R extends string>(evidence: JsonObject, key: string, reasons: readonly R[]): { path: string; reason: R }[] | null {
   if (!Object.hasOwn(evidence, key)) return null;
   if (!Array.isArray(evidence[key])) throw new Error(`invalid ${key}`);
@@ -248,6 +258,8 @@ export async function readReconciledOatResult(
   parityTelemetry: JsonObject | null;
   inert_fields: InertTunableField[] | null;
   projection_only: ProjectionOnlyField[] | null;
+  runner_controls: RunnerControlField[] | null;
+  consumer_verified: ConsumerVerifiedField[] | null;
   deliveryIdentity: JsonObject | null;
   diagnosticOnlyRealistic: boolean; diagnosticRealisticReconciliationVersion: number | null;
   kind?: "diagnostic-only";
@@ -304,6 +316,11 @@ export async function readReconciledOatResult(
   if (evidence.version !== 1 || !Array.isArray(evidence.processes)) throw new Error("OAT evidence version or processes are invalid");
   const inertFields = extractInertTunableFields(evidence);
   const projectionOnly = extractFields(evidence, "projection_only", ["consumer_startup_proof_unverified"] as const);
+  const runnerControls = extractFields(evidence, "runner_controls", ["maintenance_runner_control", "router_log_filter_inheritance"] as const);
+  const consumerVerified = extractFields(evidence, "consumer_verified", ["consumer_startup_readback"] as const);
+  const coveragePaths = [inertFields, projectionOnly, runnerControls, consumerVerified]
+    .flatMap(fields => fields?.map(field => field.path) ?? []);
+  if (new Set(coveragePaths).size !== coveragePaths.length) throw new Error("duplicate tunable coverage path");
   const processes = evidence.processes.map(process => object(process, "OAT process"));
   const collectors = processes.filter(process => process.component === "collector");
   if (collectors.length !== 1) throw new Error("expected exactly one collector");
@@ -398,7 +415,7 @@ export async function readReconciledOatResult(
     measurement, images, clientEvidence, clientEvidences: clients.reports.map(report => report.evidence),
     clientEffectiveConfigs: clients.reports.map(report => report.config), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
-    inert_fields: inertFields, projection_only: projectionOnly,
+    inert_fields: inertFields, projection_only: projectionOnly, runner_controls: runnerControls, consumer_verified: consumerVerified,
     ...(diagnostic ? { kind: "diagnostic-only" as const } : {}), diagnosticOnlyRealistic: diagnostic !== undefined,
     diagnosticRealisticReconciliationVersion: diagnostic ? DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION : null,
     parityTelemetry: parity ? {
