@@ -180,13 +180,27 @@ export function assertParityEvidence(seed: unknown, input: unknown, allowWriterO
   }
   const guard = object(evidence.overload_guard, "overload guard");
   const settings = object(guard.settings, "overload settings");
+  const requestedGuard = config.overload_guard === undefined ? {} : object(config.overload_guard, "requested overload guard");
+  const signal = requestedGuard.memory_signal ?? "process_rss";
+  if (signal !== "process_rss" && signal !== "cgroup_memory") throw new Error("invalid guard memory signal");
   if (guard.status !== "complete" || guard.requested_container_memory_limit_bytes !== local.collector_memory_limit_bytes
     || settings.enabled !== true || settings.cap_fraction !== 0.9 || settings.zero_progress_windows !== 2
+    || (settings.memory_signal ?? "process_rss") !== signal
     || !Array.isArray(guard.last_caps)) throw new Error("overload guard evidence is unavailable or inconsistent");
   const caps = guard.last_caps.map((value) => object(value, "guard cap"))
     .filter((cap) => cap.metric === "container_memory_bytes");
   if (caps.length !== 1 || caps[0]!.confirmed !== true || caps[0]!.cap !== local.collector_memory_limit_bytes) {
     throw new Error("collector container memory cap is unconfirmed");
+  }
+  if (signal === "cgroup_memory") {
+    const pressure = object(object(tunables.collector, "collector").pressure, "collector pressure");
+    const physical = guard.last_caps.map((value) => object(value, "guard cap"))
+      .filter((cap) => cap.metric === "collector_cgroup_memory_bytes");
+    if (!Number.isSafeInteger(pressure.rss_limit_bytes) || Number(pressure.rss_limit_bytes) <= 0 ||
+      physical.length !== 1 || physical[0]!.confirmed !== true || physical[0]!.cap !== pressure.rss_limit_bytes ||
+      !Number.isSafeInteger(physical[0]!.observed_value) || Number(physical[0]!.observed_value) <= 0) {
+      throw new Error("collector guard signal or RSS threshold is unconfirmed");
+    }
   }
 }
 
