@@ -2479,6 +2479,12 @@ groups:
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([wrong_column])), 1)?;
                 assert!(projected(&result, "parquet_writer.defaults.encoding"));
+                let mut uncompressed = process.clone();
+                uncompressed["layout_table_policies"][0]["parquet_columns"]["value"] =
+                    json!({"compression":"uncompressed","compression_level":null});
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([uncompressed])), 1)?;
+                assert!(projected(&result, "parquet_writer.defaults.data_page_v2_compression_ratio_threshold"));
                 let mut conflicting_properties = process.clone();
                 conflicting_properties["layout_table_policies"][1]["parquet_properties"]["write_batch_size"] = json!(1);
                 let mut result = initial.clone();
@@ -2619,6 +2625,7 @@ groups:
             (json!({"transport":{"endpoint_buffer_size":37}}), "endpoint_buffer_size"),
             (json!({"transport":{"ipc_compression":"zstd"}}), "ipc_compression"),
             (json!({"arrow_ipc":{"compression":"zstd"}}), "ipc_compression"),
+            (json!({"arrow_ipc":{"alignment":8}}), "ipc_alignment"),
         ];
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..").join("..").join("target").join("debug")
@@ -2648,6 +2655,7 @@ groups:
             verify_process_configuration(&config, ComponentRole::Client, &observed)
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
+                | "payload_customer_id" | "corpus_rows" | "corpus_bytes"
                 | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
                 | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "max_memory_bytes"
                 | "stream_retry_max_attempts" | "stream_retry_base_backoff_ms" | "stream_retry_max_backoff_ms"
@@ -2657,7 +2665,7 @@ groups:
                 | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
                 | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
                 | "rate_limit_period_ms" | "rate_limit_rps" | "connect_retries" | "retry_backoff_ms"
-                | "grpc_send_compression" | "grpc_accept_compression" | "ipc_compression"
+                | "grpc_send_compression" | "grpc_accept_compression" | "ipc_compression" | "ipc_alignment"
                 | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
                 config.clients_per_table = 1;
                 let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
@@ -2665,7 +2673,7 @@ groups:
                 let mut covered = initial.clone();
                 promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
                 let path = if input.get("arrow_ipc").is_some() {
-                    "arrow_ipc.compression".to_owned()
+                    format!("arrow_ipc.{}", if field == "ipc_compression" { "compression" } else { "alignment" })
                 } else {
                     format!("{}.{}", if input.get("client").is_some() { "client" } else { "transport" }, field)
                 };
@@ -2690,6 +2698,21 @@ groups:
                 "adapter accepted wrong {field} for {input}");
         }
         config.clients_per_table = 1;
+        for (input, inactive, active) in [
+            (json!({"corpus_rows":0,"corpus_bytes":4096}), "client.corpus_rows", "client.corpus_bytes"),
+            (json!({"corpus_rows":127,"corpus_bytes":0}), "client.corpus_bytes", "client.corpus_rows"),
+        ] {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":input}))?;
+            let observed = actual_client_startup(&binary, &config)?;
+            let mut covered = tunable_leaf_evidence(&config)?;
+            promote_client_readback(&config, &mut covered, Some(&vec![json!({
+                "client_id":"client-1", "consumer_effective_config":observed
+            })]))?;
+            assert!(covered["projection_only"].as_array().context("missing projection fields")?
+                .iter().any(|entry| entry["path"] == inactive));
+            assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
+                .iter().any(|entry| entry["path"] == active));
+        }
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":{
             "workers":0, "runtime_threads":0, "batch_rows":0, "streams_per_worker":0
         }}))?;

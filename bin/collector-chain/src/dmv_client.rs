@@ -152,6 +152,8 @@ pub struct Options {
     pub stream_retry_max_backoff_ms: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_IPC_COMPRESSION", value_enum, default_value_t = IpcCompression::None)]
     pub ipc_compression: IpcCompression,
+    #[arg(long, env = "ARROWCOL_CLIENT_IPC_ALIGNMENT", default_value_t = 64)]
+    pub ipc_alignment: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_DICTIONARY_HANDLING", value_enum, default_value_t = Dictionaries::Hydrate)]
     pub dictionary_handling: Dictionaries,
     #[arg(long, env = "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION", value_enum, default_value_t = GrpcCompression::None)]
@@ -223,6 +225,10 @@ impl Options {
     ///
     /// Returns the same validation failures as `resolve`, including unavailable CPU discovery.
     pub fn resolve_with_evidence(mut self, rows: usize, concurrency: usize) -> Result<(Self, serde_json::Value)> {
+        anyhow::ensure!(
+            matches!(self.ipc_alignment, 8 | 16 | 32 | 64),
+            "ipc-alignment must be 8, 16, 32, or 64"
+        );
         let requested = serde_json::json!({
             "workers": self.workers, "runtime_threads": self.runtime_threads,
             "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
@@ -2743,7 +2749,10 @@ async fn encode(table: &DmvTable, version: &str, batch: RecordBatch, options: &O
     let data = FlightDataEncoderBuilder::new()
         .with_schema(Arc::clone(&table.schema))
         .with_flight_descriptor(Some(descriptor))
-        .with_options(IpcWriteOptions::default().try_with_compression(compression)?)
+        .with_options(
+            IpcWriteOptions::try_new(options.ipc_alignment, false, arrow_ipc::MetadataVersion::V5)?
+                .try_with_compression(compression)?,
+        )
         .with_dictionary_handling(match options.dictionary_handling {
             Dictionaries::Hydrate => DictionaryHandling::Hydrate,
             Dictionaries::Resend => DictionaryHandling::Resend,
@@ -3840,6 +3849,26 @@ mod tests {
                 .await?;
             assert_eq!(decoded, vec![batch.clone()]);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_alignment_changes_padding_without_changing_rows() -> Result<()> {
+        use arrow_flight::decode::FlightRecordBatchStream;
+        let table = table_named("sqlserver_wait_stats")?;
+        let mut options = options()?;
+        let batch = synthetic_batch(&table, "client", 3, 0, 0, &options)?;
+        let mut sizes = Vec::new();
+        for alignment in [8, 64] {
+            options.ipc_alignment = alignment;
+            let encoded = encode(&table, "v1", batch.clone(), &options).await?;
+            sizes.push(encoded.iter().map(|message| message.data_body.len()).sum::<usize>());
+            let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(encoded.into_iter().map(Ok)))
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(decoded, vec![batch.clone()]);
+        }
+        assert!(sizes[0] < sizes[1]);
         Ok(())
     }
 

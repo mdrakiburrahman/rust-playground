@@ -114,6 +114,8 @@ pub struct TransportTunables {
 #[serde(deny_unknown_fields)]
 pub struct ArrowIpcTunables {
     pub compression: Option<ArrowIpcCompression>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -114,6 +114,7 @@ const CAPABILITIES: &[Capability] = &[
     gated_capability!("client.stream_retry_max_backoff_ms", "250", StreamRetries),
     capability!("transport.ipc_compression", "none (compatibility alias)"),
     capability!("arrow_ipc.compression", "none"),
+    capability!("arrow_ipc.alignment", "64 bytes"),
     capability!(
         "transport.dictionary_handling",
         "hydrate; resend rejected for current DMV schema"
@@ -763,6 +764,14 @@ impl Tunables {
         {
             bail!("configure Arrow IPC compression in arrow_ipc.compression, not in both sections");
         }
+        if self
+            .arrow_ipc
+            .as_ref()
+            .and_then(|settings| settings.alignment)
+            .is_some_and(|alignment| !matches!(alignment, 8 | 16 | 32 | 64))
+        {
+            bail!("arrow_ipc.alignment must be 8, 16, 32, or 64");
+        }
         if let Some(transport) = &self.transport {
             if transport
                 .rate_limit_period_ms
@@ -1130,6 +1139,9 @@ impl Tunables {
                 continue;
             }
             if section == "arrow_ipc" {
+                if let Some(alignment) = self.arrow_ipc.as_ref().and_then(|settings| settings.alignment) {
+                    output.insert("ARROWCOL_CLIENT_IPC_ALIGNMENT".to_owned(), alignment.to_string());
+                }
                 if let Some(compression) = self.arrow_ipc.as_ref().and_then(|settings| settings.compression) {
                     let value = match compression {
                         ArrowIpcCompression::None => "none",
@@ -2918,6 +2930,30 @@ mod tests {
         let duplicate: Tunables =
             serde_json::from_str(r#"{"arrow_ipc":{"compression":"zstd"},"transport":{"ipc_compression":"zstd"}}"#)?;
         assert!(error_text(duplicate.validate()).contains("not in both sections"));
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_ipc_alignment_is_strict_and_omitted_when_unset() -> Result<()> {
+        let omitted = Tunables::parse_oat_json(serde_json::json!({"arrow_ipc":{"compression":"none"}}))?;
+        assert!(serde_json::to_value(&omitted)?["arrow_ipc"].get("alignment").is_none());
+        for alignment in [8, 16, 32, 64] {
+            let config = Tunables::parse_oat_json(serde_json::json!({"arrow_ipc":{"alignment":alignment}}))?;
+            assert_eq!(
+                config.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_IPC_ALIGNMENT"],
+                alignment.to_string()
+            );
+        }
+        for alignment in [
+            serde_json::json!(0),
+            serde_json::json!(24),
+            serde_json::json!(128),
+            serde_json::json!("8"),
+            serde_json::json!(8.0),
+            serde_json::json!(true),
+        ] {
+            assert!(Tunables::parse_oat_json(serde_json::json!({"arrow_ipc":{"alignment":alignment}})).is_err());
+        }
         Ok(())
     }
 
