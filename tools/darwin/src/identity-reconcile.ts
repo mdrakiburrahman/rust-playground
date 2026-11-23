@@ -55,6 +55,28 @@ async function checkTools(tools: IdentityTools): Promise<void> {
   }
 }
 
+export function decodeExtractedManifests(output: Buffer, expectedCount: number): Buffer[] {
+  if (!Number.isSafeInteger(expectedCount) || expectedCount < 1 || expectedCount > 1024) {
+    throw new Error("invalid expected client report count");
+  }
+  const manifests: Buffer[] = [];
+  let offset = 0;
+  while (offset < output.length) {
+    const end = output.indexOf(10, offset);
+    if (end < 0 || end - offset > 7) throw new Error("invalid extractor manifest frame");
+    const lengthText = output.subarray(offset, end).toString("latin1");
+    if (!/^[1-9][0-9]*$/.test(lengthText)) throw new Error("invalid extractor manifest length");
+    const length = Number(lengthText);
+    offset = end + 1;
+    if (length > 1024 * 1024 || length > output.length - offset) throw new Error("truncated or oversized extractor manifest");
+    manifests.push(output.subarray(offset, offset + length));
+    if (manifests.length > expectedCount) throw new Error("extractor returned extra manifests");
+    offset += length;
+  }
+  if (manifests.length !== expectedCount) throw new Error("extractor manifest count does not match reports");
+  return manifests;
+}
+
 export async function verifyReconciledDelivery(
   tools: IdentityTools, outputDir: string, resultPath: string, expectedResultSha256: string,
   evidenceJson: string, table: string, activePaths: string[],
@@ -64,16 +86,25 @@ export async function verifyReconciledDelivery(
   const resultSha256 = await hash(resultPath);
   if (resultSha256 !== expectedResultSha256) throw new Error("OAT result changed before identity verification");
   const evidence = Buffer.from(evidenceJson, "utf8");
+  if (evidence.length === 0 || evidence.length > 16 * 1024 * 1024) throw new Error("invalid identity evidence size");
+  const parsedEvidence: unknown = JSON.parse(evidenceJson);
+  if (typeof parsedEvidence !== "object" || parsedEvidence === null || Array.isArray(parsedEvidence)
+    || !Array.isArray((parsedEvidence as Record<string, unknown>).client_phase_reports)) {
+    throw new Error("identity client reports are unavailable");
+  }
+  const reportCount = ((parsedEvidence as Record<string, unknown>).client_phase_reports as unknown[]).length;
   const evidenceSha256 = createHash("sha256").update(evidence).digest("hex");
-  const manifest = execFileSync(tools.extractor, [], {
-    input: evidence, env: tools.env, maxBuffer: 1024 * 1024 + 1, timeout: 60_000,
+  const framed = execFileSync(tools.extractor, [], {
+    input: evidence, env: tools.env, maxBuffer: 16 * 1024 * 1024 + 8192, timeout: 60_000,
   });
-  const manifestPath = join(outputDir, "identity-manifest.json");
+  const manifests = decodeExtractedManifests(framed, reportCount);
+  const manifestPaths = manifests.map((_, index) => join(outputDir,
+    manifests.length === 1 ? "identity-manifest.json" : `identity-manifest-${String(index).padStart(4, "0")}.json`));
   const evidencePath = join(outputDir, "identity-evidence.json");
   const inputPath = join(outputDir, "identity-snapshot.json");
   await writeFile(evidencePath, evidence, { flag: "wx", mode: 0o400 });
-  await writeFile(manifestPath, manifest, { flag: "wx", mode: 0o400 });
-  const input = JSON.stringify({ table, rewrite_commit_count: 0, manifest_paths: [manifestPath], active_parquet_paths: activePaths });
+  for (const [index, path] of manifestPaths.entries()) await writeFile(path, manifests[index]!, { flag: "wx", mode: 0o400 });
+  const input = JSON.stringify({ table, rewrite_commit_count: 0, manifest_paths: manifestPaths, active_parquet_paths: activePaths });
   await writeFile(inputPath, input, { flag: "wx", mode: 0o400 });
   const output = execFileSync(tools.node, [
     "--import", "tsx", tools.verifier, "--input", inputPath, "--decoder", tools.decoder,
@@ -84,13 +115,18 @@ export async function verifyReconciledDelivery(
     || (parsed as Record<string, unknown>).verified !== true
     || (parsed as Record<string, unknown>).scope !== "exact_whole_snapshot_delivery_identity_set_equality"
     || (parsed as Record<string, unknown>).activeFileCount !== activePaths.length
+    || (parsed as Record<string, unknown>).manifestCount !== reportCount
     || (parsed as Record<string, unknown>).snapshotInputSha256 !== createHash("sha256").update(input).digest("hex")) {
     throw new Error("identity verifier did not produce a valid bound verdict");
   }
   if (await hash(resultPath) !== resultSha256 || await hash(evidencePath) !== evidenceSha256
-    || await hash(manifestPath) !== createHash("sha256").update(manifest).digest("hex")
     || await hash(inputPath) !== createHash("sha256").update(input).digest("hex")) {
     throw new Error("identity evidence changed during verification");
+  }
+  for (const [index, path] of manifestPaths.entries()) {
+    if (await hash(path) !== createHash("sha256").update(manifests[index]!).digest("hex")) {
+      throw new Error("identity manifest changed during verification");
+    }
   }
   await checkTools(tools);
   return {

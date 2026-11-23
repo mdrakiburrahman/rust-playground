@@ -5,6 +5,75 @@ const COHORTS = ["unscheduled", "warmup", "measurement", "post_window"] as const
 type Cohort = typeof COHORTS[number];
 type ObjectValue = Record<string, unknown>;
 
+export function parseManifestJson(text: string): unknown {
+  let position = 0;
+  const tokenPattern = /(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/y;
+  const whitespace = (): void => {
+    while (position < text.length && /[\x20\t\r\n]/.test(text[position]!)) position++;
+  };
+  function string(): string {
+    const start = position++;
+    while (position < text.length) {
+      const char = text[position++]!;
+      if (char === "\\") position++;
+      else if (char === '"') return JSON.parse(text.slice(start, position)) as string;
+    }
+    throw new Error("unterminated manifest string");
+  }
+  function value(depth: number): unknown {
+    if (depth > 128) throw new Error("manifest nesting exceeds limit");
+    whitespace();
+    const char = text[position];
+    if (char === '"') return string();
+    if (char === "{") {
+      position++;
+      const result: ObjectValue = Object.create(null) as ObjectValue;
+      whitespace();
+      if (text[position] === "}") { position++; return result; }
+      while (true) {
+        whitespace();
+        if (text[position] !== '"') throw new Error("invalid manifest object key");
+        const key = string();
+        if (Object.hasOwn(result, key)) throw new Error("duplicate manifest object key");
+        whitespace();
+        if (text[position++] !== ":") throw new Error("invalid manifest object");
+        result[key] = value(depth + 1);
+        whitespace();
+        const separator = text[position++];
+        if (separator === "}") return result;
+        if (separator !== ",") throw new Error("invalid manifest object separator");
+      }
+    }
+    if (char === "[") {
+      position++;
+      const result: unknown[] = [];
+      whitespace();
+      if (text[position] === "]") { position++; return result; }
+      while (true) {
+        result.push(value(depth + 1));
+        whitespace();
+        const separator = text[position++];
+        if (separator === "]") return result;
+        if (separator !== ",") throw new Error("invalid manifest array separator");
+      }
+    }
+    tokenPattern.lastIndex = position;
+    const match = tokenPattern.exec(text);
+    if (!match) throw new Error("invalid manifest value");
+    const token = match[0];
+    position += token.length;
+    if (/^(?:0|[1-9][0-9]*)$/.test(token)
+      && (token.length > 16 || (token.length === 16 && BigInt(token) > BigInt(Number.MAX_SAFE_INTEGER)))) return token;
+    const parsed: unknown = JSON.parse(token);
+    if (typeof parsed === "number" && !Number.isFinite(parsed)) throw new Error("invalid manifest number");
+    return parsed;
+  }
+  const result = value(0);
+  whitespace();
+  if (position !== text.length) throw new Error("trailing manifest data");
+  return result;
+}
+
 export interface IdentityOptions {
   table: string;
   rewriteCommitCount: number;
@@ -136,7 +205,7 @@ function indexManifests(manifests: readonly unknown[], options: IdentityOptions)
       if (range.table !== options.table || range.outcome !== "acknowledged" || range.attempts !== 1) {
         throw new Error("foreign table, nonacknowledged or retried delivery range");
       }
-      const worker = integer(range.worker, "worker", 0, 65_535);
+      const worker = integer(range.worker, "worker", 0, 1023);
       const first = u64(range.first_sequence, "first sequence");
       const last = u64(range.last_sequence, "last sequence");
       const batches = integer(range.batch_count, "batch count", 1, 1_000_000);
@@ -147,10 +216,7 @@ function indexManifests(manifests: readonly unknown[], options: IdentityOptions)
       if (unscheduled !== (rangeCohort === "unscheduled")) throw new Error("range cohort contradicts scheduled/unscheduled manifest bounds");
       if (range.first_send_unix_ns === null || range.first_send_unix_ns === undefined
         || range.last_outcome_unix_ms === null || range.last_outcome_unix_ms === undefined) throw new Error("acknowledged range lacks send/outcome evidence");
-      if (typeof range.first_send_unix_ns === "number") {
-        if (!Number.isInteger(range.first_send_unix_ns) || range.first_send_unix_ns <= 0
-          || range.first_send_unix_ns > Number(U64_MAX)) throw new Error("invalid send timestamp");
-      } else if (u64(range.first_send_unix_ns, "send timestamp") === 0n) throw new Error("invalid send timestamp");
+      if (u64(range.first_send_unix_ns, "send timestamp") === 0n) throw new Error("invalid send timestamp");
       integer(range.last_outcome_unix_ms, "outcome time", 1);
       const key = `${run}/${incarnation}/${worker}`;
       const entries = namespaces.get(key) ?? [];
@@ -201,7 +267,7 @@ export async function verifyDeliveryIdentitySet(
     if (typeof value !== "string" || value.length > 160) throw new Error("malformed delivery identity");
     const match = /^https:\/\/x\.invalid\/v1\/([a-f0-9]{32})\/([a-f0-9]{32})\/(0|[1-9][0-9]{0,4})\/([0-9a-z]{1,13})\/(0|[1-9][0-9]{0,9})$/.exec(value);
     if (!match) throw new Error("malformed or noncanonical delivery identity");
-    const worker = integer(Number(match[3]), "identity worker", 0, 65_535);
+    const worker = integer(Number(match[3]), "identity worker", 0, 1023);
     const sequence = base36(match[4]!);
     const row = integer(Number(match[5]), "row ordinal", 0, 4_294_967_295);
     const entries = indexed.namespaces.get(`${match[1]}/${match[2]}/${worker}`);

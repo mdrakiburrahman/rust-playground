@@ -6,7 +6,19 @@ import { join } from "node:path";
 import test from "node:test";
 import { Table, Utf8, tableToIPC, vectorFromArray } from "apache-arrow";
 import { Table as WasmTable, writeParquet } from "parquet-wasm";
-import { artifactHash, hashTsx, verifyReconciledDelivery } from "./identity-reconcile.js";
+import { artifactHash, decodeExtractedManifests, hashTsx, verifyReconciledDelivery } from "./identity-reconcile.js";
+
+test("extractor frames preserve bytes and reject truncation, noncanonical lengths, and wrong counts", () => {
+  const first = Buffer.from('{"n":18446744073709551615}');
+  const second = Buffer.from('{"n":9007199254740993}');
+  const framed = Buffer.concat([Buffer.from(`${first.length}\n`), first, Buffer.from(`${second.length}\n`), second]);
+  assert.deepEqual(decodeExtractedManifests(framed, 2), [first, second]);
+  assert.throws(() => decodeExtractedManifests(framed, 1), /extra/);
+  assert.throws(() => decodeExtractedManifests(framed, 3), /count/);
+  assert.throws(() => decodeExtractedManifests(framed.subarray(0, -1), 2), /truncated/);
+  assert.throws(() => decodeExtractedManifests(Buffer.from("02\n{}"), 1), /length/);
+  assert.throws(() => decodeExtractedManifests(Buffer.from("1048577\n"), 1), /oversized/);
+});
 
 test("binds original evidence and rejects duplicate delivered identities", async () => {
   const dir = await mkdtemp(join(tmpdir(), "darwin-identity-gate-"));
@@ -32,12 +44,14 @@ test("binds original evidence and rejects duplicate delivered identities", async
         last_outcome_unix_ms: 2100 }],
     };
     const original = JSON.stringify(manifest).replace("123456789", "1795385557123456789");
-    const evidence = `{"client_phase_reports":[{"phase_counters":{"payload_manifest":${original}}}]}`;
-    const extractor = process.env.DARWIN_TEST_EXTRACTOR ?? join(dir, "extractor");
-    const decoder = process.env.DARWIN_TEST_READER ?? join(dir, "decoder");
+    const other = original.replace('"run_uuid":"' + "a".repeat(32), '"run_uuid":"' + "d".repeat(32));
+    const otherPrefix = prefix.replace("a".repeat(32), "d".repeat(32));
+    const evidence = `{"client_phase_reports":[{"phase_counters":{"payload_manifest":${original}}},{"phase_counters":{"payload_manifest":${other}}}]}`;
+    const extractor = process.env.DARWIN_TEST_EXTRACTOR ?? join(dir, "extractor.cjs");
+    const decoder = process.env.DARWIN_TEST_READER ?? join(dir, "decoder.cjs");
     const realParquet = Boolean(process.env.DARWIN_TEST_READER);
     if (!process.env.DARWIN_TEST_EXTRACTOR) {
-      await writeFile(extractor, `#!${process.execPath}\nlet s="";process.stdin.on("data",c=>s+=c);process.stdin.on("end",()=>process.stdout.write(s.slice(s.indexOf('{"schema"'),-4)));\n`);
+      await writeFile(extractor, `#!${process.execPath}\nprocess.stdin.resume();process.stdin.on("end",()=>{for(const m of ${JSON.stringify([original, other])})process.stdout.write(Buffer.byteLength(m)+"\\n"+m)});\n`);
       await chmod(extractor, 0o700);
     }
     if (!realParquet) {
@@ -49,7 +63,7 @@ test("binds original evidence and rejects duplicate delivered identities", async
     const writeRows = async (rows: string[]) => writeFile(data, realParquet
       ? writeParquet(WasmTable.fromIPCStream(tableToIPC(new Table({ endpoint_url: vectorFromArray(rows, new Utf8()) }), "stream")))
       : `${rows.join("\n")}\n`);
-    await writeRows([`${prefix}0`, `${prefix}1`]);
+    await writeRows([`${prefix}0`, `${prefix}1`, `${otherPrefix}0`, `${otherPrefix}1`]);
     await writeFile(result, "bound result");
     const digest = async (path: string) => createHash("sha256").update(await readFile(path)).digest("hex");
     const node = await realpath(process.execPath);
@@ -64,13 +78,16 @@ test("binds original evidence and rejects duplicate delivered identities", async
     await mkdir(first);
     const verdict = await verifyReconciledDelivery(tools, first, result, await digest(result), evidence, table, [data]);
     assert.equal(verdict.verified, true);
-    assert.equal(verdict.activeFileRows, 2);
-    assert.match(await readFile(join(first, "identity-manifest.json"), "utf8"), /1795385557123456789/);
-    await writeRows([`${prefix}0`, `${prefix}0`]);
+    assert.equal(verdict.activeFileRows, 4);
+    assert.equal(verdict.manifestCount, 2);
+    assert.equal(await readFile(join(first, "identity-manifest-0000.json"), "utf8"), original);
+    assert.equal(await readFile(join(first, "identity-manifest-0001.json"), "utf8"), other);
+    assert.equal(await readFile(join(first, "identity-evidence.json"), "utf8"), evidence);
+    await writeRows([`${prefix}0`, `${prefix}1`, `${otherPrefix}0`, `${otherPrefix}0`]);
     const second = join(dir, "second");
     await mkdir(second);
     await assert.rejects(verifyReconciledDelivery(tools, second, result, await digest(result), evidence, table, [data]));
-    await writeRows([`${prefix}0`]);
+    await writeRows([`${prefix}0`, `${prefix}1`, `${otherPrefix}0`]);
     const third = join(dir, "third");
     await mkdir(third);
     await assert.rejects(verifyReconciledDelivery(tools, third, result, await digest(result), evidence, table, [data]));

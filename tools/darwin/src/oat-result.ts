@@ -133,6 +133,45 @@ export function extractClientEvidence(raw: unknown, requestedProfile: ClientData
   } };
 }
 
+export function extractClientReports(raw: unknown, profile: ClientDataProfile) {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 1024) throw new Error("expected 1 to 1024 client reports");
+  let totalCompletedRows = 0;
+  let sharedImage: string | undefined;
+  const reports = raw.map(item => {
+    const report = object(item, "client report");
+    const image = object(report.execution_image, "client image");
+    if (image.source !== "docker_container_inspect") throw new Error("client image provenance is unavailable");
+    const id = imageId(image.image_id);
+    if (sharedImage !== undefined && sharedImage !== id) throw new Error("client images differ");
+    sharedImage = id;
+    const config = object(report.consumer_effective_config, "client readback");
+    const counters = object(report.phase_counters, "client phase counters");
+    const cumulative = object(counters.process_cumulative, "client cumulative counters");
+    if (!Number.isSafeInteger(cumulative.completed_rows) || Number(cumulative.completed_rows) < 0
+      || cumulative.ambiguous_rows !== 0) throw new CoverageUnavailableError("client cumulative completions are unavailable or ambiguous");
+    totalCompletedRows += Number(cumulative.completed_rows);
+    if (!Number.isSafeInteger(totalCompletedRows)) throw new CoverageUnavailableError("client cumulative completions overflow");
+    return { image, config, evidence: extractClientEvidence(item, profile) };
+  });
+  const first = reports[0]!;
+  if (reports.some(report => report.evidence.payloadCorpusSha256 !== first.evidence.payloadCorpusSha256)) {
+    throw new Error("client business corpus hashes differ");
+  }
+  const cpus = reports.map(report => report.evidence.cpu);
+  const start = cpus[0]!.sampleStartUnixMs;
+  const end = cpus[0]!.sampleEndUnixMs;
+  const allComparable = cpus.every(cpu => cpu.coreEquivalents !== null
+    && cpu.sampleStartUnixMs === start && cpu.sampleEndUnixMs === end);
+  const totalCpu = allComparable ? cpus.reduce((sum, cpu) => sum + cpu.coreEquivalents!, 0) : null;
+  const clientEvidence: ClientEvidence = {
+    ...first.evidence,
+    cpu: totalCpu !== null && Number.isFinite(totalCpu)
+      ? { coreEquivalents: totalCpu, sampleStartUnixMs: start, sampleEndUnixMs: end, unavailableReason: null }
+      : { coreEquivalents: null, sampleStartUnixMs: null, sampleEndUnixMs: null, unavailableReason: "client CPU samples unavailable or not aligned" },
+  };
+  return { image: sharedImage!, reports, clientEvidence, totalCompletedRows };
+}
+
 export async function readReconciledOatResult(
   resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string,
   compressionLevel: number | null | CompressionSpec,
@@ -142,7 +181,7 @@ export async function readReconciledOatResult(
   },
   identity?: { tools: IdentityTools; outputDir: string; collectorRevision?: string },
 ): Promise<{
-  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
+  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; clientEvidences: ClientEvidence[]; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   parityTelemetry: JsonObject | null;
@@ -213,13 +252,10 @@ export async function readReconciledOatResult(
     }
     return `${process.component}:${imageId(process.image_id)}`;
   });
-  if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
-    throw new Error("expected one client image receipt");
-  }
-  const client = object(object(evidence.client_phase_reports[0], "client report").execution_image, "client image");
-  const clientEvidence = extractClientEvidence(evidence.client_phase_reports[0], requestedProfile);
-  if (client.source !== "docker_container_inspect") throw new Error("client image provenance is unavailable");
-  images.push(`client:${imageId(client.image_id)}`);
+  const clients = extractClientReports(evidence.client_phase_reports, requestedProfile);
+  const client = clients.reports[0]!.image;
+  const clientEvidence = clients.clientEvidence;
+  images.push(`client:${clients.image}`);
   images.sort();
   const measurement = adaptOatEvidence(evidence);
   const canonicalTable = `telemetry.sqlserver.${table}`;
@@ -230,13 +266,9 @@ export async function readReconciledOatResult(
   }
   const stopped = JSON.parse(await readFile(stoppedPath, "utf8"));
   const receipts = extractStoppedReceipts(evidence, stopped, row.run_id, canonicalTable, measurement);
-  if (parity) {
-    const report = object(evidence.client_phase_reports[0], "client report");
-    const cumulative = object(object(report.phase_counters, "client phase counters").process_cumulative, "client cumulative counters");
-    const stoppedRows = receipts.all.reduce((sum, receipt) => sum + receipt.rows, 0);
-    if (!Number.isSafeInteger(stoppedRows) || stoppedRows !== cumulative.completed_rows) {
-      throw new CoverageUnavailableError("stopped Delta rows do not match unambiguous cumulative client completions");
-    }
+  const stoppedRows = receipts.all.reduce((sum, receipt) => sum + receipt.rows, 0);
+  if (!Number.isSafeInteger(stoppedRows) || stoppedRows !== clients.totalCompletedRows) {
+    throw new CoverageUnavailableError("stopped Delta rows do not match unambiguous cumulative client completions");
   }
   if (typeof evidence.preload_delta !== "object" || evidence.preload_delta === null || Array.isArray(evidence.preload_delta)) {
     throw new CoverageUnavailableError("pre-load Delta evidence is unavailable");
@@ -269,14 +301,15 @@ export async function readReconciledOatResult(
   if (identity) await writeFile(join(identity.outputDir, "identity-result.json"),
     `${JSON.stringify(identityResult.value)}\n`, { flag: "wx", mode: 0o400 });
   return {
-    measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
+    measurement, images, clientEvidence, clientEvidences: clients.reports.map(report => report.evidence), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
     parityTelemetry: parity ? {
       backlog: evidence.backlog ?? null,
       backlog_budgets: object(object(object(parity.config, "parity config").tunables, "tunables").collector, "collector").batching,
       effective_readback: { before_admission: evidence.parity_admission_readback,
         collector: collector.effective_config, writer: collector.writer_policy_overrides,
-        table_layout: collector.layout_table_policies, client: object(evidence.client_phase_reports[0], "client report").consumer_effective_config },
+        table_layout: collector.layout_table_policies, client: clients.reports[0]!.config,
+        clients: clients.reports.map(report => report.config) },
       admission_waits: null, admission_waits_unavailable_reason: "stage telemetry not integrated",
       commit_substages: null, commit_substages_unavailable_reason: "stage telemetry not integrated",
       client_send_stalls: null, client_send_stalls_unavailable_reason: "stage telemetry not integrated",

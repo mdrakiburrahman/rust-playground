@@ -148,6 +148,24 @@ test("collector parity readback rejects drift in historical limits and local pre
       last_caps: [{ metric: "container_memory_bytes", confirmed: true, cap: 92341796864 }] },
   };
   assert.doesNotThrow(() => assertParityEvidence(seed, evidence));
+  const secondClient = structuredClone(evidence.client_phase_reports[0]!);
+  const multi = { ...evidence, client_phase_reports: [evidence.client_phase_reports[0]!, secondClient] };
+  assert.doesNotThrow(() => assertParityEvidence(seed, multi));
+  assert.throws(() => assertParityEvidence(seed, {
+    ...multi, client_phase_reports: [multi.client_phase_reports[0]!,
+      { ...secondClient, consumer_effective_config: { ...secondClient.consumer_effective_config, workers: 999 } }],
+  }), /client readback changed/);
+  assert.throws(() => assertParityEvidence(seed, {
+    ...multi, client_phase_reports: [multi.client_phase_reports[0]!,
+      { ...secondClient, phase_counters: { ...secondClient.phase_counters,
+        delivery_cumulative: { ...secondClient.phase_counters.delivery_cumulative, retried_rows: 1 } } }],
+  }), /delivery evidence is ambiguous/);
+  assert.throws(() => assertParityEvidence(seed, {
+    ...multi, client_phase_reports: [multi.client_phase_reports[0]!,
+      { ...secondClient, phase_counters: { ...secondClient.phase_counters,
+        process_cumulative: { completed_rows: Number.MAX_SAFE_INTEGER, ambiguous_rows: 0 } } }],
+  }), /overflow|safe integer/);
+  assert.throws(() => assertParityEvidence(seed, { ...evidence, client_phase_reports: [] }), /client readback/);
   const requestedWriter = { defaults: { compression: "zstd", compression_level: 3 }, max_row_group_rows: 262144 };
   const qualifiedSeed = { ...seed, tunables: { ...seed.tunables, parquet_writer: requestedWriter } };
   const qualifiedEvidence = {

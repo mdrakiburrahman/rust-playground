@@ -156,27 +156,33 @@ export function assertParityEvidence(seed: unknown, input: unknown, allowWriterO
   const admissionWriter = object(admissionCollector.parquet_writer, "pre-admission writer");
   if (allowWriterOverrides && tunables.parquet_writer != null) assertWriter(admissionWriter, tunables.parquet_writer);
   else if (hasOverride(admissionWriter)) throw new Error("pre-admission writer readback contains an override");
-  if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) {
+  if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length === 0
+    || evidence.client_phase_reports.length > 1024) {
     throw new Error("client readback is unavailable");
   }
-  const report = object(evidence.client_phase_reports[0], "client");
-  const client = object(report.consumer_effective_config, "client readback");
   const admissionClient = object(admission.client, "pre-admission client");
-  if (!isDeepStrictEqual(admissionClient, client)) throw new Error("pre-admission client readback changed");
-  for (const [key, value] of Object.entries(object(tunables.client, "client tunables"))) {
-    if (!isDeepStrictEqual(client[key], value)) throw new Error(`client readback differs at ${key}`);
-  }
   const transport = object(tunables.transport, "transport");
-  for (const key of ["ipc_compression", "grpc_send_compression", "max_flight_data_bytes", "max_message_bytes"]) {
-    if (!isDeepStrictEqual(client[key], transport[key])) throw new Error(`client transport readback differs at ${key}`);
-  }
-  const counters = object(report.phase_counters, "client phase counters");
-  const cumulative = object(counters.process_cumulative, "client cumulative counters");
-  const delivery = object(counters.delivery_cumulative, "client cumulative delivery evidence");
-  if (cumulative.ambiguous_rows !== 0 || !Number.isSafeInteger(cumulative.completed_rows) || Number(cumulative.completed_rows) < 0
-    || delivery.scope !== "completed_process_lifetime_counters_not_unique_delivery"
-    || ["retried_streams", "retried_rows", "ambiguous_streams", "ambiguous_rows"].some((key) => delivery[key] !== 0)) {
-    throw new Error("client cumulative delivery evidence is ambiguous, retried or unavailable");
+  let totalRows = 0;
+  for (const raw of evidence.client_phase_reports) {
+    const report = object(raw, "client");
+    const client = object(report.consumer_effective_config, "client readback");
+    if (!isDeepStrictEqual(admissionClient, client)) throw new Error("pre-admission client readback changed");
+    for (const [key, value] of Object.entries(object(tunables.client, "client tunables"))) {
+      if (!isDeepStrictEqual(client[key], value)) throw new Error(`client readback differs at ${key}`);
+    }
+    for (const key of ["ipc_compression", "grpc_send_compression", "max_flight_data_bytes", "max_message_bytes"]) {
+      if (!isDeepStrictEqual(client[key], transport[key])) throw new Error(`client transport readback differs at ${key}`);
+    }
+    const counters = object(report.phase_counters, "client phase counters");
+    const cumulative = object(counters.process_cumulative, "client cumulative counters");
+    const delivery = object(counters.delivery_cumulative, "client cumulative delivery evidence");
+    if (cumulative.ambiguous_rows !== 0 || !Number.isSafeInteger(cumulative.completed_rows) || Number(cumulative.completed_rows) < 0
+      || delivery.scope !== "completed_process_lifetime_counters_not_unique_delivery"
+      || ["retried_streams", "retried_rows", "ambiguous_streams", "ambiguous_rows"].some((key) => delivery[key] !== 0)) {
+      throw new Error("client cumulative delivery evidence is ambiguous, retried or unavailable");
+    }
+    totalRows += Number(cumulative.completed_rows);
+    if (!Number.isSafeInteger(totalRows)) throw new Error("client cumulative rows exceed safe integer range");
   }
   const guard = object(evidence.overload_guard, "overload guard");
   const settings = object(guard.settings, "overload settings");
