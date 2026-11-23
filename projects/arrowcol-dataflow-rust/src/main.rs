@@ -8,6 +8,12 @@ use arrowcol_dataflow_components as _;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(disabled) = configure_thp()? {
+        eprintln!(
+            "arrowcol_effective_config {}",
+            serde_json::json!({"process":{"thp_disabled":disabled,"scope":"linux_thp_disable_flag"}})
+        );
+    }
     eprintln!(
         "arrowcol_effective_config {}",
         arrow_deltalake::writer::effective_startup_config_json()?
@@ -65,6 +71,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     propagate(result, shutdown_error.take())
 }
 
+fn configure_thp() -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    const ENV: &str = "ARROWCOL_COLLECTOR_THP_DISABLED";
+    let value = match std::env::var(ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(format!("{ENV}: {error}").into()),
+    };
+    let requested = match value.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err(format!("{ENV} must be true or false").into()),
+    };
+    #[cfg(target_os = "linux")]
+    {
+        rustix::thread::disable_transparent_huge_pages(requested)
+            .map_err(|error| format!("{ENV}: setting Linux process flag: {error}"))?;
+        let actual = rustix::thread::transparent_huge_pages_are_disabled()
+            .map_err(|error| format!("{ENV}: reading Linux process flag: {error}"))?;
+        if actual != requested {
+            return Err(format!("{ENV} did not match the Linux process flag").into());
+        }
+        Ok(Some(actual))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = requested;
+        Err(format!("{ENV} is supported only on Linux").into())
+    }
+}
+
 /// Keeps the engine's own error (for example `IncompatiblePdataWiring`) as the process error
 /// and fails a run that otherwise succeeded when its shutdown hook failed.
 fn propagate(
@@ -107,6 +143,34 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thp_flag_reaches_linux_kernel() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("ARROWCOL_TEST_THP_CHILD").is_some() {
+            let expected = std::env::var("ARROWCOL_COLLECTOR_THP_DISABLED")? == "true";
+            assert_eq!(configure_thp()?, Some(expected));
+            assert_eq!(rustix::thread::transparent_huge_pages_are_disabled()?, expected);
+            return Ok(());
+        }
+        for value in ["true", "false"] {
+            let child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::thp_flag_reaches_linux_kernel"])
+                .env_clear()
+                .env("ARROWCOL_TEST_THP_CHILD", "1")
+                .env("ARROWCOL_COLLECTOR_THP_DISABLED", value)
+                .output()?;
+            if !child.status.success() || !String::from_utf8_lossy(&child.stdout).contains("1 passed;") {
+                return Err(format!(
+                    "THP child failed: {}\n{}",
+                    String::from_utf8_lossy(&child.stdout),
+                    String::from_utf8_lossy(&child.stderr)
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn clean_shutdown_closes_publisher_before_terminal_write() {

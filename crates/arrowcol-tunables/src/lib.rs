@@ -237,6 +237,11 @@ pub struct CollectorTunables {
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
     pub socket: Option<CollectorSocketTunables>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_bool"
+    )]
+    pub thp_disabled: Option<bool>,
     pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
 }
