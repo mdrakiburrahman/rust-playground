@@ -4473,8 +4473,10 @@ mod tests {
             ("target_cpu", serde_json::json!("native")),
             ("target_cpu", serde_json::json!(4)),
         ] {
-            let error = Tunables::parse_oat_json(serde_json::json!({"collector": {field: value}}))
-                .expect_err("invalid build profile was accepted");
+            let error = match Tunables::parse_oat_json(serde_json::json!({"collector": {field: value}})) {
+                Ok(_) => return Err(format!("invalid collector.{field} build profile was accepted").into()),
+                Err(error) => error,
+            };
             let error = format!("{error:#}");
             assert!(error.contains(&format!("collector.{field}")), "{field}: {error}");
         }
