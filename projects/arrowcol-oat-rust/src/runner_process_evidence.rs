@@ -2046,6 +2046,46 @@ mod startup_readback_tests {
 mod consumer_startup_projection_tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn parquet_policy_reaches_actual_collector_startup() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(format!("arrowcol-dataflow-rust{}", std::env::consts::EXE_SUFFIX));
+        let cases = [
+            json!({"defaults":{"compression":"uncompressed"}}),
+            json!({"defaults":{"compression":"snappy"}}),
+            json!({"defaults":{"compression":"gzip","compression_level":6}}),
+            json!({"defaults":{"compression":"brotli","compression_level":1}}),
+            json!({"defaults":{"compression":"lz4"}}),
+            json!({"defaults":{"compression":"lz4_raw"}}),
+            json!({"defaults":{"compression":"zstd","compression_level":3},
+                "columns":{"customer_id":{"compression":"snappy","dictionary_enabled":true}},
+                "writer_version":"v2","max_row_group_rows":16384,"max_row_group_bytes":1048576,
+                "data_page_row_count_limit":2048,"write_batch_size":512,
+                "offset_index_enabled":true,"column_index_truncate_length":64,
+                "statistics_truncate_length":64}),
+        ];
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for policy in cases {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy}))?;
+            let output = std::process::Command::new(&binary)
+                .arg("--help")
+                .env_clear()
+                .envs(role_environment(&config, ComponentRole::Collector)?)
+                .output()
+                .context("launch collector for Parquet policy readback")?;
+            anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+            let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+            verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            observed.as_object_mut().context("startup readback must be an object")?.remove("parquet_writer");
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        }
+        Ok(())
+    }
+
     fn actual_client_startup(binary: &Path, config: &OatConfig) -> Result<Value> {
         let table = config.tables.first().context("startup fixture needs a table")?;
         let mut command = std::process::Command::new(binary);
