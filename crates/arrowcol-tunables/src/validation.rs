@@ -304,6 +304,11 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
     capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
+    capability!("collector.runtime.event_interval", "Tokio default (61)"),
+    capability!("collector.runtime.global_queue_interval", "Tokio adaptive default"),
+    capability!("collector.runtime.thread_stack_size", "platform thread default"),
+    capability!("collector.runtime.thread_keep_alive_ms", "Tokio default (10000)"),
+    capability!("collector.runtime.cpu_thread_stack_size", "platform thread default"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
@@ -1122,6 +1127,11 @@ impl Tunables {
                         ("BATCH_ROWS", runtime.batch_rows),
                         ("CPU_WORKERS", runtime.cpu_workers),
                         ("CPU_QUEUE_JOBS", runtime.cpu_queue_jobs),
+                        ("EVENT_INTERVAL", runtime.event_interval),
+                        ("GLOBAL_QUEUE_INTERVAL", runtime.global_queue_interval),
+                        ("THREAD_STACK_SIZE", runtime.thread_stack_size),
+                        ("THREAD_KEEP_ALIVE_MS", runtime.thread_keep_alive_ms),
+                        ("CPU_THREAD_STACK_SIZE", runtime.cpu_thread_stack_size),
                     ] {
                         if let Some(value) = value {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
@@ -1826,6 +1836,16 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
         ("batch_rows", runtime.batch_rows, 1, 262_144),
         ("cpu_workers", runtime.cpu_workers, 1, 128),
         ("cpu_queue_jobs", runtime.cpu_queue_jobs, 1, 128),
+        ("event_interval", runtime.event_interval, 1, 65_535),
+        ("global_queue_interval", runtime.global_queue_interval, 1, 65_535),
+        ("thread_stack_size", runtime.thread_stack_size, 65_536, 67_108_864),
+        ("thread_keep_alive_ms", runtime.thread_keep_alive_ms, 1, 86_400_000),
+        (
+            "cpu_thread_stack_size",
+            runtime.cpu_thread_stack_size,
+            65_536,
+            67_108_864,
+        ),
     ] {
         if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
             bail!("collector.runtime.{name} must be between {minimum} and {maximum}");
@@ -2380,6 +2400,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn scheduler_knobs_reject_invalid_values_and_types() {
+        for field in [
+            "event_interval",
+            "global_queue_interval",
+            "thread_stack_size",
+            "thread_keep_alive_ms",
+            "cpu_thread_stack_size",
+        ] {
+            for value in [serde_json::json!(0), serde_json::json!("3"), serde_json::json!(null)] {
+                let mut candidate = serde_json::json!({"collector":{"runtime":{}}});
+                candidate["collector"]["runtime"][field] = value;
+                let error = Tunables::parse_oat_json(candidate).expect_err(field);
+                assert!(format!("{error:#}").contains(field), "{field}: {error:#}");
+            }
+        }
+    }
 
     #[test]
     fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
