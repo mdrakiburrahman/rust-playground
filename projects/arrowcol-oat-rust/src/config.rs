@@ -598,6 +598,14 @@ impl OatConfig {
         Ok((rss, buffered))
     }
 
+    pub(crate) fn collector_build_profile_hash(&self) -> Option<String> {
+        self.tunables
+            .collector
+            .as_ref()
+            .filter(|collector| collector.has_build_profile())
+            .map(|collector| collector_build_profile_hash(collector.build_profile()))
+    }
+
     fn verify_local_cpu_profile(&self) -> Result<()> {
         if self.platform.kind != OatMode::Local {
             return Ok(());
@@ -1057,18 +1065,17 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        let computed_profile_hash = self.collector_build_profile_hash();
         if let Some(profile_hash) = &self.platform.collector_build_profile_hash {
-            let profile = self
-                .tunables
-                .collector
-                .as_ref()
-                .filter(|collector| collector.has_build_profile())
-                .context("platform.collector_build_profile_hash requires tunables.collector build-profile fields")?
-                .build_profile();
-            let expected = collector_build_profile_hash(profile);
-            if profile_hash != &expected {
+            let expected = computed_profile_hash
+                .as_deref()
+                .context("platform.collector_build_profile_hash requires tunables.collector build-profile fields")?;
+            if profile_hash != expected {
                 bail!("platform.collector_build_profile_hash does not match the effective collector build profile");
             }
+        }
+        if computed_profile_hash.is_some() && self.platform.local.collector_image_override.is_some() {
+            bail!("platform.local.collector_image_override cannot be combined with collector build-profile fields");
         }
         self.verify_local_cpu_profile()?;
         if self

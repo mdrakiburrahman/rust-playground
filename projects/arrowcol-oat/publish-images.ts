@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { collectorBuildProfileHash, type CollectorBuildProfile } from './collector-build-profile.js';
+import { collectorBuildProfileHash, parseCollectorBuildProfile, type CollectorBuildProfile } from './collector-build-profile.js';
 import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
