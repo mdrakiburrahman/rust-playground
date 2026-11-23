@@ -41,6 +41,7 @@ pub(crate) struct PressureDiagnosticSample {
     request_index: u64,
     started: Instant,
     handler_total_ns: u64,
+    blocking_queue_ns: u64,
     serialization_ns: u64,
     procfs_ns: u64,
     tables_lock_wait_ns: u64,
@@ -59,6 +60,7 @@ impl PressureDiagnosticSample {
             request_index,
             started: Instant::now(),
             handler_total_ns: 0,
+            blocking_queue_ns: 0,
             serialization_ns: 0,
             procfs_ns: 0,
             tables_lock_wait_ns: 0,
@@ -69,6 +71,10 @@ impl PressureDiagnosticSample {
 
     pub(crate) fn record_handler_total(&mut self, elapsed: Duration) {
         self.handler_total_ns = pressure_diagnostic_nanos(elapsed);
+    }
+
+    pub(crate) fn record_blocking_queue(&mut self, elapsed: Duration) {
+        self.blocking_queue_ns = pressure_diagnostic_nanos(elapsed);
     }
 
     pub(crate) fn record_serialization(&mut self, elapsed: Duration) {
@@ -115,6 +121,7 @@ impl PressureDiagnosticSample {
                 request_index = self.request_index,
                 elapsed_since_first_opted_in_request_ms,
                 handler_total_us = self.handler_total_ns / 1_000,
+                blocking_queue_us = self.blocking_queue_ns / 1_000,
                 serialization_us = self.serialization_ns / 1_000,
                 procfs_us = self.procfs_ns / 1_000,
                 tables_lock_wait_us = self.tables_lock_wait_ns / 1_000,
@@ -2784,6 +2791,7 @@ mod tests {
             request_index: 1,
             started: Instant::now(),
             handler_total_ns: 0,
+            blocking_queue_ns: 0,
             serialization_ns: 0,
             procfs_ns: 0,
             tables_lock_wait_ns: 0,
