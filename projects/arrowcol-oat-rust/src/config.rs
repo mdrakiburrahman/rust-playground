@@ -54,8 +54,6 @@ pub struct OatConfig {
     pub arrowcol_endpoint: String,
     pub router_metrics_endpoint: String,
     #[serde(default)]
-    pub dmv_client_binary: String,
-    #[serde(default)]
     pub edge_secret_file: String,
     #[serde(default)]
     pub dmv_client_image: String,
@@ -1806,7 +1804,7 @@ mod tests {
 
     #[test]
     fn collector_cpu_preflight_parses_linux_flags_and_sse3_alias() {
-        let flags = "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 fma abm movbe xsave avx512f avx512bw avx512cd avx512dq avx512vl\n";
+        let flags = "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 f16c bmi1 bmi2 fma abm movbe xsave avx512f avx512bw avx512cd avx512dq avx512vl\n";
         for target in ["x86-64-v2", "x86-64-v3", "x86-64-v4"] {
             assert!(
                 arrowcol_tunables::verify_collector_target_cpu_flags(target, flags, "collector.target_cpu preflight")
@@ -1855,6 +1853,16 @@ mod tests {
             Ok(()) => anyhow::bail!("expected missing AVX2 to fail"),
         };
         assert!(insufficient.contains("AVX2 (cpuinfo token: avx2)"));
+
+        let missing_f16c = match arrowcol_tunables::verify_collector_target_cpu_flags(
+            "x86-64-v3",
+            "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 fma abm movbe xsave\n",
+            "collector.target_cpu preflight",
+        ) {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("expected missing F16C to fail"),
+        };
+        assert!(missing_f16c.contains("F16C (cpuinfo token: f16c)"));
         Ok(())
     }
 
@@ -2176,7 +2184,6 @@ mod tests {
             dfe_pod_selector: "app=arrowcol".to_owned(),
             arrowcol_endpoint: "http://arrowcol-router.arrowcol.svc:50050".to_owned(),
             router_metrics_endpoint: "http://router.arrowcol.svc:50050/metrics".to_owned(),
-            dmv_client_binary: "target/debug/arrowcol-dmv".to_owned(),
             edge_secret_file: "/run/secrets/edge-hmac".to_owned(),
             dmv_client_image: "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-oat-client:dev".to_owned(),
             maintenance_image: None,

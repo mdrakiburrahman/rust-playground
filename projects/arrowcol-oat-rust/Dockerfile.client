@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 FROM rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+ARG OAT_CLIENT_BUILD_LTO=off
+ARG OAT_CLIENT_BUILD_CODEGEN_UNITS=16
+ARG OAT_CLIENT_BUILD_OPT_LEVEL=3
+ARG OAT_CLIENT_BUILD_TARGET_CPU=generic
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
@@ -13,7 +17,19 @@ COPY docs/experiments/arrowcol-oat/oat-config.quick.json /workspace/docs/experim
 COPY submodules/otel-arrow /workspace/submodules/otel-arrow
 RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rust-playground-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=rust-playground-target,target=/workspace/target,sharing=locked \
+    --mount=type=cache,id=rust-playground-target-oat-client-${OAT_CLIENT_BUILD_LTO}-${OAT_CLIENT_BUILD_CODEGEN_UNITS}-${OAT_CLIENT_BUILD_OPT_LEVEL}-${OAT_CLIENT_BUILD_TARGET_CPU},target=/workspace/target,sharing=locked \
+    set -eu; \
+    case "${OAT_CLIENT_BUILD_LTO}" in off|thin-local|thin|fat) ;; *) echo 'invalid OAT_CLIENT_BUILD_LTO' >&2; exit 2 ;; esac; \
+    case "${OAT_CLIENT_BUILD_CODEGEN_UNITS}" in ''|*[!0-9]*) echo 'invalid OAT_CLIENT_BUILD_CODEGEN_UNITS' >&2; exit 2 ;; esac; \
+    [ "${OAT_CLIENT_BUILD_CODEGEN_UNITS}" -ge 1 ] && [ "${OAT_CLIENT_BUILD_CODEGEN_UNITS}" -le 256 ] || { echo 'invalid OAT_CLIENT_BUILD_CODEGEN_UNITS' >&2; exit 2; }; \
+    case "${OAT_CLIENT_BUILD_OPT_LEVEL}" in 2|3) ;; *) echo 'invalid OAT_CLIENT_BUILD_OPT_LEVEL' >&2; exit 2 ;; esac; \
+    case "${OAT_CLIENT_BUILD_TARGET_CPU}" in generic|x86-64-v2|x86-64-v3|x86-64-v4) ;; *) echo 'invalid OAT_CLIENT_BUILD_TARGET_CPU' >&2; exit 2 ;; esac; \
+    export ARROWCOL_OAT_CLIENT_BUILD_LTO=${OAT_CLIENT_BUILD_LTO} ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS=${OAT_CLIENT_BUILD_CODEGEN_UNITS}; \
+    export ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL=${OAT_CLIENT_BUILD_OPT_LEVEL} ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU=${OAT_CLIENT_BUILD_TARGET_CPU}; \
+    case "${OAT_CLIENT_BUILD_LTO}" in off) export CARGO_PROFILE_RELEASE_LTO=off ;; thin-local) export CARGO_PROFILE_RELEASE_LTO=false ;; thin|fat) export CARGO_PROFILE_RELEASE_LTO=${OAT_CLIENT_BUILD_LTO} ;; esac; \
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${OAT_CLIENT_BUILD_CODEGEN_UNITS}; \
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL=${OAT_CLIENT_BUILD_OPT_LEVEL}; \
+    if [ "${OAT_CLIENT_BUILD_TARGET_CPU}" != generic ]; then export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C target-cpu=${OAT_CLIENT_BUILD_TARGET_CPU}"; fi; \
     CARGO_TARGET_DIR=/workspace/target cargo build --locked --release \
       --package collector-chain --bin arrowcol-dmv \
       --package arrowcol-oat-rust --bin arrowcol-oat-pin-init \

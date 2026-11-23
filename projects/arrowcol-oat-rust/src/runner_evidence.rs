@@ -724,6 +724,7 @@ impl CellEvidence {
 
     fn record_client(&mut self, config: &OatConfig, table: &str, client_id: &str, output: &str) -> Result<()> {
         let effective = process_configurations(output)?;
+        crate::runner::verify_oat_client_build_profile_readback(&effective)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
         let data_profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
         let counters = client_phase_evidence(output, data_profile)?;
@@ -2646,7 +2647,7 @@ mod downstream_runner_tests {
             let start = self.start.load(std::sync::atomic::Ordering::SeqCst) + config.warmup_seconds * 1000;
             let end = start + config.measure_seconds * 1000;
             Ok(format!(
-                "measured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
+                "OAT_CLIENT_BUILD_PROFILE {{\"lto\":\"off\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}}\nmeasured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
                 config.measure_seconds,
                 100.0 / config.measure_seconds as f64
             ))

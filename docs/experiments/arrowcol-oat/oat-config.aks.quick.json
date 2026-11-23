@@ -22,7 +22,6 @@
   "dfe_pod_selector": "app=arrowcol",
   "arrowcol_endpoint": "http://arrowcol-router.arrow-collector.svc.cluster.local:50050",
   "router_metrics_endpoint": "http://arrowcol-router.arrow-collector.svc.cluster.local:15050/metrics",
-  "dmv_client_binary": "target/debug/arrowcol-dmv",
   "dmv_client_image": "",
   "edge_secret_file": "/run/secrets/edge-hmac",
   "edge_secret_name": "arrowcol-router-auth",

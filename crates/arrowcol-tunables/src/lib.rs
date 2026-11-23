@@ -396,6 +396,11 @@ const X86_64_FEATURES: &[CollectorCpuFeatureRequirement] = &[
         minimum_level: 3,
     },
     CollectorCpuFeatureRequirement {
+        isa_feature: "F16C",
+        cpuinfo_tokens: &["f16c"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
         isa_feature: "BMI1",
         cpuinfo_tokens: &["bmi1"],
         minimum_level: 3,

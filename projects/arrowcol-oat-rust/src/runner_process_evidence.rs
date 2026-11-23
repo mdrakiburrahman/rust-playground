@@ -300,7 +300,30 @@ fn process_configurations(text: &str) -> Result<Value> {
     let mut configuration = json!({});
     let mut resolution_seen = false;
     let mut delta_io_runtime_build_seen = false;
+    let mut client_build_profile_seen = false;
     for line in text.lines() {
+        if let Some(value) = line.strip_prefix("OAT_CLIENT_BUILD_PROFILE ") {
+            if client_build_profile_seen {
+                bail!("duplicate OAT client build-profile readback");
+            }
+            client_build_profile_seen = true;
+            let value: Value = serde_json::from_str(value).context("invalid OAT client build-profile readback")?;
+            let profile = value.as_object().context("OAT client build-profile readback must be an object")?;
+            let lto = profile.get("lto").and_then(Value::as_str);
+            let codegen_units = profile.get("codegen_units").and_then(Value::as_u64);
+            let opt_level = profile.get("opt_level").and_then(Value::as_u64);
+            let target_cpu = profile.get("target_cpu").and_then(Value::as_str);
+            if profile.len() != 4
+                || !matches!(lto, Some("off" | "thin-local" | "thin" | "fat"))
+                || !codegen_units.is_some_and(|value| (1..=256).contains(&value))
+                || !matches!(opt_level, Some(2 | 3))
+                || !matches!(target_cpu, Some("generic" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4"))
+            {
+                bail!("invalid OAT client build-profile readback");
+            }
+            configuration["build_profile"] = value;
+            continue;
+        }
         if let Some(value) = line.strip_prefix("OAT_CLIENT_RESOLUTION ") {
             if resolution_seen {
                 bail!("duplicate client resolution source");
@@ -993,6 +1016,20 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
         }
     }
     Ok(records)
+}
+
+pub(crate) fn verify_oat_client_build_profile_readback(observed: &Value) -> Result<()> {
+    let profile = observed.get("build_profile").context("OAT client omitted startup build-profile readback")?;
+    let expected = json!({
+        "lto": "off",
+        "codegen_units": 16,
+        "opt_level": 3,
+        "target_cpu": "generic",
+    });
+    if profile != &expected {
+        bail!("OAT client startup build-profile readback does not match the requested release profile");
+    }
+    Ok(())
 }
 
 fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
@@ -2111,10 +2148,19 @@ mod startup_readback_tests {
         config.tunables = serde_json::from_value(json!({"client":{"batch_rows":257}}))?;
         assert!(verify_process_configuration(&config, ComponentRole::Client, &json!({})).is_err());
         assert!(verify_process_configuration(&config, ComponentRole::Client, &json!({"batch_rows":256})).is_err());
-        let readback =
-            process_configurations("unrelated log\nOAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":257,\"workers\":4}\n")?;
+        let readback = process_configurations(concat!(
+            "unrelated log\n",
+            "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"off\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}\n",
+            "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":257,\"workers\":4}\n",
+        ))?;
+        verify_oat_client_build_profile_readback(&readback)?;
         verify_process_configuration(&config, ComponentRole::Client, &readback)?;
         assert_eq!(readback["workers"], 4);
+        let wrong_profile = process_configurations(
+            "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"thin-local\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}\n",
+        )?;
+        assert!(verify_oat_client_build_profile_readback(&wrong_profile).is_err());
+        assert!(verify_oat_client_build_profile_readback(&json!({})).is_err());
         Ok(())
     }
 
@@ -3188,6 +3234,8 @@ groups:
         let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
         anyhow::ensure!(text.lines().any(|line| line.starts_with("OAT_CLIENT_EFFECTIVE_CONFIG ")),
             "consumer omitted startup envelope");
+        anyhow::ensure!(text.lines().any(|line| line.starts_with("OAT_CLIENT_BUILD_PROFILE ")),
+            "consumer omitted build-profile startup readback");
         process_configurations(&text)
     }
 

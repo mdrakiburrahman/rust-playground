@@ -43,7 +43,33 @@ struct Args {
     pilot: bool,
 }
 
+fn emit_build_profile_readback() -> Result<()> {
+    let (lto, codegen_units, opt_level, target_cpu) = (
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_LTO"),
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS"),
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL"),
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU"),
+    );
+    if lto.is_none() && codegen_units.is_none() && opt_level.is_none() && target_cpu.is_none() {
+        return Ok(());
+    }
+    let (Some(lto), Some(codegen_units), Some(opt_level), Some(target_cpu)) =
+        (lto, codegen_units, opt_level, target_cpu)
+    else {
+        anyhow::bail!("client build profile readback is incomplete");
+    };
+    let build_profile = serde_json::json!({
+        "lto": lto,
+        "codegen_units": codegen_units.parse::<u16>().context("invalid client codegen-units readback")?,
+        "opt_level": opt_level.parse::<u8>().context("invalid client opt-level readback")?,
+        "target_cpu": target_cpu,
+    });
+    println!("OAT_CLIENT_BUILD_PROFILE {build_profile}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    emit_build_profile_readback()?;
     let mut args = Args::parse();
     let (tuning, resolution) = args.tuning.resolve_with_evidence(args.rows, args.concurrency)?;
     args.tuning = tuning;

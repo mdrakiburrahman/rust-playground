@@ -27,6 +27,10 @@ These controls are rebuild-only. The canonical profile key is `allocator=<value>
 
 Every profile hash, requested field, image identity, and compiled startup value is recorded separately. A startup-profile mismatch is a failed arm, never a throughput result.
 
+## OAT client release build
+
+The local `arrowcol-oat-client` image uses an explicit release profile: `opt-level=3`, `lto=off` (no LTO), `codegen-units=16`, and `target_cpu=generic` (no `-C target-cpu` flag). `arrowcol-dmv` emits these compiled values in `OAT_CLIENT_BUILD_PROFILE`; the runner verifies the readback before recording client throughput.
+
 ## Client data profile and identity
 
 Generator settings below apply at **process startup**.
