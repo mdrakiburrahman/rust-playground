@@ -3152,6 +3152,38 @@ groups:
         }
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row"}
+        }))?;
+        let observed = actual_client_startup(&binary, &config)?;
+        prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(0);
+        prepared["generator_applicability"]["tables"][0]["pod_ordinal"] =
+            json!({"eligible_columns":1,"eligible_rows":8});
+        let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
+        let initial = tunable_leaf_evidence(&config)?;
+        let report = json!({
+            "client_id":"client-1", "table":table, "consumer_effective_config":observed,
+            "phase_counters":{"preparation":preparation}
+        });
+        let mut covered = initial.clone();
+        promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
+        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
+        let mut absent = report.clone();
+        absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
+        let mut uncovered = initial.clone();
+        promote_client_readback(&config, &mut uncovered, Some(&vec![absent]))?;
+        assert!(uncovered["projection_only"].as_array().context("projection_only array")?
+            .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
+        let mut zero = report;
+        zero["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] =
+            json!({"eligible_columns":0,"eligible_rows":0});
+        let mut inert = initial;
+        promote_client_readback(&config, &mut inert, Some(&vec![zero]))?;
+        assert!(inert["inert_fields"].as_array().context("inert_fields array")?
+            .iter().any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_pod_ordinal_guid_rows"));
+        prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(9);
+        assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         for (input, inactive, active) in [
             (json!({"corpus_rows":0,"corpus_bytes":4096}), "client.corpus_rows", "client.corpus_bytes"),
             (json!({"corpus_rows":127,"corpus_bytes":0}), "client.corpus_bytes", "client.corpus_rows"),

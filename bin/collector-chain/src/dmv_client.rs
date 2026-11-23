@@ -535,7 +535,7 @@ struct EncodedBatch {
     encoded_bytes: u64,
 }
 
-fn null_fraction_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], profile: DataProfile) -> Result<serde_json::Value> {
+fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Options) -> Result<serde_json::Value> {
     #[derive(Default)]
     struct Counts {
         rows: u64,
@@ -543,6 +543,8 @@ fn null_fraction_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], profile: Dat
         eligible: std::collections::BTreeSet<String>,
         eligible_rows: u64,
         null_rows: u64,
+        guid_columns: std::collections::BTreeSet<String>,
+        guid_rows: u64,
     }
     let mut tables = std::collections::BTreeMap::<String, Counts>::new();
     for batches in corpus {
@@ -556,9 +558,20 @@ fn null_fraction_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], profile: Dat
                 .checked_add(batch.rows)
                 .context("corpus table row count overflow")?;
             for (field, array) in batch.template.schema().fields().iter().zip(batch.template.columns()) {
+                if options.guid_uniqueness == Some(GuidUniqueness::PerRow)
+                    && field.data_type() == &DataType::Utf8
+                    && is_guid_field(field.name())
+                    && array.len() > array.null_count()
+                {
+                    counts.guid_columns.insert(field.name().to_owned());
+                    counts.guid_rows = counts
+                        .guid_rows
+                        .checked_add(u64::try_from(array.len() - array.null_count())?)
+                        .context("corpus GUID row count overflow")?;
+                }
                 if !field.is_nullable()
                     || field.name() == "customer_id"
-                    || (profile == DataProfile::Realistic && field.name() == "endpoint_url")
+                    || (options.data_profile == DataProfile::Realistic && field.name() == "endpoint_url")
                 {
                     continue;
                 }
@@ -584,6 +597,10 @@ fn null_fraction_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], profile: Dat
                 "eligible_columns": counts.eligible.len(),
                 "eligible_rows": counts.eligible_rows,
                 "null_rows": counts.null_rows,
+            },
+            "pod_ordinal": {
+                "eligible_columns": counts.guid_columns.len(),
+                "eligible_rows": counts.guid_rows,
             },
         })).collect::<Vec<_>>(),
     }))
@@ -1153,7 +1170,7 @@ impl PreparedClient {
             }
             corpus.push(Arc::new(batches));
         }
-        let generator_applicability = null_fraction_corpus_evidence(&corpus, options.data_profile)?;
+        let generator_applicability = generator_corpus_evidence(&corpus, &options)?;
         let mut channels = Vec::new();
         for _ in 0..options.workers {
             let mut worker = Vec::new();
@@ -4552,6 +4569,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pod_ordinal_changes_only_per_row_guid_generation() -> Result<()> {
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let mut options = options()?;
+        options.guid_uniqueness = Some(GuidUniqueness::PerRow);
+        let first = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        options.pod_ordinal = 3;
+        let second = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        assert_ne!(
+            first.column_by_name("availability_group_id"),
+            second.column_by_name("availability_group_id")
+        );
+        options.guid_uniqueness = Some(GuidUniqueness::Cardinality);
+        let third = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        options.pod_ordinal = 4;
+        assert_eq!(third, synthetic_batch(&table, "client", 8, 0, 0, &options)?);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn terminal_send_failure_is_not_retried_and_row_budget_counts_attempts() -> Result<()> {
         let mut options = options()?;
@@ -4848,6 +4884,7 @@ mod tests {
         options.grpc_accept_compression = GrpcCompression::Gzip;
         options.data_profile = DataProfile::Realistic;
         options.null_fraction = 1.0;
+        options.guid_uniqueness = Some(GuidUniqueness::PerRow);
         options.send_iter = SendIter::ArcCursor;
         options.identity_builder = IdentityBuilder::DirectUtf8;
         let client = PreparedClient::prepare(
@@ -4900,6 +4937,8 @@ mod tests {
         assert_eq!(eligible_columns, 0);
         assert_eq!(applicability["null_fraction"]["eligible_rows"], eligible_columns * 8);
         assert_eq!(applicability["null_fraction"]["null_rows"], eligible_columns * 8);
+        assert!(applicability["pod_ordinal"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
+        assert!(applicability["pod_ordinal"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()
