@@ -24,6 +24,166 @@ static PROCESS_INSTANCE_ID: LazyLock<CollectorInstanceId> = LazyLock::new(Collec
 static GLOBAL_METRICS: LazyLock<Arc<RuntimeMetrics>> =
     LazyLock::new(|| Arc::new(RuntimeMetrics::new(*PROCESS_INSTANCE_ID)));
 const MAX_TABLE_PRESSURE_ENTRIES: usize = 256;
+const MAX_PERIODIC_PRESSURE_SAMPLES: u64 = 64;
+const MAX_SLOW_PRESSURE_SAMPLES: u64 = 32;
+const SLOW_PRESSURE_SAMPLE_THRESHOLD: Duration = Duration::from_millis(10);
+
+static PRESSURE_DIAGNOSTICS_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| matches!(std::env::var("ARROWCOL_PRESSURE_DIAGNOSTICS").as_deref(), Ok("1")));
+static PRESSURE_DIAGNOSTIC_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static PRESSURE_SLOW_SAMPLE_SLOTS: AtomicU64 = AtomicU64::new(0);
+static PRESSURE_SLOW_SAMPLES_CENSORED: AtomicU64 = AtomicU64::new(0);
+static PRESSURE_CENSOR_EVENT_REPORTED: AtomicBool = AtomicBool::new(false);
+static PRESSURE_DIAGNOSTICS_STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// A fixed-size sample of the actual `/v1/pressure` handler, never of ingest batches.
+pub(crate) struct PressureDiagnosticSample {
+    request_index: u64,
+    started: Instant,
+    handler_total_ns: u64,
+    serialization_ns: u64,
+    procfs_ns: u64,
+    tables_lock_wait_ns: u64,
+    tables_lock_hold_ns: u64,
+    tables_lock_count: u64,
+}
+
+impl PressureDiagnosticSample {
+    pub(crate) fn start() -> Option<Self> {
+        if !*PRESSURE_DIAGNOSTICS_ENABLED {
+            return None;
+        }
+        PRESSURE_DIAGNOSTICS_STARTED.get_or_init(Instant::now);
+        let request_index = next_pressure_request_index(&PRESSURE_DIAGNOSTIC_REQUESTS);
+        Some(Self {
+            request_index,
+            started: Instant::now(),
+            handler_total_ns: 0,
+            serialization_ns: 0,
+            procfs_ns: 0,
+            tables_lock_wait_ns: 0,
+            tables_lock_hold_ns: 0,
+            tables_lock_count: 0,
+        })
+    }
+
+    pub(crate) fn record_handler_total(&mut self, elapsed: Duration) {
+        self.handler_total_ns = pressure_diagnostic_nanos(elapsed);
+    }
+
+    pub(crate) fn record_serialization(&mut self, elapsed: Duration) {
+        self.serialization_ns = pressure_diagnostic_nanos(elapsed);
+    }
+
+    fn record_procfs(&mut self, elapsed: Duration) {
+        self.procfs_ns = pressure_diagnostic_nanos(elapsed);
+    }
+
+    fn record_tables_lock(&mut self, wait: Duration, hold: Duration) {
+        self.tables_lock_wait_ns = self.tables_lock_wait_ns.saturating_add(pressure_diagnostic_nanos(wait));
+        self.tables_lock_hold_ns = self.tables_lock_hold_ns.saturating_add(pressure_diagnostic_nanos(hold));
+        self.tables_lock_count = self.tables_lock_count.saturating_add(1);
+    }
+
+    pub(crate) fn finish(self) {
+        let elapsed = self.started.elapsed();
+        let periodic = is_periodic_pressure_sample(self.request_index);
+        let slow_reserved = !periodic
+            && elapsed >= SLOW_PRESSURE_SAMPLE_THRESHOLD
+            && reserve_slow_pressure_sample(&PRESSURE_SLOW_SAMPLE_SLOTS);
+        if !periodic && elapsed >= SLOW_PRESSURE_SAMPLE_THRESHOLD && !slow_reserved {
+            let censored =
+                note_censored_pressure_sample(&PRESSURE_SLOW_SAMPLES_CENSORED, &PRESSURE_CENSOR_EVENT_REPORTED);
+            if let Some(censored_count) = censored {
+                tracing::warn!(
+                    target: "arrowcol::pressure_diagnostics",
+                    request_index = self.request_index,
+                    censored_slow_samples = censored_count,
+                    slow_sample_limit = MAX_SLOW_PRESSURE_SAMPLES,
+                    "pressure diagnostic slow-sample budget exhausted; this and later slow samples are censored"
+                );
+            }
+        }
+        if periodic || slow_reserved {
+            let sample_kind = if periodic { "power_of_two" } else { "slow" };
+            let elapsed_since_first_opted_in_request_ms = PRESSURE_DIAGNOSTICS_STARTED.get().map_or(0, |started| {
+                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+            });
+            tracing::debug!(
+                target: "arrowcol::pressure_diagnostics",
+                sample_kind = sample_kind,
+                request_index = self.request_index,
+                elapsed_since_first_opted_in_request_ms,
+                handler_total_us = self.handler_total_ns / 1_000,
+                serialization_us = self.serialization_ns / 1_000,
+                procfs_us = self.procfs_ns / 1_000,
+                tables_lock_wait_us = self.tables_lock_wait_ns / 1_000,
+                tables_lock_hold_us = self.tables_lock_hold_ns / 1_000,
+                tables_lock_count = self.tables_lock_count,
+                censored_slow_samples = PRESSURE_SLOW_SAMPLES_CENSORED.load(Ordering::Relaxed),
+                "sampled /v1/pressure handler timing"
+            );
+        }
+    }
+}
+
+fn pressure_diagnostic_nanos(elapsed: Duration) -> u64 {
+    elapsed.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn is_periodic_pressure_sample(request_index: u64) -> bool {
+    request_index.is_power_of_two() && request_index.trailing_zeros() < MAX_PERIODIC_PRESSURE_SAMPLES as u32
+}
+
+fn reserve_slow_pressure_sample(slots: &AtomicU64) -> bool {
+    slots
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            if used < MAX_SLOW_PRESSURE_SAMPLES {
+                Some(used + 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
+fn next_pressure_request_index(requests: &AtomicU64) -> u64 {
+    requests
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
+            Some(index.saturating_add(1))
+        })
+        .map_or(u64::MAX, |previous| previous.saturating_add(1))
+}
+
+fn note_censored_pressure_sample(censored: &AtomicU64, reported: &AtomicBool) -> Option<u64> {
+    let count = censored.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    (!reported.swap(true, Ordering::Relaxed)).then_some(count)
+}
+
+fn pressure_diagnostic_lock_wait_started(diagnostic: Option<&PressureDiagnosticSample>) -> Option<Instant> {
+    diagnostic.map(|_| Instant::now())
+}
+
+fn pressure_diagnostic_lock_wait(
+    mut diagnostic: Option<&mut PressureDiagnosticSample>,
+    started: Option<Instant>,
+) -> Option<Instant> {
+    let acquired = diagnostic.as_ref().map(|_| Instant::now());
+    if let (Some(diagnostic), Some(started), Some(acquired)) = (diagnostic.as_deref_mut(), started, acquired) {
+        diagnostic.record_tables_lock(acquired.saturating_duration_since(started), Duration::ZERO);
+    }
+    diagnostic.as_ref().map(|_| Instant::now())
+}
+
+fn pressure_diagnostic_lock_hold(diagnostic: Option<&mut PressureDiagnosticSample>, started: Option<Instant>) {
+    if let (Some(diagnostic), Some(started)) = (diagnostic, started) {
+        diagnostic.tables_lock_hold_ns = diagnostic
+            .tables_lock_hold_ns
+            .saturating_add(pressure_diagnostic_nanos(started.elapsed()));
+    }
+}
+
+// The elapsed-time epoch begins at the first opted-in request, not process startup.
 /// A fixed ArrowCol pipeline stage used by the throughput campaign.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PipelineStage {
@@ -1816,6 +1976,20 @@ impl RuntimeMetrics {
     /// Returns a clock or bounded-measurement error when a snapshot cannot be
     /// represented by the routing contract.
     pub fn pressure(&self) -> Result<DashboardPressure, String> {
+        self.pressure_snapshot(None)
+    }
+
+    pub(crate) fn pressure_for_admin(
+        &self,
+        diagnostic: Option<&mut PressureDiagnosticSample>,
+    ) -> Result<DashboardPressure, String> {
+        self.pressure_snapshot(diagnostic)
+    }
+
+    fn pressure_snapshot(
+        &self,
+        mut diagnostic: Option<&mut PressureDiagnosticSample>,
+    ) -> Result<DashboardPressure, String> {
         let now = now_unix_millis()?;
         let native_quiver = self.native_quiver_enabled();
         let active = self.active_streams.load(Ordering::Acquire);
@@ -1829,14 +2003,18 @@ impl RuntimeMetrics {
         let pending_commits = self.pending_commits.load(Ordering::Acquire);
         let max_streams = self.max_concurrent_streams.load(Ordering::Acquire).max(1);
         let rss_limit = self.rss_limit_bytes.load(Ordering::Acquire).max(1);
+        let procfs_started = diagnostic.as_ref().map(|_| Instant::now());
         let actual_rss = resident_memory_bytes().unwrap_or(0);
+        if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), procfs_started) {
+            diagnostic.record_procfs(started.elapsed());
+        }
         let bounded_rss = actual_rss.min(rss_limit);
         let bytes_limit = self.buffered_bytes_limit.load(Ordering::Acquire).max(1);
         let rows_limit = self.buffered_rows_limit.load(Ordering::Acquire).max(1);
         let batches_limit = self.buffered_batches_limit.load(Ordering::Acquire).max(1);
         let commit_limit = self.max_pending_commits.load(Ordering::Acquire).max(1);
         let available = max_streams.saturating_sub(active.min(max_streams));
-        let oldest_age = self.oldest_buffer_age();
+        let oldest_age = self.oldest_buffer_age_for_pressure(diagnostic.as_deref_mut());
         let dfe_accepting = self.accepting.load(Ordering::Acquire)
             && actual_rss <= rss_limit
             && dfe_bytes <= bytes_limit
@@ -1847,7 +2025,7 @@ impl RuntimeMetrics {
             && buffered_bytes <= bytes_limit
             && buffered_rows <= rows_limit
             && buffered_batches <= batches_limit;
-        let tables = self.table_pressure(native_quiver);
+        let tables = self.table_pressure(native_quiver, diagnostic.as_deref_mut());
         let dfe_pressure = ratio_bps(dfe_batches.min(batches_limit), batches_limit)?;
         let delta_pressure = ratio_bps(pending_commits.min(commit_limit), commit_limit)?;
         let (quiver_pressure, quiver_state) = if native_quiver {
@@ -1915,7 +2093,7 @@ impl RuntimeMetrics {
         };
         Ok(DashboardPressure {
             rich,
-            table_versions: self.table_versions(),
+            table_versions: self.table_versions(diagnostic),
             actual_rss_bytes: actual_rss,
             dfe_channel_capacity: self.dfe_channel_capacity.load(Ordering::Acquire),
             dfe_channel_occupancy: dfe_batches,
@@ -1936,6 +2114,44 @@ impl RuntimeMetrics {
         })
     }
 
+    fn with_pressure_tables<T>(
+        &self,
+        mut diagnostic: Option<&mut PressureDiagnosticSample>,
+        read: impl FnOnce(&BTreeMap<TableIdentity, TableState>) -> T,
+        poisoned: impl FnOnce() -> T,
+    ) -> T {
+        let wait_started = pressure_diagnostic_lock_wait_started(diagnostic.as_deref());
+        let lock = self.tables.lock();
+        let acquired = pressure_diagnostic_lock_wait(diagnostic.as_deref_mut(), wait_started);
+        match lock {
+            Ok(tables) => {
+                let hold_started = acquired;
+                let value = read(&tables);
+                pressure_diagnostic_lock_hold(diagnostic, hold_started);
+                drop(tables);
+                value
+            }
+            Err(error) => {
+                let tables = error.into_inner();
+                let hold_started = acquired;
+                pressure_diagnostic_lock_hold(diagnostic, hold_started);
+                drop(tables);
+                poisoned()
+            }
+        }
+    }
+
+    fn oldest_buffer_age_for_pressure(&self, diagnostic: Option<&mut PressureDiagnosticSample>) -> u64 {
+        self.with_pressure_tables(
+            diagnostic,
+            |tables| tables.values().filter_map(|state| state.oldest_buffered_at).min(),
+            || None,
+        )
+        .map_or(0, |oldest| {
+            duration_millis(Instant::now().saturating_duration_since(oldest))
+        })
+    }
+
     fn oldest_buffer_age(&self) -> u64 {
         self.tables
             .lock()
@@ -1946,9 +2162,13 @@ impl RuntimeMetrics {
             })
     }
 
-    fn table_pressure(&self, native_quiver: bool) -> Vec<TablePressure> {
-        self.tables.lock().map_or_else(
-            |_| Vec::new(),
+    fn table_pressure(
+        &self,
+        native_quiver: bool,
+        diagnostic: Option<&mut PressureDiagnosticSample>,
+    ) -> Vec<TablePressure> {
+        self.with_pressure_tables(
+            diagnostic,
             |tables| {
                 tables
                     .iter()
@@ -1980,12 +2200,13 @@ impl RuntimeMetrics {
                     })
                     .collect()
             },
+            Vec::new,
         )
     }
 
-    fn table_versions(&self) -> Vec<TableVersionStatus> {
-        self.tables.lock().map_or_else(
-            |_| Vec::new(),
+    fn table_versions(&self, diagnostic: Option<&mut PressureDiagnosticSample>) -> Vec<TableVersionStatus> {
+        self.with_pressure_tables(
+            diagnostic,
             |tables| {
                 tables
                     .iter()
@@ -1999,6 +2220,7 @@ impl RuntimeMetrics {
                     })
                     .collect()
             },
+            Vec::new,
         )
     }
 
@@ -2450,6 +2672,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pressure_diagnostic_sampling_is_run_wide_and_strictly_bounded() {
+        let requests = AtomicU64::new(0);
+        assert_eq!(next_pressure_request_index(&requests), 1);
+        assert_eq!(next_pressure_request_index(&requests), 2);
+        let exhausted_requests = AtomicU64::new(u64::MAX);
+        assert_eq!(next_pressure_request_index(&exhausted_requests), u64::MAX);
+
+        for exponent in 0_u32..64 {
+            assert!(is_periodic_pressure_sample(1_u64 << exponent));
+        }
+        assert!(!is_periodic_pressure_sample(u64::MAX));
+
+        let slow_slots = AtomicU64::new(0);
+        for _ in 0..MAX_SLOW_PRESSURE_SAMPLES {
+            assert!(reserve_slow_pressure_sample(&slow_slots));
+        }
+        assert!(!reserve_slow_pressure_sample(&slow_slots));
+
+        let censored = AtomicU64::new(0);
+        let marker_reported = AtomicBool::new(false);
+        assert_eq!(note_censored_pressure_sample(&censored, &marker_reported), Some(1));
+        assert_eq!(note_censored_pressure_sample(&censored, &marker_reported), None);
+        assert_eq!(censored.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn exporter_group_guards_release_on_completion_error_and_cancellation() {
         use futures::FutureExt;
 
@@ -2520,6 +2768,45 @@ mod tests {
             SchemaName::new("generated").expect("schema"),
             TableName::new("events").expect("table"),
         )
+    }
+
+    #[test]
+    fn instrumented_pressure_preserves_table_and_buffer_accounting() {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        metrics.configure_receiver(4, 1_000_000, 1_000_000, 1_000, 10, 10);
+        metrics.configure_exporter(4);
+        let tracker = PendingTracker::new(Arc::clone(&metrics));
+        let id = tracker
+            .insert(table(), 3, 128, SchemaVersion::FIRST, SchemaVersion::FIRST)
+            .expect("insert");
+        let regular = serde_json::to_value(metrics.pressure().expect("pressure")).expect("JSON");
+        let mut diagnostic = PressureDiagnosticSample {
+            request_index: 1,
+            started: Instant::now(),
+            handler_total_ns: 0,
+            serialization_ns: 0,
+            procfs_ns: 0,
+            tables_lock_wait_ns: 0,
+            tables_lock_hold_ns: 0,
+            tables_lock_count: 0,
+        };
+        let sampled = serde_json::to_value(
+            metrics
+                .pressure_for_admin(Some(&mut diagnostic))
+                .expect("instrumented pressure"),
+        )
+        .expect("JSON");
+        for field in ["buffered_bytes", "buffered_rows", "buffered_batches", "pending_commits"] {
+            assert_eq!(regular["rich"][field], sampled["rich"][field], "{field}");
+        }
+        assert_eq!(regular["table_versions"], sampled["table_versions"]);
+        assert!(!regular["rich"]["tables"][0]["buffered_bytes"].is_null());
+        assert_eq!(
+            regular["rich"]["tables"][0]["buffered_bytes"],
+            sampled["rich"]["tables"][0]["buffered_bytes"]
+        );
+        assert_eq!(diagnostic.tables_lock_count, 3);
+        tracker.resolve(id, true);
     }
 
     /// Scenario: DFE work remains outstanding after Flight best-effort completion.

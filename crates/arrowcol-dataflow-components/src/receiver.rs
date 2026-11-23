@@ -44,7 +44,9 @@ use tonic::transport::Server;
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
 use crate::envelope::ArrowcolBatchEnvelope;
-use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
+use crate::metrics::{
+    DurableStream, PendingTracker, PressureDiagnosticSample, RuntimeMetrics, global_metrics, process_instance_id,
+};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
 /// DFE URN for arbitrary Arrow Flight ingress.
@@ -976,15 +978,27 @@ async fn admin_capabilities(State(state): State<AdminState>) -> impl IntoRespons
 }
 
 async fn admin_pressure(State(state): State<AdminState>) -> Response {
-    match state.metrics.pressure() {
+    let mut diagnostic = PressureDiagnosticSample::start();
+    let handler_started = diagnostic.as_ref().map(|_| Instant::now());
+    let response = match state.metrics.pressure_for_admin(diagnostic.as_mut()) {
         Ok(mut pressure) => {
             if state.direct_topology && state.metrics.ready() {
                 pressure.resolved_buffering_mode = "memory_only";
             }
-            Json(pressure).into_response()
+            let serialization_started = diagnostic.as_ref().map(|_| Instant::now());
+            let response = Json(pressure).into_response();
+            if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), serialization_started) {
+                diagnostic.record_serialization(started.elapsed());
+            }
+            response
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if let (Some(mut diagnostic), Some(started)) = (diagnostic, handler_started) {
+        diagnostic.record_handler_total(started.elapsed());
+        diagnostic.finish();
     }
+    response
 }
 
 async fn admin_metrics(State(state): State<AdminState>) -> Response {
