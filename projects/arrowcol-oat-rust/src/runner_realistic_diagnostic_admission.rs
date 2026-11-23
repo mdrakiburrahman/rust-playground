@@ -3,7 +3,7 @@ const DIAGNOSTIC_CLIENT_CPUS_ENV: &str = "OAT_DIAGNOSTIC_CLIENT_CPUS";
 const DIAGNOSTIC_REFERENCE_ENV: &str = "OAT_DIAGNOSTIC_REFERENCE";
 const DIAGNOSTIC_LIVE_BATCH_BYTES: u64 = 184_639_488;
 const DIAGNOSTIC_CLIENT_MEMORY_BYTES: u64 = 5_368_709_120;
-const DIAGNOSTIC_COLLECTOR_MEMORY_BYTES: u64 = 86 * 1024 * 1024 * 1024;
+const DIAGNOSTIC_COLLECTOR_MEMORY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "mode", deny_unknown_fields)]
@@ -18,6 +18,8 @@ enum DiagnosticReference {
         receipt_sha256: String,
         run_id: String,
         corpus_sha256: String,
+        collector_memory_limit_bytes: u64,
+        kustainer: Value,
         clients: Vec<DiagnosticClientReservation>,
     },
 }
@@ -40,17 +42,26 @@ fn validate_diagnostic_reference(raw: &str, proof: &Value, run_id: &str) -> Resu
         receipt_sha256,
         run_id: reference_run_id,
         corpus_sha256,
+        collector_memory_limit_bytes,
+        kustainer,
         clients,
     } = &reference
     {
         let valid_hash = |hash: &str| {
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         };
-        let mapping = proof.get("client_mapping").context("missing diagnostic client mapping")?;
+        let mapping = proof
+            .get("client_mapping")
+            .context("missing diagnostic client mapping")?;
         let logical_client_id = format!(
             "{}:{}",
             mapping["table"].as_str().context("missing diagnostic table")?,
-            mapping["client_ordinal"].as_u64().context("missing diagnostic client ordinal")?
+            mapping["client_ordinal"]
+                .as_u64()
+                .context("missing diagnostic client ordinal")?
         );
         ensure!(
             kind == "diagnostic-comparison-profile"
@@ -61,6 +72,8 @@ fn validate_diagnostic_reference(raw: &str, proof: &Value, run_id: &str) -> Resu
                 && uuid::Uuid::parse_str(reference_run_id)?.to_string() == *reference_run_id
                 && reference_run_id != run_id
                 && corpus_sha256 == proof["payload_corpus_sha256"].as_str().unwrap_or_default()
+                && *collector_memory_limit_bytes == DIAGNOSTIC_COLLECTOR_MEMORY_BYTES
+                && kustainer.is_object()
                 && clients.len() == 1
                 && clients[0].logical_client_id == logical_client_id
                 && clients[0].corpus_memory_reservation_bytes > 0
@@ -81,6 +94,13 @@ fn schedule_after_diagnostic_admission<T>(
     match (raw_reference, proof) {
         (Some(raw), Some(proof)) => {
             let reference = validate_diagnostic_reference(raw, proof, run_id)?;
+            if reference["mode"] == "matched" {
+                ensure!(
+                    reference["kustainer"] == proof["kustainer"]
+                        && reference["collector_memory_limit_bytes"] == proof["collector_memory_limit_bytes"],
+                    "diagnostic cap or Kustainer differs from reference"
+                );
+            }
             ensure!(
                 proof.get("reference") == Some(&reference),
                 "diagnostic schedule proof differs from its frozen comparison profile"
@@ -124,8 +144,8 @@ fn diagnostic_host_memory_admission(meminfo: &str, collector_cap: Option<u64>) -
     let budget = available - DIAGNOSTIC_CLIENT_MEMORY_BYTES;
     let bound = budget.checked_mul(3).context("host admission arithmetic overflow")? / 4;
     ensure!(
-        DIAGNOSTIC_COLLECTOR_MEMORY_BYTES <= bound,
-        "collector cap exceeds 75% of available memory after client budget"
+        DIAGNOSTIC_COLLECTOR_MEMORY_BYTES <= bound - bound.div_ceil(20),
+        "collector cap leaves less than 5% of the post-client 75% admission bound free"
     );
     Ok(json!({
         "kind": "diagnostic-only", "phase": "immediately_before_schedule",
@@ -314,6 +334,16 @@ async fn diagnostic_cpu_readback(config: &OatConfig, handle: &ClientHandle, run_
         "diagnostic run-owned client roster differs from its single handle"
     );
     let collector_proof = diagnostic_container_cpu_readback(ids[0], &collector).await?;
+    let mut memory = Command::new("docker");
+    memory.args(["exec", ids[0], "cat", "/sys/fs/cgroup/memory.max"]);
+    let live_cap = diagnostic_command(memory, "read effective collector memory cap")
+        .await?
+        .trim()
+        .parse::<u64>()?;
+    ensure!(
+        live_cap == DIAGNOSTIC_COLLECTOR_MEMORY_BYTES,
+        "effective collector memory limit mismatch"
+    );
     let engine_num_cores = diagnostic_engine_readback(ids[0], config).await?;
     let client_proof = diagnostic_container_cpu_readback(container_id, &client).await?;
     let cpus = collector.union(&client).copied().collect::<Vec<_>>();
@@ -337,12 +367,23 @@ async fn diagnostic_cpu_readback(config: &OatConfig, handle: &ClientHandle, run_
     ensure!(siblings.len() == cpus.len(), "CPU sibling readback is incomplete");
     let topology = cpus.into_iter().zip(siblings).collect::<Vec<_>>();
     validate_diagnostic_cpu_topology(&collector, &client, &topology)?;
-    let masks = Path::new(config.platform.compose_state_root.as_deref().context("missing diagnostic state root")?)
-        .join(run_id).join("diagnostic-cpus.json");
+    let masks = Path::new(
+        config
+            .platform
+            .compose_state_root
+            .as_deref()
+            .context("missing diagnostic state root")?,
+    )
+    .join(run_id)
+    .join("diagnostic-cpus.json");
     let mut inspect = diagnostic_cpu_tool();
     inspect.arg("inspect").arg(&project).arg(masks);
-    let roster: Value = serde_json::from_str(&diagnostic_command(inspect, "verify complete diagnostic project CPU assignments").await?)?;
-    Ok(json!({"collector": collector_proof, "client": client_proof, "thread_siblings": topology, "project_readback": roster, "engine_num_cores": engine_num_cores}))
+    let roster: Value = serde_json::from_str(
+        &diagnostic_command(inspect, "verify complete diagnostic project CPU assignments").await?,
+    )?;
+    Ok(
+        json!({"collector_memory_limit_bytes":live_cap,"collector": collector_proof, "client": client_proof, "thread_siblings": topology, "project_readback": roster, "engine_num_cores": engine_num_cores}),
+    )
 }
 
 fn diagnostic_expected_pin(
@@ -601,10 +642,41 @@ async fn diagnostic_admission_or_cancel(
             .map(|proof| Some((proof, run_id.to_owned())))
     })();
     let result = match result {
-        Ok(Some((mut proof, run_id))) => diagnostic_cpu_readback(config, &handles[0], &run_id).await.map(|cpu| {
-            proof["cpu_isolation"] = cpu;
-            Some(proof)
-        }),
+        Ok(Some((mut proof, run_id))) => diagnostic_cpu_readback(config, &handles[0], &run_id)
+            .await
+            .and_then(|cpu| {
+                let containers = cpu
+                    .pointer("/project_readback/containers")
+                    .and_then(Value::as_array)
+                    .context("missing diagnostic roster")?;
+                let ks = containers
+                    .iter()
+                    .filter(|c| c["service"] == "kusto")
+                    .collect::<Vec<_>>();
+                ensure!(
+                    ks.len() == 1
+                        && ks[0]["image"]
+                            .as_str()
+                            .is_some_and(|s| s.strip_prefix("sha256:").is_some_and(|v| v.len() == 64
+                                && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))),
+                    "missing or ambiguous Kustainer identity"
+                );
+                proof["kustainer"] = json!({"state":ks[0]["state"], "image":ks[0]["image"]});
+                ensure!(
+                    config.platform.local.collector_memory_limit_bytes == Some(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES)
+                        && config
+                            .tunables
+                            .collector
+                            .as_ref()
+                            .and_then(|c| c.pressure.as_ref())
+                            .and_then(|p| p.rss_limit_bytes)
+                            == Some(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES),
+                    "diagnostic cap or RSS policy mismatch"
+                );
+                proof["collector_memory_limit_bytes"] = cpu["collector_memory_limit_bytes"].clone();
+                proof["cpu_isolation"] = cpu;
+                Ok(Some(proof))
+            }),
         Ok(None) => Ok(None),
         Err(error) => Err(error),
     };
@@ -671,7 +743,7 @@ mod realistic_diagnostic_admission_tests {
         assert!(diagnostic_host_memory_admission(enough, Some(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES)).is_ok());
         assert!(
             diagnostic_host_memory_admission(
-                "MemTotal: 200000000 kB\nMemAvailable: 100000000 kB\n",
+                "MemTotal: 200000000 kB\nMemAvailable: 98000000 kB\n",
                 Some(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES)
             )
             .is_err()
@@ -773,7 +845,10 @@ mod realistic_diagnostic_admission_tests {
             "client_ordinal": 1,
             "client_id": client_id,
         });
+        proof["collector_memory_limit_bytes"] = json!(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES);
+        proof["kustainer"] = json!({"state":"running","image":format!("sha256:{}", "d".repeat(64))});
         let exact_reference = json!({
+            "collector_memory_limit_bytes": DIAGNOSTIC_COLLECTOR_MEMORY_BYTES, "kustainer": proof["kustainer"],
             "mode": "matched",
             "kind": "diagnostic-comparison-profile",
             "qualification": "not-evaluated",
@@ -791,15 +866,16 @@ mod realistic_diagnostic_admission_tests {
         mismatched_reference["clients"][0]["corpus_memory_reservation_bytes"] = json!(101);
         proof["reference"] = mismatched_reference.clone();
         assert!(
-            schedule_after_diagnostic_admission(
-                Some(&mismatched_reference.to_string()),
-                Some(&proof),
-                run,
-                || schedule_calls.set(schedule_calls.get() + 1),
-            )
+            schedule_after_diagnostic_admission(Some(&mismatched_reference.to_string()), Some(&proof), run, || {
+                schedule_calls.set(schedule_calls.get() + 1)
+            },)
             .is_err()
         );
-        assert_eq!(schedule_calls.get(), 0, "a one-byte mismatch must not enter the schedule callback");
+        assert_eq!(
+            schedule_calls.get(),
+            0,
+            "a one-byte mismatch must not enter the schedule callback"
+        );
 
         proof["reference"] = exact_reference.clone();
         assert!(
@@ -811,16 +887,28 @@ mod realistic_diagnostic_admission_tests {
         );
         assert_eq!(schedule_calls.get(), 0);
 
+        for (field, wrong) in [
+            ("collector_memory_limit_bytes", json!(1)),
+            (
+                "kustainer",
+                json!({"state":"exited","image":proof["kustainer"]["image"]}),
+            ),
+        ] {
+            let mut drift = proof.clone();
+            drift[field] = wrong;
+            assert!(
+                schedule_after_diagnostic_admission(Some(&exact_reference.to_string()), Some(&drift), run, || panic!(
+                    "unexpected schedule"
+                ))
+                .is_err()
+            );
+        }
         let mut wrong_roster = exact_reference.clone();
         wrong_roster["clients"] = json!([]);
         proof["reference"] = wrong_roster.clone();
         assert!(
-            schedule_after_diagnostic_admission(
-                Some(&wrong_roster.to_string()),
-                Some(&proof),
-                run,
-                || schedule_calls.set(schedule_calls.get() + 1),
-            )
+            schedule_after_diagnostic_admission(Some(&wrong_roster.to_string()), Some(&proof), run, || schedule_calls
+                .set(schedule_calls.get() + 1),)
             .is_err(),
             "an incomplete client roster must not schedule clients"
         );
@@ -830,16 +918,21 @@ mod realistic_diagnostic_admission_tests {
         schedule_after_diagnostic_admission(None, None, run, || {
             normal_schedule_calls.set(normal_schedule_calls.get() + 1)
         })?;
-        assert_eq!(normal_schedule_calls.get(), 1, "non-diagnostic scheduling remains unchanged");
+        assert_eq!(
+            normal_schedule_calls.get(),
+            1,
+            "non-diagnostic scheduling remains unchanged"
+        );
 
         proof["reference"] = exact_reference.clone();
-        schedule_after_diagnostic_admission(
-            Some(&exact_reference.to_string()),
-            Some(&proof),
-            run,
-            || schedule_calls.set(schedule_calls.get() + 1),
-        )?;
-        assert_eq!(schedule_calls.get(), 1, "an exact per-client match must enter the schedule callback");
+        schedule_after_diagnostic_admission(Some(&exact_reference.to_string()), Some(&proof), run, || {
+            schedule_calls.set(schedule_calls.get() + 1)
+        })?;
+        assert_eq!(
+            schedule_calls.get(),
+            1,
+            "an exact per-client match must enter the schedule callback"
+        );
         Ok(())
     }
 
@@ -879,7 +972,12 @@ mod realistic_diagnostic_admission_tests {
         );
         assert!(
             validate_diagnostic_live_fleet(
-                &config, &[], std::slice::from_ref(&client), run, &pin, r#"{"mode":"first"}"#
+                &config,
+                &[],
+                std::slice::from_ref(&client),
+                run,
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_err()
         );
@@ -920,7 +1018,12 @@ mod realistic_diagnostic_admission_tests {
         wrong.schedule_received = true;
         assert!(
             validate_diagnostic_live_fleet(
-                &config, std::slice::from_ref(&handle), &[wrong], run, &pin, r#"{"mode":"first"}"#
+                &config,
+                std::slice::from_ref(&handle),
+                &[wrong],
+                run,
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_err()
         );
@@ -928,17 +1031,19 @@ mod realistic_diagnostic_admission_tests {
         wrong.failure = Some("failed".into());
         assert!(
             validate_diagnostic_live_fleet(
-                &config, std::slice::from_ref(&handle), &[wrong], run, &pin, r#"{"mode":"first"}"#
+                &config,
+                std::slice::from_ref(&handle),
+                &[wrong],
+                run,
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_err()
         );
         let mut wrong = client.clone();
         wrong.output.clear();
         assert!(
-            validate_diagnostic_live_fleet(
-                &config, &[handle], &[wrong], run, &pin, r#"{"mode":"first"}"#
-            )
-            .is_err()
+            validate_diagnostic_live_fleet(&config, &[handle], &[wrong], run, &pin, r#"{"mode":"first"}"#).is_err()
         );
         Ok(())
     }
@@ -1009,4 +1114,59 @@ mod realistic_diagnostic_admission_tests {
         );
         Ok(())
     }
+}
+
+async fn diagnostic_terminal_memory(
+    config: &OatConfig,
+    run: &str,
+    guard: Option<&Value>,
+    stop: Option<&Value>,
+) -> Value {
+    let peak = async {
+        let project = scoped_compose_project(
+            config.platform.compose_project.as_deref().context("missing project")?,
+            run,
+        );
+        let mut ps = Command::new("docker");
+        ps.args([
+            "ps",
+            "--no-trunc",
+            "--filter",
+            &format!("label=com.docker.compose.project={project}"),
+            "--filter",
+            "label=com.docker.compose.service=dataflow-1",
+            "--format",
+            "{{.ID}}",
+        ]);
+        let id = diagnostic_command(ps, "locate terminal collector").await?;
+        let id = id.trim();
+        ensure!(
+            id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "collector identity unavailable"
+        );
+        let mut cmd = Command::new("docker");
+        cmd.args([
+            "exec",
+            id,
+            "cat",
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory.peak",
+        ]);
+        let data = diagnostic_command(cmd, "read collector cgroup memory limit and peak").await?;
+        let values = data
+            .lines()
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(
+            values.len() == 2 && values[0] == DIAGNOSTIC_COLLECTOR_MEMORY_BYTES && values[1] > 0,
+            "invalid cgroup memory readback"
+        );
+        Ok::<_, anyhow::Error>(json!({"collector_id":id,"limit_bytes":values[0],"peak_bytes":values[1]}))
+    }
+    .await;
+    let (peak, error) = match peak {
+        Ok(v) => (v, None),
+        Err(e) => (Value::Null, Some(e.to_string())),
+    };
+    json!({"cgroup":peak,"read_error":error,"guard_status":guard.and_then(|g|g.get("status")),"guard_cap":guard.and_then(|g|g.get("requested_container_memory_limit_bytes")),"stop":stop})
 }

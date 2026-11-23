@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {checkProject,cpuTicks,summarize,cpuWindowReceipt} from './diagnostic-cpu.js';
 const masks:Record<string,string>={'dataflow-1':'0','oat-client':'24-29',router:'30,31',bootstrap:'30,31',sidecar:'30,31'};
-const plan=()=>({project:'diagnostic-fixture',masks:{...masks},containers:Object.entries(masks).map(([service,cpuset],i)=>({service,cpuset,id:String(i),state:service==='bootstrap'?'exited':'running',started:'a',finished:'b',restarts:0}))});
+const plan=()=>({project:'diagnostic-fixture',masks:{...masks},containers:Object.entries(masks).map(([service,cpuset],i)=>({service,cpuset,image:`sha256:${"a".repeat(64)}`,id:String(i),state:service==='bootstrap'?'exited':'running',started:'a',finished:'b',restarts:0}))});
 test('readback includes exited containers, rejects absent, empty, mismatched and unclassified assignments',()=>{
   checkProject(plan(),'0-31');for(const edit of [ (c:any)=>delete c.cpuset,(c:any)=>{c.cpuset='';},(c:any)=>{c.cpuset='24-29';},(c:any)=>{c.service='unresolved';}]){
     const p=plan();edit(p.containers.find(c=>c.state==='exited'));assert.throws(()=>checkProject(p,'0-31'));

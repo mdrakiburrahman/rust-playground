@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 type Role = 'collector' | 'client' | 'support';
 const role = (s: string): Role => s === 'dataflow-1' ? 'collector' : s === 'oat-client' ? 'client' : 'support';
-type Member = { id: string; service: string; cpuset: string; state: string; started: string; finished: string; restarts: number };
+type Member = { id: string; image: string; service: string; cpuset: string; state: string; started: string; finished: string; restarts: number };
 type Plan = { project: string; masks: Record<string,string>; containers: Member[] };
 function cpus(s: string): number[] {
   assert(typeof s === 'string' && s.length > 0, 'missing or empty cpuset');
@@ -52,7 +52,7 @@ async function inspect(project:string,masks:Plan['masks']):Promise<Plan>{
   const containers=await Promise.all(listed.map(async({Id:id}:{Id:string}):Promise<Member>=>{
     assert(/^[a-f0-9]{64}$/.test(id));const c=await engine(`/containers/${id}/json`);
     assert.equal(c.Id,id);assert.equal(c.Config.Labels['com.docker.compose.project'],project);
-    return {id,service:c.Config.Labels['com.docker.compose.service'],cpuset:c.HostConfig.CpusetCpus,state:c.State.Status,
+    return {id,image:c.Image,service:c.Config.Labels['com.docker.compose.service'],cpuset:c.HostConfig.CpusetCpus,state:c.State.Status,
       started:c.State.StartedAt,finished:c.State.FinishedAt,restarts:c.RestartCount};
   }));
   const plan={project,masks,containers:containers.sort((a,b)=>a.id.localeCompare(b.id))};

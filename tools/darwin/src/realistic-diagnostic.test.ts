@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { fitsDiagnosticBound, memoryOutcome } from "./diagnostic-memory.js";
 import { CLIENT_MEMORY, COLLECTOR_MEMORY, diagnosticPaths, realisticDiagnosticConfig } from "./realistic-diagnostic-config.js";
 import {
   diagnosticInputBytes, diagnosticLaunchEnv, diagnosticPins, freezeDiagnosticComparisonProfile,
@@ -62,7 +63,9 @@ function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
       max_memory_bytes: CLIENT_MEMORY,
     }],
   };
+  const k = {state:"running",image:`sha256:${"d".repeat(64)}`};
   const proof = () => ({
+    collector_memory_limit_bytes: COLLECTOR_MEMORY, kustainer: k,
     kind: "diagnostic-only",
     phase: "before_schedule",
     data_profile: "realistic",
@@ -81,6 +84,7 @@ function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
   return {
     kind: "diagnostic-only",
     qualification: "not-evaluated",
+    collector_memory_limit_bytes: COLLECTOR_MEMORY, kustainer: k,
     reference_establishment: "explicit-first-arm", collector_cpu_evidence: true,
     snapshot_reconciled: true,
     run_id: runId,
@@ -178,7 +182,7 @@ test("freezes a non-circular first-arm profile and binds its per-client reservat
     profile_sha256: profileSha256,
     receipt_sha256: receiptSha256,
     run_id: profile.reference_run_id,
-    corpus_sha256: profile.corpus_sha256,
+    corpus_sha256: profile.corpus_sha256, collector_memory_limit_bytes: COLLECTOR_MEMORY, kustainer: profile.kustainer,
     clients: profile.clients,
   };
   const later = firstArmReceipt(expected);
@@ -242,6 +246,7 @@ test("derives realistic diagnostic from an unchanged historical seed", async () 
     assert.deepEqual(arm.dfe_worker_concurrency, [n]);
     const expectedCollector = structuredClone(original.tunables.collector);
     expectedCollector.runtime.cpu_workers = n;
+    expectedCollector.pressure.rss_limit_bytes = COLLECTOR_MEMORY;
     assert.deepEqual(arm.tunables.collector, expectedCollector);
   }
   assert.throws(() => realisticDiagnosticConfig(original, [...cpus, 8]));
@@ -406,4 +411,23 @@ test("launch environment passes the required pin and parity precheck without inh
   assert.equal(env.OAT_DIAGNOSTIC_CLIENT_CPUS, "8,9");
   assert.equal(env.OAT_DIAGNOSTIC_REFERENCE, JSON.stringify(reference));
   assert.throws(() => diagnosticLaunchEnv("/run/home", 8 * 1024 * 1024, "/run/tools", "bad", [8, 9], reference));
+});
+
+test("reserves a full 5% of the post-client admission bound", () => {
+  const threshold = Math.ceil(COLLECTOR_MEMORY * 20 / 19);
+  assert.equal(fitsDiagnosticBound(threshold), true);
+  assert.equal(fitsDiagnosticBound(threshold - 1), false);
+});
+
+test("attributes only a complete guard and an identity-bound cgroup peak", () => {
+  const id = "a".repeat(64);
+  const admission = "[oat] diagnostic pre-schedule admission: " + JSON.stringify({cpu_isolation:{collector:{container_id:id}}});
+  const sample = {cgroup:{collector_id:id,limit_bytes:COLLECTOR_MEMORY,peak_bytes:123}, guard_cap:COLLECTOR_MEMORY,guard_status:"complete",stop:null};
+  const outcome = (overrides: Record<string, unknown>) => memoryOutcome(admission + "\n[oat] diagnostic terminal memory: " + JSON.stringify({...sample,...overrides}));
+  assert.equal(outcome({}).permits_cpu_attribution, true);
+  assert.equal(outcome({cgroup:{...sample.cgroup,collector_id:"b".repeat(64)}}).permits_cpu_attribution, false);
+  assert.equal(outcome({guard_status:"unavailable"}).guard_engaged, null);
+  assert.equal(outcome({guard_status:"triggered",stop:{reason:"hard_cap_fraction",metric:"collector_rss_bytes"}}).memory_limited, true);
+  assert.equal(outcome({guard_status:"triggered",stop:{reason:"zero_ingestion_commit_progress",metric:"new_ingestion_commits"}}).memory_limited, null);
+  assert.equal(memoryOutcome("").permits_cpu_attribution, false);
 });

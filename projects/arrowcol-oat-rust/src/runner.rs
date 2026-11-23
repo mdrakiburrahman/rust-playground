@@ -2155,17 +2155,10 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
             },
         ),
     ]);
-    if config
-        .platform
-        .compose_project
-        .as_deref()
-        .is_some_and(|name| name.starts_with("diagnostic-"))
-    {
-        environment.insert(
-            "LOADTEST_CPUS".to_owned(),
-            configured_diagnostic_workers(config)?.to_string(),
-        );
-    }
+    environment.insert(
+        "LOADTEST_CPUS".to_owned(),
+        first_local_concurrency(&config.dfe_worker_concurrency)?.to_string(),
+    );
     environment.extend(local_control_mount_environment(state_dir));
     for (variable, name) in secret_paths {
         let path = state_dir.join("secrets").join(name);
@@ -4281,6 +4274,21 @@ async fn run_matrix_cell(
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
+    if config
+        .platform
+        .compose_project
+        .as_deref()
+        .is_some_and(|p| p.starts_with("diagnostic-"))
+    {
+        let memory = diagnostic_terminal_memory(
+            config,
+            run_id,
+            client_run.evidence.overload_guard.as_ref(),
+            client_run.evidence.overload_stop.as_ref(),
+        )
+        .await;
+        println!("[oat] diagnostic terminal memory: {memory}");
+    }
     let diagnostics_root = Path::new("out/arrowcol-oat/admission-diagnostics");
     if let Err(error) = platform.finish_resource_measurement(config).await {
         retain_admission_diagnostics(
@@ -8148,6 +8156,20 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     run_streaming_command(up, "start remaining local OAT stack")
         .await
         .context("local compose stack is a per-run project; results are not touched by stack cleanup")?;
+    let mut first_collector = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut first_collector);
+    first_collector.args(["ps", "--no-trunc", "--quiet", "dataflow-1"]);
+    let id = diagnostic_command(first_collector, "resolve initial local collector").await?;
+    read_local_engine_count(
+        id.trim(),
+        first_local_concurrency(&config.dfe_worker_concurrency)? as usize,
+    )
+    .await?;
     let mut rendered_config = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),

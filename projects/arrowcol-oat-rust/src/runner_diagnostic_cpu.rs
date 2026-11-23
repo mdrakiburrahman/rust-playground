@@ -149,13 +149,28 @@ fn verify_diagnostic_engine_argv(raw: &str, expected: usize) -> Result<usize> {
         flags.len() == 1
             && *flags[0].1 == "--num-cores"
             && args.get(flags[0].0 + 1).copied() == Some(expected.to_string().as_str()),
-        "running collector --num-cores differs from diagnostic CPU allocation"
+        "running collector --num-cores differs from requested worker count"
     );
     Ok(expected)
 }
 
 async fn diagnostic_engine_readback(id: &str, config: &OatConfig) -> Result<usize> {
-    let expected = configured_diagnostic_workers(config)?;
+    read_local_engine_count(id, configured_diagnostic_workers(config)?).await
+}
+
+fn first_local_concurrency(values: &[u32]) -> Result<u32> {
+    values
+        .first()
+        .copied()
+        .filter(|n| *n > 0)
+        .context("missing positive initial DFE worker concurrency")
+}
+
+async fn read_local_engine_count(id: &str, expected: usize) -> Result<usize> {
+    ensure!(
+        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "ambiguous local collector identity"
+    );
     let mut cmd = Command::new("docker");
     cmd.args(["exec", id, "/bin/sh", "-ec", r#"for f in /proc/[0-9]*/cmdline; do
         if [ "$(tr '\000' '\n' < "$f" 2>/dev/null | head -n 1)" = /usr/local/bin/arrowcol-dataflow-rust ]; then cat "$f"; fi
@@ -179,5 +194,18 @@ fn diagnostic_worker_strata_reject_mismatched_config_and_live_engine() -> Result
         assert!(verify_diagnostic_engine_argv(&argv, 32).is_err());
         assert!(verify_diagnostic_engine_argv(&format!("{argv}{argv}"), expected).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn diagnostic_and_ordinary_local_startup_validate_first_cell_not_last() -> Result<()> {
+    let first = first_local_concurrency(&[3, 7])? as usize;
+    assert_eq!(
+        verify_diagnostic_engine_argv("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\03\0", first)?,
+        3
+    );
+    assert!(verify_diagnostic_engine_argv("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\07\0", first).is_err());
+    assert!(first_local_concurrency(&[]).is_err());
+    assert!(first_local_concurrency(&[0, 7]).is_err());
     Ok(())
 }

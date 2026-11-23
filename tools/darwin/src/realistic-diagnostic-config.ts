@@ -12,7 +12,7 @@ function object(value: unknown, name: string): JsonObject {
 export const COLLECTOR_SOURCE_BASE = "ad83c6376086f020a7d4e8cffd66994eedb537fe";
 export const DIAGNOSTIC_STRING_WIDTH = 63;
 export const CLIENT_MEMORY = 5 * 1024 ** 3;
-export const COLLECTOR_MEMORY = 86 * 1024 ** 3;
+export const COLLECTOR_MEMORY = 64 * 1024 ** 3;
 
 export function diagnosticPaths(root: string, snapshot: string, output: string) {
   for (const path of [root, snapshot, output]) {
@@ -43,13 +43,15 @@ export function realisticDiagnosticConfig(seed: unknown, cpus: readonly number[]
     || pressure.buffered_batches_limit !== 16_384 || commit.batch_window !== "2s"
     || !isDeepStrictEqual(config.dfe_worker_concurrency, [32])
     || commit.max_files_per_commit !== 128 || commit.max_pending_files !== 512 || runtime.cpu_workers !== 32
-    || local.collector_memory_limit_bytes !== COLLECTOR_MEMORY || pressure.rss_limit_bytes !== COLLECTOR_MEMORY
+    || local.collector_memory_limit_bytes !== 86 * 1024 ** 3 || pressure.rss_limit_bytes !== 86 * 1024 ** 3
     || guard.enabled !== true || guard.cap_fraction !== 0.9 || guard.zero_progress_windows !== 2
     || config.warmup_seconds !== 60 || config.measure_seconds !== 150 || client.streams_per_worker !== 2) {
     throw new Error("frozen parity pressure, guard, timing or topology changed");
   }
   if (![8, 16, 24].includes(cpus.length) || cpus.some((cpu, i) => !Number.isSafeInteger(cpu) || cpu < 0 || cpu >= 24
     || (i > 0 && cpu <= cpus[i - 1]!))) throw new Error("invalid diagnostic collector CPU stratum");
+  local.collector_memory_limit_bytes = COLLECTOR_MEMORY;
+  pressure.rss_limit_bytes = COLLECTOR_MEMORY;
   local.collector_cpus = [...cpus];
   config.dfe_worker_concurrency = [cpus.length];
   runtime.cpu_workers = cpus.length;

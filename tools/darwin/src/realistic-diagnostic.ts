@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from "node:util";
 import { tableFromIPC } from "apache-arrow";
 import { readParquet } from "parquet-wasm";
 import { STARTUP_ACCOUNTING_EXPECTED, requireMatchedStartupAccounting, requireStartupAccounting } from "../../../projects/arrowcol-oat/startup-accounting.js";
+import { fitsDiagnosticBound, memoryOutcome } from "./diagnostic-memory.js";
 import { cpuWindowReceipt } from "../../../projects/arrowcol-oat/diagnostic-cpu.js";
 import * as oatResult from "./oat-result.js";
 import { parseManifestJson } from "./delivery-identity.js";
@@ -41,14 +42,21 @@ type FrozenComparisonProfile = {
   seed_sha256: string;
   corpus_sha256: string;
   images: unknown;
+  collector_memory_limit_bytes: number; kustainer: Kustainer;
   diagnostic_profile: typeof DIAGNOSTIC_WORKLOAD_PROFILE;
   clients: DiagnosticClientReservation[];
 };
+type Kustainer = { state: string; image: string };
+function kustainer(raw: unknown): Kustainer {
+  const k = object(raw, "Kustainer observation");
+  if ((k.state !== "running" && k.state !== "exited") || typeof k.image !== "string" || !/^sha256:[0-9a-f]{64}$/.test(k.image)) throw new Error("invalid Kustainer state or image");
+  return {state:k.state, image:k.image};
+}
 type DiagnosticReference =
   | { mode: "first" }
   | { mode: "matched"; kind: "diagnostic-comparison-profile"; qualification: "not-evaluated";
       profile_sha256: string; receipt_sha256: string; run_id: string; corpus_sha256: string;
-      clients: DiagnosticClientReservation[] };
+      collector_memory_limit_bytes: number; kustainer: Kustainer; clients: DiagnosticClientReservation[] };
 type DiagnosticReferenceInput =
   | { mode: "establish" }
   | { mode: "compare"; profilePath: string; profileSha256: string; receiptPath: string };
@@ -128,7 +136,9 @@ export function freezeDiagnosticComparisonProfile(
   const recheck = object(receipt.pre_schedule_admission, "reference pre-schedule admission");
   const schedule = object(receipt.client_schedule, "reference schedule");
   if (receipt.kind !== "diagnostic-only" || receipt.qualification !== "not-evaluated"
-    || receipt.collector_cpu_evidence !== true || receipt.reference_establishment !== "explicit-first-arm" || receipt.snapshot_reconciled !== true
+    || receipt.collector_memory_limit_bytes !== COLLECTOR_MEMORY || initial.collector_memory_limit_bytes !== COLLECTOR_MEMORY
+    || recheck.collector_memory_limit_bytes !== COLLECTOR_MEMORY || !isDeepStrictEqual(kustainer(receipt.kustainer), initial.kustainer)
+    || !isDeepStrictEqual(receipt.kustainer, recheck.kustainer) || receipt.collector_cpu_evidence !== true || receipt.reference_establishment !== "explicit-first-arm" || receipt.snapshot_reconciled !== true
     || receipt.source_revision !== expected.source || receipt.harness_revision !== expected.harness
     || receipt.collector_source_revision !== expected.collectorSource || receipt.startup_revision !== expected.startup
     || receipt.diagnostic_gate_sha256 !== expected.gate || receipt.controller_sha256 !== expected.controller
@@ -172,7 +182,7 @@ export function freezeDiagnosticComparisonProfile(
     footer_sha256: expected.footer,
     seed_sha256: expected.seed,
     corpus_sha256: expected.corpus,
-    images: expected.images,
+    images: expected.images, collector_memory_limit_bytes: COLLECTOR_MEMORY, kustainer: kustainer(receipt.kustainer),
     diagnostic_profile: DIAGNOSTIC_WORKLOAD_PROFILE,
     clients,
   };
@@ -191,15 +201,15 @@ export function validateFrozenComparisonProfile(
   parseManifestJson(text);
   const profile = object(JSON.parse(text), "comparison profile");
   const fields = [
-    "clients", "collector_source_revision", "controller_sha256", "corpus_sha256",
+    "clients", "collector_memory_limit_bytes", "collector_source_revision", "controller_sha256", "corpus_sha256",
     "diagnostic_gate_sha256", "diagnostic_profile", "footer_sha256", "harness_revision",
-    "images", "kind", "qualification", "reference_receipt_sha256", "reference_run_id",
+    "images", "kind", "kustainer", "qualification", "reference_receipt_sha256", "reference_run_id",
     "schema_version", "seed_sha256", "source_revision", "startup_revision",
   ];
   if (Object.keys(profile).sort().join(",") !== fields.join(",")
     || profile.schema_version !== 1 || profile.kind !== "diagnostic-comparison-profile"
     || profile.qualification !== "not-evaluated"
-    || profile.source_revision !== expected.source || profile.harness_revision !== expected.harness
+    || profile.collector_memory_limit_bytes !== COLLECTOR_MEMORY || profile.source_revision !== expected.source || profile.harness_revision !== expected.harness
     || profile.collector_source_revision !== expected.collectorSource || profile.startup_revision !== expected.startup
     || profile.diagnostic_gate_sha256 !== expected.gate || profile.controller_sha256 !== expected.controller
     || profile.footer_sha256 !== expected.footer || profile.seed_sha256 !== expected.seed
@@ -241,7 +251,7 @@ export function validateFrozenComparisonProfile(
     footer_sha256: expected.footer,
     seed_sha256: expected.seed,
     corpus_sha256: expected.corpus,
-    images: profile.images,
+    images: profile.images, collector_memory_limit_bytes: COLLECTOR_MEMORY, kustainer: kustainer(profile.kustainer),
     diagnostic_profile: DIAGNOSTIC_WORKLOAD_PROFILE,
     clients,
   };
@@ -271,7 +281,7 @@ function diagnosticReference(profile: FrozenComparisonProfile, profileSha256: st
     profile_sha256: profileSha256,
     receipt_sha256: profile.reference_receipt_sha256,
     run_id: profile.reference_run_id,
-    corpus_sha256: profile.corpus_sha256,
+    corpus_sha256: profile.corpus_sha256, collector_memory_limit_bytes: profile.collector_memory_limit_bytes, kustainer: profile.kustainer,
     clients: profile.clients,
   };
 }
@@ -287,7 +297,7 @@ export function validateDiagnosticReferenceProof(
     return;
   }
   for (const proof of proofs) {
-    if (!isDeepStrictEqual(proof.reference, reference)) throw new Error("diagnostic admission did not use the frozen comparison profile");
+    if (proof.collector_memory_limit_bytes !== reference.collector_memory_limit_bytes || !isDeepStrictEqual(proof.kustainer, reference.kustainer) || !isDeepStrictEqual(proof.reference, reference)) throw new Error("diagnostic admission did not use the frozen comparison profile");
     const clients = referenceClients(proof);
     if (!isDeepStrictEqual(clients, reference.clients)) {
       throw new Error("post-run client reservations differ from the frozen comparison profile");
@@ -333,7 +343,7 @@ export function validateHostAdmission(log: string, schedule: unknown): JsonObjec
     || available <= CLIENT_MEMORY || Number(proof.mem_total_bytes) < available
     || proof.client_memory_budget_bytes !== CLIENT_MEMORY || proof.collector_memory_limit_bytes !== COLLECTOR_MEMORY
     || proof.collector_limit_bound_bytes !== Math.floor((available - CLIENT_MEMORY) * 0.75)
-    || Number(proof.collector_limit_bound_bytes) < COLLECTOR_MEMORY
+    || !fitsDiagnosticBound(Number(proof.collector_limit_bound_bytes))
     || !Number.isSafeInteger(proof.observed_at_unix_ms) || !Number.isSafeInteger(effective.schedule_created_at_unix_ms)
     || Number(proof.observed_at_unix_ms) > Number(effective.schedule_created_at_unix_ms)) {
     throw new Error("diagnostic host memory admission differs from the pre-schedule contract");
@@ -652,12 +662,16 @@ export async function runRealisticDiagnostic(options: {
     await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o400 });
     const configHash = await sha256(configPath);
     const host = await inspectParityHost(CLIENT_MEMORY, COLLECTOR_MEMORY);
+    if (!fitsDiagnosticBound(host.collectorLimitBoundBytes)) throw new Error("diagnostic memory bound lacks 5% headroom");
     await writeFile(join(paths.output, "diagnostic-host.json"), `${JSON.stringify(host, null, 2)}\n`, { flag: "wx" });
     const logPath = join(paths.output, "diagnostic-run.log");
-    await runDiagnosticOat(
+    try { await runDiagnosticOat(
       runtime, configPath, paths.home, join(trusted, "bin"), logPath,
       options.stackBytes, expected.corpus, clientCpus, reference,
-    );
+    ); } finally {
+      const result = memoryOutcome(await readFile(logPath, "utf8").catch(() => ""));
+      await writeFile(join(paths.output, "diagnostic-memory.json"), JSON.stringify(result, null, 2) + "\n", { flag: "wx" });
+    }
     if (await sha256(configPath) !== configHash || await sha256(clientOverridePath) !== clientOverrideHash || await sha256(seedPath) !== expected.seed
       || await sha256(join(runtime, "target", "release", "arrowcol-oat-rust")) !== expected.controller
       || git(runtime, env, "rev-parse", "HEAD") !== expected.source
@@ -676,6 +690,7 @@ export async function runRealisticDiagnostic(options: {
       throw new Error("frozen comparison profile changed during the diagnostic arm");
     }
     const log = await readFile(logPath, "utf8");
+    const memory = memoryOutcome(log);
     const prefix = "[oat] immutable local images: ";
     const imageLines = log.split("\n").filter(line => line.startsWith(prefix));
     if (imageLines.length !== 1 || !isDeepStrictEqual(object(JSON.parse(imageLines[0]!.slice(prefix.length)), "admitted images"),
@@ -794,7 +809,8 @@ export async function runRealisticDiagnostic(options: {
       measurement_window: { start_unix_ms: reconciled.measurement.startUnixMs, end_unix_ms: reconciled.measurement.endUnixMs },
       collector_treatment: { kind: "cpuset_and_engine_workers", cpus, engine_num_cores: engineCores, runtime_cpu_workers: cpuWorkers },
       project_cpu_window: cpuWindow,
-      collector_cpu_evidence: cpuWindow.collector_cpu_evidence,
+      collector_cpu_evidence: cpuWindow.collector_cpu_evidence && memory.permits_cpu_attribution,
+      collector_memory: memory, collector_memory_limit_bytes: COLLECTOR_MEMORY, kustainer: kustainer(preScheduleAdmission.kustainer),
       client_resource_observation: {
         requested_logical_cpus: clientCpus, cpu: client.cpu,
         measurement_window: object(report.phase_counters, "client counters").measurement_window,
@@ -808,7 +824,7 @@ export async function runRealisticDiagnostic(options: {
     const receiptPath = join(paths.output, "diagnostic-receipt.json");
     await writeFile(receiptPath, receiptBytes, { flag: "wx" });
     let establishedProfile: { path: string; sha256: string } | undefined;
-    if (reference.mode === "first" && cpuWindow.collector_cpu_evidence) {
+    if (reference.mode === "first" && receipt.collector_cpu_evidence === true) {
       const profile = freezeDiagnosticComparisonProfile(
         receiptBytes, createHash("sha256").update(receiptBytes).digest("hex"), expected,
       );
