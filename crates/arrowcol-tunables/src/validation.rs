@@ -25,6 +25,7 @@ enum ApplicabilityGate {
     ConnectionRetries,
     Http2Keepalive,
     FixedHttp2Window,
+    TcpKeepalive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,8 +152,16 @@ const CAPABILITIES: &[Capability] = &[
     capability!("transport.request_timeout_ms", "component default"),
     capability!("transport.tcp_nodelay", "true"),
     capability!("transport.tcp_keepalive_ms", "component default"),
-    capability!("transport.tcp_keepalive_interval_ms", "component default"),
-    capability!("transport.tcp_keepalive_retries", "component default"),
+    gated_capability!(
+        "transport.tcp_keepalive_interval_ms",
+        "0; inert when tcp_keepalive_ms is 0",
+        TcpKeepalive
+    ),
+    gated_capability!(
+        "transport.tcp_keepalive_retries",
+        "0; inert when tcp_keepalive_ms is 0",
+        TcpKeepalive
+    ),
     capability!("transport.rate_limit_rps", "disabled"),
     capability!("transport.endpoint_concurrency_limit", "256"),
     capability!("transport.endpoint_buffer_size", "1024"),
@@ -479,6 +488,8 @@ impl Tunables {
             .and_then(Value::as_u64)
             == Some(0);
         let adaptive_http2_window = requested.pointer("/transport/adaptive_window") == Some(&Value::Bool(true));
+        let tcp_keepalive_disabled =
+            requested.pointer("/transport/tcp_keepalive_ms").and_then(Value::as_u64) == Some(0);
         let mut inert_fields = Vec::new();
         let mut projection_only = Vec::new();
         let mut runner_controls = Vec::new();
@@ -488,6 +499,7 @@ impl Tunables {
             connection_retries_disabled: bool,
             http2_keepalive_disabled: bool,
             adaptive_http2_window: bool,
+            tcp_keepalive_disabled: bool,
         }
         fn visit(
             value: &Value,
@@ -540,6 +552,8 @@ impl Tunables {
                 (inert, "http2_keepalive_disabled")
             } else if capability.gate == Some(ApplicabilityGate::FixedHttp2Window) && context.adaptive_http2_window {
                 (inert, "adaptive_http2_window")
+            } else if capability.gate == Some(ApplicabilityGate::TcpKeepalive) && context.tcp_keepalive_disabled {
+                (inert, "tcp_keepalive_disabled")
             } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
                 (inert, "dictionary_disabled")
             } else if matches!(
@@ -563,6 +577,7 @@ impl Tunables {
                 connection_retries_disabled,
                 http2_keepalive_disabled,
                 adaptive_http2_window,
+                tcp_keepalive_disabled,
             },
             false,
             &mut inert_fields,

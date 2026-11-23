@@ -969,6 +969,7 @@ test('nulls HTTP/2 factors that are overridden or disabled', () => {
   for (const [field, reason] of [
     ['stream_window_bytes', 'adaptive_http2_window'],
     ['keepalive_timeout_ms', 'http2_keepalive_disabled'],
+    ['tcp_keepalive_retries', 'tcp_keepalive_disabled'],
   ] as const) {
     const candidate = coveredCandidate('http2', 100, 235).map(row => ({
       ...row, factorConfigPaths: [`tunables.transport.${field}`, 'parquet_writer.defaults.compression'],

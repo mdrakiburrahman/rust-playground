@@ -2434,6 +2434,7 @@ groups:
                 | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
                 | "keepalive_timeout_ms" | "keepalive_while_idle"
                 | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
+                | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
                 | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
                 config.clients_per_table = 1;
                 let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
@@ -2462,7 +2463,8 @@ groups:
         config.clients_per_table = 1;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
             "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
-            "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false
+            "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false,
+            "tcp_keepalive_ms":0, "tcp_keepalive_interval_ms":500, "tcp_keepalive_retries":3
         }}))?;
         let observed = actual_client_startup(&binary, &config)?;
         let mut coverage = tunable_leaf_evidence(&config)?;
@@ -2470,7 +2472,8 @@ groups:
             "client_id":"client-1", "consumer_effective_config":observed
         })]))?;
         for field in ["transport.stream_window_bytes", "transport.connection_window_bytes",
-            "transport.keepalive_timeout_ms", "transport.keepalive_while_idle"] {
+            "transport.keepalive_timeout_ms", "transport.keepalive_while_idle",
+            "transport.tcp_keepalive_interval_ms", "transport.tcp_keepalive_retries"] {
             assert!(coverage["inert_fields"].as_array().context("missing inert fields")?
                 .iter().any(|entry| entry["path"] == field));
             assert!(!coverage["consumer_verified"].as_array().context("missing verified fields")?

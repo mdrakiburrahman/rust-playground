@@ -79,6 +79,35 @@ fn http2_options_are_inert_only_when_their_feature_is_disabled_or_overridden() -
     Ok(())
 }
 
+#[test]
+fn tcp_keepalive_options_follow_the_enable_setting() -> Result<()> {
+    for (keepalive, expected_inert) in [(0, true), (60_000, false)] {
+        let tunables = Tunables::parse_oat_json(json!({"transport": {
+            "tcp_keepalive_ms": keepalive, "tcp_keepalive_interval_ms": 500, "tcp_keepalive_retries": 3
+        }}))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        for path in ["transport.tcp_keepalive_interval_ms", "transport.tcp_keepalive_retries"] {
+            assert_eq!(
+                evidence["inert_fields"]
+                    .as_array()
+                    .context("missing inert fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path && entry["reason"] == "tcp_keepalive_disabled"),
+                expected_inert
+            );
+            assert_eq!(
+                evidence["projection_only"]
+                    .as_array()
+                    .context("missing projected fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path),
+                !expected_inert
+            );
+        }
+    }
+    Ok(())
+}
+
 // The scanner deliberately fails on unfamiliar field syntax rather than silently skipping it.
 // Vecs of scalar values and sorting_columns are treated as atomic values. The latter's
 // element schema is guarded separately below.
