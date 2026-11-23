@@ -42,7 +42,7 @@ struct ApiError {
     error: String,
 }
 
-#[tokio::main]
+#[tokio::main(worker_stack_size = 8_388_608)]
 async fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(path) = args.fixture_setup {
