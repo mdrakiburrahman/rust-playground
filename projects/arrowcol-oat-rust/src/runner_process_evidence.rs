@@ -2185,7 +2185,10 @@ mod consumer_startup_projection_tests {
         ))?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector": {
-                "batching":{"max_arrow_memory_per_flush":134217728,"max_rows_per_flush":777777,
+                "batching":{"coalesce_publications":true,"age_flush_policy":"drain_ready","pipeline_depth":2,
+                    "global_capacity":{"bytes":1073741824,"rows":5000000,"batches":2048},
+                    "per_table_capacity":{"bytes":268435456,"rows":1000000,"batches":512},
+                    "max_arrow_memory_per_flush":134217728,"max_rows_per_flush":777777,
                     "max_batches_per_flush":333,"max_age":"12s","max_concurrent_flushes":2},
                 "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13},
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
@@ -2297,7 +2300,7 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 24);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 33);
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
@@ -2315,7 +2318,8 @@ groups:
             assert_eq!(uncovered, initial);
         }
         for (group, fields) in [
-            ("batching", &["max_arrow_memory_per_flush", "max_rows_per_flush", "max_batches_per_flush",
+            ("batching", &["coalesce_publications", "age_flush_policy", "pipeline_depth",
+                "max_arrow_memory_per_flush", "max_rows_per_flush", "max_batches_per_flush",
                 "max_age", "max_concurrent_flushes"][..]),
             ("commit", &["batch_window", "max_files_per_commit", "max_pending_files"][..]),
             ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
@@ -2334,6 +2338,17 @@ groups:
                 wrong[group][*field] = json!("wrong");
                 anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err(),
                     "verifier accepted wrong {group}.{field}");
+            }
+        }
+        for capacity in ["global_capacity", "per_table_capacity"] {
+            for field in ["bytes", "rows", "batches"] {
+                let mut missing = observed.clone();
+                missing["batching"][capacity].as_object_mut().context("missing capacity readback")?
+                    .remove(field).context("consumer omitted requested capacity")?;
+                assert!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err());
+                let mut wrong = observed.clone();
+                wrong["batching"][capacity][field] = json!("wrong");
+                assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
             }
         }
         let mut wrong = observed;

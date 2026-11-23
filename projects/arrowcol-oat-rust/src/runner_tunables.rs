@@ -233,11 +233,25 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if let Some(field) = path.strip_prefix("collector.batching.")
+            && matches!(field,
+                "coalesce_publications" | "age_flush_policy" | "pipeline_depth"
+                | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
+                | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
+                | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
+                | "max_age" | "max_concurrent_flushes")
+        {
+            let pointer = format!("/{}", field.replace('.', "/"));
+            if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
+                .and_then(|value| value.pointer(&pointer)).is_some()
+                && collectors.iter().all(|process| process["effective_config"]["batching"].pointer(&pointer).is_some())
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         let (section, field, variable) = match path {
-            "collector.batching.max_arrow_memory_per_flush" | "collector.batching.max_rows_per_flush"
-            | "collector.batching.max_batches_per_flush" | "collector.batching.max_age"
-            | "collector.batching.max_concurrent_flushes" =>
-                ("batching", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_BATCHING_CONFIG"),
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
