@@ -48,7 +48,7 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
             "Parquet max row-group bytes must be positive"
         );
 
-        let arrow_writer = ArrowWriter::try_new(writer, schema.clone(), Some(properties))?;
+        let arrow_writer = ArrowWriter::try_new(writer, Arc::clone(&schema), Some(properties))?;
         let (file_writer, row_group_factory) = arrow_writer.into_serialized_writer()?;
         Ok(Self {
             file_writer: Some(file_writer),
@@ -100,8 +100,7 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
                     continue;
                 }
                 let average_row_bytes = current_bytes / self.row_group_rows;
-                if average_row_bytes > 0 {
-                    let rows_that_fit = (max_bytes - current_bytes) / average_row_bytes;
+                if let Some(rows_that_fit) = (max_bytes - current_bytes).checked_div(average_row_bytes) {
                     if rows > rows_that_fit {
                         if rows_that_fit == 0 {
                             self.flush().await?;
