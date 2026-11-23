@@ -44,7 +44,7 @@ struct ApiError {
 
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_stack_size(8 * 1024 * 1024)
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .context("build ArrowCol OAT Tokio runtime")?;
