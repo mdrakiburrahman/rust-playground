@@ -1072,6 +1072,9 @@ trait Platform: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    async fn finish_official_publication(&mut self, _publication_succeeded: bool) -> Result<()> {
+        Ok(())
+    }
     fn mark_qap_outcome_unresolved(&mut self) {}
     async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
@@ -1092,6 +1095,10 @@ trait Platform: Send + Sync {
     async fn arm_clients(&mut self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
+    async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+        self.cancel_client(config, handle).await?;
+        Ok(None)
+    }
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
         None
     }
@@ -1115,6 +1122,9 @@ trait Platform: Send + Sync {
             .collect())
     }
     fn shutdown_drain_evidence(&self) -> Option<Value> {
+        None
+    }
+    fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
         None
     }
     fn local_lifecycle_timing(&self) -> Option<Value> {
@@ -1277,6 +1287,7 @@ struct LocalPlatform {
     build_seconds: Option<f64>,
     setup_seconds: Option<f64>,
     maintenance_cell_baseline: Vec<ProcessLog>,
+    stopped_collector_logs: std::sync::Mutex<Option<Vec<ProcessLog>>>,
 }
 
 #[async_trait::async_trait]
@@ -1681,6 +1692,24 @@ impl Platform for AksPlatform {
         publish_campaign_official_measurement(self, config, rows, submitted, deadline).await
     }
 
+    async fn finish_official_publication(&mut self, publication_succeeded: bool) -> Result<()> {
+        if let Some(runtime_dir) = self.runtime_dir.take() {
+            let retention = runtime_evidence_retention(
+                self.fic_prepare_attempted,
+                self.fic_record_path.as_deref(),
+                self.fic_ready_snapshot_path.as_deref(),
+                self.qap_bind_attempted,
+                self.qap_record_path.as_deref(),
+                self.workload_stop_record_path.as_deref(),
+                self.qap_outcome_unresolved || !publication_succeeded,
+            );
+            apply_runtime_evidence_retention(&runtime_dir, retention)
+                .await
+                .with_context(|| format!("remove private AKS runtime files {}", runtime_dir.display()))?;
+        }
+        Ok(())
+    }
+
     fn mark_qap_outcome_unresolved(&mut self) {
         self.qap_outcome_unresolved = true;
     }
@@ -1764,7 +1793,11 @@ impl Platform for AksPlatform {
     }
 
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()> {
-        cancel_aks_client_job(config, handle).await
+        cancel_aks_client_job(config, handle).await.map(|_| ())
+    }
+
+    async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+        cancel_aks_client_job(config, handle).await.map(Some)
     }
 
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
@@ -1869,11 +1902,7 @@ impl Platform for LocalPlatform {
     }
 
     fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
-        self.maintenance_cell_baseline = logs
-            .iter()
-            .filter(|log| log.role == ComponentRole::Maintenance)
-            .cloned()
-            .collect();
+        self.maintenance_cell_baseline = logs.to_vec();
     }
 
     fn kind(&self) -> crate::config::OatMode {
@@ -2050,8 +2079,12 @@ impl Platform for LocalPlatform {
         finish_local_client(handle).await
     }
 
-    async fn cancel_client(&self, _config: &OatConfig, handle: &ClientHandle) -> Result<()> {
-        cancel_local_client(handle).await
+    async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()> {
+        cancel_local_client(config, handle).await.map(|_| ())
+    }
+
+    async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+        cancel_local_client(config, handle).await.map(Some)
     }
 
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
@@ -2063,7 +2096,22 @@ impl Platform for LocalPlatform {
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
-        match cleanup_local_platform(config, self).await {
+        let result = cleanup_local_platform(config, self).await;
+        let missing_logs = self
+            .stopped_collector_logs
+            .lock()
+            .expect("collector logs mutex poisoned")
+            .is_none();
+        if result.is_err()
+            && missing_logs
+            && let Ok(logs) = local_process_logs_for_role(config, self, Some(ComponentRole::Collector)).await
+        {
+            *self
+                .stopped_collector_logs
+                .lock()
+                .expect("collector logs mutex poisoned") = Some(logs);
+        }
+        match result {
             Ok(evidence) => {
                 self.shutdown_drain_evidence = Some(evidence);
                 Ok(())
@@ -2077,6 +2125,14 @@ impl Platform for LocalPlatform {
 
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         self.shutdown_drain_evidence.clone()
+    }
+
+    fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
+        self.stopped_collector_logs
+            .lock()
+            .expect("collector logs mutex poisoned")
+            .clone()
+            .map(|logs| (logs, self.maintenance_cell_baseline.clone()))
     }
 }
 
@@ -2154,6 +2210,7 @@ impl LocalPlatform {
             build_seconds: None,
             setup_seconds: None,
             maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: std::sync::Mutex::new(None),
         })
     }
 
@@ -2493,14 +2550,16 @@ async fn finish_local_client(handle: ClientHandle) -> Result<String> {
     ))
 }
 
-async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
+async fn cancel_local_client(config: &OatConfig, handle: &ClientHandle) -> Result<String> {
     let ClientProcess::Local { container_id } = &handle.process else {
         bail!("local client cancel received a non-local process handle");
     };
+    stop_local_client_containers(std::slice::from_ref(container_id), config.client_stop_grace_seconds()).await?;
+    let logs = poll_local_client(handle).await.map(|progress| progress.output);
     let mut remove = Command::new("docker");
-    remove.args(["rm", "--force", container_id]);
-    run_command(remove, "cancel local OAT client container").await?;
-    Ok(())
+    remove.args(["rm", container_id]);
+    run_command(remove, "remove cancelled local OAT client container").await?;
+    logs.context("read cancelled local OAT client logs before removal")
 }
 
 fn run_scoped_local_router_config(router_text: &str, run_id: &str, run_pin_ttl_ms: u64) -> Result<String> {
@@ -2621,6 +2680,7 @@ async fn start_aks_client_job(
         job_name: &job_name,
         args,
         run_seconds,
+        stop_grace_seconds: config.client_stop_grace_seconds(),
     });
     configure_fleet_client_placement(
         &mut job,
@@ -2652,6 +2712,13 @@ async fn start_aks_client_job(
     .await
     .context("read applied AKS client Job resource spec")?;
     let applied_job: Value = serde_json::from_str(&applied_job_json).context("parse applied AKS client Job")?;
+    let actual_grace = applied_job
+        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
+        .and_then(Value::as_u64)
+        .context("applied client Job omitted termination grace")?;
+    if actual_grace != config.client_stop_grace_seconds() {
+        bail!("applied client Job termination grace differs from configured quiesce budget");
+    }
     let job_containers = applied_job
         .pointer("/spec/template/spec/containers")
         .and_then(Value::as_array)
@@ -2671,7 +2738,7 @@ async fn start_aks_client_job(
         "role": "client",
         "job": job_name,
         "requested": client_resources,
-        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"]},
+        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"], "stop_grace_seconds": pod["stop_grace_seconds"]},
         "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"],
             "container": "client", "container_id": pod["container_id"]},
     }));
@@ -2692,6 +2759,7 @@ struct AksClientJobSpec<'a> {
     job_name: &'a str,
     args: &'a [String],
     run_seconds: i64,
+    stop_grace_seconds: u64,
 }
 
 fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
@@ -2705,6 +2773,7 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
         job_name,
         args,
         run_seconds,
+        stop_grace_seconds,
     } = spec;
     let labels = json!({
         "app": "arrowcol-oat-client",
@@ -2725,7 +2794,7 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
                 "metadata": { "labels": labels },
                 "spec": {
                     "restartPolicy": "Never",
-                    "terminationGracePeriodSeconds": 10,
+                    "terminationGracePeriodSeconds": stop_grace_seconds,
                     "automountServiceAccountToken": false,
                     "nodeSelector": { "arrow-collector/role": "client", "kubernetes.io/arch": "amd64" },
                     "tolerations": [{
@@ -2840,7 +2909,15 @@ async fn wait_for_aks_client_pod_resource_readback(
                     .and_then(Value::as_array)
                     .context("AKS client pod has no containers")?;
                 let resources = verify_container_resources(containers, "client", "client", expected)?;
+                let stop_grace = pod
+                    .pointer("/spec/terminationGracePeriodSeconds")
+                    .and_then(Value::as_u64)
+                    .context("client pod omitted termination grace")?;
+                if stop_grace != config.client_stop_grace_seconds() {
+                    bail!("client pod termination grace differs from configured quiesce budget");
+                }
                 return Ok(json!({
+                    "stop_grace_seconds": stop_grace,
                     "name": metadata.get("name"),
                     "uid": metadata.get("uid"),
                     "node": node,
@@ -3117,11 +3194,49 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
     ))
 }
 
-async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<()> {
+async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<String> {
     let ClientProcess::Aks { job_name } = &handle.process else {
         bail!("AKS client cancel received a non-AKS process handle");
     };
-    kubectl(
+    // The client is PID 1 in the dedicated, non-restarting job container. Signal
+    // it without deleting the pod so its terminal logs remain readable.
+    let target = format!("job/{job_name}");
+    let signal = tokio::time::timeout(
+        Duration::from_secs(10),
+        kubectl(
+            config,
+            vec![
+                "exec",
+                "--namespace",
+                &config.namespace,
+                &target,
+                "-c",
+                "client",
+                "--",
+                "/bin/sh",
+                "-c",
+                "kill -TERM 1",
+            ],
+            None,
+        ),
+    )
+    .await;
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(config.client_stop_grace_seconds().saturating_add(10));
+    let logs = loop {
+        let progress = tokio::time::timeout_at(deadline, poll_aks_client_job(config, handle)).await;
+        match progress {
+            Ok(Ok(progress)) if progress.completed || progress.failure.is_some() => break Ok(progress.output),
+            Ok(Err(error)) => break Err(error.context("read cancelled AKS client status and logs")),
+            Err(_) => {
+                break Err(anyhow::anyhow!(
+                    "cancelled AKS client did not exit within its grace period; signal result: {signal:?}"
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    };
+    let deletion = kubectl(
         config,
         vec![
             "delete",
@@ -3131,13 +3246,14 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
             &config.namespace,
             "--ignore-not-found",
             "--wait=true",
-            "--timeout=30s",
+            &format!("--timeout={}s", config.client_stop_grace_seconds().saturating_add(30)),
         ],
         None,
     )
     .await
-    .with_context(|| format!("cancel AKS DMV client Job {job_name}"))?;
-    Ok(())
+    .with_context(|| format!("cancel AKS DMV client Job {job_name}"));
+    deletion?;
+    logs
 }
 
 /// Runs the configured benchmark matrix and publishes its compact results.
@@ -3547,6 +3663,9 @@ async fn run_isolated_cell(
                 Ok(()),
             );
             outcome.aks_cleanup_confirmed = false;
+            if let Err(evidence_error) = attach_teardown_outcome(&mut outcome, "not_started") {
+                outcome.error = Some(evidence_error.context("attach unavailable teardown evidence"));
+            }
             return outcome;
         }
     };
@@ -3563,6 +3682,9 @@ async fn run_isolated_cell(
                 Ok(()),
             );
             outcome.aks_cleanup_confirmed = false;
+            if let Err(evidence_error) = attach_teardown_outcome(&mut outcome, "not_started") {
+                outcome.error = Some(evidence_error.context("attach unavailable teardown evidence"));
+            }
             return outcome;
         }
     };
@@ -3590,7 +3712,7 @@ async fn run_isolated_cell(
                 "ArrowCol scale",
             )?;
             match tokio::time::timeout_at(lifecycle_deadline, async {
-                let mut rows = Box::pin(run_matrix_cell(
+                let rows = Box::pin(run_matrix_cell(
                     &config,
                     orchestration_id,
                     &run_id,
@@ -3599,18 +3721,6 @@ async fn run_isolated_cell(
                     platform.as_mut(),
                     lifecycle_deadline,
                 )).await?;
-                if let Err(error) = platform.publish_official_measurement(
-                    &config, &rows, submitted_config.as_ref(), lifecycle_deadline,
-                ).await {
-                    tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
-                    for row in &mut rows {
-                        row.status = "failed".to_owned();
-                        row.failure = Some(match row.failure.take() {
-                            Some(prior) => format!("{prior}; official_measurement_publication_failed"),
-                            None => "official_measurement_publication_failed".to_owned(),
-                        });
-                    }
-                }
                 Ok(rows)
             }).await {
                 Ok(result) => result,
@@ -3637,7 +3747,26 @@ async fn run_isolated_cell(
         }
         evidence
     });
-    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
+    let cleanup_succeeded = cleanup.is_ok();
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    if let Ok(rows) = &mut result
+        && let Some((logs, baseline)) = platform.stopped_commit_logs()
+        && let Err(error) = attach_stopped_commit_evidence(&config, rows, &logs, &baseline)
+    {
+        for row in rows {
+            row.status = "failed".to_owned();
+            let message = format!("capture stopped collector commits: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+    }
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        && let Ok(rows) = &mut result
+    {
+        attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, cleanup_succeeded).await;
+    }
     if !cancelled
         && config.platform.kind == crate::config::OatMode::Local
         && let Ok(rows) = &mut result
@@ -3701,7 +3830,276 @@ async fn run_isolated_cell(
             None => error,
         });
     }
+    if let Err(error) = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" }) {
+        outcome.error = Some(error.context("attach teardown outcome"));
+    }
+    {
+        let publication_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(
+                OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS + OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS + 1,
+            );
+        let publication = platform
+            .publish_official_measurement(&config, &outcome.rows, submitted_config.as_ref(), publication_deadline)
+            .await;
+        let published = publication.is_ok();
+        if let Err(error) = publication {
+            for row in &mut outcome.rows {
+                row.status = "failed".to_owned();
+                row.failure = Some(match row.failure.take() {
+                    Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                    None => "official_measurement_publication_failed".to_owned(),
+                });
+            }
+            let _ = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" });
+            outcome.error = Some(error.context("official cell measurement publication failed"));
+        }
+        if let Err(error) = platform
+            .finish_official_publication(published && cleanup_succeeded)
+            .await
+        {
+            outcome.error = Some(error.context("finalize official measurement runtime evidence"));
+        }
+    }
     outcome
+}
+
+async fn attach_final_aks_delta_reconciliation(
+    config: &OatConfig,
+    root: Option<&str>,
+    rows: &mut [OatResult],
+    cleanup_succeeded: bool,
+) {
+    for row in rows {
+        let delta = if cleanup_succeeded {
+            match root {
+                Some(root) => {
+                    match tokio::time::timeout(Duration::from_secs(30), read_delta_log_commits(root, &row.table)).await
+                    {
+                        Ok(Ok(delta)) => Some(delta),
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Err(error) = apply_final_aks_delta_reconciliation(config, row, delta.as_ref(), cleanup_succeeded) {
+            row.status = "failed".to_owned();
+            row.failure = Some(format!("final AKS Delta reconciliation failed: {error:#}"));
+        }
+    }
+}
+
+fn apply_final_aks_delta_reconciliation(
+    config: &OatConfig,
+    row: &mut OatResult,
+    delta: Option<&Value>,
+    cleanup_succeeded: bool,
+) -> Result<()> {
+    let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing AKS cell evidence")?)?;
+    let mut cell = CellEvidence::default();
+    if let Some(reports) = evidence["client_phase_reports"].as_array()
+        && reports.len() == config.clients_per_table
+    {
+        cell.client_reports.insert(row.table.clone(), reports.clone());
+    }
+    let acknowledged = cell.client_cumulative_total(&row.table, "completed_rows");
+    let cumulative = evidence.pointer("/durable_commits/run_cumulative_output");
+    let final_delta = exploratory_delta_reconciliation(
+        delta,
+        cumulative,
+        acknowledged,
+        Some(if cleanup_succeeded {
+            "final_delta_log_unavailable"
+        } else {
+            "cleanup_failed_or_uncertain"
+        }),
+    );
+    let reconciliation = cell.reconciliation(&row.table, evidence.get("durable_commits"));
+    let established = cleanup_succeeded
+        && final_delta["status"] == "matched"
+        && reconciliation["status"] == "within_bound"
+        && reconciliation["settled"] == true
+        && reconciliation["ambiguous_rows"] == 0;
+    if !evidence["durable_commits"].is_object() {
+        evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
+    }
+    evidence["durable_commits"]["run_cumulative_output"]["post_teardown_verification"] = json!(if established {
+        "matched_final_delta_log"
+    } else {
+        "unavailable_or_mismatched"
+    });
+    evidence["durable_commits"]["post_teardown_delta_reconciliation"] = final_delta;
+    evidence["reconciliation"] = reconciliation;
+    if !established {
+        row.status = "failed".to_owned();
+        let reason = "final_aks_delta_reconciliation_unavailable_or_mismatched";
+        row.failure = Some(match row.failure.take() {
+            Some(prior) => format!("{prior}; {reason}"),
+            None => reason.to_owned(),
+        });
+    }
+    row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    Ok(())
+}
+
+fn attach_stopped_commit_evidence(
+    config: &OatConfig,
+    rows: &mut [OatResult],
+    logs: &[ProcessLog],
+    baseline: &[ProcessLog],
+) -> Result<()> {
+    let (scoped, used_offsets) = cell_scoped_commit_logs(logs, baseline)?;
+    let saw_ambiguous_warning = logs.iter().any(|log| {
+        log.text
+            .contains("cancelled admissions had no observed publication outcome")
+    });
+    let cancelled_ambiguous = if logs.is_empty() || logs.iter().any(|log| !log.complete) {
+        None
+    } else {
+        logs.iter().try_fold(0_u64, |total, log| {
+            let marker = "cancelled admissions had no observed publication outcome";
+            let count = if log.text.contains(marker) {
+                log_counter(&log.text, marker, "cancelled_ambiguous")?
+            } else {
+                0
+            };
+            total.checked_add(count)
+        })
+    };
+    for row in rows {
+        let mut evidence: Value =
+            serde_json::from_str(row.evidence_json.as_deref().context("cell evidence is missing")?)?;
+        let window = evidence
+            .pointer("/backlog/measurement_window/start_unix_ms")
+            .and_then(Value::as_u64)
+            .zip(
+                evidence
+                    .pointer("/backlog/measurement_window/end_unix_ms")
+                    .and_then(Value::as_u64),
+            );
+        let commits =
+            durable_commit_evidence_for_cell(config, logs, &scoped, window, u64::try_from(row.started_at_ms).ok())?;
+        if let Some(stopped) = commits.get(&row.table) {
+            if !evidence["durable_commits"].is_object() {
+                evidence["durable_commits"] = json!({});
+            }
+            if stopped["run_cumulative_output"]["rows"].as_u64().is_none() {
+                let post = stopped["run_cumulative_output"].clone();
+                evidence["durable_commits"]["post_teardown_cumulative_output"] = post.clone();
+                if !evidence["durable_commits"]["run_cumulative_output"].is_object() {
+                    evidence["durable_commits"]["run_cumulative_output"] = post;
+                }
+                evidence["reconciliation"] =
+                    json!({"status":"unavailable", "reason":"post_teardown_collector_commit_evidence_unavailable"});
+                row.status = "failed".to_owned();
+                let reason = "post_teardown_collector_commit_evidence_unavailable";
+                row.failure = Some(match row.failure.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason.to_owned(),
+                });
+                row.evidence_json = Some(serde_json::to_string(&evidence)?);
+                continue;
+            }
+            let mut cell = CellEvidence::default();
+            if let Some(reports) = evidence["client_phase_reports"].as_array()
+                && reports.len() == config.clients_per_table
+            {
+                cell.client_reports.insert(row.table.clone(), reports.clone());
+            }
+            let target = cell.client_cumulative_total(&row.table, "completed_rows");
+            let previous = evidence["durable_commits"]["run_cumulative_output"].clone();
+            if saw_ambiguous_warning {
+                row.status = "failed".to_owned();
+                let reason = "teardown_delivery_ambiguous";
+                row.failure = Some(match row.failure.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason.to_owned(),
+                });
+            }
+            if evidence["evidence_class"] == "d53_exploratory"
+                && previous["commits_by_version"] != stopped["run_cumulative_output"]["commits_by_version"]
+            {
+                row.status = "failed".to_owned();
+                let reason = "post_teardown_exploratory_reconciliation_required";
+                row.failure = Some(match row.failure.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason.to_owned(),
+                });
+            }
+            let cumulative = &mut evidence["durable_commits"]["run_cumulative_output"];
+            *cumulative = stopped["run_cumulative_output"].clone();
+            let delta = cumulative["rows"].as_u64();
+            cumulative["client_completed_rows"] = json!(target);
+            cumulative["settled"] = json!(target.zip(delta).is_some_and(|(completed, rows)| rows >= completed));
+            cumulative["settle_gap_rows"] = json!(
+                target
+                    .zip(delta)
+                    .map(|(completed, rows)| completed.saturating_sub(rows))
+            );
+            cumulative["settle_seconds"] = previous["settle_seconds"].clone();
+            cumulative["settle_timeout_seconds"] = previous["settle_timeout_seconds"].clone();
+            cumulative["cell_scope"] = json!(if used_offsets {
+                "process_log_offset_and_ingress_time"
+            } else {
+                "ingress_time_only"
+            });
+            cumulative["capture"] = json!("post_stop_collector_logs");
+            cumulative["cancelled_ambiguous"] = json!(cancelled_ambiguous);
+            cumulative["complete_delivery_established"] = json!(false);
+            evidence["durable_commits"]["complete_30_second_commit_windows"] =
+                stopped["complete_30_second_commit_windows"].clone();
+            evidence["reconciliation"] = cell.reconciliation(&row.table, Some(&evidence["durable_commits"]));
+        }
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    }
+    Ok(())
+}
+
+fn attach_teardown_outcome(outcome: &mut MatrixOutcome, status: &str) -> Result<()> {
+    for row in &mut outcome.rows {
+        let mut evidence: Value =
+            serde_json::from_str(row.evidence_json.as_deref().context("cell evidence is missing")?)?;
+        let teardown = json!(status);
+        evidence["teardown_outcome"] = teardown.clone();
+        evidence["complete_delivery_established"] = json!(false);
+        if !evidence["durable_commits"].is_object() {
+            evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
+        }
+        let commits = &mut evidence["durable_commits"];
+        if !commits["run_cumulative_output"].is_object() {
+            commits["run_cumulative_output"] = unavailable_cumulative_output("commit_evidence_unavailable");
+        }
+        commits["complete_delivery_established"] = json!(false);
+        commits["run_cumulative_output"]["complete_delivery_established"] = json!(false);
+        commits["run_cumulative_output"]["teardown_outcome"] = teardown.clone();
+        if !commits["output_throughput"].is_object() {
+            commits["output_throughput"] = json!({"rows": null, "rows_per_second": null, "unavailable_reason": "measurement_window_evidence_unavailable"});
+        }
+        commits["output_throughput"]["teardown_outcome"] = teardown.clone();
+        if let Some(windows) = commits["complete_30_second_commit_windows"].as_array_mut() {
+            for window in windows {
+                window["teardown_outcome"] = teardown.clone();
+            }
+        } else {
+            commits["complete_30_second_commit_windows"] = json!([]);
+            commits["complete_30_second_commit_windows_unavailable_reason"] =
+                json!("measurement_window_evidence_unavailable");
+        }
+        evidence["commit_window_output_throughput"] = commits["output_throughput"].clone();
+        if row.status != "succeeded" {
+            row.rows_per_second = None;
+            evidence["ranking_eligible"] = json!(false);
+            evidence["ranking_metrics"] = Value::Null;
+            evidence["ranking_ineligible_reason"] = json!("cell_failed");
+            evidence["screen_v1"] = Value::Null;
+            evidence["screen_v1_csv_reason"] = json!("cell_failed");
+            evidence["commit_window_output_usage"] = json!("diagnostic_only");
+        }
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    }
+    Ok(())
 }
 
 fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: Value) -> Result<()> {
@@ -4468,7 +4866,7 @@ async fn run_matrix_cell(
             client_run.evidence.overload_guard.as_mut(),
             None,
         );
-        return Err(error);
+        client_run.failure = Some(format!("finish resource measurement: {error:#}"));
     }
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
@@ -4515,16 +4913,14 @@ async fn run_matrix_cell(
         startup_readback_diff,
     );
     if let Err(error) = capture {
-        if !guard_stopped {
-            return Err(error);
-        }
-        tracing::error!(%error, "post-overload output/process capture failed; retaining stop evidence for cleanup");
+        tracing::error!(%error, "post-measurement output/process capture failed; retaining evidence for cleanup");
         client_run.failure = Some(format!(
-            "{}; post_overload_stop_capture_unavailable",
-            client_run
-                .failure
-                .as_deref()
-                .unwrap_or("overload_guard stopped the cell")
+            "{}; post_measurement_capture_unavailable: {error:#}",
+            client_run.failure.as_deref().unwrap_or(if guard_stopped {
+                "overload_guard stopped the cell"
+            } else {
+                "post_measurement_capture_failed"
+            })
         ));
         if let Some(guard) = &mut client_run.evidence.overload_guard {
             guard["post_stop_capture"] = json!("unavailable");
@@ -5460,6 +5856,26 @@ async fn run_clients_inner(
     let mut router_sql_end = None;
     let mut router_cpu_pressure_samples = Vec::new();
     let mut router_cpu_pressure_parse_failures = 0_u64;
+    macro_rules! retain_armed_client_failure {
+        ($error:expr) => {{
+            let mut failure = format!("{:#}", $error);
+            if let Err(error) =
+                cancel_active_clients_with_evidence(platform, config, &handles, &active_clients, &mut evidence).await
+            {
+                failure.push_str(&format!("; client cancellation failed: {error:#}"));
+            }
+            if let Err(error) = sampler.finish_early(&mut evidence).await {
+                failure.push_str(&format!("; terminal evidence capture failed: {error:#}"));
+            }
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables,
+                failure: Some(failure),
+                evidence,
+            });
+        }};
+    }
     while completed_clients.len() < handles.len() {
         let pending_indices = handles
             .iter()
@@ -5473,7 +5889,7 @@ async fn run_clients_inner(
         let progress = tokio::select! {
             biased;
             reason = sampler.wait_for_overload_stop() => {
-                let cancellation = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                let cancellation = cancel_active_clients_with_evidence(platform, config, &handles, &active_clients, &mut evidence).await;
                 let capture = sampler.finish_early(&mut evidence).await;
                 let mut failure = reason;
                 if let Err(error) = cancellation {
@@ -5495,38 +5911,20 @@ async fn run_clients_inner(
         let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
-                let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling OAT clients after polling failure also failed: {cleanup_error:#}"
-                    ))),
-                };
+                retain_armed_client_failure!(error);
             }
         };
         for (index, state) in pending_indices.into_iter().zip(progress) {
             let handle = &handles[index];
             if let Some(failure) = state.failure {
                 let error = anyhow::anyhow!("OAT client {} failed: {failure}", handle.client_id);
-                let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling remaining OAT clients also failed: {cleanup_error:#}"
-                    ))),
-                };
+                retain_armed_client_failure!(error);
             }
             if state.completed && !completed_clients.contains(&handle.client_id) {
                 let output = match platform.finish_client(config, handle.clone()).await {
                     Ok(output) => output,
                     Err(error) => {
-                        let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                        return match cleanup {
-                            Ok(()) => Err(error),
-                            Err(cleanup_error) => Err(error.context(format!(
-                                "cancelling clients after client collection failed also failed: {cleanup_error:#}"
-                            ))),
-                        };
+                        retain_armed_client_failure!(error);
                     }
                 };
                 active_clients[index] = false;
@@ -5556,26 +5954,16 @@ async fn run_clients_inner(
                 let measurement = match measurement {
                     Ok(measurement) => measurement,
                     Err(error) => {
-                        let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                        return match cleanup {
-                            Ok(()) => Err(error),
-                            Err(cleanup_error) => Err(error.context(format!(
-                                "cancelling clients after invalid measurement also failed: {cleanup_error:#}"
-                            ))),
-                        };
+                        evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
+                        retain_armed_client_failure!(error);
                     }
                 };
                 let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
                 if let Err(error) =
                     evidence.record_client(&effective_client_config, &handle.table, &handle.client_id, &output)
                 {
-                    let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                    return match cleanup {
-                        Ok(()) => Err(error),
-                        Err(cleanup_error) => Err(error.context(format!(
-                            "cancelling clients after invalid effective-config evidence failed: {cleanup_error:#}"
-                        ))),
-                    };
+                    evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
+                    retain_armed_client_failure!(error);
                 }
                 if let Some(report) = evidence
                     .client_reports
@@ -5811,6 +6199,44 @@ async fn cancel_active_clients(
         .collect::<Vec<_>>();
     if !errors.is_empty() {
         bail!("one or more OAT clients could not be cancelled: {}", errors.join("; "));
+    }
+    Ok(())
+}
+
+async fn cancel_active_clients_with_evidence(
+    platform: &dyn Platform,
+    config: &OatConfig,
+    handles: &[ClientHandle],
+    active: &[bool],
+    evidence: &mut CellEvidence,
+) -> Result<()> {
+    let selected = handles
+        .iter()
+        .zip(active.iter())
+        .filter(|(_, active)| **active)
+        .map(|(handle, _)| handle)
+        .collect::<Vec<_>>();
+    let results = join_all(
+        selected
+            .iter()
+            .map(|handle| platform.cancel_client_with_output(config, handle)),
+    )
+    .await;
+    let mut errors = Vec::new();
+    for (handle, result) in selected.into_iter().zip(results) {
+        match result {
+            Ok(output) => evidence.record_cancelled_client(&handle.table, &handle.client_id, output.as_deref()),
+            Err(error) => {
+                evidence.record_cancelled_client(&handle.table, &handle.client_id, None);
+                errors.push(format!("{}: {error:#}", handle.client_id));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        bail!(
+            "one or more OAT clients could not be cancelled or their logs captured: {}",
+            errors.join("; ")
+        );
     }
     Ok(())
 }
@@ -9075,6 +9501,25 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
             .and_then(Value::as_str)
             == Some("dataflow-1")
     });
+    let client_ids = before
+        .iter()
+        .filter(|container| {
+            container
+                .pointer("/Config/Labels/com.docker.compose.service")
+                .and_then(Value::as_str)
+                == Some("oat-client")
+        })
+        .map(|container| {
+            container
+                .get("Id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("client container ID missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !client_ids.is_empty() {
+        stop_local_client_containers(&client_ids, config.client_stop_grace_seconds()).await?;
+    }
     let phases = snapshot_stop_phases(&before)?;
     let mut maintenance_logs = None;
     let mut collector_sigterm_at_unix_ms = None;
@@ -9109,6 +9554,10 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     } else {
         Vec::new()
     };
+    *platform
+        .stopped_collector_logs
+        .lock()
+        .expect("collector logs mutex poisoned") = Some(collector_logs.clone());
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let after: Vec<Value> = serde_json::from_slice(
@@ -9300,13 +9749,19 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         } else {
             ComponentRole::Collector
         };
-        shutdown_exit_outcome(
-            role,
-            was_running,
-            Some(exit),
-            state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
-        )
-        .with_context(|| format!("owned container {service} failed while stopping"))?;
+        if service == "oat-client" {
+            if exit == 137 || state.get("OOMKilled").and_then(Value::as_bool) != Some(false) {
+                bail!("owned client was forcibly stopped or OOM killed ({exit})");
+            }
+        } else {
+            shutdown_exit_outcome(
+                role,
+                was_running,
+                Some(exit),
+                state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
+            )
+            .with_context(|| format!("owned container {service} failed while stopping"))?;
+        }
         let finished_at = state
             .get("FinishedAt")
             .and_then(Value::as_str)
@@ -9419,8 +9874,8 @@ fn local_phase_stop_args(
     args
 }
 
-fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64) -> Duration {
-    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + 2 * 300 + 120)
+fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64, client_grace: u64) -> Duration {
+    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + client_grace + 2 * 300 + 120)
 }
 
 async fn stop_then_destroy<T>(
@@ -9441,6 +9896,7 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             local_stop_deadline(
                 config.collector_stop_grace_seconds,
                 stop_budgets.maintenance_stop_timeout_ms,
+                config.client_stop_grace_seconds(),
             ),
             stop_local_snapshot_writers(config, platform),
         )
@@ -9483,12 +9939,34 @@ fn local_oat_client_list_args(project: &str) -> Vec<String> {
 }
 
 fn local_oat_client_remove_args(container_ids: &[String]) -> Vec<String> {
-    let mut args = vec!["rm".to_owned(), "--force".to_owned()];
+    let mut args = vec!["rm".to_owned()];
     args.extend(container_ids.iter().cloned());
     args
 }
 
-async fn remove_local_oat_client_containers(project: &str) -> Result<bool> {
+async fn stop_local_client_containers(ids: &[String], grace: u64) -> Result<()> {
+    let mut stop = Command::new("docker");
+    stop.args(["stop", "--time", &grace.to_string()]).args(ids);
+    run_command(stop, "quiesce local OAT clients before removing them").await?;
+    let mut inspect = Command::new("docker");
+    inspect.args(["inspect", "--format", "{{.State.ExitCode}}"]).args(ids);
+    let output = run_command(inspect, "verify local OAT clients stopped without SIGKILL").await?;
+    let text = std::str::from_utf8(&output.stdout).context("client stop exit codes were not UTF-8")?;
+    let exit_codes = text
+        .lines()
+        .map(|line| line.trim().parse::<i32>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid client stop exit code")?;
+    if exit_codes.len() != ids.len() {
+        bail!("client stop readback omitted an exit code");
+    }
+    if exit_codes.contains(&137) {
+        bail!("local OAT client was killed before its quiesce deadline completed");
+    }
+    Ok(())
+}
+
+async fn remove_local_oat_client_containers(project: &str, client_grace: u64) -> Result<bool> {
     let mut list = Command::new("docker");
     list.args(local_oat_client_list_args(project));
     let output = run_command(list, "list local OAT client containers for cleanup").await?;
@@ -9502,6 +9980,7 @@ async fn remove_local_oat_client_containers(project: &str) -> Result<bool> {
     if ids.is_empty() {
         return Ok(false);
     }
+    stop_local_client_containers(&ids, client_grace).await?;
     let mut remove = Command::new("docker");
     remove.args(local_oat_client_remove_args(&ids));
     run_command(remove, "remove local OAT client containers").await?;
@@ -9522,7 +10001,7 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     let project = scoped_compose_project(base_project, &platform.run_id);
     let mut stack_clean = false;
     for _ in 0..3 {
-        remove_local_oat_client_containers(&project).await?;
+        remove_local_oat_client_containers(&project, config.client_stop_grace_seconds()).await?;
         let mut down = compose_command(
             compose_file,
             config.platform.compose_override_file.as_deref(),
@@ -9535,7 +10014,7 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         down.envs(&platform.environment);
         down.args(["down", "--volumes", "--remove-orphans"]);
         run_streaming_command(down, "clean up local OAT stack").await?;
-        if !remove_local_oat_client_containers(&project).await? {
+        if !remove_local_oat_client_containers(&project, config.client_stop_grace_seconds()).await? {
             stack_clean = true;
             break;
         }
@@ -13344,23 +13823,6 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         if let Err(error) = require_aks_cleanup_confirmation(platform) {
             failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
         }
-        if let Some(runtime_dir) = platform.runtime_dir.take() {
-            let retention = runtime_evidence_retention(
-                platform.fic_prepare_attempted,
-                platform.fic_record_path.as_deref(),
-                platform.fic_ready_snapshot_path.as_deref(),
-                platform.qap_bind_attempted,
-                platform.qap_record_path.as_deref(),
-                platform.workload_stop_record_path.as_deref(),
-                platform.qap_outcome_unresolved || !failures.is_empty(),
-            );
-            if let Err(error) = apply_runtime_evidence_retention(&runtime_dir, retention).await {
-                failures.push(format!(
-                    "remove private AKS runtime files {}: {error:#}",
-                    runtime_dir.display()
-                ));
-            }
-        }
         if failures.is_empty() {
             return Ok(());
         }
@@ -15581,7 +16043,9 @@ mod tests {
             job_name: "oat-00000000-table-c0",
             args: &["--endpoint".to_owned(), "http://arrowcol-router:50050".to_owned()],
             run_seconds: 3_600,
+            stop_grace_seconds: 45,
         });
+        assert_eq!(job["spec"]["template"]["spec"]["terminationGracePeriodSeconds"], 45);
         let container = &job["spec"]["template"]["spec"]["containers"][0];
         let mounts = container["volumeMounts"].as_array().context("client volume mounts")?;
         let identity_mount = mounts
@@ -15630,7 +16094,7 @@ mod tests {
         );
         assert_eq!(
             local_oat_client_remove_args(&["client-a".to_owned(), "client-b".to_owned()]),
-            ["rm", "--force", "client-a", "client-b"]
+            ["rm", "client-a", "client-b"]
         );
     }
 
@@ -16780,6 +17244,7 @@ mod tests {
             build_seconds: None,
             setup_seconds: None,
             maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: std::sync::Mutex::new(None),
         };
         fs::write(fixture.join("mode"), "stop_failure")?;
         let error = cleanup_local_platform(&config, &local)
@@ -17082,10 +17547,10 @@ mod tests {
 
     #[test]
     fn local_stop_deadline_covers_derived_maintenance_budget_and_other_phases() {
-        let deadline = local_stop_deadline(3600, 900_000);
+        let deadline = local_stop_deadline(3600, 900_000, 40);
         assert_eq!(
             deadline,
-            Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120)
+            Duration::from_millis(900_000) + Duration::from_secs(3600 + 40 + 2 * 300 + 120)
         );
         assert!(deadline > Duration::from_secs(3600 + 3 * 300));
     }
@@ -17208,7 +17673,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
+    fn snapshot_stop_distinguishes_diagnostic_client_and_maintenance_exits() -> Result<()> {
         let project = "owned-maintenance-run";
         let services = [
             "delta-maintenance",
@@ -17254,6 +17719,14 @@ mod tests {
         let outcomes = snapshot_container_outcomes(&before, &after, project)?;
         assert!(outcomes[0]["maintenance_operation_failure"].is_null());
         assert!(outcomes[0]["comment"].as_str().is_some());
+        let mut interrupted_client = after.clone();
+        interrupted_client[5]["State"]["ExitCode"] = json!(1);
+        assert_eq!(
+            snapshot_container_outcomes(&before, &interrupted_client, project)?[5]["exit_code"],
+            1
+        );
+        interrupted_client[5]["State"]["ExitCode"] = json!(137);
+        assert!(snapshot_container_outcomes(&before, &interrupted_client, project).is_err());
 
         for exit in [2, 137] {
             let mut invalid = after.clone();

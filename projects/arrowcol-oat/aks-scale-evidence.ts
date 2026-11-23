@@ -167,6 +167,17 @@ export async function readOfficialCellMeasurement(options: {
   }
   if (reference.source_revision === null) unavailableReasons.push('official_source_revision_unavailable');
   if (result.status !== 'succeeded') unavailableReasons.push('original_official_cell_did_not_succeed');
+  const commits = evidence.durable_commits as JsonRecord | null | undefined;
+  const cumulative = commits?.run_cumulative_output as JsonRecord | null | undefined;
+  const delta = commits?.post_teardown_delta_reconciliation as JsonRecord | null | undefined;
+  const reconciliation = evidence.reconciliation as JsonRecord | null | undefined;
+  const windows = commits?.complete_30_second_commit_windows;
+  const finalEvidence = evidence.teardown_outcome === 'succeeded' && output.teardown_outcome === 'succeeded' &&
+    cumulative?.teardown_outcome === 'succeeded' && Array.isArray(windows) &&
+    windows.every(window => window && typeof window === 'object' && window.teardown_outcome === 'succeeded') &&
+    delta?.status === 'matched' && reconciliation?.status === 'within_bound' &&
+    reconciliation?.settled === true && reconciliation?.ambiguous_rows === 0;
+  if (!finalEvidence) unavailableReasons.push('final_teardown_or_delivery_evidence_unavailable');
   const complete = integer(start) && integer(end) && start >= before.startedAtMs && end > start && end <= now() &&
     start === reference.measurement_start_unix_ms && end === reference.measurement_end_unix_ms &&
     output.window_seconds === (end - start) / 1000 && output.scope === ORIGINAL_WINDOW_SCOPE &&
@@ -176,7 +187,7 @@ export async function readOfficialCellMeasurement(options: {
   assertDeadline();
   return { reference: structuredClone(reference), inventory: structuredClone(inventory), effectiveConfig,
     officialResult: result, output, startMs: integer(start) ? start : null, endMs: integer(end) ? end : null,
-    committedRowsPerSecond: complete ? output.rows_per_second as number : null, submittedConfigIdentity, unavailableReasons };
+    committedRowsPerSecond: complete && finalEvidence && result.status === 'succeeded' ? output.rows_per_second as number : null, submittedConfigIdentity, unavailableReasons };
 }
 
 // Microsoft.Kusto/clusters: Percent/Average/PT1M, not row latency or cache fullness.

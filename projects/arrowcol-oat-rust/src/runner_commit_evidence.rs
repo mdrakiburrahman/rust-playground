@@ -1302,6 +1302,95 @@ mod commit_evidence_tests {
     }
 
     #[test]
+    fn failed_teardown_retains_post_stop_receipts_and_marks_windows_diagnostic() -> Result<()> {
+        let config = config()?;
+        let table = &config.tables[0];
+        let baseline = log(&[]);
+        let first = event(&config, 100, 199)?;
+        let mut drain = event(&config, 300, 400)?;
+        drain["delta_version"] = json!(8);
+        drain["finished_at_unix_ms"] = json!(70_000);
+        let mut stopped = baseline.clone();
+        stopped
+            .text
+            .push_str(&format!("arrowcol_data_commit {first}\narrowcol_data_commit {drain}\n"));
+        let mut row = OatResult {
+            run_id: "run".into(), mode: "local".into(), stamp: None, host: "local".into(),
+            experiment: "cell".into(), started_at_ms: 100, measure_seconds: 60.0, arrowcols: 1,
+            clients: 1, tables: 1, table_owner: None, pinning_ok: true, pinning_error: None,
+            failure: None, status: "succeeded".into(), git_sha: "test".into(), tunables_json: "{}".into(),
+            evidence_json: Some(json!({"backlog":{"measurement_window":{"start_unix_ms":100,"end_unix_ms":60_100}},
+                "durable_commits":{"output_throughput":{"rows":10,"rows_per_second":1.0},
+                    "run_cumulative_output":{"rows":10,"settle_seconds":1.0}},
+                "client_phase_reports":[{"phase_counters":{"process_cumulative":{"completed_rows":20,"ambiguous_rows":0}}}],
+                "ranking_eligible":true,"ranking_metrics":{"committed_rows_per_second":1.0}}).to_string()),
+            replicas: 1, dfe_worker_concurrency: 1, table: table.clone(), rows: Some(20), duration_ms: Some(60_000),
+            rows_per_second: Some(1.0), cpu_millicores: None, memory_bytes: None, qap: QapMetrics::default(),
+        };
+        let mut partial_row = row.clone();
+        let mut incomplete = stopped.clone();
+        incomplete.complete = false;
+        attach_stopped_commit_evidence(&config, std::slice::from_mut(&mut partial_row), &[incomplete], std::slice::from_ref(&baseline))?;
+        let partial: Value = serde_json::from_str(partial_row.evidence_json.as_deref().context("missing partial evidence")?)?;
+        assert_eq!(partial["durable_commits"]["run_cumulative_output"]["rows"], 10);
+        assert!(partial["durable_commits"]["post_teardown_cumulative_output"]["rows"].is_null());
+        assert_eq!(partial["reconciliation"]["status"], "unavailable");
+        assert_eq!(partial_row.status, "failed");
+        stopped.text.push_str("WARN cancelled admissions had no observed publication outcome; delivery remains ambiguous cancelled_ambiguous=2\n");
+        stopped.text = filter_process_evidence_text(&stopped.text)?;
+        attach_stopped_commit_evidence(&config, std::slice::from_mut(&mut row), &[stopped], &[baseline])?;
+        let mut clean = finish_matrix_cell(&config, "orchestration", "run", 1, 1, Ok(vec![row.clone()]), Ok(()));
+        attach_teardown_outcome(&mut clean, "succeeded")?;
+        let clean_evidence: Value = serde_json::from_str(clean.rows[0].evidence_json.as_deref().context("missing clean evidence")?)?;
+        assert_eq!(clean_evidence["teardown_outcome"], "succeeded");
+        assert_eq!(clean_evidence["complete_delivery_established"], false);
+        assert_eq!(clean.rows[0].status, "failed");
+        assert!(clean.rows[0].failure.as_deref().is_some_and(|failure| failure.contains("teardown_delivery_ambiguous")));
+        assert!(clean.rows[0].rows_per_second.is_none());
+        let mut outcome = finish_matrix_cell(
+            &config,
+            "orchestration",
+            "run",
+            1,
+            1,
+            Ok(vec![row]),
+            Err(anyhow::anyhow!("drain failed")),
+        );
+        attach_teardown_outcome(&mut outcome, "failed")?;
+        let row = &outcome.rows[0];
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(row.status, "failed");
+        assert!(row.rows_per_second.is_none());
+        assert_eq!(evidence["teardown_outcome"], "failed");
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["cancelled_ambiguous"], 2);
+        assert_eq!(evidence["complete_delivery_established"], false);
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["rows"], 20);
+        assert_eq!(
+            evidence["durable_commits"]["run_cumulative_output"]["commits_by_version"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(evidence["reconciliation"]["status"], "within_bound");
+        assert_eq!(
+            evidence["durable_commits"]["complete_30_second_commit_windows"][0]["rows"],
+            10
+        );
+        assert_eq!(
+            evidence["durable_commits"]["complete_30_second_commit_windows"][0]["teardown_outcome"],
+            "failed"
+        );
+        assert_eq!(
+            evidence["commit_window_output_throughput"]["teardown_outcome"],
+            "failed"
+        );
+        assert_eq!(evidence["ranking_eligible"], false);
+        assert!(evidence["ranking_metrics"].is_null());
+        Ok(())
+    }
+
+    #[test]
     fn full_filtered_log_preserves_startup_readback_and_tail_commit() -> Result<()> {
         let mut config = config()?;
         config.tunables = serde_json::from_value(json!({"router":{"hard_pressure_bps":9500}}))?;

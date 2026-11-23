@@ -1775,6 +1775,7 @@ mod overload_guard_tests {
                 build_seconds: None,
                 setup_seconds: None,
                 maintenance_cell_baseline: Vec::new(),
+                stopped_collector_logs: std::sync::Mutex::new(None),
             };
             platform.router_metrics_url =
                 Some(local_compose_endpoint(&config, &platform, "router", "50050", "/metrics").await?);
@@ -2256,7 +2257,7 @@ mod overload_guard_tests {
                 let platform = LocalPlatform { run_id:run_id.clone(), state_dir:root.clone(), environment:HashMap::new(),
                     control_dir:root.clone(), client_progress:std::sync::Mutex::new(HashMap::new()),
                     router_metrics_url:None, collector_metrics_url:Some(format!("{endpoint}/metrics")),
-                    qap_url:None, daemon_endpoint:None, shutdown_drain_evidence:None, build_seconds:None, setup_seconds:None, maintenance_cell_baseline:Vec::new() };
+                    qap_url:None, daemon_endpoint:None, shutdown_drain_evidence:None, build_seconds:None, setup_seconds:None, maintenance_cell_baseline:Vec::new(), stopped_collector_logs:std::sync::Mutex::new(None) };
                 let cgroup = String::from_utf8(docker(&["exec", &id, "cat", "/proc/self/cgroup",
                     "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"]).await?.stdout)?;
                 println!("guard_docker_readback {}", json!({"container_id":id,"requested_cap":config.platform.local.collector_memory_limit_bytes,"cgroup":cgroup}));

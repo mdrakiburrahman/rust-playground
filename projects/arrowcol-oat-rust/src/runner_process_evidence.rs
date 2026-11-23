@@ -57,6 +57,7 @@ fn is_process_evidence_line(line: &str) -> bool {
         "arrowcol_wal_effective_config ",
         "arrowcol_layout_",
         "arrowcol_data_commit ",
+        "cancelled admissions had no observed publication outcome",
         "arrowcol_maintenance_",
         "delta-maintenance ",
         "OAT_CLIENT_",
@@ -3266,6 +3267,7 @@ groups:
             (json!({"client":{"seed":29}}), "seed"),
             (json!({"client":{"max_memory_bytes":268435456}}), "max_memory_bytes"),
             (json!({"client":{"interval_us":7}}), "interval_us"),
+            (json!({"client":{"quiesce_timeout_ms":31000}}), "quiesce_timeout_ms"),
             (json!({"client":{"connections_per_worker":3}}), "connections_per_worker"),
             (json!({"client":{"streams_per_worker":7}}), "streams_per_worker"),
             (json!({"client":{"max_rows":129}}), "max_rows"),
@@ -3332,7 +3334,7 @@ groups:
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
                 | "payload_customer_id" | "corpus_rows" | "corpus_bytes"
                 | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
-                | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "send_iter" | "identity_builder" | "max_memory_bytes"
+                | "streams_per_worker" | "interval_us" | "quiesce_timeout_ms" | "data_mode" | "data_profile" | "send_iter" | "identity_builder" | "max_memory_bytes"
                 | "stream_retry_max_attempts" | "stream_retry_base_backoff_ms" | "stream_retry_max_backoff_ms"
                 | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
                 | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"

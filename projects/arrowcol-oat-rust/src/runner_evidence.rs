@@ -75,6 +75,23 @@ fn official_measurement_bytes(
         bail!("official cell result does not match the original inventory and table");
     }
     let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("official result has no evidence")?)?;
+    let teardown = evidence["teardown_outcome"].as_str().context("official result has no final teardown outcome")?;
+    if !matches!(teardown, "succeeded" | "failed" | "not_started")
+        || evidence["durable_commits"]["run_cumulative_output"]["teardown_outcome"] != teardown
+        || evidence["commit_window_output_throughput"]["teardown_outcome"] != teardown
+        || !evidence["durable_commits"]["complete_30_second_commit_windows"].as_array()
+            .is_some_and(|windows| windows.iter().all(|window| window["teardown_outcome"] == teardown))
+    {
+        bail!("official result lacks consistent final teardown and commit-window evidence");
+    }
+    if row.status == "succeeded" && (teardown != "succeeded"
+        || evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"] != "matched"
+        || evidence["reconciliation"]["status"] != "within_bound"
+        || evidence["reconciliation"]["settled"] != true
+        || evidence["reconciliation"]["ambiguous_rows"] != 0)
+    {
+        bail!("successful official result lacks final settled unambiguous delivery evidence");
+    }
     let effective = json!({
         "typed_oat_config": config,
         "resolved_aks_resources": config.effective_aks_resources(),
@@ -176,7 +193,15 @@ async fn publish_campaign_official_measurement(
         let (current, _) = read_authoritative_campaign_inventory(
             platform, &identity, &cached.orchestration_run_id, publication_deadline.saturating_duration_since(tokio::time::Instant::now()),
         ).await?;
-        current.assert_custody_ready(platform.campaign_cli_paths()?).await?;
+        cached.validate_successor(&current)?;
+        if rows.iter().any(|row| row.status == "succeeded") {
+            for action in [CampaignCleanupAction::StopAdmission, CampaignCleanupAction::BoundedDrain,
+                CampaignCleanupAction::EvidenceCapture, CampaignCleanupAction::StopMaintenance,
+                CampaignCleanupAction::TerminalCapture, CampaignCleanupAction::RemoveNamespace,
+                CampaignCleanupAction::RemoveQap, CampaignCleanupAction::RemoveFic, CampaignCleanupAction::Handoff] {
+                campaign_cleanup_step_complete(&action, &current)?;
+            }
+        }
         let bytes = official_measurement_bytes(&current, config, rows, submitted)?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let destination = current.evidence_destination.as_ref().context("official measurement destination is missing")?;
@@ -233,9 +258,13 @@ mod official_cell_measurement_tests {
             },
             started_at_ms: 1_000, qap: QapMetrics::default(), resources: None, resource_evidence: None,
         })?;
-        let output = commit_window_output(&BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None)?;
+        let mut output = commit_window_output(&BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None)?;
+        output["teardown_outcome"] = json!("failed");
         rows[0].evidence_json = Some(serde_json::to_string(&json!({
-            "version": 1, "commit_window_output_throughput": output,
+            "version": 1, "teardown_outcome": "failed",
+            "commit_window_output_throughput": output,
+            "durable_commits": {"run_cumulative_output": {"rows": null, "teardown_outcome": "failed"},
+                "complete_30_second_commit_windows": []},
         }))?);
         rows[0].git_sha = "a".repeat(40);
         Ok((config, inventory, rows))
@@ -337,6 +366,47 @@ mod official_cell_measurement_tests {
         wrong.cell_run_id = "c0ffee00-0000-4000-8000-000000000099".to_owned();
         assert!(official_measurement_bytes(&wrong, &config, &rows, None).is_err());
         println!("D46_OFFICIAL_PRODUCER_BYTES {}", String::from_utf8(bytes)?);
+        Ok(())
+    }
+
+    #[test]
+    fn final_official_result_requires_teardown_and_reconciled_delivery() -> Result<()> {
+        let (mut config, inventory, mut rows) = original_measurement()?;
+        config.clients_per_table = 1;
+        let row = &mut rows[0];
+        row.status = "succeeded".to_owned();
+        row.failure = None;
+        row.evidence_json = Some(json!({
+            "client_phase_reports": [{"phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}}],
+            "durable_commits": {
+                "run_cumulative_output": {"rows": 10, "settled": true, "commits_by_version": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]},
+                "output_throughput": {"rows": 10}, "complete_30_second_commit_windows": [{"rows": 10}]
+            }
+        }).to_string());
+        let delta = json!({"rows": 10, "versions": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]});
+        apply_final_aks_delta_reconciliation(&config, row, Some(&delta), true)?;
+        let mut outcome = finish_matrix_cell(&config, &inventory.orchestration_run_id, &inventory.cell_run_id, 1, 1, Ok(rows), Ok(()));
+        attach_teardown_outcome(&mut outcome, "succeeded")?;
+        let payload: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &outcome.rows, None)?)?;
+        let evidence = &payload["official_result"]["evidence"];
+        assert_eq!(evidence["teardown_outcome"], "succeeded");
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["rows"], 10);
+        assert_eq!(evidence["durable_commits"]["complete_30_second_commit_windows"][0]["teardown_outcome"], "succeeded");
+        assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
+        let mut pending = outcome.rows.clone();
+        let mut changed: Value = serde_json::from_str(pending[0].evidence_json.as_deref().unwrap())?;
+        changed["teardown_outcome"] = json!("pending");
+        pending[0].evidence_json = Some(changed.to_string());
+        assert!(official_measurement_bytes(&inventory, &config, &pending, None).is_err());
+        let mut failed = outcome.rows;
+        apply_final_aks_delta_reconciliation(&config, &mut failed[0], None, false)?;
+        let mut outcome = finish_matrix_cell(&config, &inventory.orchestration_run_id, &inventory.cell_run_id, 1, 1, Ok(failed), Err(anyhow::anyhow!("drain failed")));
+        attach_teardown_outcome(&mut outcome, "failed")?;
+        let payload: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &outcome.rows, None)?)?;
+        assert_eq!(payload["official_result"]["status"], "failed");
+        assert_eq!(payload["official_result"]["evidence"]["teardown_outcome"], "failed");
+        assert_eq!(payload["official_result"]["evidence"]["durable_commits"]["run_cumulative_output"]["rows"], 10);
+        assert_eq!(payload["official_result"]["evidence"]["commit_window_output_usage"], "diagnostic_only");
         Ok(())
     }
 

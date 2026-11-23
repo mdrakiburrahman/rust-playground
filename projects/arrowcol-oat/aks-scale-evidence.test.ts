@@ -32,7 +32,12 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, 
     submitted_config_sha256: 'b'.repeat(64), effective_config_json: effective, effective_config_sha256: hash(effective),
     source_revision: 'a'.repeat(40),
     official_result: { run_id: cellId, table: 'synthetic_offline_table', status: 'succeeded', git_sha: 'a'.repeat(40),
-      tunables: { orchestration_run_id: orchestrationId }, evidence: { version: 1, commit_window_output_throughput: {
+      tunables: { orchestration_run_id: orchestrationId }, evidence: { version: 1, teardown_outcome: 'succeeded',
+        durable_commits: { run_cumulative_output: { teardown_outcome: 'succeeded' },
+          complete_30_second_commit_windows: [{ teardown_outcome: 'succeeded' }],
+          post_teardown_delta_reconciliation: { status: 'matched' } },
+        reconciliation: { status: 'within_bound', settled: true, ambiguous_rows: 0 }, commit_window_output_throughput: {
+        teardown_outcome: 'succeeded',
         scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
         measurement_start_unix_ms: window?.startMs ?? now - 60_000, measurement_end_unix_ms: window?.endMs ?? now - 30_000,
         window_seconds: window ? (window.endMs - window.startMs) / 1000 : 30, rows_per_second: 1234,
@@ -559,4 +564,23 @@ test('actual Rust immutable producer bytes remain an original window with unavai
   assert.equal(observed.committedRowsPerSecond, 0);
   assert.ok(observed.unavailableReasons.includes('authoritative_submitted_config_identity_unavailable'));
   assert.ok(observed.unavailableReasons.includes('original_official_cell_did_not_succeed'));
+});
+
+
+test('official reader never reports failed or nonfinal cells as performance', async t => {
+  for (const defect of ['failed', 'missing-teardown', 'unsettled', 'ambiguous', 'delta-mismatch'] as const) {
+    await t.test(defect, async t => {
+      const f = syntheticAuthenticatedTransport(t);
+      const result = f.document.official_result;
+      if (defect === 'failed') result.status = 'failed';
+      if (defect === 'missing-teardown') result.evidence.teardown_outcome = 'pending';
+      if (defect === 'unsettled') result.evidence.reconciliation.settled = false;
+      if (defect === 'ambiguous') result.evidence.reconciliation.ambiguous_rows = 1;
+      if (defect === 'delta-mismatch') result.evidence.durable_commits.post_teardown_delta_reconciliation.status = 'mismatch';
+      f.publishSyntheticDocument();
+      const read = await f.read();
+      assert.equal(read.committedRowsPerSecond, null);
+      assert.ok(read.unavailableReasons.includes(defect === 'failed' ? 'original_official_cell_did_not_succeed' : 'final_teardown_or_delivery_evidence_unavailable'));
+    });
+  }
 });
