@@ -2416,6 +2416,12 @@ mod optimize_upload_tests {
         )?;
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         assert_eq!(observed, vec![(0, vec![1, 2]), (1, vec![3, 4])]);
+        let unsafe_config = OptimizeConfig {
+            input_prefetch_files: 2,
+            bin_concurrency: 8,
+            ..OptimizeConfig::default()
+        };
+        assert!(unsafe_config.validate().is_err());
         Ok(())
     }
 
@@ -2742,6 +2748,9 @@ impl OptimizeConfig {
         if self.output_row_group_rows == 0 {
             return invalid("output row-group rows must be positive");
         }
+        if !(1..=MAX_OPTIMIZE_BIN_CONCURRENCY).contains(&self.bin_concurrency) {
+            return invalid("bin_concurrency must be within 1..=8");
+        }
         if !(1..=8).contains(&self.input_prefetch_files) {
             return invalid("input_prefetch_files must be within 1..=8");
         }
@@ -2757,9 +2766,6 @@ impl OptimizeConfig {
             {
                 return invalid("input_prefetch_files encoded input budget exceeds 512 MiB");
             }
-        }
-        if !(1..=MAX_OPTIMIZE_BIN_CONCURRENCY).contains(&self.bin_concurrency) {
-            return invalid("bin_concurrency must be within 1..=8");
         }
         if !(1..=MAX_OPTIMIZE_UPLOAD_CONCURRENCY).contains(&self.upload_concurrency) {
             return invalid("upload_concurrency must be within 1..=16");

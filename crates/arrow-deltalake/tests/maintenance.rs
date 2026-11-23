@@ -2204,6 +2204,7 @@ fn optimize_d42_residual_proof_write_failure_discards_prior_bin_outputs() -> Res
             ..LayoutPolicy::default()
         }),
         sealed_final: true,
+        bin_concurrency: 2,
         batch_rows: 6,
         ..optimize_config()
     };
