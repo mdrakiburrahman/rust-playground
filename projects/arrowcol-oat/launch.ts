@@ -1133,7 +1133,7 @@ async function diagnosticTransitionReceiptRoot(): Promise<string | undefined> {
 
 export async function assertNoUnsettledDeadlineReceipts(
   root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
-  requiredLocalDisposition?: string,
+  requiredLocalDisposition?: string, reconcileLocal = true,
 ): Promise<void> {
   const names: string[] = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
@@ -1171,6 +1171,9 @@ export async function assertNoUnsettledDeadlineReceipts(
     const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (!reconcileLocal) {
+      throw new Error(`Unsettled launcher receipt ${path}; refusing diagnostic transition without modifying it`);
+    }
     if (deadline.submittedPlatform === 'aks') {
       throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
     }
@@ -2091,7 +2094,7 @@ export async function main(
   if (prelaunchOnly && !transitionRoot) throw new OatCliError('Diagnostic prelaunch requires the versioned transition runtime');
   if (transitionRoot) receiptRoot = transitionRoot;
   await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
-    transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined);
+    transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !transitionRoot);
   if (prelaunchOnly) {
     console.log('Diagnostic transition ledger prelaunch gate passed; no workload started.');
     return;
