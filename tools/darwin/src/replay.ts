@@ -4,7 +4,7 @@ import { cp, mkdir, mkdtemp, open, readFile, readdir, realpath, rmdir, writeFile
 import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { checkCompressionCandidate } from "./compression-policy.js";
+import { checkCompressionCandidate, configCompressionSpec, parseCompressionSpec, type CompressionSpec } from "./compression-policy.js";
 import { readReconciledOatResult } from "./oat-result.js";
 import { artifactHash, hashTsx, type IdentityTools } from "./identity-reconcile.js";
 import { parityImageIds } from "./image-binding.js";
@@ -198,6 +198,28 @@ export interface QualifiedArm {
 
 export async function replayCompressionArm(
   data: string, label: string, raw: unknown, level: number, producerRevision: string,
+  runtime: string, home: string, preparedBinaryHash: string, identityTools: IdentityTools,
+  bindHost: string, endpointHost: string, stackBytes: number, qualified?: QualifiedArm,
+) {
+  return replayArm(data, label, raw, level, producerRevision, runtime, home, preparedBinaryHash, identityTools,
+    bindHost, endpointHost, stackBytes, qualified);
+}
+
+export async function replayTypedCompressionArm(
+  data: string, label: string, raw: unknown, requested: CompressionSpec, producerRevision: string,
+  runtime: string, home: string, preparedBinaryHash: string, identityTools: IdentityTools,
+  bindHost: string, endpointHost: string, stackBytes: number, qualified: QualifiedArm,
+) {
+  const compression = parseCompressionSpec(requested);
+  if (!isDeepStrictEqual(configCompressionSpec(raw), compression)) {
+    throw new Error("configured compression differs from the declared arm");
+  }
+  return replayArm(data, label, raw, compression, producerRevision, runtime, home, preparedBinaryHash, identityTools,
+    bindHost, endpointHost, stackBytes, qualified);
+}
+
+async function replayArm(
+  data: string, label: string, raw: unknown, level: number | CompressionSpec, producerRevision: string,
   runtime: string, home: string, preparedBinaryHash: string, identityTools: IdentityTools,
   bindHost: string, endpointHost: string, stackBytes: number, qualified?: QualifiedArm,
 ) {

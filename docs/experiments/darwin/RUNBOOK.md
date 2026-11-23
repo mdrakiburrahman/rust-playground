@@ -15,6 +15,7 @@ required before relying on this path.
 | --- | --- |
 | Fresh trusted home | `npx --no-install tsx tools/darwin/src/main.ts setup --home "$PWD/.darwin/qualification"` |
 | Identity-bearing smoke | `.darwin/qualification/trusted/bin/harness qualify --roles <roles.json> --bind-host <docker-bridge-ip> --endpoint-host <docker-bridge-ip> --controller-stack-bytes 33554432` |
+| Experimental codec smoke | `.darwin/qualification/trusted/bin/harness qualify-codec-smoke --candidate "$PWD" --roles <roles.json> --bind-host <docker-bridge-ip> --endpoint-host <docker-bridge-ip> --controller-stack-bytes 33554432` |
 | Smoke then full local series | Add `--series` to the command in a fresh trusted home. |
 
 `roles.json` must contain `baseline` and `candidate` objects with `imageId`
@@ -25,6 +26,11 @@ both collector images; labels alone do not prove source provenance. The two
 collector roles must differ, while all other roles remain fixed. The generated
 partition shortcut is not requested. This profile uses 14 client workers and
 a 16 GiB client budget, not the historical 1 GiB client profile.
+
+The codec smoke copies only `compression` and `compression_level` from the
+allowlisted candidate into the guarded qualification profile; it does not
+change the baseline or run a comparison. It is not yet live-validated. The
+Darwin runner and its existing pair evaluator remain Zstd-level-only.
 
 The driver writes an exclusive original 24-hour deadline and retains failed
 locks for manual owned-cell recovery; it does not resume interrupted series or

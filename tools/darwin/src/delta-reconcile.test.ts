@@ -7,6 +7,8 @@ import { test } from "node:test";
 import { tableFromArrays, tableToIPC } from "apache-arrow";
 import { Compression, Table as WasmTable, WriterPropertiesBuilder, writeParquet } from "parquet-wasm";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
+import { parseCompressionSpec } from "./compression-policy.js";
+import { wasmCompression } from "./oat-result.js";
 import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
 
 test("reconciles timed commits with decoded active Delta Adds and rejects changed evidence", async () => {
@@ -14,9 +16,9 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
   try {
     const tableRoot = join(root, "orders", "table");
     await mkdir(join(tableRoot, "_delta_log"), { recursive: true });
-    const parquet = (rows: number[]) => Buffer.from(writeParquet(
+    const parquet = (rows: number[], codec = Compression.ZSTD) => Buffer.from(writeParquet(
       WasmTable.fromIPCStream(tableToIPC(tableFromArrays({ value: rows }), "stream")),
-      new WriterPropertiesBuilder().setCompression(Compression.ZSTD).build(),
+      new WriterPropertiesBuilder().setCompression(codec).build(),
     ));
     const one = parquet([1, 2, 3]);
     const two = parquet([4, 5]);
@@ -66,6 +68,40 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       partition_columns: ["__arrowcol_ingestion"], granularity: "hour",
       logs: [0, 1].map(version => ({ version, sha256: sha(files[`_delta_log/${String(version).padStart(20, "0")}.json`]!) })),
     };
+    for (const codec of ["uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd"]) {
+      const expected = wasmCompression(parseCompressionSpec({ codec, level: null }));
+      const encoded = parquet([1, 2, 3], expected);
+      files["first.parquet"] = encoded;
+      files["_delta_log/00000000000000000002.json"] = Buffer.from(
+        JSON.stringify({ add: { path: "first.parquet", size: encoded.length, dataChange: true } }) + "\n",
+      );
+      await writeSnapshot(5);
+      const window = { ...measurement, parquetBytes: encoded.length, parquetBytesPerRow: encoded.length / 3 };
+      const selected = { ...receipt, parquetBytes: encoded.length };
+      const actual = reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+        window, [selected], [selected, laterReceipt], expected, preload);
+      assert.equal((await actual).rows, 3);
+      const wrong = expected === Compression.SNAPPY ? Compression.ZSTD : Compression.SNAPPY;
+      await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+        window, [selected], [selected, laterReceipt], wrong, preload), /selected Parquet codec differs/);
+    }
+    const snappy = parquet([1, 2, 3], Compression.SNAPPY);
+    files["first.parquet"] = snappy;
+    files["_delta_log/00000000000000000002.json"] = Buffer.from(
+      JSON.stringify({ add: { path: "first.parquet", size: snappy.length, dataChange: true } }) + "\n",
+    );
+    await writeSnapshot(5);
+    const first = { ...receipt, parquetBytes: snappy.length };
+    const second = { ...laterReceipt, finishedAtUnixMs: 150999 };
+    const both = { ...measurement, rows: 5, files: 2, commits: 2,
+      parquetBytes: snappy.length + two.length, parquetBytesPerRow: (snappy.length + two.length) / 5 };
+    await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+      both, [first, second], [first, second], Compression.SNAPPY, preload), /selected Parquet codec differs/);
+    files["first.parquet"] = one;
+    files["_delta_log/00000000000000000002.json"] = Buffer.from(
+      JSON.stringify({ add: { path: "first.parquet", size: one.length, dataChange: true } }) + "\n",
+    );
+    await writeSnapshot(5);
     const reconcile = (receipts: TimedReceipt[], allReceipts: TimedReceipt[] = [...receipts, laterReceipt], proof: unknown = preload) =>
       reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
         measurement, receipts, allReceipts, Compression.ZSTD, proof);

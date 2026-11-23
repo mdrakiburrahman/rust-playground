@@ -6,8 +6,9 @@ import { inspectParityHost } from "./parity-preflight.js";
 import { buildFooterInspector } from "./parity-replay.js";
 import { qualificationConfig } from "./qualification-config.js";
 import { runObservedArm } from "./qualification-observer.js";
-import { cleanEnv, prepareIdentityTools, prepareReplayRuntime, replayCompressionArm, sha256 } from "./replay.js";
-import { bindCodeArm, codeCommonConfigHash, type CodeRole } from "./tier2-binding.js";
+import { cleanEnv, prepareIdentityTools, prepareReplayRuntime, replayCompressionArm, replayTypedCompressionArm, sha256, type QualifiedArm } from "./replay.js";
+import { bindCodeArm, bindCompressionArm, codeCommonConfigHash, type CodeRole } from "./tier2-binding.js";
+import { checkTypedCompressionCandidate } from "./compression-policy.js";
 import { createOriginalDeadline, readOriginalDeadline } from "./tier2-deadline.js";
 import { ARM_RUN_BUDGET_MS, CLEANUP_RESERVE_MS, RECONCILIATION_RESERVE_MS, runTier2, type ArmBinding, type ArmRole, type Tier2Arm } from "./tier2.js";
 import type { SnapshotManifest } from "./snapshot.js";
@@ -45,8 +46,9 @@ function executableHash(image: CodeRole, env: NodeJS.ProcessEnv): string {
 
 export async function replayQualification(
   repo: string, home: string, rolesPath: string, bindHost: string, endpointHost: string,
-  stackBytes: number, runSeries: boolean,
+  stackBytes: number, runSeries: boolean, codecCandidate?: unknown,
 ): Promise<JsonObject> {
+  if (codecCandidate !== undefined && runSeries) throw new Error("typed compression is limited to a non-qualifying smoke");
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
   }
@@ -73,6 +75,17 @@ export async function replayQualification(
   const seedHash = await sha256(historicalPath);
   if (manifest.files["experiments/darwin/historical-parity.oat.json"]?.sha256 !== seedHash) throw new Error("trusted seed changed");
   const config = qualificationConfig(JSON.parse(await readFile(historicalPath, "utf8")));
+  const compressionSeedPath = join(trusted, "src", "experiments", "darwin", "candidate.oat.json");
+  let compressionSeed: unknown;
+  let compression: ReturnType<typeof checkTypedCompressionCandidate> | undefined;
+  if (codecCandidate !== undefined) {
+    const seedSha256 = await sha256(compressionSeedPath);
+    if (manifest.files["experiments/darwin/candidate.oat.json"]?.sha256 !== seedSha256) {
+      throw new Error("trusted compression seed changed");
+    }
+    compressionSeed = JSON.parse(await readFile(compressionSeedPath, "utf8")) as unknown;
+    compression = checkTypedCompressionCandidate(compressionSeed, codecCandidate);
+  }
   const configHash = codeCommonConfigHash(config);
   for (const collector of [baseline, candidate]) {
     bindCodeArm(config, { ...nonCollectorImages, collector: collector.imageId }, collector);
@@ -81,7 +94,7 @@ export async function replayQualification(
     throw new Error("layout trial requires a distinct candidate collector");
   }
   const planHash = hash(JSON.stringify({ revision: manifest.commit, configHash, seedHash, baseline, candidate,
-    nonCollectorImages, observerImageId, stackBytes, runSeries }));
+    nonCollectorImages, observerImageId, stackBytes, runSeries, compression }));
   const data = join(home, "data");
   await mkdir(data, { recursive: true });
   const lock = join(data, "evaluating");
@@ -92,7 +105,7 @@ export async function replayQualification(
     await mkdir(plan);
     const original = await createOriginalDeadline(join(plan, "deadline.json"), planHash);
     await writeFile(join(plan, "plan.json"), `${JSON.stringify({ version: 1, planHash, baseline, candidate,
-      nonCollectorImages, observerImageId, config, configHash, seedHash, runSeries, original })}\n`, { flag: "wx", mode: 0o400 });
+      nonCollectorImages, observerImageId, config, configHash, seedHash, runSeries, compression, original })}\n`, { flag: "wx", mode: 0o400 });
     const { runtime, binaryHash } = await prepareReplayRuntime(repo, home, stackBytes);
     const identityTools = await prepareIdentityTools(home, runtime, manifest, stackBytes);
     const footer = await buildFooterInspector(runtime, join(trusted, "prepare-home"), stackBytes);
@@ -131,9 +144,10 @@ export async function replayQualification(
       await readOriginalDeadline(join(plan, "deadline.json"), planHash);
       const host = await inspectParityHost(16 * 1024 ** 3, 86 * 1024 ** 3);
       const images = { ...nonCollectorImages, collector: selected.imageId };
-      const bound = bindCodeArm(config, images, selected);
-      const result = await replayCompressionArm(data, label, bound, 3, manifest.commit, runtime, home, binaryHash,
-        identityTools, bindHost, endpointHost, stackBytes, {
+      const bound = compression
+        ? bindCompressionArm(compressionSeed, codecCandidate, config, images, selected).config
+        : bindCodeArm(config, images, selected);
+      const qualified = {
           collectorRevision: selected.revision, expectedImages: images, deadlineUnixMs, decodeFile,
           launch: (root, run) => runObservedArm(root, run, {
             collectorImageId: selected.imageId, collectorRevision: selected.revision,
@@ -141,7 +155,12 @@ export async function replayQualification(
             observerBundleSha256: bundleSha256, observerSourcePath: source, observerSourceSha256: sourceSha256,
             deadlineUnixMs,
           }),
-        });
+        } satisfies QualifiedArm;
+      const result = compression
+        ? await replayTypedCompressionArm(data, label, bound, compression, manifest.commit, runtime, home, binaryHash,
+          identityTools, bindHost, endpointHost, stackBytes, qualified)
+        : await replayCompressionArm(data, label, bound, 3, manifest.commit, runtime, home, binaryHash,
+          identityTools, bindHost, endpointHost, stackBytes, qualified);
       await readOriginalDeadline(join(plan, "deadline.json"), planHash);
       if (!result.observer || result.deliveryIdentity?.verified !== true) throw new Error("qualified arm evidence is incomplete");
       await writeFile(join(result.runRoot, "host.json"), `${JSON.stringify(host)}\n`, { flag: "wx", mode: 0o400 });
@@ -154,7 +173,7 @@ export async function replayQualification(
     }
     const smoke = await execute("smoke", baseline, start + ARM_RUN_BUDGET_MS);
     if (!runSeries) {
-      const report = { kind: "smoke", valid: 0, accepted: false, reason: "single arm cannot qualify", original, smoke };
+      const report = { kind: "smoke", valid: 0, accepted: false, reason: "single arm cannot qualify", original, compression, smoke };
       await writeFile(join(plan, "result.json"), `${JSON.stringify(report)}\n`, { flag: "wx", mode: 0o400 });
       completed = true;
       return { ...report, reportPath: join(plan, "result.json") };

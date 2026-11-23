@@ -3,6 +3,7 @@ import { lstat, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
+import { parseCompressionSpec, type CompressionSpec } from "./compression-policy.js";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
 import { verifyReconciledDelivery, type IdentityTools } from "./identity-reconcile.js";
 import { adaptOatEvidence, CoverageUnavailableError, extractTimedReceipts, type OatMeasurement } from "./metrics-adapter.js";
@@ -29,6 +30,18 @@ export function assertParityProcessRevision(
 }
 
 export type ClientDataProfile = "diagnostic" | "realistic";
+
+export function wasmCompression(spec: CompressionSpec): Compression {
+  switch (spec.codec) {
+    case "uncompressed": return Compression.UNCOMPRESSED;
+    case "snappy": return Compression.SNAPPY;
+    case "gzip": return Compression.GZIP;
+    case "brotli": return Compression.BROTLI;
+    case "lz4": return Compression.LZ4;
+    case "lz4_raw": return Compression.LZ4_RAW;
+    case "zstd": return Compression.ZSTD;
+  }
+}
 
 export interface ClientEvidence {
   profile: ClientDataProfile;
@@ -121,7 +134,8 @@ export function extractClientEvidence(raw: unknown, requestedProfile: ClientData
 }
 
 export async function readReconciledOatResult(
-  resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string, compressionLevel: number | null,
+  resultsPath: string, snapshotRoot: string, table: string, sourceRevision: string,
+  compressionLevel: number | null | CompressionSpec,
   requestedProfile: ClientDataProfile, parity?: {
     config: unknown; decodeFile: (path: string, active: boolean) => Promise<number>; collectorRevision?: string;
     allowWriterOverrides?: boolean;
@@ -135,11 +149,19 @@ export async function readReconciledOatResult(
   deliveryIdentity: JsonObject | null;
   cellRunId: string; snapshotReconciled: true;
 }> {
+  const typedCompression = compressionLevel !== null && typeof compressionLevel === "object";
+  const compression = compressionLevel === null ? null : parseCompressionSpec(
+    typeof compressionLevel === "number" ? { codec: "zstd", level: compressionLevel } : compressionLevel,
+  );
+  if (typedCompression && (requestedProfile !== "realistic" || !parity?.allowWriterOverrides
+    || typeof parity.decodeFile !== "function" || !identity)) {
+    throw new Error("typed compression requires qualified preflight and delivery identity");
+  }
   if (requestedProfile === "diagnostic") {
-    if (compressionLevel !== null || !parity || typeof parity.decodeFile !== "function") {
+    if (compression !== null || !parity || typeof parity.decodeFile !== "function") {
       throw new Error("diagnostic parity requires a physical footer inspector and no codec override");
     }
-  } else if (compressionLevel === null || (parity && (!parity.allowWriterOverrides || typeof parity.decodeFile !== "function"))) {
+  } else if (compression === null || (parity && (!parity.allowWriterOverrides || typeof parity.decodeFile !== "function"))) {
     throw new Error("realistic compression requires its Zstd level and an explicitly qualified parity gate");
   }
   if (requestedProfile === "realistic" && !identity) {
@@ -180,7 +202,7 @@ export async function readReconciledOatResult(
   }
   if (requestedProfile === "realistic") {
     const policy = object(object(collector.writer_policy_overrides, "writer policy").defaults, "writer defaults");
-    if (policy.compression !== "zstd" || policy.compression_level !== compressionLevel) {
+    if (!compression || policy.compression !== compression.codec || (policy.compression_level ?? null) !== compression.level) {
       throw new Error("collector configured compression does not match the run");
     }
   }
@@ -229,7 +251,7 @@ export async function readReconciledOatResult(
   const identityResult: { value: JsonObject | null } = { value: null };
   const proof = await reconcileStoppedSnapshot(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
-    compressionLevel === null ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.decodeFile,
+    compression === null ? Compression.UNCOMPRESSED : wasmCompression(compression), preload, parity?.decodeFile,
     identity ? async paths => {
       identityResult.value = await verifyReconciledDelivery(identity.tools, identity.outputDir, resultsPath,
         createHash("sha256").update(bytes).digest("hex"), evidenceJson, table, paths);

@@ -108,16 +108,26 @@ async function main(args: string[]): Promise<void> {
       combined_score: 0, accepted: false, reason: "single local parity arm", receipt })}`);
     return;
   }
-  if (command === "qualify") {
+  if (command === "qualify" || command === "qualify-codec-smoke") {
+    const codecSmoke = command === "qualify-codec-smoke";
+    const experiment = codecSmoke ? "compression-config" : "layout-sort";
     let qualification: Awaited<ReturnType<typeof replayQualification>>;
     try {
+      if (codecSmoke && args.includes("--series")) throw new Error("codec smoke cannot run a qualification series");
+      let candidate: unknown;
+      if (codecSmoke) {
+        const candidateRoot = path.resolve(option(args, "--candidate", repo));
+        const problems = await check(home, candidateRoot, experiment);
+        if (problems) throw new Error(`candidate violates ${problems} path checks`);
+        candidate = JSON.parse(await readFile(path.join(candidateRoot, "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
+      }
       qualification = await replayQualification(repo, home, path.resolve(option(args, "--roles")),
         option(args, "--bind-host"), option(args, "--endpoint-host"),
-        Number(option(args, "--controller-stack-bytes")), args.includes("--series"));
+        Number(option(args, "--controller-stack-bytes")), args.includes("--series"), candidate);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "unexpected qualification error";
       console.error(`@FEEDBACK ${reason}`);
-      console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "layout-sort",
+      console.log(`@RESULT ${JSON.stringify({ version: 1, experiment,
         tier: args.includes("--series") ? "tier2-series" : "tier2-smoke", objective: "durable-rate",
         valid: 0, combined_score: 0, accepted: false, reason, durable_rows_per_second: null,
         measurement_unavailable_reason: reason })}`);
@@ -125,7 +135,7 @@ async function main(args: string[]): Promise<void> {
       return;
     }
     console.log("@FEEDBACK Local Tier-2 evidence alone cannot qualify a winner.");
-    console.log(`@RESULT ${JSON.stringify({ version: 1, experiment: "layout-sort",
+    console.log(`@RESULT ${JSON.stringify({ version: 1, experiment,
       tier: args.includes("--series") ? "tier2-series" : "tier2-smoke", objective: "durable-rate",
       valid: 0, combined_score: 0, accepted: false, reason: qualification.reason, qualification })}`);
     return;

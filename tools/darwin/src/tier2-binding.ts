@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { checkTypedCompressionCandidate, type CompressionSpec } from "./compression-policy.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -56,4 +57,18 @@ export function bindCodeArm(seed: unknown, images: Record<string, string>, colle
 
 export function codeCommonConfigHash(seed: unknown): string {
   return createHash("sha256").update(JSON.stringify(seed)).digest("hex");
+}
+
+export function bindCompressionArm(
+  frozenCandidate: unknown, candidate: unknown, qualificationSeed: unknown,
+  images: Record<string, string>, collector: CodeRole,
+): { config: JsonObject; compression: CompressionSpec } {
+  const compression = checkTypedCompressionCandidate(frozenCandidate, candidate);
+  const config = bindCodeArm(qualificationSeed, images, collector);
+  const tunables = object(config.tunables, "tunables");
+  const writer = object(tunables.parquet_writer, "writer");
+  const defaults = object(writer.defaults, "writer defaults");
+  defaults.compression = compression.codec;
+  defaults.compression_level = compression.level;
+  return { config, compression };
 }

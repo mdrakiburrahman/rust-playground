@@ -158,6 +158,21 @@ test("collector parity readback rejects drift in historical limits and local pre
       collector: { ...structuredClone(readback), parquet_writer: { ...structuredClone(requestedWriter), columns: {} } } },
   };
   assert.doesNotThrow(() => assertParityEvidence(qualifiedSeed, qualifiedEvidence, true));
+  const snappyWriter = { defaults: { compression: "snappy", compression_level: null }, max_row_group_rows: 262144 };
+  const snappySeed = { ...seed, tunables: { ...seed.tunables, parquet_writer: snappyWriter } };
+  const snappyEvidence = {
+    ...structuredClone(evidence),
+    processes: [{ ...structuredClone(evidence.processes[0]!), writer_policy_overrides: {
+      ...structuredClone(snappyWriter), columns: {} } }],
+    parity_admission_readback: { ...structuredClone(evidence.parity_admission_readback),
+      collector: { ...structuredClone(readback), parquet_writer: { ...structuredClone(snappyWriter), columns: {} } } },
+  };
+  assert.doesNotThrow(() => assertParityEvidence(snappySeed, snappyEvidence, true));
+  snappyEvidence.processes[0]!.writer_policy_overrides.defaults.compression = "zstd";
+  assert.throws(() => assertParityEvidence(snappySeed, snappyEvidence, true), /writer readback differs/);
+  snappyEvidence.processes[0]!.writer_policy_overrides.defaults.compression = "snappy";
+  snappyEvidence.parity_admission_readback.collector.parquet_writer.defaults.compression = "zstd";
+  assert.throws(() => assertParityEvidence(snappySeed, snappyEvidence, true), /writer readback differs/);
   qualifiedEvidence.parity_admission_readback.collector.parquet_writer.defaults.compression_level = 4;
   assert.throws(() => assertParityEvidence(qualifiedSeed, qualifiedEvidence, true), /writer readback differs/);
   qualifiedEvidence.parity_admission_readback.collector.parquet_writer.defaults.compression_level = 3;

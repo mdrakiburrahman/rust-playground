@@ -44,6 +44,8 @@ test("refuses a diagnostic result without the physical parity gate", async () =>
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", 3, "realistic", {
     config: {}, decodeFile: async () => 0,
   }), /explicitly qualified parity gate/);
+  await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused",
+    { codec: "snappy", level: null }, "realistic"), /typed compression requires qualified preflight/);
 });
 
 test("accepts matching Realistic evidence and reports client CPU separately", () => {

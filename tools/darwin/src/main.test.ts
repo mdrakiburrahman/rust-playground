@@ -59,3 +59,20 @@ test("qualification infrastructure failures report null measurement and exit non
     assert.match(run.stderr, /@FEEDBACK /);
   } finally { await rm(temporary, { recursive: true, force: true }); }
 });
+
+test("codec smoke cannot be promoted into a series", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "darwin-codec-cli-"));
+  try {
+    execFileSync("git", ["init", "-q", temporary]);
+    const main = fileURLToPath(new URL("./main.ts", import.meta.url));
+    const run = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), main, "qualify-codec-smoke",
+      "--home", path.join(temporary, "missing"), "--series"], { cwd: temporary, encoding: "utf8" });
+    assert.equal(run.status, 1);
+    const result = JSON.parse(run.stdout.replace(/^@RESULT /, ""));
+    assert.equal(result.experiment, "compression-config");
+    assert.equal(result.valid, 0);
+    assert.equal(result.accepted, false);
+    assert.equal(result.durable_rows_per_second, null);
+    assert.match(result.reason, /cannot run a qualification series/);
+  } finally { await rm(temporary, { recursive: true, force: true }); }
+});

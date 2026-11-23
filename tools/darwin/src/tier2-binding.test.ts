@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bindCodeArm, codeCommonConfigHash } from "./tier2-binding.js";
+import { bindCodeArm, bindCompressionArm, codeCommonConfigHash } from "./tier2-binding.js";
 
 const limit = 86 * 1024 ** 3;
 const seed = {
@@ -37,4 +37,17 @@ test("rejects weakened guard, topology and shortcut changes before admission", (
     { ...seed, tunables: { ...seed.tunables, collector: { ...seed.tunables.collector,
       runtime: { generated_partition_fast_path: false } } } },
   ]) assert.throws(() => bindCodeArm(invalid, images, role), /violates/);
+});
+
+test("binds only the candidate codec into the guarded production configuration", () => {
+  const candidate = { ...structuredClone(seed), tunables: { ...structuredClone(seed.tunables),
+    parquet_writer: { defaults: { compression: "snappy", compression_level: null } } } };
+  const { config, compression } = bindCompressionArm(seed, candidate, seed, images, role);
+  assert.deepEqual(compression, { codec: "snappy", level: null });
+  const expected = bindCodeArm(seed, images, role);
+  const writer = (expected.tunables as typeof seed.tunables).parquet_writer;
+  Object.assign(writer.defaults, { compression: "snappy", compression_level: null });
+  assert.deepEqual(config, expected);
+  candidate.overload_guard.cap_fraction = 0.95;
+  assert.throws(() => bindCompressionArm(seed, candidate, seed, images, role), /only compression/);
 });
