@@ -535,6 +535,60 @@ struct EncodedBatch {
     encoded_bytes: u64,
 }
 
+fn null_fraction_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], profile: DataProfile) -> Result<serde_json::Value> {
+    #[derive(Default)]
+    struct Counts {
+        rows: u64,
+        fields: usize,
+        eligible: std::collections::BTreeSet<String>,
+        eligible_rows: u64,
+        null_rows: u64,
+    }
+    let mut tables = std::collections::BTreeMap::<String, Counts>::new();
+    for batches in corpus {
+        for batch in batches.iter() {
+            let counts = tables
+                .entry(batch.table.identity.table().as_str().to_owned())
+                .or_default();
+            counts.fields = batch.template.num_columns();
+            counts.rows = counts
+                .rows
+                .checked_add(batch.rows)
+                .context("corpus table row count overflow")?;
+            for (field, array) in batch.template.schema().fields().iter().zip(batch.template.columns()) {
+                if !field.is_nullable()
+                    || field.name() == "customer_id"
+                    || (profile == DataProfile::Realistic && field.name() == "endpoint_url")
+                {
+                    continue;
+                }
+                counts.eligible.insert(field.name().to_owned());
+                counts.eligible_rows = counts
+                    .eligible_rows
+                    .checked_add(u64::try_from(array.len())?)
+                    .context("corpus eligible row count overflow")?;
+                counts.null_rows = counts
+                    .null_rows
+                    .checked_add(u64::try_from(array.null_count())?)
+                    .context("corpus null count overflow")?;
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "version": 1,
+        "tables": tables.into_iter().map(|(table, counts)| serde_json::json!({
+            "table": table,
+            "schema_fields": counts.fields,
+            "rows": counts.rows,
+            "null_fraction": {
+                "eligible_columns": counts.eligible.len(),
+                "eligible_rows": counts.eligible_rows,
+                "null_rows": counts.null_rows,
+            },
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ManifestCohort {
@@ -1099,6 +1153,7 @@ impl PreparedClient {
             }
             corpus.push(Arc::new(batches));
         }
+        let generator_applicability = null_fraction_corpus_evidence(&corpus, options.data_profile)?;
         let mut channels = Vec::new();
         for _ in 0..options.workers {
             let mut worker = Vec::new();
@@ -1109,6 +1164,7 @@ impl PreparedClient {
         }
         let mut preparation = serde_json::json!({
             "data_profile": options.data_profile,
+            "generator_applicability": generator_applicability,
             "payload_corpus_hash_version": PAYLOAD_HASH_VERSION,
             "payload_corpus_hash_scope": payload_hash_scope(options.data_profile),
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
@@ -4791,6 +4847,7 @@ mod tests {
         options.grpc_send_compression = GrpcCompression::Gzip;
         options.grpc_accept_compression = GrpcCompression::Gzip;
         options.data_profile = DataProfile::Realistic;
+        options.null_fraction = 1.0;
         options.send_iter = SendIter::ArcCursor;
         options.identity_builder = IdentityBuilder::DirectUtf8;
         let client = PreparedClient::prepare(
@@ -4834,6 +4891,15 @@ mod tests {
         );
         assert!(report.completed_rows > 8, "fast worker did not replenish its slot");
         let metrics = client.metrics("completed")?;
+        let applicability = &metrics["preparation"]["generator_applicability"]["tables"][0];
+        assert_eq!(applicability["table"], "sqlserver_availability_replica_states");
+        assert_eq!(applicability["rows"], 8);
+        let eligible_columns = applicability["null_fraction"]["eligible_columns"]
+            .as_u64()
+            .context("eligible columns")?;
+        assert!(eligible_columns > 0);
+        assert_eq!(applicability["null_fraction"]["eligible_rows"], eligible_columns * 8);
+        assert_eq!(applicability["null_fraction"]["null_rows"], eligible_columns * 8);
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()

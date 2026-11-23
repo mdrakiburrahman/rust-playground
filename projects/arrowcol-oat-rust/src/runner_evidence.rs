@@ -737,6 +737,7 @@ impl CellEvidence {
         }
         self.client_reports.entry(table.to_owned()).or_default().push(json!({
             "client_id": client_id,
+            "table": table,
             "phase_counters": counters,
             "consumer_effective_config": effective,
             "execution_image": client_image_evidence(output)?,
@@ -2351,6 +2352,42 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
             result.insert(key.to_owned(), value.clone());
         }
     }
+    if let Some(applicability) = object.get("generator_applicability") {
+        let tables = applicability.get("tables").and_then(Value::as_array)
+            .context("client generator_applicability tables must be an array")?;
+        if applicability["version"] != 1 || tables.is_empty() {
+            bail!("invalid client generator_applicability version or tables");
+        }
+        let mut names = HashSet::new();
+        let mut total_rows = 0_u64;
+        for table in tables {
+            let name = table["table"].as_str().filter(|name| !name.is_empty())
+                .context("client generator_applicability table is missing")?;
+            if !names.insert(name.to_ascii_lowercase()) {
+                bail!("duplicate client generator_applicability table");
+            }
+            let rows = table["rows"].as_u64().filter(|rows| *rows > 0)
+                .context("client generator_applicability rows must be positive")?;
+            let fields = table["schema_fields"].as_u64().filter(|fields| *fields > 0)
+                .context("client generator_applicability schema_fields must be positive")?;
+            let nulls = &table["null_fraction"];
+            let columns = nulls["eligible_columns"].as_u64()
+                .context("client generator_applicability eligible_columns must be unsigned")?;
+            let eligible_rows = nulls["eligible_rows"].as_u64()
+                .context("client generator_applicability eligible_rows must be unsigned")?;
+            let null_rows = nulls["null_rows"].as_u64()
+                .context("client generator_applicability null_rows must be unsigned")?;
+            if columns > fields || rows.checked_mul(columns) != Some(eligible_rows) || null_rows > eligible_rows {
+                bail!("inconsistent client generator_applicability null counts");
+            }
+            total_rows = total_rows.checked_add(rows).context("client generator_applicability row overflow")?;
+        }
+        if object.get("corpus_rows").and_then(Value::as_u64) != Some(total_rows) {
+            bail!("client generator_applicability does not match prepared corpus rows");
+        }
+        result.insert("generator_applicability".to_owned(), applicability.clone());
+    }
+
     for key in [
         "generation_wall_seconds",
         "generation_cpu_seconds",
