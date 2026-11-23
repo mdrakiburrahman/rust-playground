@@ -1731,24 +1731,25 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 mod tests {
     use super::*;
 
+    fn validation_error(config: &OatConfig) -> Result<String> {
+        match config.validate() {
+            Ok(()) => anyhow::bail!("expected configuration validation to fail"),
+            Err(error) => Ok(error.to_string()),
+        }
+    }
+
     #[test]
     fn local_setup_timeout_is_strictly_bounded() -> Result<()> {
         let mut config = valid();
         config.platform.local.setup_timeout_ms = Some(0);
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("platform.local.setup_timeout_ms")
-        );
+        assert!(validation_error(&config)?.contains("platform.local.setup_timeout_ms"));
 
         config.platform.local.setup_timeout_ms = Some(LOCAL_SETUP_TIMEOUT_MIN_MS);
         config.validate()?;
         config.platform.local.setup_timeout_ms = Some(LOCAL_SETUP_TIMEOUT_MAX_MS);
         config.validate()?;
         config.platform.local.setup_timeout_ms = Some(LOCAL_SETUP_TIMEOUT_MAX_MS + 1);
-        assert!(config.validate().unwrap_err().to_string().contains("30000..=86400000"));
+        assert!(validation_error(&config)?.contains("30000..=86400000"));
 
         config.platform.kind = OatMode::Local;
         config.platform.local.setup_timeout_ms = None;
@@ -1772,42 +1773,51 @@ mod tests {
             data_profile: Some(ClientDataProfile::Realistic),
             ..Default::default()
         });
-        let error = config.validate().unwrap_err().to_string();
+        let error = validation_error(&config)?;
         assert!(error.contains("conservative workload reservation"), "{error}");
         assert!(error.contains("configured_live_slots=4"), "{error}");
 
-        config.tunables.client.as_mut().unwrap().max_memory_bytes = Some(24 * 1024 * 1024 * 1024);
+        config
+            .tunables
+            .client
+            .as_mut()
+            .context("missing client tunables")?
+            .max_memory_bytes = Some(24 * 1024 * 1024 * 1024);
         config.validate()?;
 
-        let client = config.tunables.client.as_mut().unwrap();
+        let client = config.tunables.client.as_mut().context("missing client tunables")?;
         client.data_profile = Some(ClientDataProfile::Diagnostic);
         client.data_mode = Some(DataMode::Independent);
         client.workers = Some(2);
         client.max_memory_bytes = Some(24 * 1024 * 1024 * 1024);
-        let error = config.validate().unwrap_err().to_string();
+        let error = validation_error(&config)?;
         assert!(error.contains("conservative workload reservation"), "{error}");
         Ok(())
     }
 
     #[test]
-    fn config_validation_rejects_local_scale_out_campaign_before_startup() {
+    fn config_validation_rejects_local_scale_out_campaign_before_startup() -> Result<()> {
         let mut config = valid();
         config.platform.kind = OatMode::Local;
         config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("scale_out_single_table exploratory runs require AKS"));
+        assert!(validation_error(&config)?.contains("scale_out_single_table exploratory runs require AKS"));
+        Ok(())
     }
 
     #[test]
     fn collector_cpu_preflight_parses_linux_flags_and_sse3_alias() {
         let flags = "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 fma abm movbe xsave avx512f avx512bw avx512cd avx512dq avx512vl\n";
         for target in ["x86-64-v2", "x86-64-v3", "x86-64-v4"] {
-            arrowcol_tunables::verify_collector_target_cpu_flags(target, flags, "collector.target_cpu preflight")
-                .unwrap();
+            assert!(
+                arrowcol_tunables::verify_collector_target_cpu_flags(target, flags, "collector.target_cpu preflight")
+                    .is_ok()
+            );
         }
         let spaced = "flags : cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2\n";
-        arrowcol_tunables::verify_collector_target_cpu_flags("x86-64-v2", spaced, "collector.target_cpu preflight")
-            .unwrap();
+        assert!(
+            arrowcol_tunables::verify_collector_target_cpu_flags("x86-64-v2", spaced, "collector.target_cpu preflight")
+                .is_ok()
+        );
         assert!(
             arrowcol_tunables::verify_collector_target_cpu_flags("generic", "", "collector.target_cpu preflight")
                 .is_ok()
@@ -1815,30 +1825,37 @@ mod tests {
     }
 
     #[test]
-    fn collector_cpu_preflight_reports_absent_empty_and_missing_flags() {
-        let absent = arrowcol_tunables::verify_collector_target_cpu_flags(
+    fn collector_cpu_preflight_reports_absent_empty_and_missing_flags() -> Result<()> {
+        let absent = match arrowcol_tunables::verify_collector_target_cpu_flags(
             "x86-64-v2",
             "processor\t: 0\n",
             "collector.target_cpu preflight",
-        )
-        .unwrap_err();
+        ) {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("expected missing host CPU flags to fail"),
+        };
         assert!(absent.contains("collector.target_cpu preflight cannot find host CPU flags"));
 
-        let empty = arrowcol_tunables::verify_collector_target_cpu_flags(
+        let empty = match arrowcol_tunables::verify_collector_target_cpu_flags(
             "x86-64-v2",
             "flags\t\t:   \n",
             "collector.target_cpu preflight",
-        )
-        .unwrap_err();
+        ) {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("expected empty host CPU flags to fail"),
+        };
         assert!(empty.contains("collector.target_cpu preflight found empty host CPU flags"));
 
-        let insufficient = arrowcol_tunables::verify_collector_target_cpu_flags(
+        let insufficient = match arrowcol_tunables::verify_collector_target_cpu_flags(
             "x86-64-v3",
             "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx bmi1 bmi2 fma abm movbe xsave\n",
             "collector.target_cpu preflight",
-        )
-        .unwrap_err();
+        ) {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("expected missing AVX2 to fail"),
+        };
         assert!(insufficient.contains("AVX2 (cpuinfo token: avx2)"));
+        Ok(())
     }
 
     #[test]
@@ -1910,7 +1927,7 @@ mod tests {
             .collector
             .get_or_insert_with(Default::default)
             .target_cpu = Some(CollectorTargetCpu::Generic);
-        let error = explicit.validate().unwrap_err().to_string();
+        let error = validation_error(&explicit)?;
         assert!(error.contains("tunables.collector build-profile fields"));
         assert!(error.contains("platform.local.stable_image_build=true"));
 

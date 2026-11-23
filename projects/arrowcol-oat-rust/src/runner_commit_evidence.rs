@@ -705,7 +705,9 @@ struct LocalDeltaCommitMetadata {
     timestamp_unix_ms: Option<u64>,
 }
 
-fn parse_local_delta_commit(version: u64, contents: &[u8]) -> Result<(LocalDeltaCommitMetadata, BTreeMap<(u64, String), DeltaLogAdd>)> {
+type LocalDeltaAdds = BTreeMap<(u64, String), DeltaLogAdd>;
+
+fn parse_local_delta_commit(version: u64, contents: &[u8]) -> Result<(LocalDeltaCommitMetadata, LocalDeltaAdds)> {
     let mut metadata = LocalDeltaCommitMetadata::default();
     let mut adds = BTreeMap::new();
     for (line_number, line) in contents.split(|byte| *byte == b'\n').enumerate() {
@@ -1004,10 +1006,11 @@ mod local_delta_reconciliation_tests {
         fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
     }
 
-    fn receipt(version: u64, rows: u64, files: u64, input: u64, bytes: u64, min: u64, max: u64, finish: u64) -> Value {
+    fn receipt(version: u64, rows: u64, files: u64, bytes: (u64, u64), ingress: (u64, u64), finish: u64) -> Value {
         json!({
-            "delta_version": version, "rows": rows, "files": files, "input_bytes": input,
-            "parquet_bytes": bytes, "min_ingested_at_ms": min, "max_ingested_at_ms": max,
+            "delta_version": version, "rows": rows, "files": files,
+            "input_bytes": bytes.0, "parquet_bytes": bytes.1,
+            "min_ingested_at_ms": ingress.0, "max_ingested_at_ms": ingress.1,
             "finished_at_unix_ms": finish, "elapsed_seconds": 0.1,
         })
     }
@@ -1035,10 +1038,10 @@ mod local_delta_reconciliation_tests {
                 "rows": 15, "files": 2, "input_bytes": 900, "parquet_bytes": 400,
             },
             "run_cumulative_output": {"commits_by_version": [
-                receipt(0, 99, 1, 100, 50, 900, 950, 999),
-                receipt(1, 10, 1, 600, 300, 1_005, 1_008, 1_010),
-                receipt(3, 5, 1, 300, 100, 1_040, 1_045, 1_050),
-                receipt(4, 77, 1, 100, 50, 108_000, 108_500, 109_000),
+                receipt(0, 99, 1, (100, 50), (900, 950), 999),
+                receipt(1, 10, 1, (600, 300), (1_005, 1_008), 1_010),
+                receipt(3, 5, 1, (300, 100), (1_040, 1_045), 1_050),
+                receipt(4, 77, 1, (100, 50), (108_000, 108_500), 109_000),
             ]},
         })
     }
