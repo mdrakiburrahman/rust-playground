@@ -84,7 +84,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.connections_per_worker", "1"),
     capability!("client.pod_ordinal", "0 (per-client GUID salt; u32)"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
-    capability!("client.max_rows", "component default"),
+    capability!("client.max_rows", "0; one-shot only, inert in duration-based OAT cells"),
     capability!("client.stream_retry_max_attempts", "4"),
     capability!("client.stream_retry_base_backoff_ms", "10"),
     capability!("client.stream_retry_max_backoff_ms", "250"),
@@ -471,6 +471,8 @@ impl Tunables {
                     || (name.starts_with("maintenance.") && name != "maintenance.enabled"))
             {
                 (inert, "maintenance_disabled")
+            } else if name == "client.max_rows" {
+                (inert, "duration_based_run")
             } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
                 (inert, "dictionary_disabled")
             } else if matches!(

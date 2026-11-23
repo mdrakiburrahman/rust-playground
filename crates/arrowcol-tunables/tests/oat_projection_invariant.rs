@@ -348,6 +348,20 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
 }
 
 #[test]
+fn duration_run_classifies_one_shot_max_rows_as_inert() -> Result<()> {
+    let tunables = Tunables::parse_oat_json(json!({"client":{"max_rows":129}}))?;
+    let evidence = tunables.classify_oat_leaves()?;
+    assert_eq!(
+        evidence["inert_fields"],
+        json!([{
+            "path": "client.max_rows", "reason": "duration_based_run"
+        }])
+    );
+    assert_eq!(evidence["projection_only"], json!([]));
+    Ok(())
+}
+
+#[test]
 fn typed_oat_leaves_have_a_classification_and_reach_their_role() -> Result<()> {
     let mut errors = Vec::new();
     for path in typed_leaves()? {

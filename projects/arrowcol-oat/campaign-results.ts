@@ -315,7 +315,7 @@ function factorCoverage(row: CampaignMeasurement): FactorCoverage {
       if (!isRecord(evidence)) { incomplete = true; continue; }
       const seen = new Set<string>();
       for (const [field, reasons, allowedReasons] of [
-        ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled']],
+        ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled', 'duration_based_run']],
         ['projection_only', projected, ['consumer_startup_proof_unverified']],
         ['runner_controls', undefined, ['maintenance_runner_control', 'router_log_filter_inheritance']],
         ['consumer_verified', undefined, ['consumer_startup_readback']],

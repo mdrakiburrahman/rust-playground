@@ -933,6 +933,22 @@ test('qualifies fully covered runner-control factors', () => {
   assert.match(renderCampaignResults(candidate, 'C1'), /runner \(3\/3\)/);
 });
 
+test('nulls a duration-based run when the varied factor is a one-shot row limit', () => {
+  const candidate = coveredCandidate('one-shot-limit', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.client.max_rows', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: { max_rows: 129 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'client.max_rows', reason: 'duration_based_run' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: client\.max_rows: duration_based_run/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
 test('nulls a per-column dictionary page limit when dictionary is explicitly disabled on that column', () => {
   const candidate = coveredCandidate('dictionary-off', 100, 240).map(row => ({
     ...row,
