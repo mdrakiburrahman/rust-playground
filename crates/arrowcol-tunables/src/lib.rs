@@ -331,6 +331,11 @@ pub struct CommitTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_detach_ratio"
+    )]
+    pub detach_ratio: Option<u8>,
     pub enabled: Option<bool>,
     pub sort_columns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -391,6 +396,15 @@ pub struct RuntimeTunables {
     )]
     pub cpu_queue_jobs: Option<usize>,
     pub generated_partition_fast_path: Option<bool>,
+}
+
+fn deserialize_detach_ratio<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)
+        .map_err(|err| serde::de::Error::custom(format!("collector.layout.detach_ratio: {err}")))?;
+    Ok(Some(value))
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

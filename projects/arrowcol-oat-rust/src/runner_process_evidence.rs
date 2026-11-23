@@ -588,6 +588,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
+            "ARROWCOL_COLLECTOR_LAYOUT_DETACH_RATIO" => "/runtime/layout_detach_ratio".to_owned(),
             "ARROWCOL_COLLECTOR_LAYOUT_ENABLED" => "/layout/process_policy/enabled".to_owned(),
             "ARROWCOL_COLLECTOR_SORT_OPTIONS" => {
                 expected = serde_json::to_value(
@@ -868,6 +869,10 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
                 bail!("collector layout reported invalid resolved limit");
             }
             policy.insert(field.to_owned(), actual.clone());
+        }
+        if let Some(ratio) = value["config"].get("detach_ratio") {
+            anyhow::ensure!(enabled && ratio.as_u64().is_some_and(|ratio| (1..=8).contains(&ratio)), "invalid effective collector.layout.detach_ratio");
+            policy.insert("detach_ratio".to_owned(), ratio.clone());
         }
         let properties = &value["parquet_properties"];
         let valid_properties = properties.as_object().is_some_and(|object| {

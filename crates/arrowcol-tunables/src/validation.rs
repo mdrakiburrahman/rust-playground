@@ -266,6 +266,7 @@ const CAPABILITIES: &[Capability] = &[
         "collector.layout.bloom_columns",
         "customer_id (comma-separated; empty disables Bloom filters)"
     ),
+    capability!("collector.layout.detach_ratio", "2"),
     capability!("collector.layout.max_rows", "262144"),
     capability!("collector.layout.max_input_bytes", "67108864"),
     capability!("collector.layout.row_group_rows", "16384"),
@@ -1095,6 +1096,7 @@ impl Tunables {
                         output.insert("ARROWCOL_COLLECTOR_BLOOM_COLUMNS".to_owned(), columns.join(","));
                     }
                     for (suffix, value) in [
+                        ("LAYOUT_DETACH_RATIO", layout.detach_ratio.map(usize::from)),
                         ("LAYOUT_MAX_ROWS", layout.max_rows),
                         ("LAYOUT_MAX_INPUT_BYTES", layout.max_input_bytes),
                         ("LAYOUT_ROW_GROUP_ROWS", layout.row_group_rows),
@@ -1487,6 +1489,13 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
     let Some(layout) = layout else {
         return Ok(());
     };
+    if let Some(ratio) = layout.detach_ratio {
+        anyhow::ensure!((1..=8).contains(&ratio), "collector.layout.detach_ratio must be 1..=8");
+        anyhow::ensure!(
+            layout.enabled != Some(false),
+            "collector.layout.detach_ratio requires enabled layout"
+        );
+    }
     let has_overrides = layout.sort_columns.is_some()
         || layout.sort_options.is_some()
         || layout.bloom_columns.is_some()
@@ -3095,6 +3104,24 @@ mod tests {
             serde_json::from_str(r#"{"arrow_ipc":{"compression":"zstd"},"transport":{"ipc_compression":"zstd"}}"#)?;
         assert!(error_text(duplicate.validate()).contains("not in both sections"));
         Ok(())
+    }
+
+    #[test]
+    fn detach_ratio_rejects_bad_values_and_inactive_layout() {
+        for ratio in [
+            serde_json::json!(0),
+            serde_json::json!(9),
+            serde_json::json!("2"),
+            serde_json::Value::Null,
+            serde_json::json!(1.5),
+        ] {
+            let result = Tunables::parse_oat_json(serde_json::json!({"collector":{"layout":{"detach_ratio":ratio}}}));
+            assert!(format!("{:#}", result.unwrap_err()).contains("collector.layout.detach_ratio"));
+        }
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector":{"layout":{"detach_ratio":2,"enabled":false}}}))
+                .is_err()
+        );
     }
 
     #[test]
