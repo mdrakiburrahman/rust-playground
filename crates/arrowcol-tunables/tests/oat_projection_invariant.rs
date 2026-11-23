@@ -295,6 +295,9 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "router.sql_pool_acquire_timeout_ms" {
         input["router"] = json!({"sql_pool_max_size": 1});
     }
+    if path == "client.identity_builder" {
+        input["client"] = json!({"data_profile": "realistic"});
+    }
     if path == "collector.upload.buffer_capacity_bytes" || path == "collector.upload.request_concurrency" {
         input["collector"] = json!({"upload": {"mode": "buffered_multipart"}});
     }
