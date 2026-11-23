@@ -665,6 +665,18 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
+        for (field, maximum) in [
+            ("optimize_upload_concurrency", 16),
+            ("bin_concurrency", 8),
+            ("input_prefetch_files", 8),
+        ] {
+            if let Some(setting) = value.get("maintenance").and_then(|section| section.get(field))
+                && !setting.is_null()
+                && !setting.as_u64().is_some_and(|number| (1..=maximum).contains(&number))
+            {
+                bail!("maintenance.{field} must be an integer within 1..={maximum}");
+            }
+        }
         let tunables: Self = serde_json::from_value(value).context("parse OAT tunables")?;
         tunables.validate_for_oat()?;
         Ok(tunables)
@@ -2943,7 +2955,9 @@ mod tests {
         ] {
             let mut input = value.clone();
             input["maintenance"]["optimize_upload_concurrency"] = invalid;
-            assert!(Tunables::parse_oat_json(input).is_err());
+            assert!(
+                format!("{:#}", Tunables::parse_oat_json(input).unwrap_err()).contains("optimize_upload_concurrency")
+            );
         }
         let mut no_multipart = value.clone();
         no_multipart["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
@@ -2974,7 +2988,7 @@ mod tests {
         ] {
             let mut input = valid.clone();
             input["maintenance"]["bin_concurrency"] = invalid;
-            assert!(Tunables::parse_oat_json(input).is_err());
+            assert!(format!("{:#}", Tunables::parse_oat_json(input).unwrap_err()).contains("bin_concurrency"));
         }
         let mut too_small = valid.clone();
         too_small["maintenance"]["max_concurrent_decoded_bytes"] = serde_json::json!(2147483647u64);
@@ -3005,7 +3019,7 @@ mod tests {
         ] {
             let mut input = valid.clone();
             input["maintenance"]["input_prefetch_files"] = invalid;
-            assert!(Tunables::parse_oat_json(input).is_err());
+            assert!(format!("{:#}", Tunables::parse_oat_json(input).unwrap_err()).contains("input_prefetch_files"));
         }
         let mut spool = valid.clone();
         spool["maintenance"]["input_read_strategy"] = serde_json::json!("spool");
