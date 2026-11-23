@@ -2049,6 +2049,17 @@ mod consumer_startup_projection_tests {
     #[test]
     #[ignore = "requires built arrowcol-dataflow-rust"]
     fn parquet_policy_reaches_actual_collector_startup() -> Result<()> {
+        fn leaf_paths(value: &Value, path: &mut Vec<String>, leaves: &mut Vec<Vec<String>>) {
+            if let Some(fields) = value.as_object() {
+                for (key, value) in fields {
+                    path.push(key.clone());
+                    leaf_paths(value, path, leaves);
+                    path.pop();
+                }
+            } else {
+                leaves.push(path.clone());
+            }
+        }
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug")
             .join(format!("arrowcol-dataflow-rust{}", std::env::consts::EXE_SUFFIX));
@@ -2059,8 +2070,16 @@ mod consumer_startup_projection_tests {
             json!({"defaults":{"compression":"brotli","compression_level":1}}),
             json!({"defaults":{"compression":"lz4"}}),
             json!({"defaults":{"compression":"lz4_raw"}}),
-            json!({"defaults":{"compression":"zstd","compression_level":3},
-                "columns":{"customer_id":{"compression":"snappy","dictionary_enabled":true}},
+            json!({"defaults":{"compression":"zstd","compression_level":3,"encoding":"plain",
+                    "dictionary_enabled":true,"dictionary_page_size_limit":2048,
+                    "data_page_size_limit":4096,"statistics":"chunk","write_page_header_statistics":true,
+                    "bloom_filter_enabled":true,"bloom_filter_fpp":0.05,"bloom_filter_ndv":1024,
+                    "data_page_v2_compression_ratio_threshold":1.5},
+                "columns":{"customer_id":{"compression":"gzip","compression_level":5,
+                    "encoding":"delta_byte_array","dictionary_enabled":true,"dictionary_page_size_limit":1024,
+                    "data_page_size_limit":2048,"statistics":"page","write_page_header_statistics":false,
+                    "bloom_filter_enabled":true,"bloom_filter_fpp":0.1,"bloom_filter_ndv":512,
+                    "data_page_v2_compression_ratio_threshold":1.2}},
                 "writer_version":"v2","max_row_group_rows":16384,"max_row_group_bytes":1048576,
                 "data_page_row_count_limit":2048,"write_batch_size":512,
                 "offset_index_enabled":true,"column_index_truncate_length":64,
@@ -2070,7 +2089,7 @@ mod consumer_startup_projection_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         for policy in cases {
-            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy}))?;
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy.clone()}))?;
             let output = std::process::Command::new(&binary)
                 .arg("--help")
                 .env_clear()
@@ -2080,6 +2099,21 @@ mod consumer_startup_projection_tests {
             anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
             let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
             verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            let mut leaves = Vec::new();
+            leaf_paths(&policy, &mut Vec::new(), &mut leaves);
+            for path in leaves {
+                let mut missing = observed.clone();
+                let mut parent = &mut missing["parquet_writer"];
+                for part in &path[..path.len() - 1] {
+                    parent = parent.get_mut(part).context("missing policy parent")?;
+                }
+                parent.as_object_mut().context("policy parent must be an object")?
+                    .remove(&path[path.len() - 1]).context("consumer omitted requested policy leaf")?;
+                anyhow::ensure!(
+                    verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
+                    "verifier accepted missing Parquet leaf {}", path.join(".")
+                );
+            }
             observed.as_object_mut().context("startup readback must be an object")?.remove("parquet_writer");
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
         }
