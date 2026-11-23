@@ -239,6 +239,13 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
       const parityResult = await preflight();
       assert.equal(parityResult.prelaunch_only, true);
       assert.equal(parityResult.qualification, 'not-evaluated');
+      const other = path.join(receiptRoot, '123e4567-e89b-42d3-a456-426614174099.json');
+      const otherReceipt = JSON.stringify({ ...receipt, invocation_id: '123e4567-e89b-42d3-a456-426614174099' });
+      await writeFile(other, otherReceipt);
+      await assert.rejects(check('other-unsettled'), /OAT run failed/);
+      assert.match(await readFile(path.join(root, 'other-unsettled.log'), 'utf8'), /refusing diagnostic transition without modifying it/);
+      assert.equal(await readFile(other, 'utf8'), otherReceipt);
+      await unlink(other);
       await assert.rejects(readFile(path.join(runtime, 'out', 'arrowcol-oat', 'deadline-receipts', `${invocation}.json`)), { code: 'ENOENT' });
       await unlink(dispositionPath);
       await assert.rejects(check('missing'), /OAT run failed/);
