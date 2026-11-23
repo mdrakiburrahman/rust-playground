@@ -2735,7 +2735,17 @@ mod tests {
         for field in ["batch_channel_capacity", "put_result_channel_capacity"] {
             let valid = serde_json::json!({"collector":{"limits":{field: 7}}});
             let parsed = Tunables::parse_oat_json(valid)?;
-            Tunables::parse_oat_json(serde_json::to_value(parsed)?)?;
+            let serialized = serde_json::to_value(parsed)?;
+            let other = if field == "batch_channel_capacity" {
+                "put_result_channel_capacity"
+            } else {
+                "batch_channel_capacity"
+            };
+            assert!(serialized.pointer(&format!("/collector/limits/{other}")).is_none());
+            Tunables::parse_oat_json(serialized)?;
+            Tunables::parse_oat_json(serde_json::to_value(Tunables::parse_oat_json(
+                serde_json::json!({"collector":{"limits":{}}}),
+            )?)?)?;
             let maximum = serde_json::json!({"collector":{"limits":{field:usize::MAX >> 3}}});
             Tunables::parse_oat_json(maximum)?;
             for capacity in [0, (usize::MAX >> 3) + 1] {
@@ -2744,6 +2754,7 @@ mod tests {
                 assert!(error.contains(&format!("collector.limits.{field}")), "{error}");
             }
             for invalid in [
+                serde_json::Value::Null,
                 serde_json::json!(-1),
                 serde_json::json!("untrusted"),
                 serde_json::json!(true),
