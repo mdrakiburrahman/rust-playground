@@ -3055,6 +3055,18 @@ groups:
         promote_client_readback(&config, &mut projected, Some(&vec![skewed]))?;
         assert!(projected["projection_only"].as_array().context("projection_only array")?.iter()
             .any(|entry| entry["path"] == "client.seed"));
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "client":{"skew":0.3,"value_variation":"per_row"}
+        }))?;
+        let observed = actual_client_startup(&binary, &config)?;
+        let report = json!({
+            "client_id":"client-1","table":table,"consumer_effective_config":observed,
+            "phase_counters":{"preparation":client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?}
+        });
+        let mut verified = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut verified, Some(&vec![report]))?;
+        assert!(verified["consumer_verified"].as_array().context("consumer_verified array")?.iter()
+            .any(|entry| entry["path"] == "client.skew"));
         for profile in ["diagnostic", "realistic"] {
             config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
                 "client":{"string_width":0,"data_profile":profile}
