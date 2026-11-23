@@ -2151,9 +2151,9 @@ mod startup_readback_tests {
                 "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
             ))?;
             config.tunables = serde_json::from_value(tunables)?;
-            let output = format!("OAT_CLIENT_EFFECTIVE_CONFIG {}\n", json!({
-                "request_timeout_ms":1234, "quiesce_timeout_ms":effective_timeout
-            }));
+            let output = format!("OAT_CLIENT_BUILD_PROFILE {}\nOAT_CLIENT_EFFECTIVE_CONFIG {}\n",
+                json!({"lto":"off", "codegen_units":16, "opt_level":3, "target_cpu":"generic"}),
+                json!({"request_timeout_ms":1234, "quiesce_timeout_ms":effective_timeout}));
             let mut evidence = CellEvidence::default();
             evidence.record_client(&config, "table-a", "client-a", &output)?;
             evidence.record_client(&config, "table-b", "client-b", &output)?;
