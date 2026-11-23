@@ -405,6 +405,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.read_ahead" => Some(("read_ahead", "ARROWCOL_COLLECTOR_READ_AHEAD")),
             "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
             "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
+            "collector.runtime.cpu_dispatch" => Some(("cpu_dispatch", "ARROWCOL_COLLECTOR_CPU_DISPATCH")),
+            "collector.runtime.cpu_placement" => Some(("cpu_placement", "ARROWCOL_COLLECTOR_CPU_PLACEMENT")),
             "collector.runtime.partition_grouping" => {
                 Some(("partition_grouping", "ARROWCOL_COLLECTOR_PARTITION_GROUPING"))
             }
@@ -434,16 +436,22 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                     effective["delta_io_runtime_build"].get(field) == Some(requested)
                 })
             });
+            let pool_field = match field {
+                "cpu_thread_stack_size" => Some("thread_stack_size"),
+                "cpu_dispatch" | "cpu_placement" => Some(field),
+                _ => None,
+            };
+            let pool_matches = pool_field.is_none_or(|pool_field| collectors.iter().all(|process| {
+                let effective = &process["effective_config"];
+                matches!(effective["cpu_pool"]["scope"].as_str(), Some("runtime_initialization" | "lazy_pool_initialization"))
+                    && effective["cpu_pool"].get(pool_field) == effective["runtime"].get(field)
+            }));
             if environment.contains_key(variable)
                 && collectors.iter().all(|process| process["effective_config"]["runtime"].get(field).is_some())
                 && io_build_matches
-                && (field != "cpu_thread_stack_size" || collectors.iter().all(|process| {
-                    process["effective_config"]["cpu_pool"]["thread_stack_size"]
-                        == process["effective_config"]["runtime"][field]
-                        && process["effective_config"]["cpu_pool"]["scope"] == "lazy_pool_initialization"
-                }))
+                && pool_matches
             {
-                let reason = if field == "cpu_thread_stack_size" {
+                let reason = if pool_field.is_some() {
                     "consumer_cpu_pool_readback"
                 } else {
                     "consumer_startup_readback"
@@ -459,7 +467,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
                 | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
                 | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
-                | "max_age" | "max_concurrent_flushes")
+                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency")
         {
             let pointer = format!("/{}", field.replace('.', "/"));
             if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
@@ -1510,6 +1518,41 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 assert_eq!(is_projected, !expected[index], "{path}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_modes_need_pool_readback_and_stage_concurrency_needs_batching_readback() -> Result<()> {
+        let mut config = config()?;
+        let runtime = json!({"cpu_dispatch":"bounded_shards", "cpu_placement":"compact_allowed"});
+        let batching = json!({"stage_file_concurrency":8});
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"runtime":runtime,"batching":batching}
+        }))?;
+        let mut process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"runtime":runtime,"batching":batching}
+        });
+        for (pool, expected_modes) in [
+            (Value::Null, [false, false]),
+            (json!({"scope":"runtime_initialization","cpu_dispatch":"shared_fifo","cpu_placement":"compact_allowed"}), [false, true]),
+            (json!({"scope":"runtime_initialization","cpu_dispatch":"bounded_shards","cpu_placement":"compact_allowed"}), [true, true]),
+        ] {
+            process["effective_config"]["cpu_pool"] = pool;
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            for (path, expected) in [
+                ("collector.runtime.cpu_dispatch", expected_modes[0]),
+                ("collector.runtime.cpu_placement", expected_modes[1]),
+                ("collector.batching.stage_file_concurrency", true),
+            ] {
+                assert_eq!(verified.iter().any(|entry| entry["path"] == path), expected, "{path}");
+            }
+        }
+        process["effective_config"]["batching"]["stage_file_concurrency"] = json!(1);
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &process["effective_config"]).is_err());
         Ok(())
     }
 
