@@ -11,7 +11,7 @@ pub use arrow_deltalake::writer::{
 };
 pub use arrowcol_routing::AdmissionPressureGauge;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::str::FromStr;
 
 /// Payload customer IDs are bounded printable identifiers, not delivery identities.
@@ -254,6 +254,218 @@ pub struct CollectorTunables {
     pub thp_disabled: Option<bool>,
     pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
+    #[serde(deserialize_with = "deserialize_collector_allocator")]
+    pub allocator: Option<CollectorAllocator>,
+    #[serde(deserialize_with = "deserialize_collector_lto")]
+    pub lto: Option<CollectorLto>,
+    #[serde(deserialize_with = "deserialize_collector_codegen_units")]
+    pub codegen_units: Option<u16>,
+    #[serde(deserialize_with = "deserialize_collector_opt_level")]
+    pub opt_level: Option<CollectorOptLevel>,
+    #[serde(deserialize_with = "deserialize_collector_target_cpu")]
+    pub target_cpu: Option<CollectorTargetCpu>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorAllocator {
+    #[default]
+    System,
+    Mimalloc,
+}
+impl CollectorAllocator {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Mimalloc => "mimalloc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorLto {
+    #[default]
+    Off,
+    Thin,
+    Fat,
+}
+impl CollectorLto {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Thin => "thin",
+            Self::Fat => "fat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum CollectorOptLevel {
+    #[serde(rename = "2")]
+    O2,
+    #[serde(rename = "3")]
+    O3,
+}
+impl Default for CollectorOptLevel {
+    fn default() -> Self {
+        Self::O3
+    }
+}
+impl CollectorOptLevel {
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::O2 => 2,
+            Self::O3 => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub enum CollectorTargetCpu {
+    #[default]
+    #[serde(rename = "generic")]
+    Generic,
+    #[serde(rename = "x86-64-v2")]
+    X86_64V2,
+    #[serde(rename = "x86-64-v3")]
+    X86_64V3,
+    #[serde(rename = "x86-64-v4")]
+    X86_64V4,
+}
+impl CollectorTargetCpu {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::X86_64V2 => "x86-64-v2",
+            Self::X86_64V3 => "x86-64-v3",
+            Self::X86_64V4 => "x86-64-v4",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectorBuildProfile {
+    pub allocator: CollectorAllocator,
+    pub lto: CollectorLto,
+    pub codegen_units: u16,
+    pub opt_level: CollectorOptLevel,
+    pub target_cpu: CollectorTargetCpu,
+}
+impl Default for CollectorBuildProfile {
+    fn default() -> Self {
+        Self {
+            allocator: CollectorAllocator::System,
+            lto: CollectorLto::Off,
+            codegen_units: 16,
+            opt_level: CollectorOptLevel::O3,
+            target_cpu: CollectorTargetCpu::Generic,
+        }
+    }
+}
+impl CollectorBuildProfile {
+    pub fn canonical_key(self) -> String {
+        format!(
+            "allocator={};lto={};codegen_units={};opt_level={};target_cpu={}",
+            self.allocator.as_str(),
+            self.lto.as_str(),
+            self.codegen_units,
+            self.opt_level.as_u8(),
+            self.target_cpu.as_str()
+        )
+    }
+}
+impl CollectorTunables {
+    pub fn has_build_profile(&self) -> bool {
+        self.allocator.is_some()
+            || self.lto.is_some()
+            || self.codegen_units.is_some()
+            || self.opt_level.is_some()
+            || self.target_cpu.is_some()
+    }
+    pub fn build_profile(&self) -> CollectorBuildProfile {
+        CollectorBuildProfile {
+            allocator: self.allocator.unwrap_or_default(),
+            lto: self.lto.unwrap_or_default(),
+            codegen_units: self.codegen_units.unwrap_or(16),
+            opt_level: self.opt_level.unwrap_or_default(),
+            target_cpu: self.target_cpu.unwrap_or_default(),
+        }
+    }
+}
+
+fn deserialize_profile_enum<'de, D, T>(
+    deserializer: D,
+    field: &'static str,
+    allowed: &'static str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)
+        .map_err(|_| D::Error::custom(format!("{field} must be {allowed}")))?;
+    value.map_or(Ok(None), |value| {
+        parse(&value)
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("{field} must be {allowed}")))
+    })
+}
+fn deserialize_collector_allocator<'de, D>(d: D) -> Result<Option<CollectorAllocator>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(d, "collector.allocator", "system or mimalloc", |v| match v {
+        "system" => Some(CollectorAllocator::System),
+        "mimalloc" => Some(CollectorAllocator::Mimalloc),
+        _ => None,
+    })
+}
+fn deserialize_collector_lto<'de, D>(d: D) -> Result<Option<CollectorLto>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(d, "collector.lto", "off, thin or fat", |v| match v {
+        "off" => Some(CollectorLto::Off),
+        "thin" => Some(CollectorLto::Thin),
+        "fat" => Some(CollectorLto::Fat),
+        _ => None,
+    })
+}
+fn deserialize_collector_codegen_units<'de, D>(d: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u16>::deserialize(d).map_err(|_| D::Error::custom("collector.codegen_units must be an integer in 1..=256"))
+}
+fn deserialize_collector_opt_level<'de, D>(d: D) -> Result<Option<CollectorOptLevel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let level =
+        Option::<u8>::deserialize(d).map_err(|_| D::Error::custom("collector.opt_level must be integer 2 or 3"))?;
+    level.map_or(Ok(None), |v| match v {
+        2 => Ok(Some(CollectorOptLevel::O2)),
+        3 => Ok(Some(CollectorOptLevel::O3)),
+        _ => Err(D::Error::custom("collector.opt_level must be integer 2 or 3")),
+    })
+}
+fn deserialize_collector_target_cpu<'de, D>(d: D) -> Result<Option<CollectorTargetCpu>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(
+        d,
+        "collector.target_cpu",
+        "generic, x86-64-v2, x86-64-v3 or x86-64-v4",
+        |v| match v {
+            "generic" => Some(CollectorTargetCpu::Generic),
+            "x86-64-v2" => Some(CollectorTargetCpu::X86_64V2),
+            "x86-64-v3" => Some(CollectorTargetCpu::X86_64V3),
+            "x86-64-v4" => Some(CollectorTargetCpu::X86_64V4),
+            _ => None,
+        },
+    )
 }
 
 fn deserialize_channel_capacity_object<'de, D>(deserializer: D) -> Result<Option<ChannelCapacityTunables>, D::Error>

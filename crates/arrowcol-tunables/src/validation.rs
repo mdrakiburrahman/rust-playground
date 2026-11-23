@@ -425,6 +425,10 @@ const CAPABILITIES: &[Capability] = &[
         "system; mimalloc requires a rebuilt collector image",
         RebuildOnly
     ),
+    capability!("collector.lto", "off", RebuildOnly),
+    capability!("collector.codegen_units", "16", RebuildOnly),
+    capability!("collector.opt_level", "3", RebuildOnly),
+    capability!("collector.target_cpu", "generic", RebuildOnly),
     capability!(
         "collector.multipart_upload",
         "unsupported: pinned backend lacks conditional completion",
@@ -662,6 +666,15 @@ impl Tunables {
                 (inert, "rate_limit_disabled")
             } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
                 (inert, "dictionary_disabled")
+            } else if matches!(
+                name.as_str(),
+                "collector.allocator"
+                    | "collector.lto"
+                    | "collector.codegen_units"
+                    | "collector.opt_level"
+                    | "collector.target_cpu"
+            ) {
+                (controls, "rebuild_only_collector_profile")
             } else if matches!(
                 name.as_str(),
                 "maintenance.enabled" | "maintenance.operations" | "maintenance.apply"
@@ -1690,6 +1703,9 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
 fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
     if let Some(socket) = &collector.socket {
         socket.validate().map_err(anyhow::Error::msg)?;
+    }
+    if collector.codegen_units.is_some_and(|units| !(1..=256).contains(&units)) {
+        bail!("collector.codegen_units must be in 1..=256");
     }
     if collector
         .shutdown_drain_timeout_seconds
@@ -4422,6 +4438,47 @@ mod tests {
             ..Default::default()
         };
         assert!(error_text(invalid.validate()).contains("entropy"));
+    }
+
+    #[test]
+    fn collector_build_profile_values_are_strict_and_bounded() -> Result<()> {
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector": {
+            "allocator": "mimalloc", "lto": "thin", "codegen_units": 8,
+            "opt_level": 2, "target_cpu": "x86-64-v3"
+        }}))?;
+        let collector = valid.collector.as_ref().context("collector profile")?;
+        assert_eq!(
+            collector.build_profile().canonical_key(),
+            "allocator=mimalloc;lto=thin;codegen_units=8;opt_level=2;target_cpu=x86-64-v3"
+        );
+        let controls = valid.classify_oat_leaves()?["runner_controls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for field in ["allocator", "lto", "codegen_units", "opt_level", "target_cpu"] {
+            assert!(
+                controls
+                    .iter()
+                    .any(|entry| entry["path"] == format!("collector.{field}"))
+            );
+        }
+        for (field, value) in [
+            ("allocator", serde_json::json!("jemalloc")),
+            ("allocator", serde_json::json!(false)),
+            ("lto", serde_json::json!("none")),
+            ("codegen_units", serde_json::json!("16")),
+            ("codegen_units", serde_json::json!(0)),
+            ("codegen_units", serde_json::json!(257)),
+            ("opt_level", serde_json::json!(1)),
+            ("target_cpu", serde_json::json!("native")),
+            ("target_cpu", serde_json::json!(4)),
+        ] {
+            let error = Tunables::parse_oat_json(serde_json::json!({"collector": {field: value}}))
+                .expect_err("invalid build profile was accepted")
+                .to_string();
+            assert!(error.contains(&format!("collector.{field}")), "{field}: {error}");
+        }
+        Ok(())
     }
 
     #[test]
