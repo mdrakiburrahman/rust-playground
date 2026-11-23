@@ -299,6 +299,25 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if let Some(field) = path.strip_prefix("collector.socket.")
+            && matches!(field, "recv_buffer_bytes" | "send_buffer_bytes")
+        {
+            if environment.contains_key("ARROWCOL_COLLECTOR_SOCKET_CONFIG")
+                && collectors.iter().all(|process| {
+                    let config = &process["effective_config"];
+                    let requested = config["socket"][field].as_u64();
+                    let observed = config["socket_listener_effective"][field].as_u64();
+                    config["socket_listener_effective"]["scope"] == "linux_flight_listener"
+                        && requested.zip(observed).is_some_and(|(requested, observed)| {
+                            requested.checked_mul(2).is_some_and(|minimum| observed >= minimum)
+                        })
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_linux_listener_buffer_readback"}));
+                return false;
+            }
+            return true;
+        }
         if path == "collector.socket.tcp_nodelay" {
             if environment.contains_key("ARROWCOL_COLLECTOR_SOCKET_CONFIG")
                 && collectors.iter().all(|process| {
@@ -1290,6 +1309,31 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
             assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.socket.tcp_nodelay"),
                 observed == Some(true));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn socket_buffer_evidence_requires_unclamped_listener_readback() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"socket":{"recv_buffer_bytes":32768}}
+        }))?;
+        let mut process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"socket":{"recv_buffer_bytes":32768}}
+        });
+        for observed in [None, Some(32768), Some(65536)] {
+            if let Some(value) = observed {
+                process["effective_config"]["socket_listener_effective"] =
+                    json!({"recv_buffer_bytes":value,"scope":"linux_flight_listener"});
+            }
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.socket.recv_buffer_bytes"),
+                observed == Some(65536));
         }
         Ok(())
     }
