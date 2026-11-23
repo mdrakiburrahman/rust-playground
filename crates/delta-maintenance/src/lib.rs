@@ -957,6 +957,13 @@ fn configuration_evidence(
             PropValue::Unsigned(value) => serde_json::json!(value),
             PropValue::Float(value) => serde_json::json!(value),
             PropValue::Text(value) => serde_json::json!(value),
+            PropValue::StringList(value) if name == "arrowcol.layout.sortOptions" && !value.is_empty() => {
+                let options = value
+                    .iter()
+                    .map(|entry| arrow_deltalake::layout::SortKeyOptions::from_property(entry))
+                    .collect::<Result<Vec<_>>>()?;
+                serde_json::json!(options)
+            }
             PropValue::StringList(value) => serde_json::json!(value),
         };
         policy.insert(name.to_owned(), value);

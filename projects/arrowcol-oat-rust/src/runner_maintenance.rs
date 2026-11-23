@@ -451,11 +451,10 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
                 .collect::<Result<Vec<_>>>()?;
             Ok(serde_json::to_value(options)?)
         };
-        let actual = actual.as_array().context("maintenance sort options readback must be an array")?
-            .iter().map(|value| value.as_str().context("maintenance sort option must be a string"))
-            .collect::<Result<Vec<_>>>()?;
+        let actual: Vec<arrow_deltalake::layout::SortKeyOptions> = serde_json::from_value(actual)
+            .context("maintenance sort options readback must be a typed array")?;
         let expected = expected.as_str().context("maintenance sort options must be comma separated")?;
-        return Ok((parse(actual)?, parse(expected.split(',').collect())?));
+        return Ok((serde_json::to_value(actual)?, parse(expected.split(',').collect())?));
     }
     Ok((actual, expected))
 }
@@ -1084,14 +1083,15 @@ mod maintenance_topology_tests {
             "startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
             "table_policy":{"arrowcol.maintenance.operationTimeout":300_000,
                 "arrowcol.layout.sortColumns":["customer_id"],
-                "arrowcol.layout.sortOptions":["customer_id:descending:first"]},
+                "arrowcol.layout.sortOptions":[{"column":"customer_id","direction":"descending","nulls":"first"}]},
             "layout_sources":{"arrowcol.layout.sortOptions":"process"}, "active":true
         });
         verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
         let table = canonical_dmv_table_name(&config.tables[0])?;
         let event = |policy: &Value| format!("arrowcol_maintenance_table_config {}\n", json!({"table":table,"config":policy}));
         maintenance_table_evidence(&config, &event(&observed))?;
-        observed["table_policy"]["arrowcol.layout.sortOptions"] = json!(["customer_id:ascending:last"]);
+        observed["table_policy"]["arrowcol.layout.sortOptions"] =
+            json!([{"column":"customer_id","direction":"ascending","nulls":"last"}]);
         assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
         assert!(maintenance_table_evidence(&config, &event(&observed)).is_err());
         observed["layout_sources"]["arrowcol.layout.sortOptions"] = json!("table");
