@@ -23,6 +23,19 @@ export type PreloadProofPins = {
   logSha256: string;
 };
 
+const reviewedPreloadPins: PreloadProofPins = Object.freeze({
+  invocation: '89fdefa5-855d-46ea-93ea-481fd77cbd2e',
+  run: '8d46570b-791e-43c6-a25a-4832c5cbee81',
+  cell: '241b7533-1025-441c-b8b2-ae9bbc547c1e',
+  table: 'sqlserver_availability_replica_states',
+  collectorImage: 'sha256:c6ed6724f3323ca120fe50f93fccf505c48eb593cd3b7c2e5c8ce85b92a8a93e',
+  collectorRevision: '3630d3e4301bc3ba8f9f69a308d077cebee6d12a',
+  receiptSha256: '9c288590a651a8fcdbe1ba9fa242ed235b565923416392e5bbbb6c9701d359a8',
+  markerSha256: '9dafe9bf79d8dd0f3c7398a2abcbe851a0a931fec4f319d8bfe5fa0facf9d12e',
+  resultSha256: 'b6dc74b976de44d22f4ee328f4add64cdf36060e05bb7b268191cac3eeea7ee1',
+  logSha256: '04fd38d33e9ac82af23be0d5fcefb078128a0bc939329e50f7bb3a19a7663503',
+});
+
 function object(value: unknown, label: string): Json {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`Invalid ${label}`);
   return value as Json;
@@ -248,16 +261,39 @@ export async function inspectPinnedPreloadFailure(
   return first;
 }
 
+export async function inspectReviewedPreloadFailure(
+  receiptPath: string, markerPath: string,
+): Promise<Json> {
+  return inspectPinnedPreloadFailure(receiptPath, markerPath, reviewedPreloadPins);
+}
+
+async function dispositionProof(receiptPath: string, markerPath: string, env: RecoveryEnvironment): Promise<Json> {
+  if (basename(receiptPath) !== `${reviewedPreloadPins.invocation}.json`) return inspect(receiptPath, markerPath, env);
+  const proof = await inspectPinnedPreloadFailure(receiptPath, markerPath, reviewedPreloadPins, env);
+  return { ...proof, kind: 'verified-preload-failed-cleanup', disposition: 'recorded' };
+}
+
+async function assertNoConflictingAksDisposition(receiptPath: string): Promise<void> {
+  try {
+    await lstat(`${receiptPath}.failed-aks-disposition`);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error('Conflicting AKS disposition exists');
+}
+
 export async function assertLocalFailedDisposition(
   receiptPath: string, dispositionPath: string, env: RecoveryEnvironment = environment,
 ): Promise<void> {
+  if (basename(receiptPath) === `${reviewedPreloadPins.invocation}.json`) await assertNoConflictingAksDisposition(receiptPath);
   const saved = object(JSON.parse((await boundedFile(dispositionPath, 1024 * 1024)).toString('utf8')), 'local disposition');
   const markerPath = string(saved.marker_path, 'marker path');
   const { recorded_at_unix_ms: recordedAt, ...recordedProof } = saved;
   if (typeof recordedAt !== 'number' || !Number.isSafeInteger(recordedAt) || recordedAt <= 0 || recordedAt > Date.now()) {
     throw new Error('Local disposition timestamp is invalid');
   }
-  const expected = await inspect(receiptPath, markerPath, env);
+  const expected = await dispositionProof(receiptPath, markerPath, env);
   if (JSON.stringify(recordedProof) !== JSON.stringify(expected)) throw new Error('Local failure disposition or evidence changed');
 }
 
@@ -267,7 +303,8 @@ export async function recordLocalFailedDisposition(
   if (!uuid.test(invocation)) throw new Error('Invalid invocation ID');
   const receiptPath = resolve(root, `${invocation}.json`);
   const dispositionPath = receiptPath + localDispositionSuffix;
-  const proof = await inspect(receiptPath, markerPath, env);
+  if (invocation === reviewedPreloadPins.invocation) await assertNoConflictingAksDisposition(receiptPath);
+  const proof = await dispositionProof(receiptPath, markerPath, env);
   if (proof.invocation_id !== invocation) throw new Error('Invocation does not match receipt');
   const temporary = `${dispositionPath}.${randomUUID()}.tmp`;
   let created = false;
@@ -280,8 +317,9 @@ export async function recordLocalFailedDisposition(
     } finally {
       await file.close();
     }
-    const verified = await inspect(receiptPath, markerPath, env);
+    const verified = await dispositionProof(receiptPath, markerPath, env);
     if (JSON.stringify(verified) !== JSON.stringify(proof)) throw new Error('Recovery evidence changed while recording');
+    if (invocation === reviewedPreloadPins.invocation) await assertNoConflictingAksDisposition(receiptPath);
     await link(temporary, dispositionPath);
     const directory = await open(dirname(receiptPath), 'r');
     try { await directory.sync(); } finally { await directory.close(); }

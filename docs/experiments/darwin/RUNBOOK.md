@@ -206,6 +206,10 @@ the receipt-owning runtime after verified cleanup. It appends a disposition
 without changing the failed receipt; each subsequent launch rechecks its
 evidence and same-host resource absence. Missing evidence, active writers,
 resources or a changed host boot block recovery. Do not retry until cleanup is
-confirmed. Fresh HOME and restricted paths prevent accidental credential
+confirmed. The separately pinned pre-load failure for invocation
+`89fdefa5-855d-46ea-93ea-481fd77cbd2e` also uses this command: it rechecks the
+four original hashes and startup failure without requiring a guard record.
+This only records cleanup; it does not rank or retry the failed run.
+Fresh HOME and restricted paths prevent accidental credential
 inheritance; they are not a security sandbox. Run candidate workloads only in
 throwaway environments and never pass the Darwin model token to builds or runs.

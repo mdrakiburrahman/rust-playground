@@ -1926,6 +1926,7 @@ export async function main(
   collect: typeof collectDataFlow = collectDataFlow,
   onOwnedRun?: OatOwnedRunObserver,
   signal?: AbortSignal,
+  recordLocalFailure: typeof recordLocalFailedDisposition = recordLocalFailedDisposition,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
@@ -1940,7 +1941,7 @@ export async function main(
     if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
     const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(receiptRoot, `${args[1]}.json`))).toString('utf8'));
     if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
-    await recordLocalFailedDisposition(receiptRoot, args[1], resolve(args[2]));
+    await recordLocalFailure(receiptRoot, args[1], resolve(args[2]));
     console.log('Recorded verified local cleanup; the original failure remains unranked.');
     return;
   }
