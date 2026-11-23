@@ -2930,13 +2930,15 @@ groups:
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row"}
+            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row"}
         }))?;
         let observed = actual_client_startup(&binary, &config)?;
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(0);
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"] =
             json!({"eligible_columns":1,"eligible_rows":8});
         prepared["generator_applicability"]["tables"][0]["guid_uniqueness"] =
+            json!({"eligible_columns":1,"eligible_rows":8});
+        prepared["generator_applicability"]["tables"][0]["value_variation"] =
             json!({"eligible_columns":1,"eligible_rows":8});
         let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
         let initial = tunable_leaf_evidence(&config)?;
@@ -2950,6 +2952,8 @@ groups:
             .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
         assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
             .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
+        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.value_variation"));
         let mut absent = report.clone();
         absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
         let mut uncovered = initial.clone();
@@ -2960,11 +2964,19 @@ groups:
         zero["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] =
             json!({"eligible_columns":0,"eligible_rows":0});
         let mut inert = initial;
-        promote_client_readback(&config, &mut inert, Some(&vec![zero]))?;
+        promote_client_readback(&config, &mut inert, Some(&vec![zero.clone()]))?;
         assert!(inert["inert_fields"].as_array().context("inert_fields array")?
-            .iter().any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_eligible_guid_rows"));
+            .iter().any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_eligible_generated_rows"));
         assert!(inert["consumer_verified"].as_array().context("consumer_verified array")?
             .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
+        for (skew, target, reason) in [(1.0, "inert_fields", Some("all_values_skewed")), (0.5, "projection_only", None)] {
+            let mut skewed = zero.clone();
+            skewed["consumer_effective_config"]["skew"] = json!(skew);
+            let mut classified = tunable_leaf_evidence(&config)?;
+            promote_client_readback(&config, &mut classified, Some(&vec![skewed]))?;
+            assert!(classified[target].as_array().context("evidence array")?.iter().any(|entry|
+                entry["path"] == "client.value_variation" && reason.is_none_or(|reason| entry["reason"] == reason)));
+        }
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         for (input, inactive, active) in [

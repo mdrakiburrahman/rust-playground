@@ -399,6 +399,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.null_fraction") => ("null_fraction", "ARROWCOL_CLIENT_NULL_FRACTION"),
             Some("client.pod_ordinal") => ("pod_ordinal", "ARROWCOL_CLIENT_POD_ORDINAL"),
             Some("client.guid_uniqueness") => ("guid_uniqueness", "ARROWCOL_CLIENT_GUID_UNIQUENESS"),
+            Some("client.value_variation") => ("value_variation", "ARROWCOL_CLIENT_VALUE_VARIATION"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -453,7 +454,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }
             return true;
         }
-        if matches!(field, "pod_ordinal" | "guid_uniqueness") {
+        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation") {
             let counts = reports.iter().map(|report| {
                 let name = report["table"].as_str()?;
                 let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
@@ -466,7 +467,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }).collect::<Option<Vec<_>>>();
             let Some(counts) = counts else { return true; };
             if counts.iter().all(|&(columns, rows)| columns == 0 && rows == 0) {
-                inert.push(json!({"path": entry["path"], "reason": "no_eligible_guid_rows"}));
+                inert.push(json!({"path": entry["path"], "reason": "no_eligible_generated_rows"}));
                 return false;
             }
             if counts.iter().any(|&(columns, rows)| columns == 0 || rows == 0)
@@ -474,13 +475,25 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             {
                 return true;
             }
+            if field == "value_variation" {
+                let skews = reports.iter().map(|report| report["consumer_effective_config"]["skew"].as_f64())
+                    .collect::<Option<Vec<_>>>();
+                let Some(skews) = skews else { return true; };
+                if skews.iter().all(|&skew| skew == 1.0) {
+                    inert.push(json!({"path": entry["path"], "reason": "all_values_skewed"}));
+                    return false;
+                }
+                if skews.iter().any(|&skew| skew != 0.0) {
+                    return true;
+                }
+            }
         }
         if !environment.contains_key(variable)
             || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
         {
             return true;
         }
-        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness") {
+        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation") {
             "consumer_startup_and_prepared_corpus"
         } else { "consumer_startup_readback" }}));
         false
