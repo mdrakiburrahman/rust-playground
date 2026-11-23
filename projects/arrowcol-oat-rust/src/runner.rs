@@ -7977,17 +7977,33 @@ fn local_collector_profile_tag(profile_hash: &str) -> String {
     format!("arrowcol-oat/dataflow:profile-{profile_hash}")
 }
 
-fn verify_collector_profile_image(observed: &str, profile_hash: &str) -> Result<String> {
+fn verify_collector_profile_image(
+    observed: &str,
+    expected_source_revision: &str,
+    profile_hash: &str,
+) -> Result<String> {
     let fields = observed.split_whitespace().collect::<Vec<_>>();
-    if fields.len() != 3
-        || !fields[0].starts_with("sha256:")
-        || fields[1].len() != 40
-        || !fields[1].bytes().all(|byte| byte.is_ascii_hexdigit())
-        || fields[2] != profile_hash
-    {
-        bail!("local collector image profile hash or revision provenance does not match the requested build profile");
+    if fields.len() != 3 {
+        bail!("local collector profile image metadata must contain image ID, source revision, and profile hash");
+    }
+    let image_digest = fields[0].strip_prefix("sha256:").unwrap_or_default();
+    if !is_lower_hex_string(image_digest, 64) {
+        bail!("local collector profile image ID must be a full sha256 digest");
+    }
+    if !is_lower_hex_string(expected_source_revision, 40) || fields[1] != expected_source_revision {
+        bail!("local collector profile image source revision does not match the checked-out source");
+    }
+    if !is_lower_hex_string(profile_hash, 64) || fields[2] != profile_hash {
+        bail!("local collector image profile hash does not match the requested build profile");
     }
     Ok(fields[0].to_owned())
+}
+
+fn is_lower_hex_string(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
@@ -8032,7 +8048,12 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
                 inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
                 let output = run_command(inspect, "resolve profile-specific local collector image").await?;
                 let observed = String::from_utf8(output.stdout)?;
-                verify_collector_profile_image(&observed, &profile_hash)?
+                let mut revision = Command::new("git");
+                revision.args(["rev-parse", "HEAD"]);
+                revision.current_dir(std::env::current_dir()?);
+                let output = run_command(revision, "resolve checked-out source revision").await?;
+                let expected_revision = String::from_utf8(output.stdout)?;
+                verify_collector_profile_image(&observed, expected_revision.trim(), &profile_hash)?
             } else {
                 let mut inspect = Command::new("docker");
                 inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);
@@ -8075,16 +8096,26 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
 #[test]
 fn profile_hash_selects_and_validates_local_collector_image() -> Result<()> {
     let profile_hash = "a".repeat(64);
+    let source_revision = "c".repeat(40);
     assert_eq!(
         local_collector_profile_tag(&profile_hash),
         format!("arrowcol-oat/dataflow:profile-{profile_hash}")
     );
-    let observed = format!("sha256:{} {} {}", "b".repeat(64), "c".repeat(40), profile_hash);
+    let observed = format!("sha256:{} {} {}", "b".repeat(64), source_revision, profile_hash);
     assert_eq!(
-        verify_collector_profile_image(&observed, &profile_hash)?,
+        verify_collector_profile_image(&observed, &source_revision, &profile_hash)?,
         format!("sha256:{}", "b".repeat(64))
     );
-    assert!(verify_collector_profile_image(&observed, &"d".repeat(64)).is_err());
+    assert!(verify_collector_profile_image(&observed, &source_revision, &"d".repeat(64)).is_err());
+    assert!(verify_collector_profile_image(&observed, &"d".repeat(40), &profile_hash).is_err());
+    for image_id in [
+        "sha256:short".to_owned(),
+        format!("sha256:{}", "B".repeat(64)),
+        format!("sha256:{}suffix", "b".repeat(64)),
+    ] {
+        let invalid = format!("{image_id} {source_revision} {profile_hash}");
+        assert!(verify_collector_profile_image(&invalid, &source_revision, &profile_hash).is_err());
+    }
     Ok(())
 }
 
@@ -10831,7 +10862,7 @@ fn select_aks_collector_profile_image(runtime_config: &mut Value, profile_hash: 
         .with_context(|| {
             format!("AKS runtime config is missing the collector image for build profile {profile_hash}")
         })?;
-    if !image.contains("@sha256:") {
+    if !is_digest_pinned_aks_image(&image) {
         bail!("AKS collector build-profile image must be pinned by manifest digest");
     }
     let images = runtime_config
@@ -10841,6 +10872,35 @@ fn select_aks_collector_profile_image(runtime_config: &mut Value, profile_hash: 
     images.insert("dataflow".to_owned(), json!(image));
     runtime_config["collectorBuildProfileHash"] = json!(profile_hash);
     Ok(())
+}
+
+fn is_digest_pinned_aks_image(image: &str) -> bool {
+    let Some((registry, repository_and_digest)) = image.split_once('/') else {
+        return false;
+    };
+    let Some(registry_name) = registry.strip_suffix(".azurecr.io") else {
+        return false;
+    };
+    if registry_name.is_empty()
+        || !registry_name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Some((repository, digest)) = repository_and_digest.split_once("@sha256:") else {
+        return false;
+    };
+    let mut repository_bytes = repository.bytes();
+    if !repository_bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !repository_bytes
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'/' | b'_' | b'.' | b'-'))
+    {
+        return false;
+    }
+    is_lower_hex_string(digest, 64)
 }
 
 #[cfg(test)]
@@ -10854,6 +10914,15 @@ fn aks_profile_hash_selects_digest_pinned_collector_image() -> Result<()> {
     assert_eq!(runtime["images"]["dataflow"], image);
     assert_eq!(runtime["collectorBuildProfileHash"], hash);
     assert!(select_aks_collector_profile_image(&mut runtime, &"d".repeat(64)).is_err());
+    for image in [
+        format!("registry.azurecr.io/dataflow@sha256:{}", "b".repeat(63)),
+        format!("registry.azurecr.io/dataflow@sha256:{}suffix", "b".repeat(64)),
+        format!("dataflow@sha256:{}", "b".repeat(64)),
+        format!("registry.azurecr.io/dataflow@sha256:{}", "B".repeat(64)),
+    ] {
+        let mut runtime = json!({"collectorBuildImages":{(hash.clone()):image}});
+        assert!(select_aks_collector_profile_image(&mut runtime, &hash).is_err());
+    }
     Ok(())
 }
 

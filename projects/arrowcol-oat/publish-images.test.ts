@@ -8,6 +8,7 @@ import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
 import {
   buildLocalImages, MissingPublishedImagesError, publishClientImage, publishImages, publishViewer, readPublishedImages,
 } from './publish-images.js';
+import { parseCollectorBuildProfile } from './collector-build-profile.js';
 import { validateRuntime } from './runtime.js';
 
 const client = '00000000-0000-0000-0000-000000000002';
@@ -292,6 +293,20 @@ test('builds the collector image at its canonical profile-hash tag', async t => 
   for (const argument of ['PROFILE_HASH=' + hash, 'BUILD_ALLOCATOR=mimalloc', 'BUILD_LTO=thin',
     'BUILD_CODEGEN_UNITS=8', 'BUILD_OPT_LEVEL=2', 'BUILD_TARGET_CPU=x86-64-v3',
     'org.opencontainers.image.profile=' + hash]) assert.ok(collector.includes(argument), argument);
+});
+
+test('rejects explicit null build-profile fields while preserving omitted defaults', () => {
+  const defaults = {
+    allocator: 'system', lto: 'off', codegen_units: 16, opt_level: 3, target_cpu: 'generic',
+  } as const;
+  assert.equal(parseCollectorBuildProfile({}), undefined);
+  assert.deepEqual(parseCollectorBuildProfile({ allocator: 'mimalloc' }), { ...defaults, allocator: 'mimalloc' });
+  for (const field of ['allocator', 'lto', 'codegen_units', 'opt_level', 'target_cpu'] as const) {
+    assert.throws(
+      () => parseCollectorBuildProfile({ [field]: null }),
+      error => error instanceof Error && error.message === `collector.${field} must not be null`,
+    );
+  }
 });
 
 test('opt-in maintenance verifies a sixth immutable revision, while legacy setup still uses five', async t => {

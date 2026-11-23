@@ -20,9 +20,11 @@ export function parseCollectorBuildProfile(value: unknown): CollectorBuildProfil
   const profile = { ...defaults };
   let configured = false;
   for (const field of fields) {
-    if (!Object.hasOwn(input, field) || input[field] == null) continue;
-    configured = true;
+    if (!Object.hasOwn(input, field)) continue;
     const item = input[field];
+    if (item === null) throw new Error(`collector.${field} must not be null`);
+    if (item === undefined) continue;
+    configured = true;
     if (field === 'allocator' && (item === 'system' || item === 'mimalloc')) profile.allocator = item;
     else if (field === 'lto' && (item === 'off' || item === 'thin' || item === 'fat')) profile.lto = item;
     else if (field === 'codegen_units' && Number.isInteger(item) && (item as number) >= 1 && (item as number) <= 256) profile.codegen_units = item as number;
