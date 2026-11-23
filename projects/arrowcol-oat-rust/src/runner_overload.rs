@@ -1043,6 +1043,7 @@ impl GuardProbe {
         let mut pressure_url = Url::parse(&scraper.endpoint)?;
         pressure_url.set_path("/v1/pressure");
         pressure_url.set_query(None);
+        let mut http_timing = PressureHttpTiming::default();
         let (memory, logs, pressure) = tokio::join!(
             guard_read_leg(deadline, async {
                 #[cfg(unix)]
@@ -1064,12 +1065,35 @@ impl GuardProbe {
                 }
             }),
             guard_read_leg(deadline, async {
-                scraper.read_endpoint(pressure_url.as_str()).await
+                scraper.read_endpoint_timed(pressure_url.as_str(), Some((&mut http_timing, deadline))).await
             }),
         );
         record_guard_read_leg(diagnostics, "cgroup_memory", &memory);
         record_guard_read_leg(diagnostics, "collector_logs", &logs);
         record_guard_read_leg(diagnostics, "pressure_http", &pressure);
+        if diagnostics["pressure_http_timings"].is_null() {
+            diagnostics["pressure_http_timings"] = json!([]);
+            diagnostics["pressure_http_timing_dropped"] = json!(0);
+        }
+        let samples = diagnostics["pressure_http_timings"].as_array_mut()
+            .context("pressure HTTP timing evidence must be an array")?;
+        let dropped = samples.len() == 512;
+        if dropped {
+            samples.remove(0);
+        }
+        samples.push(json!({
+            "started_at_ms": request_start_ms,
+            "remaining_budget_at_first_poll_ms": http_timing.remaining_budget_at_first_poll_ms,
+            "headers_ms": http_timing.headers_ms,
+            "body_ms": http_timing.body_ms,
+            "status": pressure.status,
+            "elapsed_ms": pressure.elapsed_ms,
+        }));
+        if dropped {
+            let count = diagnostics["pressure_http_timing_dropped"].as_u64()
+                .context("pressure HTTP timing dropped counter missing")?;
+            diagnostics["pressure_http_timing_dropped"] = json!(count + 1);
+        }
         if let Ok(body) = &pressure.result {
             diagnostics["last_pressure"] = pressure_body_excerpt(body);
         }
@@ -2312,6 +2336,48 @@ mod overload_guard_tests {
         let evidence = diagnostics.to_string();
         assert!(synthetic.iter().all(|secret| !evidence.contains(secret) && !logs.contains(secret)),
             "guard emitted untrusted error text");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pressure_http_timing_distinguishes_complete_body_and_cancelled_read() -> Result<()> {
+        for incomplete in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}/v1/pressure", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0; 1024];
+                socket.read(&mut request).await?;
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await?;
+                if incomplete {
+                    std::future::pending::<()>().await;
+                } else {
+                    socket.write_all(b"test").await?;
+                }
+                Ok::<(), std::io::Error>(())
+            });
+            let scraper = PublicationBacklogScraper {
+                endpoint: endpoint.clone(),
+                _tunnel: None,
+                client: reqwest::Client::builder().no_proxy().build()?,
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut timing = PressureHttpTiming::default();
+            let leg = guard_read_leg(deadline, async {
+                scraper.read_endpoint_timed(&endpoint, Some((&mut timing, deadline))).await
+            }).await;
+            server.abort();
+            assert!(timing.remaining_budget_at_first_poll_ms.is_some());
+            assert!(timing.headers_ms.is_some());
+            if incomplete {
+                assert_eq!(leg.status, "timeout");
+                assert!(leg.cancelled);
+                assert!(timing.body_ms.is_none());
+            } else {
+                assert_eq!(leg.into_result()?, "test");
+                assert!(timing.body_ms.is_some());
+            }
+        }
         Ok(())
     }
 
