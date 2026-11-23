@@ -114,20 +114,19 @@ mod tests {
         dictionary: bool,
         statistics: EnabledStatistics,
         second_codec: Option<Compression>,
-    ) -> std::path::PathBuf {
+    ) -> Result<std::path::PathBuf> {
         let path = std::env::temp_dir().join(format!("parity-footer-{}.parquet", uuid::Uuid::new_v4()));
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int32, false),
             Field::new("second", DataType::Int32, false),
         ]));
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            Arc::clone(&schema),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 1, 2])),
                 Arc::new(Int32Array::from(vec![2, 3, 2, 3])),
             ],
-        )
-        .unwrap();
+        )?;
         let mut props = WriterProperties::builder()
             .set_compression(compression)
             .set_dictionary_enabled(dictionary)
@@ -135,14 +134,14 @@ mod tests {
         if let Some(codec) = second_codec {
             props = props.set_column_compression(ColumnPath::from("second"), codec);
         }
-        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props.build())).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        path
+        let mut writer = ArrowWriter::try_new(File::create(&path)?, schema, Some(props.build()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(path)
     }
 
     #[test]
-    fn requires_dictionary_and_page_statistics() {
+    fn requires_dictionary_and_page_statistics() -> Result<()> {
         for (compression, dictionary, statistics, valid) in [
             (Compression::UNCOMPRESSED, true, EnabledStatistics::Page, true),
             (
@@ -155,18 +154,19 @@ mod tests {
             (Compression::UNCOMPRESSED, true, EnabledStatistics::Chunk, false),
             (Compression::UNCOMPRESSED, true, EnabledStatistics::None, false),
         ] {
-            let path = fixture(compression, dictionary, statistics, None);
+            let path = fixture(compression, dictionary, statistics, None)?;
             assert_eq!(inspect(&path).is_ok(), valid);
-            assert_eq!(decode(&path).unwrap(), 4);
-            fs::remove_file(path).unwrap();
+            assert_eq!(decode(&path)?, 4);
+            fs::remove_file(path)?;
         }
         let path = fixture(
             Compression::UNCOMPRESSED,
             true,
             EnabledStatistics::Page,
             Some(Compression::ZSTD(Default::default())),
-        );
+        )?;
         assert!(inspect(&path).is_err());
-        fs::remove_file(path).unwrap();
+        fs::remove_file(path)?;
+        Ok(())
     }
 }
