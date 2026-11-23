@@ -34,7 +34,8 @@ export function realisticDiagnosticConfig(seed: unknown): JsonObject {
   const pressure = object(collector.pressure, "pressure");
   const commit = object(collector.commit, "commit");
   const runtime = object(collector.runtime, "runtime");
-  const local = object(object(config.platform, "platform").local, "local");
+  const platform = object(config.platform, "platform");
+  const local = object(platform.local, "local");
   const guard = object(config.overload_guard, "overload guard");
   if (!isDeepStrictEqual(batching.global_capacity, { bytes: 4_290_000_000, rows: 25_000_000, batches: 16_384 })
     || pressure.buffered_bytes_limit !== 4_290_000_000 || pressure.buffered_rows_limit !== 25_000_000
@@ -53,5 +54,6 @@ export function realisticDiagnosticConfig(seed: unknown): JsonObject {
   client.max_memory_bytes = CLIENT_MEMORY;
   client.stream_retry_max_attempts = 1;
   transport.connect_retries = 0;
+  platform.compose_project = "diagnostic-stable";
   return config;
 }

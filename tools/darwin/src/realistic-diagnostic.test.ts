@@ -229,6 +229,9 @@ test("derives realistic diagnostic from an unchanged historical seed", async () 
   assert.equal(config.tunables.client.stream_retry_max_attempts, 1);
   assert.equal(config.tunables.transport.connect_retries, 0);
   assert.equal(config.platform.local.collector_memory_limit_bytes, COLLECTOR_MEMORY);
+  const second = realisticDiagnosticConfig(await seed());
+  assert.deepEqual(config.platform, second.platform);
+  assert.equal(config.platform.compose_project, "diagnostic-stable");
   assert.deepEqual(config.tunables.collector, original.tunables.collector);
   assert.deepEqual(config.overload_guard, original.overload_guard);
   assert.deepEqual(config.tables, ["sqlserver_availability_replica_states"]);

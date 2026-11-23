@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdir, open, readFile, realpath, rmdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -633,7 +633,6 @@ export async function runRealisticDiagnostic(options: {
     const identityOutput = join(paths.output, "diagnostic-identity-evidence");
     await mkdir(identityOutput);
     const platform = object(config.platform, "platform");
-    platform.compose_project = `diagnostic-${randomUUID().replaceAll("-", "")}`;
     platform.compose_state_root = paths.state;
     if (platform.compose_override_file !== "projects/loadtest/compose.oat.yaml") throw new Error("unexpected base Compose override");
     const baseOverride = await readFile(join(runtime, "projects", "loadtest", "compose.oat.yaml"), "utf8");
