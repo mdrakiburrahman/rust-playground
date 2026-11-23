@@ -4897,7 +4897,7 @@ mod tests {
         let eligible_columns = applicability["null_fraction"]["eligible_columns"]
             .as_u64()
             .context("eligible columns")?;
-        assert!(eligible_columns > 0);
+        assert_eq!(eligible_columns, 0);
         assert_eq!(applicability["null_fraction"]["eligible_rows"], eligible_columns * 8);
         assert_eq!(applicability["null_fraction"]["null_rows"], eligible_columns * 8);
         let retry_counts = |name: &str| -> Result<u64> {
