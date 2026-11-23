@@ -6,7 +6,7 @@ function fixture(name: Arm) {
   const {cores, flushes, commitFiles, collector} = arms[name];
   const cpus = Array.from({length: cores}, (_, i) => i);
   const cap = 64 * 1024**3;
-  const tuning = {runtime:{cpu_workers:cores}, batching:{max_concurrent_flushes:flushes}, commit:{max_files_per_commit:commitFiles}, pressure:{rss_limit_bytes:cap}};
+  const tuning = {runtime:{cpu_workers:cores}, batching:{max_concurrent_flushes:flushes}, commit:{batch_window:String(arms[name].batchWindow),max_files_per_commit:commitFiles}, pressure:{rss_limit_bytes:cap}};
   const config = {platform:{local:{collector_image_override:{...collector}, expected_image_ids:{collector:collector.image_id}, collector_cpus:cpus, collector_memory_limit_bytes:cap}}, tunables:{collector:tuning}, dfe_worker_concurrency:[cores], overload_guard:{enabled:true,memory_signal:'cgroup_memory'}, measure_seconds:150};
   const masks = {'dataflow-1':cpus.join(','), router:'30,31'};
   const cpu = {engine_num_cores:cores, collector:{requested:cpus}, collector_memory_limit_bytes:cap, project_readback:{masks, containers:Object.entries(masks).map(([service,cpuset])=>({service,cpuset,image:service==='router'?'router-image':collector.image_id,state:'running',restarts:0}))}};

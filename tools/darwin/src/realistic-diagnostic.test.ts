@@ -444,3 +444,59 @@ test("attributes only a complete guard and an identity-bound cgroup peak", () =>
   assert.equal(failed.permits_cpu_attribution,false);
   assert.equal(memoryOutcome("").permits_cpu_attribution, false);
 });
+
+test('runner comparator admits only the exact commit cadence against a complete named reference', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { mkdir, rm, writeFile } = await import('node:fs/promises');
+  const { resolve, join } = await import('node:path');
+  const { randomUUID } = await import('node:crypto');
+  const { pathToFileURL } = await import('node:url');
+  const { bindDiagnosticReference } = await import('./realistic-diagnostic.js');
+  const { candidate, arms } = await import('../../../projects/arrowcol-oat/diagnostic-arm.js');
+  const hash = (b:Buffer) => createHash('sha256').update(b).digest('hex');
+  const fixture = async (name:string) => JSON.parse(await readFile(new URL(`../../../projects/arrowcol-oat/fixtures/named-arm-${name}.json`,import.meta.url),'utf8'));
+  // Config was validated and serialized by Rust OatConfig; process settings and
+  // the complete service roster retain their wire shapes, not a live admission.
+  const config = await fixture('oat-config'), {cpu, observed} = await fixture('readback');
+  const root = resolve(`out/diagnostic-fixture-${randomUUID()}`), output = join(root,'diagnostic-output');
+  await mkdir(output,{recursive:true});
+  try {
+    config.platform.compose_state_root = join(root,'state');
+    config.platform.compose_override_file = join(root,'override.yml');
+    config.platform.local.snapshot_root = join(root,'diagnostic-snapshot');
+    config.result_url = pathToFileURL(join(output,'results.parquet')).href;
+    config.website_url = pathToFileURL(join(output,'site/results.parquet')).href;
+    await writeFile(config.platform.compose_override_file,'services: {}\n');
+    const compare = (name:string, reference:unknown) => spawnSync(process.execPath, ['--import','tsx',
+      'projects/arrowcol-oat/diagnostic-arm.ts',name,JSON.stringify(config),JSON.stringify(cpu),JSON.stringify(observed),candidate.source_revision],
+      {encoding:'utf8',env:{...process.env,OAT_DIAGNOSTIC_REFERENCE:JSON.stringify(reference)}});
+    const first = {mode:'first',arm:'candidate-baseline'};
+    const baseline = compare('candidate-baseline',first);
+    assert.equal(baseline.status,0,baseline.stderr);
+    const witness = JSON.parse(baseline.stdout);
+    const expected = {...diagnosticPinsFixture(), collectorSource:candidate.source_revision, images:config.platform.local.expected_image_ids};
+    const receipt = firstArmReceipt(expected);
+    const freeze = {pins_sha256:'b'.repeat(64),stack_bytes:8388608};
+    Object.assign(receipt, {named_freeze:freeze,named_contract:arms['candidate-baseline']});
+    for(const proof of [receipt.diagnostic_admission,receipt.pre_schedule_admission]) Object.assign(proof,{reference:first,arm_contract:witness,cpu_isolation:cpu});
+    const receiptBytes = Buffer.from(JSON.stringify(receipt));
+    const profileBytes = Buffer.from(JSON.stringify(freezeDiagnosticComparisonProfile(receiptBytes,hash(receiptBytes),expected)));
+    const profile = verifyComparisonProfileReference(profileBytes,hash(profileBytes),receiptBytes,expected);
+    const name = 'commit-window-1s';
+    const reference = bindDiagnosticReference(profile,hash(profileBytes),receiptBytes,name,freeze);
+    await writeFile(join(output,'diagnostic-reference-receipt.json'),receiptBytes);
+    await writeFile(join(output,'diagnostic-comparison-profile.json'),profileBytes);
+    config.tunables.collector.commit.batch_window = '1s';
+    assert.notEqual(compare(name,reference).status,0,'stale live 2s window');
+    observed.collector.commit.batch_window = '1s';
+    const treatment = compare(name,reference);
+    assert.equal(treatment.status,0,treatment.stderr);
+    assert.equal(JSON.parse(treatment.stdout).baseline_sha256,witness.baseline_sha256);
+    config.tunables.collector.commit.batch_window = '3s';
+    assert.notEqual(compare(name,reference).status,0,'wrong requested window');
+    config.tunables.collector.commit.batch_window = '1s';
+    config.tunables.collector.commit.max_pending_files++;
+    observed.collector.commit.max_pending_files++;
+    assert.notEqual(compare(name,reference).status,0,'second independent change');
+  } finally {await rm(root,{recursive:true,force:true});}
+});

@@ -8,12 +8,13 @@ export const candidate={source_revision:'ad83c6376086f020a7d4e8cffd66994eedb537f
 export const mainCollector={source_revision:'3630d3e4301bc3ba8f9f69a308d077cebee6d12a',image_id:'sha256:23a418cf48ab1765b6ab7b1a1bd647ee2486357db37865027b60df1ca4ee4c49'};
 // Closed manifest. No request-supplied JSON paths, pairs, values, or exclusions.
 export const arms={
-  'candidate-baseline':{kind:'reference',cores:8,flushes:12,commitFiles:128,collector:candidate},
-  'software-main':{kind:'software-comparison',cores:8,flushes:12,commitFiles:128,collector:mainCollector},
-  'cpu-16':{kind:'collector-cpu',cores:16,flushes:12,commitFiles:128,collector:candidate},
-  'cpu-24':{kind:'collector-cpu',cores:24,flushes:12,commitFiles:128,collector:candidate},
-  'writer-flush-6':{kind:'concurrent-flushes',cores:8,flushes:6,commitFiles:128,collector:candidate},
-  'commit-files-64':{kind:'commit-files',cores:8,flushes:12,commitFiles:64,collector:candidate},
+  'candidate-baseline':{kind:'reference',cores:8,flushes:12,commitFiles:128,batchWindow:'2s',collector:candidate},
+  'software-main':{kind:'software-comparison',cores:8,flushes:12,commitFiles:128,batchWindow:'2s',collector:mainCollector},
+  'cpu-16':{kind:'collector-cpu',cores:16,flushes:12,commitFiles:128,batchWindow:'2s',collector:candidate},
+  'cpu-24':{kind:'collector-cpu',cores:24,flushes:12,commitFiles:128,batchWindow:'2s',collector:candidate},
+  'writer-flush-6':{kind:'concurrent-flushes',cores:8,flushes:6,commitFiles:128,batchWindow:'2s',collector:candidate},
+  'commit-files-64':{kind:'commit-files',cores:8,flushes:12,commitFiles:64,batchWindow:'2s',collector:candidate},
+  'commit-window-1s':{kind:'commit-cadence',cores:8,flushes:12,commitFiles:128,batchWindow:'1s',collector:candidate},
 } as const;
 export type Arm=keyof typeof arms;
 export function armName(v:unknown):Arm {assert(typeof v==='string' && Object.hasOwn(arms,v),'unknown diagnostic arm');return v as Arm;}
@@ -35,6 +36,7 @@ export function armWitness(name:Arm, raw:any, cpu:any, observed:any, source:stri
   assert(observed.client && observed.status === "verified_before_schedule", "missing live readback");
   for(const c of [t,effective]){
     assert.equal(c.runtime.cpu_workers,arm.cores);assert.equal(c.batching.max_concurrent_flushes,arm.flushes);
+    assert.equal(c.commit.batch_window,arm.batchWindow);
     assert.equal(c.commit.max_files_per_commit,arm.commitFiles);
   }
   assert.equal(config.overload_guard.memory_signal,'cgroup_memory');assert.equal(config.overload_guard.enabled,true);
@@ -48,6 +50,8 @@ export function armWitness(name:Arm, raw:any, cpu:any, observed:any, source:stri
   local.collector_image_override=base.collector;local.expected_image_ids.collector=base.collector.image_id;
   local.collector_cpus=mask(8);config.dfe_worker_concurrency=[8];t.runtime.cpu_workers=8;
   t.batching.max_concurrent_flushes=base.flushes;t.commit.max_files_per_commit=base.commitFiles;
+  t.commit.batch_window=base.batchWindow;
+  effective.commit.batch_window=base.batchWindow;
   effective.runtime.cpu_workers=base.cores;
   effective.batching.max_concurrent_flushes=base.flushes;
   effective.commit.max_files_per_commit=base.commitFiles;

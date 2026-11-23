@@ -46,6 +46,8 @@ enum TreatmentArm {
     WriterFlush6,
     #[serde(rename = "commit-files-64")]
     CommitFiles64,
+    #[serde(rename = "commit-window-1s")]
+    CommitWindow1s,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -953,12 +955,12 @@ mod realistic_diagnostic_admission_tests {
         });
         let schedule_calls = Cell::new(0);
         let mut named = exact_reference.clone();
-        named["arm"] = json!({"name":"cpu-16", "baseline_sha256":"d".repeat(64)});
+        named["arm"] = json!({"name":"commit-window-1s", "baseline_sha256":"d".repeat(64)});
         proof["reference"] = named.clone();
         for invalid in [
             Value::Null,
             json!({"name":"cpu-24", "baseline_sha256":"d".repeat(64)}),
-            json!({"name":"cpu-16", "baseline_sha256":"e".repeat(64)}),
+            json!({"name":"commit-window-1s", "baseline_sha256":"e".repeat(64)}),
         ] {
             proof["arm_contract"] = invalid;
             assert!(
@@ -972,7 +974,7 @@ mod realistic_diagnostic_admission_tests {
         schedule_after_diagnostic_admission(Some(&named.to_string()), Some(&proof), run, || ())?;
         for invalid in [
             json!({"name":"unlisted", "baseline_sha256":"d".repeat(64)}),
-            json!({"name":"cpu-16", "baseline_sha256":"d".repeat(64), "skip":true}),
+            json!({"name":"commit-window-1s", "baseline_sha256":"d".repeat(64), "skip":true}),
         ] {
             named["arm"] = invalid;
             proof["reference"] = named.clone();

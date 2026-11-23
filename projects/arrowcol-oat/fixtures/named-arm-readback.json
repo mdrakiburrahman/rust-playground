@@ -1,0 +1,470 @@
+{
+  "cpu": {
+    "client": {
+      "configured": "24,25,26,27,28,29",
+      "container_id": "0000000000000000000000000000000000000000000000000000000000000006",
+      "effective": "24-29",
+      "requested": [
+        24,
+        25,
+        26,
+        27,
+        28,
+        29
+      ]
+    },
+    "collector": {
+      "configured": "0,1,2,3,4,5,6,7",
+      "container_id": "0000000000000000000000000000000000000000000000000000000000000007",
+      "effective": "0-7",
+      "requested": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    "collector_memory_limit_bytes": 68719476736,
+    "engine_num_cores": 8,
+    "project_readback": {
+      "containers": [
+        {
+          "cpuset": "30,31",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "0000000000000000000000000000000000000000000000000000000000000008",
+          "image": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+          "restarts": 0,
+          "service": "arrowcol-catalog",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "30,31",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "0000000000000000000000000000000000000000000000000000000000000009",
+          "image": "sha256:000000000000000000000000000000000000000000000000000000000000000a",
+          "restarts": 0,
+          "service": "lgtm",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "0,1,2,3,4,5,6,7",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "0000000000000000000000000000000000000000000000000000000000000007",
+          "image": "sha256:66c9d807973182594d6244a93f412a2b2c1da8b3bed30cfa528610ae50d67e68",
+          "restarts": 0,
+          "service": "dataflow-1",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "30,31",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "000000000000000000000000000000000000000000000000000000000000000b",
+          "image": "sha256:0000000000000000000000000000000000000000000000000000000000000004",
+          "restarts": 0,
+          "service": "router",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "30,31",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "image": "sha256:000000000000000000000000000000000000000000000000000000000000000d",
+          "restarts": 0,
+          "service": "kusto",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "30,31",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "000000000000000000000000000000000000000000000000000000000000000e",
+          "image": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+          "restarts": 0,
+          "service": "delta-maintenance",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "30,31",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "000000000000000000000000000000000000000000000000000000000000000f",
+          "image": "sha256:0000000000000000000000000000000000000000000000000000000000000005",
+          "restarts": 0,
+          "service": "sqlserver",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        },
+        {
+          "cpuset": "24,25,26,27,28,29",
+          "finished": "0001-01-01T00:00:00Z",
+          "id": "0000000000000000000000000000000000000000000000000000000000000006",
+          "image": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+          "restarts": 0,
+          "service": "oat-client",
+          "started": "2000-01-01T00:00:00Z",
+          "state": "running"
+        }
+      ],
+      "masks": {
+        "arrowcol-catalog": "30,31",
+        "arrowcol-migrate": "30,31",
+        "cadvisor": "30,31",
+        "database-bootstrap": "30,31",
+        "dataflow-1": "0,1,2,3,4,5,6,7",
+        "delta-maintenance": "30,31",
+        "kusto": "30,31",
+        "kusto-explorer": "30,31",
+        "lgtm": "30,31",
+        "oat-client": "24,25,26,27,28,29",
+        "oat-pin-init": "30,31",
+        "portainer": "30,31",
+        "router": "30,31",
+        "sqlserver": "30,31",
+        "validator": "30,31"
+      },
+      "project": "diagnostic-stab-8f1de56f4530418ea93fbbec564266d3"
+    },
+    "thread_siblings": [
+      [
+        0,
+        [
+          0,
+          1
+        ]
+      ],
+      [
+        1,
+        [
+          0,
+          1
+        ]
+      ],
+      [
+        2,
+        [
+          2,
+          3
+        ]
+      ],
+      [
+        3,
+        [
+          2,
+          3
+        ]
+      ],
+      [
+        4,
+        [
+          4,
+          5
+        ]
+      ],
+      [
+        5,
+        [
+          4,
+          5
+        ]
+      ],
+      [
+        6,
+        [
+          6,
+          7
+        ]
+      ],
+      [
+        7,
+        [
+          6,
+          7
+        ]
+      ],
+      [
+        24,
+        [
+          24,
+          25
+        ]
+      ],
+      [
+        25,
+        [
+          24,
+          25
+        ]
+      ],
+      [
+        26,
+        [
+          26,
+          27
+        ]
+      ],
+      [
+        27,
+        [
+          26,
+          27
+        ]
+      ],
+      [
+        28,
+        [
+          28,
+          29
+        ]
+      ],
+      [
+        29,
+        [
+          28,
+          29
+        ]
+      ]
+    ]
+  },
+  "observed": {
+    "client": {
+      "adaptive_window": false,
+      "batch_rows": 65536,
+      "cardinality": 1024,
+      "connect_retries": 0,
+      "connect_timeout_ms": 30000,
+      "connection_window_bytes": 16777216,
+      "connections_per_worker": 2,
+      "corpus_bytes": 0,
+      "corpus_rows": 65536,
+      "data_mode": "shared",
+      "data_profile": "realistic",
+      "dictionary_handling": "hydrate",
+      "entropy": 1,
+      "grpc_accept_compression": "none",
+      "grpc_send_compression": "none",
+      "guid_uniqueness": "per_row",
+      "header_table_bytes": 4096,
+      "interval_us": 0,
+      "ipc_compression": "none",
+      "keepalive_interval_ms": 10000,
+      "keepalive_timeout_ms": 20000,
+      "keepalive_while_idle": true,
+      "max_flight_data_bytes": 67108864,
+      "max_frame_bytes": 16384,
+      "max_header_list_bytes": 16384,
+      "max_memory_bytes": 5368709120,
+      "max_message_bytes": 134217728,
+      "max_rows": 0,
+      "null_fraction": 0,
+      "payload_customer_id": "direct-e64-confirmwide",
+      "pod_ordinal": 0,
+      "rate_limit_rps": 0,
+      "request_timeout_ms": 30000,
+      "resolution": {
+        "available_parallelism": 6,
+        "corpus_rows_source": "explicit_rows",
+        "legacy": {
+          "concurrency": 32,
+          "rows": 8192
+        },
+        "requested": {
+          "batch_rows": 65536,
+          "corpus_bytes": 0,
+          "corpus_rows": 65536,
+          "data_profile": "realistic",
+          "guid_uniqueness": null,
+          "pod_ordinal": 0,
+          "runtime_threads": 14,
+          "stream_retry_base_backoff_ms": 10,
+          "stream_retry_max_attempts": 1,
+          "stream_retry_max_backoff_ms": 250,
+          "streams_per_worker": 2,
+          "string_length_distribution": null,
+          "string_width": 63,
+          "value_variation": null,
+          "workers": 14
+        },
+        "resolved": {
+          "batch_rows": 65536,
+          "corpus_bytes": 0,
+          "corpus_rows": 65536,
+          "data_profile": "realistic",
+          "guid_uniqueness": "per_row",
+          "pod_ordinal": 0,
+          "runtime_threads": 14,
+          "stream_retry_base_backoff_ms": 10,
+          "stream_retry_max_attempts": 1,
+          "stream_retry_max_backoff_ms": 250,
+          "streams_per_worker": 2,
+          "string_length_distribution": "uniform",
+          "string_width": 63,
+          "value_variation": "per_row",
+          "workers": 14
+        },
+        "version": 1
+      },
+      "retry_backoff_ms": 100,
+      "runtime_threads": 14,
+      "seed": 20260923,
+      "skew": 0,
+      "stream_retry_base_backoff_ms": 10,
+      "stream_retry_max_attempts": 1,
+      "stream_retry_max_backoff_ms": 250,
+      "stream_window_bytes": 1048576,
+      "streams_per_worker": 2,
+      "string_length_distribution": "uniform",
+      "string_width": 63,
+      "tcp_keepalive_interval_ms": 0,
+      "tcp_keepalive_ms": 60000,
+      "tcp_keepalive_retries": 0,
+      "tcp_nodelay": true,
+      "value_variation": "per_row",
+      "workers": 14
+    },
+    "collector": {
+      "allocator": "system",
+      "authority_timeout": "10s",
+      "batching": {
+        "adaptive_file": {
+          "cold_start_parquet_ratio": 0.25,
+          "ewma_weight": 0.2,
+          "max_input_bytes": 1073741824,
+          "max_parquet_ratio": 4,
+          "min_input_bytes": 1048576,
+          "min_parquet_ratio": 0.015625,
+          "target_parquet_bytes": 134217728
+        },
+        "age_flush_policy": "drain_ready",
+        "coalesce_publications": true,
+        "global_capacity": {
+          "batches": 16384,
+          "bytes": 4290000000,
+          "rows": 25000000
+        },
+        "max_age": "1m",
+        "max_arrow_memory_per_flush": 1073741824,
+        "max_batches_per_flush": 2048,
+        "max_concurrent_flushes": 12,
+        "max_rows_per_flush": 2000000,
+        "per_table_capacity": {
+          "batches": 8192,
+          "bytes": 4000000000,
+          "rows": 12000000
+        },
+        "pipeline_depth": 8
+      },
+      "catalog": {
+        "maximum_cache_age": "10s",
+        "type": "remote"
+      },
+      "commit": {
+        "batch_window": "2s",
+        "max_files_per_commit": 128,
+        "max_pending_files": 512
+      },
+      "commit_telemetry": {
+        "clock": "system_unix_ms",
+        "schema_version": 1,
+        "scope": "new_ingestion_addfiles_after_sync"
+      },
+      "cpu_pressure": "process",
+      "engine": {
+        "shutdown_drain_timeout_seconds": 60
+      },
+      "layout": {
+        "process_policy": {
+          "bloom_columns": [
+            "customer_id"
+          ],
+          "enabled": true,
+          "max_input_bytes": 1073741824,
+          "max_rows": 2000000,
+          "page_rows": 2048,
+          "row_group_rows": 262144,
+          "sort_columns": [
+            "customer_id"
+          ]
+        },
+        "table_properties_override": true
+      },
+      "limits": {
+        "admission_timeout": "30s",
+        "batch_channel_capacity": 4,
+        "grpc_accept_compression": "none",
+        "grpc_send_compression": "none",
+        "max_ddl_bytes": 65536,
+        "max_message_bytes": 134217728,
+        "max_metadata_bytes": 16384,
+        "max_schema_bytes": 1048576,
+        "max_stream_duration": "5m",
+        "put_result_channel_capacity": 16
+      },
+      "log_filter": null,
+      "parquet_writer": {
+        "column_index_truncate_length": null,
+        "columns": {},
+        "data_page_row_count_limit": null,
+        "defaults": {
+          "bloom_filter_enabled": null,
+          "bloom_filter_fpp": null,
+          "bloom_filter_ndv": null,
+          "compression": null,
+          "compression_level": null,
+          "data_page_size_limit": null,
+          "data_page_v2_compression_ratio_threshold": null,
+          "dictionary_enabled": null,
+          "dictionary_page_size_limit": null,
+          "encoding": null,
+          "statistics": null,
+          "write_page_header_statistics": null
+        },
+        "max_row_group_bytes": null,
+        "max_row_group_rows": null,
+        "offset_index_enabled": null,
+        "sorting_columns": null,
+        "statistics_truncate_length": null,
+        "write_batch_size": null,
+        "writer_version": null
+      },
+      "pressure": {
+        "buffered_batches_limit": 16384,
+        "buffered_bytes_limit": 4290000000,
+        "buffered_rows_limit": 25000000,
+        "heartbeat_interval": "5s",
+        "max_concurrent_streams": 256,
+        "pressure_interval": "2s",
+        "registration_ttl": "30s",
+        "rss_limit_bytes": 68719476736
+      },
+      "routing": {
+        "command_timeout": "30s",
+        "connect_timeout": "15s",
+        "type": "sql_server"
+      },
+      "runtime": {
+        "batch_rows": 16384,
+        "blocking_workers": 64,
+        "cpu_workers": 8,
+        "generated_partition_fast_path": false,
+        "read_ahead": 8,
+        "runtime_workers": 4,
+        "task_limit": 128,
+        "upload_buffer_capacity_bytes": 8388608,
+        "upload_limit": 8,
+        "upload_mode": "put_create",
+        "upload_request_concurrency": 2
+      }
+    },
+    "collector_image_id": "sha256:66c9d807973182594d6244a93f412a2b2c1da8b3bed30cfa528610ae50d67e68",
+    "observed_at_unix_ms": 1000,
+    "status": "verified_before_schedule"
+  }
+}

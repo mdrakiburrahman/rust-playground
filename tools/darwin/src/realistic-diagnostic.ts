@@ -287,6 +287,22 @@ function diagnosticReference(profile: FrozenComparisonProfile, profileSha256: st
   };
 }
 
+export function bindDiagnosticReference(profile: FrozenComparisonProfile, profileHash: string, receipt: Buffer,
+  name: Arm | undefined, freeze: {pins_sha256: string; stack_bytes: number}): DiagnosticReference {
+  const reference = diagnosticReference(profile, profileHash);
+  const bound = JSON.parse(receipt.toString('utf8'));
+  if (name && name !== 'candidate-baseline') {
+    const w = bound.pre_schedule_admission?.arm_contract;
+    if (reference.mode !== 'matched' || !isDeepStrictEqual(bound.diagnostic_admission?.reference, {mode:'first', arm:'candidate-baseline'})
+      || !isDeepStrictEqual(bound.named_freeze, freeze) || w?.name !== 'candidate-baseline'
+      || !isDeepStrictEqual(w.manifest, arms['candidate-baseline']) || !isDeepStrictEqual(w, bound.diagnostic_admission?.arm_contract)) {
+      throw Error('missing exact named reference evidence');
+    }
+    reference.arm = {name, baseline_sha256: string(w.baseline_sha256, /^[0-9a-f]{64}$/, 'named reference witness')};
+  } else if (bound.pre_schedule_admission?.arm_contract) throw Error('named baseline requires explicit treatment');
+  return reference;
+}
+
 export function validateDiagnosticReferenceProof(
   proofs: readonly JsonObject[],
   reference: DiagnosticReference,
@@ -582,13 +598,7 @@ export async function runRealisticDiagnostic(options: {
     comparisonProfile = verifyComparisonProfileReference(
       comparisonProfileBytes, options.reference.profileSha256, referenceReceiptBytes, expected,
     );
-    reference = diagnosticReference(comparisonProfile, options.reference.profileSha256);
-    const bound=JSON.parse(referenceReceiptBytes.toString('utf8'));
-    if(name && name!=='candidate-baseline'){
-      const w=bound.pre_schedule_admission?.arm_contract;
-      if(reference.mode!=='matched' || !isDeepStrictEqual(bound.diagnostic_admission?.reference,{mode:'first',arm:'candidate-baseline'}) || !isDeepStrictEqual(bound.named_freeze,freeze) || w?.name!=='candidate-baseline' || !isDeepStrictEqual(w.manifest,arms['candidate-baseline']) || !isDeepStrictEqual(w,bound.diagnostic_admission?.arm_contract))throw Error('missing exact named reference evidence');
-      reference.arm={name,baseline_sha256:string(w.baseline_sha256,/^[0-9a-f]{64}$/,'named reference witness')};
-    }else if(bound.pre_schedule_admission?.arm_contract)throw Error('named baseline requires explicit treatment');
+    reference = bindDiagnosticReference(comparisonProfile, options.reference.profileSha256, referenceReceiptBytes, name, freeze);
   }
   if (expected.collectorSource !== COLLECTOR_SOURCE_BASE) throw new Error("diagnostic collector must be built from the frozen collector source");
   if(recipe){expected.collectorSource=recipe.collector.source_revision;expected.images={...expected.images,collector:recipe.collector.image_id};}
@@ -626,7 +636,7 @@ export async function runRealisticDiagnostic(options: {
   if (object(files["experiments/darwin/historical-parity.oat.json"], "seed manifest").sha256 !== expected.seed
     || await sha256(seedPath) !== expected.seed) throw new Error("seed pin differs from trusted snapshot");
   const config = realisticDiagnosticConfig(JSON.parse(await readFile(seedPath, "utf8")), cpus);
-  if(recipe){const c=object(object(config.tunables,'tunables').collector,'collector');object(c.batching,'batching').max_concurrent_flushes=recipe.flushes;object(c.commit,'commit').max_files_per_commit=recipe.commitFiles;}
+  if(recipe){const c=object(object(config.tunables,'tunables').collector,'collector');object(c.batching,'batching').max_concurrent_flushes=recipe.flushes;const commit=object(c.commit,'commit');if(commit.batch_window!=='2s')throw Error('unexpected seed commit window');commit.batch_window=recipe.batchWindow;commit.max_files_per_commit=recipe.commitFiles;}
   const lock = join(options.home, "data", "evaluating");
   await mkdir(dirname(lock), { recursive: true });
   await mkdir(lock);

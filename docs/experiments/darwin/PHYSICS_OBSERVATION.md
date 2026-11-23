@@ -94,6 +94,7 @@ stack size and run parent throughout. Use the mask matching the chosen row.
 | `software-main` | Only the source/image pair below; software comparison, **not** single-resource causality |
 | `cpu-16`, `cpu-24` | CPUs 0–15 or 0–23; engine `--num-cores`, DFE concurrency and runtime CPU workers move together to 16 or 24 |
 | `writer-flush-6` | `batching.max_concurrent_flushes` 12 → 6 (exporter flush-slot semaphore, not writer threads) |
+| `commit-window-1s` | Commit cadence: `commit.batch_window` 2s → 1s; the 128-file limit is unchanged |
 | `commit-files-64` | `commit.max_files_per_commit` 128 → 64 |
 
 Candidate source `ad83c6376086f020a7d4e8cffd66994eedb537fe` requires image
