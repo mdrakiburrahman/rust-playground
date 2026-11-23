@@ -279,3 +279,46 @@ fn canonical_writer_rejects_inconsistent_batches() -> Result<()> {
     assert_eq!(accepted.num_rows(), 2);
     Ok(())
 }
+
+#[test]
+fn file_mapping_modes_preserve_values_and_validate_later_batches() -> Result<()> {
+    const KNOB: &str = "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE";
+    const CHILD: &str = "ARROWCOL_MAPPING_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Runtime configuration is process-wide. Do not mutate the test runner's environment.
+        for mode in ["false", "true"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "file_mapping_modes_preserve_values_and_validate_later_batches"])
+                .env(CHILD, "1")
+                .env(KNOB, mode)
+                .status()?;
+            assert!(status.success(), "{KNOB}={mode}");
+        }
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let raw = raw_batch()?;
+    let table = DeltaTable::open_url(url(root.path())?, raw.schema(), vec![])?;
+    let reordered = raw.slice(1, 2).project(&[3, 2, 1, 0])?;
+    let published = runtime()?.block_on(async {
+        let mut file = table.new_file(raw.schema())?;
+        file.write(&raw).await?;
+        file.write(&reordered).await?;
+        file.finish().await
+    })?;
+    let schema = table.arrow_schema()?;
+    let expected = normalize::align(&normalize::batch(&raw)?, Arc::clone(&schema))?;
+    assert_eq!(
+        read_file(&published.file.path, &schema)?,
+        arrow::compute::concat_batches(&schema, &[expected.clone(), expected.slice(1, 2)])?
+    );
+    runtime()?.block_on(async {
+        let mut file = table.new_file(raw.schema())?;
+        file.write(&raw).await?;
+        // The same plan cannot make a later batch missing the required id column valid.
+        assert!(file.write(&raw.project(&[1, 2, 3])?).await.is_err());
+        assert_eq!(file.rows_written(), raw.num_rows());
+        assert!(file.write(&raw).await.is_err());
+        Ok(())
+    })
+}

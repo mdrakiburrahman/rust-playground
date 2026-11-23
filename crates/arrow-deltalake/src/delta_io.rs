@@ -81,6 +81,9 @@ pub struct DeltaRuntimeConfig {
     /// Skip row-wise grouping for internally generated single ingestion partitions.
     #[serde(default)]
     pub generated_partition_fast_path: bool,
+    /// Reuse the bound logical projection and evaluator within one file.
+    #[serde(default)]
+    pub file_mapping_cache: bool,
 }
 
 const fn default_detach_ratio() -> usize {
@@ -116,6 +119,7 @@ impl DeltaRuntimeConfig {
             cpu_queue_jobs: None,
             partition_grouping: crate::PartitionGrouping::default(),
             generated_partition_fast_path: false,
+            file_mapping_cache: false,
         }
     }
 
@@ -197,6 +201,10 @@ impl DeltaRuntimeConfig {
                 "false" => false,
                 _ => anyhow::bail!("{name} must be 'true' or 'false', got {raw:?}"),
             };
+        }
+        let name = "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE";
+        if let Some(raw) = lookup(name)? {
+            config.file_mapping_cache = raw.parse::<bool>().with_context(|| format!("{name} must be true or false"))?;
         }
         if config.upload_mode == UploadMode::PutCreate {
             anyhow::ensure!(

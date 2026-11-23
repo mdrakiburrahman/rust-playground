@@ -308,6 +308,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
     capability!("collector.runtime.partition_grouping", "scalar_map"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
+    capability!("collector.runtime.file_mapping_cache", "false"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
     capability!("collector.upload.request_concurrency", "2"),
@@ -1131,6 +1132,9 @@ impl Tunables {
                             "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH".to_owned(),
                             enabled.to_string(),
                         );
+                    }
+                    if let Some(enabled) = runtime.file_mapping_cache {
+                        output.insert("ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE".into(), enabled.to_string());
                     }
                     for (field, value) in [
                         ("RUNTIME_WORKERS", runtime.workers),
@@ -2399,6 +2403,14 @@ fn flatten_environment(value: &Value, prefix: &str, output: &mut BTreeMap<String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_mapping_cache_rejects_non_boolean_values() {
+        for bad in [serde_json::json!("false"), serde_json::json!(null), serde_json::json!(1)] {
+            let value = serde_json::json!({"collector":{"runtime":{"file_mapping_cache":bad}}});
+            assert!(error_text(Tunables::parse_oat_json(value)).contains("file_mapping_cache"));
+        }
+    }
+
     fn error_text<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> String {
         match result {
             Ok(_) => String::new(),

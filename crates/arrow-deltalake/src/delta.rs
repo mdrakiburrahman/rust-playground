@@ -4387,6 +4387,11 @@ impl DeltaTable {
             builder = builder.with_partition_values(typed);
         }
         let context = builder.build()?;
+        let mapping = if runtime_config()?.file_mapping_cache {
+            Some(FileMapping::new(&schema, &context, &self.engine)?)
+        } else {
+            None
+        };
         let mut directory = self.root.clone();
         for (name, value) in &values {
             let value = value.as_deref().unwrap_or("__HIVE_DEFAULT_PARTITION__");
@@ -4402,6 +4407,7 @@ impl DeltaTable {
         let parquet = ParquetFileWriter::create_with_properties(path, physical, properties)?;
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(DeltaFileWriter {
+            mapping,
             table: Arc::clone(self),
             schema,
             context,
@@ -4888,8 +4894,37 @@ impl DeltaTable {
     }
 }
 
+/// Valid only after alignment to this file's snapshot schema. Never retains batch data.
+struct FileMapping {
+    projection: Vec<usize>,
+    evaluator: Arc<dyn delta_kernel::ExpressionEvaluator>,
+}
+
+impl FileMapping {
+    fn new(schema: &SchemaRef, context: &BoundWriteContext, engine: &LocalEngine) -> Result<Self> {
+        let logical: arrow::datatypes::Schema = context.logical_data_schema().as_ref().try_into_arrow()?;
+        let projection = logical
+            .fields()
+            .iter()
+            .map(|field| schema.index_of(field.name()))
+            .collect::<std::result::Result<_, _>>()?;
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            Arc::clone(context.logical_data_schema()),
+            context.logical_to_physical(),
+            Arc::clone(context.physical_data_schema()).into(),
+        )?;
+        Ok(Self { projection, evaluator })
+    }
+
+    fn physical_batch(&self, aligned: &RecordBatch) -> Result<RecordBatch> {
+        let data = ArrowEngineData::new(aligned.project(&self.projection)?);
+        Ok(self.evaluator.evaluate(&data)?.try_into_record_batch()?)
+    }
+}
+
 /// Streaming Delta data file. `finish` closes, syncs, and commits it.
 pub struct DeltaFileWriter {
+    mapping: Option<FileMapping>,
     table: Arc<DeltaTable>,
     pub(crate) schema: SchemaRef,
     pub(crate) context: BoundWriteContext,
@@ -5280,20 +5315,10 @@ impl DeltaFileWriter {
             batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
         }
         let normalized = normalize::align(&batch, Arc::clone(&self.schema))?;
-        let data_schema: arrow::datatypes::Schema = self.context.logical_data_schema().as_ref().try_into_arrow()?;
-        let projection = data_schema
-            .fields()
-            .iter()
-            .map(|field| normalized.schema().index_of(field.name()))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let normalized = normalized.project(&projection)?;
-        let data = ArrowEngineData::new(normalized);
-        let evaluator = self.table.engine.evaluation_handler().new_expression_evaluator(
-            Arc::clone(self.context.logical_data_schema()),
-            self.context.logical_to_physical(),
-            Arc::clone(self.context.physical_data_schema()).into(),
-        )?;
-        let physical = evaluator.evaluate(&data)?.try_into_record_batch()?;
+        let physical = match &self.mapping {
+            Some(mapping) => mapping.physical_batch(&normalized)?,
+            None => FileMapping::new(&self.schema, &self.context, &self.table.engine)?.physical_batch(&normalized)?,
+        };
         let rows = self
             .accepted_rows
             .checked_add(batch.num_rows())

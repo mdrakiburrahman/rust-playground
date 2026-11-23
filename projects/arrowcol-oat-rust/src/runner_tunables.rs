@@ -288,6 +288,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
             "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
             "collector.runtime.partition_grouping" => Some(("partition_grouping", "ARROWCOL_COLLECTOR_PARTITION_GROUPING")),
+            "collector.runtime.file_mapping_cache" => Some(("file_mapping_cache", "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE")),
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
             _ => None,
         };
@@ -1029,6 +1030,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
              json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256})),
             (json!({"collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":2}}}),
              json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":2,"upload_limit":32})),
+            (json!({"collector":{"runtime":{"file_mapping_cache":true}}}), json!({"file_mapping_cache":true})),
             (json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
              json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2})),
         ] {
