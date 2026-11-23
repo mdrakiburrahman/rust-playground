@@ -72,6 +72,19 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
         });
+    let adaptive_policies = collectors.iter()
+        .flat_map(|process| process["adaptive_table_policies"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    let adaptive_tables = adaptive_policies.iter()
+        .filter_map(|policy| policy["table_name"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let adaptive_covered = !expected_tables.is_empty()
+        && collectors.iter().all(|process| process["adaptive_table_policies"].is_array())
+        && expected_tables.iter().all(|table| adaptive_tables.contains(table.as_str()))
+        && adaptive_policies.iter().all(|policy| {
+            policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
+                && policy["scope"] == "installed_estimator_not_full_run_history"
+        });
     let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
         "ARROWCOL_COLLECTOR_BATCHING_CONFIG"]
         .into_iter()
@@ -86,6 +99,21 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        if let Some(field) = path.strip_prefix("collector.batching.adaptive_file.")
+            && matches!(field, "target_parquet_bytes" | "min_input_bytes" | "max_input_bytes"
+                | "cold_start_parquet_ratio" | "ewma_weight" | "min_parquet_ratio" | "max_parquet_ratio")
+        {
+            let requested = projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
+                .and_then(|value| value["adaptive_file"].get(field))
+                .filter(|value| !value.is_null());
+            if adaptive_covered && requested.is_some()
+                && adaptive_policies.iter().all(|policy| policy["config"].get(field) == requested)
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_table_adaptive_readback"}));
+                return false;
+            }
+            return true;
+        }
         if let Some(field) = path.strip_prefix("collector.layout.")
             && matches!(field, "enabled" | "sort_columns" | "bloom_columns" | "max_rows"
                 | "max_input_bytes" | "row_group_rows" | "page_rows")

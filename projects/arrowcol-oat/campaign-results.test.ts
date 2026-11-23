@@ -1160,6 +1160,24 @@ test('accepts table-writer readback for active Parquet limits', () => {
   assert.match(renderCampaignResults(candidate, 'C1'), />800\*?<\/text>/);
 });
 
+test('accepts table-adaptive readback for an active sizing factor', () => {
+  const candidate = coveredCandidate('adaptive-sizing', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.collector.batching.adaptive_file.target_parquet_bytes'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+      batching: { adaptive_file: { target_parquet_bytes: 134217728 } },
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'collector.batching.adaptive_file.target_parquet_bytes', reason: 'consumer_table_adaptive_readback' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), />800\*?<\/text>/);
+});
+
 test('an active cell retains its committed rate after Kustainer death', () => {
   const candidate = coveredCandidate('active-death', 800, 260);
   for (const row of candidate) {

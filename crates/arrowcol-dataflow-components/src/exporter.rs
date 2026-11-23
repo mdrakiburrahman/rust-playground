@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use arrow_deltalake::commit::{BatchedTable, CommitReceiptError};
-use arrow_deltalake::sizing::{AdaptiveFileSizeEstimator, FlushTrigger};
+use arrow_deltalake::sizing::{AdaptiveFileSizeConfig, AdaptiveFileSizeEstimator, FlushTrigger};
 use async_trait::async_trait;
 use futures::future::{FutureExt, LocalBoxFuture};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -696,6 +696,7 @@ async fn run_batch_worker(
         max_pending_files,
         coalesce_publications: policy.coalesce_publications,
         adaptive_defaults: policy.adaptive_file.build(),
+        adaptive_readback: Arc::new(Mutex::new(None)),
         pipeline_depth: policy.pipeline_depth,
         force_commit: policy.pipeline_depth == 1,
         pending_flush: None,
@@ -891,6 +892,7 @@ struct GroupPublisher<'a> {
     max_pending_files: usize,
     coalesce_publications: bool,
     adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
+    adaptive_readback: Arc<Mutex<Option<AdaptiveFileSizeConfig>>>,
     pipeline_depth: usize,
     force_commit: bool,
     pending_flush: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -912,6 +914,27 @@ impl GroupPublisher<'_> {
         if estimator.config() != &config {
             *estimator = AdaptiveFileSizeEstimator::new(config)
                 .map_err(|error| ExportFailure::Permanent(format!("invalid writer policy: {error}")))?;
+        }
+        let mut previous = self
+            .adaptive_readback
+            .lock()
+            .map_err(|_| ExportFailure::Permanent("adaptive policy readback lock poisoned".to_owned()))?;
+        if *previous != Some(config) {
+            let event = serde_json::json!({
+                "table_name": self.identity.to_string(),
+                "scope": "installed_estimator_not_full_run_history",
+                "config": {
+                    "target_parquet_bytes": config.target_parquet_bytes,
+                    "min_input_bytes": config.min_input_bytes,
+                    "max_input_bytes": config.max_input_bytes,
+                    "cold_start_parquet_ratio": config.cold_start_parquet_ratio,
+                    "ewma_weight": config.ewma_weight,
+                    "min_parquet_ratio": config.min_parquet_ratio,
+                    "max_parquet_ratio": config.max_parquet_ratio,
+                }
+            });
+            eprintln!("arrowcol_adaptive_config {event}");
+            *previous = Some(config);
         }
         Ok(())
     }
@@ -979,6 +1002,7 @@ impl GroupPublisher<'_> {
         let max_pending_files = self.max_pending_files;
         let coalesce_publications = self.coalesce_publications;
         let adaptive_defaults = self.adaptive_defaults;
+        let adaptive_readback = Arc::clone(&self.adaptive_readback);
         let flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending_flush = Arc::clone(&flush);
         let task = arrow_deltalake::delta::spawn_shared_io(async move {
@@ -992,6 +1016,7 @@ impl GroupPublisher<'_> {
                 max_pending_files,
                 coalesce_publications,
                 adaptive_defaults,
+                adaptive_readback,
                 pipeline_depth: 1,
                 force_commit: false,
                 pending_flush: Some(pending_flush),
