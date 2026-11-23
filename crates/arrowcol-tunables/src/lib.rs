@@ -379,6 +379,11 @@ pub struct PressureTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_timestamp_kernel"
+    )]
+    pub timestamp_kernel: Option<arrow_deltalake::TimestampKernel>,
     pub workers: Option<usize>,
     pub blocking_workers: Option<usize>,
     #[serde(
@@ -417,6 +422,17 @@ fn deserialize_present_partition_grouping<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<PartitionGrouping>, D::Error> {
     PartitionGrouping::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::TimestampKernel>, D::Error> {
+    // Deserialize a string first: serde's externally tagged object enum form is not a tunable value.
+    let raw = String::deserialize(d)
+        .map_err(|_| <D::Error as serde::de::Error>::custom("collector.runtime.timestamp_kernel must be a string"))?;
+    serde_json::from_value(serde_json::Value::String(raw))
+        .map(Some)
+        .map_err(|e| serde::de::Error::custom(format!("collector.runtime.timestamp_kernel: {e}")))
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

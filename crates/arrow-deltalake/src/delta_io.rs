@@ -42,6 +42,9 @@ impl UploadMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaRuntimeConfig {
+    /// Raw timestamp and nanosecond companion conversion.
+    #[serde(default)]
+    pub timestamp_kernel: crate::TimestampKernel,
     /// Async I/O workers: default cores / 4, clamped to 2..=16; allowed 1..=64.
     pub runtime_workers: usize,
     /// Blocking I/O workers: default cores * 2, clamped to 32..=128; allowed 2..=256.
@@ -97,6 +100,7 @@ impl Default for DeltaRuntimeConfig {
 impl DeltaRuntimeConfig {
     fn for_cores(cores: usize) -> Self {
         Self {
+            timestamp_kernel: crate::TimestampKernel::Reference,
             runtime_workers: (cores / 4).clamp(2, 16),
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
             blocking_fs_reserve: 1,
@@ -166,6 +170,11 @@ impl DeltaRuntimeConfig {
                 "{name} must be an unsigned decimal integer"
             );
             config.cpu_queue_jobs = Some(raw.parse().with_context(|| format!("parse {name}"))?);
+        }
+        let name = "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL";
+        if let Some(raw) = lookup(name)? {
+            config.timestamp_kernel =
+                serde_json::from_value(serde_json::Value::String(raw)).with_context(|| format!("parse {name}"))?;
         }
         let mode_name = "ARROWCOL_COLLECTOR_UPLOAD_MODE";
         if let Some(raw) = lookup(mode_name)? {
