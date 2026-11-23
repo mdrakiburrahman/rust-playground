@@ -78,6 +78,16 @@ pub struct DeltaRuntimeConfig {
     /// Partition grouping algorithm; the default preserves row-wise grouping.
     #[serde(default)]
     pub partition_grouping: crate::PartitionGrouping,
+    #[serde(default)]
+    pub event_interval: Option<usize>,
+    #[serde(default)]
+    pub global_queue_interval: Option<usize>,
+    #[serde(default)]
+    pub thread_stack_size: Option<usize>,
+    #[serde(default)]
+    pub thread_keep_alive_ms: Option<usize>,
+    #[serde(default)]
+    pub cpu_thread_stack_size: Option<usize>,
     /// Skip row-wise grouping for internally generated single ingestion partitions.
     #[serde(default)]
     pub generated_partition_fast_path: bool,
@@ -121,6 +131,11 @@ impl DeltaRuntimeConfig {
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
             cpu_queue_jobs: None,
             partition_grouping: crate::PartitionGrouping::default(),
+            event_interval: None,
+            global_queue_interval: None,
+            thread_stack_size: None,
+            thread_keep_alive_ms: None,
+            cpu_thread_stack_size: None,
             generated_partition_fast_path: false,
             file_mapping_cache: false,
             generated_partition_binding: crate::GeneratedPartitionBinding::RevalidateRows,
@@ -183,6 +198,22 @@ impl DeltaRuntimeConfig {
         if let Some(raw) = lookup(name)? {
             config.timestamp_kernel =
                 serde_json::from_value(serde_json::Value::String(raw)).with_context(|| format!("parse {name}"))?;
+        }
+        for (suffix, value) in [
+            ("EVENT_INTERVAL", &mut config.event_interval),
+            ("GLOBAL_QUEUE_INTERVAL", &mut config.global_queue_interval),
+            ("THREAD_STACK_SIZE", &mut config.thread_stack_size),
+            ("THREAD_KEEP_ALIVE_MS", &mut config.thread_keep_alive_ms),
+            ("CPU_THREAD_STACK_SIZE", &mut config.cpu_thread_stack_size),
+        ] {
+            let name = format!("ARROWCOL_COLLECTOR_{suffix}");
+            if let Some(raw) = lookup(&name)? {
+                anyhow::ensure!(
+                    !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()),
+                    "{name} must be an unsigned decimal integer"
+                );
+                *value = Some(raw.parse().with_context(|| format!("parse {name}"))?);
+            }
         }
         let mode_name = "ARROWCOL_COLLECTOR_UPLOAD_MODE";
         if let Some(raw) = lookup(mode_name)? {
@@ -257,6 +288,20 @@ impl DeltaRuntimeConfig {
                 "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS must be in 1..=128"
             );
         }
+        for (name, value, min, max) in [
+            ("EVENT_INTERVAL", self.event_interval, 1, 65_535),
+            ("GLOBAL_QUEUE_INTERVAL", self.global_queue_interval, 1, 65_535),
+            ("THREAD_STACK_SIZE", self.thread_stack_size, 65_536, 67_108_864),
+            ("THREAD_KEEP_ALIVE_MS", self.thread_keep_alive_ms, 1, 86_400_000),
+            ("CPU_THREAD_STACK_SIZE", self.cpu_thread_stack_size, 65_536, 67_108_864),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    (min..=max).contains(&value),
+                    "ARROWCOL_COLLECTOR_{name} must be in {min}..={max}, got {value}"
+                );
+            }
+        }
         if self.upload_mode == UploadMode::BufferedMultipart {
             anyhow::ensure!(
                 (1024 * 1024..=64 * 1024 * 1024).contains(&self.upload_buffer_capacity_bytes),
@@ -321,13 +366,16 @@ thread_local! {
 }
 
 impl CpuPool {
-    fn new(workers: usize, queue_jobs: usize) -> Result<Self> {
+    fn new(workers: usize, queue_jobs: usize, stack_size: Option<usize>) -> Result<Self> {
         let (sender, receiver) = tokio::sync::mpsc::channel::<CpuJob>(queue_jobs);
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
-            std::thread::Builder::new()
-                .name(format!("delta-cpu-{index}"))
+            let mut builder = std::thread::Builder::new().name(format!("delta-cpu-{index}"));
+            if let Some(size) = stack_size {
+                builder = builder.stack_size(size);
+            }
+            builder
                 .spawn(move || {
                     CPU_WORKER.set(true);
                     loop {
@@ -388,7 +436,9 @@ fn cpu_pool() -> Result<&'static CpuPool> {
     let config = runtime_config()?;
     let workers = config.cpu_workers;
     let queue_jobs = config.cpu_queue_jobs.unwrap_or(workers);
-    match CPU_POOL.get_or_init(|| CpuPool::new(workers, queue_jobs).map_err(|error| format!("{error:#}"))) {
+    match CPU_POOL.get_or_init(|| {
+        CpuPool::new(workers, queue_jobs, config.cpu_thread_stack_size).map_err(|error| format!("{error:#}"))
+    }) {
         Ok(pool) => Ok(pool),
         Err(error) => anyhow::bail!("{error}"),
     }
@@ -554,13 +604,25 @@ impl SharedExecutor {
                     "blocking filesystem reserve must be smaller than the blocking worker count",
                 )
             })?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             .worker_threads(config.runtime_workers)
             .max_blocking_threads(config.blocking_workers)
             .thread_name("delta-io")
-            .enable_all()
-            .build()
-            .context("create shared Delta I/O runtime")?;
+            .enable_all();
+        if let Some(value) = config.event_interval {
+            builder.event_interval(value as u32);
+        }
+        if let Some(value) = config.global_queue_interval {
+            builder.global_queue_interval(value as u32);
+        }
+        if let Some(value) = config.thread_stack_size {
+            builder.thread_stack_size(value);
+        }
+        if let Some(value) = config.thread_keep_alive_ms {
+            builder.thread_keep_alive(std::time::Duration::from_millis(value as u64));
+        }
+        let runtime = builder.build().context("create shared Delta I/O runtime")?;
         Ok(Self {
             runtime,
             admission: Arc::new(Admission::new(config.task_limit)),
@@ -888,6 +950,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_scheduler_settings_parse_and_create_consumers() -> Result<()> {
+        let config = DeltaRuntimeConfig::from_lookup(|name| {
+            Ok(match name {
+                "ARROWCOL_COLLECTOR_EVENT_INTERVAL" => Some("7".to_owned()),
+                "ARROWCOL_COLLECTOR_GLOBAL_QUEUE_INTERVAL" => Some("13".to_owned()),
+                "ARROWCOL_COLLECTOR_THREAD_STACK_SIZE" => Some("2097152".to_owned()),
+                "ARROWCOL_COLLECTOR_THREAD_KEEP_ALIVE_MS" => Some("3000".to_owned()),
+                "ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE" => Some("2097152".to_owned()),
+                _ => None,
+            })
+        })?;
+        let pool = CpuPool::new(1, 1, config.cpu_thread_stack_size)?;
+        assert_eq!(
+            pool.run(|| std::thread::current().name().map(str::to_owned))?
+                .as_deref(),
+            Some("delta-cpu-0")
+        );
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .event_interval(config.event_interval.context("event interval")? as u32)
+            .global_queue_interval(config.global_queue_interval.context("global queue interval")? as u32)
+            .thread_stack_size(config.thread_stack_size.context("thread stack")?)
+            .thread_keep_alive(std::time::Duration::from_millis(
+                config.thread_keep_alive_ms.context("keep alive")? as u64,
+            ));
+        let runtime = builder.build()?;
+        assert_eq!(runtime.block_on(async { 42 }), 42);
+        Ok(())
+    }
+
+    #[test]
     fn runtime_queue_and_blocking_reserve_resolve_and_validate() -> Result<()> {
         let config = DeltaRuntimeConfig::from_lookup(|name| {
             Ok(match name {
@@ -982,7 +1075,7 @@ mod tests {
 
     #[test]
     fn cpu_jobs_keep_panics_nested_calls_and_io_independent() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1, 1)?);
+        let pool = Arc::new(CpuPool::new(1, 1, None)?);
         let nested_pool = Arc::clone(&pool);
         let caller = std::thread::current().id();
         let (worker, answer) = pool.run(move || {
@@ -1008,7 +1101,7 @@ mod tests {
 
     #[test]
     fn cpu_queue_and_execution_are_bounded() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1, 1)?);
+        let pool = Arc::new(CpuPool::new(1, 1, None)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
@@ -1035,7 +1128,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cpu_async_admission_does_not_block_the_caller_runtime() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1, 1)?);
+        let pool = Arc::new(CpuPool::new(1, 1, None)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);

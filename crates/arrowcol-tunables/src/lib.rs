@@ -411,6 +411,31 @@ pub struct RuntimeTunables {
         deserialize_with = "deserialize_present_partition_grouping"
     )]
     pub partition_grouping: Option<PartitionGrouping>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub event_interval: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub global_queue_interval: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub thread_stack_size: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub thread_keep_alive_ms: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub cpu_thread_stack_size: Option<usize>,
     pub generated_partition_fast_path: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_binding")]
     pub generated_partition_binding: Option<arrow_deltalake::GeneratedPartitionBinding>,

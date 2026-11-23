@@ -308,6 +308,11 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING",
             )),
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
+            "collector.runtime.event_interval" => Some(("event_interval", "ARROWCOL_COLLECTOR_EVENT_INTERVAL")),
+            "collector.runtime.global_queue_interval" => Some(("global_queue_interval", "ARROWCOL_COLLECTOR_GLOBAL_QUEUE_INTERVAL")),
+            "collector.runtime.thread_stack_size" => Some(("thread_stack_size", "ARROWCOL_COLLECTOR_THREAD_STACK_SIZE")),
+            "collector.runtime.thread_keep_alive_ms" => Some(("thread_keep_alive_ms", "ARROWCOL_COLLECTOR_THREAD_KEEP_ALIVE_MS")),
+            "collector.runtime.cpu_thread_stack_size" => Some(("cpu_thread_stack_size", "ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE")),
             _ => None,
         };
         if let Some((field, variable)) = runtime {
@@ -1051,6 +1056,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             (json!({"collector":{"runtime":{"file_mapping_cache":true}}}), json!({"file_mapping_cache":true})),
             (json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
              json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2})),
+            (json!({"collector":{"runtime":{"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152}}}),
+             json!({"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152})),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
