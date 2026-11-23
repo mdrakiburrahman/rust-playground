@@ -674,7 +674,8 @@ impl Tunables {
         {
             bail!("client.send_iter must be clone_vec or arc_cursor");
         }
-        let tunables: Self = serde_json::from_value(value).context("parse OAT tunables")?;
+        let tunables: Self =
+            serde_path_to_error::deserialize(value).map_err(|error| anyhow::anyhow!("parse OAT tunables: {error}"))?;
         tunables.validate_for_oat()?;
         Ok(tunables)
     }
@@ -3108,6 +3109,24 @@ mod tests {
                 bail!("invalid identity builder must fail");
             };
             assert!(error.to_string().contains("identity_builder"), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_client_and_transport_values_name_their_fields() -> Result<()> {
+        for (input, field) in [
+            (serde_json::json!({"client":{"workers":"bad"}}), "client.workers"),
+            (serde_json::json!({"client":{"seed":"bad"}}), "client.seed"),
+            (
+                serde_json::json!({"transport":{"grpc_send_compression":"bad"}}),
+                "transport.grpc_send_compression",
+            ),
+        ] {
+            let Err(error) = Tunables::parse_oat_json(input) else {
+                bail!("malformed {field} must fail");
+            };
+            assert!(error.to_string().contains(field), "{error:#}");
         }
         Ok(())
     }
