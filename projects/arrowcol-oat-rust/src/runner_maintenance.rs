@@ -338,6 +338,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "MAX_CONSECUTIVE_STALE_PLANS"
         | "SEALED_PARTITIONS_ONLY"
         | "MAX_CONCURRENT_TABLES"
+        | "BIN_CONCURRENCY"
         | "MAX_CONCURRENT_DECODED_BYTES"
         | "COMMIT_ATTEMPTS"
         | "COMMIT_BUDGET_SECS"
@@ -1332,10 +1333,12 @@ mod maintenance_topology_tests {
         ))?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "maintenance": {"enabled": true, "operations": ["optimize"],
-                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3}
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3,
+                "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64}
         }))?;
         let mut observed = json!({"startup": {
             "apply": false, "operations": ["optimize"], "interval_secs": 60,
+            "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64,
             "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3}
         }});
         verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;

@@ -566,6 +566,7 @@ pub struct MaintenanceTunables {
     pub layout_page_rows: Option<usize>,
     pub max_files_per_bin: Option<usize>,
     pub max_bins_per_commit: Option<usize>,
+    pub bin_concurrency: Option<usize>,
     pub max_actions_per_commit: Option<usize>,
     pub max_plan_bytes: Option<usize>,
     pub max_decoded_bytes_per_bin: Option<u64>,

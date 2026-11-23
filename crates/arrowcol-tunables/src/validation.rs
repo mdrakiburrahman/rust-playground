@@ -449,6 +449,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.layout_page_rows", "2048"),
     capability!("maintenance.max_files_per_bin", "64"),
     capability!("maintenance.max_bins_per_commit", "16"),
+    capability!("maintenance.bin_concurrency", "1"),
     capability!("maintenance.max_actions_per_commit", "2048"),
     capability!("maintenance.max_plan_bytes", "1048576"),
     capability!("maintenance.max_decoded_bytes_per_bin", "1073741824"),
@@ -1871,9 +1872,24 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             let budget = bytes
                 .checked_mul(concurrency + 1)
                 .and_then(|v| v.checked_mul(tables))
+                .and_then(|v| v.checked_mul(maintenance.bin_concurrency.unwrap_or(1)))
                 .context("maintenance.optimize_upload_concurrency buffer budget overflow")?;
             if budget > 536_870_912 {
                 bail!("maintenance.optimize_upload_concurrency buffer budget exceeds 512 MiB");
+            }
+        }
+        if maintenance.optimize_upload_mode == Some(MaintenanceUploadMode::BufferedMultipart)
+            && maintenance.bin_concurrency.unwrap_or(1) > 1
+        {
+            let budget = maintenance
+                .optimize_upload_buffer_bytes
+                .unwrap_or(8_388_608)
+                .checked_mul(maintenance.optimize_upload_concurrency.unwrap_or(1).saturating_add(1))
+                .and_then(|v| v.checked_mul(maintenance.max_concurrent_tables.unwrap_or(1)))
+                .and_then(|v| v.checked_mul(maintenance.bin_concurrency.unwrap_or(1)))
+                .context("maintenance.bin_concurrency upload buffer budget overflow")?;
+            if budget > 536_870_912 {
+                bail!("maintenance.bin_concurrency upload buffer budget exceeds 512 MiB");
             }
         }
         if let Some(bytes) = maintenance.optimize_upload_buffer_bytes {
@@ -1983,6 +1999,7 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             maintenance.max_bins_per_commit.is_some(),
             has_optimize,
         ),
+        ("bin_concurrency", maintenance.bin_concurrency.is_some(), has_optimize),
         (
             "max_actions_per_commit",
             maintenance.max_actions_per_commit.is_some(),
@@ -2084,9 +2101,18 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     if !(1_024..=1_073_741_824).contains(&catalog_message_bytes) {
         bail!("maintenance.catalog_max_decoding_message_bytes must be between 1024 and 1073741824");
     }
+    let bins = maintenance.bin_concurrency.unwrap_or(1);
+    if !(1..=8).contains(&bins) {
+        bail!("maintenance.bin_concurrency must be between 1 and 8");
+    }
+    if bins > 1 && maintenance.max_concurrent_decoded_bytes.is_none() {
+        bail!("maintenance.bin_concurrency above 1 requires max_concurrent_decoded_bytes");
+    }
     if let Some(budget) = maintenance.max_concurrent_decoded_bytes {
         let concurrency = u64::try_from(maintenance.max_concurrent_tables.unwrap_or(1))
-            .context("maintenance.max_concurrent_tables does not fit u64")?;
+            .context("maintenance.max_concurrent_tables does not fit u64")?
+            .checked_mul(u64::try_from(bins)?)
+            .context("maintenance.bin_concurrency decoded budget overflows u64")?;
         let required = maintenance
             .max_decoded_bytes_per_bin
             .unwrap_or(1_073_741_824)
@@ -2094,7 +2120,7 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             .context("maintenance concurrent decoded-byte budget overflows u64")?;
         if required > budget {
             bail!(
-                "maintenance.max_concurrent_decoded_bytes must cover max_decoded_bytes_per_bin times max_concurrent_tables"
+                "maintenance.max_concurrent_decoded_bytes must cover max_decoded_bytes_per_bin times bin_concurrency times max_concurrent_tables"
             );
         }
     }
@@ -2903,6 +2929,38 @@ mod tests {
         over["maintenance"]["optimize_upload_buffer_bytes"] = serde_json::json!(67_108_864);
         over["maintenance"]["max_concurrent_tables"] = serde_json::json!(3);
         assert!(format!("{:#}", Tunables::parse_oat_json(over).unwrap_err()).contains("optimize_upload_concurrency"));
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_bin_concurrency_requires_bounded_budget() -> Result<()> {
+        let valid = serde_json::json!({"maintenance": {
+            "enabled": true, "operations": ["optimize"], "bin_concurrency": 2,
+            "max_concurrent_decoded_bytes": 2147483648u64
+        }});
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Maintenance)?;
+        assert_eq!(env["ARROWCOL_MAINT_BIN_CONCURRENCY"], "2");
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(9),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut input = valid.clone();
+            input["maintenance"]["bin_concurrency"] = invalid;
+            assert!(Tunables::parse_oat_json(input).is_err());
+        }
+        let mut too_small = valid.clone();
+        too_small["maintenance"]["max_concurrent_decoded_bytes"] = serde_json::json!(2147483647u64);
+        assert!(
+            format!("{:#}", Tunables::parse_oat_json(too_small).unwrap_err()).contains("max_concurrent_decoded_bytes")
+        );
+        let mut missing = valid;
+        missing["maintenance"]
+            .as_object_mut()
+            .context("maintenance fixture")?
+            .remove("max_concurrent_decoded_bytes");
+        assert!(format!("{:#}", Tunables::parse_oat_json(missing).unwrap_err()).contains("bin_concurrency"));
         Ok(())
     }
 

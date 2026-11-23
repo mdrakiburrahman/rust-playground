@@ -787,6 +787,7 @@ fn optimize_rewrites_latest_closed_partitions_preserving_rows() -> Result<()> {
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let config = OptimizeConfig {
         latest_partitions: Some(2),
+        bin_concurrency: 2,
         ..optimize_config()
     };
     let plan = maintenance.plan_optimize(&config)?;

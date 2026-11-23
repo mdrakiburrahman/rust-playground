@@ -219,9 +219,24 @@ impl Settings {
             let budget = bytes
                 .checked_mul(concurrency + 1)
                 .and_then(|v| v.checked_mul(self.max_concurrent_tables))
+                .and_then(|v| v.checked_mul(self.optimize.bin_concurrency))
                 .context("optimize_upload_concurrency buffer budget overflow")?;
             if budget > 536_870_912 {
                 bail!("optimize_upload_concurrency buffer budget exceeds 512 MiB");
+            }
+        }
+        if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart && self.optimize.bin_concurrency > 1 {
+            let buffer = limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES);
+            let concurrency = limits.optimize_upload_concurrency.unwrap_or(1);
+            let budget = buffer
+                .checked_mul(concurrency + 1)
+                .and_then(|v| v.checked_mul(self.max_concurrent_tables))
+                .and_then(|v| v.checked_mul(self.optimize.bin_concurrency))
+                .context("bin_concurrency upload buffer budget overflow")?;
+            if budget > 536_870_912 {
+                bail!("bin_concurrency upload buffer budget exceeds 512 MiB");
             }
         }
         if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
@@ -283,13 +298,20 @@ impl Settings {
     }
 
     fn validate_decoded_budget(&self, per_bin: u64) -> Result<()> {
+        if self.optimize.bin_concurrency > 1 && self.max_concurrent_decoded_bytes.is_none() {
+            bail!("bin_concurrency above 1 requires max_concurrent_decoded_bytes");
+        }
         if let Some(budget) = self.max_concurrent_decoded_bytes {
-            let concurrency = u64::try_from(self.max_concurrent_tables)?;
+            let concurrency = u64::try_from(self.max_concurrent_tables)?
+                .checked_mul(u64::try_from(self.optimize.bin_concurrency)?)
+                .context("bin_concurrency decoded budget overflow")?;
             let total = per_bin
                 .checked_mul(concurrency)
                 .context("concurrent decode budget overflow")?;
             if budget == 0 || total > budget {
-                bail!("per-bin decoded limit times concurrent tables exceeds the aggregate decode budget");
+                bail!(
+                    "max_decoded_bytes_per_bin times bin_concurrency times max_concurrent_tables exceeds max_concurrent_decoded_bytes"
+                );
             }
         }
         Ok(())
@@ -1021,6 +1043,7 @@ fn configuration_evidence(
             "max_consecutive_stale_plans": startup.max_consecutive_stale_plans,
             "sealed_partitions_only": sealed_partitions_only_requested,
             "max_concurrent_tables": startup.max_concurrent_tables,
+            "bin_concurrency": startup.optimize.bin_concurrency,
             "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
             "commit_attempts": startup.commit_attempts,
             "commit_budget_secs": startup.commit_budget.as_secs(),
@@ -1190,6 +1213,7 @@ impl OptimizeEvidence {
                 "max_files_per_bin": config.max_files_per_bin,
                 "min_files_per_bin": config.min_files_per_bin,
                 "max_bins_per_commit": config.max_bins_per_commit,
+                "bin_concurrency": config.bin_concurrency,
                 "max_actions_per_commit": config.max_actions_per_commit,
                 "max_plan_bytes": config.max_plan_bytes,
                 "max_decoded_bytes_per_bin": config.max_decoded_bytes_per_bin,

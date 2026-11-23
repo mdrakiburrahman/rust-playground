@@ -132,6 +132,8 @@ struct Cli {
     max_files_per_bin: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_BINS_PER_COMMIT", default_value_t = 16)]
     max_bins_per_commit: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_BIN_CONCURRENCY", default_value_t = 1)]
+    bin_concurrency: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIONS_PER_COMMIT", default_value_t = 2048)]
     max_actions_per_commit: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_PLAN_BYTES", default_value_t = 1024 * 1024)]
@@ -315,6 +317,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             small_file_bytes: cli.small_file_bytes.unwrap_or_else(|| (target / 2).max(1)),
             max_files_per_bin: cli.max_files_per_bin,
             max_bins_per_commit: cli.max_bins_per_commit,
+            bin_concurrency: cli.bin_concurrency,
             max_actions_per_commit: cli.max_actions_per_commit,
             max_plan_bytes: cli.max_plan_bytes,
             max_decoded_bytes_per_bin: cli.max_decoded_bytes_per_bin,

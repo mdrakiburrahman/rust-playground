@@ -2491,6 +2491,7 @@ pub const MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OPTIMIZE_UPLOAD_CONCURRENCY: usize = 16;
+pub const MAX_OPTIMIZE_BIN_CONCURRENCY: usize = 8;
 
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
@@ -2526,6 +2527,7 @@ pub struct OptimizeConfig {
     /// Input buffering strategy; spool uses temporary local disk.
     pub input_read_strategy: InputReadStrategy,
     pub upload_concurrency: usize,
+    pub bin_concurrency: usize,
     pub max_output_file_bytes: u64,
     pub max_active_files: usize,
     /// Whole-output sort using the shared layout helper.
@@ -2560,6 +2562,7 @@ impl Default for OptimizeConfig {
             batch_rows: 8192,
             input_read_strategy: InputReadStrategy::Memory,
             upload_concurrency: 1,
+            bin_concurrency: 1,
             max_output_file_bytes: 1023 * 1024 * 1024,
             max_active_files: 1_000_000,
             layout: None,
@@ -2605,6 +2608,9 @@ impl OptimizeConfig {
         }
         if self.output_row_group_rows == 0 {
             return invalid("output row-group rows must be positive");
+        }
+        if !(1..=MAX_OPTIMIZE_BIN_CONCURRENCY).contains(&self.bin_concurrency) {
+            return invalid("bin_concurrency must be within 1..=8");
         }
         if !(1..=MAX_OPTIMIZE_UPLOAD_CONCURRENCY).contains(&self.upload_concurrency) {
             return invalid("upload_concurrency must be within 1..=16");
@@ -3204,9 +3210,7 @@ impl DeltaTable {
             .output_policy_fingerprint
             .as_deref()
             .context("missing output policy fingerprint")?;
-        let mut outputs = Vec::new();
-        let mut kept: Vec<&OptimizeBin> = Vec::new();
-        let mut actions = 0_usize;
+        let mut candidates = Vec::new();
         for bin in &plan.bins {
             let proof = reuse_no_benefit_proofs
                 .then(|| optimize_no_benefit_proof(&state, bin, output_policy_fingerprint, config.batch_rows))
@@ -3219,55 +3223,121 @@ impl DeltaTable {
                 report.nonbeneficial_bins += 1;
                 continue;
             }
-            let written = match self.rewrite_bin(
-                &state.snapshot,
-                bin,
-                config,
-                control,
-                upload_buffer_bytes,
-                Some(writer_config),
-            ) {
-                Ok(written) => written,
-                Err(error) => return Err(self.discard_after(&outputs, error, &mut report)),
+            candidates.push((bin, proof));
+        }
+        let mut outputs = Vec::new();
+        let mut kept: Vec<&OptimizeBin> = Vec::new();
+        let mut actions = 0_usize;
+        for batch in candidates.chunks(config.bin_concurrency) {
+            let mut rewrites = std::collections::VecDeque::new();
+            let mut error = None;
+            let results = if config.bin_concurrency == 1 {
+                vec![self.rewrite_bin(
+                    &state.snapshot,
+                    batch[0].0,
+                    config,
+                    control,
+                    upload_buffer_bytes,
+                    Some(writer_config),
+                )]
+            } else {
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::new();
+                    let mut spawn_error = None;
+                    let snapshot = &state.snapshot;
+                    for (bin, _) in batch {
+                        match std::thread::Builder::new().spawn_scoped(scope, move || {
+                            self.rewrite_bin(snapshot, bin, config, control, upload_buffer_bytes, Some(writer_config))
+                        }) {
+                            Ok(handle) => handles.push(handle),
+                            Err(error) => {
+                                spawn_error = Some(fail(
+                                    MaintenanceErrorKind::ResourceLimit,
+                                    format!("bin_concurrency worker spawn failed: {error}"),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    let mut results: Vec<_> = handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle.join().unwrap_or_else(|_| {
+                                Err(fail(
+                                    MaintenanceErrorKind::Uncertain,
+                                    "OPTIMIZE bin worker panicked; unpublished outputs may remain",
+                                ))
+                            })
+                        })
+                        .collect();
+                    if let Some(error) = spawn_error {
+                        results.push(Err(error));
+                    }
+                    results
+                })
             };
-            let expected: Option<u64> = bin.files.iter().map(|file| file.rows).sum();
-            if expected.is_some_and(|rows| rows != written.iter().map(|output| output.rows).sum::<u64>()) {
-                outputs.extend(written);
-                let error = fail(
-                    MaintenanceErrorKind::StalePlan,
-                    "rewritten row count differs from input statistics",
-                );
+            for result in results {
+                match result {
+                    Ok(written) => rewrites.push_back(written),
+                    Err(cause) => {
+                        if error.is_none() || error_kind(&cause) == Some(MaintenanceErrorKind::Uncertain) {
+                            error = Some(cause);
+                        }
+                    }
+                }
+            }
+            if let Some(error) = error {
+                outputs.extend(rewrites.into_iter().flatten());
                 return Err(self.discard_after(&outputs, error, &mut report));
             }
-            // Verify the actual outputs: never commit a rewrite that does not
-            // reduce the file count or that exceeds the per-commit action budget.
-            let cost = bin.files.len() + written.len();
-            let beneficial = written.len() < bin.files.len();
-            if !beneficial || actions + cost > config.max_actions_per_commit {
-                if beneficial {
-                    report.backlog_files += bin.files.len() as u64;
-                } else {
-                    report.nonbeneficial_bins += 1;
-                }
-                if let Err(cleanup) = self.discard_outputs(&written) {
+            for (bin, proof) in batch {
+                let Some(written) = rewrites.pop_front() else {
+                    let error = fail(MaintenanceErrorKind::Uncertain, "missing OPTIMIZE bin worker result");
+                    return Err(self.discard_after(&outputs, error, &mut report));
+                };
+                let expected: Option<u64> = bin.files.iter().map(|file| file.rows).sum();
+                if expected.is_some_and(|rows| rows != written.iter().map(|output| output.rows).sum::<u64>()) {
                     outputs.extend(written);
+                    outputs.extend(rewrites.into_iter().flatten());
                     let error = fail(
-                        MaintenanceErrorKind::Uncertain,
-                        format!("dropping an unpublishable rewrite failed: {cleanup}"),
+                        MaintenanceErrorKind::StalePlan,
+                        "rewritten row count differs from input statistics",
                     );
                     return Err(self.discard_after(&outputs, error, &mut report));
                 }
-                if !beneficial
-                    && let Some(proof) = proof
-                    && let Err(error) = self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof)
-                {
-                    return Err(self.discard_after(&outputs, error, &mut report));
+                // Verify the actual outputs: never commit a rewrite that does not
+                // reduce the file count or that exceeds the per-commit action budget.
+                let cost = bin.files.len() + written.len();
+                let beneficial = written.len() < bin.files.len();
+                if !beneficial || actions + cost > config.max_actions_per_commit {
+                    if beneficial {
+                        report.backlog_files += bin.files.len() as u64;
+                    } else {
+                        report.nonbeneficial_bins += 1;
+                    }
+                    if let Err(cleanup) = self.discard_outputs(&written) {
+                        outputs.extend(written);
+                        outputs.extend(rewrites.into_iter().flatten());
+                        let error = fail(
+                            MaintenanceErrorKind::Uncertain,
+                            format!("dropping an unpublishable rewrite failed: {cleanup}"),
+                        );
+                        return Err(self.discard_after(&outputs, error, &mut report));
+                    }
+                    if !beneficial
+                        && let Some(proof) = proof
+                        && let Err(error) =
+                            self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof.clone())
+                    {
+                        outputs.extend(rewrites.into_iter().flatten());
+                        return Err(self.discard_after(&outputs, error, &mut report));
+                    }
+                    continue;
                 }
-                continue;
+                actions += cost;
+                kept.push(bin);
+                outputs.extend(written);
             }
-            actions += cost;
-            kept.push(bin);
-            outputs.extend(written);
         }
         let inputs: BTreeSet<String> = kept
             .iter()
