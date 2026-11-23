@@ -1,7 +1,7 @@
 # Offline Realistic delivery equality
 
 | Input/output | Contract |
-|---|---|
+| --- | --- |
 | `snapshot.json` | `{ "table": "sqlserver_availability_replica_states", "rewrite_commit_count": 0, "manifest_paths": ["/run/completed-manifest.json"], "active_parquet_paths": ["/run/active-ingestion.parquet"] }`; paths must come from the trusted stopped-snapshot reconciler. |
 | Terminal manifest | Complete identity-bearing Realistic v1, all prepared batches ACKed exactly once, with no retry, ambiguity, error or truncation. Preserve original serialized bytes: JavaScript reserialization may round nanosecond integers. |
 | Exact equality | Complete unique run/incarnation/worker/sequence/row identities. Missing, foreign, duplicate, rewritten or aliased input fails. |
