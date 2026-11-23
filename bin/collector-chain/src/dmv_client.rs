@@ -46,6 +46,16 @@ enum SendFrames {
     Shared { frames: Arc<Vec<FlightData>>, index: usize },
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityBuilder {
+    #[default]
+    #[value(name = "formatted_rows")]
+    FormattedRows,
+    #[value(name = "direct_utf8")]
+    DirectUtf8,
+}
+
 impl Iterator for SendFrames {
     type Item = FlightData;
 
@@ -154,6 +164,8 @@ pub struct Options {
     pub data_profile: DataProfile,
     #[arg(long, env = "ARROWCOL_CLIENT_SEND_ITER", value_enum, default_value_t = SendIter::CloneVec)]
     pub send_iter: SendIter,
+    #[arg(long, env = "ARROWCOL_CLIENT_IDENTITY_BUILDER", value_enum, default_value_t = IdentityBuilder::FormattedRows)]
+    pub identity_builder: IdentityBuilder,
     #[arg(long, env = "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", value_enum)]
     pub string_length_distribution: Option<StringLengthDistribution>,
     #[arg(long, env = "ARROWCOL_CLIENT_VALUE_VARIATION", value_enum)]
@@ -267,6 +279,10 @@ impl Options {
     ///
     /// Returns the same validation failures as `resolve`, including unavailable CPU discovery.
     pub fn resolve_with_evidence(mut self, rows: usize, concurrency: usize) -> Result<(Self, serde_json::Value)> {
+        anyhow::ensure!(
+            self.identity_builder != IdentityBuilder::DirectUtf8 || self.data_profile == DataProfile::Realistic,
+            "identity-builder=direct_utf8 requires data-profile=realistic"
+        );
         anyhow::ensure!(
             matches!(self.ipc_alignment, 8 | 16 | 32 | 64),
             "ipc-alignment must be 8, 16, 32, or 64"
@@ -1522,8 +1538,14 @@ impl PreparedClient {
         }
         let live_batch_permit = live_batch_permit.context("realistic logical batch requires a memory reservation")?;
         let sequence = self.next_logical_batch_sequence(worker)?;
-        let batch =
-            batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
+        let batch = batch_with_logical_identity(
+            &template.template,
+            self.run_id,
+            self.incarnation_id,
+            worker,
+            sequence,
+            self.options.identity_builder,
+        )?;
         let (data, raw_arrow_bytes, encoded_bytes) =
             encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
         anyhow::ensure!(
@@ -2744,6 +2766,7 @@ fn batch_with_logical_identity(
     incarnation_id: uuid::Uuid,
     worker: usize,
     sequence: u64,
+    builder: IdentityBuilder,
 ) -> Result<RecordBatch> {
     let identity_column = batch
         .schema()
@@ -2753,10 +2776,46 @@ fn batch_with_logical_identity(
         batch.schema().field(identity_column).data_type() == &DataType::Utf8,
         "logical identity endpoint_url column must be a nonnullable string"
     );
-    let values = (0..batch.num_rows())
-        .map(|row| logical_identity_url(run_id, incarnation_id, worker, sequence, row))
-        .collect::<Result<Vec<_>>>()?;
-    let identity: ArrayRef = Arc::new(StringArray::from_iter_values(values.iter().map(String::as_str)));
+    let identity: ArrayRef = match builder {
+        IdentityBuilder::FormattedRows => {
+            let values = (0..batch.num_rows())
+                .map(|row| logical_identity_url(run_id, incarnation_id, worker, sequence, row))
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StringArray::from_iter_values(values.iter().map(String::as_str)))
+        }
+        IdentityBuilder::DirectUtf8 => {
+            use std::fmt::Write as _;
+            anyhow::ensure!(worker < 1_024, "logical identity worker id exceeds 1023");
+            let last_row = batch.num_rows().saturating_sub(1);
+            u32::try_from(last_row).context("logical identity row ordinal exceeds u32")?;
+            let prefix = format!(
+                "https://x.invalid/v1/{}/{}/{}/{}/",
+                run_id.simple(),
+                incarnation_id.simple(),
+                worker,
+                base36(sequence)
+            );
+            let width = prefix
+                .len()
+                .checked_add(last_row.to_string().len())
+                .context("identity width overflow")?;
+            let capacity = width
+                .checked_mul(batch.num_rows())
+                .context("identity values capacity overflow")?;
+            anyhow::ensure!(
+                capacity <= i32::MAX as usize,
+                "identity values exceed Arrow Utf8 capacity"
+            );
+            let mut array = arrow_array::builder::StringBuilder::with_capacity(batch.num_rows(), capacity);
+            let mut value = String::with_capacity(width);
+            for row in 0..batch.num_rows() {
+                value.clear();
+                write!(&mut value, "{prefix}{row}")?;
+                array.append_value(&value);
+            }
+            Arc::new(array.finish())
+        }
+    };
     let columns = batch
         .columns()
         .iter()
@@ -3239,6 +3298,30 @@ mod tests {
             .resolve(100, 1)
     }
 
+    #[tokio::test]
+    async fn direct_identity_matches_formatted_rows_and_encoded_frames() -> Result<()> {
+        use prost::Message;
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let batch = synthetic_batch(&table, "identity-test", 37, 0, 0, &options)?;
+        for (worker, sequence) in [(0, 0), (1023, u64::MAX)] {
+            let args = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+            let formatted =
+                batch_with_logical_identity(&batch, args.0, args.1, worker, sequence, IdentityBuilder::FormattedRows)?;
+            let direct =
+                batch_with_logical_identity(&batch, args.0, args.1, worker, sequence, IdentityBuilder::DirectUtf8)?;
+            assert_eq!(formatted, direct);
+            let frames = encode(&table, "v1", formatted, &options).await?;
+            let direct_frames = encode(&table, "v1", direct, &options).await?;
+            assert_eq!(
+                frames.iter().map(Message::encode_to_vec).collect::<Vec<_>>(),
+                direct_frames.iter().map(Message::encode_to_vec).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn send_cursor_replays_identical_frames_without_eager_cloning() -> Result<()> {
         use prost::Message;
@@ -3383,8 +3466,22 @@ mod tests {
             .downcast_ref::<StringArray>()
             .context("customer_id is not a string")?;
         assert!(customer.iter().all(|value| value == Some("direct-e64-confirmwide")));
-        let a = batch_with_logical_identity(&first, uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), 0, 0)?;
-        let b = batch_with_logical_identity(&second, uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(4), 0, 0)?;
+        let a = batch_with_logical_identity(
+            &first,
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            0,
+            0,
+            IdentityBuilder::FormattedRows,
+        )?;
+        let b = batch_with_logical_identity(
+            &second,
+            uuid::Uuid::from_u128(3),
+            uuid::Uuid::from_u128(4),
+            0,
+            0,
+            IdentityBuilder::FormattedRows,
+        )?;
         assert_ne!(a.column_by_name("endpoint_url"), b.column_by_name("endpoint_url"));
         assert_eq!(
             hash_test_batches(&table, DataProfile::Realistic, 0, std::slice::from_ref(&a))?,
@@ -3746,7 +3843,14 @@ mod tests {
         let base_ipc_data = encode(&table, "v1", batch.clone(), &options).await?;
         let base_ipc_bytes_per_row =
             base_ipc_data.iter().map(|message| message.encoded_len()).sum::<usize>() / batch.num_rows();
-        let identity_batch = batch_with_logical_identity(&batch, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0, 0)?;
+        let identity_batch = batch_with_logical_identity(
+            &batch,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            0,
+            0,
+            IdentityBuilder::FormattedRows,
+        )?;
         let identity_ipc_data = encode(&table, "v1", identity_batch.clone(), &options).await?;
         let identity_ipc_bytes_per_row = identity_ipc_data
             .iter()
@@ -4687,6 +4791,8 @@ mod tests {
         options.grpc_send_compression = GrpcCompression::Gzip;
         options.grpc_accept_compression = GrpcCompression::Gzip;
         options.data_profile = DataProfile::Realistic;
+        options.send_iter = SendIter::ArcCursor;
+        options.identity_builder = IdentityBuilder::DirectUtf8;
         let client = PreparedClient::prepare(
             &endpoint,
             "smoke",

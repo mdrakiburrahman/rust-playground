@@ -529,6 +529,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.data_mode") => ("data_mode", "ARROWCOL_CLIENT_DATA_MODE"),
             Some("client.data_profile") => ("data_profile", "ARROWCOL_CLIENT_DATA_PROFILE"),
             Some("client.send_iter") => ("send_iter", "ARROWCOL_CLIENT_SEND_ITER"),
+            Some("client.identity_builder") => ("identity_builder", "ARROWCOL_CLIENT_IDENTITY_BUILDER"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
