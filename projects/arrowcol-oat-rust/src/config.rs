@@ -2351,15 +2351,11 @@ mod tests {
             .as_mut()
             .context("sorting columns")?[0]
             .descending = false;
-        assert!(
-            format!(
-                "{:#}",
-                maintenance
-                    .validate_selected_parquet_schemas()
-                    .expect_err("wrong metadata accepted")
-            )
-            .contains("sorting metadata must match")
-        );
+        let mismatch = maintenance
+            .validate_selected_parquet_schemas()
+            .err()
+            .context("wrong metadata accepted")?;
+        assert!(format!("{mismatch:#}").contains("sorting metadata must match"));
         Ok(())
     }
 
