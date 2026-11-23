@@ -55,7 +55,7 @@ test('rejects live-slot, batch-byte, reservation, and memory-limit mismatches', 
     { ...valid, live_identity_batch_reservation_bytes: liveBatchReservationBytes - 1 },
     { ...valid, memory_reservation_bytes: valid.memory_reservation_bytes + 1 },
     { ...valid, max_memory_bytes: maxMemoryBytes - 1 },
-    { ...valid, memory_reservation_bytes: maxMemoryBytes + 1 },
+    client('oat-run-table-c1', maxMemoryBytes - liveBatchReservationBytes + 1),
   ]) {
     assert.throws(() => requireStartupAccounting(evidence([invalid]), ['oat-run-table-c1']));
   }
@@ -167,18 +167,21 @@ test('rejects malformed or extra matched-arm evidence', () => {
     expected_client_ids: expectedClientIds,
     evidence: evidence([client(expectedClientIds[0]!)]),
   };
+  const extraFieldArm = { ...validArm, arm_id: 'candidate', unexpected_arm_field: true };
   assert.throws(() => requireMatchedStartupAccounting([validArm]));
   assert.throws(
-    () => requireMatchedStartupAccounting([
-      validArm,
-      { ...validArm, arm_id: 'candidate', unexpected_arm_field: true },
-    ]),
+    () => requireMatchedStartupAccounting([validArm, extraFieldArm]),
     /missing, malformed, or extra arm field/,
   );
   assert.throws(
     () => requireMatchedStartupAccounting([
       validArm,
-      { ...validArm, arm_id: 'candidate', expected_client_ids: ['oat-run-other-c1'] },
+      {
+        ...validArm,
+        arm_id: 'candidate',
+        expected_client_ids: ['oat-run-other-c1'],
+        evidence: evidence([client('oat-run-other-c1')]),
+      },
     ]),
     /different client roster/,
   );
