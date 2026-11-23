@@ -718,8 +718,8 @@ impl Tunables {
         {
             bail!("client.send_iter must be clone_vec or arc_cursor");
         }
-        let tunables: Self = serde_path_to_error::deserialize(value)
-            .map_err(|error| anyhow::anyhow!("parse OAT tunables: {error}"))?;
+        let tunables: Self =
+            serde_path_to_error::deserialize(value).map_err(|error| anyhow::anyhow!("parse OAT tunables: {error}"))?;
         tunables.validate_for_oat()?;
         Ok(tunables)
     }

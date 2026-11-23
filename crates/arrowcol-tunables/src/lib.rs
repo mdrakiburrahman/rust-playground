@@ -680,7 +680,6 @@ where
         .map(Some)
         .map_err(|_| serde::de::Error::custom("collector.runtime.parquet_column_workers must be an unsigned integer"))
 }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]

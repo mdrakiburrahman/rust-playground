@@ -103,7 +103,9 @@ impl TryFrom<String> for GeneratedPartitionBinding {
         match raw.as_str() {
             "revalidate_rows" => Ok(Self::RevalidateRows),
             "proven_constant" => Ok(Self::ProvenConstant),
-            _ => anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}"),
+            _ => {
+                anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}")
+            }
         }
     }
 }
