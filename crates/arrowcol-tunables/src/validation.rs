@@ -2955,20 +2955,15 @@ mod tests {
         ] {
             let mut input = value.clone();
             input["maintenance"]["optimize_upload_concurrency"] = invalid;
-            assert!(
-                format!("{:#}", Tunables::parse_oat_json(input).unwrap_err()).contains("optimize_upload_concurrency")
-            );
+            assert!(error_text(Tunables::parse_oat_json(input)).contains("optimize_upload_concurrency"));
         }
         let mut no_multipart = value.clone();
         no_multipart["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
-        assert!(
-            format!("{:#}", Tunables::parse_oat_json(no_multipart).unwrap_err())
-                .contains("optimize_upload_concurrency")
-        );
+        assert!(error_text(Tunables::parse_oat_json(no_multipart)).contains("optimize_upload_concurrency"));
         let mut over = value;
         over["maintenance"]["optimize_upload_buffer_bytes"] = serde_json::json!(67_108_864);
         over["maintenance"]["max_concurrent_tables"] = serde_json::json!(3);
-        assert!(format!("{:#}", Tunables::parse_oat_json(over).unwrap_err()).contains("optimize_upload_concurrency"));
+        assert!(error_text(Tunables::parse_oat_json(over)).contains("optimize_upload_concurrency"));
         Ok(())
     }
 
@@ -2988,19 +2983,17 @@ mod tests {
         ] {
             let mut input = valid.clone();
             input["maintenance"]["bin_concurrency"] = invalid;
-            assert!(format!("{:#}", Tunables::parse_oat_json(input).unwrap_err()).contains("bin_concurrency"));
+            assert!(error_text(Tunables::parse_oat_json(input)).contains("bin_concurrency"));
         }
         let mut too_small = valid.clone();
         too_small["maintenance"]["max_concurrent_decoded_bytes"] = serde_json::json!(2147483647u64);
-        assert!(
-            format!("{:#}", Tunables::parse_oat_json(too_small).unwrap_err()).contains("max_concurrent_decoded_bytes")
-        );
+        assert!(error_text(Tunables::parse_oat_json(too_small)).contains("max_concurrent_decoded_bytes"));
         let mut missing = valid;
         missing["maintenance"]
             .as_object_mut()
             .context("maintenance fixture")?
             .remove("max_concurrent_decoded_bytes");
-        assert!(format!("{:#}", Tunables::parse_oat_json(missing).unwrap_err()).contains("bin_concurrency"));
+        assert!(error_text(Tunables::parse_oat_json(missing)).contains("bin_concurrency"));
         Ok(())
     }
 
@@ -3019,14 +3012,14 @@ mod tests {
         ] {
             let mut input = valid.clone();
             input["maintenance"]["input_prefetch_files"] = invalid;
-            assert!(format!("{:#}", Tunables::parse_oat_json(input).unwrap_err()).contains("input_prefetch_files"));
+            assert!(error_text(Tunables::parse_oat_json(input)).contains("input_prefetch_files"));
         }
         let mut spool = valid.clone();
         spool["maintenance"]["input_read_strategy"] = serde_json::json!("spool");
-        assert!(format!("{:#}", Tunables::parse_oat_json(spool).unwrap_err()).contains("input_prefetch_files"));
+        assert!(error_text(Tunables::parse_oat_json(spool)).contains("input_prefetch_files"));
         let mut large = valid;
         large["maintenance"]["max_concurrent_tables"] = serde_json::json!(5);
-        assert!(format!("{:#}", Tunables::parse_oat_json(large).unwrap_err()).contains("input_prefetch_files"));
+        assert!(error_text(Tunables::parse_oat_json(large)).contains("input_prefetch_files"));
         Ok(())
     }
 
