@@ -278,6 +278,19 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if path == "collector.socket.tcp_nodelay" {
+            if environment.contains_key("ARROWCOL_COLLECTOR_SOCKET_CONFIG")
+                && collectors.iter().all(|process| {
+                    let config = &process["effective_config"];
+                    config["socket_effective"]["tcp_nodelay"] == config["socket"]["tcp_nodelay"]
+                        && config["socket_effective"]["scope"] == "accepted_flight_socket"
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_accepted_socket_readback"}));
+                return false;
+            }
+            return true;
+        }
         let runtime = match path {
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
             "collector.runtime.blocking_workers" => Some(("blocking_workers", "ARROWCOL_COLLECTOR_BLOCKING_WORKERS")),

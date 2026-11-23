@@ -283,6 +283,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.limits.max_stream_duration", "300s"),
     capability!("collector.limits.admission_timeout", "30s"),
     capability!("collector.limits.max_ddl_bytes", "65536"),
+    capability!("collector.socket.tcp_nodelay", "OS default"),
     capability!("collector.pressure.max_concurrent_streams", "128"),
     capability!("collector.pressure.rss_limit_bytes", "2147483648"),
     capability!("collector.pressure.buffered_bytes_limit", "536870912"),
@@ -667,6 +668,11 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
+        if let Some(value) = value.pointer("/collector/socket/tcp_nodelay")
+            && !value.is_boolean()
+        {
+            bail!("collector.socket.tcp_nodelay must be a boolean");
+        }
         if let Some(runtime) = value.pointer("/collector/runtime").and_then(Value::as_object) {
             for name in [
                 "event_interval",
@@ -1075,6 +1081,9 @@ impl Tunables {
                     )?;
                     canonicalize_optional_duration(&mut value.admission_timeout, "collector.limits.admission_timeout")?;
                     insert_json_config("ARROWCOL_COLLECTOR_LIMITS_CONFIG", &value, &mut output)?;
+                }
+                if let Some(value) = &collector.socket {
+                    insert_json_config("ARROWCOL_COLLECTOR_SOCKET_CONFIG", value, &mut output)?;
                 }
                 if let Some(value) = &collector.pressure {
                     let mut value = value.clone();
@@ -2418,6 +2427,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receiver_socket_rejects_non_boolean() -> Result<()> {
+        for value in [serde_json::json!(1), serde_json::json!("true"), serde_json::json!(null)] {
+            let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"socket":{"tcp_nodelay":value}}
+            })));
+            assert!(error.contains("collector.socket.tcp_nodelay"), "{error}");
+        }
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"socket":{"tcp_nodelay":true}}}))?;
+        assert_eq!(
+            valid.environment_for(ComponentRole::Collector)?["ARROWCOL_COLLECTOR_SOCKET_CONFIG"],
+            r#"{"tcp_nodelay":true}"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn scheduler_knobs_reject_invalid_values_and_types() {
         for field in [
             "event_interval",
@@ -2429,8 +2454,8 @@ mod tests {
             for value in [serde_json::json!(0), serde_json::json!("3"), serde_json::json!(null)] {
                 let mut candidate = serde_json::json!({"collector":{"runtime":{}}});
                 candidate["collector"]["runtime"][field] = value;
-                let error = Tunables::parse_oat_json(candidate).expect_err(field);
-                assert!(format!("{error:#}").contains(field), "{field}: {error:#}");
+                let error = error_text(Tunables::parse_oat_json(candidate));
+                assert!(error.contains(field), "{field}: {error}");
             }
         }
     }
