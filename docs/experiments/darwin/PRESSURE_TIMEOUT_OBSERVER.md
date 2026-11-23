@@ -11,7 +11,7 @@
 | `observer` | Attempt-local process CPU microseconds, voluntary/involuntary switches, event-loop utilization and 10-ms-resolution loop-delay histogram. No histogram sample means unknown, not zero delay. These are whole-process metrics, not per-request CPU or proof of descheduling. |
 | `validity` | Missing/inconsistent channels are unknown. Null is unobserved. Even an observed sequence ending in error identifies only the last observed phase, not a server or network cause. |
 
-The observer never serializes event payloads, headers, bodies, credentials, exception messages or other requests. It counts decoded bytes without retaining the body. One outstanding GET, default `fetch` pooling, 3 s timeout, 1 Hz attempt cadence (no catch-up burst), 1 MiB decoded limit and the original zero-error / successful max <1.5 s verdict. Missing trace data cannot rescue a failed pressure result or fail a successful HTTP verdict.
+The observer never serializes event payloads, headers, bodies, credentials, exception messages or other requests. As in the original sampler, `response.arrayBuffer()` drains and buffers the full successful HTTP response before the 1 MiB size check. No body bytes are written to evidence; the limit is not a peak-memory bound. One outstanding GET, default `fetch` pooling, 3 s timeout, 1 Hz attempt cadence (no catch-up burst), 1 MiB decoded limit and the original zero-error / successful max <1.5 s verdict. Missing trace data cannot rescue a failed pressure result or fail a successful HTTP verdict.
 
 ## Discriminating probe for review only
 

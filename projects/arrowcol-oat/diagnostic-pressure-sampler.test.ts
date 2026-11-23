@@ -64,3 +64,25 @@ test('concurrent fetch to the same endpoint is not attributed to the sampler',as
     const e=await collecting; assert.equal(e.error_count,0);assert(e.observations.every(s=>s.trace.validity==='observed'));
   });
 });
+
+test('oversized HTTP body is fully drained before size rejection', async () => {
+  let tailSentAt: number | undefined;
+  await fixture((_req, res) => {
+    res.write(Buffer.alloc(1_048_577));
+    setTimeout(() => {
+      if (res.destroyed) return;
+      tailSentAt = performance.now();
+      res.end('private-delayed-tail');
+    }, 100);
+  }, async url => {
+    const e = await collect(url, 1);
+    const s = e.observations[0]!;
+    assert.equal(e.error_count, 1);
+    assert.equal(e.success_count, 0);
+    assert.equal(s.error, 'pressure response exceeds 1 MiB');
+    assert(tailSentAt !== undefined && s.body_complete_ms !== null);
+    assert(s.start_monotonic_ms + s.body_complete_ms >= tailSentAt);
+    assert.notEqual(s.trace.offset_ms.trailers, null);
+    assert(!JSON.stringify(e).includes('private-delayed-tail'));
+  });
+});

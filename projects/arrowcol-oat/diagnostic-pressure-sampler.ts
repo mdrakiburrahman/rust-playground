@@ -92,11 +92,9 @@ async function sample(o:Observer, due:number) {
     if(response.redirected) a.ambiguous=true; // Fetch semantics unchanged; no redirect target is logged.
     if(!response.ok) error=`HTTP ${status}`;
     else {
-      const reader=response.body?.getReader(); let size=0;
-      if(reader) {try {for(;;){const {done,value}=await reader.read(); if(done) break;
-        size+=value.byteLength; if(size>1_048_576){error='pressure response exceeds 1 MiB'; void reader.cancel().catch(()=>{}); break;}
-      }} finally {reader.releaseLock();}}
-      if(!error) body_complete_ms=performance.now()-start;
+      const bytes = await response.arrayBuffer();
+      body_complete_ms = performance.now() - start;
+      if (bytes.byteLength > 1_048_576) error = 'pressure response exceeds 1 MiB';
     }
   } catch(e) {error=e instanceof Error && e.name==='TimeoutError'?'TimeoutError': 'fetch or body read failed';}
   const elapsed_ms=performance.now()-start; a.closed=true;
