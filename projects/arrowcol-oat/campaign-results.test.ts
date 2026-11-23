@@ -949,6 +949,22 @@ test('nulls a duration-based run when the varied factor is a one-shot row limit'
   assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
 });
 
+test('excludes collector shutdown settings from measurement heatmaps', () => {
+  const candidate = coveredCandidate('shutdown', 800, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.collector.shutdown_drain_timeout_seconds', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { collector: { shutdown_drain_timeout_seconds: 17 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'collector.shutdown_drain_timeout_seconds', reason: 'collector_shutdown_after_measurement' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: collector\.shutdown_drain_timeout_seconds: collector_shutdown_after_measurement/);
+  assert.doesNotMatch(svg, /observed mean 800 rows\/s|>800\*?<\/text>/);
+});
+
 test('nulls connection backoff when connection retries are disabled', () => {
   const candidate = coveredCandidate('backoff', 100, 235).map(row => ({
     ...row, factorConfigPaths: ['tunables.transport.retry_backoff_ms', 'parquet_writer.defaults.compression'],
