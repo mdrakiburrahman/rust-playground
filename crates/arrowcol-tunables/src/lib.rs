@@ -285,10 +285,10 @@ impl CollectorSocketTunables {
             ("collector.socket.recv_buffer_bytes", self.recv_buffer_bytes),
             ("collector.socket.send_buffer_bytes", self.send_buffer_bytes),
         ] {
-            if let Some(value) = value {
-                if !(1..=1_073_741_823).contains(&value) {
-                    return Err(format!("{name} must be in 1..=1073741823"));
-                }
+            if let Some(value) = value
+                && !(1..=1_073_741_823).contains(&value)
+            {
+                return Err(format!("{name} must be in 1..=1073741823"));
             }
         }
         Ok(())

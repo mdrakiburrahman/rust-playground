@@ -740,14 +740,19 @@ fn configure_flight_listener(
                 .map_err(|error| format!("{field}: {error}"))?;
             socket.send_buffer_size().map_err(|error| format!("{field}: {error}"))?
         };
-        if observed < requested * 2 {
-            return Err(format!(
-                "{field}: OS clamped request {requested}; reported buffer is {observed} bytes"
-            ));
-        }
+        verify_linux_buffer_size(&field, requested, observed)?;
         actual[name] = serde_json::json!(observed);
     }
     Ok(Some(actual))
+}
+
+fn verify_linux_buffer_size(field: &str, requested: usize, observed: usize) -> Result<(), String> {
+    if observed < requested * 2 {
+        return Err(format!(
+            "{field}: OS clamped request {requested}; reported buffer is {observed} bytes"
+        ));
+    }
+    Ok(())
 }
 
 fn configure_flight_socket(
@@ -1268,6 +1273,10 @@ pub(crate) mod tests {
             socket.send_buffer_size()?,
             actual["send_buffer_bytes"].as_u64().ok_or("missing send readback")? as usize
         );
+        let error = verify_linux_buffer_size("collector.socket.recv_buffer_bytes", 32_768, 32_768)
+            .err()
+            .ok_or("clamped value was accepted")?;
+        assert!(error.contains("collector.socket.recv_buffer_bytes"));
         Ok(())
     }
 
