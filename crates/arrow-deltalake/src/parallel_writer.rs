@@ -414,7 +414,7 @@ mod tests {
 
         impl Write for Sink {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.fail.swap(false, Ordering::SeqCst) {
+                if self.fail.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(500));
                     return Err(std::io::Error::other("injected row-group sink failure"));
                 }
@@ -433,9 +433,15 @@ mod tests {
             fail: Arc::clone(&fail),
             bytes: Vec::new(),
         };
-        let properties = WriterProperties::builder().set_max_row_group_row_count(Some(2)).build();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(8192))
+            .set_dictionary_enabled(false)
+            .build();
         let mut writer = ParallelArrowWriter::try_new(sink, Arc::clone(&schema), properties, 2)?;
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef])?;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(0..8192)) as ArrayRef],
+        )?;
         fail.store(true, Ordering::SeqCst);
         let start = Instant::now();
         let (result, heartbeat) = tokio::join!(writer.write(&batch), async {
