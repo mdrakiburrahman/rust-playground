@@ -57,7 +57,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
         });
-    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
+        "ARROWCOL_COLLECTOR_BATCHING_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
         .map(|(name, value)| Ok((name, serde_json::from_str::<Value>(value)?)))
@@ -120,17 +121,20 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 let Some(columns) = record["parquet_column_options"].as_object().filter(|columns| !columns.is_empty()) else {
                     return false;
                 };
-                let applicable = |actual: &Value| {
+                let applicable = |name: &str, actual: &Value| {
                     (field != "dictionary_page_size_limit" || actual["dictionary_enabled"] == true)
                         && (field != "write_page_header_statistics" || actual["statistics"] == "page")
                         && (!matches!(field, "bloom_filter_fpp" | "bloom_filter_ndv") || actual["bloom_filter_enabled"] == true)
-                        && (field != "data_page_v2_compression_ratio_threshold" || record["parquet_properties"]["writer_version"] == "v2")
+                        && (field != "data_page_v2_compression_ratio_threshold"
+                            || (record["parquet_properties"]["writer_version"] == "v2"
+                                && record["parquet_columns"][name]["compression"].as_str()
+                                    .is_some_and(|codec| codec != "uncompressed")))
                 };
                 if let Some(column) = column {
-                    columns.get(column).is_some_and(|actual| applicable(actual) && actual.get(field) == Some(requested))
+                    columns.get(column).is_some_and(|actual| applicable(column, actual) && actual.get(field) == Some(requested))
                 } else {
                     let effective = columns.iter().filter(|(name, actual)| {
-                        applicable(actual) && policy.get("columns").and_then(|columns| columns.get(*name))
+                        applicable(name, actual) && policy.get("columns").and_then(|columns| columns.get(*name))
                             .and_then(|options| options.get(field)).is_none_or(Value::is_null)
                     }).collect::<Vec<_>>();
                     !effective.is_empty() && effective.iter().all(|(_, actual)| actual.get(field) == Some(requested))
@@ -229,6 +233,24 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if let Some(field) = path.strip_prefix("collector.batching.")
+            && matches!(field,
+                "coalesce_publications" | "age_flush_policy" | "pipeline_depth"
+                | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
+                | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
+                | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
+                | "max_age" | "max_concurrent_flushes")
+        {
+            let pointer = format!("/{}", field.replace('.', "/"));
+            if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
+                .and_then(|value| value.pointer(&pointer)).is_some()
+                && collectors.iter().all(|process| process["effective_config"]["batching"].pointer(&pointer).is_some())
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
@@ -295,6 +317,9 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
     let mut promoted = Vec::new();
     projection.retain(|entry| {
         let (field, variable) = match entry["path"].as_str() {
+            Some("client.payload_customer_id") => ("payload_customer_id", "ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID"),
+            Some("client.corpus_rows") => ("corpus_rows", "ARROWCOL_CLIENT_CORPUS_ROWS"),
+            Some("client.corpus_bytes") => ("corpus_bytes", "ARROWCOL_CLIENT_CORPUS_BYTES"),
             Some("client.workers") => ("workers", "ARROWCOL_CLIENT_WORKERS"),
             Some("client.runtime_threads") => ("runtime_threads", "ARROWCOL_CLIENT_RUNTIME_THREADS"),
             Some("client.batch_rows") => ("batch_rows", "ARROWCOL_CLIENT_BATCH_ROWS"),
@@ -311,6 +336,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("transport.grpc_send_compression") => ("grpc_send_compression", "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION"),
             Some("transport.grpc_accept_compression") => ("grpc_accept_compression", "ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION"),
             Some("transport.ipc_compression") | Some("arrow_ipc.compression") => ("ipc_compression", "ARROWCOL_CLIENT_IPC_COMPRESSION"),
+            Some("arrow_ipc.alignment") => ("ipc_alignment", "ARROWCOL_CLIENT_IPC_ALIGNMENT"),
             Some("transport.max_flight_data_bytes") => ("max_flight_data_bytes", "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES"),
             Some("transport.max_frame_bytes") => ("max_frame_bytes", "ARROWCOL_CLIENT_MAX_FRAME_BYTES"),
             Some("transport.header_table_bytes") => ("header_table_bytes", "ARROWCOL_CLIENT_HEADER_TABLE_BYTES"),
@@ -335,6 +361,12 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("transport.endpoint_buffer_size") => ("endpoint_buffer_size", "ARROWCOL_CLIENT_ENDPOINT_BUFFER_SIZE"),
             _ => return true,
         };
+        let client = config.tunables.client.as_ref();
+        if (field == "corpus_rows" && client.and_then(|client| client.corpus_bytes).unwrap_or(0) > 0)
+            || (field == "corpus_bytes" && client.and_then(|client| client.corpus_rows).unwrap_or(0) > 0)
+        {
+            return true;
+        }
         if !environment.contains_key(variable)
             || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
         {

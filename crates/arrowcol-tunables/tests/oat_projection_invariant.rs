@@ -311,6 +311,9 @@ fn fixture(path: &str, value: Value) -> Value {
 }
 
 fn candidates(path: &str) -> Vec<Value> {
+    if path == "arrow_ipc.alignment" {
+        return vec![json!(8)];
+    }
     if path.ends_with("sorting_columns") {
         return vec![json!([{ "path": "customer_id", "descending": false, "nulls_first": false }])];
     }
@@ -388,7 +391,11 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
             format!("ARROWCOL_CLIENT_{}", parts[1].to_ascii_uppercase()),
             None,
         ),
-        "arrow_ipc" => (ComponentRole::Client, "ARROWCOL_CLIENT_IPC_COMPRESSION".into(), None),
+        "arrow_ipc" => (
+            ComponentRole::Client,
+            format!("ARROWCOL_CLIENT_IPC_{}", parts[1].to_ascii_uppercase()),
+            None,
+        ),
         "router" => (
             ComponentRole::Router,
             format!("ARROWCOL_ROUTER_{}", parts[1].to_ascii_uppercase()),
