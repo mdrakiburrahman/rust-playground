@@ -306,6 +306,21 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if path == "wal.max_in_flight" {
+            let requested = config.tunables.wal.as_ref().and_then(|wal| wal.max_in_flight);
+            if let Some(requested) = requested
+                && collectors.iter().all(|process| {
+                    process.pointer("/effective_config/wal/instances")
+                        .and_then(Value::as_array)
+                        .is_some_and(|instances| !instances.is_empty()
+                            && instances.iter().all(|instance| instance["max_in_flight"].as_u64() == Some(requested as u64)))
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         let runtime = match path {
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
             "collector.runtime.blocking_workers" => Some(("blocking_workers", "ARROWCOL_COLLECTOR_BLOCKING_WORKERS")),
@@ -351,7 +366,10 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
             | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
             | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => ("pressure", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"),
-            "collector.limits.batch_channel_capacity" | "collector.limits.put_result_channel_capacity" =>
+            "collector.limits.batch_channel_capacity" | "collector.limits.put_result_channel_capacity"
+            | "collector.limits.grpc_accept_compression" | "collector.limits.grpc_send_compression"
+            | "collector.limits.max_metadata_bytes" | "collector.limits.max_schema_bytes"
+            | "collector.limits.max_message_bytes" =>
                 ("limits", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_LIMITS_CONFIG"),
             _ => return true,
         };

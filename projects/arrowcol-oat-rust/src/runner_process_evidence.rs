@@ -2330,12 +2330,15 @@ mod consumer_startup_projection_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "wal":{"max_in_flight":7},
             "collector": {
                 "shutdown_drain_timeout_seconds":17,
                 "exporter":{"authority_timeout":"4s"},
                 "channel_capacity":{"control_node":11,"control_pipeline":12,
                     "control_completion":13,"pdata":14},
-                "limits":{"batch_channel_capacity":9,"put_result_channel_capacity":19},
+                "limits":{"batch_channel_capacity":9,"put_result_channel_capacity":19,
+                    "grpc_accept_compression":"gzip","grpc_send_compression":"zstd",
+                    "max_metadata_bytes":32768,"max_schema_bytes":2097152,"max_message_bytes":33554432},
                 "batching":{"coalesce_publications":true,"age_flush_policy":"drain_ready","pipeline_depth":2,
                     "global_capacity":{"bytes":1073741824,"rows":5000000,"batches":2048},
                     "per_table_capacity":{"bytes":268435456,"rows":1000000,"batches":512},
@@ -2391,6 +2394,12 @@ groups:
               registration:
                 instance_key: isolated-startup-test
                 flight_endpoint: "127.0.0.1:{flight_port}"
+          durable:
+            type: processor:durable_buffer
+            config:
+              path: "{}/wal"
+              retention_size_cap: "4 GiB"
+              max_in_flight: ${{env:ARROWCOL_WAL_MAX_IN_FLIGHT:-1000}}
           delta:
             type: exporter:arrow_deltalake
             config:
@@ -2399,8 +2408,10 @@ groups:
                 type: memory
         connections:
           - from: flight
+            to: durable
+          - from: durable
             to: delta
-"#, root.0.display());
+"#, root.0.display(), root.0.display());
             std::fs::write(&yaml_path, yaml)?;
             drop((flight, admin));
             let mut child = Child(std::process::Command::new(&binary)
@@ -2430,7 +2441,7 @@ groups:
                         Duration::from_millis(100),
                     ).is_ok()
                 });
-                if listening && output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#) {
+                if listening && output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#) && output.contains(r#""kind":"aggregate""#) {
                     std::thread::sleep(Duration::from_millis(100));
                     if let Some(status) = child.0.try_wait()? {
                         let output = std::fs::read_to_string(&log_path)?;
@@ -2458,6 +2469,12 @@ groups:
         assert_eq!(observed["engine"]["shutdown_drain_timeout_seconds"], json!(17));
         assert_eq!(observed["authority_timeout"], json!("4s"));
         assert_eq!(observed["limits"]["put_result_channel_capacity"], json!(19));
+        assert_eq!(observed["limits"]["grpc_accept_compression"], json!("gzip"));
+        assert_eq!(observed["limits"]["grpc_send_compression"], json!("zstd"));
+        assert_eq!(observed["limits"]["max_metadata_bytes"], json!(32768));
+        assert_eq!(observed["limits"]["max_schema_bytes"], json!(2097152));
+        assert_eq!(observed["limits"]["max_message_bytes"], json!(33554432));
+        assert_eq!(observed["wal"]["instances"][0]["max_in_flight"], json!(7));
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
             "component": "collector", "instance_id": "collector-1", "log_complete": true,
@@ -2467,10 +2484,33 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 40);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 46);
+        for path in [
+            "wal.max_in_flight",
+            "collector.limits.grpc_accept_compression",
+            "collector.limits.grpc_send_compression",
+            "collector.limits.max_metadata_bytes",
+            "collector.limits.max_schema_bytes",
+            "collector.limits.max_message_bytes",
+        ] {
+            assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?.iter().any(|entry| entry["path"] == path));
+        }
         assert_eq!(covered["inert_fields"], json!([{"path":"collector.shutdown_drain_timeout_seconds","reason":"collector_shutdown_after_measurement"}]));
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
-        for field in ["batch_channel_capacity", "put_result_channel_capacity"] {
+        for replacement in [json!([]), json!([{"max_in_flight":8}]), json!([{}])] {
+            let mut wrong = process.clone();
+            wrong["effective_config"]["wal"]["instances"] = replacement;
+            let mut uncovered = initial.clone();
+            promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong])), 1)?;
+            assert!(uncovered["consumer_verified"].as_array().context("consumer_verified array")?.is_empty());
+        }
+        let mut incomplete = initial.clone();
+        promote_collector_readback(&config, &mut incomplete, Some(&json!([process.clone()])), 2)?;
+        assert_eq!(incomplete, initial);
+        for field in [
+            "batch_channel_capacity", "put_result_channel_capacity", "grpc_accept_compression",
+            "grpc_send_compression", "max_metadata_bytes", "max_schema_bytes", "max_message_bytes",
+        ] {
             for missing in [false, true] {
                 let mut wrong = process.clone();
                 if missing {
