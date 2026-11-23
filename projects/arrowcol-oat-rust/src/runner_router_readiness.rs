@@ -93,16 +93,18 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Option<String>>>,
 {
-    let url = Url::parse(endpoint)?;
-    let host = url
-        .host_str()
-        .context("local endpoint has no host")?
-        .trim_matches(['[', ']']);
-    let port = url.port_or_known_default().context("local endpoint has no port")?;
+    let mut ready_url = Url::parse(endpoint)?;
+    ready_url.set_path("/readyz");
+    ready_url.set_query(None);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(1))
+        .build()?;
     let until = tokio::time::Instant::now() + deadline;
     let mut backoff = Duration::from_millis(100);
     let explanation = format!(
-        "local router endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"
+        "local router endpoint {endpoint} did not return HTTP 200 from /readyz; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"
     );
     loop {
         match tokio::time::timeout_at(until, inspect()).await {
@@ -112,7 +114,8 @@ where
             Err(_) => bail!("{explanation}"),
         }
         let attempt_deadline = (tokio::time::Instant::now() + Duration::from_secs(1)).min(until);
-        if let Ok(Ok(_)) = tokio::time::timeout_at(attempt_deadline, tokio::net::TcpStream::connect((host, port))).await
+        if let Ok(Ok(response)) = tokio::time::timeout_at(attempt_deadline, client.get(ready_url.clone()).send()).await
+            && response.status() == reqwest::StatusCode::OK
         {
             return Ok(());
         }
@@ -127,6 +130,7 @@ where
 #[cfg(test)]
 mod local_router_readiness_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn delayed_router_bind_succeeds() -> Result<()> {
@@ -136,7 +140,29 @@ mod local_router_readiness_tests {
         let server = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(75)).await;
             let listener = reservation.listen(16)?;
-            let _connection = listener.accept().await?;
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0; 512];
+                let mut request_len = 0;
+                loop {
+                    let count = stream.read(&mut request[request_len..]).await?;
+                    if count == 0 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty HTTP request"));
+                    }
+                    request_len += count;
+                    if request[..request_len].windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    if request_len == request.len() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "HTTP request too large"));
+                    }
+                }
+                if !String::from_utf8_lossy(&request[..request_len]).starts_with("GET /readyz ") {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected readiness path"));
+                }
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                stream.write_all(response.as_bytes()).await?;
+            }
             Ok::<_, std::io::Error>(())
         });
         wait_for_local_router(
@@ -171,21 +197,25 @@ mod local_router_readiness_tests {
         let reservation = tokio::net::TcpSocket::new_v4()?;
         reservation.bind("127.0.0.1:0".parse()?)?;
         let port = reservation.local_addr()?.port();
-        let started = tokio::time::Instant::now();
+        let inspections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inspected = std::sync::Arc::clone(&inspections);
         let error = wait_for_local_router(
             &format!("http://127.0.0.1:{port}/metrics"),
             Duration::from_secs(5),
-            || async {
-                Ok(Some(
-                    "local router container state=exited exit_code=17; bounded log tail: failed".to_owned(),
-                ))
+            || {
+                inspected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async {
+                    Ok(Some(
+                        "local router container state=exited exit_code=17; bounded log tail: failed".to_owned(),
+                    ))
+                }
             },
         )
         .await
         .err()
         .context("unexpectedly connected")?;
         assert!(error.to_string().contains("state=exited exit_code=17"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(inspections.load(std::sync::atomic::Ordering::Relaxed), 1);
         Ok(())
     }
 }

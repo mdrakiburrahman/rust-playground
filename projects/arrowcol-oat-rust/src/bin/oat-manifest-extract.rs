@@ -66,13 +66,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserves_large_integer_values_and_requires_one_manifest() -> Result<()> {
-        let input = br#"{"client_phase_reports":[{"phase_counters":{"payload_manifest":{"nanoseconds":1795385557123456789}}}]}"#;
-        let output = extract(input)?;
-        assert_eq!(output, br#"{"nanoseconds":1795385557123456789}"#);
-        assert!(extract(br#"{"client_phase_reports":[]}"#).is_err());
-        assert!(extract(br#"{"client_phase_reports":[{},{}]}"#).is_err());
-        assert!(extract(br#"{"client_phase_reports":[{}]}"#).is_err());
     fn preserves_manifest_slices_and_rejects_ambiguous_evidence() -> Result<()> {
         let first = r#"{ "n":18446744073709551615, "s":"} \" [" }"#;
         let second = r#"{"n":9007199254740993}"#;

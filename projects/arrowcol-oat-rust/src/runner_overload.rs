@@ -1227,6 +1227,14 @@ enum GuardSignal {
 #[cfg(test)]
 mod overload_guard_tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn serve_readiness(listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        }
+    }
 
     #[test]
     fn guard_http_log_filter_handles_chunk_boundaries_and_partial_records() -> Result<()> {
@@ -1702,6 +1710,8 @@ mod overload_guard_tests {
             let after = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let old = before.local_addr()?.port();
             let new = after.local_addr()?.port();
+            let before_ready = tokio::spawn(serve_readiness(before));
+            let after_ready = tokio::spawn(serve_readiness(after));
             let mut state = json!({"scaled":false,"before":{"router":old,"dataflow-1":old,"kusto":old},
                 "after":{"router":new,"dataflow-1":new,"kusto":new}});
             fs::write(root.join("state.json"), state.to_string())?;
@@ -1810,6 +1820,8 @@ mod overload_guard_tests {
             assert!(platform.qap_url.is_none());
             let commands = fs::read_to_string(root.join("commands"))?;
             assert!(!commands.contains("oat-client"));
+            before_ready.abort();
+            after_ready.abort();
             Ok::<(), anyhow::Error>(())
         }
         .await;
