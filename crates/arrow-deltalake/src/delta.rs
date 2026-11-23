@@ -1398,6 +1398,29 @@ mod io_tests {
         let staged = writer.stage().await?;
         let reader =
             parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged.file.path)?)?;
+        let codec_readback = table
+            .layout_readback
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .as_ref()
+            .context("missing table writer readback")?
+            .event(&table.url, crate::writer::process_config()?)?;
+        let expected_codec = codec_readback["parquet_columns"]["id"]["compression"]
+            .as_str()
+            .context("missing codec readback")?;
+        for group in reader.metadata().row_groups() {
+            let actual = match group.column(0).compression() {
+                parquet::basic::Compression::UNCOMPRESSED => "uncompressed",
+                parquet::basic::Compression::SNAPPY => "snappy",
+                parquet::basic::Compression::GZIP(_) => "gzip",
+                parquet::basic::Compression::BROTLI(_) => "brotli",
+                parquet::basic::Compression::LZ4 => "lz4",
+                parquet::basic::Compression::LZ4_RAW => "lz4_raw",
+                parquet::basic::Compression::ZSTD(_) => "zstd",
+                parquet::basic::Compression::LZO => "lzo",
+            };
+            assert_eq!(actual, expected_codec);
+        }
         assert_eq!(reader.metadata().num_row_groups(), 2);
         assert!(
             reader
@@ -2451,14 +2474,42 @@ impl LayoutReadback {
 
     fn event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
         let mut config = self.policy.config_json(Some(self.enabled));
+        let base = if self.enabled {
+            Some(self.policy.writer_properties(&self.schema)?)
+        } else {
+            None
+        };
+        let properties = parquet_config.writer_properties(
+            &self.schema,
+            base.clone(),
+            &crate::writer::sorting_from_properties(&self.schema, base.as_ref())?,
+        )?;
+        let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
+        let mut parquet_columns = serde_json::Map::new();
+        let mut columns_unavailable = descriptor.columns().len() > 256;
+        for column in descriptor.columns().iter().take(256) {
+            use parquet::basic::Compression;
+            let (codec, level) = match properties.compression(column.path()) {
+                Compression::UNCOMPRESSED => ("uncompressed", None),
+                Compression::SNAPPY => ("snappy", None),
+                Compression::GZIP(level) => ("gzip", Some(i64::from(level.compression_level()))),
+                Compression::BROTLI(level) => ("brotli", Some(i64::from(level.compression_level()))),
+                Compression::LZ4 => ("lz4", None),
+                Compression::LZ4_RAW => ("lz4_raw", None),
+                Compression::ZSTD(level) => ("zstd", Some(i64::from(level.compression_level()))),
+                Compression::LZO => ("lzo", None),
+            };
+            if parquet_columns
+                .insert(
+                    column.path().string(),
+                    serde_json::json!({"compression":codec,"compression_level":level}),
+                )
+                .is_some()
+            {
+                columns_unavailable = true;
+            }
+        }
         if self.enabled {
-            let base = Some(self.policy.writer_properties(&self.schema)?);
-            let properties = parquet_config.writer_properties(
-                &self.schema,
-                base.clone(),
-                &crate::writer::sorting_from_properties(&self.schema, base.as_ref())?,
-            )?;
-            let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
             let bloom_columns = descriptor
                 .columns()
                 .iter()
@@ -2497,6 +2548,7 @@ impl LayoutReadback {
             "encoding_precedence": ["parquet_config", "resolved_layout", "parquet_defaults"],
             "table_property_overrides": self.table_property_overrides,
             "config": config,
+            "parquet_columns": (!columns_unavailable).then_some(parquet_columns),
         }))
     }
 }
@@ -5514,6 +5566,33 @@ mod layout_readback_tests {
                 .as_array()
                 .is_some_and(|keys| { keys.contains(&serde_json::json!("arrowcol.layout.maxRows")) })
         );
+        for (codec, level) in [
+            ("uncompressed", None),
+            ("snappy", None),
+            ("lz4", None),
+            ("lz4_raw", None),
+            ("gzip", Some(6)),
+            ("brotli", Some(1)),
+            ("zstd", Some(3)),
+        ] {
+            let mut defaults = serde_json::json!({"compression":codec});
+            if let Some(level) = level {
+                defaults["compression_level"] = serde_json::json!(level);
+            }
+            let policy = serde_json::from_value(serde_json::json!({
+                "defaults": defaults,
+                "columns":{"customer_id":{"compression":"gzip","compression_level":5}}
+            }))?;
+            let event = readback.event(&url, &policy)?;
+            assert_eq!(
+                event["parquet_columns"]["value"],
+                serde_json::json!({"compression":codec,"compression_level":level})
+            );
+            assert_eq!(
+                event["parquet_columns"]["customer_id"],
+                serde_json::json!({"compression":"gzip","compression_level":5})
+            );
+        }
         table.insert("arrowcol.layout.enabled".into(), "false".into());
         let resolved = arrowcol_props::resolve(&table, &process)?;
         assert!(publication_layout(&schema, &resolved)?.is_none());

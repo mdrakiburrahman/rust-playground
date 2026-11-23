@@ -687,6 +687,33 @@ fn inherited_router_log_filter(config: &OatConfig) -> Result<String> {
         .context("router YAML omitted telemetry.log_filter")
 }
 
+fn parquet_column_readback(value: &Value) -> Option<Value> {
+    let columns = value.as_object()?;
+    if columns.is_empty() || columns.len() > 256 {
+        return None;
+    }
+    for (name, settings) in columns {
+        if name.is_empty() || name.len() > 128
+            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        {
+            return None;
+        }
+        let settings = settings.as_object()?;
+        if settings.len() != 2 {
+            return None;
+        }
+        let level = settings.get("compression_level")?;
+        match settings.get("compression")?.as_str()? {
+            "uncompressed" | "snappy" | "lz4" | "lz4_raw" | "lzo" if level.is_null() => {}
+            "gzip" if level.as_i64().is_some_and(|level| (0..=9).contains(&level)) => {}
+            "brotli" if level.as_i64().is_some_and(|level| (0..=11).contains(&level)) => {}
+            "zstd" if level.as_i64().is_some_and(|level| (1..=22).contains(&level)) => {}
+            _ => return None,
+        }
+    }
+    Some(value.clone())
+}
+
 fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
     let tables = config
         .tables
@@ -753,6 +780,7 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             policy.insert(field.to_owned(), actual.clone());
         }
         let record = json!({"table_id":id,"table_name":table,"config":policy,
+            "parquet_columns":parquet_column_readback(&value["parquet_columns"]),
             "scope":"table_effective_at_file_construction_not_full_run_history"});
         if !records.contains(&record) {
             if records.len() >= 256 {
@@ -2318,7 +2346,11 @@ groups:
                         "table_name":canonical_dmv_table_name(table)?,
                         "config":{"enabled":true, "sort_columns":[], "bloom_columns":[],
                             "max_rows":65536, "max_input_bytes":1048576,
-                            "row_group_rows":policy["max_row_group_rows"], "page_rows":policy["data_page_row_count_limit"]}
+                            "row_group_rows":policy["max_row_group_rows"], "page_rows":policy["data_page_row_count_limit"]},
+                        "parquet_columns":{
+                            "value":{"compression":"zstd","compression_level":3},
+                            "customer_id":{"compression":"gzip","compression_level":5}
+                        }
                     })
                 ))).collect::<Result<String>>()?;
                 let tables = collector_layout_records(&config, &events)?;
@@ -2331,15 +2363,44 @@ groups:
                 let initial = tunable_leaf_evidence(&config)?;
                 let mut covered = initial.clone();
                 promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-                for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit"] {
+                for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit",
+                    "parquet_writer.defaults.compression", "parquet_writer.defaults.compression_level",
+                    "parquet_writer.columns.customer_id.compression", "parquet_writer.columns.customer_id.compression_level"] {
                     assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
                         .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"));
                 }
+                let projected = |evidence: &Value, path: &str| {
+                    evidence["projection_only"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
+                };
+                assert!(parquet_column_readback(&json!({"value":{"compression":"zstd","compression_level":"3"}})).is_none());
+                for columns in [
+                    Value::Null,
+                    json!({"customer_id":{"compression":"gzip","compression_level":5}}),
+                    json!({"value":{"compression":"snappy","compression_level":3},
+                        "customer_id":{"compression":"gzip","compression_level":5}}),
+                ] {
+                    let mut incomplete = process.clone();
+                    incomplete["layout_table_policies"][1]["parquet_columns"] = columns;
+                    let mut result = initial.clone();
+                    promote_collector_readback(&config, &mut result, Some(&json!([incomplete])), 1)?;
+                    assert!(projected(&result, "parquet_writer.defaults.compression_level"));
+                }
+                let mut disabled = process.clone();
+                disabled["layout_table_policies"][0]["config"]["enabled"] = json!(false);
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([disabled])), 1)?;
+                assert!(projected(&result, "parquet_writer.max_row_group_rows"));
+                assert!(!projected(&result, "parquet_writer.defaults.compression"));
                 process["layout_table_policies"][0]["config"]["row_group_rows"] = json!(1);
                 let mut uncovered = initial.clone();
                 promote_collector_readback(&config, &mut uncovered, Some(&json!([process.clone()])), 1)?;
                 assert!(uncovered["projection_only"].as_array().context("missing projection fields")?
                     .iter().any(|entry| entry["path"] == "parquet_writer.max_row_group_rows"));
+                process["layout_table_policies"][0]["parquet_columns"]["value"]["compression"] = json!("snappy");
+                let mut wrong_codec = initial.clone();
+                promote_collector_readback(&config, &mut wrong_codec, Some(&json!([process.clone()])), 1)?;
+                assert!(wrong_codec["projection_only"].as_array().context("missing projection fields")?
+                    .iter().any(|entry| entry["path"] == "parquet_writer.defaults.compression"));
                 process["layout_table_policies"].as_array_mut().context("missing table policies")?.remove(0);
                 let mut missing = initial.clone();
                 promote_collector_readback(&config, &mut missing, Some(&json!([process])), 1)?;
