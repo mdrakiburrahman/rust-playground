@@ -53,6 +53,10 @@ impl SortKeyOptions {
         format!("{}:{direction}:{nulls}", self.column)
     }
 
+    /// Parse one catalog sort option.
+    ///
+    /// # Errors
+    /// Rejects malformed keys, directions, and null placement.
     pub fn from_property(value: &str) -> Result<Self> {
         let parts = value.split(':').collect::<Vec<_>>();
         ensure!(parts.len() == 3 && !parts[0].is_empty(), "invalid sort option {value}");
@@ -452,7 +456,7 @@ mod tests {
         ]));
         let make = |customers, values| {
             RecordBatch::try_new(
-                schema.clone(),
+                Arc::clone(&schema),
                 vec![
                     Arc::new(StringArray::from(customers)),
                     Arc::new(Int32Array::from(values)),
@@ -486,13 +490,13 @@ mod tests {
             ..LayoutPolicy::default()
         };
         let properties = policy.writer_properties(&schema)?;
-        let mut buffer = FileSortBuffer::new(schema.clone(), policy)?;
+        let mut buffer = FileSortBuffer::new(Arc::clone(&schema), policy)?;
         assert!(buffer.try_push(&a)?);
         assert!(buffer.try_push(&b)?);
         let sorted = buffer.finish()?;
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("mixed.parquet");
-        let mut writer = ArrowWriter::try_new(std::fs::File::create(&file)?, schema.clone(), Some(properties))?;
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&file)?, Arc::clone(&schema), Some(properties))?;
         writer.write(&sorted)?;
         writer.close()?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(file)?)?;

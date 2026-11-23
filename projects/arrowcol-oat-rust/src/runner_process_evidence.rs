@@ -1752,6 +1752,25 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn collector_sort_options_require_exact_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let options = json!([{"column":"customer_id","direction":"descending","nulls":"first"}]);
+        config.tunables = serde_json::from_value(json!({"collector":{"layout":{
+            "sort_columns":["customer_id"],"sort_options":options
+        }}}))?;
+        let observed = json!({"layout":{"process_policy":{"sort_columns":["customer_id"],"sort_options":options}}});
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let mut wrong = observed.clone();
+        wrong["layout"]["process_policy"]["sort_options"][0]["nulls"] = json!("last");
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
+        wrong["layout"]["process_policy"].as_object_mut().context("policy")?.remove("sort_options");
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn collector_layout_requires_separate_matching_table_proof_and_never_merges_it_into_startup() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"

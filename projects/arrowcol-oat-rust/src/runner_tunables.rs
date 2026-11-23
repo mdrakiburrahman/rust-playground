@@ -1295,6 +1295,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 "layout": {
                     "enabled": true,
                     "sort_columns": ["session_id"],
+                    "sort_options": [{"column":"session_id","direction":"descending","nulls":"first"}],
                     "bloom_columns": ["database_name"],
                     "max_rows": 4096,
                     "max_input_bytes": 16777216,

@@ -2272,10 +2272,10 @@ mod tests {
             .tunables
             .collector
             .as_mut()
-            .unwrap()
+            .context("collector missing")?
             .layout
             .as_mut()
-            .unwrap()
+            .context("layout missing")?
             .sort_options = Some(vec![arrow_deltalake::layout::SortKeyOptions {
             column: "customer_id".to_owned(),
             direction: arrow_deltalake::layout::SortDirection::Descending,
@@ -2286,13 +2286,15 @@ mod tests {
             .tunables
             .collector
             .as_mut()
-            .unwrap()
+            .context("collector missing")?
             .layout
             .as_mut()
-            .unwrap()
+            .context("layout missing")?
             .sort_options
             .as_mut()
-            .unwrap()[0]
+            .context("sort options missing")?
+            .first_mut()
+            .context("sort option missing")?
             .direction = arrow_deltalake::layout::SortDirection::Ascending;
         let mismatch = sorted
             .validate()

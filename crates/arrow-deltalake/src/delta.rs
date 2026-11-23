@@ -5520,7 +5520,16 @@ mod layout_readback_tests {
     #[test]
     fn layout_readback_resolves_both_aliases_and_preserves_schema_auto() -> Result<()> {
         let aliases = PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES;
-        let values = ["false", "customer_id,value", "value", "256", "3145728", "32", "8"];
+        let values = [
+            "false",
+            "customer_id,value",
+            "customer_id:descending:first,value:ascending:last",
+            "value",
+            "256",
+            "3145728",
+            "32",
+            "8",
+        ];
         let resolve = |environment: &BTreeMap<&str, &str>| {
             process_writer_properties_from(None, |name| Ok(environment.get(name).map(|value| (*value).to_owned())))
         };
@@ -5540,6 +5549,13 @@ mod layout_readback_tests {
         let config = &layout["process_policy"];
         assert_eq!(config["enabled"], false);
         assert_eq!(config["sort_columns"], serde_json::json!(["customer_id", "value"]));
+        assert_eq!(
+            config["sort_options"],
+            serde_json::json!([
+                {"column":"customer_id","direction":"descending","nulls":"first"},
+                {"column":"value","direction":"ascending","nulls":"last"}
+            ])
+        );
         assert_eq!(config["bloom_columns"], serde_json::json!(["value"]));
         assert_eq!(config["max_rows"], 256);
         assert_eq!(config["max_input_bytes"], 3_145_728);
@@ -5583,6 +5599,7 @@ mod layout_readback_tests {
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", ",id"),
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,x"),
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,,y"),
+            ("ARROWCOL_COLLECTOR_SORT_OPTIONS", "customer_id:ascending:middle"),
             ("ARROWCOL_COLLECTOR_BLOOM_COLUMNS", "x,x"),
         ] {
             let process = process_writer_properties_from(None, |key| Ok((key == name).then(|| value.to_owned())))?;
