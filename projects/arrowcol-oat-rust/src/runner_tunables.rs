@@ -380,6 +380,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
     let environment = role_environment(config, ComponentRole::Client)?;
     let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
     let mut promoted = Vec::new();
+    let mut inert = Vec::new();
     projection.retain(|entry| {
         let (field, variable) = match entry["path"].as_str() {
             Some("client.payload_customer_id") => ("payload_customer_id", "ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID"),
@@ -435,16 +436,19 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         {
             return true;
         }
-        if field == "null_fraction" && reports.iter().any(|report| {
-            let Some(name) = report["table"].as_str() else { return true; };
-            let Some(tables) = report.pointer("/phase_counters/preparation/generator_applicability/tables")
-                .and_then(Value::as_array) else { return true; };
-            if tables.len() != 1 || tables[0]["table"].as_str().is_none_or(|table| !table.eq_ignore_ascii_case(name)) {
-                return true;
+        if field == "null_fraction" {
+            if reports.iter().all(|report| {
+                let Some(name) = report["table"].as_str() else { return false; };
+                let Some(tables) = report.pointer("/phase_counters/preparation/generator_applicability/tables")
+                    .and_then(Value::as_array) else { return false; };
+                tables.len() == 1
+                    && tables[0]["table"].as_str().is_some_and(|table| table.eq_ignore_ascii_case(name))
+                    && tables[0].pointer("/null_fraction/eligible_columns").and_then(Value::as_u64) == Some(0)
+                    && tables[0].pointer("/null_fraction/eligible_rows").and_then(Value::as_u64) == Some(0)
+            }) {
+                inert.push(json!({"path": entry["path"], "reason": "no_nullable_generated_columns"}));
+                return false;
             }
-            tables[0].pointer("/null_fraction/eligible_columns").and_then(Value::as_u64).unwrap_or(0) == 0
-                || tables[0].pointer("/null_fraction/eligible_rows").and_then(Value::as_u64).unwrap_or(0) == 0
-        }) {
             return true;
         }
         if !environment.contains_key(variable)
@@ -455,6 +459,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         promoted.push(json!({"path": entry["path"], "reason": "consumer_startup_readback"}));
         false
     });
+    evidence["inert_fields"].as_array_mut().context("inert_fields must be an array")?.extend(inert);
     evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
     Ok(())
 }

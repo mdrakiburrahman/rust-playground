@@ -2898,7 +2898,7 @@ groups:
             "corpus_rows": 8,
             "generator_applicability": {"version":1,"tables":[{
                 "table":table,"schema_fields":2,"rows":8,
-                "null_fraction":{"eligible_columns":1,"eligible_rows":8,"null_rows":2}
+                "null_fraction":{"eligible_columns":0,"eligible_rows":0,"null_rows":0}
             }]}
         });
         let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
@@ -2909,15 +2909,15 @@ groups:
         });
         let mut covered = initial.clone();
         promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.null_fraction"));
-        for case in ["missing", "no_eligible_columns", "wrong_table"] {
+        assert!(covered["inert_fields"].as_array().context("inert_fields array")?
+            .iter().any(|entry| entry["path"] == "client.null_fraction" && entry["reason"] == "no_nullable_generated_columns"));
+        for case in ["missing", "eligible_columns", "wrong_table"] {
             let mut absent = report.clone();
             match case {
                 "missing" => absent["phase_counters"]["preparation"]["generator_applicability"] = Value::Null,
-                "no_eligible_columns" => {
-                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]["eligible_columns"] = json!(0);
-                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]["eligible_rows"] = json!(0);
+                "eligible_columns" => {
+                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]["eligible_columns"] = json!(1);
+                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]["eligible_rows"] = json!(8);
                 },
                 "wrong_table" => absent["table"] = json!("other"),
                 _ => unreachable!(),
@@ -2925,6 +2925,7 @@ groups:
             let mut unverified = initial.clone();
             promote_client_readback(&config, &mut unverified, Some(&vec![absent]))?;
             assert!(unverified["consumer_verified"].as_array().context("consumer_verified array")?.is_empty());
+            assert!(unverified["inert_fields"].as_array().context("inert_fields array")?.is_empty());
         }
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
