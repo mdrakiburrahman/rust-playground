@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lakehouse Explorer | Local schema contracts</title>
+  <link rel="stylesheet" href="/lakehouse/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body data-frontend="lakehouse">
+  <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="icon-home" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v11h-7v-7h-4v7H3Z"/></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M7 12h10M12 7v10"/></symbol>
+    <symbol id="icon-catalog" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 4 16 4 16 0V6M4 12c0 4 16 4 16 0"/></symbol>
+    <symbol id="icon-monitor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 3"/></symbol>
+    <symbol id="icon-workspace" viewBox="0 0 24 24"><rect x="4" y="3" width="17" height="15" rx="2"/><path d="M1 7v14h16M8 7h9M8 11h6"/></symbol>
+    <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 6h7l2 3h9v12H3Z"/></symbol>
+    <symbol id="icon-lakehouse" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v11H3Z M7 12h10v6H7Z M7 15h10M12 12v6"/></symbol>
+    <symbol id="icon-schema" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="5"/><rect x="2" y="17" width="6" height="5"/><rect x="16" y="17" width="6" height="5"/><path d="M12 7v5H5v5M12 12h7v5"/></symbol>
+    <symbol id="icon-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="1"/><path d="M3 9h18M3 15h18M9 9v12M15 9v12"/></symbol>
+    <symbol id="icon-column" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="1"/><path d="M5 8h14M5 14h14M10 3v18"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 9a8 8 0 1 0 0 7M20 3v6h-6"/></symbol>
+    <symbol id="icon-build" viewBox="0 0 24 24"><path d="m8 6-6 6 6 6M16 6l6 6-6 6M14 3l-4 18"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><path d="m15 15 7 7"/></symbol>
+    <symbol id="icon-collapse" viewBox="0 0 24 24"><path d="m13 5-7 7 7 7m6-14-7 7 7 7"/></symbol>
+    <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="icon-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+    <symbol id="icon-learn" viewBox="0 0 24 24"><path d="M3 4h7l2 2 2-2h7v16h-7l-2 2-2-2H3ZM12 6v16"/></symbol>
+    <symbol id="icon-browse" viewBox="0 0 24 24"><path d="M3 5h7l2 3h9v13H3Z"/><path d="M3 11h18"/></symbol>
+    <symbol id="icon-realtime" viewBox="0 0 24 24"><path d="m13 2-9 12h7l-1 8 10-13h-7Z"/></symbol>
+    <symbol id="icon-scorecards" viewBox="0 0 24 24"><path d="M8 3h8v9a4 4 0 0 1-8 0ZM8 6H3v4a5 5 0 0 0 5 5M16 6h5v4a5 5 0 0 1-5 5M12 16v5M7 21h10"/></symbol>
+    <symbol id="icon-data" viewBox="0 0 24 24"><circle cx="7" cy="5" r="3"/><circle cx="17" cy="5" r="3"/><path d="M2 16v-3a4 4 0 0 1 8 0v3M14 16v-3a4 4 0 0 1 8 0v3M7 18v4h10v-4"/></symbol>
+  </defs></svg>
+  <header class="suite-bar">
+    <span class="app-dots" aria-hidden="true"></span><strong>Fabric</strong><span class="suite-divider"></span>
+    <span class="suite-title">Local lakehouse</span><span class="local-prototype">LOCAL PROTOTYPE</span>
+    <div class="suite-actions"><button disabled aria-label="Search (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg></button><button disabled aria-label="Quick actions (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-realtime"/></svg></button><button disabled aria-label="More options (visual only)">...</button></div><span class="avatar" aria-label="Local demo account">D</span>
+  </header>
+  <nav class="suite-rail" aria-label="Application navigation">
+    <button id="home-nav" disabled title="Home (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-home"/></svg>Home</button>
+    <button disabled title="Copilot is not connected"><span class="copilot-symbol" aria-hidden="true"></span>Copilot</button>
+    <button id="create-nav" disabled title="Create (visual only); use New table in the explorer"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>Create</button>
+    <a href="/fabric"><svg class="icon" aria-hidden="true"><use href="#icon-catalog"/></svg>OneLake<br>catalog</a>
+    <button disabled title="Apps are not connected"><svg class="icon" aria-hidden="true"><use href="#icon-apps"/></svg>Apps</button>
+    <button disabled title="Scorecards (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-scorecards"/></svg>Scorecards</button>
+    <button disabled title="Browse (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-browse"/></svg>Browse</button>
+    <button disabled title="Learn (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-learn"/></svg>Learn</button>
+    <button id="monitor-nav" disabled title="Monitor (visual only); use Workflow runs in the explorer"><svg class="icon" aria-hidden="true"><use href="#icon-monitor"/></svg>Monitor</button>
+    <button disabled title="Real-Time (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-realtime"/></svg>Real-Time</button>
+    <button id="workspace-nav" disabled title="Workspaces (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-workspace"/></svg>Workspaces</button>
+    <button disabled title="Real-Time Open Data (visual only)"><svg class="icon" aria-hidden="true"><use href="#icon-data"/></svg>Real-Time<br>Open Data</button>
+    <button class="active" aria-current="page" disabled><svg class="icon" aria-hidden="true"><use href="#icon-lakehouse"/></svg>Local<br>lakehouse</button>
+    <button disabled aria-label="More navigation (visual only)">...</button>
+    <div class="rail-product"><span class="powerbi-symbol" aria-hidden="true"></span>Power BI</div>
+  </nav>
+  <main class="lakehouse-main">
+    <nav class="ribbon-tabs" aria-label="Lakehouse views">
+      <button id="catalog-tab" class="selected">Home</button>
+      <button disabled title="Materialized lake views are not supported by this local catalogue">Materialized lake views</button>
+      <button id="runs-tab">Workflow runs <span id="run-count">0</span></button>
+      <span class="experience-label"><svg class="icon" aria-hidden="true"><use href="#icon-lakehouse"/></svg>Lakehouse</span>
+    </nav>
+    <div class="command-bar" aria-label="Lakehouse commands">
+      <button id="refresh" title="Refresh catalogue"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg><span>Refresh</span></button>
+      <span class="command-divider"></span>
+      <label class="registry-picker">Catalogue <select id="registry" aria-label="Registry"></select></label>
+      <span class="command-divider"></span>
+      <button id="add-table" disabled><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>New table</button>
+      <button id="build-selected" disabled><svg class="icon" aria-hidden="true"><use href="#icon-build"/></svg>Build SDK</button>
+      <details class="compiler-settings"><summary>SDK options</summary><div>
+        <label for="codegen">SDK compiler</label><select id="codegen"><option value="protoc">Arrowcol protoc builder</option><option value="direct">Direct builder</option></select>
+        <p>Compiler choice does not change the catalogue authority. The SDK calls Arrowcol.</p>
+      </div></details>
+    </div>
+    <div class="information-strip"><span aria-hidden="true">i</span>Local schema contracts preview. SDKs are verified before registration. No Fabric data is copied or modified.</div>
+    <div id="notice" role="status" hidden></div>
+    <section id="catalog-view" class="explorer-workspace">
+      <aside class="explorer-panel" aria-label="Explorer">
+        <div class="explorer-heading"><strong>Explorer</strong><button id="toggle-explorer" aria-label="Collapse Explorer" aria-expanded="true" aria-controls="explorer-content"><svg class="icon" aria-hidden="true"><use href="#icon-collapse"/></svg></button></div>
+        <div id="explorer-content">
+          <div class="explorer-toolbar"><button id="choose-catalogue">Choose catalogue</button><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg></div>
+          <input id="filter" type="search" placeholder="Search tables" aria-label="Find tables">
+          <nav id="tree" aria-label="Catalogue tables"><p class="tree-empty">Loading catalogue...</p></nav>
+          <div class="explorer-note"><strong>Connected catalogue</strong><p id="registry-note"></p><span>Native Unity/Hive connections currently support inspection only.</span></div>
+        </div>
+      </aside>
+      <section class="table-workspace" aria-label="Table details">
+        <div class="table-document-tab"><svg class="icon" aria-hidden="true"><use href="#icon-table"/></svg><strong id="table-tab-name">Lakehouse explorer</strong><button id="close-detail" aria-label="Close table details" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button></div>
+        <nav class="table-tabs" role="tablist" aria-label="Table views">
+          <button id="schema-view" class="selected" role="tab" aria-selected="true" aria-controls="lakehouse-schema" disabled>Schema</button>
+          <button id="properties-view" role="tab" aria-selected="false" aria-controls="lakehouse-properties" disabled>Properties</button>
+          <button id="contract-view" role="tab" aria-selected="false" aria-controls="lakehouse-contract" disabled>SDK contract</button>
+          <span class="metadata-label">Metadata preview</span>
+        </nav>
+        <div id="table-breadcrumb" class="table-breadcrumb">Select a table in Explorer</div>
+        <div id="detail"><p class="metadata-note">Loading schema metadata...</p></div>
+        <footer id="schema-status" class="schema-status">Local catalogue · Metadata only</footer>
+      </section>
+    </section>
+    <section id="runs-view" hidden>
+      <div class="runs-heading"><h2>Workflow runs</h2><span>All catalogue connections · persisted locally · click a run for its live pipeline</span></div>
+      <div id="runs"></div><pre id="logs" hidden aria-label="Workflow logs"></pre>
+    </section>
+  </main>
+  <dialog id="create-dialog">
+    <form id="create-form">
+      <div class="dialog-heading"><div><span class="pill">Schema contracts</span><h2>New table</h2></div><button type="button" id="close-dialog" aria-label="Close new table">Close</button></div>
+      <p class="muted">Define a table once. Build strongly typed Arrowcol SDKs before registration.</p>
+      <p id="create-registry" class="connection-summary"></p>
+      <div class="identity-fields">
+        <label>Catalogue<input id="catalog-name" value="telemetry" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+        <label>Schema<input id="schema-name" value="prod" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+        <label>Table<input id="table-name" value="events" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+      </div>
+      <div class="section-title"><h3>Columns</h3><button type="button" id="add-column" class="text-button">Add column</button></div>
+      <table class="editor-table"><thead><tr><th>Name</th><th>Data type</th><th>Nullable</th><th></th></tr></thead><tbody id="column-rows"></tbody></table>
+      <div class="section-title"><h3>Properties and downstream contracts</h3><button type="button" id="add-property" class="text-button">Add property</button></div>
+      <label for="property-kind">Property to add</label><select id="property-kind"></select>
+      <p class="small muted" id="property-source"></p><div id="property-rows"></div>
+      <div class="section-title"><h3>Generated DDL</h3><span class="muted small">Validated by Rust</span></div>
+      <textarea id="ddl" rows="7" spellcheck="false" readonly aria-label="DDL preview"></textarea>
+      <label for="proto-entry">Compiler entry filename (protoc only)</label><input id="proto-entry" value="telemetry.proto" pattern="[A-Za-z0-9_][A-Za-z0-9_.-]*\.proto">
+      <div class="pipeline"><span>Schema &rarr; DDL</span><span>Frozen contract</span><span>Proto + options</span><span>Arrowcol compiler</span><span>Verify SDK</span><span>Register</span></div>
+      <p id="form-error" role="alert"></p>
+      <div class="dialog-footer"><span class="muted small">No table is registered if SDK verification fails.<br>SDK calls Arrowcol, not the catalogue service.</span><button id="create-submit" class="primary" type="submit">Create and build SDK</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

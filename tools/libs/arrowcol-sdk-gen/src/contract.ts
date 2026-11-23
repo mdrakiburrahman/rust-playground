@@ -5,7 +5,7 @@ import {
   closeSync, fsyncSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
-import { exportCompiler, generateWithProtoc, protocProvenance } from './protoc.js';
+import { exportCompiler, generateWithProtoc, protocProvenance, validateCompiler } from './protoc.js';
 
 export const contractRoot = '.temp/contract-builder';
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -46,6 +46,27 @@ export interface ContractRun {
   staged?: { sha256: string; bytes: number; candidateSha256?: string };
   artifact?: { path: string; hostPath: string; sha256: string; bytes: number };
   error?: string;
+  steps?: { phase: string; status: 'running' | 'succeeded' | 'failed'; startedAt: string; finishedAt?: string; error?: string }[];
+}
+export function setRunPhase(workspace: string, run: ContractRun, phase: string): void {
+  const now = new Date().toISOString();
+  const active = run.steps?.at(-1);
+  if (active?.status === 'running') {
+    active.status = 'succeeded';
+    active.finishedAt = now;
+  }
+  run.steps ??= [];
+  run.phase = phase;
+  if (phase !== 'complete') run.steps.push({ phase, status: 'running', startedAt: now });
+  saveRun(workspace, run);
+}
+export function failRunStep(run: ContractRun): void {
+  const active = run.steps?.at(-1);
+  if (active?.status === 'running') {
+    active.status = 'failed';
+    active.finishedAt = new Date().toISOString();
+    active.error = run.error;
+  }
 }
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -196,7 +217,7 @@ export function enqueue(workspace: string, input: unknown): ContractRun {
   if (!registry) throw new Error('Unknown registry');
   const run: ContractRun = {
     id: randomUUID(), registry, request, status: 'queued', phase: 'queued',
-    registration: 'not-attempted', createdAt: new Date().toISOString(),
+    registration: 'not-attempted', createdAt: new Date().toISOString(), steps: [],
   };
   ensureDirectory(workspace, relative(workspace, runDirectory(workspace, run.id)));
   saveRun(workspace, run);
@@ -234,6 +255,11 @@ export function commandRunner(workspace: string): Execute {
 export function generatorPath(workspace: string): string {
   return resolve(workspace, 'target', 'debug', process.platform === 'win32' ? 'arrowcol-sdk-gen.exe' : 'arrowcol-sdk-gen');
 }
+export function registryEnvironment(workspace: string, registry: Registry): NodeJS.ProcessEnv {
+  return registry.mode === 'owned' ? {
+    ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: resolve(workspace, contractRoot, 'registries', digest(registry.authority), 'identity.key'),
+  } : {};
+}
 export function hostPath(config: ContractConfig, path: string): string {
   return /^[a-zA-Z]:[\\/]/.test(config.hostWorkspace)
     ? win32.join(config.hostWorkspace, ...path.split(/[\\/]/))
@@ -265,11 +291,8 @@ export async function buildContract(
   closeSync(fd);
   const log = join(directory, 'build.log');
   const relativePath = (path: string) => relative(workspace, path);
-  const generator = async (args: string[]) => execute(generatorPath(workspace), args, log);
-  const phase = (value: string) => {
-    run.phase = value;
-    saveRun(workspace, run);
-  };
+  const generator = async (args: string[]) => execute(generatorPath(workspace), args, log, registryEnvironment(workspace, run.registry));
+  const phase = (value: string) => setRunPhase(workspace, run, value);
   run.status = 'running';
   run.startedAt = new Date().toISOString();
   run.pid = process.pid;
@@ -330,10 +353,13 @@ export async function buildContract(
     }
     run.pin = pin;
     if (run.request.mode === 'rebuild') run.registration = 'existing';
-    phase('generating');
     if (run.request.codegen === 'protoc') {
+      phase('exporting-proto');
       await exportCompiler(workspace, artifacts, compiler, entry, execute, log);
+      phase('validating-proto');
+      await validateCompiler(workspace, compiler, entry, join(directory, 'validated-descriptor.pb'), execute, log);
     }
+    phase('generating');
     const generate = () => run.request.codegen === 'protoc'
       ? generateWithProtoc(workspace, artifacts, compiler, sdk, entry, execute, log)
       : generator(['generate', '--artifacts', relativePath(artifacts), '--out', relativePath(sdk)]);
@@ -392,6 +418,7 @@ export async function buildContract(
   } catch (error) {
     run.status = 'failed';
     run.error = errorMessage(error);
+    failRunStep(run);
     writeFileSync(log, `ERROR: ${run.error}\n`, { flag: 'a' });
   } finally {
     run.finishedAt = new Date().toISOString();
@@ -402,6 +429,7 @@ export async function buildContract(
 
 async function finalizeContract(workspace: string, run: ContractRun, execute: Execute): Promise<void> {
   if (!run.staged || !run.pin) throw new Error('No verified staged release to finalize');
+  setRunPhase(workspace, run, 'finalizing');
   const config = loadConfig(workspace);
   if (JSON.stringify(config.registries.find((item) => item.id === run.registry.id)) !== JSON.stringify(run.registry)) {
     throw new Error('Registry changed since preparation; cannot promote this candidate');
@@ -419,15 +447,13 @@ async function finalizeContract(workspace: string, run: ContractRun, execute: Ex
     const candidate = join(directory, 'candidate.pb');
     if (digest(readFileSync(candidate)) !== run.staged.candidateSha256) throw new Error('Prepared candidate digest mismatch');
     run.registration = 'unknown';
-    run.phase = 'promoting';
-    saveRun(workspace, run);
+    setRunPhase(workspace, run, 'promoting');
     await execute(generatorPath(workspace), [
       'catalog', 'promote', '--endpoint', run.registry.endpoint, '--candidate', relative(workspace, candidate),
-    ], join(directory, 'build.log'));
+    ], join(directory, 'build.log'), registryEnvironment(workspace, run.registry));
     run.registration = 'committed';
   }
-  run.phase = 'publishing';
-  saveRun(workspace, run);
+  setRunPhase(workspace, run, 'publishing');
   const releaseDirectory = join(
     contractRoot, 'releases', digest(run.registry.authority), run.pin.tableId,
     `v${run.pin.version}`, run.staged.sha256,
@@ -440,14 +466,14 @@ async function finalizeContract(workspace: string, run: ContractRun, execute: Ex
     sha256: run.staged.sha256, bytes: run.staged.bytes,
   };
   run.status = 'succeeded';
-  run.phase = 'complete';
+  setRunPhase(workspace, run, 'complete');
 }
 
 export async function resumePromotion(
   workspace: string, id: string, execute: Execute = commandRunner(workspace),
 ): Promise<ContractRun> {
   const run = readRun(workspace, id);
-  if (run.status !== 'failed' || !run.staged || !['packaging', 'promoting', 'publishing'].includes(run.phase)) {
+  if (run.status !== 'failed' || !run.staged || !['packaging', 'finalizing', 'promoting', 'publishing'].includes(run.phase)) {
     throw new Error('Only a failed promotion/publication with a verified staged archive can resume');
   }
   const claim = join(runDirectory(workspace, id), 'resume-claim');
@@ -455,11 +481,13 @@ export async function resumePromotion(
   run.status = 'running';
   run.pid = process.pid;
   delete run.error;
+  delete run.finishedAt;
   try {
     await finalizeContract(workspace, run, execute);
   } catch (error) {
     run.status = 'failed';
     run.error = errorMessage(error);
+    failRunStep(run);
   } finally {
     run.finishedAt = new Date().toISOString();
     saveRun(workspace, run);
@@ -487,6 +515,7 @@ export function recoverRuns(workspace: string): void {
       ? 'Build interrupted; verified staged bytes are retained. Explicitly resume promotion/publication for this run; no DDL is replayed.'
       : 'Build interrupted before publication. No automatic replay; inspect the run phase and catalogue.';
     run.finishedAt = new Date().toISOString();
+    failRunStep(run);
     saveRun(workspace, run);
   }
 }

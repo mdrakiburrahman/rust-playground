@@ -4,12 +4,13 @@ use arrowcol_catalog::{
     DdlCommand, DdlParser, SchemaVersion, materialize_protobuf_properties, protobuf_option_definitions,
     protobuf_table_metadata,
 };
-use arrowcol_catalog_client::rpc;
+use arrowcol_catalog_client::{InternalRequestSigner, rpc};
 use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
-use arrowcol_sdk_gen::{SafeOutputPath, bundle_from_snapshot, hydrate_catalog, write_artifact_bundle};
+use arrowcol_sdk_gen::{SafeOutputPath, bundle_from_snapshot, write_artifact_bundle};
 use clap::Subcommand;
 use prost::Message;
 use serde_json::json;
+use tonic::Request;
 use tonic::transport::{Channel, Endpoint};
 
 #[derive(Debug, Subcommand)]
@@ -100,6 +101,15 @@ fn identity(value: &str) -> Result<TableIdentity, Box<dyn std::error::Error>> {
     ))
 }
 
+fn catalog_request<T: Message>(message: T, method: &str) -> Result<Request<T>, Box<dyn std::error::Error>> {
+    let mut request = Request::new(message);
+    if let Some(path) = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE") {
+        InternalRequestSigner::from_file(path)?
+            .sign_message(&mut request, &format!("/arrowcol.catalog.v1.SchemaCatalog/{method}"))?;
+    }
+    Ok(request)
+}
+
 pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Error>> {
     let result = match command {
         CatalogCommand::Properties => serde_json::to_value(protobuf_option_definitions()?)?,
@@ -117,7 +127,7 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
         CatalogCommand::Prepare { endpoint, ddl, out } => {
             let (table, ddl) = definition(&ddl)?;
             let snapshot = rpc::schema_catalog_client::SchemaCatalogClient::new(channel(endpoint).await?)
-                .prepare_table(rpc::PrepareTableRequest { ddl })
+                .prepare_table(catalog_request(rpc::PrepareTableRequest { ddl }, "PrepareTable")?)
                 .await?
                 .into_inner();
             let bundle = bundle_from_snapshot(&snapshot, &identity(&table)?, Some(SchemaVersion::FIRST))?;
@@ -142,9 +152,12 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
             let identity = identity(&name)?;
             let prepared = bundle_from_snapshot(&candidate, &identity, Some(SchemaVersion::FIRST))?;
             let committed = rpc::schema_catalog_client::SchemaCatalogClient::new(channel(endpoint).await?)
-                .promote_table(rpc::PromoteTableRequest {
-                    candidate: Some(candidate),
-                })
+                .promote_table(catalog_request(
+                    rpc::PromoteTableRequest {
+                        candidate: Some(candidate),
+                    },
+                    "PromoteTable",
+                )?)
                 .await?
                 .into_inner();
             let committed = bundle_from_snapshot(&committed, &identity, Some(SchemaVersion::FIRST))?;
@@ -155,7 +168,7 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
         }
         CatalogCommand::List { endpoint } => {
             let snapshot = rpc::schema_catalog_client::SchemaCatalogClient::new(channel(endpoint).await?)
-                .get_snapshot(rpc::Empty {})
+                .get_snapshot(catalog_request(rpc::Empty {}, "GetSnapshot")?)
                 .await?
                 .into_inner();
             let mut tables = Vec::new();
@@ -183,13 +196,19 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
             version,
             out,
         } => {
-            let bundle = hydrate_catalog(
-                &endpoint,
-                &[],
-                &identity(&table)?,
-                version.map(SchemaVersion::new).transpose()?,
-            )
-            .await?;
+            let name = identity(&table)?;
+            let snapshot = rpc::schema_catalog_client::SchemaCatalogClient::new(channel(endpoint).await?)
+                .get_table(catalog_request(
+                    rpc::TableRequest {
+                        catalog: name.catalog().to_string(),
+                        database: name.schema().to_string(),
+                        table: name.table().to_string(),
+                    },
+                    "GetTable",
+                )?)
+                .await?
+                .into_inner();
+            let bundle = bundle_from_snapshot(&snapshot, &name, version.map(SchemaVersion::new).transpose()?)?;
             let output = SafeOutputPath::new(std::env::current_dir()?, out)?;
             write_artifact_bundle(&bundle, &output)?;
             json!({

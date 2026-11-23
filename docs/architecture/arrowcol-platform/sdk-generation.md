@@ -78,6 +78,10 @@ artifact-based export, packaging and safety details.
 `arrowcol-sdk-gen:catalog-ui` is a local developer tool, not a hosted admin
 service. It uses an original catalogue tree/detail/run layout; the reference
 Databricks workspace required sign-in and was not inspected beyond its login page.
+The separate `/fabric` frontend shares only the workflow/API and form logic;
+the original `/` frontend remains available with its direct-generator default.
+`/fabric` defaults to the Arrowcol protoc builder and allows a compiler entry
+filename. Both use the same persistent authorities, runs and immutable releases.
 The primary form accepts catalogue/schema/table names, ordered columns, supported
 types, nullability and table properties, then displays the generated DDL.
 It serializes input only; the Rust parser and central property registry validate it.
@@ -86,6 +90,7 @@ It serializes input only; the Rust parser and central property registry validate
 | --- | --- |
 | Validate | Exactly one managed CREATE; reject ALTER, LOCATION, IF NOT EXISTS and invalid typed properties |
 | Prepare | Read-only `PrepareTable` freezes table/field IDs, v1, complete schema, exact properties, comment, partitions and the selected authority's managed location |
+| Export / validate protobuf (protoc only) | Export the compiler entry and options, then run descriptor-only `protoc` to resolve imports and validate protobuf; the plugin separately validates semantic IR/API binding |
 | Generate | Direct backend uses the existing Rust renderer; the opt-in protoc backend invokes `protoc-gen-arrowcol-sdk` and reuses that same renderer |
 | Verify | Canonical byte-exact check, TypeScript typecheck and generated tests, Rust generated-crate tests |
 | Stage | Deterministic archive containing `contract/`, both SDKs in `sdk/`, and `release.json`; not exposed as a completed release |
@@ -120,14 +125,16 @@ First startup creates `.temp/contract-builder/config.json`.
 | `registries[].mode` | `owned` starts an independent local service; `external` connects only, never provisions/stops it |
 | `hostWorkspace` | Actual host checkout root for copyable paths; initialized from `CONTRACT_HOST_WORKSPACE` or the execution cwd |
 | `registries/<authority-hash>/` | Independent persistent state, warehouse and service log |
+| `registries/<authority-hash>/identity.key` | Local generated signing secret, retained across restarts; never served to the browser or packaged |
 | `runs/<UUID>/` | Request, state, Nx/build logs, candidate, staged archive and payload |
 | `releases/<authority-hash>/<table-UUID>/vN/<SHA-256>/contract-sdk.tar.gz` | Immutable completed SDK + schema contract |
 
 Stop the UI before editing configuration. An external endpoint must implement
 the candidate RPCs for new tables; no fallback to registration-first is allowed.
 Configure its actual stable authority identity, not an arbitrary new identity on
-every restart. Endpoint configuration is not cloud deployment or an authentication
-integration; credential forwarding and real cloud mutation are outside this MVP.
+every restart. Endpoint configuration is not cloud deployment. An external Arrowcol service can
+use a mounted `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE`; credential forwarding
+and real cloud mutation are outside this MVP.
 The workflow refuses a registry change between queueing and execution/promotion.
 
 The UI binds to `127.0.0.1:4173` by default. `CONTRACT_UI_PORT` changes the port;
@@ -137,14 +144,67 @@ requires a session token and JSON for mutations, and exposes only structured
 workflow requests, not shell commands. It refuses to adopt a process already
 listening on an owned registry port. Shutdown drains admitted builds before
 terminating only the registry children it started.
-Owned loopback demo registries explicitly use `dev_only_allow_unsigned`; the
-upstream deployed catalogue defaults to signed identity. This local setting
-does not disable authentication on external catalogues.
+Owned loopback demo registries use the upstream signed-identity mode, with an
+independently generated key for each authority. The backend, Nx bridge and local
+collector use that authority's key file; the SDK and browser do not receive it.
+Snapshot property maps have deterministic protobuf ordering so a signed
+promotion remains valid after decode/re-encode, while modified values fail
+authentication. Read-only rebuilds call `GetTable` directly, never the DDL
+hydration path.
+
+### Separate Fabric-style prototype
+
+The authenticated OneLake reference was inspected read-only: suite bar, navigation
+rail, Explore tabs, workspace filtering, item grid and overview drawer. An
+accessible workspace/lakehouse/schema and a selected table were found; the
+lakehouse's table view returned "Unable to load table view". No query, data
+change, tenant data, account image or proprietary asset was copied into the demo.
+This is original prototype code, not a pixel-perfect or Microsoft-hosted product.
+
+| Surface | Local behavior |
+| --- | --- |
+| Workspaces / database filter | Views over logical catalogue/schema namespaces, not actual Fabric workspaces |
+| Catalogue connection | Independent source of truth used by Nx; not an SDK or compiler variant |
+| Inspect connections | Read-only Rust catalogue and native Unity/Hive metadata inspection; native SDK-build adapters are still pending |
+| Table overview | Columns, properties, identity, version/fingerprint and committed-version rebuild |
+| New table | Ordered schema editor, compiled property defaults, DDL preview and configured protoc entry |
+| Workflow runs | Clickable live top-down pipeline, step attempts/timings and DDL/proto/log inspection, immutable download and actual host path |
+| Favorites | Browser-local, scoped by catalogue connection |
+| Govern, Secure, Copilot | Explicitly disabled; no implied connection or enforcement |
+
+`/lakehouse` is a separate Explorer-focused version; `/fabric` and `/` remain
+available. It follows the reference's nested Lakehouse/Tables/schema/table tree
+and inline table pane rather than replacing the catalogue grid with a drawer.
+Schema, Properties and SDK contract tabs display committed local metadata.
+New table, Build SDK and Workflow runs share the existing backend and compiler
+workflow. Catalogue selection includes inspection-only Unity/Hive entries with
+builds disabled. The surrounding Learn, Real-Time, Apps and other rail controls
+are visual-only; OneLake catalog links to the working `/fabric` surface.
+The table overview links back into Explorer using explicit registry/table query
+parameters, which preserve the selected table on reload.
+
+`arrowcol-sdk-gen:catalog-ui-e2e:lakehouse` covers the new layout, metadata tabs,
+tree search/collapse, non-interactive surrounding navigation, responsive layout
+and the real protoc build/rebuild/download journey.
+
+`arrowcol-sdk-gen:catalog-ui-e2e:fabric` exercises actual form submission,
+protoc execution, registry isolation, reload/favorites, rebuild identity,
+download bytes and descriptor properties. The original
+`arrowcol-sdk-gen:catalog-ui-e2e` exercises the unchanged direct-default journey.
 
 ### Failure and recovery
 
 Runs persist queued/running/succeeded/failed state, phase, registration outcome,
 timestamps, logs and release references across page reloads and server restarts.
+Click a run title/card in either frontend to open its top-down live pipeline.
+New runs retain per-step start/end timestamps and failed/resumed attempts.
+The panel follows the active step, or lets you select a stage and inspect the
+submitted DDL, row/options/compiler proto, manifests, provenance or live log tail.
+The selected run survives reload through `#run=RUN_UUID`. Direct builds explicitly
+skip protoc-only stages; rebuilds skip registration. Older runs without a trace
+say **not recorded** rather than inventing stage completion or timings.
+Document inspection is read-only and allowlisted, rejects symlinks, and returns
+at most 128 KiB per document; it cannot read arbitrary workspace files or keys.
 Pre-promotion validation/generation/test failures leave the authoritative
 catalogue unchanged. A promotion transport error is recorded as **unknown**, not
 incorrectly declared unregistered. Publication failure after acknowledgement is
@@ -302,8 +362,8 @@ definitions remain compiled and digest-pinned as in the direct backend.
 This design separates authoring, build-time contract validation, registration
 and runtime ingestion. The current implementation is a local demonstration,
 not a deployed Fabric feature. The original catalogue frontend stays available;
-a Fabric-style frontend can submit the same structured requests without owning
-schema semantics or executing arbitrary commands.
+the separate Fabric-style frontend submits the same structured requests without
+owning schema semantics or executing arbitrary commands.
 
 ### End-to-end compilation
 
@@ -403,14 +463,59 @@ have reached a durable sink.
 
 ### Registry adapter boundary
 
+The selected catalogue is the **source of truth used by the Nx workflow**, not
+a compiler backend, SDK variant or runtime SDK dependency. Rust Catalogue,
+Unity Catalog and Hive are independent authorities, not replicas that must all
+register a table. Nx adapters obtain or validate the canonical schema contract
+against the selected authority; the compiler consumes the frozen neutral contract.
+The application selects an on-node or endpoint Arrowcol destination independently.
+The generated SDK does not query any registry.
+Arrowcol itself uses its deployment-configured catalogue for schema lookup and
+admission. Callers do not pass a catalogue service/connection as an SDK argument
+or per-ingestion request setting. The logical catalogue name in the table identity
+and routing metadata is a namespace, not a registry URL or connection configuration.
+
 The current local and hosted-simulation choices are two independent Rust
-catalogues. A native Unity Catalog REST endpoint or Hive Metastore Thrift
-endpoint cannot be substituted for an Arrowcol `SchemaCatalog` address.
-An adapter must preserve read-only preparation, immutable contract history and
-exact-candidate promotion. External native identity belongs in a post-registration
-receipt, not a rewrite of the verified SDK. See the
-[registry investigation](catalog.md#optional-unity-catalog-and-hive-registries-investigation)
+catalogues. Supporting native Unity Catalog REST and Hive Metastore Thrift
+requires workflow adapters rather than passing their URLs to an Arrowcol
+`SchemaCatalog` client. For new tables the authored schema is a proposal until
+registration; adapters must preserve read-only preparation, retained canonical
+contract history and exact-candidate registration checks. External native identity
+belongs in a post-registration receipt, not a rewrite of the verified SDK. See the
+[native services and registry adapter design](catalog.md#optional-local-unity-catalog-and-hive-services)
 for persistence, registration recovery and capability limitations.
+
+#### Catalogue metadata versus SDK versioning
+
+Native catalogue schemas should not require Arrowcol-specific `version`,
+`field_number` or `contract_uri` properties. Table/column properties can carry
+optional namespaced documentation and downstream options, just as DDL
+`TBLPROPERTIES` does today. Namespacing optional extension keys does not make
+them prerequisites for representing an ordinary table.
+
+Protobuf field numbers are stable message-field identifiers, not column-order
+instructions. Under the existing strict nullable-tail-append policy, the compiler
+can derive them deterministically from the original sibling ordinal, skipping
+protobuf's reserved range. Once published, the previous descriptor is the
+compatibility baseline: numbers cannot be reused or reassigned. Native reorder,
+drop, rename or type changes must fail compatibility checks, rather than silently
+generating a different mapping.
+
+SDK package SemVer belongs to the release. A compatible nullable-tail addition
+can produce a minor release, while its normalized Arrow schema gets a new
+fingerprint. DDL spelling is not identity. Immutable schema/descriptor snapshots
+and native registration receipts belong with retained release artifacts; the
+catalogue need not carry a user-managed version counter or mandatory pointer.
+Automatic SDK SemVer assignment is a design direction, not implemented behavior:
+generated packages currently retain their existing package version.
+
+The current collector also uses internal schema versions in Flight descriptor
+paths (`vN`). An adapter must resolve those published contracts or change runtime
+lookup explicitly; SDK SemVer alone cannot replace that lookup. Existing fields
+remain unchanged and new fields must be nullable tail additions. In particular,
+making a newly nullable field required would reject older producers that omit it.
+This keeps schema identity, SDK release version and optional runtime policy
+metadata distinct without requiring reserved catalogue properties.
 
 ### Source map and acceptance
 
@@ -423,9 +528,36 @@ for persistence, registration recovery and capability limitations.
 | Compiler contract and plugin | `crates/arrowcol-protoc/proto/arrowcol_codegen.proto`, `crates/arrowcol-protoc/src/lib.rs` |
 | Shared SDK renderer | `crates/arrowcol-sdk-gen/src/generate.rs`, `src/render/` |
 | Real plugin-composition proof | `crates/arrowcol-protoc/tests/plugin.rs`, `tools/libs/arrowcol-sdk-gen/test/protoc-backend.e2e.ts` |
+| Separate Fabric-style layout | `tools/libs/arrowcol-sdk-gen/fabric-ui/` |
+| Generated SDK to committed Delta proof | `tools/libs/arrowcol-sdk-gen/test/collector-contract.e2e.ts` |
 
 Acceptance requires actual UI submission, protoc execution, generated SDK checks,
 registration-last failure cases, correct downloadable archive/hash and persistent
 history after restart. A runtime extension of that demonstration additionally
 requires sending known rows through the selected collector topology and reading
 them from the configured sink, with admission distinguished from durable delivery.
+
+### Current collector integration
+
+Upstream `main` through `9e2b2f4` was merged locally, including the matching
+`otel-arrow` submodule revision. The current collector supports a remote
+catalogue/cache, standalone or SQL routing, Arrow Flight admission, Delta export
+and optional Quiver durable admission. Production ingestion-layout metadata
+remains separate from the SDK's logical schema.
+
+The local runtime proof consumes a successful fresh protoc UI run, starts one
+loopback endpoint Arrowcol with that run's catalogue configured on the collector,
+calls the generated Rust `do_put` with three strongly typed rows, and reads only
+Parquet files referenced by committed Delta Add actions. It compares all row
+values, timestamp units and nulls; Flight completion alone is not success.
+The SDK sender receives only the Arrowcol endpoint, not a catalogue argument.
+The proof keeps its rows/evidence and refuses a nonempty or external table.
+It shuts down only its own collector and does not replay CREATE.
+
+This qualifies **SDK -> endpoint Arrowcol -> Delta**, not the complete
+on-node -> regional chain or Kusto. The existing on-node Flight exporter
+replays schema DDL downstream on first use; it does not yet implement a
+shared-authority, admission-only forwarding mode. That difference must be
+resolved before presenting the two-hop path as the same contract workflow.
+Unity Catalog/Hive runtime adapters remain unimplemented; their native endpoints
+cannot be substituted for an Arrowcol `SchemaCatalog` RPC endpoint.

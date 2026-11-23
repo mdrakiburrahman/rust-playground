@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import {
   buildContract, contractRoot, digest, enqueue, generatorPath, hostPath, loadConfig,
-  parseRequest, publishArchive, readRun, recoverRuns, resumePromotion, runDirectory, saveRun, type Execute,
+  parseRequest, publishArchive, readRun, recoverRuns, registryEnvironment, resumePromotion, runDirectory, saveRun, type Execute,
 } from '../src/contract.js';
 import { protocPaths } from '../src/protoc.js';
+import { inspectRunDocument } from '../src/run-inspection.js';
+import { pipelineSteps } from '../ui/run-pipeline.js';
 
 function fixture() {
   const workspace = mkdtempSync(join(tmpdir(), 'contract-workflow-'));
@@ -22,10 +24,12 @@ function fixture() {
   put(join(workspace, 'package-lock.json'), '{}');
   const pin = { table: 'telemetry.prod.events', tableId: '4a9d8c13-96a2-4c33-8888-e883bfbc1111', version: 1, fingerprint: 'schema-only' };
   const calls: string[][] = [];
+  const environments: { operation: string; env: NodeJS.ProcessEnv | undefined }[] = [];
   let fail = '';
-  const execute: Execute = async (command, args) => {
+  const execute: Execute = async (command, args, _log, env) => {
     const operation = args[0] === 'catalog' ? args[1] : args[0];
     calls.push([command, ...args]);
+    environments.push({ operation, env });
     if (operation === fail) throw new Error(`injected ${operation} failure`);
     if (operation === 'properties') return JSON.stringify({ definitions_sha256: `sha256:${'a'.repeat(64)}`, options: [] });
     const out = args.includes('--out') ? resolve(workspace, args[args.indexOf('--out') + 1]) : '';
@@ -41,7 +45,7 @@ function fixture() {
     return '{}';
   };
   return {
-    workspace, calls, execute, fail: (operation: string) => { fail = operation; },
+    workspace, calls, environments, execute, fail: (operation: string) => { fail = operation; },
     cleanup: () => rmSync(workspace, { recursive: true, force: true }),
   };
 }
@@ -107,9 +111,17 @@ test('CREATE prepares, generates, verifies and stages before exact promotion and
     assert.ok(operations.indexOf('test') < operations.indexOf('package-artifact'));
     assert.ok(operations.indexOf('package-artifact') < operations.indexOf('promote'));
     assert.equal(operations.filter((operation) => operation === 'promote').length, 1);
+    for (const operation of ['prepare', 'promote']) {
+      assert.deepEqual(f.environments.find((entry) => entry.operation === operation)?.env,
+        registryEnvironment(f.workspace, queued.registry), 'prepare and promotion use the selected authority signing key');
+    }
     assert.ok(run.artifact);
     assert.equal(digest(readFileSync(resolve(f.workspace, run.artifact.path))), run.artifact.sha256);
     assert.deepEqual(readRun(f.workspace, run.id), run);
+    assert.deepEqual(run.steps?.map((step) => step.phase),
+      ['validating', 'preparing', 'generating', 'verifying', 'packaging', 'finalizing', 'promoting', 'publishing']);
+    assert.ok(run.steps?.every((step) => step.status === 'succeeded' && step.finishedAt && step.finishedAt >= step.startedAt));
+    assert.equal(pipelineSteps(run).find((step) => step.phase === 'validating-proto')?.status, 'skipped');
     await assert.rejects(() => buildContract(f.workspace, run.id, f.execute), /Only a queued run/);
   } finally { f.cleanup(); }
 });
@@ -135,6 +147,7 @@ test('recovery fails an interrupted worker without discarding staged bytes or re
     const interrupted = {
       ...queued, status: 'running' as const, phase: 'publishing', pid: process.pid,
       registration: 'committed' as const, staged: { sha256: digest('archive'), bytes: 7 },
+      steps: [{ phase: 'publishing', status: 'running' as const, startedAt: queued.createdAt }],
     };
     saveRun(f.workspace, interrupted);
     context.mock.method(process, 'kill', () => {
@@ -146,6 +159,7 @@ test('recovery fails an interrupted worker without discarding staged bytes or re
     assert.equal(recovered.registration, 'committed');
     assert.deepEqual(recovered.staged, interrupted.staged);
     assert.match(recovered.error ?? '', /Explicitly resume/);
+    assert.equal(recovered.steps?.at(-1)?.status, 'failed');
   } finally { context.mock.restoreAll(); f.cleanup(); }
 });
 test('SDK verification failure does not register or publish a table', async () => {
@@ -160,9 +174,12 @@ test('SDK verification failure does not register or publish a table', async () =
     assert.equal(run.artifact, undefined);
     assert.equal(run.staged, undefined);
     assert.ok(!f.calls.some((call) => call.includes('promote')));
+    assert.equal(run.steps?.at(-1)?.status, 'failed');
+    assert.match(run.steps?.at(-1)?.error ?? '', /injected test failure/);
+    assert.equal(pipelineSteps(run).find((step) => step.phase === 'promoting')?.status, 'pending');
   } finally { f.cleanup(); }
 });
-test('an opt-in protoc failure cannot register or publish the candidate', async () => {
+for (const failingPhase of ['validating-proto', 'generating']) test(`${failingPhase} failure cannot register or publish the candidate`, async () => {
   const f = fixture();
   try {
     const paths = protocPaths(f.workspace);
@@ -171,7 +188,10 @@ test('an opt-in protoc failure cannot register or publish the candidate', async 
     writeFileSync(join(f.workspace, 'tools/libs/arrowcol-sdk-gen/src/protoc.ts'), 'driver');
     const execute: Execute = (command, args, log, env) => {
       if (command === 'protoc' && args[0] === '--version') return Promise.resolve('libprotoc test');
-      if (command === 'protoc') return Promise.reject(new Error('injected protoc failure'));
+      if (command === 'protoc') {
+        if (failingPhase === 'generating' && args.some((arg) => arg.startsWith('--descriptor_set_out='))) return Promise.resolve('');
+        return Promise.reject(new Error('injected protoc failure'));
+      }
       if (command === paths.exporter) return Promise.resolve('');
       return f.execute(command, args, log, env);
     };
@@ -181,7 +201,9 @@ test('an opt-in protoc failure cannot register or publish the candidate', async 
     });
     const failed = await buildContract(f.workspace, queued.id, execute);
     assert.equal(failed.status, 'failed');
-    assert.equal(failed.phase, 'generating');
+    assert.equal(failed.phase, failingPhase);
+    assert.equal(failed.steps?.at(-1)?.phase, failingPhase);
+    assert.equal(failed.steps?.at(-1)?.status, 'failed');
     assert.match(failed.error ?? '', /injected protoc failure/);
     assert.equal(failed.registration, 'not-attempted');
     assert.equal(failed.artifact, undefined);
@@ -205,6 +227,10 @@ test('unknown promotion preserves verified bytes and explicit resume promotes th
     const resumed = await resumePromotion(f.workspace, failed.id, f.execute);
     assert.equal(resumed.status, 'succeeded', resumed.error ?? '');
     assert.equal(resumed.artifact?.sha256, failed.staged.sha256);
+    const promotion = pipelineSteps(resumed).find((step) => step.phase === 'promoting')!;
+    assert.equal(promotion.status, 'succeeded');
+    assert.deepEqual(promotion.attempts.map((attempt) => attempt.status), ['failed', 'succeeded']);
+    assert.ok(promotion.attempts.every((attempt) => attempt.finishedAt! >= attempt.startedAt));
     assert.deepEqual(f.calls.slice(count).map((call) => call.slice(1, 3)), [['catalog', 'properties'], ['catalog', 'promote']]);
   } finally { f.cleanup(); }
 });
@@ -217,6 +243,35 @@ test('rebuilding an explicit committed version never prepares or promotes', asyn
     assert.equal(run.registration, 'existing');
     assert.ok(f.calls.some((call) => call.includes('export') && call.includes('--version')));
     assert.ok(!f.calls.some((call) => call.includes('prepare') || call.includes('promote')));
+    assert.equal(pipelineSteps(run).find((step) => step.phase === 'promoting')?.status, 'skipped');
+    const legacy = { ...run, steps: undefined };
+    assert.ok(pipelineSteps(legacy).filter((step) => !step.skip && step.phase !== 'submitted')
+      .every((step) => step.status === 'not-recorded' && !step.startedAt));
+    const resumedLegacy = { ...run, steps: run.steps!.filter((step) => ['finalizing', 'publishing'].includes(step.phase)) };
+    assert.equal(pipelineSteps(resumedLegacy).find((step) => step.phase === 'verifying')?.status, 'not-recorded');
+    assert.equal(pipelineSteps(resumedLegacy).find((step) => step.phase === 'publishing')?.status, 'succeeded');
+  } finally { f.cleanup(); }
+});
+
+test('run inspection allowlists documents, reports missing outputs and bounds file reads', () => {
+  const f = fixture();
+  try {
+    const run = enqueue(f.workspace, { registry: 'local', mode: 'create', codegen: 'protoc',
+      protoEntry: 'events.proto', ddl: 'CREATE TABLE telemetry.prod.events (id BIGINT)' });
+    assert.equal(inspectRunDocument(f.workspace, run.id, 'ddl').text, run.request.mode === 'create' ? run.request.ddl : '');
+    assert.equal(inspectRunDocument(f.workspace, run.id, 'compiler').available, false);
+    assert.throws(() => inspectRunDocument(f.workspace, run.id, '../../config.json'), /Unknown run document/);
+    assert.throws(() => inspectRunDocument(f.workspace, run.id, '__proto__'), /Unknown run document/);
+    assert.throws(() => inspectRunDocument(f.workspace, '../../', 'schema'), /Invalid run/);
+    const directory = join(runDirectory(f.workspace, run.id), 'payload', 'compiler');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'events.proto'), 'x'.repeat(150_000));
+    const document = inspectRunDocument(f.workspace, run.id, 'compiler');
+    assert.equal(document.text?.length, 128 * 1024);
+    assert.equal(document.truncated, true);
+    rmSync(join(directory, 'events.proto'));
+    symlinkSync(join(f.workspace, 'package-lock.json'), join(directory, 'events.proto'));
+    assert.throws(() => inspectRunDocument(f.workspace, run.id, 'compiler'), /symbolic links/);
   } finally { f.cleanup(); }
 });
 test('immutable publication accepts identical bytes and rejects a conflicting destination', () => {

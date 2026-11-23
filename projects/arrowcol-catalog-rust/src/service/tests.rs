@@ -650,7 +650,15 @@ async fn candidate_rpcs_require_signed_identity_before_preparing_or_promoting() 
         )?),
     );
     let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
-    let prepare = rpc::PrepareTableRequest { ddl: CREATE.into() };
+    let properties = (0..20)
+        .map(|index| format!("'vendor.key{index}'='value{index}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prepare = rpc::PrepareTableRequest {
+        ddl: format!(
+            "CREATE TABLE telemetry.prod.signed (event_id BIGINT NOT NULL) USING DELTA TBLPROPERTIES ({properties})"
+        ),
+    };
     let error = ces
         .prepare_table(Request::new(prepare.clone()))
         .await
@@ -672,7 +680,29 @@ async fn candidate_rpcs_require_signed_identity_before_preparing_or_promoting() 
     assert!(service.state.lock().await.tables.is_empty());
     let mut request = Request::new(promote);
     signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/PromoteTable")?;
-    ces.promote_table(request).await?;
+    let (metadata, extensions, message) = request.into_parts();
+    let wire = message.encode_to_vec();
+    let decoded = rpc::PromoteTableRequest::decode(wire.as_slice())?;
+    assert_eq!(
+        wire,
+        decoded.encode_to_vec(),
+        "signed candidate map encoding survives transport"
+    );
+    let mut tampered = decoded.clone();
+    tampered
+        .candidate
+        .as_mut()
+        .context("candidate")?
+        .properties
+        .insert("vendor.key0".into(), "changed".into());
+    let error = ces
+        .promote_table(Request::from_parts(metadata.clone(), extensions.clone(), tampered))
+        .await
+        .err()
+        .context("modified signed candidate")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    ces.promote_table(Request::from_parts(metadata, extensions, decoded))
+        .await?;
     assert_eq!(service.state.lock().await.tables.len(), 1);
     Ok(())
 }

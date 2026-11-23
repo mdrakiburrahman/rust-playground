@@ -43,4 +43,13 @@ export async function generateWithProtoc(
   for (const name of ['descriptor.pb', 'schema.arrow']) {
     copyFileSync(join(artifacts, name), join(sdk, 'descriptors', name));
   }
+
+}
+
+export async function validateCompiler(
+  workspace: string, compiler: string, entry: string, output: string, execute: Execute, log: string,
+): Promise<void> {
+  await execute('protoc', [
+    `--proto_path=${compiler}`, '--include_imports', `--descriptor_set_out=${relative(workspace, output)}`, entry,
+  ], log);
 }

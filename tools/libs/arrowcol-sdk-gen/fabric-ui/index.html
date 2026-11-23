@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneLake catalog | Schema contracts prototype</title>
+  <link rel="stylesheet" href="/fabric/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body data-frontend="fabric">
+  <header class="suite-bar">
+    <span class="waffle" aria-hidden="true">⠿</span>
+    <strong>Fabric</strong><span class="suite-divider"></span><span>OneLake catalog</span>
+    <span class="prototype-label">LOCAL PROTOTYPE</span>
+    <a href="/" class="original-link">Original explorer ↗</a>
+    <span class="avatar" aria-label="Local demo account">D</span>
+  </header>
+  <nav class="fabric-rail" aria-label="Fabric navigation">
+    <button id="home-nav" title="Explore local catalogues"><span aria-hidden="true">⌂</span>Home</button>
+    <button disabled title="Copilot is not connected in this local prototype"><span aria-hidden="true">✧</span>Copilot</button>
+    <button id="create-nav" title="Create a schema contract"><span aria-hidden="true">⊕</span>Create</button>
+    <button id="explore-nav" class="active"><span class="catalog-icon" aria-hidden="true">◉</span>OneLake<br>catalog</button>
+    <button id="monitor-nav"><span aria-hidden="true">◷</span>Monitor</button>
+    <button id="workspace-nav"><span aria-hidden="true">▱</span>Workspaces</button>
+    <div class="rail-bottom"><span class="catalog-icon">◈</span><small>Fabric</small></div>
+  </nav>
+  <main class="fabric-main">
+    <div class="catalog-heading">
+      <h1>OneLake catalog</h1>
+      <label class="registry-picker">Catalogue connection <select id="registry" aria-label="Registry"></select></label>
+      <span class="preview-tag">Schema contracts preview</span>
+    </div>
+    <nav class="top-tabs" aria-label="Catalog views">
+      <button id="catalog-tab" class="selected">Explore</button>
+      <button disabled title="Governance is not connected in this prototype">Govern</button>
+      <button disabled title="Permissions are not connected in this prototype">Secure</button>
+      <button id="runs-tab">Workflow runs <span id="run-count">0</span></button>
+    </nav>
+    <div id="notice" role="status" hidden></div>
+    <div class="catalog-body">
+      <aside class="catalog-sidebar">
+        <button id="all-items" class="scope-button selected"><span aria-hidden="true">▣</span> All items</button>
+        <button id="favorites" class="scope-button"><span aria-hidden="true">☆</span> Favorites</button>
+        <div class="sidebar-heading">Workspaces <span title="Local catalogue namespaces, not Fabric workspaces">ⓘ</span></div>
+        <input id="workspace-filter" type="search" placeholder="Search workspaces" aria-label="Search workspaces">
+        <button id="all-workspaces" class="scope-button selected"><span aria-hidden="true">▱</span> All workspaces</button>
+        <nav id="workspace-list" aria-label="Workspace namespaces"></nav>
+        <div class="sidebar-footnote">
+          <strong>Connected catalogue</strong><p id="registry-note"></p>
+          <p>Local namespaces are shown as workspaces. No Fabric data is copied or modified.</p>
+          <label for="codegen">SDK compiler</label>
+          <select id="codegen"><option value="protoc">Arrowcol protoc builder</option value="direct">Direct builder (original)</option></select>
+          <p>Catalogue authority and collector configuration are independent of the SDK compiler.</p>
+        </div>
+      </aside>
+      <div class="catalog-content">
+        <section id="catalog-view">
+          <div class="catalog-toolbar">
+            <strong id="scope-title">All items</strong>
+            <label class="type-filter">Type: <select id="schema-filter" aria-label="Database filter"><option value="">All databases</option></select></label>
+            <div class="toolbar-end">
+              <input id="filter" type="search" placeholder="Filter by keyword" aria-label="Find tables">
+              <button id="refresh" title="Refresh catalogue">↻ <span>Refresh</span></button>
+              <button id="add-table" class="primary" disabled>＋ New table</button>
+            </div>
+          </div>
+          <div class="catalog-sheet">
+            <div id="tree" aria-label="Catalogue tables"></div>
+            <footer class="sheet-footer"><span id="item-count">Loading catalogue…</span><span>Delta tables · Schema contracts</span></footer>
+          </div>
+          <aside id="detail-panel" class="detail-panel" hidden aria-label="Table details">
+            <div class="detail-actions"><strong>Table overview</strong><button id="close-detail" aria-label="Close table details">✕</button></div>
+            <div id="detail"></div>
+          </aside>
+        </section>
+        <section id="runs-view" hidden>
+          <div class="catalog-toolbar"><div><h2>Workflow runs</h2><p class="muted small">Nx contract builds · all catalogue connections</p></div><span class="preview-tag">Persisted locally</span></div>
+          <div id="runs"></div><pre id="logs" hidden aria-label="Workflow logs"></pre>
+        </section>
+      </div>
+    </div>
+  </main>
+  <dialog id="create-dialog">
+    <form id="create-form">
+      <div class="dialog-heading"><div><span class="preview-tag">Schema contracts</span><h2>New table</h2></div><button type="button" id="close-dialog" aria-label="Close new table">✕</button></div>
+      <p class="muted">Define a table once. Build strongly typed Arrowcol SDKs before registration.</p>
+      <p id="create-registry" class="connection-summary"></p>
+      <div class="identity-fields">
+        <label>Workspace / catalogue<input id="catalog-name" value="telemetry" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+        <label>Database / schema<input id="schema-name" value="prod" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+        <label>Table<input id="table-name" value="events" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+      </div>
+      <div class="section-title"><h3>Columns</h3><button type="button" id="add-column" class="text-button">＋ Add column</button></div>
+      <table class="editor-table"><thead><tr><th>Name</th><th>Data type</th><th>Nullable</th><th></th></tr></thead><tbody id="column-rows"></tbody></table>
+      <div class="section-title"><h3>Properties and downstream contracts</h3><button type="button" id="add-property" class="text-button">＋ Add property</button></div>
+      <label for="property-kind">Property to add</label><select id="property-kind"></select>
+      <p class="small muted" id="property-source"></p><div id="property-rows"></div>
+      <div class="section-title"><h3>Generated DDL</h3><span class="muted small">Validated by Rust</span></div>
+      <textarea id="ddl" rows="7" spellcheck="false" readonly aria-label="DDL preview"></textarea>
+      <label for="proto-entry">Compiler entry filename (protoc only)</label><input id="proto-entry" value="telemetry.proto" pattern="[A-Za-z0-9_][A-Za-z0-9_.-]*\.proto">
+      <div class="pipeline"><span>Schema → DDL</span><span>Frozen contract</span><span>Proto + options</span><span>Arrowcol compiler</span><span>Verify SDK</span><span>Register</span></div>
+      <p id="form-error" role="alert"></p>
+      <div class="dialog-footer"><span class="muted small">No table is registered if SDK verification fails.<br>SDK calls Arrowcol, not the catalogue service.</span><button id="create-submit" class="primary" type="submit">Create and build SDK</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

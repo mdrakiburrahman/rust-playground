@@ -14,24 +14,50 @@ The UI starts two independent persistent catalogue services, not mock APIs.
 
 | Command | Result |
 | --- | --- |
-| `npx --no-install nx run arrowcol-sdk-gen:catalog-ui` | Explorer at `http://localhost:4173`; local registry `18817`, hosted simulation `18818` |
+| `npx --no-install nx run arrowcol-sdk-gen:catalog-ui` | Original explorer at `http://localhost:4173/`; separate Fabric-style prototype at `/fabric`; local registry `18817`, hosted simulation `18818` |
 | `npx --no-install nx run arrowcol-sdk-gen:build-contract --registry=local --definition=schemas/events.sql` | Prepare, build/test and package before registering the exact candidate |
 | `npx --no-install nx run arrowcol-sdk-gen:build-contract --registry=hosted --table=telemetry.prod.events --schema-version=1` | Rebuild a committed version without CREATE or promotion |
 | `npx --no-install nx run arrowcol-sdk-gen:build-contract --resume-run=RUN_UUID` | Explicitly finish a failed promotion/publication using retained verified bytes |
 | `npx --no-install nx run arrowcol-sdk-gen:catalog-ui-e2e` | Against a running UI: create in both registries, rebuild, reload, download and verify; keeps test tables and evidence |
+| `npx --no-install nx run arrowcol-sdk-gen:catalog-ui-e2e:fabric` | Same real workflow through the separate Fabric-style UI with protoc, favorites and detail drawer |
+| `CONTRACT_COLLECTOR_RUN=RUN_UUID npx --no-install nx run arrowcol-sdk-gen:collector-contract-e2e` | Writes three synthetic rows using a fresh protoc UI run's SDK, then checks committed Delta rows; requires the owned catalogue/UI running and an empty table |
 | `npx --no-install nx run arrowcol-sdk-gen:contract-properties` | List optional properties, enum values and native defaults from compiled proto2 descriptors |
-| `npx --no-install nx run arrowcol-protoc:build-contract --registry=local --definition=schemas/events.sql` | Opt into real protoc generation; the website and default target remain direct |
+| `npx --no-install nx run arrowcol-protoc:build-contract --registry=local --definition=schemas/events.sql` | Opt into real protoc generation; the original website/default target remain direct, while `/fabric` defaults to protoc |
+| `npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=up --provider=unity` | Start persistent local Unity Catalog; substitute `hive` for Hive/PostgreSQL. **Unauthenticated local development only; never publish native ports. SDK-build adapters remain pending.** |
+| `npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=verify --provider=hive` | Retains a native metadata-only example and checks restart persistence; substitute `unity`. Not a Delta/SDK ingestion test |
 
 CLI builds require the selected registry to be running. Configuration, run logs,
 registry state/warehouses and immutable releases live under
 `.temp/contract-builder`. **Do not clean this directory if you need its tables,
 run history or artifacts.** Copy releases elsewhere before repository cleanup.
-The UI offers downloads and copyable host paths. Set `CONTRACT_HOST_WORKSPACE`
+Click a workflow run for its live top-down pipeline, step timings, DDL/proto
+inspection and logs. The UI offers downloads and copyable host paths. Set `CONTRACT_HOST_WORKSPACE`
 to the host checkout path on first startup when running inside a container.
 Browser checks require Playwright Chromium and its system libraries
 (`npx --no-install playwright install --with-deps chromium --only-shell`).
+The catalogue dropdown includes Unity Catalog and Hive Metastore as **inspection-only**
+connections. Selecting either opens native metadata inspection and disables SDK builds;
+switch back to Local/Hosted to build. **Inspect connections** also browses any service
+without changing the selected connection.
+See [native setup, inspection and safety](../../docs/architecture/arrowcol-platform/catalog.md#optional-local-unity-catalog-and-hive-services).
+
+| Frontend | Purpose |
+| --- | --- |
+| `/` | Original catalogue explorer |
+| `/fabric` | Existing OneLake catalogue demo, unchanged navigation |
+| `/lakehouse` | Separate Lakehouse Explorer: nested table tree, inline schema/properties/SDK tabs and compact build controls |
+
+Open a Fabric table's **Open in Lakehouse Explorer** link to carry its catalogue and
+table selection into the new view. The Lakehouse rail mirrors the reference's
+surrounding navigation (including Learn and Real-Time), but only OneLake catalogue
+and Explorer actions work; other rail items are non-interactive decoration.
+The pane displays real schema metadata, not queried or fabricated data rows.
+Run `npx --no-install nx run arrowcol-sdk-gen:catalog-ui-e2e:lakehouse` for the
+new frontend's actual create/build/rebuild/download journey.
 
 See [workflow phases, configuration and recovery](../../docs/architecture/arrowcol-platform/sdk-generation.md#registration-last-contract-workflow).
+The [schema-to-SDK design](../../docs/architecture/arrowcol-platform/sdk-generation.md#design-schema-authoring-to-a-protoc-built-sdk)
+explains each compilation step and the catalogue/collector boundary.
 
 Protobuf is a proto2 **schema contract**, not the ingestion wire. Scalar fields
 are optional; timestamps are UTC microseconds (`int64`), decimals are strings.

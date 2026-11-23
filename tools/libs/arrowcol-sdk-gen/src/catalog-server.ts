@@ -8,11 +8,14 @@ import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   commandRunner, contractRoot, digest, enqueue, ensureDirectory, errorMessage, generatorPath,
-  isCode, listRuns, loadConfig, readRun, recoverRuns, runDirectory, saveRun,
+  failRunStep, isCode, listRuns, loadConfig, readRun, recoverRuns, registryEnvironment, runDirectory, saveRun,
 } from './contract.js';
+import { inspectRunDocument } from './run-inspection.js';
+import { nativeManager } from './native-catalogues.js';
 
 const workspace = process.cwd();
 const execute = commandRunner(workspace);
+const nativeCatalogues = nativeManager(workspace, execute);
 const nxPackagePath = createRequire(import.meta.url).resolve('nx/package.json');
 const nxPackage: { bin: { nx: string } } = JSON.parse(readFileSync(nxPackagePath, 'utf8'));
 const nxBinary = resolve(dirname(nxPackagePath), nxPackage.bin.nx);
@@ -92,6 +95,7 @@ async function pump(): Promise<void> {
           latest.status = 'failed';
           latest.error = `Nx workflow failed: ${errorMessage(error)}`;
           latest.finishedAt = new Date().toISOString();
+          failRunStep(latest);
           saveRun(workspace, latest);
         }
         console.error(`Run ${run.id}: ${errorMessage(error)}`);
@@ -111,12 +115,22 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   const url = new URL(request.url ?? '/', `http://${requestHost}`);
   if (request.method === 'GET' && url.pathname === '/api/config') {
     json(response, 200, { registries: loadConfig(workspace).registries, token });
+  } else if (request.method === 'GET' && url.pathname === '/api/connections') {
+    json(response, 200, {
+      registries: loadConfig(workspace).registries,
+      native: await Promise.all([nativeCatalogues.status('unity'), nativeCatalogues.status('hive')]),
+    });
+  } else if (request.method === 'GET' && /^\/api\/native-catalogues\/(unity|hive)\/inspect$/.test(url.pathname)) {
+    const provider = url.pathname.split('/')[3] === 'unity' ? 'unity' : 'hive';
+    json(response, 200, await nativeCatalogues.inspect(provider, url.searchParams.get('catalog') || undefined,
+      url.searchParams.get('schema') || undefined, url.searchParams.get('table') || undefined));
   } else if (request.method === 'GET' && url.pathname === '/api/properties') {
     json(response, 200, JSON.parse(await execute(generatorPath(workspace), ['catalog', 'properties'])));
   } else if (request.method === 'GET' && url.pathname === '/api/tables') {
     const registry = loadConfig(workspace).registries.find((item) => item.id === url.searchParams.get('registry'));
     if (!registry) { json(response, 400, { error: 'Unknown registry' }); return; }
-    const snapshot = await execute(generatorPath(workspace), ['catalog', 'list', '--endpoint', registry.endpoint]);
+    const snapshot = await execute(generatorPath(workspace), ['catalog', 'list', '--endpoint', registry.endpoint],
+      undefined, registryEnvironment(workspace, registry));
     json(response, 200, JSON.parse(snapshot));
   } else if (request.method === 'GET' && url.pathname === '/api/runs') {
     recoverRuns(workspace);
@@ -125,6 +139,9 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     const run = enqueue(workspace, await body(request));
     json(response, 202, run);
     void pump().catch((error) => console.error(`Run dispatcher: ${errorMessage(error)}`));
+  } else if (request.method === 'GET' && /^\/api\/runs\/[^/]+\/documents\/[^/]+$/.test(url.pathname)) {
+    const parts = url.pathname.split('/');
+    json(response, 200, inspectRunDocument(workspace, parts[3], parts[5]));
   } else if (request.method === 'GET' && /^\/api\/runs\/[^/]+\/log$/.test(url.pathname)) {
     const id = url.pathname.split('/')[3];
     readRun(workspace, id);
@@ -150,15 +167,24 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       'Cache-Control': 'no-store',
     });
     response.end(bytes);
-  } else if (request.method === 'GET' && ['/', '/app.js', '/style.css'].includes(url.pathname)) {
+  } else if (request.method === 'GET' && ['/', '/app.js', '/run-pipeline.js', '/style.css'].includes(url.pathname)) {
     const file = url.pathname === '/' ? join(assets, 'index.html')
       : url.pathname === '/style.css' ? join(assets, 'style.css')
-        : resolve(workspace, contractRoot, 'public/app.js');
+        : resolve(workspace, contractRoot, 'public', url.pathname.slice(1));
     response.writeHead(200, {
       'Content-Type': url.pathname === '/' ? 'text/html' : url.pathname.endsWith('.css') ? 'text/css' : 'text/javascript',
       'Cache-Control': 'no-store',
     });
     response.end(readFileSync(file));
+  } else if (request.method === 'GET' && ['/fabric', '/fabric/', '/fabric/style.css', '/lakehouse', '/lakehouse/', '/lakehouse/style.css'].includes(url.pathname)) {
+    const stylesheet = url.pathname.endsWith('.css');
+    response.writeHead(200, {
+      'Content-Type': stylesheet ? 'text/css' : 'text/html',
+      'Cache-Control': 'no-store',
+    });
+    response.end(readFileSync(resolve(workspace, 'tools/libs/arrowcol-sdk-gen',
+      url.pathname.startsWith('/lakehouse') ? 'lakehouse-ui' : 'fabric-ui',
+      stylesheet ? 'style.css' : 'index.html')));
   } else json(response, 404, { error: 'Not found' });
 }
 const server = createServer((request, response) => {
@@ -187,7 +213,8 @@ try {
       !['127.0.0.1', '0.0.0.0'].includes(host)) throw new Error('Invalid UI port or bind address');
   const config = loadConfig(workspace);
   acquireLock();
-  await execute('cargo', ['build', '--locked', '--quiet', '-p', 'arrowcol-sdk-gen', '-p', 'arrowcol-catalog-rust']);
+  await execute('cargo', ['build', '--locked', '--quiet', '-p', 'arrowcol-sdk-gen',
+    '-p', 'arrowcol-protoc', '-p', 'arrowcol-catalog-rust']);
   await execute(process.execPath, [
     'node_modules/typescript/bin/tsc', '--project', 'tools/libs/arrowcol-sdk-gen/ui/tsconfig.json',
   ]);
@@ -195,11 +222,15 @@ try {
     if (await listening(registry.endpoint)) throw new Error(`Refusing to adopt unowned service at ${registry.endpoint}`);
     const root = join(contractRoot, 'registries', digest(registry.authority));
     ensureDirectory(workspace, root);
+    const environment = registryEnvironment(workspace, registry);
+    const secret = environment.ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE!;
+    if (!existsSync(secret)) writeFileSync(secret, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
     const output = openSync(resolve(workspace, root, 'service.log'), 'a');
     const binary = resolve(workspace, 'target/debug', process.platform === 'win32' ? 'arrowcol-catalog-rust.exe' : 'arrowcol-catalog-rust');
     const child = spawn(binary, [
       '--listen', new URL(registry.endpoint).host,
-      '--ddl-auth-mode', 'dev_only_allow_unsigned',
+      '--ddl-auth-mode', 'signed_identity',
+      '--ddl-identity-secret-file', secret,
       '--state-dir', resolve(workspace, root, 'state'),
       '--warehouse-root', resolve(workspace, root, 'warehouse'),
     ], { cwd: workspace, stdio: ['ignore', output, output], shell: false });
@@ -217,7 +248,7 @@ try {
       if (child.exitCode !== null || child.signalCode !== null) throw new Error(`${registry.label} exited; see ${root}/service.log`);
       try {
         await execute(binary, ['--healthcheck', '--listen', new URL(registry.endpoint).host,
-          '--ddl-auth-mode', 'dev_only_allow_unsigned']);
+          '--ddl-auth-mode', 'signed_identity', '--ddl-identity-secret-file', secret]);
         ready = true;
         break;
       } catch (error) { lastError = errorMessage(error); await delay(500); }
