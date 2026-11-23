@@ -1047,6 +1047,14 @@ impl OatConfig {
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
         let computed_profile_hash = self.collector_build_profile_hash();
+        if computed_profile_hash.is_some()
+            && self.platform.kind == OatMode::Local
+            && !self.platform.local.stable_image_build
+        {
+            bail!(
+                "tunables.collector build-profile fields require platform.local.stable_image_build=true for verified immutable image pinning; set it to true or omit the build-profile fields"
+            );
+        }
         if let Some(profile_hash) = &self.platform.collector_build_profile_hash {
             let expected = computed_profile_hash
                 .as_deref()
@@ -1725,6 +1733,46 @@ mod tests {
             .context("missing override")?
             .image_id = "latest".to_owned();
         assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_default_local_profile_requires_stable_image_selection() -> Result<()> {
+        let local_config = || {
+            let mut config = valid();
+            config.platform.kind = OatMode::Local;
+            config.platform.runtime_config_file = None;
+            config.platform.bootstrap_env_file = None;
+            config.platform.compose_file = Some("projects/loadtest/compose.yaml".to_owned());
+            config.platform.compose_override_file = Some("projects/loadtest/compose.override.yaml".to_owned());
+            config.platform.compose_project = Some("oat-test".to_owned());
+            config.platform.compose_state_root = Some(config.directory.to_string_lossy().into_owned());
+            config.qap_database = Some("loadtest".to_owned());
+            config
+        };
+
+        let omitted = local_config();
+        assert!(omitted.collector_build_profile_hash().is_none());
+        omitted.validate()?;
+
+        let mut explicit = local_config();
+        explicit
+            .tunables
+            .collector
+            .get_or_insert_with(Default::default)
+            .target_cpu = Some(CollectorTargetCpu::Generic);
+        let error = explicit.validate().unwrap_err().to_string();
+        assert!(error.contains("tunables.collector build-profile fields"));
+        assert!(error.contains("platform.local.stable_image_build=true"));
+
+        let mut stable = local_config();
+        stable.platform.local.stable_image_build = true;
+        stable
+            .tunables
+            .collector
+            .get_or_insert_with(Default::default)
+            .target_cpu = Some(CollectorTargetCpu::Generic);
+        stable.validate()?;
         Ok(())
     }
 

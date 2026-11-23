@@ -5,6 +5,7 @@
 | Score | Sustained newly committed Delta rows/s from commit-window evidence; admission and rewrites are excluded. |
 | Scope | Local mode, final public DMV table `sqlserver_availability_replica_states`, replicas `[1]`, one leased box per cohort. |
 | Profile | Every manifest sets `campaign_profile: "single_hot_table"`: one DMV table, replicas `[1]`, WAL disabled, and continuous maintenance applying optimize, purge, vacuum, checkpoint, and prune-log. |
+| Local build profile | Any explicit `tunables.collector` build-profile field in local mode requires `platform.local.stable_image_build: true`; otherwise config validation fails before Compose. Stable mode verifies and pins the immutable collector image by profile hash, source revision, and image ID. |
 | Guard and envelope | Every baseline requests `overload_guard` enabled, cap fraction 0.90, two zero-progress windows, and a 4 GiB local collector memory limit. This common initial request is not measured headroom or proof of host suitability. |
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |

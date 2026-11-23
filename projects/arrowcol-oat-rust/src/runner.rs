@@ -8062,7 +8062,11 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
             if let Some(profile_hash) = config.collector_build_profile_hash() {
                 let mut inspect = Command::new("docker");
                 inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
-                let output = run_command(inspect, "resolve profile-specific local collector image").await?;
+                let output = run_command(inspect, "resolve profile-specific local collector image")
+                    .await
+                    .with_context(|| {
+                        format!("required immutable collector profile image {source} is unavailable; rebuild with platform.local.stable_image_build=true")
+                    })?;
                 let observed = String::from_utf8(output.stdout)?;
                 let mut revision = Command::new("git");
                 revision.args(["rev-parse", "HEAD"]);
@@ -8124,6 +8128,7 @@ fn profile_hash_selects_and_validates_local_collector_image() -> Result<()> {
     );
     assert!(verify_collector_profile_image(&observed, &source_revision, &"d".repeat(64)).is_err());
     assert!(verify_collector_profile_image(&observed, &"d".repeat(40), &profile_hash).is_err());
+    assert!(verify_collector_profile_image("", &source_revision, &profile_hash).is_err());
     for image_id in [
         "sha256:short".to_owned(),
         format!("sha256:{}", "B".repeat(64)),
