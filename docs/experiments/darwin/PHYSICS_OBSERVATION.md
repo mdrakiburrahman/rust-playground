@@ -42,6 +42,18 @@ Decoder children are stopped and reaped on early failure or interruption.
 | Matched corpus | First-arm mode explicitly establishes a reference only after its receipt is reconciled. A matched arm requires the SHA-256 of a frozen comparison profile and its referenced completed receipt, with identical source, harness, seed, image and corpus pins. It copies both exact inputs and checks the same logical client's reservation at readiness, immediately before scheduling, and after the run. `--compare-reservations FIRST_RECEIPT SECOND_RECEIPT` remains a post-run comparison helper. |
 | Results | This is a fixed-image collector CPU-scaling diagnostic, not a main-vs-candidate qualification or verdict. Whole-snapshot delivery equality includes warmup and drain; reconciled durable throughput uses deduplicated commits finishing in `[start,end)`, not client cohort membership. |
 
+### Project CPU admission and measurement
+
+The launch arguments are unchanged. Pass the ordered collector CPU list for the arm and client list `24,25,26,27,28,29`. Support is fixed at `30,31`; support services share those CPUs. The runner resolves services from its benchmark, OAT and maintenance Compose profiles with the generated run overlay. Only `dataflow-1` and `oat-client` are exceptions to the support default. The three role sets must be online and physically disjoint; this is **not host isolation**.
+
+| Receipt field | Meaning |
+| --- | --- |
+| `pre_schedule_admission.cpu_isolation.project_readback` | Resolved service→cpuset map and every extant project-labelled container (including exited one-offs), ID, service, state and inspected cpuset. Missing, empty, unknown or mismatched assignments reject scheduling. Removed one-offs no longer have container counters. |
+| `project_cpu_window.start/end` | Scheduled boundaries, actual host read times and per-container Engine read times (Unix ms), cumulative CPU nanoseconds, and host per-CPU ticks. One-shot reads aim 150 ms ahead of each boundary; timestamps outside ±1 s or discontinuous evidence reject the result. Containers already exited at both observations contribute zero, explicitly labelled, not a fabricated counter. |
+| `project_cpu_window.per_container/group_cores/router_cores` | CPU seconds divided by actual elapsed seconds. Router is shown separately **and** included once in support. `host_busy_per_cpu` is busy fraction, excluding idle and iowait, not double-counting guest ticks. |
+| `project_cpu_window.non_collector_busy_on_collector_cpus` | Host busy cores on the collector set minus pinned collector cores. This is an estimate, **not** attribution to individual processes. Kernel, dockerd, containerd, docker-proxy, devcontainer and other unpinned work can contribute. Negative estimates are retained and marked invalid. |
+| `project_cpu_window.limited_by`, `collector_cpu_evidence` | A client or support group averaging **≥90%** of its logical CPU set marks the arm limited by that group (possibly both), not collector-CPU evidence. Apply the same criterion to pressure-probe comparisons; mean CPU below threshold alone does not establish headroom. A limited arm or invalid residual cannot establish a reference profile. |
+
 ### Diagnostic client profile correction
 
 Use a fresh reference for the **width-63** profile. Do not compare it to a receipt from the earlier implicit Realistic width of 96. This changes generated string lengths, not the default generator, batch size, estimator, or admission policy.

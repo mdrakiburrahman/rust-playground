@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from "node:util";
 import { tableFromIPC } from "apache-arrow";
 import { readParquet } from "parquet-wasm";
 import { STARTUP_ACCOUNTING_EXPECTED, requireMatchedStartupAccounting, requireStartupAccounting } from "../../../projects/arrowcol-oat/startup-accounting.js";
+import { cpuWindowReceipt } from "../../../projects/arrowcol-oat/diagnostic-cpu.js";
 import * as oatResult from "./oat-result.js";
 import { parseManifestJson } from "./delivery-identity.js";
 import { extractClientEvidence, extractStoppedReceipts, readReconciledOatResult } from "./oat-result.js";
@@ -127,7 +128,7 @@ export function freezeDiagnosticComparisonProfile(
   const recheck = object(receipt.pre_schedule_admission, "reference pre-schedule admission");
   const schedule = object(receipt.client_schedule, "reference schedule");
   if (receipt.kind !== "diagnostic-only" || receipt.qualification !== "not-evaluated"
-    || receipt.reference_establishment !== "explicit-first-arm" || receipt.snapshot_reconciled !== true
+    || receipt.collector_cpu_evidence !== true || receipt.reference_establishment !== "explicit-first-arm" || receipt.snapshot_reconciled !== true
     || receipt.source_revision !== expected.source || receipt.harness_revision !== expected.harness
     || receipt.collector_source_revision !== expected.collectorSource || receipt.startup_revision !== expected.startup
     || receipt.diagnostic_gate_sha256 !== expected.gate || receipt.controller_sha256 !== expected.controller
@@ -534,7 +535,7 @@ export async function runRealisticDiagnostic(options: {
   }
   const cpus = parseCollectorCpus(options.collectorCpus);
   const clientCpus = parseCollectorCpus(options.clientCpus);
-  if (clientCpus.some(cpu => cpus.includes(cpu))) throw new Error("client and collector CPUs overlap");
+  if (!isDeepStrictEqual(clientCpus, [24,25,26,27,28,29]) || cpus.some(cpu => clientCpus.includes(cpu) || cpu === 30 || cpu === 31)) throw new Error("invalid diagnostic collector, client or support CPU mask");
   const expected = diagnosticPins(JSON.parse(await readFile(options.pinsFile, "utf8")));
   let reference: DiagnosticReference;
   let comparisonProfile: FrozenComparisonProfile | undefined;
@@ -696,6 +697,11 @@ export async function runRealisticDiagnostic(options: {
     validateDiagnosticCpuProof(admission, cpus, clientCpus);
     validateDiagnosticCpuProof(preScheduleAdmission, cpus, clientCpus);
     validateDiagnosticRecheck(admission, preScheduleAdmission, hostAdmission);
+    const cpuPrefix = "[oat] diagnostic CPU window: ";
+    const windows = log.split("\n").filter(line => line.startsWith(cpuPrefix));
+    if (windows.length !== 1) throw new Error("expected exactly one diagnostic CPU window");
+    const cpuWindow = cpuWindowReceipt(object(preScheduleAdmission.cpu_isolation, "CPU isolation").project_readback,
+      JSON.parse(windows[0]!.slice(cpuPrefix.length)), object(object(evidence.client_schedule, "schedule").effective, "effective schedule"));
     if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) throw new Error("client evidence missing");
     const report = object(evidence.client_phase_reports[0], "client report");
     const executionImage = object(report.execution_image, "client execution image");
@@ -781,6 +787,8 @@ export async function runRealisticDiagnostic(options: {
       original_byte_scope: "collector_reported_input_bytes_from_reconciled_commit_receipts",
       whole_snapshot_identity: wholeRunIdentity,
       measurement_window: { start_unix_ms: reconciled.measurement.startUnixMs, end_unix_ms: reconciled.measurement.endUnixMs },
+      project_cpu_window: cpuWindow,
+      collector_cpu_evidence: cpuWindow.collector_cpu_evidence,
       client_resource_observation: {
         requested_logical_cpus: clientCpus, cpu: client.cpu,
         measurement_window: object(report.phase_counters, "client counters").measurement_window,
@@ -794,7 +802,7 @@ export async function runRealisticDiagnostic(options: {
     const receiptPath = join(paths.output, "diagnostic-receipt.json");
     await writeFile(receiptPath, receiptBytes, { flag: "wx" });
     let establishedProfile: { path: string; sha256: string } | undefined;
-    if (reference.mode === "first") {
+    if (reference.mode === "first" && cpuWindow.collector_cpu_evidence) {
       const profile = freezeDiagnosticComparisonProfile(
         receiptBytes, createHash("sha256").update(receiptBytes).digest("hex"), expected,
       );

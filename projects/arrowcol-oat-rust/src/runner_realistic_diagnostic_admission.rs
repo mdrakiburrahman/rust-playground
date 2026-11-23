@@ -336,7 +336,12 @@ async fn diagnostic_cpu_readback(config: &OatConfig, handle: &ClientHandle, run_
     ensure!(siblings.len() == cpus.len(), "CPU sibling readback is incomplete");
     let topology = cpus.into_iter().zip(siblings).collect::<Vec<_>>();
     validate_diagnostic_cpu_topology(&collector, &client, &topology)?;
-    Ok(json!({"collector": collector_proof, "client": client_proof, "thread_siblings": topology}))
+    let masks = Path::new(config.platform.compose_state_root.as_deref().context("missing diagnostic state root")?)
+        .join(run_id).join("diagnostic-cpus.json");
+    let mut inspect = diagnostic_cpu_tool();
+    inspect.arg("inspect").arg(&project).arg(masks);
+    let roster: Value = serde_json::from_str(&diagnostic_command(inspect, "verify complete diagnostic project CPU assignments").await?)?;
+    Ok(json!({"collector": collector_proof, "client": client_proof, "thread_siblings": topology, "project_readback": roster}))
 }
 
 fn diagnostic_expected_pin(

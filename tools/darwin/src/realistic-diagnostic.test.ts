@@ -81,7 +81,7 @@ function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
   return {
     kind: "diagnostic-only",
     qualification: "not-evaluated",
-    reference_establishment: "explicit-first-arm",
+    reference_establishment: "explicit-first-arm", collector_cpu_evidence: true,
     snapshot_reconciled: true,
     run_id: runId,
     source_revision: expected.source,

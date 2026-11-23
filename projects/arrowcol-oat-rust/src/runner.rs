@@ -50,6 +50,7 @@ include!("runner_wal.rs");
 include!("runner_overload.rs");
 include!("runner_admission_diagnostics.rs");
 include!("runner_realistic_diagnostic_admission.rs");
+include!("runner_diagnostic_cpu.rs");
 include!("runner_fixture.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5197,6 +5198,20 @@ async fn run_clients_inner(
         "scope": "orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
     }));
     evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
+    let cpu_observer = if let Some(proof) = &schedule_admission {
+        let mut cmd = diagnostic_cpu_tool();
+        cmd.arg("window")
+            .arg(proof["cpu_isolation"]["project_readback"].to_string())
+            .arg(measurement_start_unix_ms.to_string())
+            .arg(measurement_end_unix_ms.to_string());
+        Some(
+            cmd.stdout(Stdio::piped())
+                .spawn()
+                .context("start diagnostic CPU boundary observer")?,
+        )
+    } else {
+        None
+    };
     if let Some(prepared) = &mut prepared_guard {
         prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
         prepared.engine.proof["run_id"] = json!(project_run_id);
@@ -5378,6 +5393,12 @@ async fn run_clients_inner(
         if completed_clients.len() < handles.len() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+    }
+    if let Some(child) = cpu_observer {
+        let output = child.wait_with_output().await?;
+        ensure!(output.status.success(), "diagnostic CPU window observer failed");
+        let window: Value = serde_json::from_slice(&output.stdout)?;
+        println!("[oat] diagnostic CPU window: {window}");
     }
     let final_sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
     if let Ok(sample) = &final_sample {
@@ -7912,6 +7933,7 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
     let path = platform.state_dir.join("tunables.compose.json");
     let mut overlay: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
     apply_stable_local_images(&mut overlay, &images, config.platform.local.expected_image_ids.as_ref())?;
+    apply_diagnostic_cpu_masks(config, platform, &mut overlay).await?;
     tokio::fs::write(&path, serde_json::to_vec(&overlay)?).await?;
     println!("[oat] immutable local images: {}", serde_json::to_string(&images)?);
     Ok(())
