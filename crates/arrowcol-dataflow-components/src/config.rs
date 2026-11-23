@@ -220,6 +220,52 @@ mod override_tests {
     }
 
     #[test]
+    fn oat_partial_overrides_reach_the_shipped_collector_baseline() -> Result<(), String> {
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"pressure":{"heartbeat_interval":"25s","buffered_bytes_limit":3_000_000_000_u64},
+                         "batching":{"adaptive_file":{"max_input_bytes":8_388_608}}}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        for template in [
+            include_str!("../../../projects/arrowcol-dataflow-rust/config.yaml"),
+            include_str!("../../../projects/arrowcol-dataflow-rust/config.quiver.yaml"),
+        ] {
+            let expanded = otel_arrow_dfe_config::env_substitution::substitute_env_vars(template)
+                .map_err(|error| error.to_string())?;
+            let pipeline = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_yaml(&expanded)
+                .map_err(|error| error.to_string())?;
+            let pipeline = serde_json::to_value(pipeline).map_err(|error| error.to_string())?;
+            let registration: RegistrationConfig = serde_json::from_value(
+                pipeline
+                    .pointer("/groups/arrowcol/pipelines/ingest/nodes/flight/config/registration")
+                    .ok_or("missing receiver registration")?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let effective: RegistrationConfig =
+                merge_config(&registration, &environment["ARROWCOL_COLLECTOR_PRESSURE_CONFIG"], None)?;
+            effective.validate()?;
+            assert_eq!(effective.heartbeat_interval, Duration::from_secs(25));
+            assert_eq!(effective.buffered_bytes_limit, 3_000_000_000);
+            let batch: FileBatchConfig = serde_json::from_value(
+                pipeline
+                    .pointer("/groups/arrowcol/pipelines/ingest/nodes/delta/config/batching")
+                    .ok_or("missing exporter batching")?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let effective: FileBatchConfig =
+                merge_config(&batch, &environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"], None)?;
+            effective.validate()?;
+            assert_eq!(effective.adaptive_file.max_input_bytes, 8_388_608);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn lease_overrides_validate_resolved_ttl_and_clock_bounds() -> Result<(), String> {
         let registration: RegistrationConfig = serde_json::from_value(serde_json::json!({
             "instance_key": "test", "flight_endpoint": "127.0.0.1:8815"

@@ -239,11 +239,14 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.max_arrow_memory_per_flush", "536870912"),
     capability!("collector.batching.max_rows_per_flush", "1000000"),
     capability!("collector.batching.max_batches_per_flush", "512"),
-    capability!("collector.batching.max_age", "30s"),
+    capability!("collector.batching.max_age", "5s in OAT YAML; 30s component default"),
     capability!("collector.batching.max_concurrent_flushes", "4"),
     capability!("collector.batching.pipeline_depth", "1"),
     capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
-    capability!("collector.batching.adaptive_file.min_input_bytes", "16777216"),
+    capability!(
+        "collector.batching.adaptive_file.min_input_bytes",
+        "1048576 in OAT YAML; 16777216 component default"
+    ),
     capability!("collector.batching.adaptive_file.max_input_bytes", "1073741824"),
     capability!("collector.batching.adaptive_file.cold_start_parquet_ratio", "0.25"),
     capability!("collector.batching.adaptive_file.ewma_weight", "0.2"),
@@ -270,7 +273,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.layout.max_input_bytes", "67108864"),
     capability!("collector.layout.row_group_rows", "16384"),
     capability!("collector.layout.page_rows", "2048"),
-    capability!("collector.commit.batch_window", "10s"),
+    capability!("collector.commit.batch_window", "2s in OAT YAML; 10s component default"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!("collector.limits.max_metadata_bytes", "16384"),
@@ -279,13 +282,25 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.limits.max_schema_bytes", "1048576"),
     capability!("collector.limits.max_message_bytes", "16777216"),
     capability!("collector.limits.batch_channel_capacity", "4"),
-    capability!("collector.limits.put_result_channel_capacity", "8"),
+    capability!(
+        "collector.limits.put_result_channel_capacity",
+        "16 in OAT YAML; 8 component default"
+    ),
     capability!("collector.limits.max_stream_duration", "300s"),
     capability!("collector.limits.admission_timeout", "30s"),
     capability!("collector.limits.max_ddl_bytes", "65536"),
-    capability!("collector.pressure.max_concurrent_streams", "128"),
-    capability!("collector.pressure.rss_limit_bytes", "2147483648"),
-    capability!("collector.pressure.buffered_bytes_limit", "536870912"),
+    capability!(
+        "collector.pressure.max_concurrent_streams",
+        "256 in OAT YAML; 128 component default"
+    ),
+    capability!(
+        "collector.pressure.rss_limit_bytes",
+        "4294967296 in OAT YAML; 2147483648 component default"
+    ),
+    capability!(
+        "collector.pressure.buffered_bytes_limit",
+        "2147483648 in OAT YAML; 536870912 component default"
+    ),
     capability!("collector.pressure.buffered_rows_limit", "10000000"),
     capability!("collector.pressure.buffered_batches_limit", "4096"),
     capability!("collector.pressure.pressure_interval", "2s"),
@@ -293,7 +308,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.cpu_pressure", "off"),
     capability!(
         "collector.pressure.registration_ttl",
-        "20s; must exceed heartbeat_interval"
+        "30s in OAT YAML; 20s component default; must exceed heartbeat_interval"
     ),
     capability!("collector.runtime.workers", "clamp(c/4,2,16)"),
     capability!("collector.runtime.blocking_workers", "clamp(2c,32,128)"),
@@ -672,7 +687,7 @@ impl Tunables {
     /// # Errors
     /// Returns an error for invalid values, unsupported settings, or an unprojectable configuration.
     pub fn validate_for_oat(&self) -> Result<()> {
-        self.validate_with_transport_defaults(16_777_216, 2_097_152)?;
+        self.validate_with_transport_defaults(16_777_216, 2_097_152, true)?;
         for role in [
             ComponentRole::Client,
             ComponentRole::Router,
@@ -689,10 +704,15 @@ impl Tunables {
     /// # Errors
     /// Returns an error when a setting is out of bounds, unsupported, or inconsistent with another setting.
     pub fn validate(&self) -> Result<()> {
-        self.validate_with_transport_defaults(33_554_432, 32_505_856)
+        self.validate_with_transport_defaults(33_554_432, 32_505_856, false)
     }
 
-    fn validate_with_transport_defaults(&self, default_message_bytes: u64, default_flight_bytes: u64) -> Result<()> {
+    fn validate_with_transport_defaults(
+        &self,
+        default_message_bytes: u64,
+        default_flight_bytes: u64,
+        oat_collector_defaults: bool,
+    ) -> Result<()> {
         if let Some(client) = &self.client {
             if client
                 .payload_customer_id
@@ -862,10 +882,10 @@ impl Tunables {
         if let Some(collector) = &self.collector {
             validate_collector_controls(collector)?;
             validate_collector_layout(collector.layout.as_ref())?;
-            validate_batching(collector.batching.as_ref())?;
+            validate_batching(collector.batching.as_ref(), oat_collector_defaults)?;
             validate_commit(collector.commit.as_ref())?;
             validate_limits(collector.limits.as_ref())?;
-            validate_pressure(collector.pressure.as_ref())?;
+            validate_pressure(collector.pressure.as_ref(), oat_collector_defaults)?;
             validate_runtime(collector.runtime.as_ref())?;
             validate_collector_upload(collector)?;
         }
@@ -1576,7 +1596,7 @@ fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
     Ok(())
 }
 
-fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
+fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) -> Result<()> {
     let batching = batching.cloned().unwrap_or_default();
     let global = batching.global_capacity.unwrap_or_default();
     let per_table = batching.per_table_capacity.unwrap_or_default();
@@ -1637,7 +1657,9 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
 
     let adaptive = batching.adaptive_file.unwrap_or_default();
     let target = adaptive.target_parquet_bytes.unwrap_or(134_217_728);
-    let minimum = adaptive.min_input_bytes.unwrap_or(16_777_216);
+    let minimum = adaptive
+        .min_input_bytes
+        .unwrap_or(if oat_defaults { 1_048_576 } else { 16_777_216 });
     let maximum = adaptive.max_input_bytes.unwrap_or(1_073_741_824);
     let cold_ratio = adaptive.cold_start_parquet_ratio.unwrap_or(0.25);
     let ewma = adaptive.ewma_weight.unwrap_or(0.2);
@@ -1715,10 +1737,14 @@ fn validate_limits(limits: Option<&LimitsTunables>) -> Result<()> {
     Ok(())
 }
 
-fn validate_pressure(pressure: Option<&PressureTunables>) -> Result<()> {
+fn validate_pressure(pressure: Option<&PressureTunables>, oat_defaults: bool) -> Result<()> {
     let pressure = pressure.cloned().unwrap_or_default();
-    let rss = pressure.rss_limit_bytes.unwrap_or(2_147_483_648);
-    let buffered = pressure.buffered_bytes_limit.unwrap_or(536_870_912);
+    let rss = pressure
+        .rss_limit_bytes
+        .unwrap_or(if oat_defaults { 4_294_967_296 } else { 2_147_483_648 });
+    let buffered = pressure
+        .buffered_bytes_limit
+        .unwrap_or(if oat_defaults { 2_147_483_648 } else { 536_870_912 });
     let max_streams = pressure.max_concurrent_streams.unwrap_or(128);
     if max_streams > (usize::MAX >> 3) {
         bail!("collector.pressure.max_concurrent_streams exceeds Semaphore::MAX_PERMITS");
@@ -1760,7 +1786,7 @@ fn validate_pressure(pressure: Option<&PressureTunables>) -> Result<()> {
     let ttl = validate_millisecond_duration(
         "collector.pressure.registration_ttl",
         pressure.registration_ttl.as_deref(),
-        "20s",
+        if oat_defaults { "30s" } else { "20s" },
     )?;
     if ttl <= heartbeat {
         bail!("collector.pressure.registration_ttl must exceed heartbeat_interval");
@@ -2380,6 +2406,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn oat_partial_collector_overrides_use_shipped_pipeline_defaults() -> Result<()> {
+        for settings in [
+            serde_json::json!({"pressure":{"heartbeat_interval":"25s"}}),
+            serde_json::json!({"pressure":{"buffered_bytes_limit":3_000_000_000_u64}}),
+            serde_json::json!({"batching":{"adaptive_file":{"max_input_bytes":8_388_608}}}),
+        ] {
+            let tunables = Tunables::parse_oat_json(serde_json::json!({"collector":settings}))?;
+            assert!(tunables.validate().is_err(), "standalone defaults must remain distinct");
+        }
+        for settings in [
+            serde_json::json!({"pressure":{"heartbeat_interval":"30s"}}),
+            serde_json::json!({"pressure":{"rss_limit_bytes":1_073_741_824_u64}}),
+            serde_json::json!({"batching":{"adaptive_file":{"max_input_bytes":524_288}}}),
+        ] {
+            let error = error_text(Tunables::parse_oat_json(serde_json::json!({"collector":settings})));
+            assert!(error.contains("collector."), "{error}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
