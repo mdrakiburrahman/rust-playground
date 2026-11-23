@@ -1732,7 +1732,8 @@ fn delta_stats_selection_is_strict_and_projected_separately() -> Result<()> {
         let error = Tunables::parse_oat_json(serde_json::json!({
             "collector": {"commit": {"delta_stats_columns": columns}}
         }))
-        .expect_err("invalid stats columns accepted");
+        .err()
+        .context("invalid stats columns accepted")?;
         assert!(format!("{error:#}").contains("collector.commit.delta_stats_columns"));
     }
     assert!(

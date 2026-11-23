@@ -1773,6 +1773,7 @@ mod io_tests {
         let Ok(case) = std::env::var(CASE) else {
             for (case, columns) in [
                 ("selected", r#"["id"]"#),
+                ("nested", r#"["nested.value"]"#),
                 ("disabled", "[]"),
                 ("unknown", r#"["missing"]"#),
                 ("existing", "[]"),
@@ -1793,9 +1794,14 @@ mod io_tests {
             return Ok(());
         };
         let directory = tempfile::tempdir()?;
+        let nested = arrow::array::StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            Arc::new(arrow::array::Int32Array::from(vec![9])) as ArrayRef,
+        )]);
         let input = RecordBatch::try_from_iter(vec![
             ("id", Arc::new(arrow::array::Int32Array::from(vec![42])) as ArrayRef),
             ("ignored", Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef),
+            ("nested", Arc::new(nested) as ArrayRef),
         ])?;
         if case == "existing" {
             let url = Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
@@ -1847,6 +1853,10 @@ mod io_tests {
             assert_eq!(stats["minValues"], serde_json::json!({"id":42}));
             assert_eq!(stats["maxValues"], serde_json::json!({"id":42}));
             assert_eq!(stats["nullCount"], serde_json::json!({"id":0}));
+        } else if case == "nested" {
+            assert_eq!(stats["minValues"], serde_json::json!({"nested":{"value":9}}));
+            assert_eq!(stats["maxValues"], serde_json::json!({"nested":{"value":9}}));
+            assert_eq!(stats["nullCount"], serde_json::json!({"nested":{"value":0}}));
         } else {
             for field in ["minValues", "maxValues", "nullCount"] {
                 assert!(stats[field].is_null() || stats[field].as_object().is_some_and(|fields| fields.is_empty()));
