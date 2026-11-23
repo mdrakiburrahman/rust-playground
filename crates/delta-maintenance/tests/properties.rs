@@ -231,6 +231,10 @@ fn automatic_layout_uses_table_policy_over_process_and_reports_applied_source() 
         .0
         .properties
         .insert("arrowcol.layout.sortColumns".into(), "id".into());
+    source
+        .0
+        .properties
+        .insert("arrowcol.layout.sortOptions".into(), "id:descending:first".into());
     source.0.properties.insert("arrowcol.layout.maxRows".into(), "2".into());
     source
         .0
@@ -245,6 +249,14 @@ fn automatic_layout_uses_table_policy_over_process_and_reports_applied_source() 
     assert_eq!(evidence.config["layout_mode"], "automatic");
     assert_eq!(evidence.config["layout_applied"], true);
     assert_eq!(evidence.config["layout"]["sort_columns"], serde_json::json!(["id"]));
+    assert_eq!(
+        evidence.config["layout"]["sort_options"],
+        serde_json::json!([{"column":"id","direction":"descending","nulls":"first"}])
+    );
+    assert_eq!(
+        evidence.config["layout_sources"]["arrowcol.layout.sortOptions"],
+        "table"
+    );
     assert_eq!(evidence.config["layout"]["max_rows"], 2);
     assert_eq!(evidence.config["layout"]["bloom_columns"], serde_json::json!(["id"]));
     assert_eq!(

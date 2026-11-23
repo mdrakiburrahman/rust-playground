@@ -1102,14 +1102,13 @@ fn layout_policy_sources(settings: &Settings, table_properties: &BTreeMap<String
     let keys = [
         "arrowcol.layout.enabled",
         "arrowcol.layout.sortColumns",
-        "arrowcol.layout.sortOptions",
         "arrowcol.layout.bloomColumns",
         "arrowcol.layout.maxRows",
         "arrowcol.layout.maxInputSize",
         "arrowcol.layout.rowGroupRows",
         "arrowcol.layout.pageRows",
     ];
-    let sources: BTreeMap<&str, &str> = keys
+    let mut sources: BTreeMap<&str, &str> = keys
         .into_iter()
         .map(|key| {
             let source = if table_properties.contains_key(key) {
@@ -1122,6 +1121,12 @@ fn layout_policy_sources(settings: &Settings, table_properties: &BTreeMap<String
             (key, source)
         })
         .collect();
+    let key = "arrowcol.layout.sortOptions";
+    if table_properties.contains_key(key) {
+        sources.insert(key, "table");
+    } else if settings.process_properties.contains_key(key) {
+        sources.insert(key, "process");
+    }
     serde_json::json!(sources)
 }
 
@@ -1161,14 +1166,20 @@ impl OptimizeEvidence {
                 "layout_fingerprint": plan.layout_fingerprint,
                 "output_policy_fingerprint": plan.output_policy_fingerprint,
                 "layout_sources": layout_sources,
-                "layout": plan.layout_fingerprint.as_ref().and_then(|_| resolved_layout.map(|layout| serde_json::json!({
-                    "sort_columns": layout.sort_columns,
-                    "max_rows": layout.max_rows,
-                    "max_input_bytes": layout.max_input_bytes,
-                    "row_group_rows": layout.row_group_rows,
-                    "page_rows": layout.page_rows,
-                    "bloom_columns": layout.bloom_columns,
-                }))),
+                "layout": plan.layout_fingerprint.as_ref().and_then(|_| resolved_layout.map(|layout| {
+                    let mut value = serde_json::json!({
+                        "sort_columns": layout.sort_columns,
+                        "max_rows": layout.max_rows,
+                        "max_input_bytes": layout.max_input_bytes,
+                        "row_group_rows": layout.row_group_rows,
+                        "page_rows": layout.page_rows,
+                        "bloom_columns": layout.bloom_columns,
+                    });
+                    if let Some(options) = &layout.sort_options {
+                        value["sort_options"] = serde_json::json!(options);
+                    }
+                    value
+                })),
             }),
             plan,
         }
