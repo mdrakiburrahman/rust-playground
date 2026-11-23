@@ -5,6 +5,69 @@ fn tunable_leaf_evidence(config: &OatConfig) -> Result<Value> {
     config.tunables.classify_oat_leaves()
 }
 
+fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
+    let Some(processes) = processes.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let collectors = processes
+        .iter()
+        .filter(|process| process["component"] == "collector")
+        .collect::<Vec<_>>();
+    let identities = collectors
+        .iter()
+        .filter_map(|process| process["instance_id"].as_str().filter(|id| !id.is_empty()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if replicas == 0
+        || collectors.len() != replicas as usize
+        || identities.len() != collectors.len()
+        || collectors.iter().any(|process| {
+            process["log_complete"] != true
+                || process["startup_tunables_verified"] != true
+                || process["effective_config_source"] != "consumer_startup_readback"
+                || {
+                    let mut observed = process["effective_config"].clone();
+                    if let Some(fields) = observed.as_object_mut()
+                        && !process["writer_policy_overrides"].is_null()
+                    {
+                        fields.insert("parquet_writer".to_owned(), process["writer_policy_overrides"].clone());
+                    }
+                    verify_process_configuration(config, ComponentRole::Collector, &observed).is_err()
+                }
+        })
+    {
+        return Ok(());
+    }
+    let projection = evidence["projection_only"]
+        .as_array_mut()
+        .context("projection_only must be an array")?;
+    let mut promoted = Vec::new();
+    projection.retain(|entry| {
+        let Some(path) = entry["path"].as_str() else {
+            return true;
+        };
+        let section = match path {
+            "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
+            | "collector.commit.max_pending_files" => "commit",
+            "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
+            | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
+            | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
+            | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => "pressure",
+            _ => return true,
+        };
+        let field = path.rsplit('.').next().unwrap_or_default();
+        if collectors.iter().any(|process| process["effective_config"][section].get(field).is_none()) {
+            return true;
+        }
+        promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+        false
+    });
+    evidence["consumer_verified"]
+        .as_array_mut()
+        .context("consumer_verified must be an array")?
+        .extend(promoted);
+    Ok(())
+}
+
 #[cfg(test)]
 fn inert_tunable_fields(config: &OatConfig) -> Result<Vec<Value>> {
     Ok(tunable_leaf_evidence(config)?["inert_fields"]

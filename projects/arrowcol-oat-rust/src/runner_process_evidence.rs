@@ -853,6 +853,8 @@ fn process_evidence_for_cell(
                     });
             result.push(json!({
                 "component": role_name(role),
+                "instance_id": log.instance_id,
+                "startup_tunables_verified": true,
                 "effective_config": observed.then_some(effective),
                 "writer_policy_overrides": writer_policy,
                 "writer_policy_scope": "configured_startup_overrides_not_complete_schema_resolved_or_exercised_file_properties",
@@ -2164,6 +2166,31 @@ groups:
         }
         let observed = process_configurations(&text.context("collector did not produce readback")?)?;
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let process = json!({
+            "component": "collector", "instance_id": "collector-1", "log_complete": true,
+            "startup_tunables_verified": true, "effective_config_source": "consumer_startup_readback",
+            "effective_config": observed,
+        });
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 11);
+        assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
+        let mut wrong_process = process.clone();
+        wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
+        let mut missing_process = process.clone();
+        missing_process["effective_config"]["pressure"].as_object_mut().context("pressure object")?.remove("buffered_rows_limit");
+        let mut incomplete_process = process.clone();
+        incomplete_process["log_complete"] = json!(false);
+        for processes in [
+            json!([]), json!([wrong_process]), json!([missing_process]), json!([incomplete_process]),
+            json!([process.clone(), process.clone()]),
+        ] {
+            let mut uncovered = initial.clone();
+            let replicas = if processes.as_array().context("process array")?.len() == 2 { 2 } else { 1 };
+            promote_collector_readback(&config, &mut uncovered, Some(&processes), replicas)?;
+            assert_eq!(uncovered, initial);
+        }
         for (group, fields) in [
             ("commit", &["batch_window", "max_files_per_commit", "max_pending_files"][..]),
             ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",

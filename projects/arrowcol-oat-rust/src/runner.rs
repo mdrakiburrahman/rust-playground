@@ -4521,7 +4521,13 @@ fn result_rows(
     } else {
         None
     };
-    let leaf_evidence = tunable_leaf_evidence(config)?;
+    let mut leaf_evidence = tunable_leaf_evidence(config)?;
+    promote_collector_readback(
+        config,
+        &mut leaf_evidence,
+        client_run.evidence.processes.as_ref(),
+        replicas,
+    )?;
     let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
