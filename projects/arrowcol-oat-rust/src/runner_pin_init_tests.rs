@@ -97,8 +97,9 @@ mod pin_init_tests {
 
     #[test]
     fn fresh_initializer_receives_only_explicit_delta_stats_selection() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let (mut config, platform, _) = fixture(root.path())?;
+        let root = std::env::temp_dir().join(format!("pin-stats-env-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let (mut config, platform, _) = fixture(&root)?;
         let absent = run_table_initializer_cloud_env(&config, &platform, RUN)?;
         assert!(!absent.as_array().context("initializer environment")?.iter()
             .any(|entry| entry["name"] == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS"));
@@ -112,6 +113,7 @@ mod pin_init_tests {
                 .context("missing creation-time stats policy")?;
             assert_eq!(field["value"], columns.to_string());
         }
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
