@@ -2347,7 +2347,7 @@ mod overload_guard_tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await?;
                 let mut request = [0; 1024];
-                socket.read(&mut request).await?;
+                assert!(socket.read(&mut request).await? > 0);
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await?;
                 if incomplete {
                     std::future::pending::<()>().await;
