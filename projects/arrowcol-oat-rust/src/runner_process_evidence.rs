@@ -2437,7 +2437,7 @@ groups:
                     "parquet_writer.columns.customer_id.compression", "parquet_writer.columns.customer_id.compression_level",
                     "parquet_writer.defaults.encoding", "parquet_writer.defaults.dictionary_enabled",
                     "parquet_writer.defaults.dictionary_page_size_limit", "parquet_writer.defaults.data_page_size_limit",
-                    "parquet_writer.defaults.statistics", "parquet_writer.defaults.write_page_header_statistics",
+                    "parquet_writer.defaults.statistics",
                     "parquet_writer.defaults.bloom_filter_enabled", "parquet_writer.defaults.bloom_filter_fpp",
                     "parquet_writer.defaults.bloom_filter_ndv", "parquet_writer.defaults.data_page_v2_compression_ratio_threshold",
                     "parquet_writer.columns.customer_id.encoding", "parquet_writer.columns.customer_id.dictionary_enabled",
@@ -2452,9 +2452,18 @@ groups:
                 let projected = |evidence: &Value, path: &str| {
                     evidence["projection_only"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
                 };
+                assert!(projected(&covered, "parquet_writer.defaults.write_page_header_statistics"));
                 let mut malformed_options = process["layout_table_policies"][0]["parquet_column_options"].clone();
                 malformed_options["value"]["dictionary_enabled"] = json!("true");
                 assert!(parquet_column_options_readback(&malformed_options).is_none());
+                let mut no_statistics = process.clone();
+                for column in ["value", "customer_id"] {
+                    no_statistics["layout_table_policies"][0]["parquet_column_options"][column]["statistics"] = json!("none");
+                }
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([no_statistics])), 1)?;
+                assert!(projected(&result, "parquet_writer.column_index_truncate_length"));
+                assert!(projected(&result, "parquet_writer.statistics_truncate_length"));
                 let mut missing_properties = process.clone();
                 missing_properties["layout_table_policies"][0]["parquet_properties"] = Value::Null;
                 let mut result = initial.clone();

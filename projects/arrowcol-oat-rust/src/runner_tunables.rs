@@ -77,7 +77,19 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             let requested = parquet_policy.as_ref().and_then(|policy| policy.get(field))
                 .filter(|value| !value.is_null());
             if tables_covered && requested.is_some()
-                && table_policies.iter().all(|record| record["parquet_properties"].get(field) == requested)
+                && table_policies.iter().all(|record| {
+                    record["parquet_properties"].get(field) == requested
+                        && (!matches!(field, "column_index_truncate_length" | "statistics_truncate_length")
+                            || record["parquet_column_options"].as_object().is_some_and(|columns| {
+                                columns.values().any(|column| {
+                                    if field == "column_index_truncate_length" {
+                                        column["statistics"] == "page"
+                                    } else {
+                                        matches!(column["statistics"].as_str(), Some("chunk" | "page"))
+                                    }
+                                })
+                            }))
+                })
             {
                 promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
                 return false;
@@ -110,6 +122,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 };
                 let applicable = |actual: &Value| {
                     (field != "dictionary_page_size_limit" || actual["dictionary_enabled"] == true)
+                        && (field != "write_page_header_statistics" || actual["statistics"] == "page")
                         && (!matches!(field, "bloom_filter_fpp" | "bloom_filter_ndv") || actual["bloom_filter_enabled"] == true)
                         && (field != "data_page_v2_compression_ratio_threshold" || record["parquet_properties"]["writer_version"] == "v2")
                 };
