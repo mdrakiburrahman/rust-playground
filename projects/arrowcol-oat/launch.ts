@@ -70,7 +70,7 @@ export function cliExitCode(error: unknown): number {
 }
 
 function validateArguments(args: string[]): void {
-  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only']);
+  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only', '--diagnostic-prelaunch-only']);
   let positionalConfig = false;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
@@ -1100,13 +1100,49 @@ export async function assertCanonicalAksLaunchWorkspace(root: string): Promise<v
   }
 }
 
+async function diagnosticTransitionReceiptRoot(): Promise<string | undefined> {
+  const stateRoot = resolve(workspaceRoot, '../../..');
+  if (resolve(stateRoot, 'pressure-diagnostic-v2/trusted/runtime') !== workspaceRoot ||
+      !stateRoot.endsWith(`${sep}.darwin`)) return undefined;
+  if (process.env.OAT_DARWIN_PARITY_PRECHECK !== '1') {
+    throw new Error('Transition runtime is restricted to diagnostic parity');
+  }
+  const originalTrusted = resolve(stateRoot, 'pressure-diagnostic/trusted');
+  const originalRuntime = resolve(originalTrusted, 'runtime');
+  const receiptRoot = resolve(originalRuntime, 'out/arrowcol-oat/deadline-receipts');
+  for (const path of [workspaceRoot, originalTrusted, originalRuntime, receiptRoot]) {
+    if (await realpath(path) !== path) throw new Error('Diagnostic transition path is not canonical');
+  }
+  const revision = '86eb8ebe07d876c925e027c0c656a69917269f22';
+  const manifest: unknown = JSON.parse((await readLegacyRegularFile(resolve(originalTrusted, 'manifest.json'))).toString('utf8'));
+  const producer: unknown = JSON.parse((await readLegacyRegularFile(resolve(originalTrusted, 'producer.json'))).toString('utf8'));
+  if (!isRecord(manifest) || manifest.commit !== revision || !isRecord(producer) || producer.revision !== revision) {
+    throw new Error('Original diagnostic freeze does not match the reviewed producer');
+  }
+  const git = (...args: string[]) => execFileSync('git', ['-C', originalRuntime, ...args], { encoding: 'utf8' }).trimEnd();
+  if (git('rev-parse', '--show-toplevel') !== originalRuntime || git('rev-parse', 'HEAD') !== revision ||
+      git('status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none') ||
+      git('submodule', 'status', '--recursive').split('\n').some(line => line && !line.startsWith(' '))) {
+    throw new Error('Original diagnostic producer is not clean at the frozen revision');
+  }
+  const originalReceipt = resolve(receiptRoot, '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json');
+  await readLegacyRegularFile(originalReceipt);
+  await readLegacyRegularFile(originalReceipt + localDispositionSuffix);
+  return receiptRoot;
+}
+
 export async function assertNoUnsettledDeadlineReceipts(
   root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
+  requiredLocalDisposition?: string,
 ): Promise<void> {
   const names: string[] = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
     throw error;
   });
+  if (requiredLocalDisposition &&
+      (!names.includes(requiredLocalDisposition) || !names.includes(requiredLocalDisposition + localDispositionSuffix))) {
+    throw new Error('Required diagnostic cleanup proof is missing from the canonical ledger');
+  }
   const admittedDispositions = new Set<string>();
   for (const name of names.filter((entry) => entry.endsWith(legacyDispositionSuffix))) {
     const originalName = name.slice(0, -legacyDispositionSuffix.length);
@@ -1926,6 +1962,7 @@ export async function main(
   collect: typeof collectDataFlow = collectDataFlow,
   onOwnedRun?: OatOwnedRunObserver,
   signal?: AbortSignal,
+  recordLocalFailure: typeof recordLocalFailedDisposition = recordLocalFailedDisposition,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
@@ -1940,7 +1977,7 @@ export async function main(
     if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
     const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(receiptRoot, `${args[1]}.json`))).toString('utf8'));
     if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
-    await recordLocalFailedDisposition(receiptRoot, args[1], resolve(args[2]));
+    await recordLocalFailure(receiptRoot, args[1], resolve(args[2]));
     console.log('Recorded verified local cleanup; the original failure remains unranked.');
     return;
   }
@@ -2049,7 +2086,16 @@ export async function main(
     }
     config.subscriptionId = subscriptionId;
   }
-  await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const transitionRoot = await diagnosticTransitionReceiptRoot();
+  const prelaunchOnly = args.includes('--diagnostic-prelaunch-only');
+  if (prelaunchOnly && !transitionRoot) throw new OatCliError('Diagnostic prelaunch requires the versioned transition runtime');
+  if (transitionRoot) receiptRoot = transitionRoot;
+  await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
+    transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined);
+  if (prelaunchOnly) {
+    console.log('Diagnostic transition ledger prelaunch gate passed; no workload started.');
+    return;
+  }
   const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
     if (deadline.isExpired()) {

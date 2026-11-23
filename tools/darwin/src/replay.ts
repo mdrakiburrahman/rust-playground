@@ -94,7 +94,9 @@ async function prepareRuntime(repo: string, home: string, manifest: SnapshotMani
 }
 
 export async function runOat(runtime: string, configPath: string, home: string, toolDir: string, logPath: string,
-  stackBytes: number, parity: boolean | "qualified" = false, deadlineSeconds?: number): Promise<void> {
+  stackBytes: number, parity: boolean | "qualified" = false, deadlineSeconds?: number,
+  diagnosticPrelaunchOnly = false): Promise<void> {
+  if (diagnosticPrelaunchOnly && parity !== true) throw new Error("prelaunch check requires diagnostic parity");
   if (deadlineSeconds !== undefined && (!Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1 || deadlineSeconds > 600)) {
     throw new Error("local launcher deadline must be an integer from 1 to 600 seconds");
   }
@@ -105,6 +107,7 @@ export async function runOat(runtime: string, configPath: string, home: string, 
     env.PATH = `${toolDir}:${env.PATH}`;
     const child = spawn(process.execPath, ["--import", "tsx", "projects/arrowcol-oat/cli.ts",
       "--config", configPath, "--mode", "local", "--no-viewer",
+      ...(diagnosticPrelaunchOnly ? ["--diagnostic-prelaunch-only"] : []),
       ...(deadlineSeconds === undefined ? [] : ["--deadline-seconds", String(deadlineSeconds)])], {
       cwd: runtime, env, stdio: ["ignore", log.fd, log.fd],
     });

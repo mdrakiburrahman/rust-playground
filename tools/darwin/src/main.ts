@@ -101,6 +101,7 @@ async function main(args: string[]): Promise<void> {
       parseParityProfile(option(args, "--profile", "historical-parity-diagnostic")),
       args.includes("--generated-partition-fast-path") ?
         parsePartitionFastPath(option(args, "--generated-partition-fast-path")) : undefined,
+      args.includes("--diagnostic-prelaunch-only"),
     );
     console.log("@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
     console.log(`@RESULT ${JSON.stringify({ version: 1,
