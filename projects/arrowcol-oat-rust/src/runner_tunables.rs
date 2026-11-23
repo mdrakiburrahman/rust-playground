@@ -395,6 +395,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.data_profile") => ("data_profile", "ARROWCOL_CLIENT_DATA_PROFILE"),
             Some("client.send_iter") => ("send_iter", "ARROWCOL_CLIENT_SEND_ITER"),
             Some("client.identity_builder") => ("identity_builder", "ARROWCOL_CLIENT_IDENTITY_BUILDER"),
+            Some("client.null_fraction") => ("null_fraction", "ARROWCOL_CLIENT_NULL_FRACTION"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -432,6 +433,18 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         if (field == "corpus_rows" && client.and_then(|client| client.corpus_bytes).unwrap_or(0) > 0)
             || (field == "corpus_bytes" && client.and_then(|client| client.corpus_rows).unwrap_or(0) > 0)
         {
+            return true;
+        }
+        if field == "null_fraction" && reports.iter().any(|report| {
+            let Some(name) = report["table"].as_str() else { return true; };
+            let Some(tables) = report.pointer("/phase_counters/preparation/generator_applicability/tables")
+                .and_then(Value::as_array) else { return true; };
+            if tables.len() != 1 || tables[0]["table"].as_str().is_none_or(|table| !table.eq_ignore_ascii_case(name)) {
+                return true;
+            }
+            tables[0].pointer("/null_fraction/eligible_columns").and_then(Value::as_u64).unwrap_or(0) == 0
+                || tables[0].pointer("/null_fraction/eligible_rows").and_then(Value::as_u64).unwrap_or(0) == 0
+        }) {
             return true;
         }
         if !environment.contains_key(variable)
