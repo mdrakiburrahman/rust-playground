@@ -1840,45 +1840,6 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
         }
         .validate()?;
     }
-
-    #[cfg(test)]
-    #[test]
-    fn delta_stats_selection_is_strict_and_projected_separately() -> Result<()> {
-        for columns in [serde_json::json!([]), serde_json::json!(["id", "nested.value"])] {
-            let tunables = Tunables::parse_oat_json(serde_json::json!({
-                "collector": {"commit": {"delta_stats_columns": columns}}
-            }))?;
-            let environment = tunables.environment_for(ComponentRole::Collector)?;
-            assert_eq!(
-                environment[arrow_deltalake::delta_stats::ENVIRONMENT],
-                columns.to_string()
-            );
-            if let Some(commit) = environment.get("ARROWCOL_COLLECTOR_COMMIT_CONFIG") {
-                let commit: Value = serde_json::from_str(commit)?;
-                assert!(commit.get("delta_stats_columns").is_none());
-            }
-        }
-        for columns in [
-            serde_json::json!(null),
-            serde_json::json!("id"),
-            serde_json::json!([1]),
-            serde_json::json!(["id", "id"]),
-            serde_json::json!(["a,,b"]),
-            serde_json::json!(["nested."]),
-        ] {
-            let error = Tunables::parse_oat_json(serde_json::json!({
-                "collector": {"commit": {"delta_stats_columns": columns}}
-            }))
-            .expect_err("invalid stats columns accepted");
-            assert!(format!("{error:#}").contains("collector.commit.delta_stats_columns"));
-        }
-        assert!(
-            !Tunables::default()
-                .environment_for(ComponentRole::Collector)?
-                .contains_key(arrow_deltalake::delta_stats::ENVIRONMENT)
-        );
-        Ok(())
-    }
     validate_duration("collector.commit.batch_window", commit.batch_window.as_deref(), "10s")?;
     let files = commit.max_files_per_commit.unwrap_or(64);
     let pending = commit.max_pending_files.unwrap_or(256);
@@ -1887,6 +1848,45 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     if files > pending || pending > (usize::MAX >> 3) {
         bail!("collector.commit requires 0 < max_files_per_commit <= max_pending_files <= Semaphore::MAX_PERMITS");
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn delta_stats_selection_is_strict_and_projected_separately() -> Result<()> {
+    for columns in [serde_json::json!([]), serde_json::json!(["id", "nested.value"])] {
+        let tunables = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"delta_stats_columns": columns}}
+        }))?;
+        let environment = tunables.environment_for(ComponentRole::Collector)?;
+        assert_eq!(
+            environment[arrow_deltalake::delta_stats::ENVIRONMENT],
+            columns.to_string()
+        );
+        if let Some(commit) = environment.get("ARROWCOL_COLLECTOR_COMMIT_CONFIG") {
+            let commit: Value = serde_json::from_str(commit)?;
+            assert!(commit.get("delta_stats_columns").is_none());
+        }
+    }
+    for columns in [
+        serde_json::json!(null),
+        serde_json::json!("id"),
+        serde_json::json!([1]),
+        serde_json::json!(["id", "id"]),
+        serde_json::json!(["a,,b"]),
+        serde_json::json!(["nested."]),
+    ] {
+        let error = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"delta_stats_columns": columns}}
+        }))
+        .expect_err("invalid stats columns accepted");
+        assert!(format!("{error:#}").contains("collector.commit.delta_stats_columns"));
+    }
+    assert!(
+        !Tunables::default()
+            .environment_for(ComponentRole::Collector)?
+            .contains_key(arrow_deltalake::delta_stats::ENVIRONMENT)
+    );
     Ok(())
 }
 
