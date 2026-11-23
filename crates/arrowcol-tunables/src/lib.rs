@@ -228,6 +228,11 @@ pub struct CollectorTunables {
     )]
     pub shutdown_drain_timeout_seconds: Option<u32>,
     pub batching: Option<BatchingTunables>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_channel_capacity_object"
+    )]
+    pub channel_capacity: Option<ChannelCapacityTunables>,
     pub catalog: Option<CatalogTunables>,
     pub commit: Option<CommitTunables>,
     pub exporter: Option<ExporterTunables>,
@@ -238,6 +243,65 @@ pub struct CollectorTunables {
     pub runtime: Option<RuntimeTunables>,
     pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
+}
+
+fn deserialize_channel_capacity_object<'de, D>(deserializer: D) -> Result<Option<ChannelCapacityTunables>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ChannelCapacityTunables::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.starts_with("collector.channel_capacity.") {
+                serde::de::Error::custom(message)
+            } else {
+                serde::de::Error::custom("collector.channel_capacity must be an object with supported capacity fields")
+            }
+        })
+}
+
+macro_rules! channel_capacity_deserializer {
+    ($function:ident, $field:literal) => {
+        fn $function<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            usize::deserialize(deserializer).map(Some).map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "collector.channel_capacity.{} must be a non-negative integer",
+                    $field
+                ))
+            })
+        }
+    };
+}
+
+channel_capacity_deserializer!(deserialize_control_node, "control_node");
+channel_capacity_deserializer!(deserialize_control_pipeline, "control_pipeline");
+channel_capacity_deserializer!(deserialize_control_completion, "control_completion");
+channel_capacity_deserializer!(deserialize_pdata, "pdata");
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelCapacityTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_control_node"
+    )]
+    pub control_node: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_control_pipeline"
+    )]
+    pub control_pipeline: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_control_completion"
+    )]
+    pub control_completion: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_pdata")]
+    pub pdata: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

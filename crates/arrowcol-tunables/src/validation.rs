@@ -228,6 +228,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.upstream_idle_timeout_seconds", "60"),
     capability!("router.upstream_ping_interval_seconds", "15; 0 disables"),
     capability!("collector.shutdown_drain_timeout_seconds", "60"),
+    capability!("collector.channel_capacity.control_node", "64"),
+    capability!("collector.channel_capacity.control_pipeline", "64"),
+    capability!("collector.channel_capacity.control_completion", "512"),
+    capability!("collector.channel_capacity.pdata", "32"),
     capability!("collector.batching.coalesce_publications", "false"),
     capability!("collector.batching.age_flush_policy", "immediate"),
     capability!("collector.batching.global_capacity.bytes", "2147483648"),
@@ -677,7 +681,13 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
-        let tunables: Self = serde_json::from_value(value).context("parse OAT tunables")?;
+        let tunables: Self = serde_json::from_value(value).map_err(|error| {
+            if error.to_string().starts_with("collector.channel_capacity") {
+                anyhow::anyhow!("{error}")
+            } else {
+                anyhow::Error::new(error).context("parse OAT tunables")
+            }
+        })?;
         tunables.validate_for_oat()?;
         Ok(tunables)
     }
@@ -1039,6 +1049,21 @@ impl Tunables {
                         "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS".to_owned(),
                         seconds.to_string(),
                     );
+                }
+                if let Some(capacity) = &collector.channel_capacity {
+                    for (name, value) in [
+                        ("ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE", capacity.control_node),
+                        ("ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE", capacity.control_pipeline),
+                        (
+                            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION",
+                            capacity.control_completion,
+                        ),
+                        ("ARROWCOL_COLLECTOR_CHANNEL_PDATA", capacity.pdata),
+                    ] {
+                        if let Some(value) = value {
+                            output.insert(name.to_owned(), value.to_string());
+                        }
+                    }
                 }
                 if let Some(value) = &collector.batching {
                     let mut value = value.clone();
@@ -1566,6 +1591,18 @@ fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
         .is_some_and(|seconds| !(1..=MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS).contains(&seconds))
     {
         bail!("collector.shutdown_drain_timeout_seconds must be in 1..={MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS}");
+    }
+    if let Some(capacity) = &collector.channel_capacity {
+        for (name, value) in [
+            ("control_node", capacity.control_node),
+            ("control_pipeline", capacity.control_pipeline),
+            ("control_completion", capacity.control_completion),
+            ("pdata", capacity.pdata),
+        ] {
+            if value.is_some_and(|value| !(1..=65_536).contains(&value)) {
+                bail!("collector.channel_capacity.{name} must be in 1..=65536");
+            }
+        }
     }
     if let Some(catalog) = &collector.catalog {
         validate_millisecond_duration(
@@ -2406,6 +2443,58 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn channel_capacity_validation_and_projection_are_strict() -> Result<()> {
+        let tunables = Tunables::parse_oat_json(serde_json::json!({"collector":{"channel_capacity":{
+            "control_node": 11, "control_pipeline": 12, "control_completion": 13, "pdata": 14
+        }}}))?;
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        for (name, value) in [
+            ("ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE", "11"),
+            ("ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE", "12"),
+            ("ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION", "13"),
+            ("ARROWCOL_COLLECTOR_CHANNEL_PDATA", "14"),
+        ] {
+            assert_eq!(env.get(name).map(String::as_str), Some(value));
+        }
+        for name in ["control_node", "control_pipeline", "control_completion", "pdata"] {
+            let maximum = serde_json::json!({"collector":{"channel_capacity":{name: 65_536}}});
+            Tunables::parse_oat_json(maximum)?;
+            for invalid in [
+                serde_json::json!(0),
+                serde_json::json!(65_537),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("12"),
+                serde_json::Value::Null,
+            ] {
+                let value = serde_json::json!({"collector":{"channel_capacity":{name: invalid}}});
+                let error = error_text(Tunables::parse_oat_json(value));
+                assert!(error.contains(name), "{name}: {error}");
+            }
+        }
+        for invalid in [serde_json::Value::Null, serde_json::json!("fast"), serde_json::json!(4)] {
+            let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"channel_capacity":invalid}
+            })));
+            assert!(error.contains("collector.channel_capacity"), "{error}");
+        }
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"channel_capacity":{"unknown":1}}
+            }))
+            .is_err()
+        );
+        let omitted = serde_json::to_value(Tunables::parse_oat_json(serde_json::json!({"collector":{}}))?)?;
+        assert!(omitted.pointer("/collector/channel_capacity").is_none());
+        let partial = Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"channel_capacity":{"pdata":14}}
+        }))?;
+        let serialized = serde_json::to_value(partial)?;
+        Tunables::parse_oat_json(serialized)?;
+        Ok(())
+    }
 
     #[test]
     fn oat_partial_collector_overrides_use_shipped_pipeline_defaults() -> Result<()> {

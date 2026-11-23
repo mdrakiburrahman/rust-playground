@@ -13,9 +13,10 @@ groups:
         policies:
           channel_capacity:
             control:
-              node: 64
-              pipeline: 64
-            pdata: 32
+              node: ${env:ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE:-64}
+              pipeline: ${env:ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE:-64}
+              completion: ${env:ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION:-512}
+            pdata: ${env:ARROWCOL_COLLECTOR_CHANNEL_PDATA:-32}
         nodes:
           flight:
             type: receiver:arrow_flight
