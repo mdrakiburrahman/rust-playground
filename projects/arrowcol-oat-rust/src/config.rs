@@ -77,12 +77,28 @@ pub struct OatConfig {
     pub website_url: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverloadRssSignal {
+    #[default]
+    ProcessRss,
+    CgroupMemory,
+}
+
+impl OverloadRssSignal {
+    fn is_process_rss(&self) -> bool {
+        *self == Self::ProcessRss
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OverloadGuardConfig {
     pub enabled: bool,
     pub cap_fraction: f64,
     pub zero_progress_windows: u32,
+    #[serde(skip_serializing_if = "OverloadRssSignal::is_process_rss")]
+    pub memory_signal: OverloadRssSignal,
 }
 
 impl Default for OverloadGuardConfig {
@@ -91,6 +107,7 @@ impl Default for OverloadGuardConfig {
             enabled: true,
             cap_fraction: 0.90,
             zero_progress_windows: 2,
+            memory_signal: OverloadRssSignal::ProcessRss,
         }
     }
 }
@@ -553,6 +570,24 @@ impl EffectiveStopBudgets {
 }
 
 impl OatConfig {
+    pub(crate) fn cgroup_guard_requested_limits(&self) -> Result<(u64, u64)> {
+        let pressure = self
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.pressure.as_ref())
+            .context("cgroup RSS guard requires explicitly requested collector pressure limits")?;
+        let rss = pressure
+            .rss_limit_bytes
+            .filter(|value| *value > 0)
+            .context("cgroup RSS guard requires a positive requested RSS limit")?;
+        let buffered = pressure
+            .buffered_bytes_limit
+            .filter(|value| *value > 0)
+            .context("cgroup RSS guard requires a positive requested buffered-byte limit")?;
+        Ok((rss, buffered))
+    }
+
     fn validate_campaign_profile(&self) -> Result<()> {
         if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
             if self.tables.as_slice() != ["sqlserver_availability_replica_states"] {
@@ -1000,6 +1035,9 @@ impl OatConfig {
             || !(1..=2).contains(&self.overload_guard.zero_progress_windows)
         {
             bail!("overload_guard requires cap_fraction in (0, 0.90] and zero_progress_windows in 1..=2");
+        }
+        if self.overload_guard.memory_signal == OverloadRssSignal::CgroupMemory {
+            self.cgroup_guard_requested_limits()?;
         }
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;
@@ -1627,6 +1665,9 @@ mod tests {
             json!({"cap_fraction":"0.9"}),
             json!({"zero_progress_windows":1.5}),
             json!({"zero_progress_windows":-1}),
+            json!({"memory_signal":null}),
+            json!({"memory_signal":false}),
+            json!({"memory_signal":"other"}),
             json!({"unknown":true}),
         ] {
             assert!(serde_json::from_value::<OverloadGuardConfig>(value).is_err());
@@ -1638,6 +1679,32 @@ mod tests {
             assert!(config.validate().is_err());
         }
         config.overload_guard = serde_json::from_value(json!({"cap_fraction":0.8,"zero_progress_windows":1}))?;
+        config.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cgroup_guard_requires_explicit_positive_limits() -> Result<()> {
+        use serde_json::json;
+
+        let default = OverloadGuardConfig::default();
+        assert_eq!(default.memory_signal, OverloadRssSignal::ProcessRss);
+        assert!(serde_json::to_value(default)?.get("memory_signal").is_none());
+        let mut config = valid();
+        config.overload_guard = serde_json::from_value(json!({"memory_signal":"cgroup_memory"}))?;
+        assert!(config.validate().is_err());
+        for limits in [
+            json!({}),
+            json!({"rss_limit_bytes":0,"buffered_bytes_limit":1024}),
+            json!({"rss_limit_bytes":1024,"buffered_bytes_limit":0}),
+        ] {
+            config.tunables.collector = Some(serde_json::from_value(json!({"pressure":limits}))?);
+            assert!(config.cgroup_guard_requested_limits().is_err());
+        }
+        config.tunables.collector = Some(serde_json::from_value(json!({"pressure":{
+            "rss_limit_bytes":2147483648_u64,"buffered_bytes_limit":536870912_u64
+        }}))?);
+        assert_eq!(config.cgroup_guard_requested_limits()?, (2147483648, 536870912));
         config.validate()?;
         Ok(())
     }
