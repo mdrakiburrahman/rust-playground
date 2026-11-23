@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { CLIENT_MEMORY, COLLECTOR_MEMORY, diagnosticPaths, realisticDiagnosticConfig } from "./realistic-diagnostic-config.js";
-import { diagnosticInputBytes, diagnosticLaunchEnv, diagnosticPins, requireMatchingCorpusReservation, validateDiagnosticCpuProof, validateDiagnosticProof, validateHostAdmission, verifyDiagnosticHook } from "./realistic-diagnostic.js";
+import { diagnosticInputBytes, diagnosticLaunchEnv, diagnosticPins, requireMatchingCorpusReservation, validateDiagnosticCpuProof, validateDiagnosticProof, validateDiagnosticRecheck, validateHostAdmission, verifyDiagnosticHook } from "./realistic-diagnostic.js";
 import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
 
 test("requires explicit full harness and collector provenance pins", () => {
@@ -89,16 +89,18 @@ test("requires distinct, normalized run-owned diagnostic paths", () => {
 test("requires a single diagnostic hook between readiness and parity precheck", () => {
   const include = 'include!("runner_realistic_diagnostic_admission.rs");';
   const ready = "let ready_clients = loop {";
-  const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients).await?;";
+  const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
+  const recheck = "diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
   const memoryHook = "diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;";
   const precheck = 'let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");';
   const schedule = "let schedule_deadline = tokio::time::Instant::now();";
-  assert.doesNotThrow(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${precheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${precheck}\n${hook}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${hook}\n${precheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n// ${hook}\n${precheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${memoryHook}\nlet other = 1;\n${schedule}`));
+  assert.doesNotThrow(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
+  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
+  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${precheck}\n${hook}\n${recheck}\n${memoryHook}\n${schedule}`));
+  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
+  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n// ${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
+  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${memoryHook}\n${schedule}`));
+  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\nlet other = 1;\n${schedule}`));
 });
 
 test("requires a fresh pre-schedule host memory admission", () => {
@@ -130,6 +132,9 @@ test("requires a single matching pre-schedule diagnostic proof", () => {
   const line = `[oat] diagnostic admission: ${JSON.stringify(proof)}\n`;
   const schedule = { effective: { schedule_created_at_unix_ms: 1001 } };
   assert.deepEqual(validateDiagnosticProof(line, corpus, schedule), proof);
+  const recheckLine = line.replace("diagnostic admission:", "diagnostic pre-schedule admission:");
+  assert.deepEqual(validateDiagnosticProof(recheckLine, corpus, schedule, true), proof);
+  assert.throws(() => validateDiagnosticProof(line, corpus, schedule, true));
   assert.throws(() => validateDiagnosticProof("", corpus, schedule));
   assert.throws(() => validateDiagnosticProof(line + line, corpus, schedule));
   assert.throws(() => validateDiagnosticProof(line, "b".repeat(64), schedule));
@@ -137,6 +142,18 @@ test("requires a single matching pre-schedule diagnostic proof", () => {
   assert.throws(() => validateDiagnosticProof(line.replace('"admitted_live_slots":28', '"admitted_live_slots":27'), corpus, schedule));
   const wrongStartup = { ...proof, startup_accounting: { ...startup, clients: [{ ...startup.clients[0], live_identity_batch_bytes: 0 }] } };
   assert.throws(() => validateDiagnosticProof(`[oat] diagnostic admission: ${JSON.stringify(wrongStartup)}\n`, corpus, schedule));
+});
+
+test("requires consistent live recheck before host memory readback", () => {
+  const first = { startup_accounting: { clients: [{ id: "client", corpus: 3 }] }, client_mapping: { id: "client" },
+    cpu_isolation: { cpus: [1, 2] }, observed_at_unix_ms: 10 };
+  const second = { ...first, observed_at_unix_ms: 11 };
+  const host = { observed_at_unix_ms: 12 };
+  assert.doesNotThrow(() => validateDiagnosticRecheck(first, second, host));
+  assert.throws(() => validateDiagnosticRecheck(first, { ...second, startup_accounting: {} }, host));
+  assert.throws(() => validateDiagnosticRecheck(first, { ...second, cpu_isolation: {} }, host));
+  assert.throws(() => validateDiagnosticRecheck(first, { ...second, observed_at_unix_ms: 9 }, host));
+  assert.throws(() => validateDiagnosticRecheck(first, second, { observed_at_unix_ms: 10 }));
 });
 
 test("compares observed corpus reservations across diagnostic arms", () => {
