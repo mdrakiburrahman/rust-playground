@@ -264,6 +264,10 @@ fn classify(path: &str) -> LeafClass {
         | "collector.codegen_units"
         | "collector.opt_level"
         | "collector.target_cpu" => LeafClass::RunnerControl,
+        "client.build_profile.lto"
+        | "client.build_profile.codegen_units"
+        | "client.build_profile.opt_level"
+        | "client.build_profile.target_cpu" => LeafClass::RunnerControl,
         // The OAT runner uses these to decide whether to start maintenance and its arguments.
         "maintenance.enabled" | "maintenance.operations" | "maintenance.apply" => LeafClass::RunnerControl,
         // Maintenance logging is inert when the role is disabled.
@@ -353,6 +357,10 @@ fn candidates(path: &str) -> Vec<Value> {
         "collector.codegen_units" => return vec![json!(16)],
         "collector.opt_level" => return vec![json!(3)],
         "collector.target_cpu" => return vec![json!("generic")],
+        "client.build_profile.lto" => return vec![json!("off")],
+        "client.build_profile.codegen_units" => return vec![json!(16)],
+        "client.build_profile.opt_level" => return vec![json!(3)],
+        "client.build_profile.target_cpu" => return vec![json!("generic")],
         "collector.runtime.cpu_dispatch" => return vec![json!("bounded_shards")],
         "collector.runtime.cpu_placement" => return vec![json!("scatter_allowed")],
         "collector.batching.stage_file_concurrency" => return vec![json!(16)],
@@ -894,10 +902,16 @@ fn evidence_classification_uses_only_requested_non_null_leaves() -> Result<()> {
             "reason":"consumer_startup_proof_unverified"})
     }));
     assert!(!evidence.to_string().contains("client.max_rows"));
-    let controls = evidence["runner_controls"].as_array().context("runner_controls missing")?;
+    let controls = evidence["runner_controls"]
+        .as_array()
+        .context("runner_controls missing")?;
     for field in ["lto", "codegen_units", "opt_level", "target_cpu"] {
-        assert!(controls.iter().any(|entry| entry["path"] == format!("client.build_profile.{field}")
-            && entry["reason"] == "rebuild_only_oat_client_profile"));
+        assert!(
+            controls
+                .iter()
+                .any(|entry| entry["path"] == format!("client.build_profile.{field}")
+                    && entry["reason"] == "rebuild_only_oat_client_profile")
+        );
     }
     assert_eq!(
         Tunables::parse_oat_json(json!({}))?.classify_oat_leaves()?,

@@ -717,22 +717,32 @@ impl OatConfig {
             return Ok(());
         }
         let mut requested = Vec::new();
-        if let Some(target_cpu) = self.tunables.collector.as_ref().and_then(|collector| collector.target_cpu) {
+        if let Some(target_cpu) = self
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.target_cpu)
+        {
             requested.push(("collector.target_cpu preflight", target_cpu));
         }
-        if let Some(target_cpu) = self.tunables.client.as_ref()
+        if let Some(target_cpu) = self
+            .tunables
+            .client
+            .as_ref()
             .and_then(|client| client.build_profile.as_ref())
             .map(|profile| profile.build_profile().target_cpu)
         {
             requested.push(("client.build_profile.target_cpu preflight", target_cpu));
         }
-        let requested = requested.into_iter().filter(|(_, cpu)| *cpu != CollectorTargetCpu::Generic)
+        let requested = requested
+            .into_iter()
+            .filter(|(_, cpu)| *cpu != CollectorTargetCpu::Generic)
             .collect::<Vec<_>>();
         if requested.is_empty() {
             return Ok(());
         }
-        let cpu_info = std::fs::read_to_string("/proc/cpuinfo")
-            .context("target_cpu preflight cannot read host CPU flags")?;
+        let cpu_info =
+            std::fs::read_to_string("/proc/cpuinfo").context("target_cpu preflight cannot read host CPU flags")?;
         for (field, target_cpu) in requested {
             arrowcol_tunables::verify_collector_target_cpu_flags(target_cpu.as_str(), &cpu_info, field)
                 .map_err(anyhow::Error::msg)?;
@@ -1178,6 +1188,15 @@ impl OatConfig {
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
         let computed_profile_hash = self.collector_build_profile_hash();
+        let computed_client_profile_hash = self.client_build_profile_hash();
+        if computed_client_profile_hash.is_some() && self.platform.kind != OatMode::Local {
+            bail!("tunables.client.build_profile fields currently require platform.kind=local");
+        }
+        if computed_client_profile_hash.is_some() && !self.platform.local.stable_image_build {
+            bail!(
+                "tunables.client.build_profile fields require platform.local.stable_image_build=true for verified immutable image pinning; set it to true or omit the build-profile fields"
+            );
+        }
         if self
             .platform
             .local
@@ -2031,6 +2050,22 @@ mod tests {
             .get_or_insert_with(Default::default)
             .target_cpu = Some(CollectorTargetCpu::Generic);
         stable.validate()?;
+
+        let mut client_profile = local_config();
+        client_profile.tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "client":{"build_profile":{"target_cpu":"generic"}}
+        }))?;
+        let error = validation_error(&client_profile)?;
+        assert!(error.contains("tunables.client.build_profile fields"));
+        assert!(error.contains("platform.local.stable_image_build=true"));
+        client_profile.platform.local.stable_image_build = true;
+        client_profile.validate()?;
+
+        let mut aks_client_profile = valid();
+        aks_client_profile.tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "client":{"build_profile":{"target_cpu":"generic"}}
+        }))?;
+        assert!(validation_error(&aks_client_profile)?.contains("platform.kind=local"));
         Ok(())
     }
 

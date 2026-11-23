@@ -4576,9 +4576,18 @@ mod tests {
         let tunables = Tunables::parse_oat_json(serde_json::json!({"client":{"build_profile":{
             "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
         }}}))?;
-        let profile = tunables.client.as_ref().context("client tunables")?
-            .build_profile.as_ref().context("client build profile")?.build_profile();
-        assert_eq!(profile.canonical_key(), "lto=thin-local;codegen_units=8;opt_level=2;target_cpu=x86-64-v3");
+        let profile = tunables
+            .client
+            .as_ref()
+            .context("client tunables")?
+            .build_profile
+            .as_ref()
+            .context("client build profile")?
+            .build_profile();
+        assert_eq!(
+            profile.canonical_key(),
+            "lto=thin-local;codegen_units=8;opt_level=2;target_cpu=x86-64-v3"
+        );
         for (field, value) in [
             ("lto", serde_json::json!("none")),
             ("codegen_units", serde_json::json!(0)),
@@ -4587,12 +4596,28 @@ mod tests {
             ("target_cpu", serde_json::json!("native")),
         ] {
             let error = Tunables::parse_oat_json(serde_json::json!({"client":{"build_profile":{(field):value}}}))
-                .err().context("invalid client build profile was accepted")?;
-            assert!(format!("{error:#}").contains(&format!("client.build_profile.{field}")), "{error:#}");
+                .err()
+                .context("invalid client build profile was accepted")?;
+            assert!(
+                format!("{error:#}").contains(&format!("client.build_profile.{field}")),
+                "{error:#}"
+            );
         }
-        assert!(required_rust_target_features("generic")?.is_empty());
-        assert!(required_rust_target_features("x86-64-v3")?.contains(&"f16c"));
-        assert!(required_rust_target_features("x86-64-v4")?.contains(&"avx512f"));
+        assert!(
+            required_rust_target_features("generic")
+                .map_err(anyhow::Error::msg)?
+                .is_empty()
+        );
+        assert!(
+            required_rust_target_features("x86-64-v3")
+                .map_err(anyhow::Error::msg)?
+                .contains(&"f16c")
+        );
+        assert!(
+            required_rust_target_features("x86-64-v4")
+                .map_err(anyhow::Error::msg)?
+                .contains(&"avx512f")
+        );
         Ok(())
     }
 

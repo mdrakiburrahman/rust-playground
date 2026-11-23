@@ -409,18 +409,31 @@ impl CollectorTargetCpu {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientBuildProfile {
     pub lto: CollectorLto,
     pub codegen_units: u16,
     pub opt_level: CollectorOptLevel,
     pub target_cpu: CollectorTargetCpu,
 }
+impl Default for ClientBuildProfile {
+    fn default() -> Self {
+        Self {
+            lto: CollectorLto::Off,
+            codegen_units: 16,
+            opt_level: CollectorOptLevel::O3,
+            target_cpu: CollectorTargetCpu::Generic,
+        }
+    }
+}
 impl ClientBuildProfile {
     pub fn canonical_key(self) -> String {
         format!(
             "lto={};codegen_units={};opt_level={};target_cpu={}",
-            self.lto.as_str(), self.codegen_units, self.opt_level.as_u8(), self.target_cpu.as_str()
+            self.lto.as_str(),
+            self.codegen_units,
+            self.opt_level.as_u8(),
+            self.target_cpu.as_str()
         )
     }
 }
@@ -610,11 +623,45 @@ pub fn verify_collector_target_cpu_flags(target_cpu: &str, cpu_info: &str, field
 
 pub fn required_rust_target_features(target_cpu: &str) -> Result<&'static [&'static str], String> {
     const V2: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2"];
-    const V3: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2",
-        "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"];
-    const V4: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2",
-        "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave",
-        "avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
+    const V3: &[&str] = &[
+        "cmpxchg16b",
+        "popcnt",
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+        "avx",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "xsave",
+    ];
+    const V4: &[&str] = &[
+        "cmpxchg16b",
+        "popcnt",
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+        "avx",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "xsave",
+        "avx512f",
+        "avx512bw",
+        "avx512cd",
+        "avx512dq",
+        "avx512vl",
+    ];
     match target_cpu {
         "generic" => Ok(&[]),
         "x86-64-v2" => Ok(V2),
@@ -753,13 +800,18 @@ fn deserialize_client_build_lto<'de, D>(d: D) -> Result<Option<CollectorLto>, D:
 where
     D: Deserializer<'de>,
 {
-    deserialize_profile_enum(d, "client.build_profile.lto", "off, thin-local, thin or fat", |value| match value {
-        "off" => Some(CollectorLto::Off),
-        "thin-local" => Some(CollectorLto::ThinLocal),
-        "thin" => Some(CollectorLto::Thin),
-        "fat" => Some(CollectorLto::Fat),
-        _ => None,
-    })
+    deserialize_profile_enum(
+        d,
+        "client.build_profile.lto",
+        "off, thin-local, thin or fat",
+        |value| match value {
+            "off" => Some(CollectorLto::Off),
+            "thin-local" => Some(CollectorLto::ThinLocal),
+            "thin" => Some(CollectorLto::Thin),
+            "fat" => Some(CollectorLto::Fat),
+            _ => None,
+        },
+    )
 }
 fn deserialize_client_build_codegen_units<'de, D>(d: D) -> Result<Option<u16>, D::Error>
 where
@@ -769,7 +821,9 @@ where
         .map_err(|_| D::Error::custom("client.build_profile.codegen_units must be an integer in 1..=256"))?;
     value.map_or(Ok(None), |value| match value {
         1..=256 => Ok(Some(value)),
-        _ => Err(D::Error::custom("client.build_profile.codegen_units must be an integer in 1..=256")),
+        _ => Err(D::Error::custom(
+            "client.build_profile.codegen_units must be an integer in 1..=256",
+        )),
     })
 }
 fn deserialize_client_build_opt_level<'de, D>(d: D) -> Result<Option<CollectorOptLevel>, D::Error>
@@ -781,20 +835,27 @@ where
     value.map_or(Ok(None), |value| match value {
         2 => Ok(Some(CollectorOptLevel::O2)),
         3 => Ok(Some(CollectorOptLevel::O3)),
-        _ => Err(D::Error::custom("client.build_profile.opt_level must be integer 2 or 3")),
+        _ => Err(D::Error::custom(
+            "client.build_profile.opt_level must be integer 2 or 3",
+        )),
     })
 }
 fn deserialize_client_build_target_cpu<'de, D>(d: D) -> Result<Option<CollectorTargetCpu>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_profile_enum(d, "client.build_profile.target_cpu", "generic, x86-64-v2, x86-64-v3 or x86-64-v4", |value| match value {
-        "generic" => Some(CollectorTargetCpu::Generic),
-        "x86-64-v2" => Some(CollectorTargetCpu::X86_64V2),
-        "x86-64-v3" => Some(CollectorTargetCpu::X86_64V3),
-        "x86-64-v4" => Some(CollectorTargetCpu::X86_64V4),
-        _ => None,
-    })
+    deserialize_profile_enum(
+        d,
+        "client.build_profile.target_cpu",
+        "generic, x86-64-v2, x86-64-v3 or x86-64-v4",
+        |value| match value {
+            "generic" => Some(CollectorTargetCpu::Generic),
+            "x86-64-v2" => Some(CollectorTargetCpu::X86_64V2),
+            "x86-64-v3" => Some(CollectorTargetCpu::X86_64V3),
+            "x86-64-v4" => Some(CollectorTargetCpu::X86_64V4),
+            _ => None,
+        },
+    )
 }
 
 fn deserialize_channel_capacity_object<'de, D>(deserializer: D) -> Result<Option<ChannelCapacityTunables>, D::Error>

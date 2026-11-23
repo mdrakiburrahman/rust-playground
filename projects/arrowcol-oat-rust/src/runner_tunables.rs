@@ -828,7 +828,7 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
                 .and_then(|client| client.build_profile.as_ref())
                 .context("client profile hash requires client build-profile tunables")?
                 .build_profile();
-            let image = super::local_client_profile_tag(&profile_hash);
+            let image = local_client_profile_tag(&profile_hash);
             let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
             client["image"] = json!(image);
             client["build"]["args"] = json!({
@@ -1008,6 +1008,35 @@ fn validate_collector_exporter_override(
 #[cfg(test)]
 mod tunable_injection_tests {
     use super::*;
+
+    #[test]
+    fn client_build_profile_selects_distinct_images_and_projects_build_args() -> Result<()> {
+        let mut first = config()?;
+        first.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "client":{"build_profile":{
+                "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
+            }}
+        }))?;
+        let profile_hash = first.client_build_profile_hash().context("client profile hash missing")?;
+        let image = local_client_profile_tag(&profile_hash);
+        let overlay = compose_tunables(&first)?;
+        assert_eq!(overlay["services"]["oat-client"]["image"], image);
+        assert_eq!(overlay["services"]["oat-pin-init"]["image"], image);
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_PROFILE_HASH"], profile_hash);
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_LTO"], "thin-local");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_CODEGEN_UNITS"], "8");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_OPT_LEVEL"], "2");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_TARGET_CPU"], "x86-64-v3");
+
+        let mut alternate = config()?;
+        alternate.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "client":{"build_profile":{
+                "lto":"thin-local","codegen_units":8,"opt_level":3,"target_cpu":"x86-64-v3"
+            }}
+        }))?;
+        assert_ne!(profile_hash, alternate.client_build_profile_hash().context("alternate client profile hash missing")?);
+        Ok(())
+    }
 
     #[test]
     fn rust_runtime_exporter_config_matches_collector_parser_without_override() -> Result<()> {

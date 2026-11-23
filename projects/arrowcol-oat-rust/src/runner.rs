@@ -8624,7 +8624,9 @@ fn local_prebuild_image_sources(
 ) -> Vec<(String, String, Option<String>, Option<String>)> {
     let profile_hash = config.collector_build_profile_hash();
     let client_profile_hash = config.client_build_profile_hash();
-    let client = client_profile_hash.as_deref().map(local_client_profile_tag)
+    let client = client_profile_hash
+        .as_deref()
+        .map(local_client_profile_tag)
         .unwrap_or_else(|| "arrowcol-oat-client:local".to_owned());
     let collector = profile_hash
         .as_deref()
@@ -8831,14 +8833,6 @@ fn local_maintenance_table_initialization_mode(config: &OatConfig) -> Option<boo
         .then_some(partitioned)
 }
 
-fn verify_collector_profile_image(
-    observed: &str,
-    expected_source_revision: &str,
-    profile_hash: &str,
-) -> Result<String> {
-    verify_profile_image("collector", observed, expected_source_revision, profile_hash)
-}
-
 fn verify_profile_image(
     role: &str,
     observed: &str,
@@ -8897,11 +8891,15 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
     let mut images = BTreeMap::new();
     for (role, default_source) in sources {
         let source = if role == "collector" {
-            config.collector_build_profile_hash().as_deref()
+            config
+                .collector_build_profile_hash()
+                .as_deref()
                 .map(local_collector_profile_tag)
                 .unwrap_or_else(|| default_source.to_owned())
         } else if role == "client" {
-            config.client_build_profile_hash().as_deref()
+            config
+                .client_build_profile_hash()
+                .as_deref()
                 .map(local_client_profile_tag)
                 .unwrap_or_else(|| default_source.to_owned())
         } else {
@@ -8916,7 +8914,8 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
             let mut inspect = Command::new("docker");
             inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
             let output = run_command(inspect, &format!("resolve profile-specific local {role} image"))
-                .await.with_context(|| format!("required immutable {role} profile image {source} is unavailable"))?;
+                .await
+                .with_context(|| format!("required immutable {role} profile image {source} is unavailable"))?;
             let observed = String::from_utf8(output.stdout)?;
             let mut revision = Command::new("git");
             revision.args(["rev-parse", "HEAD"]);
@@ -8966,19 +8965,19 @@ fn profile_hash_selects_and_validates_local_collector_image() -> Result<()> {
     );
     let observed = format!("sha256:{} {} {}", "b".repeat(64), source_revision, profile_hash);
     assert_eq!(
-        verify_collector_profile_image(&observed, &source_revision, &profile_hash)?,
+        verify_profile_image("collector", &observed, &source_revision, &profile_hash)?,
         format!("sha256:{}", "b".repeat(64))
     );
-    assert!(verify_collector_profile_image(&observed, &source_revision, &"d".repeat(64)).is_err());
-    assert!(verify_collector_profile_image(&observed, &"d".repeat(40), &profile_hash).is_err());
-    assert!(verify_collector_profile_image("", &source_revision, &profile_hash).is_err());
+    assert!(verify_profile_image("collector", &observed, &source_revision, &"d".repeat(64)).is_err());
+    assert!(verify_profile_image("collector", &observed, &"d".repeat(40), &profile_hash).is_err());
+    assert!(verify_profile_image("collector", "", &source_revision, &profile_hash).is_err());
     for image_id in [
         "sha256:short".to_owned(),
         format!("sha256:{}", "B".repeat(64)),
         format!("sha256:{}suffix", "b".repeat(64)),
     ] {
         let invalid = format!("{image_id} {source_revision} {profile_hash}");
-        assert!(verify_collector_profile_image(&invalid, &source_revision, &profile_hash).is_err());
+        assert!(verify_profile_image("collector", &invalid, &source_revision, &profile_hash).is_err());
     }
     Ok(())
 }

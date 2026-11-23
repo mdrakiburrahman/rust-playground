@@ -106,6 +106,8 @@ The OAT client release profile is rebuild-only and defaults to `lto=off`, `codeg
 | `client.build_profile.opt_level` | Integer `2` or `3` | `3` | OAT client image rebuild | Must match Cargo's effective `OPT_LEVEL`; a mismatch fails the image build. |
 | `client.build_profile.target_cpu` | `generic`, `x86-64-v2`, `x86-64-v3`, or `x86-64-v4`; `native` is forbidden | `generic` | OAT client image rebuild and CPU preflight | Local preflight checks host flags; image build checks rustc target features, including F16C for v3/v4. |
 
+Client build profiles are supported only in local runs and require `platform.local.stable_image_build=true`; this verifies and pins the resulting profile-tagged client image.
+
 The local image tag includes the profile SHA-256, preventing profiles from reusing an image. `arrowcol-dmv` emits the compiled values in `OAT_CLIENT_BUILD_PROFILE`; the runner derives the expected values from this config and rejects mismatches before recording throughput.
 
 ## Client data profile and identity

@@ -19,10 +19,15 @@ fn main() {
         return;
     }
     if values.iter().any(Option::is_none) {
-        let missing = PROFILE_VARIABLES.iter().zip(values.iter())
+        let missing = PROFILE_VARIABLES
+            .iter()
+            .zip(values.iter())
             .filter_map(|(name, value)| value.is_none().then_some(*name))
             .collect::<Vec<_>>();
-        panic!("client build-profile metadata is incomplete; missing {}", missing.join(", "));
+        panic!(
+            "client build-profile metadata is incomplete; missing {}",
+            missing.join(", ")
+        );
     }
     let [Some(lto), Some(codegen_units), Some(opt_level), Some(target_cpu)] = values else {
         unreachable!();
@@ -30,7 +35,8 @@ fn main() {
     if !matches!(lto.as_str(), "off" | "thin-local" | "thin" | "fat") {
         panic!("ARROWCOL_OAT_CLIENT_BUILD_LTO has unsupported value {lto}");
     }
-    let codegen_units = codegen_units.parse::<u16>()
+    let codegen_units = codegen_units
+        .parse::<u16>()
         .unwrap_or_else(|_| panic!("ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS must be an integer in 1..=256"));
     if !(1..=256).contains(&codegen_units) {
         panic!("ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS must be an integer in 1..=256");
@@ -44,12 +50,21 @@ fn main() {
     }
 
     let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
-    let enabled = features.split(',').filter(|feature| !feature.is_empty()).collect::<HashSet<_>>();
+    let enabled = features
+        .split(',')
+        .filter(|feature| !feature.is_empty())
+        .collect::<HashSet<_>>();
     let required = arrowcol_tunables::required_rust_target_features(&target_cpu)
         .unwrap_or_else(|error| panic!("ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU: {error}"));
-    let missing = required.iter().filter(|feature| !enabled.contains(**feature)).copied().collect::<Vec<_>>();
+    let missing = required
+        .iter()
+        .filter(|feature| !enabled.contains(**feature))
+        .copied()
+        .collect::<Vec<_>>();
     if !missing.is_empty() {
-        panic!("ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU={target_cpu} requires target features missing from CARGO_CFG_TARGET_FEATURE: {}",
-            missing.join(", "));
+        panic!(
+            "ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU={target_cpu} requires target features missing from CARGO_CFG_TARGET_FEATURE: {}",
+            missing.join(", ")
+        );
     }
 }
