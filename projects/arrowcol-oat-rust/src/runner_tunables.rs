@@ -539,6 +539,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.string_length_distribution") => ("string_length_distribution", "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION"),
             Some("client.entropy") => ("entropy", "ARROWCOL_CLIENT_ENTROPY"),
             Some("client.cardinality") => ("cardinality", "ARROWCOL_CLIENT_CARDINALITY"),
+            Some("client.seed") => ("seed", "ARROWCOL_CLIENT_SEED"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -593,7 +594,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }
             return true;
         }
-        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality") {
+        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality" | "seed") {
             let counts = reports.iter().map(|report| {
                 let name = report["table"].as_str()?;
                 let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
@@ -602,7 +603,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
                 }
                 let evidence_field = match field {
                     "string_length_distribution" => "string_width",
-                    "cardinality" => "value_variation",
+                    "cardinality" | "seed" => "value_variation",
                     _ => field,
                 };
                 let columns = tables[0].get(evidence_field)?.get("eligible_columns")?.as_u64()?;
@@ -611,7 +612,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }).collect::<Option<Vec<_>>>();
             let Some(counts) = counts else { return true; };
             if counts.iter().all(|&(columns, rows)| columns == 0 && rows == 0) {
-                if matches!(field, "entropy" | "cardinality") {
+                if matches!(field, "entropy" | "cardinality" | "seed") {
                     return true;
                 }
                 inert.push(json!({"path": entry["path"], "reason": "no_eligible_generated_rows"}));
@@ -649,13 +650,22 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
                     return true;
                 }
             }
+            if field == "seed" && reports.iter().any(|report| {
+                let effective = &report["consumer_effective_config"];
+                effective["skew"].as_f64() != Some(0.0)
+                    || !(effective["value_variation"] == "per_row"
+                        || (effective["value_variation"] == "cardinality"
+                            && effective["cardinality"].as_u64().is_some_and(|value| value > 1)))
+            }) {
+                return true;
+            }
         }
         if !environment.contains_key(variable)
             || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
         {
             return true;
         }
-        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality") {
+        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality" | "seed") {
             "consumer_startup_and_prepared_corpus"
         } else { "consumer_startup_readback" }}));
         false
