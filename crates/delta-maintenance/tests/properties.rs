@@ -674,12 +674,9 @@ fn decoded_budget_rejects_table_override_without_mutating_data() -> Result<()> {
     persist_policy(&source)?;
     let before = inventory(root.path())?;
     let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
-    assert!(
-        results[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("aggregate decode budget"))
-    );
+    assert!(results[0].error.as_deref().is_some_and(|error| {
+        error.contains("max_decoded_bytes_per_bin") && error.contains("max_concurrent_decoded_bytes")
+    }));
     assert_eq!(before, inventory(root.path())?);
     Ok(())
 }
