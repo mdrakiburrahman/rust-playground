@@ -4525,6 +4525,7 @@ fn result_rows(
         "effective_stop_budgets": config.maintenance_stop_budget()?,
         "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "inert_fields": inert_tunable_fields(config),
         "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
         "cpu_quota": cpu_quota_evidence,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
@@ -4637,6 +4638,7 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                evidence["inert_fields"] = json!(inert_tunable_fields(config));
                 evidence["ownership_samples"] = json!(client_run.pinning.samples);
                 if let Some(fleet) = &config.platform.fleet {
                     let mut pool_rates = BTreeMap::<String, f64>::new();
@@ -17611,9 +17613,13 @@ mod tests {
 
     #[test]
     fn local_qap_deadline_keeps_progress_and_exact_snapshot_coverage_without_changing_delta_results() -> Result<()> {
-        let config: OatConfig = serde_json::from_str(include_str!(
+        let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance": {"enabled": false},
+            "logging": {"maintenance": "debug"}
+        }))?;
         let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
         let table = config.tables[0].clone();
         let external = qap_bindings(run, std::slice::from_ref(&table))?
@@ -17717,6 +17723,10 @@ mod tests {
         )?;
         assert_eq!(rows[0].status, "succeeded");
         let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
+        let tunables: Value = serde_json::from_str(&rows[0].tunables_json)?;
+        let inert = json!([{"path": "logging.maintenance", "reason": "maintenance_disabled"}]);
+        assert_eq!(tunables["inert_fields"], inert);
+        assert_eq!(result["inert_fields"], inert);
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
         assert_eq!(result["downstream_status"], "unavailable");
         assert!(result["ownership_samples"][0]["observed_at_unix_ms"].is_u64());

@@ -1,6 +1,21 @@
 use arrowcol_tunables::ComponentRole;
 use otel_arrow_dfe_config::engine::EngineConfig;
 
+fn inert_tunable_fields(config: &OatConfig) -> Vec<Value> {
+    if !maintenance_enabled(config)
+        && config
+            .tunables
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.maintenance)
+            .is_some()
+    {
+        vec![json!({"path": "logging.maintenance", "reason": "maintenance_disabled"})]
+    } else {
+        Vec::new()
+    }
+}
+
 fn capability_evidence() -> Vec<Value> {
     arrowcol_tunables::capability_table()
         .iter()

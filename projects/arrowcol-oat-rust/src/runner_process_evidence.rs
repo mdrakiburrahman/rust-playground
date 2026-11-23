@@ -1684,6 +1684,15 @@ mod startup_readback_tests {
             "maintenance": {"enabled": false}
         }))?;
         assert_eq!(process_evidence(&config, &[])?, json!([]));
+        assert_eq!(
+            inert_tunable_fields(&config),
+            vec![json!({"path":"logging.maintenance","reason":"maintenance_disabled"})]
+        );
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "logging": {"maintenance": "warn"},
+            "maintenance": {"enabled": true, "operations": ["optimize"]}
+        }))?;
+        assert!(inert_tunable_fields(&config).is_empty());
         Ok(())
     }
 
