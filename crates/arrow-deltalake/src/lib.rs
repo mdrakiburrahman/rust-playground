@@ -43,6 +43,37 @@ pub mod sizing;
 pub mod telemetry;
 pub mod writer;
 
+/// How the writer groups rows by their Delta partition values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum PartitionGrouping {
+    #[default]
+    ScalarMap,
+    TypedRuns,
+}
+
+impl TryFrom<String> for PartitionGrouping {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "scalar_map" => Ok(Self::ScalarMap),
+            "typed_runs" => Ok(Self::TypedRuns),
+            _ => Err("expected scalar_map or typed_runs"),
+        }
+    }
+}
+
+impl PartitionGrouping {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScalarMap => "scalar_map",
+            Self::TypedRuns => "typed_runs",
+        }
+    }
+}
+
 /// Stable size and row counters for one completed Parquet file.
 ///
 /// `input_bytes` is the logical size of the Arrow slices accepted by the

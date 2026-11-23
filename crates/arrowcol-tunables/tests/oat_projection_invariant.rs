@@ -364,6 +364,7 @@ fn candidates(path: &str) -> Vec<Value> {
         json!("none"),
         json!("hydrate"),
         json!("drain_ready"),
+        json!("typed_runs"),
         json!("process"),
         json!("buffered_multipart"),
         json!("backpressure"),
@@ -804,6 +805,28 @@ fn typed_serialization_null_defaults_do_not_hide_or_invent_requested_leaves() ->
             {"path":"collector.runtime.cpu_workers", "reason":"consumer_startup_proof_unverified"}
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn partition_grouping_only_accepts_explicit_enum_strings() -> Result<()> {
+    for invalid in [
+        Value::Null,
+        json!(true),
+        json!(1),
+        json!({"typed_runs":null}),
+        json!("TypedRuns"),
+        json!("auto"),
+    ] {
+        assert!(Tunables::parse_oat_json(json!({"collector":{"runtime":{"partition_grouping":invalid}}})).is_err());
+    }
+    for mode in ["scalar_map", "typed_runs"] {
+        let tunables = Tunables::parse_oat_json(json!({"collector":{"runtime":{"partition_grouping":mode}}}))?;
+        assert_eq!(
+            tunables.environment_for(ComponentRole::Collector)?["ARROWCOL_COLLECTOR_PARTITION_GROUPING"],
+            mode
+        );
+    }
     Ok(())
 }
 
