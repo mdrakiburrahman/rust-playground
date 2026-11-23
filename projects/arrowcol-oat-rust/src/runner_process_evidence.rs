@@ -2333,6 +2333,7 @@ mod consumer_startup_projection_tests {
             "collector": {
                 "channel_capacity":{"control_node":11,"control_pipeline":12,
                     "control_completion":13,"pdata":14},
+                "limits":{"batch_channel_capacity":9,"put_result_channel_capacity":19},
                 "batching":{"coalesce_publications":true,"age_flush_policy":"drain_ready","pipeline_depth":2,
                     "global_capacity":{"bytes":1073741824,"rows":5000000,"batches":2048},
                     "per_table_capacity":{"bytes":268435456,"rows":1000000,"batches":512},
@@ -2449,6 +2450,8 @@ groups:
         assert_eq!(observed["engine"]["channel_capacity"], json!({
             "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
         }));
+        assert_eq!(observed["limits"]["batch_channel_capacity"], json!(9));
+        assert_eq!(observed["limits"]["put_result_channel_capacity"], json!(19));
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
             "component": "collector", "instance_id": "collector-1", "log_complete": true,
@@ -2458,8 +2461,21 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 37);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 39);
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
+        for field in ["batch_channel_capacity", "put_result_channel_capacity"] {
+            for missing in [false, true] {
+                let mut wrong = process.clone();
+                if missing {
+                    wrong["effective_config"]["limits"].as_object_mut().context("missing limits")?.remove(field);
+                } else {
+                    wrong["effective_config"]["limits"][field] = json!(1);
+                }
+                let mut uncovered = initial.clone();
+                promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong])), 1)?;
+                assert!(uncovered["consumer_verified"].as_array().context("consumer_verified array")?.is_empty());
+            }
+        }
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
         let mut missing_process = process.clone();
