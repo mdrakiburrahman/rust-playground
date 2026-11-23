@@ -34,7 +34,8 @@ interface OfficialRun {
 }
 
 type RecordValue = Record<string, unknown>;
-type Cell = { x: string; y: string; rates: number[] };
+type FactorCoverage = { status: 'active' | 'projection_only' | 'unknown' | 'inert'; reason: string };
+type Cell = { x: string; y: string; rates: number[]; coverage: FactorCoverage };
 type Summary = {
   candidate: string;
   rates: number[];
@@ -258,10 +259,11 @@ function officialImageIds(run: OfficialRun): string[] | null {
 function assertCompatibleBaselines(rows: CampaignMeasurement[], cohort: string): void {
   let source: string | undefined;
   let configFingerprint: string | undefined;
+  let imageFingerprint: string | undefined;
   let mode: string | undefined;
   for (const row of rows) {
     if (!row.officialRuns?.length) continue;
-    if (!row.factorConfigPaths) throw new Error('official evidence requires factorConfigPaths to compare frozen baselines');
+    if (!row.factorConfigPaths) continue;
     for (const run of row.officialRuns) {
       if (factorPathsOverlap(run.config, row.factorConfigPaths[0], row.factorConfigPaths[1]) ||
           !resolveFactorLeaf(run.config, row.factorConfigPaths[0]) || !resolveFactorLeaf(run.config, row.factorConfigPaths[1])) {
@@ -271,15 +273,89 @@ function assertCompatibleBaselines(rows: CampaignMeasurement[], cohort: string):
       if (!removeFactorPath(config, row.factorConfigPaths[0]) || !removeFactorPath(config, row.factorConfigPaths[1])) {
         throw new Error('cohort ' + cohort + ' factorConfigPaths do not resolve in official config');
       }
-      const fingerprint = stableJson({ config, collectorImages: officialImageIds(run) });
-      if (source !== undefined && (source !== run.expectedSha || configFingerprint !== fingerprint || mode !== run.mode)) {
+      const fingerprint = stableJson(config);
+      const images = officialImageIds(run);
+      const image = images ? stableJson(images) : undefined;
+      if (source !== undefined && (source !== run.expectedSha || configFingerprint !== fingerprint || mode !== run.mode) ||
+          image !== undefined && imageFingerprint !== undefined && image !== imageFingerprint) {
         throw new Error('cohort ' + cohort + ' has incompatible frozen source/resource/load baselines');
       }
       source = run.expectedSha;
       configFingerprint = fingerprint;
+      if (image !== undefined) imageFingerprint = image;
       mode = run.mode;
     }
   }
+}
+
+function canonicalFactorPath(path: string): string | undefined {
+  const parts = path.split('.');
+  if (parts.some(part => part.trim() === '' || part !== part.trim())) return undefined;
+  if (parts[0] === 'tunables') parts.shift();
+  return parts.length ? parts.join('.') : undefined;
+}
+
+function factorCoverage(row: CampaignMeasurement): FactorCoverage {
+  const unknown: FactorCoverage = { status: 'unknown', reason: 'varied factor coverage unknown' };
+  if (!row.factorConfigPaths || !row.officialRuns?.length) return unknown;
+  const paths = row.factorConfigPaths.map(canonicalFactorPath);
+  if (paths.some(path => !path) || new Set(paths).size !== paths.length) return unknown;
+  const matches = (entryPath: string): boolean => {
+    const canonical = canonicalFactorPath(entryPath);
+    return canonical !== undefined && paths.includes(canonical);
+  };
+  let incomplete = false;
+  const inert: string[] = [];
+  const projected: string[] = [];
+  for (const run of row.officialRuns) {
+    if (row.factorConfigPaths.some(path => !resolveFactorLeaf(run.config, path)) || !run.rows.length) incomplete = true;
+    for (const result of run.rows) {
+      let evidence: unknown;
+      try { evidence = typeof result.evidence_json === 'string' ? JSON.parse(result.evidence_json) : null; } catch { evidence = null; }
+      if (!isRecord(evidence)) { incomplete = true; continue; }
+      const seen = new Set<string>();
+      for (const [field, reasons, allowedReasons] of [
+        ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled']],
+        ['projection_only', projected, ['consumer_startup_proof_unverified']],
+        ['runner_controls', undefined, ['maintenance_runner_control', 'router_log_filter_inheritance']],
+        ['consumer_verified', undefined, []],
+      ] as const) {
+        const entries = evidence[field];
+        if (!Array.isArray(entries)) { incomplete = true; continue; }
+        for (const entry of entries) {
+          if (!isRecord(entry) || typeof entry.path !== 'string') {
+            incomplete = true;
+            continue;
+          }
+          const path = canonicalFactorPath(entry.path);
+          if (!path) { incomplete = true; continue; }
+          if (seen.has(path)) incomplete = true;
+          seen.add(path);
+          if (typeof entry.reason !== 'string' || !(allowedReasons as readonly string[]).includes(entry.reason)) {
+            incomplete = true;
+            continue;
+          }
+          if (reasons && matches(entry.path)) reasons.push(entry.path + ': ' + entry.reason);
+        }
+      }
+      if (paths.some(path => !seen.has(path!))) incomplete = true;
+    }
+  }
+  if (inert.length) return {
+    status: 'inert',
+    reason: 'inert: ' + [...new Set(inert)].join('; ') + (incomplete ? '; varied factor coverage unknown' : ''),
+  };
+  if (incomplete) return unknown;
+  if (projected.length) return { status: 'projection_only', reason: 'consumption unproven: ' + [...new Set(projected)].join('; ') };
+  return { status: 'active', reason: 'factor coverage complete' };
+}
+
+function combineCoverage(coverages: FactorCoverage[]): FactorCoverage {
+  for (const status of ['inert', 'unknown', 'projection_only', 'active'] as const) {
+    const matching = coverages.filter(coverage => coverage.status === status);
+    if (matching.length) return { status, reason: [...new Set(matching.map(coverage => coverage.reason))].join('; ') };
+  }
+  return { status: 'unknown', reason: 'varied factor coverage unknown' };
 }
 
 function nonNegativeInteger(value: unknown): number | undefined {
@@ -694,6 +770,7 @@ function officialOverloadStop(run: OfficialRun): string | undefined {
 function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
   const stop = officialOverloadStop(run);
   if (stop) return { reason: stop };
+  if (!officialImageIds(run)) return { reason: 'official collector image evidence is missing' };
   const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
   if (verdict.ingestPass !== true || verdict.rows.length !== 1) return { reason: 'official campaign ingest evidence did not pass: ' + verdict.reasons.join('; ') };
   const row = verdict.rows[0]!;
@@ -800,7 +877,7 @@ function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
   return { qualified: true, rates, reason: 'protocol evidence complete' };
 }
 
-function summarizeCandidates(rows: CampaignMeasurement[]): Summary[] {
+function summarizeCandidates(rows: CampaignMeasurement[], cells: Map<string, Cell>): Summary[] {
   const groups = new Map<string, CampaignMeasurement[]>();
   for (const row of rows) {
     const group = groups.get(row.candidate) ?? [];
@@ -814,9 +891,11 @@ function summarizeCandidates(rows: CampaignMeasurement[]): Summary[] {
     const repeatIds = new Set(group.map(row => row.repeat));
     const completeSet = expectedRepeats !== null && repeatIds.size === expectedRepeats &&
       Array.from({ length: expectedRepeats }, (_, index) => repeatIds.has(index + 1)).every(Boolean);
-    const qualified = expectedRepeats !== null && expectedRepeats >= 3 && completeSet && completed.length === expectedRepeats;
+    const coverage = cells.get(JSON.stringify([group[0]!.valueX, group[0]!.valueY]))!.coverage;
+    const qualified = coverage.status === 'active' && expectedRepeats !== null && expectedRepeats >= 3 && completeSet && completed.length === expectedRepeats;
     const officialRepeatRates = completed.map(item => average(item.evidence.rates));
-    const observedRates = group.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
+    const observedRates = coverage.status === 'inert' || coverage.status === 'unknown' ? [] :
+      group.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
     const rates = qualified ? officialRepeatRates : observedRates;
     const deaths = group.map(row => row.diedFirst).filter((value): value is string => value !== null && value !== undefined);
     const status = qualified ? 'qualified' : deaths.some(value => value.toLowerCase() !== 'kustainer') ? 'failed' :
@@ -826,7 +905,10 @@ function summarizeCandidates(rows: CampaignMeasurement[]): Summary[] {
       min: rates.length ? Math.min(...rates) : 0,
       max: rates.length ? Math.max(...rates) : 0,
       completedRepeats: completed.length, expectedRepeats, status,
-      reason: qualified ? 'protocol evidence complete' : assessments.find(item => !item.evidence.qualified)?.evidence.reason ?? 'protocol evidence incomplete',
+      reason: qualified ? 'protocol evidence complete' : [
+        ...(coverage.status === 'active' ? [] : [coverage.reason]),
+        assessments.find(item => !item.evidence.qualified)?.evidence.reason ?? 'protocol evidence incomplete',
+      ].join('; '),
     };
   });
 }
@@ -847,17 +929,29 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   assertCompatibleBaselines(rows, cohort);
   const xValues = [...new Set(rows.map(row => row.valueX))].sort();
   const yValues = [...new Set(rows.map(row => row.valueY))].sort();
+  const factorPairs = new Set(rows.flatMap(row => {
+    if (!row.factorConfigPaths) return [];
+    const paths = row.factorConfigPaths.map(canonicalFactorPath);
+    return paths.every(path => path !== undefined) ? [JSON.stringify(paths)] : [];
+  }));
   const cells = new Map<string, Cell>();
   for (const row of rows) {
     const key = JSON.stringify([row.valueX, row.valueY]);
-    const cell = cells.get(key) ?? { x: row.valueX, y: row.valueY, rates: [] };
+    const coverage = combineCoverage([
+      factorCoverage(row),
+      ...(factorPairs.size > 1 ?
+        [{ status: 'unknown' as const, reason: 'varied factor coverage unknown: inconsistent factor paths in cohort' }] : []),
+    ]);
+    const cell = cells.get(key) ?? { x: row.valueX, y: row.valueY, rates: [], coverage };
+    cell.coverage = combineCoverage([cell.coverage, coverage]);
     if (row.committedRowsPerSecond !== null) cell.rates.push(row.committedRowsPerSecond);
     cells.set(key, cell);
   }
-  const rates = rows.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
+  const rates = [...cells.values()].flatMap(cell =>
+    cell.coverage.status === 'inert' || cell.coverage.status === 'unknown' ? [] : cell.rates);
   const minimum = rates.length ? Math.min(...rates) : 0;
   const maximum = rates.length ? Math.max(...rates) : 0;
-  const summaries = summarizeCandidates(rows);
+  const summaries = summarizeCandidates(rows, cells);
   const leaderboard = sortCampaignLeaderboard(summaries.filter(item => item.status === 'qualified'));
   const exploratory = summaries.filter(item => item.status !== 'qualified');
   const maxMean = Math.max(1, ...leaderboard.map(item => item.mean));
@@ -889,17 +983,17 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     xValues.forEach((x, columnIndex) => {
       const cell = cells.get(JSON.stringify([x, value]));
       const xPosition = heatX + 120 + columnIndex * cellWidth;
-      if (!cell || !cell.rates.length) {
+      if (!cell || !cell.rates.length || cell.coverage.status === 'inert' || cell.coverage.status === 'unknown') {
         parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="#f6f8fa" stroke="#d0d7de"/>');
         parts.push(svgText(xPosition + 8, y + 22, 'null', 11));
       } else {
         const mean = average(cell.rates);
         parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="' + cellColor(mean, minimum, maximum) + '" stroke="#8c959f"/>');
-        parts.push(svgText(xPosition + 8, y + 22, numberLabel(mean), 11, 'bold'));
+        parts.push(svgText(xPosition + 8, y + 22, numberLabel(mean) + (cell.coverage.status === 'projection_only' ? '*' : ''), 11, 'bold'));
       }
     });
   });
-  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | observed repeat means; null = unavailable', 11));
+  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | observed means; null = unavailable; * consumption unproven', 11));
   const barStart = leaderboardX + 190;
   const barWidth = 300;
   if (!leaderboard.length) parts.push(svgText(leaderboardX, 112, 'No qualified winner: complete official evidence is missing or invalid.', 12, 'bold'));
@@ -918,7 +1012,9 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   parts.push(svgText(40, noteY, 'What died first', 16, 'bold'));
   if (!deaths.length) parts.push(svgText(40, noteY + 25, 'No failure recorded in these rows.', 12));
   deaths.slice(0, 8).forEach((row, index) => {
-    const rate = row.committedRowsPerSecond === null ? 'committed rows/s: null' : 'committed rows/s: ' + numberLabel(row.committedRowsPerSecond);
+    const coverage = cells.get(JSON.stringify([row.valueX, row.valueY]))!.coverage;
+    const rate = row.committedRowsPerSecond === null || coverage.status === 'inert' || coverage.status === 'unknown' ?
+      'committed rows/s: null' : 'committed rows/s: ' + numberLabel(row.committedRowsPerSecond);
     const status = row.collectorOnly ? 'collector-only; downstream metrics: null; ' : '';
     const comment = row.comment ? ' — ' + row.comment : '';
     parts.push(svgText(40, noteY + 25 + index * 23, row.candidate + ' repeat ' + row.repeat + ': ' + row.diedFirst + ' (' + status + rate + ')' + comment, 11));

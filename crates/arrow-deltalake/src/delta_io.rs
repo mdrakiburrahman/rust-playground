@@ -66,7 +66,7 @@ pub struct DeltaRuntimeConfig {
     pub batch_rows: usize,
     /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
     pub cpu_workers: usize,
-    /// CPU queue capacity; absent means the resolved CPU worker count.
+    /// CPU queue capacity, 1..=128; absent means the resolved CPU worker count.
     #[serde(default)]
     pub cpu_queue_jobs: Option<usize>,
     /// Skip row-wise grouping for internally generated single ingestion partitions.
@@ -206,8 +206,8 @@ impl DeltaRuntimeConfig {
         );
         if let Some(queue) = self.cpu_queue_jobs {
             anyhow::ensure!(
-                (1..=self.cpu_workers).contains(&queue),
-                "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS must be between 1 and CPU_WORKERS"
+                (1..=128).contains(&queue),
+                "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS must be in 1..=128"
             );
         }
         if self.upload_mode == UploadMode::BufferedMultipart {
@@ -497,6 +497,16 @@ impl Drop for Permit {
 impl SharedExecutor {
     fn new() -> Result<Self> {
         let config = runtime_config()?;
+        let blocking_capacity = config
+            .blocking_workers
+            .checked_sub(config.blocking_fs_reserve)
+            .filter(|&capacity| capacity > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "blocking filesystem reserve must be smaller than the blocking worker count",
+                )
+            })?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.runtime_workers)
             .max_blocking_threads(config.blocking_workers)
@@ -509,9 +519,7 @@ impl SharedExecutor {
             admission: Arc::new(Admission::new(config.task_limit)),
             // Admitted synchronous jobs may wait on tokio::fs, which uses this
             // same blocking pool. Keep the configured slots free for filesystem work.
-            blocking_admission: Arc::new(tokio::sync::Semaphore::new(
-                config.blocking_workers - config.blocking_fs_reserve,
-            )),
+            blocking_admission: Arc::new(tokio::sync::Semaphore::new(blocking_capacity)),
             upload_admission: Arc::new(tokio::sync::Semaphore::new(config.upload_limit)),
             background_failure: Arc::new(Mutex::new(None)),
         })
@@ -801,7 +809,7 @@ mod tests {
         assert_eq!(config.blocking_fs_reserve, 1);
         for (knob, value) in [
             ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "0"),
-            ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "5"),
+            ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "129"),
             ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "1.5"),
             ("ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE", "0"),
             ("ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE", "4"),
@@ -826,11 +834,12 @@ mod tests {
         let tuned = DeltaRuntimeConfig::from_lookup(|name| {
             Ok(match name {
                 "ARROWCOL_COLLECTOR_CPU_WORKERS" | "ARROWCOL_COLLECTOR_BLOCKING_WORKERS" => Some("4".to_owned()),
-                "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS" | "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE" => Some("2".to_owned()),
+                "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS" => Some("5".to_owned()),
+                "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE" => Some("2".to_owned()),
                 _ => None,
             })
         })?;
-        assert_eq!((tuned.cpu_queue_jobs, tuned.blocking_fs_reserve), (Some(2), 2));
+        assert_eq!((tuned.cpu_queue_jobs, tuned.blocking_fs_reserve), (Some(5), 2));
         Ok(())
     }
 

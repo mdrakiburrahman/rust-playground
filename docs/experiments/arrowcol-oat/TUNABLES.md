@@ -61,9 +61,15 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
 | `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
 | `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
-| `collector.runtime.blocking_fs_reserve` | Integer `1..=255`, default `1`, strictly less than resolved `blocking_workers`. Reserves blocking threads for filesystem handoffs. |
-| `collector.runtime.cpu_queue_jobs` | Integer `1..=128`, default resolved `cpu_workers`, no greater than resolved `cpu_workers`. Bounds queued CPU jobs without changing worker count. |
-| `logging.maintenance` | Inert when maintenance is disabled because no maintenance process is running; listed in the cell's `tunables_json.inert_fields` and `evidence_json.inert_fields`. |
+| `collector.runtime.blocking_fs_reserve` | Integer `1..=255`, default `1`, strictly less than `blocking_workers`. Values above `31` require an explicit `blocking_workers`; otherwise the host default is at least 32. Reserves blocking threads for filesystem handoffs. |
+| `collector.runtime.cpu_queue_jobs` | Integer `1..=128`, default resolved `cpu_workers`. Bounds queued CPU jobs independently of worker count. |
+| `logging.maintenance` | Inert when maintenance is disabled because no maintenance process is running; listed in the cell's `tunables_json.inert_fields` and `evidence_json.inert_fields`, and Darwin receipt `inert_fields`. A null receipt field means evidence was unavailable, not that no fields were inert. |
+| `maintenance.*` | Except for the `enabled` runner control, fields are inert when maintenance is disabled. Values remain range- and cross-field-validated; enabling the role also requires the corresponding operations. |
+| `parquet_writer.columns.<column>.dictionary_page_size_limit` | Inert if the same column explicitly disables dictionary encoding. Inert factors are not ranked or attributed effects. |
+
+Coverage evidence distinguishes runner controls, inert fields, and projected fields
+whose consumer startup verification is unproven. Missing coverage remains unknown;
+projection-only rates are marked and excluded from selection and effect claims.
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal

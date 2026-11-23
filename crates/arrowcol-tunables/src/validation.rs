@@ -347,8 +347,11 @@ const CAPABILITIES: &[Capability] = &[
         "maintenance.optimize_upload_buffer_bytes",
         "8388608; buffered_multipart only"
     ),
-    capability!("maintenance.interval_secs", "one-shot"),
-    capability!("maintenance.max_idle_backoff_secs", "3600"),
+    capability!("maintenance.interval_secs", "OAT: 60s; standalone CLI: one-shot"),
+    capability!(
+        "maintenance.max_idle_backoff_secs",
+        "OAT: chosen interval (60s when omitted); standalone CLI: 3600s"
+    ),
     capability!("maintenance.max_cycles", "unlimited"),
     capability!("maintenance.max_consecutive_stale_plans", "8; inclusive 1..=1024"),
     capability!("maintenance.max_concurrent_tables", "1"),
@@ -415,6 +418,94 @@ pub fn capability_table() -> &'static [Capability] {
 }
 
 impl Tunables {
+    /// Classifies explicitly configured, non-null leaves without parsing the serialized
+    /// representation back into a typed configuration. Startup verification is not
+    /// inferred from projection alone.
+    ///
+    /// # Errors
+    /// Returns an error for invalid settings or an unclassified leaf.
+    pub fn classify_oat_leaves(&self) -> Result<Value> {
+        self.validate_for_oat()?;
+        let requested = serde_json::to_value(self)?;
+        let maintenance_enabled = requested.pointer("/maintenance/enabled") == Some(&Value::Bool(true));
+        let mut inert_fields = Vec::new();
+        let mut projection_only = Vec::new();
+        let mut runner_controls = Vec::new();
+        fn visit(
+            value: &Value,
+            path: &mut Vec<String>,
+            maintenance_enabled: bool,
+            dictionary_disabled: bool,
+            inert: &mut Vec<Value>,
+            projection: &mut Vec<Value>,
+            controls: &mut Vec<Value>,
+        ) -> Result<()> {
+            if let Value::Object(object) = value {
+                let per_column =
+                    path.len() >= 3 && path[path.len() - 3] == "parquet_writer" && path[path.len() - 2] == "columns";
+                let disabled = per_column && object.get("dictionary_enabled") == Some(&Value::Bool(false));
+                for (key, value) in object {
+                    path.push(key.clone());
+                    visit(value, path, maintenance_enabled, disabled, inert, projection, controls)?;
+                    path.pop();
+                }
+                return Ok(());
+            }
+            if value.is_null() || path.is_empty() {
+                return Ok(());
+            }
+            let mut catalog_path: Vec<&str> = path.iter().map(String::as_str).collect();
+            if catalog_path.starts_with(&["maintenance", "parquet_writer"]) {
+                catalog_path.remove(0);
+            }
+            if catalog_path.len() >= 4 && catalog_path[0] == "parquet_writer" && catalog_path[1] == "columns" {
+                catalog_path[2] = "*";
+            }
+            let name = catalog_path.join(".");
+            if !CAPABILITIES.iter().any(|entry| entry.name == name) {
+                bail!("OAT tunable leaf missing from capability catalog: {}", path.join("."));
+            }
+            let name = path.join(".");
+            let (destination, reason) = if !maintenance_enabled
+                && (name == "logging.maintenance"
+                    || (name.starts_with("maintenance.") && name != "maintenance.enabled"))
+            {
+                (inert, "maintenance_disabled")
+            } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
+                (inert, "dictionary_disabled")
+            } else if matches!(
+                name.as_str(),
+                "maintenance.enabled" | "maintenance.operations" | "maintenance.apply"
+            ) {
+                (controls, "maintenance_runner_control")
+            } else if name == "logging.router" && value == "inherit" {
+                (controls, "router_log_filter_inheritance")
+            } else {
+                (projection, "consumer_startup_proof_unverified")
+            };
+            destination.push(serde_json::json!({"path":name,"reason":reason}));
+            Ok(())
+        }
+        visit(
+            &requested,
+            &mut Vec::new(),
+            maintenance_enabled,
+            false,
+            &mut inert_fields,
+            &mut projection_only,
+            &mut runner_controls,
+        )?;
+        for entries in [&mut inert_fields, &mut projection_only, &mut runner_controls] {
+            entries.sort_unstable_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        }
+        Ok(serde_json::json!({
+            "inert_fields": inert_fields,
+            "projection_only": projection_only,
+            "runner_controls": runner_controls,
+            "consumer_verified": [],
+        }))
+    }
+
     /// Parses and validates a complete OAT tunables object using the typed registry.
     ///
     /// # Errors
@@ -863,6 +954,13 @@ impl Tunables {
                 continue;
             }
             if section == "maintenance" {
+                if !self
+                    .maintenance
+                    .as_ref()
+                    .is_some_and(|settings| settings.enabled == Some(true))
+                {
+                    continue;
+                }
                 let mut value = section_value.clone();
                 if let Some(object) = value.as_object_mut() {
                     object.remove("enabled");
@@ -1506,48 +1604,25 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
             bail!("collector.runtime.{name} must be between {minimum} and {maximum}");
         }
     }
-    if let (Some(reserve), Some(workers)) = (runtime.blocking_fs_reserve, runtime.blocking_workers)
-        && reserve >= workers
-    {
-        bail!("collector.runtime.blocking_fs_reserve must be less than blocking_workers");
-    }
-    if let (Some(queue), Some(workers)) = (runtime.cpu_queue_jobs, runtime.cpu_workers)
-        && queue > workers
-    {
-        bail!("collector.runtime.cpu_queue_jobs must not exceed cpu_workers");
+    if let Some(reserve) = runtime.blocking_fs_reserve {
+        let workers = runtime.blocking_workers.unwrap_or(32);
+        if reserve >= workers {
+            bail!("collector.runtime.blocking_fs_reserve must be less than blocking_workers (minimum default 32)");
+        }
     }
     Ok(())
 }
 
 fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     let enabled = maintenance.enabled.unwrap_or(false);
-    let has_tunables = serde_json::to_value(maintenance)?.as_object().is_some_and(|object| {
-        object.iter().any(|(key, value)| match key.as_str() {
-            "enabled" | "apply" => value == true,
-            "operations" => value.as_array().is_some_and(|values| !values.is_empty()),
-            _ => !value.is_null(),
-        })
-    });
-    if !enabled {
-        if has_tunables {
-            bail!("maintenance settings require maintenance.enabled=true");
-        }
-        return Ok(());
-    }
-    let operations = maintenance
-        .operations
-        .as_deref()
-        .context("maintenance.enabled requires a nonempty operations list")?;
-    if operations.is_empty() {
+    let operations = maintenance.operations.as_deref().unwrap_or_default();
+    if enabled && operations.is_empty() {
         bail!("maintenance.enabled requires a nonempty operations list");
     }
     if operations.iter().collect::<std::collections::HashSet<_>>().len() != operations.len() {
         bail!("maintenance.operations must not contain duplicates");
     }
-    let has_operation = |operation| operations.contains(&operation);
-    if maintenance.apply == Some(true) && !enabled {
-        bail!("maintenance.apply=true requires maintenance.enabled=true");
-    }
+    let has_operation = |operation| !enabled || operations.contains(&operation);
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
     if maintenance.optimize_upload_mode.is_some() || maintenance.optimize_upload_buffer_bytes.is_some() {
         if !has_optimize {
@@ -2095,7 +2170,7 @@ mod tests {
         assert_eq!(env["ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE"], "2");
         for (field, value) in [
             ("cpu_queue_jobs", serde_json::json!(0)),
-            ("cpu_queue_jobs", serde_json::json!(5)),
+            ("cpu_queue_jobs", serde_json::json!(129)),
             ("cpu_queue_jobs", serde_json::json!("2")),
             ("cpu_queue_jobs", serde_json::json!(null)),
             ("blocking_fs_reserve", serde_json::json!(0)),
@@ -2106,6 +2181,21 @@ mod tests {
             let mut candidate = valid.clone();
             candidate["collector"]["runtime"][field] = value;
             assert!(Tunables::parse_oat_json(candidate).is_err(), "{field}");
+        }
+        let queue = serde_json::json!({"collector":{"runtime":{"cpu_workers":1,"cpu_queue_jobs":128}}});
+        let env = Tunables::parse_oat_json(queue)?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS"], "128");
+        for (reserve, workers, accepted) in [
+            (31, None, true),
+            (32, None, false),
+            (32, Some(32), false),
+            (32, Some(33), true),
+        ] {
+            let mut candidate = serde_json::json!({"collector":{"runtime":{"blocking_fs_reserve":reserve}}});
+            if let Some(workers) = workers {
+                candidate["collector"]["runtime"]["blocking_workers"] = serde_json::json!(workers);
+            }
+            assert_eq!(Tunables::parse_oat_json(candidate).is_ok(), accepted);
         }
         Ok(())
     }
@@ -2914,7 +3004,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(error_text(disabled.validate()).contains("enabled=true"));
+        disabled.validate_for_oat()?;
+        assert!(disabled.environment_for(ComponentRole::Maintenance)?.is_empty());
         let enabled_without_operations = Tunables {
             maintenance: Some(MaintenanceTunables {
                 enabled: Some(true),

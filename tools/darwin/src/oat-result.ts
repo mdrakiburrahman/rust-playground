@@ -11,6 +11,34 @@ import { assertParityEvidence } from "./parity-preflight.js";
 
 type JsonObject = Record<string, unknown>;
 
+export interface InertTunableField {
+  path: string;
+  reason: "maintenance_disabled" | "dictionary_disabled";
+}
+
+export interface ProjectionOnlyField {
+  path: string;
+  reason: "consumer_startup_proof_unverified";
+}
+
+function extractFields<R extends string>(evidence: JsonObject, key: string, reasons: readonly R[]): { path: string; reason: R }[] | null {
+  if (!Object.hasOwn(evidence, key)) return null;
+  if (!Array.isArray(evidence[key])) throw new Error(`invalid ${key}`);
+  const seen = new Set<string>();
+  return evidence[key].map((value: unknown) => {
+    const field = object(value, key);
+    const reason = reasons.find(candidate => candidate === field.reason);
+    if (Object.keys(field).length !== 2 || typeof field.path !== "string" || !field.path.trim()
+      || reason === undefined || seen.has(field.path)) throw new Error(`invalid ${key}`);
+    seen.add(field.path);
+    return { path: field.path, reason };
+  });
+}
+
+export function extractInertTunableFields(evidence: JsonObject): InertTunableField[] | null {
+  return extractFields(evidence, "inert_fields", ["maintenance_disabled", "dictionary_disabled"] as const);
+}
+
 function object(value: unknown, label: string): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as JsonObject;
@@ -218,6 +246,8 @@ export async function readReconciledOatResult(
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   parityTelemetry: JsonObject | null;
+  inert_fields: InertTunableField[] | null;
+  projection_only: ProjectionOnlyField[] | null;
   deliveryIdentity: JsonObject | null;
   diagnosticOnlyRealistic: boolean; diagnosticRealisticReconciliationVersion: number | null;
   kind?: "diagnostic-only";
@@ -272,6 +302,8 @@ export async function readReconciledOatResult(
   const cellRunId = row.run_id;
   const evidence = object(JSON.parse(evidenceJson), "OAT evidence");
   if (evidence.version !== 1 || !Array.isArray(evidence.processes)) throw new Error("OAT evidence version or processes are invalid");
+  const inertFields = extractInertTunableFields(evidence);
+  const projectionOnly = extractFields(evidence, "projection_only", ["consumer_startup_proof_unverified"] as const);
   const processes = evidence.processes.map(process => object(process, "OAT process"));
   const collectors = processes.filter(process => process.component === "collector");
   if (collectors.length !== 1) throw new Error("expected exactly one collector");
@@ -366,12 +398,13 @@ export async function readReconciledOatResult(
     measurement, images, clientEvidence, clientEvidences: clients.reports.map(report => report.evidence),
     clientEffectiveConfigs: clients.reports.map(report => report.config), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
+    inert_fields: inertFields, projection_only: projectionOnly,
     ...(diagnostic ? { kind: "diagnostic-only" as const } : {}), diagnosticOnlyRealistic: diagnostic !== undefined,
     diagnosticRealisticReconciliationVersion: diagnostic ? DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION : null,
     parityTelemetry: parity ? {
       backlog: evidence.backlog ?? null,
       backlog_budgets: object(object(object(parity.config, "parity config").tunables, "tunables").collector, "collector").batching,
-      effective_readback: { before_admission: evidence.parity_admission_readback,
+      effective_readback: { before_admission: evidence.parity_admission_readback, inert_fields: inertFields,
         collector: collector.effective_config, writer: collector.writer_policy_overrides,
         table_layout: collector.layout_table_policies, client: clients.reports[0]!.config,
         clients: clients.reports.map(report => report.config) },

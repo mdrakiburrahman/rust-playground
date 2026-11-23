@@ -1,19 +1,16 @@
 use arrowcol_tunables::ComponentRole;
 use otel_arrow_dfe_config::engine::EngineConfig;
 
-fn inert_tunable_fields(config: &OatConfig) -> Vec<Value> {
-    if !maintenance_enabled(config)
-        && config
-            .tunables
-            .logging
-            .as_ref()
-            .and_then(|logging| logging.maintenance)
-            .is_some()
-    {
-        vec![json!({"path": "logging.maintenance", "reason": "maintenance_disabled"})]
-    } else {
-        Vec::new()
-    }
+fn tunable_leaf_evidence(config: &OatConfig) -> Result<Value> {
+    config.tunables.classify_oat_leaves()
+}
+
+#[cfg(test)]
+fn inert_tunable_fields(config: &OatConfig) -> Result<Vec<Value>> {
+    Ok(tunable_leaf_evidence(config)?["inert_fields"]
+        .as_array()
+        .context("inert_fields must be an array")?
+        .clone())
 }
 
 fn capability_evidence() -> Vec<Value> {
@@ -23,6 +20,7 @@ fn capability_evidence() -> Vec<Value> {
             json!({
                 "name": capability.name,
                 "default": capability.default,
+                "consumer_startup_proof": "not_established_by_capability_catalog",
                 "boundary": match capability.boundary {
                     arrowcol_tunables::ApplyBoundary::PerCellRuntime => "per_cell_runtime",
                     arrowcol_tunables::ApplyBoundary::ProcessStartup => "process_startup",
@@ -79,7 +77,9 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             if config.platform.kind == crate::config::OatMode::Local
                 && (config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
                     || config.platform.local.partitioned_table_bootstrap)
-                && let Some(granularity) = config.tunables.maintenance.as_ref().and_then(|settings| settings.granularity)
+                && let Some(granularity) = config.tunables.maintenance.as_ref()
+                    .filter(|settings| settings.enabled == Some(true))
+                    .and_then(|settings| settings.granularity)
             {
                 let value = serde_json::to_value(granularity)?;
                 environment.insert(
@@ -505,6 +505,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         assert_eq!(bootstrap.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY"), Some(&json!("hour")));
         config.platform.local.partitioned_table_bootstrap = false;
         config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.enabled = Some(false);
+        let disabled = compose_tunables(&config)?;
+        assert!(disabled.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.enabled = Some(true);
         config.tunables.maintenance.as_mut().context("maintenance missing")?.granularity = None;
         let unset = compose_tunables(&config)?;
         assert!(unset.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());

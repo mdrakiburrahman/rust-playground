@@ -271,7 +271,12 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.to_ascii_lowercase();
-                    if !matches!(lower.as_str(), "authority_timeout" | "listener_tasks_per_fd")
+                    let public_endpoint_limit = matches!(
+                        lower.as_str(),
+                        "endpoint_concurrency_limit" | "endpoint_buffer_size"
+                    ) && value.as_u64().is_some();
+                    if !public_endpoint_limit
+                        && !matches!(lower.as_str(), "authority_timeout" | "listener_tasks_per_fd")
                         && ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
                             .iter()
                             .any(|private| lower.contains(private))
@@ -494,6 +499,7 @@ fn router_readback_path(variable: &str) -> Result<String> {
         | "MAX_TABLE_ENTRIES"
         | "MAX_OLDEST_BUFFER_AGE_MS"
         | "HARD_PRESSURE_BPS"
+        | "EXCLUDED_ADMISSION_GAUGES"
         | "WARMUP_MS"
         | "MINIMUM_WARMUP_BPS"
         | "LEASE_TTL_MS"
@@ -543,6 +549,16 @@ fn verify_process_configuration_recording(
         }
         if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
             expected = Value::Null;
+        }
+        if name == "ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES" {
+            expected = json!(
+                expected
+                    .as_str()
+                    .context("router excluded admission gauges must be comma separated")?
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+            );
         }
         if matches!(role, ComponentRole::Maintenance) && name == "ARROWCOL_MAINT_OPERATION_TIMEOUT_SECS" {
             continue;
@@ -1685,14 +1701,14 @@ mod startup_readback_tests {
         }))?;
         assert_eq!(process_evidence(&config, &[])?, json!([]));
         assert_eq!(
-            inert_tunable_fields(&config),
+            inert_tunable_fields(&config)?,
             vec![json!({"path":"logging.maintenance","reason":"maintenance_disabled"})]
         );
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "logging": {"maintenance": "warn"},
             "maintenance": {"enabled": true, "operations": ["optimize"]}
         }))?;
-        assert!(inert_tunable_fields(&config).is_empty());
+        assert!(inert_tunable_fields(&config)?.is_empty());
         Ok(())
     }
 
@@ -1716,9 +1732,105 @@ mod startup_readback_tests {
             .is_err()
         );
         let readback = process_configurations(
-            "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":1,\"secret_file\":\"private\",\"endpoint\":\"https://private\"}\n",
+            "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":1,\"secret_file\":\"private\",\"endpoint\":\"https://private\",\"endpoint_concurrency_limit\":12,\"endpoint_buffer_size\":14}\n",
         )?;
-        assert_eq!(readback, json!({"batch_rows":1}));
+        assert_eq!(readback, json!({"batch_rows":1,"endpoint_concurrency_limit":12,"endpoint_buffer_size":14}));
+        assert!(public_tuning_value(&json!({"endpoint_buffer_size":"https://private"}))
+            .is_some_and(|value| value == json!({})));
+        Ok(())
+    }
+
+    #[test]
+    fn router_excluded_gauges_require_matching_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "router": {"excluded_admission_gauges": ["cpu_utilization_bps", "active_streams"]}
+        }))?;
+        let log_filter = role_environment(&config, ComponentRole::Router)?["RUST_LOG"].clone();
+        let observed = json!({"log_filter": log_filter, "routing":{"excluded_admission_gauges":["cpu_utilization_bps","active_streams"]}});
+        verify_process_configuration(&config, ComponentRole::Router, &observed)?;
+        assert!(verify_process_configuration(&config, ComponentRole::Router, &json!({"routing":{}})).is_err());
+        assert!(verify_process_configuration(
+            &config, ComponentRole::Router, &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
+        ).is_err());
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "router": {"excluded_admission_gauges": []}
+        }))?;
+        verify_process_configuration(
+            &config, ComponentRole::Router, &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires cargo build --package arrowcol-router-rust"]
+    fn router_excluded_gauges_reach_actual_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "router": {"excluded_admission_gauges": ["cpu_utilization_bps", "active_streams"]}
+        }))?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let binary = root.join("target").join("debug")
+            .join(format!("arrowcol-router-rust{}", std::env::consts::EXE_SUFFIX));
+        let output = std::process::Command::new(binary)
+            .env_clear()
+            .envs(role_environment(&config, ComponentRole::Router)?)
+            .arg("--config")
+            .arg(root.join("projects/arrowcol-router-rust/config.smoke.yaml"))
+            .arg("--validate-and-exit")
+            .output()
+            .context("launch actual router for startup propagation")?;
+        anyhow::ensure!(output.status.success(), "router validation failed: {}", String::from_utf8_lossy(&output.stderr));
+        let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
+        let observed = process_configurations(&text)?;
+        verify_process_configuration(&config, ComponentRole::Router, &observed)
+    }
+
+    #[test]
+    fn parquet_policy_reaches_consumer_startup_configuration() -> Result<()> {
+        const CHILD: &str = "OAT_PARQUET_STARTUP_CHILD";
+        const PREFIX: &str = "OAT_PARQUET_STARTUP_READBACK ";
+        if std::env::var_os(CHILD).is_some() {
+            println!("{PREFIX}{}", arrow_deltalake::writer::effective_startup_config_json()?);
+            return Ok(());
+        }
+        let cases = [
+            json!({"defaults":{"compression":"uncompressed"}}),
+            json!({"defaults":{"compression":"snappy"}}),
+            json!({"defaults":{"compression":"gzip","compression_level":6}}),
+            json!({"defaults":{"compression":"brotli","compression_level":1}}),
+            json!({"defaults":{"compression":"lz4"}}),
+            json!({"defaults":{"compression":"lz4_raw"}}),
+            json!({"defaults":{"compression":"zstd","compression_level":3},
+                "columns":{"customer_id":{"compression":"snappy","dictionary_enabled":true}},
+                "writer_version":"v2","max_row_group_rows":16384,"max_row_group_bytes":1048576,
+                "data_page_row_count_limit":2048,"write_batch_size":512,
+                "offset_index_enabled":true,"column_index_truncate_length":64,
+                "statistics_truncate_length":64}),
+        ];
+        for policy in cases {
+            let mut config: OatConfig = serde_json::from_str(include_str!(
+                "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+            ))?;
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy}))?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "runner::startup_readback_tests::parquet_policy_reaches_consumer_startup_configuration", "--nocapture"])
+                .env_clear()
+                .env(CHILD, "1")
+                .envs(role_environment(&config, ComponentRole::Collector)?)
+                .output()?;
+            let stdout = String::from_utf8(output.stdout)?;
+            anyhow::ensure!(output.status.success(), "writer startup failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            let observed: Value = serde_json::from_str(stdout.lines()
+                .find_map(|line| line.split_once(PREFIX).map(|(_, json)| json))
+                .context("writer startup readback missing")?)?;
+            verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
+        }
         Ok(())
     }
 
@@ -1926,6 +2038,97 @@ mod startup_readback_tests {
             observed["runtime_threads"],
             observed["resolution"]["available_parallelism"]
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod consumer_startup_projection_tests {
+    use super::*;
+
+    fn actual_client_startup(binary: &Path, config: &OatConfig) -> Result<Value> {
+        let table = config.tables.first().context("startup fixture needs a table")?;
+        let mut command = std::process::Command::new(binary);
+        command.env_clear().envs(role_environment(config, ComponentRole::Client)?);
+        command.args([
+            "--endpoint", "http://127.0.0.1:0", "--table", table,
+            "--rows", &config.rows_per_table.to_string(),
+            "--concurrency", &config.dmv_concurrency.to_string(),
+        ]);
+        let output = command.output().context("launch actual client binary")?;
+        anyhow::ensure!(!output.status.success(), "unreachable endpoint unexpectedly succeeded");
+        let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
+        anyhow::ensure!(text.lines().any(|line| line.starts_with("OAT_CLIENT_EFFECTIVE_CONFIG ")),
+            "consumer omitted startup envelope");
+        process_configurations(&text)
+    }
+
+    // Real binary output, not a fabricated effective-config envelope. Each sample must
+    // differ from the same binary's baseline so a dropped env var cannot pass by default.
+    #[test]
+    #[ignore = "requires built arrowcol-dmv and an unreachable local endpoint"]
+    fn client_leaf_adapters_use_actual_consumer_startup() -> Result<()> {
+        let cases = [
+            (json!({"client":{"batch_rows":257}}), "batch_rows"),
+            (json!({"client":{"workers":7}}), "workers"),
+            (json!({"client":{"runtime_threads":5}}), "runtime_threads"),
+            (json!({"client":{"data_mode":"independent"}}), "data_mode"),
+            (json!({"client":{"cardinality":31}}), "cardinality"),
+            (json!({"client":{"seed":29}}), "seed"),
+            (json!({"client":{"interval_us":7}}), "interval_us"),
+            (json!({"client":{"connections_per_worker":3}}), "connections_per_worker"),
+            (json!({"client":{"streams_per_worker":7}}), "streams_per_worker"),
+            (json!({"client":{"pod_ordinal":3}}), "pod_ordinal"),
+            (json!({"client":{"stream_retry_max_attempts":3}}), "stream_retry_max_attempts"),
+            (json!({"client":{"stream_retry_base_backoff_ms":13}}), "stream_retry_base_backoff_ms"),
+            (json!({"client":{"stream_retry_max_backoff_ms":300}}), "stream_retry_max_backoff_ms"),
+            (json!({"transport":{"max_flight_data_bytes":1048576}}), "max_flight_data_bytes"),
+            (json!({"transport":{"max_message_bytes":8388608}}), "max_message_bytes"),
+            (json!({"transport":{"max_frame_bytes":32768}}), "max_frame_bytes"),
+            (json!({"transport":{"connect_timeout_ms":1234}}), "connect_timeout_ms"),
+            (json!({"transport":{"tcp_nodelay":false}}), "tcp_nodelay"),
+            (json!({"transport":{"endpoint_concurrency_limit":23}}), "endpoint_concurrency_limit"),
+            (json!({"transport":{"endpoint_buffer_size":37}}), "endpoint_buffer_size"),
+            (json!({"transport":{"ipc_compression":"zstd"}}), "ipc_compression"),
+            (json!({"arrow_ipc":{"compression":"zstd"}}), "ipc_compression"),
+        ];
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("target").join("debug")
+            .join(format!("arrowcol-dmv{}", std::env::consts::EXE_SUFFIX));
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        // Keep legacy sentinel resolutions deterministic and distinct from the test values.
+        config.rows_per_table = 128;
+        config.dmv_concurrency = 1;
+        config.tunables = arrowcol_tunables::Tunables::default();
+        let baseline = actual_client_startup(&binary, &config).context("read baseline client startup")?;
+        for (mut input, field) in cases {
+            // Automatic worker counts depend on the machine, so avoid accidental collisions.
+            if field == "workers" && baseline.get(field) == Some(&json!(7)) {
+                input["client"]["workers"] = json!(11);
+            }
+            if field == "runtime_threads" && baseline.get(field) == Some(&json!(5)) {
+                input["client"]["runtime_threads"] = json!(11);
+            }
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(input.clone())
+                .with_context(|| format!("invalid startup fixture {input}"))?;
+            let observed = actual_client_startup(&binary, &config)
+                .with_context(|| format!("read consumer startup for {input}"))?;
+            let actual = observed.get(field).with_context(|| format!("consumer omitted {field} for {input}"))?;
+            let default = baseline.get(field).with_context(|| format!("baseline omitted {field}"))?;
+            anyhow::ensure!(actual != default, "{field} did not differ from baseline for {input}");
+            verify_process_configuration(&config, ComponentRole::Client, &observed)
+                .with_context(|| format!("verify real consumer startup for {input}"))?;
+            let mut missing = observed.clone();
+            missing.as_object_mut().context("consumer startup is not an object")?.remove(field);
+            anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &missing).is_err(),
+                "adapter accepted missing {field} for {input}");
+            let mut wrong = observed;
+            wrong[field] = json!("intentional-mismatch");
+            anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &wrong).is_err(),
+                "adapter accepted wrong {field} for {input}");
+        }
         Ok(())
     }
 }

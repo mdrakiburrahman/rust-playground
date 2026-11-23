@@ -409,6 +409,177 @@ fn typed_oat_leaves_have_a_classification_and_reach_their_role() -> Result<()> {
 }
 
 #[test]
+fn accepted_typed_leaves_have_one_evidence_classification() -> Result<()> {
+    let mut errors = Vec::new();
+    for path in typed_leaves()? {
+        let mut values = candidates(&path);
+        if path == "maintenance.operations" {
+            values.push(json!(["optimize"]));
+        }
+        let Some(input) = values
+            .into_iter()
+            .map(|value| fixture(&path, value))
+            .find(|input| Tunables::parse_oat_json(input.clone()).is_ok())
+        else {
+            errors.push(format!("{path}: no accepted candidate"));
+            continue;
+        };
+        let evidence = Tunables::parse_oat_json(input)?
+            .classify_oat_leaves()
+            .with_context(|| format!("{path}: classify accepted input"))?;
+        let concrete = path.replace('*', "customer_id");
+        let count = ["inert_fields", "projection_only", "runner_controls"]
+            .iter()
+            .flat_map(|key| evidence[*key].as_array().expect("classification array"))
+            .filter(|item| item["path"] == concrete)
+            .count();
+        if count != 1 {
+            errors.push(format!("{path}: classified {count} times"));
+        }
+    }
+    assert!(errors.is_empty(), "classification mismatches:\n{}", errors.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn evidence_classification_uses_only_requested_non_null_leaves() -> Result<()> {
+    let input = json!({
+        "client": {"interval_us": 10, "max_rows": null},
+        "collector": {"upload": {"mode": "buffered_multipart", "request_concurrency": 2}},
+        "logging": {"maintenance": "warn", "router": "inherit"},
+        "maintenance": {"enabled": false},
+        "parquet_writer": {"defaults": {"compression": "gzip", "compression_level": 5,
+            "dictionary_enabled": false, "bloom_filter_fpp": 0.1}}
+    });
+    let evidence = Tunables::parse_oat_json(input)?.classify_oat_leaves()?;
+    assert_eq!(
+        evidence["inert_fields"],
+        json!([{
+            "path": "logging.maintenance", "reason": "maintenance_disabled"
+        }])
+    );
+    assert!(evidence["projection_only"].as_array().unwrap().iter().any(|entry| {
+        entry
+            == &json!({"path":"parquet_writer.defaults.bloom_filter_fpp",
+            "reason":"consumer_startup_proof_unverified"})
+    }));
+    assert!(evidence["projection_only"].as_array().unwrap().iter().any(|entry| {
+        entry
+            == &json!({"path":"collector.upload.request_concurrency",
+            "reason":"consumer_startup_proof_unverified"})
+    }));
+    assert!(!evidence.to_string().contains("client.max_rows"));
+    assert_eq!(
+        Tunables::parse_oat_json(json!({}))?.classify_oat_leaves()?,
+        json!({
+            "inert_fields": [], "projection_only": [], "runner_controls": [], "consumer_verified": []
+        })
+    );
+    assert_eq!(
+        Tunables::parse_oat_json(json!({"parquet_writer": {}}))?.classify_oat_leaves()?,
+        json!({
+            "inert_fields": [], "projection_only": [], "runner_controls": [], "consumer_verified": []
+        })
+    );
+    assert!(
+        Tunables::parse_oat_json(json!({
+            "collector": {"upload": {"mode":"put_create", "request_concurrency":2}}
+        }))
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn disabled_maintenance_controls_are_classified_without_a_worker() -> Result<()> {
+    let tunables = Tunables::parse_oat_json(json!({
+        "maintenance": {"enabled":false, "apply":false, "operations":[]},
+        "logging": {"maintenance":"warn"}
+    }))?;
+    let evidence = tunables.classify_oat_leaves()?;
+    assert_eq!(
+        evidence["inert_fields"],
+        json!([
+            {"path":"logging.maintenance", "reason":"maintenance_disabled"},
+            {"path":"maintenance.apply", "reason":"maintenance_disabled"},
+            {"path":"maintenance.operations", "reason":"maintenance_disabled"}
+        ])
+    );
+    assert_eq!(
+        evidence["runner_controls"],
+        json!([
+            {"path":"maintenance.enabled", "reason":"maintenance_runner_control"}
+        ])
+    );
+    let disabled = Tunables::parse_oat_json(json!({
+        "maintenance":{"enabled":false,"max_cycles":1,"granularity":"hour"}
+    }))?;
+    assert_eq!(
+        disabled.classify_oat_leaves()?["inert_fields"],
+        json!([
+            {"path":"maintenance.granularity", "reason":"maintenance_disabled"},
+            {"path":"maintenance.max_cycles", "reason":"maintenance_disabled"}
+        ])
+    );
+    assert!(disabled.environment_for(ComponentRole::Maintenance)?.is_empty());
+    assert!(
+        !disabled
+            .environment()?
+            .keys()
+            .any(|key| key.starts_with("ARROWCOL_MAINT_"))
+    );
+    assert!(
+        Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":false,"max_cycles":0}
+        }))
+        .is_err()
+    );
+    assert!(
+        Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"max_cycles":1}
+        }))
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn disabled_column_dictionary_makes_its_page_limit_inert() -> Result<()> {
+    let tunables = Tunables::parse_oat_json(json!({
+        "parquet_writer": {"columns": {"customer_id": {
+            "dictionary_enabled": false, "dictionary_page_size_limit": 4096
+        }}}
+    }))?;
+    assert_eq!(
+        tunables.classify_oat_leaves()?["inert_fields"],
+        json!([
+            {"path": "parquet_writer.columns.customer_id.dictionary_page_size_limit", "reason": "dictionary_disabled"}
+        ])
+    );
+    Ok(())
+}
+
+#[test]
+fn typed_serialization_null_defaults_do_not_hide_or_invent_requested_leaves() -> Result<()> {
+    let tunables = Tunables::parse_oat_json(json!({
+        "client":{"interval_us":0,"stream_retry_max_attempts":1},
+        "collector":{"runtime":{"cpu_workers":1}}
+    }))?;
+    let evidence = tunables.classify_oat_leaves()?;
+    assert_eq!(evidence["inert_fields"], json!([]));
+    assert_eq!(evidence["runner_controls"], json!([]));
+    assert_eq!(
+        evidence["projection_only"],
+        json!([
+            {"path":"client.interval_us", "reason":"consumer_startup_proof_unverified"},
+            {"path":"client.stream_retry_max_attempts", "reason":"consumer_startup_proof_unverified"},
+            {"path":"collector.runtime.cpu_workers", "reason":"consumer_startup_proof_unverified"}
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn upload_settings_project_without_a_runtime_section() -> Result<()> {
     for (upload, expected) in [
         (

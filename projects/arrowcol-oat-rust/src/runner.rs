@@ -4503,6 +4503,7 @@ fn result_rows(
     } else {
         None
     };
+    let leaf_evidence = tunable_leaf_evidence(config)?;
     let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
@@ -4525,7 +4526,10 @@ fn result_rows(
         "effective_stop_budgets": config.maintenance_stop_budget()?,
         "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
-        "inert_fields": inert_tunable_fields(config),
+        "inert_fields": leaf_evidence["inert_fields"],
+        "projection_only": leaf_evidence["projection_only"],
+        "runner_controls": leaf_evidence["runner_controls"],
+        "consumer_verified": leaf_evidence["consumer_verified"],
         "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
         "cpu_quota": cpu_quota_evidence,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
@@ -4638,7 +4642,10 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
-                evidence["inert_fields"] = json!(inert_tunable_fields(config));
+                evidence["inert_fields"] = leaf_evidence["inert_fields"].clone();
+                evidence["projection_only"] = leaf_evidence["projection_only"].clone();
+                evidence["runner_controls"] = leaf_evidence["runner_controls"].clone();
+                evidence["consumer_verified"] = leaf_evidence["consumer_verified"].clone();
                 evidence["ownership_samples"] = json!(client_run.pinning.samples);
                 if let Some(fleet) = &config.platform.fleet {
                     let mut pool_rates = BTreeMap::<String, f64>::new();
