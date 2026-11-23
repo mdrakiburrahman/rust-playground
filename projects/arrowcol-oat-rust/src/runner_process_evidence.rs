@@ -1675,6 +1675,19 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn disabled_maintenance_logging_does_not_require_a_process() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "logging": {"maintenance": "warn"},
+            "maintenance": {"enabled": false}
+        }))?;
+        assert_eq!(process_evidence(&config, &[])?, json!([]));
+        Ok(())
+    }
+
+    #[test]
     fn process_log_filter_fails_closed_when_retained_byte_cap_is_exceeded() {
         let mut output = String::new();
         let mut retained_bytes = MAX_RETAINED_PROCESS_LOG_BYTES;

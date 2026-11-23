@@ -697,7 +697,11 @@ impl Tunables {
                 ComponentRole::Client => None,
                 ComponentRole::Router => None,
                 ComponentRole::Collector => logging.collector,
-                ComponentRole::Maintenance => logging.maintenance,
+                ComponentRole::Maintenance => self
+                    .maintenance
+                    .as_ref()
+                    .filter(|settings| settings.enabled == Some(true))
+                    .and(logging.maintenance),
             });
             if let Some(level) = level {
                 selected.insert("RUST_LOG".to_owned(), level.as_str().to_owned());
@@ -2622,7 +2626,12 @@ mod tests {
             "trace,tiberius=error"
         );
         assert_eq!(config.environment_for(ComponentRole::Collector)?["RUST_LOG"], "info");
-        assert_eq!(config.environment_for(ComponentRole::Maintenance)?["RUST_LOG"], "warn");
+        assert!(config.environment_for(ComponentRole::Maintenance)?.is_empty());
+        let enabled = Tunables::parse_oat_json(serde_json::json!({
+            "logging": {"maintenance": "warn"},
+            "maintenance": {"enabled": true, "operations": ["optimize"]}
+        }))?;
+        assert_eq!(enabled.environment_for(ComponentRole::Maintenance)?["RUST_LOG"], "warn");
         for invalid in [
             r#"{"router":{"sql_pool_max_size":1025}}"#,
             r#"{"router":{"sql_pool_max_size":0,"sql_pool_acquire_timeout_ms":100}}"#,
