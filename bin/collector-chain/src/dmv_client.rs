@@ -558,8 +558,7 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
                 .checked_add(batch.rows)
                 .context("corpus table row count overflow")?;
             for (field, array) in batch.template.schema().fields().iter().zip(batch.template.columns()) {
-                if options.guid_uniqueness == Some(GuidUniqueness::PerRow)
-                    && field.data_type() == &DataType::Utf8
+                if field.data_type() == &DataType::Utf8
                     && is_guid_field(field.name())
                     && array.len() > array.null_count()
                 {
@@ -599,6 +598,10 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
                 "null_rows": counts.null_rows,
             },
             "pod_ordinal": {
+                "eligible_columns": if options.guid_uniqueness == Some(GuidUniqueness::PerRow) { counts.guid_columns.len() } else { 0 },
+                "eligible_rows": if options.guid_uniqueness == Some(GuidUniqueness::PerRow) { counts.guid_rows } else { 0 },
+            },
+            "guid_uniqueness": {
                 "eligible_columns": counts.guid_columns.len(),
                 "eligible_rows": counts.guid_rows,
             },
@@ -4583,6 +4586,10 @@ mod tests {
         );
         options.guid_uniqueness = Some(GuidUniqueness::Cardinality);
         let third = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        assert_ne!(
+            second.column_by_name("availability_group_id"),
+            third.column_by_name("availability_group_id")
+        );
         options.pod_ordinal = 4;
         assert_eq!(third, synthetic_batch(&table, "client", 8, 0, 0, &options)?);
         Ok(())
@@ -4939,6 +4946,7 @@ mod tests {
         assert_eq!(applicability["null_fraction"]["null_rows"], eligible_columns * 8);
         assert!(applicability["pod_ordinal"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
         assert!(applicability["pod_ordinal"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
+        assert_eq!(applicability["guid_uniqueness"], applicability["pod_ordinal"]);
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()

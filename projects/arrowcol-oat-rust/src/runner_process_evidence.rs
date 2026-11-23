@@ -3159,6 +3159,8 @@ groups:
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(0);
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"] =
             json!({"eligible_columns":1,"eligible_rows":8});
+        prepared["generator_applicability"]["tables"][0]["guid_uniqueness"] =
+            json!({"eligible_columns":1,"eligible_rows":8});
         let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
         let initial = tunable_leaf_evidence(&config)?;
         let report = json!({
@@ -3169,6 +3171,8 @@ groups:
         promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
         assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
             .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
+        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
         let mut absent = report.clone();
         absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
         let mut uncovered = initial.clone();
@@ -3181,7 +3185,9 @@ groups:
         let mut inert = initial;
         promote_client_readback(&config, &mut inert, Some(&vec![zero]))?;
         assert!(inert["inert_fields"].as_array().context("inert_fields array")?
-            .iter().any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_pod_ordinal_guid_rows"));
+            .iter().any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_eligible_guid_rows"));
+        assert!(inert["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         for (input, inactive, active) in [
