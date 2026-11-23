@@ -749,6 +749,35 @@ fn disabled_column_dictionary_makes_its_page_limit_inert() -> Result<()> {
 }
 
 #[test]
+fn dictionary_page_limits_follow_global_and_column_overrides() -> Result<()> {
+    for (enabled_override, default_inert) in [(false, true), (true, false)] {
+        let tunables = Tunables::parse_oat_json(json!({
+            "parquet_writer": {
+                "defaults":{"dictionary_enabled":false,"dictionary_page_size_limit":4096},
+                "columns":{
+                    "inherited":{"dictionary_page_size_limit":1024},
+                    "override":{"dictionary_enabled":enabled_override,"dictionary_page_size_limit":2048}
+                }
+            }
+        }))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        let inert = evidence["inert_fields"].as_array().context("missing inert fields")?;
+        let has = |path: &str| {
+            inert
+                .iter()
+                .any(|entry| entry["path"] == path && entry["reason"] == "dictionary_disabled")
+        };
+        assert_eq!(has("parquet_writer.defaults.dictionary_page_size_limit"), default_inert);
+        assert!(has("parquet_writer.columns.inherited.dictionary_page_size_limit"));
+        assert_eq!(
+            has("parquet_writer.columns.override.dictionary_page_size_limit"),
+            !enabled_override
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn typed_serialization_null_defaults_do_not_hide_or_invent_requested_leaves() -> Result<()> {
     let tunables = Tunables::parse_oat_json(json!({
         "client":{"interval_us":0,"stream_retry_max_attempts":1},

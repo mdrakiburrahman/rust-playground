@@ -525,20 +525,17 @@ impl Tunables {
         }
         fn visit(
             value: &Value,
+            requested: &Value,
             path: &mut Vec<String>,
             context: ClassificationContext,
-            dictionary_disabled: bool,
             inert: &mut Vec<Value>,
             projection: &mut Vec<Value>,
             controls: &mut Vec<Value>,
         ) -> Result<()> {
             if let Value::Object(object) = value {
-                let per_column =
-                    path.len() >= 3 && path[path.len() - 3] == "parquet_writer" && path[path.len() - 2] == "columns";
-                let disabled = per_column && object.get("dictionary_enabled") == Some(&Value::Bool(false));
                 for (key, value) in object {
                     path.push(key.clone());
-                    visit(value, path, context, disabled, inert, projection, controls)?;
+                    visit(value, requested, path, context, inert, projection, controls)?;
                     path.pop();
                 }
                 return Ok(());
@@ -559,6 +556,37 @@ impl Tunables {
                 .find(|entry| entry.name == name)
                 .with_context(|| format!("OAT tunable leaf missing from capability catalog: {}", path.join(".")))?;
             let name = path.join(".");
+            let dictionary_disabled = if path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
+                let writer = if path.first().is_some_and(|field| field == "maintenance") {
+                    requested.pointer("/maintenance/parquet_writer")
+                } else {
+                    requested.get("parquet_writer")
+                };
+                let defaults_disabled = writer.and_then(|writer| writer.pointer("/defaults/dictionary_enabled"))
+                    == Some(&Value::Bool(false));
+                let parts: Vec<&str> = path.iter().map(String::as_str).collect();
+                if let Some(position) = parts.iter().position(|part| *part == "columns") {
+                    let column = parts
+                        .get(position + 1)
+                        .and_then(|name| writer?.get("columns")?.get(*name));
+                    match column
+                        .and_then(|options| options.get("dictionary_enabled"))
+                        .and_then(Value::as_bool)
+                    {
+                        Some(enabled) => !enabled,
+                        None => defaults_disabled,
+                    }
+                } else if parts.contains(&"defaults") && defaults_disabled {
+                    !writer
+                        .and_then(|writer| writer.get("columns"))
+                        .and_then(Value::as_object)
+                        .is_some_and(|columns| columns.values().any(|column| column["dictionary_enabled"] == true))
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             let (destination, reason) = if !context.maintenance_enabled
                 && (name == "logging.maintenance"
                     || (name.starts_with("maintenance.") && name != "maintenance.enabled"))
@@ -597,6 +625,7 @@ impl Tunables {
         }
         visit(
             &requested,
+            &requested,
             &mut Vec::new(),
             ClassificationContext {
                 maintenance_enabled,
@@ -607,7 +636,6 @@ impl Tunables {
                 tcp_keepalive_disabled,
                 rate_limit_disabled,
             },
-            false,
             &mut inert_fields,
             &mut projection_only,
             &mut runner_controls,
