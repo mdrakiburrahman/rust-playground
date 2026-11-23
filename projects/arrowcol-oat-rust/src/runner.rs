@@ -8053,7 +8053,7 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
 
 #[cfg(test)]
 #[test]
-fn profile_hash_selects_and_validates_local_collector_image() {
+fn profile_hash_selects_and_validates_local_collector_image() -> Result<()> {
     let profile_hash = "a".repeat(64);
     assert_eq!(
         local_collector_profile_tag(&profile_hash),
@@ -8061,10 +8061,11 @@ fn profile_hash_selects_and_validates_local_collector_image() {
     );
     let observed = format!("sha256:{} {} {}", "b".repeat(64), "c".repeat(40), profile_hash);
     assert_eq!(
-        verify_collector_profile_image(&observed, &profile_hash).unwrap(),
+        verify_collector_profile_image(&observed, &profile_hash)?,
         format!("sha256:{}", "b".repeat(64))
     );
     assert!(verify_collector_profile_image(&observed, &"d".repeat(64)).is_err());
+    Ok(())
 }
 
 fn verify_collector_image(observed: &str, image_id: &str, source_revision: &str) -> Result<()> {
@@ -10824,15 +10825,16 @@ fn select_aks_collector_profile_image(runtime_config: &mut Value, profile_hash: 
 
 #[cfg(test)]
 #[test]
-fn aks_profile_hash_selects_digest_pinned_collector_image() {
+fn aks_profile_hash_selects_digest_pinned_collector_image() -> Result<()> {
     let hash = "a".repeat(64);
     let image = format!("registry.azurecr.io/dataflow@sha256:{}", "b".repeat(64));
     let mut runtime = json!({"images":{"dataflow":"registry.azurecr.io/dataflow@sha256:cccc"},
         "collectorBuildImages":{(hash.clone()):image.clone()}});
-    select_aks_collector_profile_image(&mut runtime, &hash).unwrap();
+    select_aks_collector_profile_image(&mut runtime, &hash)?;
     assert_eq!(runtime["images"]["dataflow"], image);
     assert_eq!(runtime["collectorBuildProfileHash"], hash);
     assert!(select_aks_collector_profile_image(&mut runtime, &"d".repeat(64)).is_err());
+    Ok(())
 }
 
 async fn prepare_aks_platform(
