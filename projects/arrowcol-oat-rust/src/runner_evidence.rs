@@ -412,6 +412,8 @@ struct PublicationBacklogSample {
     oldest_age_seconds: Option<f64>,
     status: Option<String>,
     unavailable_reason: Option<String>,
+    pipeline_stage_metrics: Option<Value>,
+    pipeline_stage_metrics_unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -422,6 +424,77 @@ struct PublicationBacklogMetrics {
     logical_bytes: Option<u64>,
     oldest_age_seconds: Option<f64>,
     status: String,
+    pipeline_stage_metrics: Option<Value>,
+    pipeline_stage_metrics_unavailable_reason: Option<String>,
+}
+
+fn parse_pipeline_histogram(text: &str, name: &str, stage: Option<&str>) -> Option<Value> {
+    let bucket_name = format!("{name}_bucket");
+    let count_name = format!("{name}_count");
+    let sum_name = format!("{name}_sum");
+    let mut buckets = BTreeMap::new();
+    let mut count = None;
+    let mut sum = None;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let mut fields = line.split_whitespace();
+        let Some(sample) = fields.next() else { continue };
+        let Some(value) = fields.next() else { continue };
+        if fields.next().is_some() {
+            continue;
+        }
+        let (metric, labels) = match sample.split_once('{') {
+            Some((metric, labels)) => (metric, labels.strip_suffix('}')?),
+            None => (sample, ""),
+        };
+        if metric != bucket_name && metric != count_name && metric != sum_name {
+            continue;
+        }
+        if !labels.contains("component=\"arrowcol-dataflow-rust\"")
+            || stage.is_some_and(|stage| !labels.contains(&format!("stage=\"{stage}\"")))
+            || stage.is_none() && labels.contains("stage=\"")
+        {
+            continue;
+        }
+        if metric == bucket_name {
+            let le = labels.split(",le=\"").nth(1)?.split('"').next()?;
+            let bucket = value.parse::<u64>().ok()?;
+            if buckets.insert(le.to_owned(), bucket).is_some() {
+                return None;
+            }
+        } else if metric == count_name {
+            if count.replace(value.parse::<u64>().ok()?).is_some() {
+                return None;
+            }
+        } else if metric == sum_name {
+            let parsed = value.parse::<f64>().ok()?;
+            if !parsed.is_finite() || sum.replace(parsed).is_some() {
+                return None;
+            }
+        }
+    }
+    let count = count?;
+    let sum = sum?;
+    if buckets.get("+Inf") != Some(&count)
+        || buckets.keys().any(|le| le != "+Inf" && !le.parse::<f64>().is_ok_and(|value| value.is_finite() && value >= 0.0))
+    {
+        return None;
+    }
+    let mut buckets = buckets.into_iter().collect::<Vec<_>>();
+    buckets.sort_by(|(left, _), (right, _)| {
+        let order = |le: &str| if le == "+Inf" { f64::INFINITY } else { le.parse::<f64>().unwrap_or(f64::INFINITY) };
+        order(left).total_cmp(&order(right))
+    });
+    let buckets = buckets.into_iter().map(|(le, count)| json!({"le":le,"count":count})).collect::<Vec<_>>();
+    Some(json!({"count":count,"sum_seconds":sum,"buckets":buckets}))
+}
+
+fn parse_pipeline_stage_metrics(text: &str) -> Option<Value> {
+    let stages = ["collect", "build", "sort", "encode", "upload", "commit"]
+        .into_iter()
+        .map(|stage| Some((stage.to_owned(), parse_pipeline_histogram(text, "arrowcol_pipeline_stage_duration_seconds", Some(stage))?)))
+        .collect::<Option<serde_json::Map<String, Value>>>()?;
+    let submission_wait = parse_pipeline_histogram(text, "arrowcol_pipeline_submission_wait_seconds", None)?;
+    Some(json!({"stage_duration_seconds":stages,"submission_wait_seconds":submission_wait}))
 }
 
 fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMetrics> {
@@ -490,6 +563,9 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
     let raw_bytes = get("arrowcol_publication_backlog_bytes")?;
     let raw_age = get("arrowcol_publication_backlog_oldest_age_seconds")?;
     let status = status.context("publication backlog exposition omitted status")?.to_owned();
+    let pipeline_stage_metrics = parse_pipeline_stage_metrics(text);
+    let pipeline_stage_metrics_unavailable_reason = pipeline_stage_metrics.is_none()
+        .then(|| "exporter_stage_histograms_missing_or_malformed".to_owned());
 
     if available {
         if status != "available" {
@@ -509,6 +585,8 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
             logical_bytes: Some(logical_bytes),
             oldest_age_seconds: Some(oldest_age_seconds),
             status,
+            pipeline_stage_metrics,
+            pipeline_stage_metrics_unavailable_reason,
         })
     } else {
         if status == "available"
@@ -525,6 +603,8 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
             logical_bytes: None,
             oldest_age_seconds: None,
             status,
+            pipeline_stage_metrics,
+            pipeline_stage_metrics_unavailable_reason,
         })
     }
 }
@@ -546,6 +626,8 @@ fn failed_publication_backlog_sample(
         oldest_age_seconds: None,
         status: None,
         unavailable_reason: Some(reason.to_owned()),
+        pipeline_stage_metrics: None,
+        pipeline_stage_metrics_unavailable_reason: Some(reason.to_owned()),
     }
 }
 
@@ -566,6 +648,8 @@ fn publication_backlog_sample(
         oldest_age_seconds: metrics.oldest_age_seconds,
         unavailable_reason: (!metrics.available).then(|| metrics.status.clone()),
         status: Some(metrics.status),
+        pipeline_stage_metrics: metrics.pipeline_stage_metrics,
+        pipeline_stage_metrics_unavailable_reason: metrics.pipeline_stage_metrics_unavailable_reason,
     }
 }
 
@@ -1639,6 +1723,23 @@ mod measurement_evidence_tests {
         )
     }
 
+    fn pipeline_histogram_exposition() -> String {
+        let mut output = String::from("process_cpu_seconds_total 123.0\n");
+        for stage in ["collect", "build", "sort", "encode", "upload", "commit"] {
+            let labels = format!("run=\"r\",variant=\"v\",component=\"arrowcol-dataflow-rust\",stage=\"{stage}\"");
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"0.5\"}} 1\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_sum{{{labels}}} 0.125\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_count{{{labels}}} 2\n"));
+        }
+        let labels = "run=\"r\",variant=\"v\",component=\"arrowcol-dataflow-rust\"";
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"0.5\"}} 1\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_sum{{{labels}}} 0.25\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_count{{{labels}}} 2\n"));
+        output
+    }
+
     #[tokio::test]
     async fn backlog_scrape_honors_the_actual_remaining_window_deadline() -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1683,6 +1784,18 @@ mod measurement_evidence_tests {
     }
 
     #[test]
+    fn pipeline_histogram_snapshots_preserve_all_stages_and_submission_wait() -> Result<()> {
+        let metrics = parse_pipeline_stage_metrics(&pipeline_histogram_exposition())
+            .context("pipeline histograms were not parsed")?;
+        assert_eq!(metrics["stage_duration_seconds"]["encode"]["count"], 2);
+        assert_eq!(metrics["stage_duration_seconds"]["upload"]["sum_seconds"], 0.125);
+        assert_eq!(metrics["stage_duration_seconds"]["commit"]["buckets"][1]["le"], "+Inf");
+        assert_eq!(metrics["submission_wait_seconds"]["count"], 2);
+        assert_eq!(metrics["submission_wait_seconds"]["sum_seconds"], 0.25);
+        Ok(())
+    }
+
+    #[test]
     fn publication_backlog_parser_preserves_unavailable_and_rejects_bad_gauges() -> Result<()> {
         let exposition = format!(
             "unrelated_metric 123 1700000000\n{}",
@@ -1698,6 +1811,8 @@ mod measurement_evidence_tests {
                 logical_bytes: Some(256),
                 oldest_age_seconds: Some(1.25),
                 status: "available".to_owned(),
+                pipeline_stage_metrics: None,
+                pipeline_stage_metrics_unavailable_reason: Some("exporter_stage_histograms_missing_or_malformed".to_owned()),
             }
         );
         let unavailable = parse_publication_backlog_metrics(&publication_backlog_exposition(

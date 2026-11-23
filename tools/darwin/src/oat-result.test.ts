@@ -133,7 +133,7 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       commits_by_version: [receipt, receipt, later] };
     const clients = [3, 2].map((completed_rows, index) => ({
       ...reportFor("realistic"),
-      execution_image: { source: "docker_container_inspect", image_id: `sha256:${"e".repeat(64)}` },
+      execution_image: { source: "docker_container_inspect", image_id: `sha256:${"e".repeat(64)}`, source_revision: "c".repeat(40) },
       consumer_effective_config: { workers: 14, streams_per_worker: 2 },
       phase_counters: { ...reportFor("realistic").phase_counters,
         payload_manifest: { ...reportFor("realistic").phase_counters.payload_manifest,
@@ -183,6 +183,23 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
           measurement_start_unix_ms: start + i * 30000, measurement_end_unix_ms: start + (i + 1) * 30000,
           window_seconds: 30, rows: i === 0 ? 3 : 0, parquet_bytes: i === 0 ? first.length : 0,
         })),
+      },
+      backlog: { samples: [{
+        request_start_unix_ms: start + 500, request_end_unix_ms: start + 600,
+        pipeline_stage_metrics: { stage_duration_seconds: { encode: { count: 2 } }, submission_wait_seconds: { count: 3 } },
+        pipeline_stage_metrics_unavailable_reason: null,
+      }], samples_dropped: 0 },
+      overload_guard: {
+        admission_diagnostics: { pressure_http_timings: [
+          { started_at_ms: start + 100, elapsed_ms: 50, status: "ok" },
+          { started_at_ms: start + 200, elapsed_ms: 1600, status: "timeout" },
+        ], pressure_http_timing_dropped: 0 },
+        complete_windows: [
+          { index: 0, ingestion_commits: 0, covered: true, outstanding: true },
+          { index: 1, ingestion_commits: 1, covered: true, outstanding: true },
+        ],
+        collector_rss_samples: [{ sampled_at_unix_ms: start, rss_bytes: 100, cap_bytes: 1000 }],
+        collector_rss_samples_dropped: 0,
       },
       resources: { samples: [] }, downstream_status: "unavailable", downstream_comment: "not measured",
     };
@@ -291,6 +308,19 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(result.measurement.rows, 3);
     assert.equal(result.activeRows, 5);
     assert.equal(result.measurement.durableRowsPerSecond, 3 / 150);
+    assert.deepEqual(result.measurement.completeBucketRows.map(bucket => bucket.rows), [3, 0, 0, 0, 0]);
+    assert.equal(result.diagnosticTelemetry.pressure_http_timings.count, 2);
+    assert.equal(result.diagnosticTelemetry.pressure_http_timings.p50_ms, 50);
+    assert.equal(result.diagnosticTelemetry.pressure_http_timings.p95_ms, 1600);
+    assert.equal(result.diagnosticTelemetry.pressure_http_timings.slow_or_timed_out_samples?.length, 1);
+    assert.equal(result.diagnosticTelemetry.zero_progress_window_count, 1);
+    assert.equal(result.diagnosticTelemetry.collector_rss_samples?.[0]!.rss_bytes, 100);
+    assert.equal(result.measurement.rssBytesMaxObserved, 100);
+    assert.equal(result.measurement.rssUnavailableReason, null);
+    assert.equal(result.clientImageSourceRevision, "c".repeat(40));
+    assert.equal(result.clientImageSourceRevisionUnavailableReason, null);
+    assert.equal(result.diagnosticTelemetry.pipeline_metric_samples?.length, 1);
+    assert.equal(result.diagnosticTelemetry.client_send_stalls, null);
     assert.deepEqual(decoded.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
     await assert.rejects(readReconciledOatResult(resultPath, join(root, "snapshots"), table, revision,
       { codec: "zstd", level: 3 }, "realistic", undefined, { tools, outputDir: root }, diagnostic),
@@ -451,7 +481,7 @@ test("rejects profile, hash contract, unavailable, and truncated evidence", () =
 
 test("extends the frozen window with complete stopped collector receipts", () => {
   const measurement: OatMeasurement = {
-    startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: 60, files: 1, commits: 1, completeBuckets: 5,
+    startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: 60, files: 1, commits: 1, completeBuckets: 5, completeBucketRows: [],
     durableRowsPerSecond: 3 / 150, parquetBytesPerRow: 20,
     commitLatencySeconds: { p50: 0.1, p99: 0.1, samples: 1 },
     cpuMillicoresMean: null, memoryBytesMaxObserved: null, rssBytesMaxObserved: null,

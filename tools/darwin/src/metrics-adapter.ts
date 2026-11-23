@@ -12,11 +12,12 @@ export interface OatMeasurement extends Measurement {
   files: number;
   commits: number;
   completeBuckets: number;
+  completeBucketRows: { index: number; startUnixMs: number; endUnixMs: number; rows: number; parquetBytes: number }[];
   commitLatencySeconds: { p50: number; p99: number; samples: number };
   cpuMillicoresMean: number | null;
   memoryBytesMaxObserved: number | null;
-  rssBytesMaxObserved: null;
-  rssUnavailableReason: string;
+  rssBytesMaxObserved: number | null;
+  rssUnavailableReason: string | null;
   resourceSampleCount: number;
   downstreamRowsPerSecond: null;
   downstreamUnavailableReason: string;
@@ -159,6 +160,7 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
   }
   let bucketRows = 0;
   let bucketBytes = 0;
+  const completeBucketRows: { index: number; startUnixMs: number; endUnixMs: number; rows: number; parquetBytes: number }[] = [];
   for (const [index, raw] of commits.complete_30_second_commit_windows.entries()) {
     const bucket = object(raw, "bucket");
     if (bucket.unavailable_reason != null
@@ -167,8 +169,12 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
       || bucket.window_seconds !== 30) {
       throw new Error("invalid or noncontiguous 30-second bucket");
     }
-    bucketRows += integer(bucket.rows, "bucket rows");
-    bucketBytes += integer(bucket.parquet_bytes, "bucket Parquet bytes");
+    const rowsInBucket = integer(bucket.rows, "bucket rows");
+    const parquetBytesInBucket = integer(bucket.parquet_bytes, "bucket Parquet bytes");
+    bucketRows += rowsInBucket;
+    bucketBytes += parquetBytesInBucket;
+    completeBucketRows.push({ index, startUnixMs: start + index * 30_000,
+      endUnixMs: start + (index + 1) * 30_000, rows: rowsInBucket, parquetBytes: parquetBytesInBucket });
     if (!Number.isSafeInteger(bucketRows) || !Number.isSafeInteger(bucketBytes)) {
       throw new Error("bucket totals overflow");
     }
@@ -213,6 +219,7 @@ export function adaptOatEvidence(input: unknown): OatMeasurement {
     files,
     commits: commitCount,
     completeBuckets: commits.complete_30_second_commit_windows.length,
+    completeBucketRows,
     durableRowsPerSecond: rate,
     parquetBytesPerRow: bytesPerRow,
     commitLatencySeconds: { p50, p99, samples: latencySamples },

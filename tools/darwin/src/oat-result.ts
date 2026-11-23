@@ -71,6 +71,134 @@ export function wasmCompression(spec: CompressionSpec): Compression {
   }
 }
 
+type DiagnosticTelemetry = {
+  pressure_http_timings: {
+    count: number | null;
+    p50_ms: number | null;
+    p95_ms: number | null;
+    p99_ms: number | null;
+    max_ms: number | null;
+    samples: JsonObject[] | null;
+    slow_or_timed_out_samples: JsonObject[] | null;
+    dropped: number | null;
+    quantile_method: "nearest_rank";
+    unavailable_reason: string | null;
+  };
+  zero_progress_window_count: number | null;
+  complete_windows: JsonObject[] | null;
+  zero_progress_windows_unavailable_reason: string | null;
+  collector_rss_samples: JsonObject[] | null;
+  collector_rss_samples_dropped: number | null;
+  collector_rss_unavailable_reason: string | null;
+  pipeline_metric_samples: JsonObject[] | null;
+  pipeline_metric_samples_unavailable_count: number | null;
+  pipeline_metric_samples_dropped: number | null;
+  pipeline_metrics_unavailable_reason: string | null;
+  client_send_stalls: null;
+  client_send_stalls_unavailable_reason: string;
+};
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(label + " must be a non-negative safe integer");
+  }
+  return value;
+}
+
+function extractDiagnosticTelemetry(evidence: JsonObject, measurement: OatMeasurement): DiagnosticTelemetry {
+  const unavailable = "overload guard evidence is missing";
+  const result: DiagnosticTelemetry = {
+    pressure_http_timings: { count: null, p50_ms: null, p95_ms: null, p99_ms: null, max_ms: null,
+      samples: null, slow_or_timed_out_samples: null, dropped: null, quantile_method: "nearest_rank",
+      unavailable_reason: unavailable },
+    zero_progress_window_count: null, complete_windows: null,
+    zero_progress_windows_unavailable_reason: unavailable,
+    collector_rss_samples: null, collector_rss_samples_dropped: null,
+    collector_rss_unavailable_reason: unavailable,
+    pipeline_metric_samples: null, pipeline_metric_samples_unavailable_count: null, pipeline_metric_samples_dropped: null,
+    pipeline_metrics_unavailable_reason: unavailable,
+    client_send_stalls: null, client_send_stalls_unavailable_reason: "OAT client evidence does not expose send-stall measurements; these are owned by the load generator.",
+  };
+  if (evidence.overload_guard == null) return result;
+  const guard = object(evidence.overload_guard, "overload guard evidence");
+  const admission = guard.admission_diagnostics == null
+    ? null : object(guard.admission_diagnostics, "guard admission diagnostics");
+  const rawTimings = admission?.pressure_http_timings;
+  if (admission && Array.isArray(rawTimings)) {
+    const samples = rawTimings.map((sample, index) => object(sample, "pressure HTTP timing sample " + index));
+    const elapsed = samples.map((sample, index) => nonNegativeInteger(sample.elapsed_ms, "pressure HTTP elapsed time " + index));
+    const sorted = [...elapsed].sort((a, b) => a - b);
+    const percentile = (fraction: number) => sorted.length ? sorted[Math.ceil(fraction * sorted.length) - 1]! : null;
+    const dropped = admission.pressure_http_timing_dropped;
+    result.pressure_http_timings = {
+      count: samples.length, p50_ms: percentile(0.5), p95_ms: percentile(0.95), p99_ms: percentile(0.99),
+      max_ms: sorted.length ? sorted[sorted.length - 1]! : null, samples,
+      slow_or_timed_out_samples: samples.filter((sample, index) => elapsed[index]! >= 1500 || sample.status === "timeout"),
+      dropped: typeof dropped === "number" ? nonNegativeInteger(dropped, "dropped pressure HTTP timing count") : null,
+      quantile_method: "nearest_rank",
+      unavailable_reason: samples.length === 0 ? "no pressure HTTP timing samples were recorded" : null,
+    };
+  } else {
+    result.pressure_http_timings.unavailable_reason = "pressure HTTP timings are missing from guard admission diagnostics";
+  }
+  if (Array.isArray(guard.complete_windows)) {
+    const windows = guard.complete_windows.map((window, index) => object(window, "guard complete window " + index));
+    result.complete_windows = windows;
+    result.zero_progress_window_count = windows.filter((window, index) => {
+      const commits = nonNegativeInteger(window.ingestion_commits, "window ingestion commits " + index);
+      return window.covered === true && window.outstanding === true && commits === 0;
+    }).length;
+    result.zero_progress_windows_unavailable_reason = windows.length ? null : "guard recorded no complete progress windows";
+  } else {
+    result.zero_progress_windows_unavailable_reason = "complete progress windows are missing from guard evidence";
+  }
+  if (Array.isArray(guard.collector_rss_samples)) {
+    result.collector_rss_samples = guard.collector_rss_samples.map((sample, index) => {
+      const parsed = object(sample, "collector RSS sample " + index);
+      return { sampled_at_unix_ms: nonNegativeInteger(parsed.sampled_at_unix_ms, "collector RSS sample timestamp"),
+        rss_bytes: nonNegativeInteger(parsed.rss_bytes, "collector RSS bytes"),
+        cap_bytes: nonNegativeInteger(parsed.cap_bytes, "collector RSS cap bytes") };
+    });
+    const dropped = guard.collector_rss_samples_dropped;
+    result.collector_rss_samples_dropped = typeof dropped === "number"
+      ? nonNegativeInteger(dropped, "dropped collector RSS sample count") : null;
+    result.collector_rss_unavailable_reason = result.collector_rss_samples.length
+      ? null : typeof guard.collector_rss_unavailable_reason === "string"
+        ? guard.collector_rss_unavailable_reason : "no collector RSS samples were recorded";
+  } else {
+    result.collector_rss_unavailable_reason = "collector RSS samples are missing from guard evidence";
+  }
+  const backlog = evidence.backlog == null ? null : object(evidence.backlog, "publication backlog evidence");
+  if (Array.isArray(backlog?.samples)) {
+    const matching = backlog.samples.map((sample, index) => object(sample, "backlog sample " + index)).filter(sample => {
+      const started = nonNegativeInteger(sample.request_start_unix_ms, "backlog sample start");
+      return started >= measurement.startUnixMs && started < measurement.endUnixMs;
+    });
+    const pipelineSamples: JsonObject[] = [];
+    const unavailableReasons: string[] = [];
+    for (const sample of matching) {
+      if (sample.pipeline_stage_metrics != null) {
+        pipelineSamples.push({
+          request_start_unix_ms: sample.request_start_unix_ms,
+          request_end_unix_ms: sample.request_end_unix_ms,
+          metrics: object(sample.pipeline_stage_metrics, "pipeline stage metrics"),
+        });
+      } else if (typeof sample.pipeline_stage_metrics_unavailable_reason === "string") {
+        unavailableReasons.push(sample.pipeline_stage_metrics_unavailable_reason);
+      }
+    }
+    result.pipeline_metric_samples = pipelineSamples.length ? pipelineSamples : null;
+    result.pipeline_metric_samples_unavailable_count = matching.length - pipelineSamples.length;
+    result.pipeline_metric_samples_dropped = typeof backlog.samples_dropped === "number"
+      ? nonNegativeInteger(backlog.samples_dropped, "dropped backlog sample count") : null;
+    result.pipeline_metrics_unavailable_reason = pipelineSamples.length
+      ? null : unavailableReasons[0] ?? "no exporter stage histogram samples in the measurement window";
+  } else {
+    result.pipeline_metrics_unavailable_reason = "publication backlog samples are missing";
+  }
+  return result;
+}
+
 export interface ClientEvidence {
   profile: ClientDataProfile;
   identityEligibleForReconciliation: boolean;
@@ -218,6 +346,9 @@ export async function readReconciledOatResult(
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   parityTelemetry: JsonObject | null;
+  diagnosticTelemetry: DiagnosticTelemetry;
+  clientImageSourceRevision: string | null;
+  clientImageSourceRevisionUnavailableReason: string | null;
   deliveryIdentity: JsonObject | null;
   diagnosticOnlyRealistic: boolean; diagnosticRealisticReconciliationVersion: number | null;
   kind?: "diagnostic-only";
@@ -312,6 +443,15 @@ export async function readReconciledOatResult(
   images.push(`client:${clients.image}`);
   images.sort();
   const measurement = adaptOatEvidence(evidence);
+  const diagnosticTelemetry = extractDiagnosticTelemetry(evidence, measurement);
+  if (diagnosticTelemetry.collector_rss_samples?.length) {
+    measurement.rssBytesMaxObserved = diagnosticTelemetry.collector_rss_samples
+      .map(sample => nonNegativeInteger(sample.rss_bytes, "collector RSS bytes"))
+      .reduce((maximum, value) => Math.max(maximum, value), 0);
+    measurement.rssUnavailableReason = null;
+  } else {
+    measurement.rssUnavailableReason = diagnosticTelemetry.collector_rss_unavailable_reason;
+  }
   const canonicalTable = `telemetry.sqlserver.${table}`;
   const stoppedPath = join(snapshotRoot, row.run_id, "stopped.json");
   const stoppedStat = await lstat(stoppedPath);
@@ -364,6 +504,9 @@ export async function readReconciledOatResult(
     `${JSON.stringify(identityResult.value)}\n`, { flag: "wx", mode: 0o400 });
   return {
     measurement, images, clientEvidence, clientEvidences: clients.reports.map(report => report.evidence),
+    diagnosticTelemetry,
+    clientImageSourceRevision: typeof client.source_revision === "string" ? client.source_revision : null,
+    clientImageSourceRevisionUnavailableReason: typeof client.source_revision === "string" ? null : "client image has no source revision label",
     clientEffectiveConfigs: clients.reports.map(report => report.config), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
     ...(diagnostic ? { kind: "diagnostic-only" as const } : {}), diagnosticOnlyRealistic: diagnostic !== undefined,
