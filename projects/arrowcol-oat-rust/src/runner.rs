@@ -3566,7 +3566,7 @@ async fn run_isolated_cell(
             return outcome;
         }
     };
-    let (result, cancelled) = tokio::select! {
+    let (mut result, cancelled) = tokio::select! {
         result = async {
             platform.prebuild(&config).await.context("untimed prebuild of local OAT images and initializer")?;
             let lifecycle_started_at = tokio::time::Instant::now();
@@ -3638,6 +3638,20 @@ async fn run_isolated_cell(
         evidence
     });
     let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
+    if !cancelled
+        && config.platform.kind == crate::config::OatMode::Local
+        && let Ok(rows) = &mut result
+        && let Err(error) = attach_local_delta_reconciliation(&config, &run_id, rows, cleanup.is_ok())
+    {
+        for row in rows {
+            row.status = "failed".to_owned();
+            let message = format!("attach local Delta reconciliation: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+    }
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
@@ -3704,6 +3718,53 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
         evidence["shutdown_drain"] = shutdown_drain.clone();
         row.evidence_json =
             Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
+    }
+    Ok(())
+}
+
+fn attach_local_delta_reconciliation(
+    config: &OatConfig,
+    run_id: &str,
+    rows: &mut [OatResult],
+    cleanup_confirmed: bool,
+) -> Result<()> {
+    for row in rows {
+        let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
+        let mut evidence: Value =
+            serde_json::from_str(evidence_json).context("parse cell evidence before local Delta reconciliation")?;
+        let durable = evidence.get("durable_commits").cloned().unwrap_or(Value::Null);
+        let reconciliation = if !cleanup_confirmed {
+            unavailable_local_delta_reconciliation("local_snapshot_unavailable_after_cleanup_failure")
+        } else if let Some(snapshot_root) = config.platform.local.snapshot_root.as_deref() {
+            let root = Path::new(snapshot_root);
+            match crate::local::stopped_snapshot_references(root, run_id, &config.tables) {
+                Ok(_) => {
+                    let log_path = root.join(run_id).join(&row.table).join("table").join("_delta_log");
+                    reconcile_local_delta_log(&log_path, &durable)
+                }
+                Err(error) => {
+                    unavailable_local_delta_reconciliation(format!("stopped_snapshot_verification_failed: {error:#}"))
+                }
+            }
+        } else {
+            unavailable_local_delta_reconciliation("snapshot_root_not_configured")
+        };
+        if !evidence["durable_commits"].is_object() {
+            evidence["durable_commits"] = json!({});
+        }
+        evidence["durable_commits"]["delta_log_reconciliation"] = reconciliation.clone();
+        evidence["screen_v1"] = reconciliation["csv"].clone();
+        evidence["screen_v1_csv_reason"] = reconciliation["csv_reason"].clone();
+        if reconciliation["status"] == "mismatch" {
+            row.status = "failed".to_owned();
+            let failure = "local_delta_log_reconciliation_mismatch";
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {failure}"),
+                None => failure.to_owned(),
+            });
+        }
+        row.evidence_json =
+            Some(serde_json::to_string(&evidence).context("serialize cell evidence with local Delta reconciliation")?);
     }
     Ok(())
 }

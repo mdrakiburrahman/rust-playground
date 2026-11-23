@@ -8,8 +8,8 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tableFromArrays, tableFromIPC, tableToIPC } from 'apache-arrow';
 import { Table as WasmTable, readParquet, writeParquet } from 'parquet-wasm';
-import { assertLocalFailedDisposition, inspectPinnedPreloadFailure, localDispositionSuffix, recordLocalFailedDisposition } from './local-failed-disposition.js';
-import { main as launchMain } from './launch.js';
+import { assertLocalFailedDisposition, inspectPinnedPreloadFailure, localDispositionSuffix, recordLocalFailedDisposition, reconcileAndQuarantineLocalFailedReceipt } from './local-failed-disposition.js';
+import { assertNoUnsettledDeadlineReceipts, main as launchMain } from './launch.js';
 import { readReconciledOatResult } from '../../tools/darwin/src/oat-result.js';
 import { runOat } from '../../tools/darwin/src/replay.js';
 
@@ -25,7 +25,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
   const run = '123e4567-e89b-42d3-a456-426614174002';
   const cell = '123e4567-e89b-42d3-a456-426614174003';
   const resultPath = path.join(runRoot, 'results.parquet');
-  const markerPath = path.join(runRoot, 'original-ownership-marker.json');
+  const markerPath = path.join(stateRoot, '.arrowcol-oat-owner-123.json');
   const logPath = path.join(runRoot, 'run.log');
   const receiptPath = path.join(receiptRoot, `${invocation}.json`);
   const project = 'arrowcol-oat-hi-123e4567e89b42d3a456426614174003';
@@ -46,7 +46,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     const run = '123e4567-e89b-42d3-a456-426614174002';
     const cell = '123e4567-e89b-42d3-a456-426614174003';
     const resultPath = path.join(runRoot, 'results.parquet');
-    const markerPath = path.join(runRoot, 'original-ownership-marker.json');
+    const markerPath = path.join(stateRoot, '.arrowcol-oat-owner-123.json');
     const logPath = path.join(runRoot, 'run.log');
     const receiptPath = path.join(receiptRoot, `${invocation}.json`);
     const project = 'arrowcol-oat-hi-123e4567e89b42d3a456426614174003';
@@ -107,13 +107,15 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
       docker: (_args: string[]) => '',
       processStartTicks: async (_pid: number) => undefined,
       bootId: async () => '123e4567-e89b-42d3-a456-426614174004',
+      listeningSockets: (_port: number) => '',
     };
     const proof = await inspectPinnedPreloadFailure(receiptPath, markerPath, pins, env);
     assert.equal(proof.kind, 'verified-preload-failed-cleanup-read-only');
     assert.equal(proof.disposition, 'not-recorded');
     assert.equal(proof.underlying_error, 'not-established-from-retained-artifacts');
     assert.deepEqual(await Promise.all(files.map(file => readFile(file))), original);
-    await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env), /Invalid overload evidence/);
+    await recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env);
+    await unlink(receiptPath + localDispositionSuffix);
     const sourcePath = fileURLToPath(new URL('./local-failed-disposition.ts', import.meta.url));
     const source = await readFile(sourcePath, 'utf8');
     const pinDeclaration = /const reviewedPreloadPins: PreloadProofPins = Object\.freeze\(\{[\s\S]*?\n\}\);/g;
@@ -330,7 +332,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
   };
   const table = tableFromArrays({
     run_id: [cell], mode: ['local'], status: [resultStatus], pinning_ok: [false], table: ['test_table'],
-    evidence_json: [JSON.stringify({ overload_guard: { run_id: cell } })],
+    evidence_json: [JSON.stringify({ overload_guard: { run_id: cell }, rows: { delta_committed: null } })],
   });
   await writeFile(resultPath, writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream'))));
   await writeFile(receiptPath, JSON.stringify(receipt));
@@ -341,6 +343,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     docker: (_args: string[]) => '',
     processStartTicks: async (_pid: number) => undefined,
     bootId: async () => '123e4567-e89b-42d3-a456-426614174004',
+      listeningSockets: (_port: number) => '',
   };
   if (resultStatus === 'pinning_violation') {
     await writeFile(receiptPath, JSON.stringify({
@@ -351,7 +354,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     await writeFile(receiptPath, originals[0]!);
     const invalid = tableFromArrays({
       run_id: [cell], mode: ['local'], status: [resultStatus], pinning_ok: [true], table: ['test_table'],
-      evidence_json: [JSON.stringify({ overload_guard: { run_id: cell } })],
+      evidence_json: [JSON.stringify({ overload_guard: { run_id: cell }, rows: { delta_committed: null } })],
     });
     await writeFile(resultPath, writeParquet(WasmTable.fromIPCStream(tableToIPC(invalid, 'stream'))));
     await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env), /Failed cell identity mismatch/);
@@ -376,4 +379,106 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
   await writeFile(receiptPath, originals[0]!);
   await writeFile(logPath, 'altered');
   await assert.rejects(assertLocalFailedDisposition(receiptPath, dispositionPath, env), /Run log does not bind/);
+});
+
+test('operator quarantine archives only failed pre-measurement receipts with verified zero-resource custody', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-operator-quarantine-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const receiptRoot = path.join(root, 'deadline-receipts');
+  const runRoot = path.join(root, 'run');
+  const stateRoot = path.join(runRoot, 'state');
+  await mkdir(receiptRoot);
+  await mkdir(stateRoot, { recursive: true });
+  const invocation = '123e4567-e89b-42d3-a456-426614174101';
+  const run = '123e4567-e89b-42d3-a456-426614174102';
+  const cell = '123e4567-e89b-42d3-a456-426614174103';
+  const resultPath = path.join(runRoot, 'result.parquet');
+  const markerPath = path.join(stateRoot, '.arrowcol-oat-owner-123.json');
+  const logPath = path.join(runRoot, 'run.log');
+  const receiptPath = path.join(receiptRoot, `${invocation}.json`);
+  const project = `arrowcol-oat-hi-${cell.replace(/-/g, '').slice(0, 32)}`;
+  const body = JSON.stringify({
+    platform: { kind: 'local', compose_project: 'arrowcol-oat-historical-parity', compose_state_root: stateRoot },
+    result_url: pathToFileURL(resultPath).href, tables: ['test_table'], replica_counts: [1], dfe_worker_concurrency: [32],
+  });
+  const hash = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex');
+  const configHash = hash(body);
+  const marker = {
+    version: 1, runId: run, ownerPid: 2147483601, ownerStartTicks: '100', serverPid: 2147483602, serverStartTicks: '200',
+    serverUrl: 'http://127.0.0.1:1234/', serverExecutable: '/tmp/oat',
+    submitted_config_body: body, submitted_config_sha256: configHash, source_config_sha256: 'a'.repeat(64),
+  };
+  const error = 'collector failed before measurement';
+  const receipt = {
+    version: 1, invocation_id: invocation, run_id: run, creation_state: 'accepted', run_state: 'failed',
+    started_at_unix_ms: 1, started_at_monotonic_ms: 1, deadline_at_unix_ms: null, deadline_seconds: null,
+    deadline_at_monotonic_ms: null, cleanup_deadline_at_unix_ms: null, overrun: false, overrun_at_unix_ms: null,
+    cancellation_attempts: 0, last_cancel_result: null, error: null, cleanup_state: 'unsettled', config_binding_error: null,
+    server_pid: marker.serverPid, server_start_ticks: marker.serverStartTicks, server_executable: marker.serverExecutable,
+    server_url: marker.serverUrl, submitted_config_body: body, submitted_config_sha256: configHash,
+    source_config_sha256: marker.source_config_sha256,
+    terminal_observation: {
+      observed_at_unix_ms: 10,
+      status: { id: run, state: 'failed', config_sha256: configHash, progress: 'failed', result_count: 1,
+        error, started_at_unix_ms: 2, finished_at_unix_ms: 9 },
+    },
+  };
+  const evidence = {
+    overload_guard: null, overload_stop: null, preload_delta: null, durable_rows_per_second: null,
+    client_schedule: null, client_phase_reports: null, durable_commits: null, durable_bytes: null,
+    rows: { delta_committed: null },
+  };
+  const table = tableFromArrays({
+    run_id: [cell], mode: ['local'], status: ['failed'], table: ['test_table'],
+    evidence_json: [JSON.stringify(evidence)],
+  });
+  const resultBytes = writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream')));
+  await writeFile(resultPath, resultBytes);
+  await writeFile(receiptPath, JSON.stringify(receipt));
+  await writeFile(markerPath, JSON.stringify(marker));
+  await writeFile(logPath, `${run} ${project} ${error}`);
+  const env = {
+    docker: (_args: string[]) => '',
+    processStartTicks: async (_pid: number) => undefined,
+    bootId: async () => '123e4567-e89b-42d3-a456-426614174104',
+    listeningSockets: (_port: number) => '',
+  };
+  await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, {
+    ...env, docker: () => 'owned-container',
+  }), /resources remain/);
+  assert.equal(await readFile(receiptPath, 'utf8'), JSON.stringify(receipt));
+  assert.equal((await readFile(markerPath, 'utf8')), JSON.stringify(marker));
+  await assert.rejects(readFile(path.join(root, 'operator-quarantine', invocation)), { code: 'ENOENT' });
+
+  let cliInvoked = false;
+  await launchMain(['--reconcile-failed-local', invocation, markerPath], undefined, undefined, receiptRoot,
+    undefined, undefined, undefined, undefined, async (actualRoot, actualInvocation, actualMarker) => {
+      cliInvoked = true;
+      assert.equal(actualRoot, receiptRoot);
+      assert.equal(actualInvocation, invocation);
+      assert.equal(actualMarker, path.resolve(markerPath));
+      return { invocation_id: invocation, disposition: 'tested' };
+    });
+  assert.equal(cliInvoked, true);
+
+  const record = await reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env);
+  const quarantineDir = path.join(root, 'operator-quarantine', invocation);
+  assert.equal(record.disposition, 'failed_before_measurement_quarantined_not_settled');
+  assert.equal(record.receipt_sha256, hash(JSON.stringify(receipt)));
+  assert.deepEqual(JSON.parse(await readFile(path.join(quarantineDir, `${invocation}.json`), 'utf8')), receipt);
+  await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });
+  await assert.rejects(readFile(markerPath), { code: 'ENOENT' });
+  await assertNoUnsettledDeadlineReceipts(receiptRoot);
+
+  const archivedEvidence = record.archived_evidence_files;
+  assert.ok(Array.isArray(archivedEvidence));
+  const archivedResultEntry = archivedEvidence.find((item: unknown) => typeof item === 'object' && item !== null &&
+    'name' in item && item.name === 'result' && 'path' in item && typeof item.path === 'string');
+  assert.ok(archivedResultEntry && typeof archivedResultEntry === 'object' && 'path' in archivedResultEntry &&
+    typeof archivedResultEntry.path === 'string');
+  const archivedResult = path.join(quarantineDir, archivedResultEntry.path);
+  await writeFile(archivedResult, 'tampered');
+  await assert.rejects(assertNoUnsettledDeadlineReceipts(receiptRoot), /archive digest mismatch/);
+  await writeFile(archivedResult, resultBytes);
+  await assertNoUnsettledDeadlineReceipts(receiptRoot);
 });

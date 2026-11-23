@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arrowcol_tunables::{
-    CollectorBuildProfile, CollectorTargetCpu, DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, Tunables,
+    ClientDataProfile, ClientTunables, CollectorBuildProfile, CollectorTargetCpu,
+    DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, DataMode, Tunables,
 };
 use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,67 @@ pub struct OatConfig {
     pub result_url: String,
     #[serde(default)]
     pub website_url: String,
+}
+
+fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurrency: usize) -> Result<()> {
+    const DEFAULT_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+    const CORPUS_RESERVATION_NUMERATOR: u64 = 40_014;
+    const CORPUS_RESERVATION_DENOMINATOR: u64 = 10_000;
+    const LIVE_SLOT_RESERVATION_BYTES: u64 = 260_000_000;
+    const EXTRA_RESERVATION_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let Some(client) = client else { return Ok(()) };
+    let Some(corpus_bytes) = client.corpus_bytes.filter(|bytes| *bytes > 0) else {
+        return Ok(());
+    };
+    let data_mode = client.data_mode.unwrap_or(DataMode::Shared);
+    let data_profile = client.data_profile.unwrap_or(ClientDataProfile::Diagnostic);
+    let needs_worker_count = data_mode == DataMode::Independent || data_profile == ClientDataProfile::Realistic;
+    let workers = if needs_worker_count {
+        client
+            .workers
+            .filter(|workers| *workers > 0)
+            .unwrap_or(std::thread::available_parallelism()?.get())
+    } else {
+        1
+    };
+    let streams = if data_profile == ClientDataProfile::Realistic {
+        client
+            .streams_per_worker
+            .filter(|streams| *streams > 0)
+            .unwrap_or(concurrency)
+    } else {
+        0
+    };
+    let copies = if data_mode == DataMode::Independent { workers } else { 1 };
+    let effective_corpus_bytes = corpus_bytes
+        .checked_mul(u64::try_from(copies)?)
+        .context("client corpus copy reservation overflow")?;
+    let corpus_reservation_bytes = effective_corpus_bytes
+        .checked_mul(CORPUS_RESERVATION_NUMERATOR)
+        .and_then(|bytes| bytes.checked_add(CORPUS_RESERVATION_DENOMINATOR - 1))
+        .context("client conservative corpus reservation overflow")?
+        / CORPUS_RESERVATION_DENOMINATOR;
+    let live_slots = workers
+        .checked_mul(streams)
+        .context("client configured live-slot count overflow")?;
+    let live_slot_reservation_bytes = u64::try_from(live_slots)?
+        .checked_mul(LIVE_SLOT_RESERVATION_BYTES)
+        .context("client live-slot reservation overflow")?;
+    let required_bytes = corpus_reservation_bytes
+        .checked_add(live_slot_reservation_bytes)
+        .and_then(|bytes| bytes.checked_add(EXTRA_RESERVATION_BYTES))
+        .context("client conservative workload reservation overflow")?;
+    let max_memory_bytes = client.max_memory_bytes.unwrap_or(DEFAULT_MAX_MEMORY_BYTES);
+    if max_memory_bytes < required_bytes {
+        bail!(
+            "tunables.client.max_memory_bytes={} is below the conservative workload reservation of {} bytes (corpus_bytes={}, data_mode={data_mode:?}, configured_live_slots={live_slots}); increase max_memory_bytes or reduce corpus size, workers, or streams_per_worker",
+            max_memory_bytes,
+            required_bytes,
+            corpus_bytes,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -247,6 +309,7 @@ impl FleetPlacement {
                 ..Default::default()
             }
             .validate_for_oat()?;
+            validate_client_memory_reservation(Some(&client.tunables), client.dmv_concurrency)?;
         }
         let mut pools = HashSet::new();
         for pool in &self.pools {
@@ -1152,6 +1215,7 @@ impl OatConfig {
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;
         self.tunables.validate_for_oat()?;
+        validate_client_memory_reservation(self.tunables.client.as_ref(), self.dmv_concurrency)?;
         self.validate_platform_resources()?;
         self.maintenance_stop_budget()?;
         self.validate_selected_parquet_schemas()?;
@@ -1694,6 +1758,34 @@ mod tests {
         );
         config.platform.local.setup_timeout_ms = Some(45_000);
         assert_eq!(config.timing_budget()?.pre_cell_setup_timeout_ms, 45_000);
+        Ok(())
+    }
+
+    #[test]
+    fn client_memory_preflight_rejects_underreserved_corpora_before_setup() -> Result<()> {
+        let mut config = valid();
+        config.tunables.client = Some(ClientTunables {
+            corpus_bytes: Some(5 * 1024 * 1024 * 1024),
+            max_memory_bytes: Some(10 * 1024 * 1024 * 1024),
+            workers: Some(1),
+            streams_per_worker: Some(4),
+            data_profile: Some(ClientDataProfile::Realistic),
+            ..Default::default()
+        });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("conservative workload reservation"), "{error}");
+        assert!(error.contains("configured_live_slots=4"), "{error}");
+
+        config.tunables.client.as_mut().unwrap().max_memory_bytes = Some(24 * 1024 * 1024 * 1024);
+        config.validate()?;
+
+        let client = config.tunables.client.as_mut().unwrap();
+        client.data_profile = Some(ClientDataProfile::Diagnostic);
+        client.data_mode = Some(DataMode::Independent);
+        client.workers = Some(2);
+        client.max_memory_bytes = Some(24 * 1024 * 1024 * 1024);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("conservative workload reservation"), "{error}");
         Ok(())
     }
 

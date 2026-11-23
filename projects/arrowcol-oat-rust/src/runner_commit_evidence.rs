@@ -697,6 +697,414 @@ async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> 
     }))
 }
 
+
+#[derive(Default)]
+struct LocalDeltaCommitMetadata {
+    operation: Option<String>,
+    operation_mode: Option<String>,
+    timestamp_unix_ms: Option<u64>,
+}
+
+fn parse_local_delta_commit(version: u64, contents: &[u8]) -> Result<(LocalDeltaCommitMetadata, BTreeMap<(u64, String), DeltaLogAdd>)> {
+    let mut metadata = LocalDeltaCommitMetadata::default();
+    let mut adds = BTreeMap::new();
+    for (line_number, line) in contents.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() { continue; }
+        let action: Value = serde_json::from_slice(line)
+            .with_context(|| format!("invalid Delta log JSON at line {}", line_number + 1))?;
+        if let Some(info) = action.get("commitInfo") {
+            if let Some(operation) = info.get("operation").and_then(Value::as_str) {
+                metadata.operation = Some(operation.to_owned());
+            }
+            metadata.operation_mode = info.pointer("/operationParameters/mode")
+                .and_then(Value::as_str).map(str::to_owned);
+            metadata.timestamp_unix_ms = info.get("timestamp").and_then(Value::as_i64)
+                .and_then(|timestamp| u64::try_from(timestamp).ok());
+        }
+        let Some(add) = action.get("add") else { continue; };
+        match add.get("dataChange") {
+            None | Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => continue,
+            Some(_) => bail!("Delta add dataChange must be a boolean"),
+        }
+        let path = add.get("path").and_then(Value::as_str).filter(|path| !path.is_empty())
+            .context("Delta add action omitted its path")?;
+        let stats = match add.get("stats") {
+            Some(Value::String(stats)) => serde_json::from_str::<Value>(stats)
+                .context("Delta add action has invalid stats JSON")?,
+            Some(Value::Object(_)) => add["stats"].clone(),
+            _ => bail!("Delta add action omitted row statistics"),
+        };
+        let rows = stats.get("numRecords").and_then(Value::as_u64)
+            .context("Delta add statistics omitted numRecords")?;
+        let bytes = add.get("size").and_then(Value::as_u64)
+            .context("Delta add action omitted file size")?;
+        let identity = (version, path.to_owned());
+        let record = DeltaLogAdd { rows, bytes };
+        if let Some(previous) = adds.insert(identity, record) && previous != record {
+            bail!("conflicting duplicate Delta add action");
+        }
+    }
+    Ok((metadata, adds))
+}
+
+fn unavailable_local_delta_reconciliation(reason: impl Into<String>) -> Value {
+    let reason = reason.into();
+    json!({
+        "version": 1, "status": "unavailable", "reconciliation_state": "unavailable",
+        "unavailable_reason": reason, "csv_reason": format!("reconciliation unavailable: {reason}"),
+        "csv": {
+            "started_utc": null, "ended_utc": null, "durable_rows_per_s": null,
+            "durable_rows": null, "committed_add_actions": null, "bytes_per_row": null,
+            "compression_ratio": null, "latency_p50_ms": null, "latency_p99_ms": null,
+            "files_written": null, "commits_written": null,
+        },
+    })
+}
+
+#[derive(Clone, Copy)]
+struct LocalCommitReceipt {
+    version: u64, rows: u64, files: u64, input_bytes: u64, parquet_bytes: u64,
+    min_ingested_at_ms: u64, max_ingested_at_ms: u64, finished_at_unix_ms: u64,
+}
+
+fn local_commit_receipt(value: &Value) -> Result<LocalCommitReceipt> {
+    let number = |field: &str| value.get(field).and_then(Value::as_u64)
+        .with_context(|| format!("commit receipt omitted valid {field}"));
+    Ok(LocalCommitReceipt {
+        version: number("delta_version")?, rows: number("rows")?, files: number("files")?,
+        input_bytes: number("input_bytes")?, parquet_bytes: number("parquet_bytes")?,
+        min_ingested_at_ms: number("min_ingested_at_ms")?, max_ingested_at_ms: number("max_ingested_at_ms")?,
+        finished_at_unix_ms: number("finished_at_unix_ms")?,
+    })
+}
+
+fn reconcile_local_delta_log(delta_log: &Path, durable: &Value) -> Value {
+    match reconcile_local_delta_log_inner(delta_log, durable) {
+        Ok(value) => value,
+        Err(error) => unavailable_local_delta_reconciliation(format!("{error:#}")),
+    }
+}
+
+fn reconcile_local_delta_log_inner(delta_log: &Path, durable: &Value) -> Result<Value> {
+    let window = durable.get("output_throughput").context("output_throughput absent")?;
+    if let Some(reason) = window.get("unavailable_reason").and_then(Value::as_str) {
+        bail!("output_throughput unavailable: {reason}");
+    }
+    let start = window["measurement_start_unix_ms"].as_u64()
+        .context("measurement window start missing or invalid")?;
+    let end = window["measurement_end_unix_ms"].as_u64()
+        .context("measurement window end missing or invalid")?;
+    ensure!(end > start, "measurement window is empty or reversed");
+    let window_seconds = (end - start) as f64 / 1000.0;
+    let receipt_values = durable.pointer("/run_cumulative_output/commits_by_version")
+        .and_then(Value::as_array).context("commit receipts (commits_by_version) absent")?;
+    if let Some(reason) = durable.pointer("/run_cumulative_output/unavailable_reason").and_then(Value::as_str) {
+        bail!("run_cumulative_output unavailable: {reason}");
+    }
+    let mut receipts_by_version = BTreeMap::new();
+    let mut receipt_errors = Vec::new();
+    for value in receipt_values {
+        match local_commit_receipt(value) {
+            Ok(receipt) => {
+                if receipts_by_version.insert(receipt.version, receipt).is_some() {
+                    return Ok(local_delta_mismatch("duplicate receipts for the same Delta version",
+                        json!({"duplicate_receipt_version": receipt.version})));
+                }
+            }
+            Err(error) => receipt_errors.push(format!("{error:#}")),
+        }
+    }
+    if !receipt_errors.is_empty() { bail!("{}", receipt_errors.join("; ")); }
+    let selected = receipts_by_version.values()
+        .filter(|receipt| receipt.finished_at_unix_ms >= start && receipt.finished_at_unix_ms < end)
+        .copied().collect::<Vec<_>>();
+    let sum = |field: fn(&LocalCommitReceipt) -> u64| -> Result<u64> {
+        selected.iter().try_fold(0_u64, |total, receipt| {
+            total.checked_add(field(receipt)).context("in-window receipt totals overflow")
+        })
+    };
+    let receipt_totals = json!({
+        "rows": sum(|receipt| receipt.rows)?, "files": sum(|receipt| receipt.files)?,
+        "input_bytes": sum(|receipt| receipt.input_bytes)?, "parquet_bytes": sum(|receipt| receipt.parquet_bytes)?,
+    });
+    for field in ["rows", "files", "input_bytes", "parquet_bytes"] {
+        let expected = window[field].as_u64().with_context(|| format!("window {field} missing or invalid"))?;
+        if receipt_totals[field].as_u64() != Some(expected) {
+            return Ok(local_delta_mismatch(format!("window {field} differs from in-window receipt total"),
+                json!({"window_value": expected, "receipt_value": receipt_totals[field]})));
+        }
+    }
+
+    let mut present_versions = BTreeSet::new();
+    for entry in fs::read_dir(delta_log).context("Delta log directory unreadable")? {
+        let entry = entry.context("read Delta log directory entry")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(version_text) = name.strip_suffix(".json") else { continue; };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) { continue; }
+        let metadata = fs::symlink_metadata(entry.path()).context("inspect Delta log JSON file")?;
+        ensure!(metadata.file_type().is_file(), "Delta log JSON entry is not a regular file");
+        present_versions.insert(version_text.parse::<u64>().context("Delta log filename version invalid")?);
+        ensure!(present_versions.len() <= 10_000, "Delta log exceeds the 10,000-file evidence bound");
+    }
+
+    let mut observed_rows = 0_u64;
+    let mut observed_files = 0_u64;
+    let mut observed_bytes = 0_u64;
+    let mut operations = BTreeMap::<String, u64>::new();
+    let mut oldest_latency_ms = Vec::new();
+    let mut newest_latency_ms = Vec::new();
+    for receipt in &selected {
+        let path = delta_log.join(format!("{:020}.json", receipt.version));
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Delta version {} missing", receipt.version))?;
+        ensure!(metadata.file_type().is_file(), "receipted Delta version is not a regular file");
+        ensure!(metadata.len() <= 64 * 1024 * 1024, "Delta version JSON exceeds the 64 MiB evidence bound");
+        let contents = fs::read(&path).context("read receipted Delta version JSON")?;
+        let (commit, adds) = parse_local_delta_commit(receipt.version, &contents)
+            .with_context(|| format!("parse Delta version {}", receipt.version))?;
+        let (rows, files, bytes) = adds.values().try_fold((0_u64, 0_u64, 0_u64), |(rows, files, bytes), add| {
+            Some((rows.checked_add(add.rows)?, files.checked_add(1)?, bytes.checked_add(add.bytes)?))
+        }).context("Delta add totals overflow")?;
+        if (rows, files, bytes) != (receipt.rows, receipt.files, receipt.parquet_bytes) {
+            return Ok(local_delta_mismatch(format!("Delta version {} Adds differ from its commit receipt", receipt.version),
+                json!({"delta_version": receipt.version,
+                    "observed": {"rows": rows, "files": files, "parquet_bytes": bytes},
+                    "receipt": {"rows": receipt.rows, "files": receipt.files, "parquet_bytes": receipt.parquet_bytes}})));
+        }
+        observed_rows = observed_rows.checked_add(rows).context("Delta row total overflow")?;
+        observed_files = observed_files.checked_add(files).context("Delta file total overflow")?;
+        observed_bytes = observed_bytes.checked_add(bytes).context("Delta byte total overflow")?;
+        let operation = commit.operation.unwrap_or_else(|| "unknown".to_owned());
+        let operation_key = commit
+            .operation_mode
+            .map_or_else(|| operation.clone(), |mode| format!("{operation}/{mode}"));
+        *operations.entry(operation_key).or_default() += 1;
+        oldest_latency_ms.push(receipt.finished_at_unix_ms.saturating_sub(receipt.min_ingested_at_ms));
+        newest_latency_ms.push(receipt.finished_at_unix_ms.saturating_sub(receipt.max_ingested_at_ms));
+    }
+
+    let span = selected.first().zip(selected.last()).map(|(first, last)| (first.version, last.version));
+    let mut candidates = present_versions.clone();
+    if let Some((first, last)) = span {
+        ensure!(last - first <= 10_000, "receipt version span exceeds the 10,000-version evidence bound");
+        for version in first..=last {
+            let path = delta_log.join(format!("{version:020}.json"));
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("Delta JSON missing inside receipt version span at {version}"))?;
+            ensure!(metadata.file_type().is_file(), "Delta JSON inside receipt version span is not a regular file");
+            candidates.insert(version);
+        }
+    }
+    let maintenance_operations = ["DELETE", "UPDATE", "MERGE", "RESTORE", "REORG", "OPTIMIZE"];
+    let mut interleaved_maintenance = BTreeMap::<String, u64>::new();
+    let mut unreceipted_checked = 0_u64;
+    for version in candidates {
+        if receipts_by_version.contains_key(&version) { continue; }
+        let in_span = span.is_some_and(|(first, last)| version >= first && version <= last);
+        let path = delta_log.join(format!("{version:020}.json"));
+        let contents = match fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) if in_span => return Err(error).with_context(|| format!("unreceipted version {version} inside receipt span is missing")),
+            Err(_) => continue,
+        };
+        ensure!(contents.len() <= 64 * 1024 * 1024, "Delta version JSON exceeds the 64 MiB evidence bound");
+        let (commit, adds) = match parse_local_delta_commit(version, &contents) {
+            Ok(parsed) => parsed,
+            Err(_) if !in_span => continue,
+            Err(error) => return Err(error).with_context(|| format!("parse unreceipted Delta version {version}")),
+        };
+        let in_window = commit.timestamp_unix_ms.is_some_and(|timestamp| timestamp >= start && timestamp < end);
+        if !in_span && !in_window { continue; }
+        unreceipted_checked = unreceipted_checked.checked_add(1).context("unreceipted version count overflow")?;
+        let operation = commit.operation.unwrap_or_else(|| "unknown".to_owned());
+        if !adds.is_empty() && !maintenance_operations.contains(&operation.as_str()) {
+            return Ok(local_delta_mismatch(format!("unreceipted version {version} ({operation}) contains data-changing Adds"),
+                json!({"delta_version": version, "operation": operation, "data_change_adds": adds.len()})));
+        }
+        let key = if adds.is_empty() { operation } else { format!("{operation} (data-changing rewrite, excluded)") };
+        *interleaved_maintenance.entry(key).or_default() += 1;
+    }
+
+    let percentile = |values: &mut Vec<u64>, p: usize| -> Option<u64> {
+        if values.is_empty() { return None; }
+        values.sort_unstable();
+        Some(values[(values.len() * p).div_ceil(100).saturating_sub(1).min(values.len() - 1)])
+    };
+    let p50 = percentile(&mut oldest_latency_ms, 50);
+    let p99 = percentile(&mut oldest_latency_ms, 99);
+    let newest_p50 = percentile(&mut newest_latency_ms, 50);
+    let newest_p99 = percentile(&mut newest_latency_ms, 99);
+    let start_utc = i64::try_from(start).ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let end_utc = i64::try_from(end).ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let bytes_per_row = (observed_rows > 0).then_some(observed_bytes as f64 / observed_rows as f64);
+    let input_bytes = receipt_totals["input_bytes"].as_u64().unwrap_or_default();
+    let compression_ratio = (observed_bytes > 0).then_some(input_bytes as f64 / observed_bytes as f64);
+    let csv = json!({
+        "started_utc": start_utc, "ended_utc": end_utc,
+        "durable_rows_per_s": observed_rows as f64 / window_seconds, "durable_rows": observed_rows,
+        "committed_add_actions": observed_files, "bytes_per_row": bytes_per_row,
+        "compression_ratio": compression_ratio, "latency_p50_ms": p50, "latency_p99_ms": p99,
+        "files_written": observed_files, "commits_written": selected.len(),
+    });
+    Ok(json!({
+        "version": 1, "status": "matched", "reconciliation_state": "reconciled",
+        "scope": "local_stopped_delta_snapshot_receipts_selected_by_finished_at_in_half_open_window",
+        "window": {"measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": window_seconds},
+        "receipts": {"total": receipt_values.len(), "in_window": selected.len(),
+            "version_span": span.map(|(first, last)| json!([first, last]))},
+        "receipt_totals": receipt_totals,
+        "observed": {
+            "durable_rows": observed_rows, "committed_add_actions": observed_files, "parquet_bytes": observed_bytes,
+            "durable_rows_per_s": observed_rows as f64 / window_seconds, "bytes_per_row": bytes_per_row,
+            "compression_ratio": compression_ratio,
+            "ingest_to_commit_oldest_row_ms": {"p50": p50, "p99": p99, "commits": selected.len()},
+            "ingest_to_commit_newest_row_ms": {"p50": newest_p50, "p99": newest_p99},
+        },
+        "collector_operations": operations, "interleaved_maintenance": interleaved_maintenance,
+        "unreceipted_versions_checked": unreceipted_checked, "csv": csv, "csv_reason": null,
+    }))
+}
+
+fn local_delta_mismatch(reason: impl Into<String>, details: Value) -> Value {
+    let reason = reason.into();
+    let mut result = unavailable_local_delta_reconciliation(format!("reconciliation mismatch: {reason}"));
+    result["status"] = json!("mismatch");
+    result["reconciliation_state"] = json!("mismatch");
+    result["unavailable_reason"] = Value::Null;
+    result["mismatch_reason"] = json!(reason);
+    result["details"] = details;
+    result["csv_reason"] = json!(format!("reconciliation mismatch: {reason}"));
+    result
+}
+
+
+#[cfg(test)]
+mod local_delta_reconciliation_tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("arrowcol-local-delta-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path { &self.0 }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    fn receipt(version: u64, rows: u64, files: u64, input: u64, bytes: u64, min: u64, max: u64, finish: u64) -> Value {
+        json!({
+            "delta_version": version, "rows": rows, "files": files, "input_bytes": input,
+            "parquet_bytes": bytes, "min_ingested_at_ms": min, "max_ingested_at_ms": max,
+            "finished_at_unix_ms": finish, "elapsed_seconds": 0.1,
+        })
+    }
+
+    fn add(path: &str, rows: u64, bytes: u64, data_change: bool) -> Value {
+        json!({"add": {
+            "path": path, "size": bytes, "dataChange": data_change,
+            "stats": json!({"numRecords": rows}).to_string(),
+        }})
+    }
+
+    fn write_version(root: &Path, version: u64, operation: &str, timestamp: u64, actions: &[Value]) -> Result<()> {
+        let mut lines = vec![serde_json::to_string(&json!({"commitInfo": {
+            "timestamp": timestamp, "operation": operation,
+        }}))?];
+        lines.extend(actions.iter().map(serde_json::to_string).collect::<std::result::Result<Vec<_>, _>>()?);
+        fs::write(root.join(format!("{version:020}.json")), lines.join("\n") + "\n")?;
+        Ok(())
+    }
+
+    fn evidence() -> Value {
+        json!({
+            "output_throughput": {
+                "measurement_start_unix_ms": 1_000, "measurement_end_unix_ms": 109_000,
+                "rows": 15, "files": 2, "input_bytes": 900, "parquet_bytes": 400,
+            },
+            "run_cumulative_output": {"commits_by_version": [
+                receipt(0, 99, 1, 100, 50, 900, 950, 999),
+                receipt(1, 10, 1, 600, 300, 1_005, 1_008, 1_010),
+                receipt(3, 5, 1, 300, 100, 1_040, 1_045, 1_050),
+                receipt(4, 77, 1, 100, 50, 108_000, 108_500, 109_000),
+            ]},
+        })
+    }
+
+    fn complete_log(root: &Path, middle: Value) -> Result<()> {
+        write_version(root, 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
+        write_version(root, 2, "OPTIMIZE", 1_020, &[middle])?;
+        write_version(root, 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        Ok(())
+    }
+
+    #[test]
+    fn reconciles_half_open_receipts_and_emits_screen_v1_metrics() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        complete_log(directory.path(), add("rewrite.parquet", 15, 390, false))?;
+        let result = reconcile_local_delta_log(directory.path(), &evidence());
+        assert_eq!(result["status"], "matched");
+        assert_eq!(result["receipts"]["in_window"], 2);
+        assert_eq!(result["observed"]["durable_rows"], 15);
+        assert_eq!(result["observed"]["committed_add_actions"], 2);
+        assert_eq!(result["csv"]["durable_rows"], 15);
+        assert_eq!(result["csv"]["commits_written"], 2);
+        assert_eq!(result["csv"]["latency_p50_ms"], 5);
+        assert_eq!(result["csv"]["latency_p99_ms"], 10);
+        assert_eq!(result["interleaved_maintenance"]["OPTIMIZE"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_in_span_json_is_unavailable_and_receipt_add_divergence_is_mismatch() -> Result<()> {
+        let missing = TestDirectory::new()?;
+        write_version(missing.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
+        write_version(missing.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        assert_eq!(reconcile_local_delta_log(missing.path(), &evidence())["status"], "unavailable");
+
+        let mismatch = TestDirectory::new()?;
+        write_version(mismatch.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 9, 300, true)])?;
+        write_version(mismatch.path(), 2, "OPTIMIZE", 1_020, &[add("rewrite.parquet", 15, 390, false)])?;
+        write_version(mismatch.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        let result = reconcile_local_delta_log(mismatch.path(), &evidence());
+        assert_eq!(result["status"], "mismatch");
+        assert!(result["csv"]["durable_rows"].is_null());
+
+        let mut bad_window_totals = evidence();
+        bad_window_totals["output_throughput"]["rows"] = json!(16);
+        assert_eq!(reconcile_local_delta_log(mismatch.path(), &bad_window_totals)["status"], "mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn unreceipted_data_adds_fail_except_for_allowed_maintenance_rewrites() -> Result<()> {
+        let ordinary = TestDirectory::new()?;
+        write_version(ordinary.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
+        write_version(ordinary.path(), 2, "WRITE", 1_020, &[add("unexpected.parquet", 1, 20, true)])?;
+        write_version(ordinary.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        assert_eq!(reconcile_local_delta_log(ordinary.path(), &evidence())["status"], "mismatch");
+
+        let maintenance = TestDirectory::new()?;
+        complete_log(maintenance.path(), add("rewrite.parquet", 1, 20, true))?;
+        let result = reconcile_local_delta_log(maintenance.path(), &evidence());
+        assert_eq!(result["status"], "matched");
+        assert_eq!(result["interleaved_maintenance"]["OPTIMIZE (data-changing rewrite, excluded)"], 1);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod delta_log_evidence_tests {
     use super::*;
