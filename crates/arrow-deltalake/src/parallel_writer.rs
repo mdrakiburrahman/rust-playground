@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use delta_kernel_default_engine::executor::TaskExecutor;
 use futures::future::join_all;
 use parquet::arrow::arrow_writer::{
     ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory, ArrowWriter, compute_leaves,
@@ -70,9 +71,10 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
             !self.failed,
             "parallel Parquet writer is unusable after an encode failure"
         );
+        self.failed = true;
         let result = self.write_inner(batch).await;
-        if result.is_err() {
-            self.failed = true;
+        if result.is_ok() {
+            self.failed = false;
         }
         result
     }
@@ -204,15 +206,19 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
             }
         }
 
-        let file_writer = self
-            .file_writer
-            .as_mut()
-            .context("Parquet file writer is unavailable")?;
-        let mut row_group = file_writer.next_row_group()?;
-        for chunk in chunks {
-            chunk.append_to_row_group(&mut row_group)?;
-        }
-        row_group.close()?;
+        let mut file_writer = self.file_writer.take().context("Parquet file writer is unavailable")?;
+        self.failed = true;
+        let file_writer = crate::delta_io::shared_executor()?
+            .spawn_blocking(move || -> Result<_> {
+                let mut row_group = file_writer.next_row_group()?;
+                for chunk in chunks {
+                    chunk.append_to_row_group(&mut row_group)?;
+                }
+                row_group.close()?;
+                Ok(file_writer)
+            })
+            .await??;
+        self.file_writer = Some(file_writer);
         self.row_group_index = self
             .row_group_index
             .checked_add(1)
@@ -228,7 +234,8 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
         );
         self.flush().await?;
         let file_writer = self.file_writer.take().context("Parquet file writer is unavailable")?;
-        crate::delta_io::run_cpu_async(move || file_writer.into_inner())
+        crate::delta_io::shared_executor()?
+            .spawn_blocking(move || file_writer.into_inner())
             .await?
             .context("close parallel Parquet file")
     }
@@ -392,6 +399,55 @@ mod tests {
         assert!(writer.write(&invalid).await.is_err());
         assert!(writer.finish().await.is_err());
         assert!(ParquetRecordBatchReaderBuilder::try_new(File::open(path)?).is_err());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_failing_sink_keeps_caller_responsive_and_poisoned() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct Sink {
+            fail: Arc<AtomicBool>,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail.swap(false, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    return Err(std::io::Error::other("injected row-group sink failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+        let fail = Arc::new(AtomicBool::new(false));
+        let sink = Sink {
+            fail: Arc::clone(&fail),
+            bytes: Vec::new(),
+        };
+        let properties = WriterProperties::builder().set_max_row_group_row_count(Some(2)).build();
+        let mut writer = ParallelArrowWriter::try_new(sink, Arc::clone(&schema), properties, 2)?;
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef])?;
+        fail.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        let (result, heartbeat) = tokio::join!(writer.write(&batch), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            start.elapsed()
+        });
+        assert!(
+            heartbeat < Duration::from_millis(400),
+            "async caller stalled for {heartbeat:?}"
+        );
+        assert!(result.is_err());
+        assert!(writer.finish().await.is_err());
         Ok(())
     }
 }
