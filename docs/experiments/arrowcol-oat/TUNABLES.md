@@ -41,6 +41,42 @@ resource sampler uses the same `usage` / `working_set` choices through
 `valueBytes`. Neither sampler substitutes RSS for missing cgroup counters.
 `memory.max=max` is classified as `container_memory_unlimited`, distinct from
 invalid or missing cap evidence.
+Every enabled local guard validates the rendered collector `mem_limit` before
+starting stack services; an uncapped Compose configuration fails with the
+`platform.local.collector_memory_limit_bytes` field in its error.
+
+## Pressure capacity and retention safety
+
+| Setting | Type and range | Default | Apply boundary | Influence and interactions |
+| --- | --- | --- | --- | --- |
+| `collector.pressure.buffered_bytes_limit`, `buffered_rows_limit`, `buffered_batches_limit` | Positive integers; bytes must not exceed `rss_limit_bytes` | OAT: 2147483648 bytes, 10000000 rows, 4096 batches | Collector startup | Routing/overload thresholds, not exporter semaphore capacities. Values below 2x `collector.batching.global_capacity` are intentional and safe; they shed admission earlier, while admitted work still flushes independently. They can reduce throughput or trip the guard early. |
+| `maintenance.log_retention_secs` | Integer at least 2592000 for OAT's default table policy; additionally at least the physical table log-retention floor | Table policy / 2592000 seconds | Strict OAT parsing and per-table maintenance configuration | Rejects the previously accepted 7200-second override before OAT projection. Consumer validation checks physical metadata, not process-overridden policy, before operations. No unsafe log-retention override is exposed by OAT. |
+| `maintenance.vacuum_retention_secs` | Positive seconds; below the physical `delta.deletedFileRetentionDuration` requires `maintenance.allow_short_vacuum_retention=true` | 604800 seconds | Strict OAT parsing and per-table maintenance configuration | Existing seven-day acknowledgement remains; explicit acknowledgement also permits a shorter value against a longer table policy. Physical retention floors are emitted as `physical_retention_floor` in startup/per-table consumer readback. |
+
+The [pressure safety proof](GUARD_AND_COMPOSE_CONTROLS.md) explains why a 2x
+capacity floor would be an incompatible policy change rather than a safety fix.
+
+## Base Compose environment audit
+
+This audit covers defaults consumed by the collector, OAT client and maintenance worker.
+Other Compose services' database/UI credentials are not performance settings.
+Unknown OAT fields or invented environment pass-throughs remain rejected.
+
+| Base environment (Compose default) | OAT control / effective readback, or fixed reason |
+| --- | --- |
+| `LOADTEST_CPUS` (`2`; quota and `--num-cores`) | `dfe_worker_concurrency` retains the worker argument; `platform.local.collector_cpu_quota` independently overrides quota. Runtime CPU evidence is described above. |
+| `ARROWCOL_MAX_MESSAGE_BYTES` (`33554432`) | `collector.limits.max_message_bytes` overrides the receiver's parsed limits; effective collector startup limits are read back. `transport.max_message_bytes` is the separate client message limit. |
+| `ARROWCOL_LAYOUT_ROW_GROUP_ROWS` (`16384`) | `collector.layout.row_group_rows`; OAT mirrors the canonical value into the legacy alias, avoiding alias conflicts. Effective writer/table policy readback remains authoritative. |
+| `ARROWCOL_LAYOUT_PAGE_ROWS` (`2048`) | `collector.layout.page_rows`, with the same canonical/legacy synchronization and writer readback. |
+| `ARROWCOL_PARTITION_GRANULARITY` (`minute`) | Local partition-bootstrap/single-hot-table campaigns apply typed `maintenance.granularity` at creation and verify physical table policy before admission. Otherwise fixed to the baseline: changing an existing table's physical partition specification is not a safe per-cell process override. |
+| `ARROWCOL_INSTANCE_KEY` (`loadtest-dataflow-1`) | Fixed run-owned identity, replaced by the OAT entrypoint's `oat-$(hostname)`; not a tuning surface because identity collisions invalidate routing/commit evidence. |
+| `ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT` (collector container address) | Fixed run-owned topology, recomputed from the container address by the OAT entrypoint. Arbitrary routing destinations would escape run isolation. |
+| `ARROWCOL_DELTA_ROOT` (`/delta/dataflow`) | Fixed container mount backed by the isolated run directory. Changing arbitrary output roots could mix tables or invalidate durable-row reconciliation. |
+| `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE` (collector, client and maintenance) | Fixed mounted secret path; identity authorization is not a performance tunable. No secret values enter tuning evidence. |
+| `LOADTEST_INTERNAL_SECRET_FILE` (client) | Fixed mounted secret path; same authorization boundary. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://lgtm:4318`; collector/maintenance) | Fixed run-owned telemetry destination. Arbitrary exporter destinations are unsupported; they could disclose telemetry and break measurement provenance. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` (`http/protobuf`; collector/maintenance) | Fixed to the supported local telemetry collector protocol; alternate exporters are not provisioned or verified by OAT. |
+| `OTEL_METRIC_EXPORT_INTERVAL` (`2000` ms; collector/maintenance) | Fixed instrumentation cadence. Its overhead is part of the baseline; arbitrary exporter-cadence experiments are unsupported until sampling/evidence completeness can be verified at the changed cadence. |
 
 ## Collector build profile and image arms
 
