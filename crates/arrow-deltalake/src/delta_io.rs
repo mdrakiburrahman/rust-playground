@@ -72,6 +72,9 @@ pub struct DeltaRuntimeConfig {
     pub batch_rows: usize,
     /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
     pub cpu_workers: usize,
+    /// Maximum concurrent Parquet leaf-column encoders; 1 preserves AsyncArrowWriter.
+    #[serde(default = "default_parquet_column_workers")]
+    pub parquet_column_workers: u8,
     /// CPU queue capacity, 1..=128; absent means the resolved CPU worker count.
     #[serde(default)]
     pub cpu_queue_jobs: Option<usize>,
@@ -107,6 +110,10 @@ fn default_blocking_fs_reserve() -> usize {
     1
 }
 
+fn default_parquet_column_workers() -> u8 {
+    1
+}
+
 impl Default for DeltaRuntimeConfig {
     fn default() -> Self {
         Self::for_cores(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get))
@@ -129,6 +136,7 @@ impl DeltaRuntimeConfig {
             read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
+            parquet_column_workers: default_parquet_column_workers(),
             cpu_queue_jobs: None,
             partition_grouping: crate::PartitionGrouping::default(),
             event_interval: None,
@@ -185,6 +193,14 @@ impl DeltaRuntimeConfig {
                 }
                 *value = raw.parse().with_context(|| format!("parse {name}"))?;
             }
+        }
+        let name = "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS";
+        if let Some(raw) = lookup(name)? {
+            anyhow::ensure!(
+                !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()),
+                "{name} must be an unsigned decimal integer"
+            );
+            config.parquet_column_workers = raw.parse().with_context(|| format!("parse {name}"))?;
         }
         let name = "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS";
         if let Some(raw) = lookup(name)? {
@@ -278,6 +294,11 @@ impl DeltaRuntimeConfig {
                 "ARROWCOL_COLLECTOR_{name} must be in {min}..={max}, got {value}"
             );
         }
+        anyhow::ensure!(
+            (1..=16).contains(&self.parquet_column_workers),
+            "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS must be in 1..=16, got {}",
+            self.parquet_column_workers
+        );
         anyhow::ensure!(
             self.blocking_fs_reserve > 0 && self.blocking_fs_reserve < self.blocking_workers,
             "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE must be positive and less than BLOCKING_WORKERS"
@@ -878,9 +899,10 @@ mod tests {
                 small.task_limit,
                 small.read_ahead,
                 small.cpu_workers,
-                small.batch_rows
+                small.batch_rows,
+                small.parquet_column_workers
             ),
-            (2, 32, 32, 8 * 1024 * 1024, 2, 64, 8, 1, 4096)
+            (2, 32, 32, 8 * 1024 * 1024, 2, 64, 8, 1, 4096, 1)
         );
         let large = DeltaRuntimeConfig::for_cores(usize::MAX);
         assert_eq!(
@@ -893,9 +915,10 @@ mod tests {
                 large.task_limit,
                 large.read_ahead,
                 large.cpu_workers,
-                large.batch_rows
+                large.batch_rows,
+                large.parquet_column_workers
             ),
-            (16, 128, 32, 8 * 1024 * 1024, 2, 256, 16, 32, 32768)
+            (16, 128, 32, 8 * 1024 * 1024, 2, 256, 16, 32, 32768, 1)
         );
         small.validate()?;
         large.validate()?;
@@ -917,6 +940,7 @@ mod tests {
             ("READ_AHEAD", 1, 128),
             ("BATCH_ROWS", 1, 262_144),
             ("CPU_WORKERS", 1, 128),
+            ("PARQUET_COLUMN_WORKERS", 1, 16),
         ] {
             let knob = format!("ARROWCOL_COLLECTOR_{knob}");
             let companion_value = |name: &str| -> Option<&'static str> {

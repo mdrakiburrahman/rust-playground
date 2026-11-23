@@ -33,6 +33,8 @@ pub mod maintenance;
 #[cfg(feature = "delta")]
 pub mod normalize;
 #[cfg(feature = "delta")]
+mod parallel_writer;
+#[cfg(feature = "delta")]
 mod partition;
 #[cfg(feature = "delta")]
 pub mod publisher;
@@ -100,12 +102,13 @@ impl TryFrom<String> for GeneratedPartitionBinding {
         match raw.as_str() {
             "revalidate_rows" => Ok(Self::RevalidateRows),
             "proven_constant" => Ok(Self::ProvenConstant),
-            _ => {
-                anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}")
-            }
+            _ => anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}"),
         }
     }
 }
+
+#[cfg(feature = "delta")]
+use parallel_writer::ParallelArrowWriter;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
@@ -147,11 +150,17 @@ impl CompletedFile {
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
 pub struct ParquetFileWriter {
-    writer: Option<AsyncArrowWriter<tokio::fs::File>>,
+    writer: Option<FileWriter>,
     durable_handle: File,
     path: PathBuf,
     rows: usize,
     input_bytes: u64,
+}
+
+enum FileWriter {
+    Sequential(AsyncArrowWriter<tokio::fs::File>),
+    #[cfg(feature = "delta")]
+    Parallel(ParallelArrowWriter<File>),
 }
 
 impl ParquetFileWriter {
@@ -183,8 +192,26 @@ impl ParquetFileWriter {
             .create_new(true)
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
-        let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, Some(properties))?;
+        #[cfg(feature = "delta")]
+        let writer = {
+            let column_workers = delta_io::runtime_config()?.parquet_column_workers;
+            if column_workers > 1 {
+                FileWriter::Parallel(ParallelArrowWriter::try_new(
+                    durable_handle.try_clone()?,
+                    schema,
+                    properties,
+                    column_workers,
+                )?)
+            } else {
+                let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+                FileWriter::Sequential(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+            }
+        };
+        #[cfg(not(feature = "delta"))]
+        let writer = {
+            let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+            FileWriter::Sequential(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+        };
         Ok(Self {
             writer: Some(writer),
             durable_handle,
@@ -223,25 +250,35 @@ impl ParquetFileWriter {
             .context("input Arrow byte count overflow")?;
         #[cfg(feature = "delta")]
         {
-            let mut writer = self
+            let writer = self
                 .writer
                 .take()
                 .context("Parquet writer unavailable after interrupted write")?;
-            let batch = batch.clone();
-            let (writer, result) = delta_io::run_cpu_future(async move {
-                let result = writer.write(&batch).await;
-                (writer, result)
-            })
-            .await?;
-            self.writer = Some(writer);
-            result?;
+            match writer {
+                FileWriter::Sequential(mut writer) => {
+                    let batch = batch.clone();
+                    let (writer, result) = delta_io::run_cpu_future(async move {
+                        let result = writer.write(&batch).await;
+                        (writer, result)
+                    })
+                    .await?;
+                    self.writer = Some(FileWriter::Sequential(writer));
+                    result?;
+                }
+                FileWriter::Parallel(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::Parallel(writer));
+                    result?;
+                }
+            }
         }
         #[cfg(not(feature = "delta"))]
-        self.writer
-            .as_mut()
-            .context("Parquet writer unavailable")?
-            .write(batch)
-            .await?;
+        match self.writer.take().context("Parquet writer unavailable")? {
+            FileWriter::Sequential(mut writer) => {
+                writer.write(batch).await?;
+                self.writer = Some(FileWriter::Sequential(writer));
+            }
+        }
         self.rows = rows;
         self.input_bytes = input_bytes;
         Ok(())
@@ -252,26 +289,37 @@ impl ParquetFileWriter {
     /// # Errors
     /// Returns close, metadata, or synchronization errors.
     pub async fn finish(self) -> Result<CompletedFile> {
-        let writer = self
-            .writer
-            .context("Parquet writer unavailable after interrupted write")?;
-        #[cfg(feature = "delta")]
-        delta_io::run_cpu_future(async move { writer.close().await }).await??;
-        #[cfg(not(feature = "delta"))]
-        writer.close().await?;
-        let durable_handle = tokio::fs::File::from_std(self.durable_handle);
+        let Self {
+            writer,
+            durable_handle,
+            path,
+            rows,
+            input_bytes,
+        } = self;
+        match writer.context("Parquet writer unavailable after interrupted write")? {
+            FileWriter::Sequential(writer) => {
+                #[cfg(feature = "delta")]
+                delta_io::run_cpu_future(async move { writer.close().await }).await??;
+                #[cfg(not(feature = "delta"))]
+                writer.close().await?;
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::Parallel(writer) => {
+                drop(writer.finish().await?);
+            }
+        }
+        let durable_handle = tokio::fs::File::from_std(durable_handle);
         durable_handle.sync_all().await?;
         let bytes = durable_handle.metadata().await?.len();
-        let parent = self
-            .path
+        let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok(CompletedFile {
-            path: self.path,
-            rows: self.rows,
-            input_bytes: self.input_bytes,
+            path,
+            rows,
+            input_bytes,
             bytes,
         })
     }
