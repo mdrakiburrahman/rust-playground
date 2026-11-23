@@ -3226,7 +3226,7 @@ mod tests {
         let options = options()?;
         let table = table_named("sqlserver_availability_replica_states")?;
         let batch = synthetic_batch(&table, "logical-hash", 7, 0, 0, &options)?;
-        let whole = hash_test_batches(&table, DataProfile::Diagnostic, 0, &[batch.clone()])?;
+        let whole = hash_test_batches(&table, DataProfile::Diagnostic, 0, std::slice::from_ref(&batch))?;
         let ragged = [batch.slice(0, 2), batch.slice(2, 1), batch.slice(3, 4)];
         assert_eq!(whole, hash_test_batches(&table, DataProfile::Diagnostic, 0, &ragged)?);
         let reordered = [batch.slice(3, 4), batch.slice(0, 3)];
@@ -3296,8 +3296,8 @@ mod tests {
         let b = batch_with_logical_identity(&second, uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(4), 0, 0)?;
         assert_ne!(a.column_by_name("endpoint_url"), b.column_by_name("endpoint_url"));
         assert_eq!(
-            hash_test_batches(&table, DataProfile::Realistic, 0, &[a.clone()])?,
-            hash_test_batches(&table, DataProfile::Realistic, 0, &[b.clone()])?
+            hash_test_batches(&table, DataProfile::Realistic, 0, std::slice::from_ref(&a))?,
+            hash_test_batches(&table, DataProfile::Realistic, 0, std::slice::from_ref(&b))?
         );
         assert_ne!(
             hash_test_batches(&table, DataProfile::Diagnostic, 0, &[a])?,
