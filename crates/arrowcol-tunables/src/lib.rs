@@ -284,17 +284,13 @@ impl CollectorLto {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub enum CollectorOptLevel {
     #[serde(rename = "2")]
     O2,
+    #[default]
     #[serde(rename = "3")]
     O3,
-}
-impl Default for CollectorOptLevel {
-    fn default() -> Self {
-        Self::O3
-    }
 }
 impl CollectorOptLevel {
     pub const fn as_u8(self) -> u8 {
