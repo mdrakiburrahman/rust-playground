@@ -56,12 +56,19 @@ impl CollectorCpuQuota {
     pub fn nano_cpus(self) -> Result<u64, &'static str> {
         match self {
             Self::Unlimited(_) => Ok(0),
-            Self::Cores(cores)
-                if cores.is_finite()
-                    && (0.000_000_001..=4096.0).contains(&cores)
-                    && (cores * 1_000_000_000.0).fract() == 0.0 =>
-            {
-                Ok((cores * 1_000_000_000.0) as u64)
+            Self::Cores(cores) if cores.is_finite() && (0.000_000_001..=4096.0).contains(&cores) => {
+                let decimal = cores.to_string();
+                let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
+                if fraction.len() > 9 {
+                    return Err("platform.local.collector_cpu_quota supports at most nanocore precision");
+                }
+                let whole = whole
+                    .parse::<u64>()
+                    .map_err(|_| "platform.local.collector_cpu_quota is invalid")?;
+                let fraction = format!("{fraction:0<9}")
+                    .parse::<u64>()
+                    .map_err(|_| "platform.local.collector_cpu_quota is invalid")?;
+                Ok(whole * 1_000_000_000 + fraction)
             }
             Self::Cores(_) => Err(
                 "platform.local.collector_cpu_quota must be a positive decimal (nanocore precision, at most 4096) or \"unlimited\"",

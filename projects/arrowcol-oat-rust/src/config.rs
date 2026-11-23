@@ -162,8 +162,31 @@ pub struct OverloadGuardConfig {
     pub zero_progress_windows: u32,
     #[serde(skip_serializing_if = "OverloadRssSignal::is_process_rss")]
     pub memory_signal: OverloadRssSignal,
-    #[serde(skip_serializing_if = "arrowcol_tunables::ContainerMemoryMetric::is_usage")]
+    #[serde(
+        skip_serializing_if = "arrowcol_tunables::ContainerMemoryMetric::is_usage",
+        deserialize_with = "deserialize_container_memory_metric"
+    )]
     pub container_memory_metric: arrowcol_tunables::ContainerMemoryMetric,
+}
+
+fn deserialize_container_memory_metric<'de, D>(
+    deserializer: D,
+) -> std::result::Result<arrowcol_tunables::ContainerMemoryMetric, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    arrowcol_tunables::ContainerMemoryMetric::deserialize(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("overload_guard.container_memory_metric: {error}")))
+}
+
+fn deserialize_collector_cpu_quota<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<arrowcol_tunables::CollectorCpuQuota>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<arrowcol_tunables::CollectorCpuQuota>::deserialize(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("platform.local.collector_cpu_quota: {error}")))
 }
 
 impl Default for OverloadGuardConfig {
@@ -544,6 +567,7 @@ pub struct LocalOptions {
     pub expected_image_ids: Option<std::collections::BTreeMap<String, String>>,
     pub collector_image_override: Option<CollectorImageOverride>,
     pub collector_cpus: Option<Vec<u32>>,
+    #[serde(default, deserialize_with = "deserialize_collector_cpu_quota")]
     pub collector_cpu_quota: Option<arrowcol_tunables::CollectorCpuQuota>,
 }
 
