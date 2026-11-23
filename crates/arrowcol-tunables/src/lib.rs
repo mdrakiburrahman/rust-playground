@@ -545,6 +545,7 @@ pub struct MaintenanceTunables {
     pub catalog_rpc_timeout_secs: Option<u64>,
     pub catalog_max_decoding_message_bytes: Option<usize>,
     pub input_read_strategy: Option<MaintenanceInputReadStrategy>,
+    pub input_prefetch_files: Option<u8>,
     pub granularity: Option<MaintenanceGranularity>,
     pub purge_retention_secs: Option<u64>,
     pub anchor_ms: Option<i64>,

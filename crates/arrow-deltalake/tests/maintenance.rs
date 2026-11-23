@@ -788,6 +788,7 @@ fn optimize_rewrites_latest_closed_partitions_preserving_rows() -> Result<()> {
     let config = OptimizeConfig {
         latest_partitions: Some(2),
         bin_concurrency: 2,
+        input_prefetch_files: 2,
         ..optimize_config()
     };
     let plan = maintenance.plan_optimize(&config)?;

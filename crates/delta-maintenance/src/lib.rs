@@ -292,8 +292,23 @@ impl Settings {
         self.optimize.validate()?;
         self.catalog_options.validate()?;
         self.validate_decoded_budget(self.optimize.max_decoded_bytes_per_bin)?;
+        self.validate_prefetch_budget(self.optimize.small_file_bytes)?;
         MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
         resolve(&BTreeMap::new(), &process_defaults(self))?;
+        Ok(())
+    }
+
+    fn validate_prefetch_budget(&self, small_file_bytes: u64) -> Result<()> {
+        if self.optimize.input_prefetch_files > 1 {
+            let budget = small_file_bytes
+                .checked_mul(u64::from(self.optimize.input_prefetch_files))
+                .and_then(|v| v.checked_mul(self.optimize.bin_concurrency as u64))
+                .and_then(|v| v.checked_mul(self.max_concurrent_tables as u64))
+                .context("input_prefetch_files encoded input budget overflow")?;
+            if budget > arrow_deltalake::maintenance::MAX_OPTIMIZE_PREFETCH_BYTES {
+                bail!("input_prefetch_files encoded input budget exceeds 512 MiB");
+            }
+        }
         Ok(())
     }
 
@@ -944,6 +959,7 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     effective.optimize.max_plan_bytes = usize::try_from(props.unsigned("arrowcol.optimize.maxPlanSize")?)?;
     effective.optimize.max_decoded_bytes_per_bin = props.unsigned("arrowcol.optimize.maxDecodedSizePerBin")?;
     effective.validate_decoded_budget(effective.optimize.max_decoded_bytes_per_bin)?;
+    effective.validate_prefetch_budget(effective.optimize.small_file_bytes)?;
     effective.optimize.max_output_file_bytes = props.unsigned("arrowcol.optimize.maxOutputFileSize")?;
     effective.optimize.max_active_files = usize::try_from(props.unsigned("arrowcol.optimize.maxActiveFiles")?)?;
     effective.optimize.max_row_group_bytes = props.unsigned("arrowcol.optimize.maxRowGroupSize")?;
@@ -1053,6 +1069,7 @@ fn configuration_evidence(
             "max_prune_files": startup.max_prune_files,
             "output_row_group_rows": startup.optimize.output_row_group_rows,
             "input_read_strategy": startup.optimize.input_read_strategy,
+            "input_prefetch_files": startup.optimize.input_prefetch_files,
             "operation_limits": startup.operation_limits,
         },
         "table_policy": policy,
@@ -1214,6 +1231,7 @@ impl OptimizeEvidence {
                 "min_files_per_bin": config.min_files_per_bin,
                 "max_bins_per_commit": config.max_bins_per_commit,
                 "bin_concurrency": config.bin_concurrency,
+                "input_prefetch_files": config.input_prefetch_files,
                 "max_actions_per_commit": config.max_actions_per_commit,
                 "max_plan_bytes": config.max_plan_bytes,
                 "max_decoded_bytes_per_bin": config.max_decoded_bytes_per_bin,

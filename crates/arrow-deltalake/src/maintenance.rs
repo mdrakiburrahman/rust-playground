@@ -2222,6 +2222,7 @@ mod optimize_upload_tests {
     #[derive(Debug)]
     struct ProbeStore {
         inner: Arc<dyn ObjectStore>,
+        probe_reads: bool,
         barrier: Arc<tokio::sync::Barrier>,
         entered: Arc<std::sync::atomic::AtomicUsize>,
         active: Arc<std::sync::atomic::AtomicUsize>,
@@ -2299,6 +2300,20 @@ mod optimize_upload_tests {
             p: &object_store::path::Path,
             o: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
+            if self.probe_reads {
+                use std::sync::atomic::Ordering;
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                if self.entered.fetch_add(1, Ordering::SeqCst) < 2 {
+                    tokio::time::timeout(Duration::from_secs(2), self.barrier.wait())
+                        .await
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "probe",
+                            source: Box::new(error),
+                        })?;
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
             self.inner.get_opts(p, o).await
         }
         fn delete_stream(
@@ -2343,6 +2358,7 @@ mod optimize_upload_tests {
         let peak = Arc::new(AtomicUsize::new(0));
         let store: Arc<dyn ObjectStore> = Arc::new(ProbeStore {
             inner: Arc::new(InMemory::new()),
+            probe_reads: false,
             barrier: Arc::new(tokio::sync::Barrier::new(2)),
             entered: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
@@ -2366,6 +2382,40 @@ mod optimize_upload_tests {
         .await??;
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         assert_eq!(store.get(&path).await?.bytes().await?.as_ref(), bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_prefetch_consumer_overlaps_reads_in_order() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = object_store::path::Path::from("a");
+        let b = object_store::path::Path::from("b");
+        inner.put_opts(&a, vec![1_u8, 2].into(), PutMode::Create.into()).await?;
+        inner.put_opts(&b, vec![3_u8, 4].into(), PutMode::Create.into()).await?;
+        let peak = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(ProbeStore {
+            inner,
+            probe_reads: true,
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            entered: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+        let mut observed = Vec::new();
+        prefetch_inputs(
+            store,
+            vec![(0, a, 2), (1, b, 2)],
+            2,
+            3,
+            &MaintenanceControl::default(),
+            |key, bytes| {
+                observed.push((*key, bytes.to_vec()));
+                Ok(())
+            },
+        )?;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(observed, vec![(0, vec![1, 2]), (1, vec![3, 4])]);
         Ok(())
     }
 
@@ -2492,6 +2542,87 @@ pub const DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OPTIMIZE_UPLOAD_CONCURRENCY: usize = 16;
 pub const MAX_OPTIMIZE_BIN_CONCURRENCY: usize = 8;
+pub const MAX_OPTIMIZE_PREFETCH_BYTES: u64 = 512 * 1024 * 1024;
+
+async fn fetch_prefetched_input(
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    expected: u64,
+    limit: u64,
+) -> Result<Bytes> {
+    let object = store.get(&path).await?;
+    if object.meta.size != expected || object.meta.size >= limit {
+        return Err(fail(
+            MaintenanceErrorKind::StalePlan,
+            "input object size differs from the planned size",
+        ));
+    }
+    let mut stream = object.into_stream();
+    let mut bytes = bytes::BytesMut::new();
+    while let Some(chunk) = stream.try_next().await? {
+        let size = u64::try_from(bytes.len())?
+            .checked_add(u64::try_from(chunk.len())?)
+            .context("prefetched input size overflow")?;
+        if size > expected {
+            return Err(fail(
+                MaintenanceErrorKind::StalePlan,
+                "input object grew during prefetch",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if u64::try_from(bytes.len())? != expected {
+        return Err(fail(
+            MaintenanceErrorKind::StalePlan,
+            "input object was truncated during prefetch",
+        ));
+    }
+    Ok(bytes.freeze())
+}
+
+fn prefetch_inputs<T>(
+    store: Arc<dyn ObjectStore>,
+    inputs: Vec<(T, object_store::path::Path, u64)>,
+    concurrency: u8,
+    limit: u64,
+    control: &MaintenanceControl,
+    mut consume: impl FnMut(&T, Bytes) -> Result<()>,
+) -> Result<()> {
+    let executor = shared_executor()?;
+    let mut inputs = inputs.into_iter();
+    let mut pending = std::collections::VecDeque::new();
+    let result = (|| -> Result<()> {
+        for (key, path, expected) in inputs.by_ref().take(usize::from(concurrency)) {
+            let task =
+                crate::delta_io::spawn_shared_io(fetch_prefetched_input(Arc::clone(&store), path, expected, limit))?;
+            pending.push_back((key, task));
+        }
+        while !pending.is_empty() {
+            control.check()?;
+            let (key, task) = pending.pop_front().expect("pending input exists");
+            let bytes = executor.block_on(async move { task.await.context("input prefetch task failed")? })?;
+            control.check()?;
+            consume(&key, bytes)?;
+            if let Some((key, path, expected)) = inputs.next() {
+                let task = crate::delta_io::spawn_shared_io(fetch_prefetched_input(
+                    Arc::clone(&store),
+                    path,
+                    expected,
+                    limit,
+                ))?;
+                pending.push_back((key, task));
+            }
+        }
+        Ok(())
+    })();
+    for (_, task) in pending {
+        task.abort();
+        executor.block_on(async move {
+            let _ = task.await;
+        });
+    }
+    result
+}
 
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
@@ -2526,6 +2657,7 @@ pub struct OptimizeConfig {
     pub batch_rows: usize,
     /// Input buffering strategy; spool uses temporary local disk.
     pub input_read_strategy: InputReadStrategy,
+    pub input_prefetch_files: u8,
     pub upload_concurrency: usize,
     pub bin_concurrency: usize,
     pub max_output_file_bytes: u64,
@@ -2561,6 +2693,7 @@ impl Default for OptimizeConfig {
             max_batch_bytes: 64 * 1024 * 1024,
             batch_rows: 8192,
             input_read_strategy: InputReadStrategy::Memory,
+            input_prefetch_files: 1,
             upload_concurrency: 1,
             bin_concurrency: 1,
             max_output_file_bytes: 1023 * 1024 * 1024,
@@ -2608,6 +2741,21 @@ impl OptimizeConfig {
         }
         if self.output_row_group_rows == 0 {
             return invalid("output row-group rows must be positive");
+        }
+        if !(1..=8).contains(&self.input_prefetch_files) {
+            return invalid("input_prefetch_files must be within 1..=8");
+        }
+        if self.input_prefetch_files > 1 {
+            if self.input_read_strategy != InputReadStrategy::Memory {
+                return invalid("input_prefetch_files above 1 requires memory input_read_strategy");
+            }
+            if self
+                .small_file_bytes
+                .checked_mul(u64::from(self.input_prefetch_files))
+                .is_none_or(|bytes| bytes > MAX_OPTIMIZE_PREFETCH_BYTES)
+            {
+                return invalid("input_prefetch_files encoded input budget exceeds 512 MiB");
+            }
         }
         if !(1..=MAX_OPTIMIZE_BIN_CONCURRENCY).contains(&self.bin_concurrency) {
             return invalid("bin_concurrency must be within 1..=8");
@@ -3435,14 +3583,39 @@ impl DeltaTable {
         };
         let result = (|| -> Result<()> {
             let mut decoded = 0_u64;
-            for file in &bin.files {
-                control.check()?;
-                let rows = self.read_input(file, config, &mut decoded, &logical, &mut writer)?;
-                if file.rows.is_some_and(|expected| expected != rows) {
-                    return Err(fail(
-                        MaintenanceErrorKind::StalePlan,
-                        format!("{} row count differs from statistics", file.path),
-                    ));
+            if config.input_prefetch_files > 1 {
+                let inputs = bin
+                    .files
+                    .iter()
+                    .map(|file| Ok((file, self.safe_object_path(&file.path)?, file.size)))
+                    .collect::<Result<Vec<_>>>()?;
+                prefetch_inputs(
+                    Arc::clone(&self.store),
+                    inputs,
+                    config.input_prefetch_files,
+                    config.small_file_bytes,
+                    control,
+                    |file, bytes| {
+                        let rows = self.decode_input(bytes, file, config, &mut decoded, &logical, &mut writer)?;
+                        if file.rows.is_some_and(|expected| expected != rows) {
+                            return Err(fail(
+                                MaintenanceErrorKind::StalePlan,
+                                format!("{} row count differs from statistics", file.path),
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                for file in &bin.files {
+                    control.check()?;
+                    let rows = self.read_input(file, config, &mut decoded, &logical, &mut writer)?;
+                    if file.rows.is_some_and(|expected| expected != rows) {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            format!("{} row count differs from statistics", file.path),
+                        ));
+                    }
                 }
             }
             control.check()?;

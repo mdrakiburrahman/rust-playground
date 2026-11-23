@@ -346,6 +346,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "MAX_PRUNE_FILES"
         | "ANCHOR_MS"
         | "INPUT_READ_STRATEGY"
+        | "INPUT_PREFETCH_FILES"
         | "CATALOG_RUNTIME_THREADS"
         | "CATALOG_RPC_TIMEOUT_SECS"
         | "CATALOG_MAX_DECODING_MESSAGE_BYTES" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
@@ -1334,11 +1335,11 @@ mod maintenance_topology_tests {
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "maintenance": {"enabled": true, "operations": ["optimize"],
                 "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3,
-                "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64}
+                "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64, "input_prefetch_files": 2}
         }))?;
         let mut observed = json!({"startup": {
             "apply": false, "operations": ["optimize"], "interval_secs": 60,
-            "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64,
+            "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64, "input_prefetch_files": 2,
             "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3}
         }});
         verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;

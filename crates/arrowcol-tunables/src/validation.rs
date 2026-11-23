@@ -426,6 +426,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.catalog_rpc_timeout_secs", "30"),
     capability!("maintenance.catalog_max_decoding_message_bytes", "33554432"),
     capability!("maintenance.input_read_strategy", "memory; spool or range"),
+    capability!("maintenance.input_prefetch_files", "1"),
     capability!("maintenance.granularity", "catalog default; hour"),
     capability!("maintenance.purge_retention_secs", "catalog default; 2592000"),
     capability!("maintenance.anchor_ms", "current time"),
@@ -1985,6 +1986,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             has_optimize,
         ),
         (
+            "input_prefetch_files",
+            maintenance.input_prefetch_files.is_some(),
+            has_optimize,
+        ),
+        (
             "max_concurrent_decoded_bytes",
             maintenance.max_concurrent_decoded_bytes.is_some(),
             has_optimize,
@@ -2265,6 +2271,26 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         .small_file_bytes
         .unwrap_or_else(|| (target_bytes / 2).max(1));
     positive("maintenance.small_file_bytes", Some(small_bytes))?;
+    let prefetch = maintenance.input_prefetch_files.unwrap_or(1);
+    if !(1..=8).contains(&prefetch) {
+        bail!("maintenance.input_prefetch_files must be between 1 and 8");
+    }
+    if prefetch > 1 {
+        if maintenance
+            .input_read_strategy
+            .is_some_and(|v| v != MaintenanceInputReadStrategy::Memory)
+        {
+            bail!("maintenance.input_prefetch_files above 1 requires memory input_read_strategy");
+        }
+        let budget = small_bytes
+            .checked_mul(u64::from(prefetch))
+            .and_then(|v| v.checked_mul(maintenance.bin_concurrency.unwrap_or(1) as u64))
+            .and_then(|v| v.checked_mul(maintenance.max_concurrent_tables.unwrap_or(1) as u64))
+            .context("maintenance.input_prefetch_files encoded input budget overflow")?;
+        if budget > 536_870_912 {
+            bail!("maintenance.input_prefetch_files encoded input budget exceeds 512 MiB");
+        }
+    }
     if small_bytes > target_bytes {
         bail!("maintenance.small_file_bytes must not exceed target_file_mib converted to bytes");
     }
@@ -2961,6 +2987,32 @@ mod tests {
             .context("maintenance fixture")?
             .remove("max_concurrent_decoded_bytes");
         assert!(format!("{:#}", Tunables::parse_oat_json(missing).unwrap_err()).contains("bin_concurrency"));
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_prefetch_rejects_invalid_modes_and_memory_budget() -> Result<()> {
+        let valid = serde_json::json!({"maintenance": {
+            "enabled": true, "operations": ["optimize"], "input_prefetch_files": 2
+        }});
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Maintenance)?;
+        assert_eq!(env["ARROWCOL_MAINT_INPUT_PREFETCH_FILES"], "2");
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(9),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut input = valid.clone();
+            input["maintenance"]["input_prefetch_files"] = invalid;
+            assert!(Tunables::parse_oat_json(input).is_err());
+        }
+        let mut spool = valid.clone();
+        spool["maintenance"]["input_read_strategy"] = serde_json::json!("spool");
+        assert!(format!("{:#}", Tunables::parse_oat_json(spool).unwrap_err()).contains("input_prefetch_files"));
+        let mut large = valid;
+        large["maintenance"]["max_concurrent_tables"] = serde_json::json!(5);
+        assert!(format!("{:#}", Tunables::parse_oat_json(large).unwrap_err()).contains("input_prefetch_files"));
         Ok(())
     }
 
