@@ -1050,6 +1050,134 @@ test('nulls a per-column dictionary page limit when dictionary is explicitly dis
   assert.doesNotMatch(unrelatedSvg, /dictionary-off: unqualified.*\(inert:/);
 });
 
+function generatorCandidate(candidate: string, rate: number, sequence: number, firstFactor = 'string_width') {
+  const results = coveredCandidate(candidate, rate, sequence).map(row => ({
+    ...row, factorConfigPaths: [`tunables.client.${firstFactor}`, 'client.guid_uniqueness'],
+  }));
+  for (const row of results) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: {
+      string_width: 64, guid_uniqueness: 'per_row', null_fraction: 0.1, pod_ordinal: 1,
+      value_variation: 'per_row', string_length_distribution: 'uniform', skew: 0,
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [];
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: `client.${firstFactor}`, reason: 'consumer_startup_and_prepared_corpus' },
+        { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+      ];
+    });
+  }
+  return results;
+}
+
+test('ranks prepared-corpus factors with unrelated Rust generator classifications', () => {
+  const cases = [
+    ['null_fraction', 'no_nullable_generated_columns', {}],
+    ['pod_ordinal', 'no_eligible_generated_rows', {}],
+    ['value_variation', 'all_values_skewed', { skew: 1 }],
+    ['string_length_distribution', 'one_byte_maximum_width', { string_width: 1 }],
+  ] as const;
+  for (const [index, [field, reason, config]] of cases.entries()) {
+    const candidate = generatorCandidate('generator-active', 800, 360 + index * 3);
+    for (const row of candidate) {
+      const tunables = row.officialRuns[0]!.config.tunables;
+      Object.assign(tunables, { client: {
+        string_width: 64, guid_uniqueness: 'per_row', null_fraction: 0.1, pod_ordinal: 1,
+        value_variation: 'per_row', string_length_distribution: 'uniform', skew: 0, ...config,
+      } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `client.${field}`, reason }];
+        evidence.projection_only = [{ path: 'client.entropy', reason: 'consumer_startup_proof_unverified' }];
+      });
+    }
+    assert.match(renderCampaignResults(candidate, 'C1'), /generator-active \(3\/3\)/);
+  }
+});
+
+test('never ranks generator factors classified inert by the Rust corpus evidence', () => {
+  const cases = [
+    ['null_fraction', 'no_nullable_generated_columns'],
+    ['pod_ordinal', 'no_eligible_generated_rows'],
+    ['value_variation', 'all_values_skewed'],
+    ['string_length_distribution', 'one_byte_maximum_width'],
+  ] as const;
+  for (const [index, [field, reason]] of cases.entries()) {
+    const candidate = generatorCandidate('generator-inert', 800, 370 + index * 3, field);
+    for (const row of candidate) {
+      if (field === 'value_variation' || field === 'string_length_distribution') {
+        Object.assign(row.officialRuns[0]!.config.tunables, { client: {
+          string_width: field === 'string_length_distribution' ? 1 : 64,
+          guid_uniqueness: 'per_row', null_fraction: 0.1, pod_ordinal: 1,
+          value_variation: 'per_row', string_length_distribution: 'uniform', skew: field === 'value_variation' ? 1 : 0,
+        } });
+      }
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `client.${field}`, reason }];
+        evidence.consumer_verified = [
+          { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        ];
+      });
+    }
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.ok(svg.includes(`inert: client.${field}: ${reason}`));
+    assert.doesNotMatch(svg, /generator-inert \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
+test('fails closed on missing, mixed, unrecognized or malformed generator evidence', () => {
+  const mutations: Array<(evidence: Record<string, unknown>) => void> = [
+    evidence => { evidence.consumer_verified = [{ path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' }]; },
+    evidence => {
+      evidence.consumer_verified = [{ path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' }];
+      evidence.projection_only = [{ path: 'client.string_width', reason: 'consumer_startup_proof_unverified' }];
+    },
+    evidence => { evidence.inert_fields = [{ path: 'client.null_fraction', reason: 'unrecognized' }]; },
+    evidence => { evidence.consumer_verified = [
+      { path: 'client.string_width', reason: 17 },
+      { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+    ]; },
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const candidate = generatorCandidate('generator-uncertain', 800, 390 + index * 3);
+    mutateFactorEvidence(candidate[1]!, mutate);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown|consumption unproven; applicability unknown/);
+    assert.doesNotMatch(svg, /generator-uncertain \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
+test('accepts committed table metadata proof for a stats factor and unrelated factors', () => {
+  for (const factor of ['collector.commit.delta_stats_columns', 'client.string_width']) {
+    const candidate = generatorCandidate('metadata-active', 800, 410).map(row => ({
+      ...row, factorConfigPaths: [`tunables.${factor}`, 'client.guid_uniqueness'],
+    }));
+    for (const row of candidate) {
+      Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+        commit: { delta_stats_columns: ['server_name', 'database_name'] },
+      } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.consumer_verified = [
+          { path: 'collector.commit.delta_stats_columns', reason: 'committed_table_metadata_readback' },
+          { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+          { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        ];
+      });
+    }
+    assert.match(renderCampaignResults(candidate, 'C1'), /metadata-active \(3\/3\)/);
+    mutateFactorEvidence(candidate[1]!, evidence => {
+      evidence.consumer_verified = [
+        { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+        { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        { path: 'collector.commit.delta_stats_columns', reason: 'not_a_valid_metadata_reason' },
+      ];
+    });
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /metadata-active \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
 test('fails closed on duplicate or unknown classifications even with otherwise complete coverage', () => {
   for (const scenario of ['unknown', 'duplicate', 'verified'] as const) {
     const candidate = coveredCandidate('runner', 100, 230);
