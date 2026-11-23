@@ -2268,15 +2268,28 @@ groups:
     #[ignore = "requires built arrowcol-dmv and an unreachable local endpoint"]
     fn client_leaf_adapters_use_actual_consumer_startup() -> Result<()> {
         let cases = [
+            (json!({"client":{"payload_customer_id":"synthetic-customer"}}), "payload_customer_id"),
+            (json!({"client":{"corpus_rows":127}}), "corpus_rows"),
+            (json!({"client":{"corpus_bytes":4096}}), "corpus_bytes"),
             (json!({"client":{"batch_rows":257}}), "batch_rows"),
             (json!({"client":{"workers":7}}), "workers"),
             (json!({"client":{"runtime_threads":5}}), "runtime_threads"),
             (json!({"client":{"data_mode":"independent"}}), "data_mode"),
+            (json!({"client":{"data_profile":"realistic"}}), "data_profile"),
+            (json!({"client":{"string_length_distribution":"uniform"}}), "string_length_distribution"),
+            (json!({"client":{"value_variation":"per_row"}}), "value_variation"),
+            (json!({"client":{"guid_uniqueness":"per_row"}}), "guid_uniqueness"),
+            (json!({"client":{"string_width":31}}), "string_width"),
             (json!({"client":{"cardinality":31}}), "cardinality"),
+            (json!({"client":{"null_fraction":0.2}}), "null_fraction"),
+            (json!({"client":{"skew":0.3}}), "skew"),
+            (json!({"client":{"entropy":0.8}}), "entropy"),
             (json!({"client":{"seed":29}}), "seed"),
+            (json!({"client":{"max_memory_bytes":268435456}}), "max_memory_bytes"),
             (json!({"client":{"interval_us":7}}), "interval_us"),
             (json!({"client":{"connections_per_worker":3}}), "connections_per_worker"),
             (json!({"client":{"streams_per_worker":7}}), "streams_per_worker"),
+            (json!({"client":{"max_rows":129}}), "max_rows"),
             (json!({"client":{"pod_ordinal":3}}), "pod_ordinal"),
             (json!({"client":{"stream_retry_max_attempts":3}}), "stream_retry_max_attempts"),
             (json!({"client":{"stream_retry_base_backoff_ms":13}}), "stream_retry_base_backoff_ms"),
@@ -2332,8 +2345,7 @@ groups:
             let observed = actual_client_startup(&binary, &config)
                 .with_context(|| format!("read consumer startup for {input}"))?;
             let actual = observed.get(field).with_context(|| format!("consumer omitted {field} for {input}"))?;
-            let default = baseline.get(field).with_context(|| format!("baseline omitted {field}"))?;
-            anyhow::ensure!(actual != default, "{field} did not differ from baseline for {input}");
+            anyhow::ensure!(Some(actual) != baseline.get(field), "{field} did not differ from baseline for {input}");
             verify_process_configuration(&config, ComponentRole::Client, &observed)
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
             let mut missing = observed.clone();
