@@ -142,10 +142,11 @@ test('allows checking the retained pre-arm snapshot at warmup end, before measur
 });
 
 test('requires corpus reservations to match per client across matched arms without pinning a value', () => {
-  const expectedClientIds = ['oat-run-table-c1'];
+  const controlId = 'control-run:table:0';
+  const candidateId = 'candidate-run:table:0';
   const arms = [
-    { arm_id: 'control', expected_client_ids: expectedClientIds, evidence: evidence([client(expectedClientIds[0]!, 77_777)]) },
-    { arm_id: 'candidate', expected_client_ids: expectedClientIds, evidence: evidence([client(expectedClientIds[0]!, 77_777)]) },
+    { arm_id: 'control', expected_client_ids: [controlId], evidence: evidence([client(controlId, 77_777)]) },
+    { arm_id: 'candidate', expected_client_ids: [candidateId], evidence: evidence([client(candidateId, 77_777)]) },
   ];
   assert.equal(requireMatchedStartupAccounting(arms)[0]?.evidence.clients[0]?.corpus_memory_reservation_bytes, 77_777);
   assert.throws(
@@ -153,7 +154,7 @@ test('requires corpus reservations to match per client across matched arms witho
       arms[0]!,
       {
         ...arms[1]!,
-        evidence: evidence([client(expectedClientIds[0]!, 77_778)]),
+        evidence: evidence([client(candidateId, 77_778)]),
       },
     ]),
     /corpus reservation differs/,
@@ -161,7 +162,7 @@ test('requires corpus reservations to match per client across matched arms witho
 });
 
 test('rejects malformed or extra matched-arm evidence', () => {
-  const expectedClientIds = ['oat-run-table-c1'];
+  const expectedClientIds = ['control-run:table:0'];
   const validArm = {
     arm_id: 'control',
     expected_client_ids: expectedClientIds,
@@ -179,10 +180,32 @@ test('rejects malformed or extra matched-arm evidence', () => {
       {
         ...validArm,
         arm_id: 'candidate',
-        expected_client_ids: ['oat-run-other-c1'],
-        evidence: evidence([client('oat-run-other-c1')]),
+        expected_client_ids: ['candidate-run:other:0'],
+        evidence: evidence([client('candidate-run:other:0')]),
       },
     ]),
     /different client roster/,
+  );
+  assert.throws(
+    () => requireMatchedStartupAccounting([
+      validArm,
+      {
+        arm_id: 'candidate',
+        expected_client_ids: ['invalid'],
+        evidence: evidence([client('invalid')]),
+      },
+    ]),
+    /invalid OAT client ID/,
+  );
+  assert.throws(
+    () => requireMatchedStartupAccounting([
+      validArm,
+      {
+        arm_id: 'candidate',
+        expected_client_ids: ['run-a:table:0', 'run-b:table:0'],
+        evidence: evidence([client('run-a:table:0'), client('run-b:table:0')]),
+      },
+    ]),
+    /duplicate logical client/,
   );
 });
