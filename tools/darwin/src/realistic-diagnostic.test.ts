@@ -250,7 +250,7 @@ test("derives realistic diagnostic from an unchanged historical seed", async () 
     assert.deepEqual(arm.tunables.collector, expectedCollector);
   }
   assert.throws(() => realisticDiagnosticConfig(original, [...cpus, 8]));
-  assert.deepEqual(config.overload_guard, original.overload_guard);
+  assert.deepEqual(config.overload_guard, {...original.overload_guard, memory_signal: "cgroup_memory"});
   assert.deepEqual(config.tables, ["sqlserver_availability_replica_states"]);
   assert.deepEqual(config.replica_counts, [1]);
 });
@@ -422,12 +422,19 @@ test("reserves a full 5% of the post-client admission bound", () => {
 test("attributes only a complete guard and an identity-bound cgroup peak", () => {
   const id = "a".repeat(64);
   const admission = "[oat] diagnostic pre-schedule admission: " + JSON.stringify({cpu_isolation:{collector:{container_id:id}}});
-  const sample = {cgroup:{collector_id:id,limit_bytes:COLLECTOR_MEMORY,peak_bytes:123}, guard_cap:COLLECTOR_MEMORY,guard_status:"complete",stop:null};
-  const outcome = (overrides: Record<string, unknown>) => memoryOutcome(admission + "\n[oat] diagnostic terminal memory: " + JSON.stringify({...sample,...overrides}));
+  const cg={collector_id:id,ps_all_ids:[id],observed_at_unix_ms:100,docker:{id,status:"running",oom_killed:false,exit_code:0,restart_count:0},events:{max:0,oom:0,oom_kill:0},stat:{anon:2,file:3},limit_bytes:COLLECTOR_MEMORY,peak_bytes:123};
+  const sample = {cgroup:cg,memory_signal:"cgroup_memory", guard_cap:COLLECTOR_MEMORY,guard_status:"complete",stop:null};
+  const outcome = (overrides: Record<string, unknown>) => memoryOutcome(admission + "\n[oat] diagnostic stop memory: " + JSON.stringify(cg) + "\n[oat] diagnostic terminal memory: " + JSON.stringify({...sample,...overrides}));
   assert.equal(outcome({}).permits_cpu_attribution, true);
   assert.equal(outcome({cgroup:{...sample.cgroup,collector_id:"b".repeat(64)}}).permits_cpu_attribution, false);
   assert.equal(outcome({guard_status:"unavailable"}).guard_engaged, null);
   assert.equal(outcome({guard_status:"triggered",stop:{reason:"hard_cap_fraction",metric:"collector_rss_bytes"}}).memory_limited, true);
   assert.equal(outcome({guard_status:"triggered",stop:{reason:"zero_ingestion_commit_progress",metric:"new_ingestion_commits"}}).memory_limited, null);
+  assert.equal(outcome({guard_status:"triggered",stop:{reason:"hard_cap_fraction",metric:"collector_cgroup_memory_bytes"}}).memory_limited,true);
+  assert.equal(outcome({cgroup:{...cg,events:{...cg.events,max:1}}}).permits_cpu_attribution,false);
+  assert.equal(outcome({cgroup:{...cg,events:{...cg.events,oom_kill:1}}}).memory_limited,true);
+  assert.equal(outcome({cgroup:{...cg,docker:{...cg.docker,oom_killed:true},stat:null,events:null}}).memory_limited,true);
+  assert.equal(outcome({cgroup:{...cg,stat:{anon:1}}}).memory_limited,null);
+  assert.equal(outcome({memory_signal:"process_rss"}).permits_cpu_attribution,false);
   assert.equal(memoryOutcome("").permits_cpu_attribution, false);
 });

@@ -19,7 +19,7 @@ enum DiagnosticReference {
         run_id: String,
         corpus_sha256: String,
         collector_memory_limit_bytes: u64,
-        kustainer: Value,
+        kustainer: Box<Value>,
         clients: Vec<DiagnosticClientReservation>,
     },
 }
@@ -663,7 +663,9 @@ async fn diagnostic_admission_or_cancel(
                 );
                 proof["kustainer"] = json!({"state":ks[0]["state"], "image":ks[0]["image"]});
                 ensure!(
-                    config.platform.local.collector_memory_limit_bytes == Some(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES)
+                    config.overload_guard.memory_signal == crate::config::OverloadRssSignal::CgroupMemory
+                        && config.platform.local.collector_memory_limit_bytes
+                            == Some(DIAGNOSTIC_COLLECTOR_MEMORY_BYTES)
                         && config
                             .tunables
                             .collector
@@ -917,10 +919,13 @@ mod realistic_diagnostic_admission_tests {
         let mut wrong_id = exact_reference.clone();
         wrong_id["clients"][0]["logical_client_id"] = json!("sqlserver_availability_replica_states:2");
         let mut wrong_count = exact_reference.clone();
-        wrong_count["clients"].as_array_mut().context("client roster")?.push(json!({
-            "logical_client_id": "sqlserver_availability_replica_states:2",
-            "corpus_memory_reservation_bytes": 100,
-        }));
+        wrong_count["clients"]
+            .as_array_mut()
+            .context("client roster")?
+            .push(json!({
+                "logical_client_id": "sqlserver_availability_replica_states:2",
+                "corpus_memory_reservation_bytes": 100,
+            }));
         for reference in [wrong_id, wrong_count] {
             proof["reference"] = reference.clone();
             assert!(
@@ -1135,57 +1140,90 @@ mod realistic_diagnostic_admission_tests {
     }
 }
 
+fn diagnostic_memory_fields(text: &str, keys: &[&str]) -> Result<Value> {
+    let mut fields = json!({});
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let key = parts.next().context("empty memory field")?;
+        if keys.contains(&key) {
+            ensure!(fields.get(key).is_none(), "duplicate memory field {key}");
+            fields[key] = json!(parts.next().context("missing memory value")?.parse::<u64>()?);
+            ensure!(parts.next().is_none(), "malformed memory field {key}");
+        }
+    }
+    ensure!(
+        keys.iter().all(|k| fields.get(k).is_some()),
+        "missing cgroup memory field"
+    );
+    Ok(fields)
+}
+
+async fn diagnostic_memory_snapshot(config: &OatConfig, run: &str) -> Value {
+    let mut snapshot = json!({"observed_at_unix_ms":unix_time_ms_u64().ok()});
+    let observation = async {
+        let project = scoped_compose_project(config.platform.compose_project.as_deref().context("missing project")?, run);
+        let mut ps = Command::new("docker");
+        ps.args(["ps","-a","--no-trunc","--filter",&format!("label=com.docker.compose.project={project}"),"--filter","label=com.docker.compose.service=dataflow-1","--format","{{.ID}}"]);
+        let ids=diagnostic_command(ps,"list all project collectors").await?;
+        snapshot["ps_all_ids"]=json!(ids.lines().collect::<Vec<_>>());
+        let id=ids.trim(); ensure!(id.len()==64 && id.bytes().all(|b|b.is_ascii_hexdigit()),"collector missing or ambiguous");
+        snapshot["collector_id"]=json!(id);
+        let mut inspect=Command::new("docker");
+        inspect.args(["inspect","--format",r#"{"id":{{json .Id}},"status":{{json .State.Status}},"oom_killed":{{json .State.OOMKilled}},"exit_code":{{json .State.ExitCode}},"restart_count":{{json .RestartCount}}}"#,id]);
+        let state:Value=serde_json::from_str(&diagnostic_command(inspect,"inspect collector state").await?)?;
+        ensure!(state["id"]==id,"collector identity changed"); snapshot["docker"]=state;
+        let mut read = Command::new("docker");
+        read.args(["exec",id,"sh","-ec","cd /sys/fs/cgroup; cat memory.events; echo ===; cat memory.stat; echo ===; cat memory.max memory.peak"]);
+        let raw=diagnostic_command(read,"read collector cgroup memory evidence").await?;
+        let mut parts=raw.split("===\n");
+        snapshot["events"]=diagnostic_memory_fields(parts.next().context("missing events")?, &["max","oom","oom_kill"])?;
+        snapshot["stat"]=diagnostic_memory_fields(parts.next().context("missing stat")?, &["anon","file"])?;
+        let values=parts.next().context("missing peak or cap")?.lines().map(str::parse::<u64>).collect::<std::result::Result<Vec<_>,_>>()?;
+        ensure!(parts.next().is_none() && values.len()==2 && values[0]==DIAGNOSTIC_COLLECTOR_MEMORY_BYTES && values[1]>0,"invalid effective cap or lifetime peak");
+        snapshot["limit_bytes"]=json!(values[0]);snapshot["peak_bytes"]=json!(values[1]);
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    if let Err(e) = observation {
+        snapshot["read_error"] = json!(format!("{e:#}"));
+    }
+    snapshot
+}
+
+async fn diagnostic_stop_capture(config: &OatConfig, run: &str, phase: &str) {
+    if config
+        .platform
+        .compose_project
+        .as_deref()
+        .is_some_and(|p| p.starts_with("diagnostic-"))
+    {
+        let observation = diagnostic_memory_snapshot(config, run).await;
+        println!("[oat] diagnostic {phase} memory: {observation}");
+    }
+}
+
 async fn diagnostic_terminal_memory(
     config: &OatConfig,
     run: &str,
     guard: Option<&Value>,
     stop: Option<&Value>,
 ) -> Value {
-    let peak = async {
-        let project = scoped_compose_project(
-            config.platform.compose_project.as_deref().context("missing project")?,
-            run,
-        );
-        let mut ps = Command::new("docker");
-        ps.args([
-            "ps",
-            "--no-trunc",
-            "--filter",
-            &format!("label=com.docker.compose.project={project}"),
-            "--filter",
-            "label=com.docker.compose.service=dataflow-1",
-            "--format",
-            "{{.ID}}",
-        ]);
-        let id = diagnostic_command(ps, "locate terminal collector").await?;
-        let id = id.trim();
-        ensure!(
-            id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
-            "collector identity unavailable"
-        );
-        let mut cmd = Command::new("docker");
-        cmd.args([
-            "exec",
-            id,
-            "cat",
-            "/sys/fs/cgroup/memory.max",
-            "/sys/fs/cgroup/memory.peak",
-        ]);
-        let data = diagnostic_command(cmd, "read collector cgroup memory limit and peak").await?;
-        let values = data
-            .lines()
-            .map(str::parse::<u64>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ensure!(
-            values.len() == 2 && values[0] == DIAGNOSTIC_COLLECTOR_MEMORY_BYTES && values[1] > 0,
-            "invalid cgroup memory readback"
-        );
-        Ok::<_, anyhow::Error>(json!({"collector_id":id,"limit_bytes":values[0],"peak_bytes":values[1]}))
+    let snapshot = diagnostic_memory_snapshot(config, run).await;
+    json!({"cgroup":snapshot,"guard_status":guard.and_then(|g|g.get("status")),"guard_cap":guard.and_then(|g|g.get("requested_container_memory_limit_bytes")),"memory_signal":guard.and_then(|g|g.pointer("/settings/memory_signal")),"stop":stop})
+}
+
+#[test]
+fn diagnostic_memory_parser_requires_unique_complete_counters() {
+    let keys = ["anon", "file"];
+    assert_eq!(
+        diagnostic_memory_fields("anon 5\nfile 7\nother 1\n", &keys).unwrap(),
+        json!({"anon":5,"file":7})
+    );
+    for bad in [
+        "anon 5",
+        "anon 5\nfile -1",
+        "anon 5\nfile 7\nfile 8",
+        "anon 5\nfile 7 8",
+    ] {
+        assert!(diagnostic_memory_fields(bad, &keys).is_err());
     }
-    .await;
-    let (peak, error) = match peak {
-        Ok(v) => (v, None),
-        Err(e) => (Value::Null, Some(e.to_string())),
-    };
-    json!({"cgroup":peak,"read_error":error,"guard_status":guard.and_then(|g|g.get("status")),"guard_cap":guard.and_then(|g|g.get("requested_container_memory_limit_bytes")),"stop":stop})
 }

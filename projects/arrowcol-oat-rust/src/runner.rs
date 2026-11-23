@@ -4819,7 +4819,9 @@ async fn run_clients(
     replicas: u32,
 ) -> Result<ClientRun> {
     let mut pinning = PinningReport::default();
-    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
+    let outcome = run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await;
+    diagnostic_stop_capture(config, project_run_id, "stop").await;
+    match outcome {
         Ok(report) => Ok(report),
         Err(error) => {
             let sample = async {
@@ -5326,7 +5328,7 @@ async fn run_clients_inner(
         let progress = tokio::select! {
             biased;
             reason = sampler.wait_for_overload_stop() => {
-                let cancellation = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                let (cancellation, ()) = tokio::join!(cancel_active_clients(platform, config, &handles, &active_clients), diagnostic_stop_capture(config, project_run_id, "guard stop"));
                 let capture = sampler.finish_early(&mut evidence).await;
                 let mut failure = reason;
                 if let Err(error) = cancellation {

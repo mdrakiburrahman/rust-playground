@@ -52,6 +52,7 @@ export function realisticDiagnosticConfig(seed: unknown, cpus: readonly number[]
     || (i > 0 && cpu <= cpus[i - 1]!))) throw new Error("invalid diagnostic collector CPU stratum");
   local.collector_memory_limit_bytes = COLLECTOR_MEMORY;
   pressure.rss_limit_bytes = COLLECTOR_MEMORY;
+  guard.memory_signal = "cgroup_memory";
   local.collector_cpus = [...cpus];
   config.dfe_worker_concurrency = [cpus.length];
   runtime.cpu_workers = cpus.length;

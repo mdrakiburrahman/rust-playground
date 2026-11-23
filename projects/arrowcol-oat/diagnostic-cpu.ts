@@ -139,15 +139,44 @@ async function main(){const [op,arg,b,c]=process.argv.slice(2);
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(e=>{console.error(e);process.exitCode=1;});
 
+// Only dimensionless CPU fractions and derived core counts use relative tolerance.
+// Never apply this comparison to raw samples, identifiers, or verdicts.
+function verifyDerived(expected:unknown, actual:unknown, path=""):void {
+  if(typeof expected==='number' && typeof actual==='number' && /^(?:router_cores|group_cores\.(?:collector|support|client)|host_busy_cores_by_set\.(?:collector|support|client)|host_busy_per_cpu\.\d+|per_container\.\d+\.cores|non_collector_busy_on_collector_cpus\.estimated_cores)$/.test(path)) {
+    assert(Number.isFinite(expected) && Number.isFinite(actual));
+    if(expected===actual)return;
+    assert(expected!==0 && actual!==0 && Math.sign(expected)===Math.sign(actual));
+    assert(Math.abs(expected-actual)<=1e-12*Math.abs(expected),'derived CPU metric exceeds relative tolerance');return;
+  }
+  if(expected!==null && typeof expected==='object') {
+    assert(actual!==null && typeof actual==='object' && Array.isArray(expected)===Array.isArray(actual));
+    assert.deepEqual(Object.keys(expected).sort(),Object.keys(actual).sort());
+    for(const key of Object.keys(expected))verifyDerived(Reflect.get(expected,key),Reflect.get(actual,key),path?`${path}.${key}`:key);
+  }else assert.deepEqual(actual,expected);
+}
+const uint=(n:unknown)=>Number.isSafeInteger(n) && Number(n)>=0;
 // Recompute the verdict from the retained counters; never trust a summary flag in a log.
 export function cpuWindowReceipt(rawPlan:unknown,raw:unknown,schedule:Record<string,unknown>){
   const plan=rawPlan as Plan, window=raw as ReturnType<typeof summarize>;
   assert.equal(window.start.target,schedule.measurement_start_unix_ms);
   assert.equal(window.end.target,schedule.measurement_end_unix_ms);
+  assert(uint(window.start.target) && uint(window.end.target) && window.end.target>window.start.target && window.end.host_at>window.start.host_at);
   for(const s of [window.start,window.end]){
+    assert.deepEqual(Object.keys(s).sort(),['counters','host_at','target','ticks']);
+    assert(uint(s.host_at));
+    for(const [cpu,tick] of Object.entries(s.ticks)) {
+      assert(/^\d+$/.test(cpu) && uint(tick.busy) && uint(tick.total) && tick.busy<=tick.total);
+      assert.deepEqual(Object.keys(tick).sort(),['busy','total']);
+    }
+    for(const member of plan.containers){const c=s.counters[member.id];
+      assert.deepEqual(Object.keys(c).sort(),['at','ns']);assert(uint(c.at) && (member.state==='exited'?c.ns===null:uint(c.ns)));
+    }
     assert(Math.abs(s.host_at-s.target)<=skew);
     assert.deepEqual(Object.keys(s.counters).sort(),plan.containers.map(c=>c.id).sort());
     for(const c of Object.values(s.counters))assert(Math.abs(c.at-s.target)<=skew);
   }
-  const computed=summarize(plan,window.start,window.end);assert.deepEqual(computed,window);return computed;
+  const computed=summarize(plan,window.start,window.end);
+  const {start: _start,end: _end,...derived}=computed;
+  const {start: _rawStart,end: _rawEnd,...claimed}=window;
+  verifyDerived(derived,claimed);return computed;
 }
