@@ -2,8 +2,111 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { CLIENT_MEMORY, COLLECTOR_MEMORY, diagnosticPaths, realisticDiagnosticConfig } from "./realistic-diagnostic-config.js";
-import { diagnosticInputBytes, diagnosticLaunchEnv, diagnosticPins, requireMatchingCorpusReservation, validateDiagnosticCpuProof, validateDiagnosticProof, validateDiagnosticRecheck, validateHostAdmission, verifyDiagnosticHook } from "./realistic-diagnostic.js";
+import {
+  diagnosticInputBytes, diagnosticLaunchEnv, diagnosticPins, freezeDiagnosticComparisonProfile,
+  requireMatchingCorpusReservation, validateDiagnosticCpuProof, validateDiagnosticProof,
+  validateDiagnosticReferenceProof, validateDiagnosticRecheck, validateFrozenComparisonProfile,
+  verifyComparisonProfileReference,
+  validateHostAdmission, verifyDiagnosticHook,
+} from "./realistic-diagnostic.js";
 import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
+
+type AdmissionProofFixture = {
+  [key: string]: unknown;
+  corpus_memory_reservation_bytes: number;
+  expected_client_ids: string[];
+  client_mapping: { table: string; client_ordinal: number; client_id: string };
+  startup_accounting: { clients: Array<{ [key: string]: unknown; client_id: string }> };
+  reference: unknown;
+};
+
+function diagnosticPinsFixture() {
+  const hash = "a".repeat(64);
+  return diagnosticPins({
+    harness_revision: "c".repeat(40),
+    source_revision: "d".repeat(40),
+    startup_revision: "e".repeat(40),
+    collector_source_revision: "b".repeat(40),
+    controller_sha256: "f".repeat(64),
+    corpus_sha256: "a".repeat(64),
+    diagnostic_gate_sha256: "1".repeat(64),
+    footer_sha256: "2".repeat(64),
+    seed_sha256: "3".repeat(64),
+    identity_tools: {
+      decoder_sha256: hash, extractor_sha256: hash, node_sha256: hash, tsx_sha256: hash, verifier_sha256: hash,
+    },
+    images: Object.fromEntries(["catalog", "client", "collector", "maintenance", "router", "sqlserver"]
+      .map(role => [role, `sha256:${hash}`])),
+  });
+}
+
+function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
+  [key: string]: unknown;
+  diagnostic_admission: AdmissionProofFixture;
+  pre_schedule_admission: AdmissionProofFixture;
+} {
+  const runId = "00000000-0000-4000-8000-000000000001";
+  const clientId = `oat-${runId}-sqlserver_availability_replica_states-c1`;
+  const startup = {
+    schema_version: 1,
+    capture_point: "client_ready_before_arm",
+    clients: [{
+      client_id: clientId,
+      configured_live_slots: 28,
+      admitted_live_slots: 28,
+      live_identity_batch_bytes: 152_920_064,
+      live_identity_batch_reservation_bytes: 28 * 152_920_064,
+      corpus_memory_reservation_bytes: 100,
+      memory_reservation_bytes: 100 + 28 * 152_920_064,
+      max_memory_bytes: CLIENT_MEMORY,
+    }],
+  };
+  const proof = () => ({
+    kind: "diagnostic-only",
+    phase: "before_schedule",
+    data_profile: "realistic",
+    payload_corpus_sha256: expected.corpus,
+    configured_live_slots: 28,
+    admitted_live_slots: 28,
+    live_identity_batch_bytes: 152_920_064,
+    corpus_memory_reservation_bytes: 100,
+    memory_reservation_bytes: 100 + 28 * 152_920_064,
+    expected_client_ids: [clientId],
+    client_mapping: { table: "sqlserver_availability_replica_states", client_ordinal: 1, client_id: clientId },
+    startup_accounting: startup,
+    reference: { mode: "first" },
+    observed_at_unix_ms: 1000,
+  });
+  return {
+    kind: "diagnostic-only",
+    qualification: "not-evaluated",
+    reference_establishment: "explicit-first-arm",
+    snapshot_reconciled: true,
+    run_id: runId,
+    source_revision: expected.source,
+    harness_revision: expected.harness,
+    collector_source_revision: expected.collectorSource,
+    startup_revision: expected.startup,
+    diagnostic_gate_sha256: expected.gate,
+    controller_sha256: expected.controller,
+    footer_sha256: expected.footer,
+    seed_sha256: expected.seed,
+    corpus_sha256: expected.corpus,
+    images: expected.images,
+    diagnostic_profile: {
+      data_profile: "realistic",
+      seed: 20260923,
+      workers: 14,
+      streams_per_worker: 2,
+      runtime_threads: 14,
+      connections_per_worker: 2,
+      max_memory_bytes: CLIENT_MEMORY,
+    },
+    client_schedule: { effective: { schedule_created_at_unix_ms: 1001 } },
+    diagnostic_admission: proof(),
+    pre_schedule_admission: proof(),
+  };
+}
 
 test("requires explicit full harness and collector provenance pins", () => {
   const hash = "a".repeat(64);
@@ -24,6 +127,68 @@ test("requires explicit full harness and collector provenance pins", () => {
   const withoutHarness = Object.fromEntries(Object.entries(input).filter(([key]) => key !== "harness_revision"));
   assert.throws(() => diagnosticPins(withoutHarness));
   assert.throws(() => diagnosticPins({ ...input, harness_revision: "31ce130" }));
+});
+
+test("freezes a non-circular first-arm profile and binds its per-client reservation to the receipt", () => {
+  const expected = diagnosticPinsFixture();
+  const receiptBytes = Buffer.from(JSON.stringify(firstArmReceipt(expected)));
+  const receiptSha256 = createHash("sha256").update(receiptBytes).digest("hex");
+  const profile = freezeDiagnosticComparisonProfile(receiptBytes, receiptSha256, expected);
+  assert.equal(profile.kind, "diagnostic-comparison-profile");
+  assert.equal(profile.qualification, "not-evaluated");
+  assert.equal(profile.reference_receipt_sha256, receiptSha256);
+  assert.deepEqual(profile.clients, [{
+    logical_client_id: "sqlserver_availability_replica_states:1",
+    corpus_memory_reservation_bytes: 100,
+  }]);
+
+  const profileBytes = Buffer.from(JSON.stringify(profile));
+  const profileSha256 = createHash("sha256").update(profileBytes).digest("hex");
+  assert.deepEqual(validateFrozenComparisonProfile(profileBytes, profileSha256, expected), profile);
+  assert.deepEqual(verifyComparisonProfileReference(profileBytes, profileSha256, receiptBytes, expected), profile);
+
+  const changedReservation = {
+    ...profile,
+    clients: [{ logical_client_id: "sqlserver_availability_replica_states:1", corpus_memory_reservation_bytes: 101 }],
+  };
+  const changedBytes = Buffer.from(JSON.stringify(changedReservation));
+  assert.throws(() => verifyComparisonProfileReference(
+    changedBytes, createHash("sha256").update(changedBytes).digest("hex"), receiptBytes, expected,
+  ));
+  const extraClient = {
+    ...profile,
+    clients: [...profile.clients, { logical_client_id: "unexpected:2", corpus_memory_reservation_bytes: 100 }],
+  };
+  const extraBytes = Buffer.from(JSON.stringify(extraClient));
+  assert.throws(() => validateFrozenComparisonProfile(
+    extraBytes, createHash("sha256").update(extraBytes).digest("hex"), expected,
+  ));
+
+  const matchedReference = {
+    mode: "matched" as const,
+    kind: "diagnostic-comparison-profile" as const,
+    qualification: "not-evaluated" as const,
+    profile_sha256: profileSha256,
+    receipt_sha256: receiptSha256,
+    run_id: profile.reference_run_id,
+    corpus_sha256: profile.corpus_sha256,
+    clients: profile.clients,
+  };
+  const later = firstArmReceipt(expected);
+  const laterId = "00000000-0000-4000-8000-000000000002";
+  const laterClientId = `oat-${laterId}-sqlserver_availability_replica_states-c1`;
+  for (const proof of [later.diagnostic_admission, later.pre_schedule_admission]) {
+    proof.expected_client_ids = [laterClientId];
+    proof.client_mapping.client_id = laterClientId;
+    proof.startup_accounting.clients[0]!.client_id = laterClientId;
+    proof.reference = matchedReference;
+  }
+  assert.doesNotThrow(() => validateDiagnosticReferenceProof(
+    [later.diagnostic_admission, later.pre_schedule_admission], matchedReference,
+  ));
+  const mismatch = structuredClone(later.diagnostic_admission);
+  mismatch.corpus_memory_reservation_bytes = 101;
+  assert.throws(() => validateDiagnosticReferenceProof([mismatch], matchedReference));
 });
 
 test("sums reconciled original bytes within the half-open commit window", () => {
@@ -90,17 +255,18 @@ test("requires a single diagnostic hook between readiness and parity precheck", 
   const include = 'include!("runner_realistic_diagnostic_admission.rs");';
   const ready = "let ready_clients = loop {";
   const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
-  const recheck = "diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
+  const recheck = "let schedule_admission = diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
   const memoryHook = "diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;";
+  const scheduleGate = "schedule_after_diagnostic_admission(";
+  const armCallback = "|| platform.arm_clients(config, project_run_id, run_start_unix_ms)";
   const precheck = 'let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");';
   const schedule = "let schedule_deadline = tokio::time::Instant::now();";
-  assert.doesNotThrow(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${precheck}\n${hook}\n${recheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n// ${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${memoryHook}\n${schedule}`));
-  assert.throws(() => verifyDiagnosticHook(`${include}\n${ready}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\nlet other = 1;\n${schedule}`));
+  const source = `${include}\n${ready}\n${hook}\n${precheck}\n${recheck}\n${memoryHook}\n${schedule}\n${scheduleGate}\n${armCallback}`;
+  assert.doesNotThrow(() => verifyDiagnosticHook(source));
+  assert.throws(() => verifyDiagnosticHook(source.replace(`${scheduleGate}\n${armCallback}`, armCallback)));
+  assert.throws(() => verifyDiagnosticHook(source.replace(recheck, "")));
+  assert.throws(() => verifyDiagnosticHook(source.replace(memoryHook, "")));
+  assert.throws(() => verifyDiagnosticHook(source.replace(hook, `// ${hook}`)));
 });
 
 test("requires a fresh pre-schedule host memory admission", () => {

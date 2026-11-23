@@ -8,6 +8,7 @@ import { tableFromIPC } from "apache-arrow";
 import { readParquet } from "parquet-wasm";
 import { requireMatchedStartupAccounting, requireStartupAccounting } from "../../../projects/arrowcol-oat/startup-accounting.js";
 import * as oatResult from "./oat-result.js";
+import { parseManifestJson } from "./delivery-identity.js";
 import { extractClientEvidence, extractStoppedReceipts, readReconciledOatResult } from "./oat-result.js";
 import type { OatMeasurement, TimedReceipt } from "./metrics-adapter.js";
 import { assertParityEvidence, inspectParityHost } from "./parity-preflight.js";
@@ -21,6 +22,35 @@ const DIAGNOSTIC_WORKLOAD_PROFILE = Object.freeze({
   data_profile: "realistic", seed: 20260923, workers: 14, streams_per_worker: 2,
   runtime_threads: 14, connections_per_worker: 2, max_memory_bytes: CLIENT_MEMORY,
 });
+const DIAGNOSTIC_LOGICAL_CLIENT = "sqlserver_availability_replica_states:1";
+type DiagnosticClientReservation = { logical_client_id: string; corpus_memory_reservation_bytes: number };
+type FrozenComparisonProfile = {
+  schema_version: 1;
+  kind: "diagnostic-comparison-profile";
+  qualification: "not-evaluated";
+  reference_receipt_sha256: string;
+  reference_run_id: string;
+  source_revision: string;
+  harness_revision: string;
+  collector_source_revision: string;
+  startup_revision: string;
+  diagnostic_gate_sha256: string;
+  controller_sha256: string;
+  footer_sha256: string;
+  seed_sha256: string;
+  corpus_sha256: string;
+  images: unknown;
+  diagnostic_profile: typeof DIAGNOSTIC_WORKLOAD_PROFILE;
+  clients: DiagnosticClientReservation[];
+};
+type DiagnosticReference =
+  | { mode: "first" }
+  | { mode: "matched"; kind: "diagnostic-comparison-profile"; qualification: "not-evaluated";
+      profile_sha256: string; receipt_sha256: string; run_id: string; corpus_sha256: string;
+      clients: DiagnosticClientReservation[] };
+type DiagnosticReferenceInput =
+  | { mode: "establish" }
+  | { mode: "compare"; profilePath: string; profileSha256: string; receiptPath: string };
 function object(value: unknown, name: string): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
   return value as JsonObject;
@@ -69,21 +99,222 @@ function diagnosticClientMapping(proof: JsonObject): { clientId: string; logical
   return { clientId: mapping.client_id, logicalId: `${mapping.table}:${mapping.client_ordinal}`, runId: match[1]! };
 }
 
+function referenceClients(proof: JsonObject): DiagnosticClientReservation[] {
+  const mapping = diagnosticClientMapping(proof);
+  const accounting = requireStartupAccounting(proof.startup_accounting, [mapping.clientId], "before_arm");
+  if (accounting.clients.length !== 1) throw new Error("comparison profile client roster is incomplete or contains extra clients");
+  const client = accounting.clients[0]!;
+  if (!Number.isSafeInteger(client.corpus_memory_reservation_bytes) || client.corpus_memory_reservation_bytes <= 0) {
+    throw new Error("comparison profile corpus reservation is missing or invalid");
+  }
+  return [{ logical_client_id: mapping.logicalId, corpus_memory_reservation_bytes: client.corpus_memory_reservation_bytes }];
+}
+
+export function freezeDiagnosticComparisonProfile(
+  receiptBytes: Buffer,
+  receiptSha256: string,
+  expected: ReturnType<typeof diagnosticPins>,
+): FrozenComparisonProfile {
+  string(receiptSha256, /^[a-f0-9]{64}$/, "reference receipt hash");
+  if (!receiptBytes.length || receiptBytes.length > 16 * 1024 * 1024
+    || createHash("sha256").update(receiptBytes).digest("hex") !== receiptSha256) {
+    throw new Error("reference receipt hash differs");
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(receiptBytes);
+  parseManifestJson(text);
+  const receipt = object(JSON.parse(text), "reference receipt");
+  const initial = object(receipt.diagnostic_admission, "reference admission");
+  const recheck = object(receipt.pre_schedule_admission, "reference pre-schedule admission");
+  const schedule = object(receipt.client_schedule, "reference schedule");
+  if (receipt.kind !== "diagnostic-only" || receipt.qualification !== "not-evaluated"
+    || receipt.reference_establishment !== "explicit-first-arm" || receipt.snapshot_reconciled !== true
+    || receipt.source_revision !== expected.source || receipt.harness_revision !== expected.harness
+    || receipt.collector_source_revision !== expected.collectorSource || receipt.startup_revision !== expected.startup
+    || receipt.diagnostic_gate_sha256 !== expected.gate || receipt.controller_sha256 !== expected.controller
+    || receipt.seed_sha256 !== expected.seed || receipt.corpus_sha256 !== expected.corpus
+    || !isDeepStrictEqual(receipt.images, expected.images)
+    || !isDeepStrictEqual(receipt.diagnostic_profile, DIAGNOSTIC_WORKLOAD_PROFILE)
+    || !isDeepStrictEqual(initial.reference, { mode: "first" })
+    || !isDeepStrictEqual(recheck.reference, { mode: "first" })) {
+    throw new Error("reference receipt is not a completed, explicit first diagnostic arm");
+  }
+  const initialProof = validateDiagnosticProof(
+    `[oat] diagnostic admission: ${JSON.stringify(initial)}\n`, expected.corpus, schedule,
+  );
+  const recheckProof = validateDiagnosticProof(
+    `[oat] diagnostic pre-schedule admission: ${JSON.stringify(recheck)}\n`, expected.corpus, schedule, true,
+  );
+  if (!isDeepStrictEqual(initialProof.startup_accounting, recheckProof.startup_accounting)
+    || !isDeepStrictEqual(initialProof.client_mapping, recheckProof.client_mapping)) {
+    throw new Error("reference arm startup roster changed before scheduling");
+  }
+  const clients = referenceClients(initialProof);
+  if (!isDeepStrictEqual(clients, referenceClients(recheckProof))
+    || clients.length !== 1 || clients[0]!.logical_client_id !== DIAGNOSTIC_LOGICAL_CLIENT) {
+    throw new Error("reference arm logical-client roster is invalid");
+  }
+  const mapping = diagnosticClientMapping(initialProof);
+  if (mapping.runId !== receipt.run_id) throw new Error("reference receipt run identity differs");
+  return {
+    schema_version: 1,
+    kind: "diagnostic-comparison-profile",
+    qualification: "not-evaluated",
+    reference_receipt_sha256: receiptSha256,
+    reference_run_id: mapping.runId,
+    source_revision: expected.source,
+    harness_revision: expected.harness,
+    collector_source_revision: expected.collectorSource,
+    startup_revision: expected.startup,
+    diagnostic_gate_sha256: expected.gate,
+    controller_sha256: expected.controller,
+    footer_sha256: expected.footer,
+    seed_sha256: expected.seed,
+    corpus_sha256: expected.corpus,
+    images: expected.images,
+    diagnostic_profile: DIAGNOSTIC_WORKLOAD_PROFILE,
+    clients,
+  };
+}
+
+export function validateFrozenComparisonProfile(
+  bytes: Buffer,
+  sha256: string,
+  expected: ReturnType<typeof diagnosticPins>,
+): FrozenComparisonProfile {
+  string(sha256, /^[a-f0-9]{64}$/, "comparison profile hash");
+  if (!bytes.length || bytes.length > 65_536 || createHash("sha256").update(bytes).digest("hex") !== sha256) {
+    throw new Error("comparison profile hash differs");
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  parseManifestJson(text);
+  const profile = object(JSON.parse(text), "comparison profile");
+  const fields = [
+    "clients", "collector_source_revision", "controller_sha256", "corpus_sha256",
+    "diagnostic_gate_sha256", "diagnostic_profile", "footer_sha256", "harness_revision",
+    "images", "kind", "qualification", "reference_receipt_sha256", "reference_run_id",
+    "schema_version", "seed_sha256", "source_revision", "startup_revision",
+  ];
+  if (Object.keys(profile).sort().join(",") !== fields.join(",")
+    || profile.schema_version !== 1 || profile.kind !== "diagnostic-comparison-profile"
+    || profile.qualification !== "not-evaluated"
+    || profile.source_revision !== expected.source || profile.harness_revision !== expected.harness
+    || profile.collector_source_revision !== expected.collectorSource || profile.startup_revision !== expected.startup
+    || profile.diagnostic_gate_sha256 !== expected.gate || profile.controller_sha256 !== expected.controller
+    || profile.footer_sha256 !== expected.footer || profile.seed_sha256 !== expected.seed
+    || profile.corpus_sha256 !== expected.corpus || !isDeepStrictEqual(profile.images, expected.images)
+    || !isDeepStrictEqual(profile.diagnostic_profile, DIAGNOSTIC_WORKLOAD_PROFILE)) {
+    throw new Error("comparison profile is stale or differs from pinned diagnostic inputs");
+  }
+  string(profile.reference_receipt_sha256, /^[a-f0-9]{64}$/, "reference receipt hash");
+  string(profile.reference_run_id, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/, "reference run ID");
+  if (!Array.isArray(profile.clients) || profile.clients.length !== 1) {
+    throw new Error("comparison profile client roster is missing or contains extra clients");
+  }
+  const clients = profile.clients.map((value, index) => {
+    const client = object(value, `comparison profile client ${index}`);
+    if (Object.keys(client).sort().join(",") !== "corpus_memory_reservation_bytes,logical_client_id"
+      || client.logical_client_id !== DIAGNOSTIC_LOGICAL_CLIENT
+      || !Number.isSafeInteger(client.corpus_memory_reservation_bytes)
+      || Number(client.corpus_memory_reservation_bytes) <= 0
+      || Number(client.corpus_memory_reservation_bytes) + 28 * 152_920_064 > CLIENT_MEMORY) {
+      throw new Error("comparison profile client reservation is missing or invalid");
+    }
+    return {
+      logical_client_id: DIAGNOSTIC_LOGICAL_CLIENT,
+      corpus_memory_reservation_bytes: Number(client.corpus_memory_reservation_bytes),
+    };
+  });
+  return {
+    schema_version: 1,
+    kind: "diagnostic-comparison-profile",
+    qualification: "not-evaluated",
+    reference_receipt_sha256: String(profile.reference_receipt_sha256),
+    reference_run_id: String(profile.reference_run_id),
+    source_revision: expected.source,
+    harness_revision: expected.harness,
+    collector_source_revision: expected.collectorSource,
+    startup_revision: expected.startup,
+    diagnostic_gate_sha256: expected.gate,
+    controller_sha256: expected.controller,
+    footer_sha256: expected.footer,
+    seed_sha256: expected.seed,
+    corpus_sha256: expected.corpus,
+    images: profile.images,
+    diagnostic_profile: DIAGNOSTIC_WORKLOAD_PROFILE,
+    clients,
+  };
+}
+
+export function verifyComparisonProfileReference(
+  profileBytes: Buffer,
+  profileSha256: string,
+  receiptBytes: Buffer,
+  expected: ReturnType<typeof diagnosticPins>,
+): FrozenComparisonProfile {
+  const profile = validateFrozenComparisonProfile(profileBytes, profileSha256, expected);
+  const receiptSha256 = createHash("sha256").update(receiptBytes).digest("hex");
+  if (receiptSha256 !== profile.reference_receipt_sha256) {
+    throw new Error("comparison profile does not bind the supplied reference receipt");
+  }
+  const derived = freezeDiagnosticComparisonProfile(receiptBytes, receiptSha256, expected);
+  if (!isDeepStrictEqual(profile, derived)) throw new Error("comparison profile differs from its verified reference receipt");
+  return profile;
+}
+
+function diagnosticReference(profile: FrozenComparisonProfile, profileSha256: string): DiagnosticReference {
+  return {
+    mode: "matched",
+    kind: "diagnostic-comparison-profile",
+    qualification: "not-evaluated",
+    profile_sha256: profileSha256,
+    receipt_sha256: profile.reference_receipt_sha256,
+    run_id: profile.reference_run_id,
+    corpus_sha256: profile.corpus_sha256,
+    clients: profile.clients,
+  };
+}
+
+export function validateDiagnosticReferenceProof(
+  proofs: readonly JsonObject[],
+  reference: DiagnosticReference,
+): void {
+  if (reference.mode === "first") {
+    if (proofs.some(proof => !isDeepStrictEqual(proof.reference, { mode: "first" }))) {
+      throw new Error("first-arm reference establishment is not explicit");
+    }
+    return;
+  }
+  for (const proof of proofs) {
+    if (!isDeepStrictEqual(proof.reference, reference)) throw new Error("diagnostic admission did not use the frozen comparison profile");
+    const clients = referenceClients(proof);
+    if (!isDeepStrictEqual(clients, reference.clients)) {
+      throw new Error("post-run client reservations differ from the frozen comparison profile");
+    }
+  }
+}
+
 export function verifyDiagnosticHook(source: string): void {
   const include = 'include!("runner_realistic_diagnostic_admission.rs");';
-  const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
-  const recheckHook = "diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
+  const hook = "let _ = diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
+  const recheckHook = "let schedule_admission = diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
   const memoryHook = "diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;";
+  const scheduleGate = "schedule_after_diagnostic_admission(";
+  const armCallback = "|| platform.arm_clients(config, project_run_id, run_start_unix_ms)";
   const lines = source.split(/\r?\n/).map(line => line.trim());
   const nonempty = lines.filter(Boolean);
   const precheckLine = nonempty.findIndex(line => line === 'let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");');
   const schedule = nonempty.findIndex((line, index) => index > precheckLine && line.startsWith("let schedule_deadline ="));
   const ready = source.indexOf("let ready_clients = loop {");
   const precheck = source.indexOf('let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");');
+  const scheduleGateIndex = source.indexOf(scheduleGate);
+  const armCallbackIndex = source.indexOf(armCallback);
   if (lines.filter(line => line === include).length !== 1 || lines.filter(line => line === hook).length !== 1
     || lines.filter(line => line === recheckHook).length !== 1 || lines.filter(line => line === memoryHook).length !== 1
-    || precheckLine < 0 || schedule < 2 || nonempty[schedule - 1] !== memoryHook || nonempty[schedule - 2] !== recheckHook || ready < 0
-    || precheck < 0 || source.indexOf(hook) <= ready || source.indexOf(hook) >= precheck) {
+    || precheckLine < 0 || schedule < 0 || ready < 0 || precheck < 0
+    || source.indexOf(hook) <= ready || source.indexOf(hook) >= precheck
+    || source.indexOf(recheckHook) <= precheck || source.indexOf(memoryHook) <= source.indexOf(recheckHook)
+    || source.indexOf(memoryHook) >= source.indexOf("let schedule_deadline =")
+    || scheduleGateIndex < source.indexOf("let schedule_deadline =") || armCallbackIndex < scheduleGateIndex) {
     throw new Error("diagnostic admission hook is not wired immediately after client readiness");
   }
 }
@@ -108,24 +339,29 @@ export function validateHostAdmission(log: string, schedule: unknown): JsonObjec
   return proof;
 }
 
-export function diagnosticLaunchEnv(home: string, stackBytes: number, toolDir: string, corpusSha256: string, clientCpus: number[]): NodeJS.ProcessEnv {
+export function diagnosticLaunchEnv(
+  home: string, stackBytes: number, toolDir: string, corpusSha256: string, clientCpus: number[],
+  reference: DiagnosticReference,
+): NodeJS.ProcessEnv {
   string(corpusSha256, /^[a-f0-9]{64}$/, "corpus hash");
   if (!isDeepStrictEqual(parseCollectorCpus(clientCpus.join(",")), clientCpus)) throw new Error("invalid client CPUs");
   const env = cleanEnv(home, stackBytes);
   env.OAT_DARWIN_PARITY_PRECHECK = "1";
   env.OAT_DIAGNOSTIC_CORPUS_SHA256 = corpusSha256;
   env.OAT_DIAGNOSTIC_CLIENT_CPUS = clientCpus.join(",");
+  env.OAT_DIAGNOSTIC_REFERENCE = JSON.stringify(reference);
   env.PATH = `${toolDir}:${env.PATH}`;
   return env;
 }
 
 async function runDiagnosticOat(runtime: string, configPath: string, home: string, toolDir: string,
-  logPath: string, stackBytes: number, corpusSha256: string, clientCpus: number[]): Promise<void> {
+  logPath: string, stackBytes: number, corpusSha256: string, clientCpus: number[],
+  reference: DiagnosticReference): Promise<void> {
   const log = await open(logPath, "wx");
   try {
     const child = spawn(process.execPath, ["--import", "tsx", "projects/arrowcol-oat/cli.ts",
       "--config", configPath, "--mode", "local", "--no-viewer"], {
-      cwd: runtime, env: diagnosticLaunchEnv(home, stackBytes, toolDir, corpusSha256, clientCpus),
+      cwd: runtime, env: diagnosticLaunchEnv(home, stackBytes, toolDir, corpusSha256, clientCpus, reference),
       stdio: ["ignore", log.fd, log.fd],
     });
     let timedOut = false;
@@ -289,6 +525,7 @@ export function diagnosticInputBytes(
 export async function runRealisticDiagnostic(options: {
   repo: string; home: string; root: string; snapshot: string; output: string; pinsFile: string;
   bindHost: string; endpointHost: string; collectorCpus: string; clientCpus: string; stackBytes: number;
+  reference: DiagnosticReferenceInput;
 }) {
   const paths = diagnosticPaths(options.root, options.snapshot, options.output);
   if (!/^[0-9a-fA-F:.]+$/.test(options.bindHost) || !/^[0-9a-fA-F:.]+$/.test(options.endpointHost)) {
@@ -298,6 +535,26 @@ export async function runRealisticDiagnostic(options: {
   const clientCpus = parseCollectorCpus(options.clientCpus);
   if (clientCpus.some(cpu => cpus.includes(cpu))) throw new Error("client and collector CPUs overlap");
   const expected = diagnosticPins(JSON.parse(await readFile(options.pinsFile, "utf8")));
+  let reference: DiagnosticReference;
+  let comparisonProfile: FrozenComparisonProfile | undefined;
+  let comparisonProfileBytes: Buffer | undefined;
+  let comparisonProfilePath: string | undefined;
+  let comparisonProfileSha256: string | undefined;
+  let referenceReceiptBytes: Buffer | undefined;
+  let referenceReceiptPath: string | undefined;
+  if (options.reference.mode === "establish") {
+    reference = { mode: "first" };
+  } else {
+    comparisonProfilePath = await realpath(string(options.reference.profilePath, /^\/.+/, "comparison profile path"));
+    comparisonProfileSha256 = options.reference.profileSha256;
+    comparisonProfileBytes = await readFile(comparisonProfilePath);
+    referenceReceiptPath = await realpath(string(options.reference.receiptPath, /^\/.+/, "reference receipt path"));
+    referenceReceiptBytes = await readFile(referenceReceiptPath);
+    comparisonProfile = verifyComparisonProfileReference(
+      comparisonProfileBytes, options.reference.profileSha256, referenceReceiptBytes, expected,
+    );
+    reference = diagnosticReference(comparisonProfile, options.reference.profileSha256);
+  }
   if (expected.collectorSource !== COLLECTOR_SOURCE_BASE) throw new Error("diagnostic collector must be built from the frozen collector source");
   if (Reflect.get(oatResult, "DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION") !== 1) {
     throw new Error("trusted diagnostic-realistic snapshot reconciliation is unavailable; no measurement may be scheduled");
@@ -363,6 +620,15 @@ export async function runRealisticDiagnostic(options: {
     if (await realpath(dirname(paths.root)) !== dirname(paths.root)) throw new Error("run parent must not contain symlinks");
     await mkdir(paths.root);
     await Promise.all([mkdir(paths.home), mkdir(paths.snapshot), mkdir(paths.output)]);
+    const comparisonProfileCopy = join(paths.output, "diagnostic-comparison-profile.json");
+    const referenceReceiptCopy = join(paths.output, "diagnostic-reference-receipt.json");
+    if (comparisonProfileBytes && comparisonProfile && referenceReceiptBytes && reference.mode === "matched") {
+      await writeFile(comparisonProfileCopy, comparisonProfileBytes, { flag: "wx", mode: 0o400 });
+        await writeFile(referenceReceiptCopy, referenceReceiptBytes, { flag: "wx", mode: 0o400 });
+        if (await sha256(comparisonProfileCopy) !== reference.profile_sha256) {
+        throw new Error("copied comparison profile changed");
+      }
+    }
     const identityOutput = join(paths.output, "diagnostic-identity-evidence");
     await mkdir(identityOutput);
     const platform = object(config.platform, "platform");
@@ -388,7 +654,10 @@ export async function runRealisticDiagnostic(options: {
     const host = await inspectParityHost(CLIENT_MEMORY, COLLECTOR_MEMORY);
     await writeFile(join(paths.output, "diagnostic-host.json"), `${JSON.stringify(host, null, 2)}\n`, { flag: "wx" });
     const logPath = join(paths.output, "diagnostic-run.log");
-    await runDiagnosticOat(runtime, configPath, paths.home, join(trusted, "bin"), logPath, options.stackBytes, expected.corpus, clientCpus);
+    await runDiagnosticOat(
+      runtime, configPath, paths.home, join(trusted, "bin"), logPath,
+      options.stackBytes, expected.corpus, clientCpus, reference,
+    );
     if (await sha256(configPath) !== configHash || await sha256(clientOverridePath) !== clientOverrideHash || await sha256(seedPath) !== expected.seed
       || await sha256(join(runtime, "target", "release", "arrowcol-oat-rust")) !== expected.controller
       || git(runtime, env, "rev-parse", "HEAD") !== expected.source
@@ -397,6 +666,15 @@ export async function runRealisticDiagnostic(options: {
       || git(repo, originEnv, "rev-parse", "HEAD") !== expected.source
       || git(repo, originEnv, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
       || !hasPinnedSubmodules(repo, originEnv)) throw new Error("pinned run inputs changed");
+    if (reference.mode === "matched" && comparisonProfileBytes && comparisonProfilePath
+      && (comparisonProfileSha256 === undefined
+        || await sha256(comparisonProfilePath) !== comparisonProfileSha256
+        || await sha256(comparisonProfileCopy) !== comparisonProfileSha256
+        || !referenceReceiptPath || !referenceReceiptBytes
+        || await sha256(referenceReceiptPath) !== reference.receipt_sha256
+        || await sha256(referenceReceiptCopy) !== reference.receipt_sha256)) {
+      throw new Error("frozen comparison profile changed during the diagnostic arm");
+    }
     const log = await readFile(logPath, "utf8");
     const prefix = "[oat] immutable local images: ";
     const imageLines = log.split("\n").filter(line => line.startsWith(prefix));
@@ -413,6 +691,7 @@ export async function runRealisticDiagnostic(options: {
     const evidence = object(JSON.parse(row.evidence_json), "evidence");
     const admission = validateDiagnosticProof(log, expected.corpus, evidence.client_schedule);
     const preScheduleAdmission = validateDiagnosticProof(log, expected.corpus, evidence.client_schedule, true);
+    validateDiagnosticReferenceProof([admission, preScheduleAdmission], reference);
     const hostAdmission = validateHostAdmission(log, evidence.client_schedule);
     validateDiagnosticCpuProof(admission, cpus, clientCpus);
     validateDiagnosticCpuProof(preScheduleAdmission, cpus, clientCpus);
@@ -480,14 +759,21 @@ export async function runRealisticDiagnostic(options: {
       "telemetry.sqlserver.sqlserver_availability_replica_states", reconciled.measurement);
     const originalBytes = diagnosticInputBytes(evidence, receipts.selected, reconciled.measurement);
     if (await sha256(stoppedPath) !== stoppedHash) throw new Error("stopped evidence changed during receipt extraction");
-    const receipt = {
+    const receipt: JsonObject = {
       kind: "diagnostic-only", qualification: "not-evaluated", source_revision: expected.source,
+      run_id: row.run_id,
+      reference_establishment: reference.mode === "first" ? "explicit-first-arm" : null,
+      diagnostic_reference: reference,
+      comparison_profile_sha256: reference.mode === "matched" ? reference.profile_sha256 : null,
+      reference_receipt_sha256: reference.mode === "matched" ? reference.receipt_sha256 : null,
+      reference_run_id: reference.mode === "matched" ? reference.run_id : null,
       diagnostic_profile: DIAGNOSTIC_WORKLOAD_PROFILE,
       seed_sha256: expected.seed, controller_sha256: expected.controller, corpus_sha256: expected.corpus,
       images: expected.images, startup_revision: expected.startup, diagnostic_gate_sha256: expected.gate,
       harness_revision: expected.harness, collector_source_revision: expected.collectorSource,
       config_sha256: configHash, diagnostic_admission: admission, collector_cpu_allocation: allocation,
       pre_schedule_admission: preScheduleAdmission, pre_schedule_host_admission: hostAdmission,
+      client_schedule: evidence.client_schedule,
       footer_sha256: expected.footer,
       durable_rows_per_second: reconciled.measurement.durableRowsPerSecond,
       committed_original_bytes_per_second: originalBytes.bytesPerSecond,
@@ -504,9 +790,26 @@ export async function runRealisticDiagnostic(options: {
       client_compose_override_sha256: clientOverrideHash,
       paths, host,
     };
-    await writeFile(join(paths.output, "diagnostic-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
+    const receiptBytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
+    const receiptPath = join(paths.output, "diagnostic-receipt.json");
+    await writeFile(receiptPath, receiptBytes, { flag: "wx" });
+    let establishedProfile: { path: string; sha256: string } | undefined;
+    if (reference.mode === "first") {
+      const profile = freezeDiagnosticComparisonProfile(
+        receiptBytes, createHash("sha256").update(receiptBytes).digest("hex"), expected,
+      );
+      const profileBytes = Buffer.from(`${JSON.stringify(profile, null, 2)}\n`);
+      const profilePath = join(paths.output, "diagnostic-comparison-profile.json");
+      await writeFile(profilePath, profileBytes, { flag: "wx", mode: 0o400 });
+      establishedProfile = {
+        path: profilePath,
+        sha256: createHash("sha256").update(profileBytes).digest("hex"),
+      };
+    } else if (comparisonProfile) {
+      validateDiagnosticReferenceProof([admission, preScheduleAdmission], reference);
+    }
     completed = true;
-    return receipt;
+    return { receipt, comparisonProfile: establishedProfile };
   } finally {
     if (completed) await rmdir(lock);
   }
@@ -521,12 +824,31 @@ async function main() {
     console.log(JSON.stringify({ kind: "diagnostic-only", corpus_memory_reservation_bytes: bytes }));
     return;
   }
-  const [repo, home, root, snapshot, output, pinsFile, bindHost, endpointHost, collectorCpus, clientCpus, stack] = process.argv.slice(2);
-  if (process.argv.length !== 13 || !repo || !home || !root || !snapshot || !output || !pinsFile || !bindHost || !endpointHost || !collectorCpus || !clientCpus || !stack) {
-    throw new Error("usage: realistic-diagnostic.ts REPO HOME RUN_ROOT SNAPSHOT_DIR OUTPUT_DIR PINS_JSON BIND_IP ENDPOINT_IP COLLECTOR_CPUS CLIENT_CPUS STACK_BYTES; or --compare-reservations FIRST_RECEIPT SECOND_RECEIPT");
+  const [repo, home, root, snapshot, output, pinsFile, bindHost, endpointHost, collectorCpus, clientCpus, stack, ...referenceArgs] = process.argv.slice(2);
+  if (!repo || !home || !root || !snapshot || !output || !pinsFile || !bindHost || !endpointHost || !collectorCpus || !clientCpus || !stack) {
+    throw new Error("usage: realistic-diagnostic.ts REPO HOME RUN_ROOT SNAPSHOT_DIR OUTPUT_DIR PINS_JSON BIND_IP ENDPOINT_IP COLLECTOR_CPUS CLIENT_CPUS STACK_BYTES (--establish-reference | --comparison-profile PROFILE_PATH PROFILE_SHA256 REFERENCE_RECEIPT_PATH); or --compare-reservations FIRST_RECEIPT SECOND_RECEIPT");
   }
-  const receipt = await runRealisticDiagnostic({ repo, home, root, snapshot, output, pinsFile, bindHost, endpointHost, collectorCpus, clientCpus, stackBytes: Number(stack) });
-  console.log(JSON.stringify(receipt));
+  let reference: DiagnosticReferenceInput;
+  if (referenceArgs.length === 1 && referenceArgs[0] === "--establish-reference") {
+    reference = { mode: "establish" };
+  } else if (referenceArgs.length === 4 && referenceArgs[0] === "--comparison-profile") {
+    reference = {
+      mode: "compare",
+      profilePath: referenceArgs[1]!,
+      profileSha256: string(referenceArgs[2], /^[a-f0-9]{64}$/, "comparison profile hash"),
+      receiptPath: referenceArgs[3]!,
+    };
+  } else {
+    throw new Error("explicit first-reference establishment or frozen comparison profile is required");
+  }
+  const result = await runRealisticDiagnostic({
+    repo, home, root, snapshot, output, pinsFile, bindHost, endpointHost,
+    collectorCpus, clientCpus, stackBytes: Number(stack), reference,
+  });
+  console.log(JSON.stringify({
+    kind: "diagnostic-only", qualification: "not-evaluated",
+    receipt: result.receipt, comparison_profile: result.comparisonProfile ?? null,
+  }));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => { console.error(error); process.exitCode = 1; });

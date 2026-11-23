@@ -4998,7 +4998,7 @@ async fn run_clients_inner(
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;
+    let _ = diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;
 
     let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
     if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
@@ -5093,7 +5093,12 @@ async fn run_clients_inner(
             };
         }
     };
-    diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;
+    let schedule_admission = diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;
+    let diagnostic_reference = if schedule_admission.is_some() {
+        Some(std::env::var(DIAGNOSTIC_REFERENCE_ENV).context("diagnostic reference is missing before schedule")?)
+    } else {
+        None
+    };
     diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
     let schedule_created_at_unix_ms = unix_time_ms_u64()?;
@@ -5122,10 +5127,14 @@ async fn run_clients_inner(
         )
         .context("shared OAT measurement end timestamp overflow")?;
     let delivery = tokio::time::timeout_at(schedule_deadline, async {
-        platform
-            .arm_clients(config, project_run_id, run_start_unix_ms)
-            .await
-            .context("arm common OAT client schedule")?;
+        schedule_after_diagnostic_admission(
+            diagnostic_reference.as_deref(),
+            schedule_admission.as_ref(),
+            project_run_id,
+            || platform.arm_clients(config, project_run_id, run_start_unix_ms),
+        )?
+        .await
+        .context("arm common OAT client schedule")?;
         local_progress(
             config,
             &format!(
