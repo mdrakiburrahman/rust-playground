@@ -420,6 +420,7 @@ fn client_sentinel_value(
         "ARROWCOL_CLIENT_BATCH_ROWS" => "batch_rows",
         "ARROWCOL_CLIENT_CORPUS_ROWS" => "corpus_rows",
         "ARROWCOL_CLIENT_STREAMS_PER_WORKER" => "streams_per_worker",
+        "ARROWCOL_CLIENT_STRING_WIDTH" => "string_width",
         _ => return Ok(None),
     };
     let proof = observed
@@ -442,6 +443,16 @@ fn client_sentinel_value(
         }
         "batch_rows" => json!(config.rows_per_table),
         "streams_per_worker" => json!(config.dmv_concurrency),
+        "string_width" => {
+            let profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
+            let profile = serde_json::to_value(profile)?;
+            if proof["requested"]["data_profile"] != profile || proof["resolved"]["data_profile"] != profile
+                || observed["data_profile"] != profile
+            {
+                bail!("client string_width resolution disagrees with data_profile");
+            }
+            if profile == "realistic" { json!(96) } else { json!(0) }
+        }
         "corpus_rows" => {
             let bytes = config
                 .tunables
@@ -2930,7 +2941,7 @@ groups:
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row"}
+            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row","string_width":31}
         }))?;
         let observed = actual_client_startup(&binary, &config)?;
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(0);
@@ -2939,6 +2950,8 @@ groups:
         prepared["generator_applicability"]["tables"][0]["guid_uniqueness"] =
             json!({"eligible_columns":1,"eligible_rows":8});
         prepared["generator_applicability"]["tables"][0]["value_variation"] =
+            json!({"eligible_columns":1,"eligible_rows":8});
+        prepared["generator_applicability"]["tables"][0]["string_width"] =
             json!({"eligible_columns":1,"eligible_rows":8});
         let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
         let initial = tunable_leaf_evidence(&config)?;
@@ -2954,6 +2967,8 @@ groups:
             .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
         assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
             .iter().any(|entry| entry["path"] == "client.value_variation"));
+        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.string_width"));
         let mut absent = report.clone();
         absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
         let mut uncovered = initial.clone();
@@ -2979,6 +2994,17 @@ groups:
         }
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
+        for profile in ["diagnostic", "realistic"] {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "client":{"string_width":0,"data_profile":profile}
+            }))?;
+            let observed = actual_client_startup(&binary, &config)?;
+            verify_process_configuration(&config, ComponentRole::Client, &observed)?;
+            assert_eq!(observed["string_width"], if profile == "realistic" { 96 } else { 0 });
+            let mut incorrect = observed;
+            incorrect["resolution"]["requested"]["string_width"] = json!(1);
+            assert!(verify_process_configuration(&config, ComponentRole::Client, &incorrect).is_err());
+        }
         for (input, inactive, active) in [
             (json!({"corpus_rows":0,"corpus_bytes":4096}), "client.corpus_rows", "client.corpus_bytes"),
             (json!({"corpus_rows":127,"corpus_bytes":0}), "client.corpus_bytes", "client.corpus_rows"),

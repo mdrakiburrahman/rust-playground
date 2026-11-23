@@ -400,6 +400,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.pod_ordinal") => ("pod_ordinal", "ARROWCOL_CLIENT_POD_ORDINAL"),
             Some("client.guid_uniqueness") => ("guid_uniqueness", "ARROWCOL_CLIENT_GUID_UNIQUENESS"),
             Some("client.value_variation") => ("value_variation", "ARROWCOL_CLIENT_VALUE_VARIATION"),
+            Some("client.string_width") => ("string_width", "ARROWCOL_CLIENT_STRING_WIDTH"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -454,7 +455,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }
             return true;
         }
-        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation") {
+        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width") {
             let counts = reports.iter().map(|report| {
                 let name = report["table"].as_str()?;
                 let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
@@ -493,7 +494,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         {
             return true;
         }
-        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation") {
+        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width") {
             "consumer_startup_and_prepared_corpus"
         } else { "consumer_startup_readback" }}));
         false
