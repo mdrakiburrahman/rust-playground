@@ -210,18 +210,35 @@ export function requireMatchedStartupAccounting(
     };
   });
 
-  const referenceClients = validatedArms[0]!.evidence.clients;
-  const referenceIds = referenceClients.map(client => client.client_id).sort();
+  function clientsByLogicalKey(arm: MatchedStartupAccountingArm): Map<string, StartupAccountingClient> {
+    const clients = new Map<string, StartupAccountingClient>();
+    for (const client of arm.evidence.clients) {
+      const parts = client.client_id.split(':');
+      if (parts.length !== 3 || parts.some(part => part === '')
+        || !/^(0|[1-9]\d*)$/.test(parts[2]!)) {
+        throw new Error(`Matched startup accounting arm ${arm.arm_id} has an invalid OAT client ID.`);
+      }
+      const key = `${parts[1]}:${parts[2]}`;
+      if (clients.has(key)) {
+        throw new Error(`Matched startup accounting arm ${arm.arm_id} has duplicate logical client ${key}.`);
+      }
+      clients.set(key, client);
+    }
+    return clients;
+  }
+
+  const referenceClients = clientsByLogicalKey(validatedArms[0]!);
   for (const arm of validatedArms.slice(1)) {
-    const clients = arm.evidence.clients;
-    if (clients.map(client => client.client_id).sort().join('\0') !== referenceIds.join('\0')) {
+    const clients = clientsByLogicalKey(arm);
+    if (clients.size !== referenceClients.size
+      || [...referenceClients.keys()].some(key => !clients.has(key))) {
       throw new Error(`Matched startup accounting arm ${arm.arm_id} has a different client roster.`);
     }
-    for (const reference of referenceClients) {
-      const current = clients.find(client => client.client_id === reference.client_id)!;
+    for (const [key, reference] of referenceClients) {
+      const current = clients.get(key)!;
       if (current.corpus_memory_reservation_bytes !== reference.corpus_memory_reservation_bytes) {
         throw new Error(
-          `Matched startup accounting corpus reservation differs for ${reference.client_id} in arm ${arm.arm_id}.`,
+          `Matched startup accounting corpus reservation differs for ${key} in arm ${arm.arm_id}.`,
         );
       }
     }
