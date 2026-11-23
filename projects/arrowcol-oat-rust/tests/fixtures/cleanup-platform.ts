@@ -24,13 +24,20 @@ if (tool === 'docker') {
         ? existsSync(join(root, 'guard-client-removed')) ? '' : 'guard-client'
         : Object.keys(services).join('\n'));
     } else if (args[0] === 'inspect') {
-      console.log(JSON.stringify(Object.entries(services).filter(([id]) => args.includes(id)).map(([id, service]) => {
-        const stopped = existsSync(join(root, `${id}-stopped`));
-        return { Id: id, RestartCount: 0,
-          Config: { Labels: { 'com.docker.compose.project': readFileSync(join(root, 'project'), 'utf8'), 'com.docker.compose.service': service } },
-          State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
-            Error: '', ExitCode: 0, OOMKilled: false, FinishedAt: new Date().toISOString() } };
-      })));
+      if (args.includes('--format')) {
+        console.log(Object.keys(services)
+          .filter(id => args.includes(id))
+          .map(() => '0')
+          .join('\n'));
+      } else {
+        console.log(JSON.stringify(Object.entries(services).filter(([id]) => args.includes(id)).map(([id, service]) => {
+          const stopped = existsSync(join(root, `${id}-stopped`));
+          return { Id: id, RestartCount: 0,
+            Config: { Labels: { 'com.docker.compose.project': readFileSync(join(root, 'project'), 'utf8'), 'com.docker.compose.service': service } },
+            State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
+              Error: '', ExitCode: 0, OOMKilled: false, FinishedAt: new Date().toISOString() } };
+        })));
+      }
     } else if (args[0] === 'stop') {
       for (const id of Object.keys(services).filter(id => args.includes(id))) writeFileSync(join(root, `${id}-stopped`), '');
     } else if (args[0] === 'logs') {
