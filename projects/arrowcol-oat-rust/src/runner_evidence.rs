@@ -625,7 +625,7 @@ impl CellEvidence {
         })
     }
 
-    fn record_client(&mut self, config: &OatConfig, table: &str, output: &str) -> Result<()> {
+    fn record_client(&mut self, config: &OatConfig, table: &str, client_id: &str, output: &str) -> Result<()> {
         let effective = process_configurations(output)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
         let data_profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
@@ -639,6 +639,7 @@ impl CellEvidence {
             }
         }
         self.client_reports.entry(table.to_owned()).or_default().push(json!({
+            "client_id": client_id,
             "phase_counters": counters,
             "consumer_effective_config": effective,
             "execution_image": client_image_evidence(output)?,

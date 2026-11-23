@@ -17,6 +17,16 @@ pub struct Capability {
     pub name: &'static str,
     pub default: &'static str,
     pub boundary: ApplyBoundary,
+    gate: Option<ApplicabilityGate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicabilityGate {
+    ConnectionRetries,
+    Http2Keepalive,
+    FixedHttp2Window,
+    TcpKeepalive,
+    RateLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +51,7 @@ macro_rules! capability {
             name: $name,
             default: $default,
             boundary: ApplyBoundary::ProcessStartup,
+            gate: None,
         }
     };
     ($name:literal, $default:literal, $boundary:ident) => {
@@ -48,6 +59,18 @@ macro_rules! capability {
             name: $name,
             default: $default,
             boundary: ApplyBoundary::$boundary,
+            gate: None,
+        }
+    };
+}
+
+macro_rules! gated_capability {
+    ($name:literal, $default:literal, $gate:ident) => {
+        Capability {
+            name: $name,
+            default: $default,
+            boundary: ApplyBoundary::ProcessStartup,
+            gate: Some(ApplicabilityGate::$gate),
         }
     };
 }
@@ -84,7 +107,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.connections_per_worker", "1"),
     capability!("client.pod_ordinal", "0 (per-client GUID salt; u32)"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
-    capability!("client.max_rows", "component default"),
+    capability!("client.max_rows", "0; one-shot only, inert in duration-based OAT cells"),
     capability!("client.stream_retry_max_attempts", "4"),
     capability!("client.stream_retry_base_backoff_ms", "10"),
     capability!("client.stream_retry_max_backoff_ms", "250"),
@@ -104,23 +127,59 @@ const CAPABILITIES: &[Capability] = &[
     capability!("transport.max_frame_bytes", "16384"),
     capability!("transport.header_table_bytes", "component default"),
     capability!("transport.max_header_list_bytes", "16384"),
-    capability!("transport.stream_window_bytes", "1048576"),
-    capability!("transport.connection_window_bytes", "16777216"),
+    gated_capability!(
+        "transport.stream_window_bytes",
+        "1048576; overridden by adaptive_window",
+        FixedHttp2Window
+    ),
+    gated_capability!(
+        "transport.connection_window_bytes",
+        "16777216; overridden by adaptive_window",
+        FixedHttp2Window
+    ),
     capability!("transport.adaptive_window", "false"),
     capability!("transport.keepalive_interval_ms", "10000"),
-    capability!("transport.keepalive_timeout_ms", "20000"),
-    capability!("transport.keepalive_while_idle", "true"),
-    capability!("transport.connect_timeout_ms", "0 (inherit request timeout)"),
+    gated_capability!(
+        "transport.keepalive_timeout_ms",
+        "20000; inert when keepalive_interval_ms is 0",
+        Http2Keepalive
+    ),
+    gated_capability!(
+        "transport.keepalive_while_idle",
+        "true; inert when keepalive_interval_ms is 0",
+        Http2Keepalive
+    ),
+    capability!("transport.connect_timeout_ms", "30000"),
     capability!("transport.request_timeout_ms", "component default"),
     capability!("transport.tcp_nodelay", "true"),
     capability!("transport.tcp_keepalive_ms", "component default"),
-    capability!("transport.tcp_keepalive_interval_ms", "component default"),
-    capability!("transport.tcp_keepalive_retries", "component default"),
-    capability!("transport.rate_limit_rps", "disabled"),
+    gated_capability!(
+        "transport.tcp_keepalive_interval_ms",
+        "0; inert when tcp_keepalive_ms is 0",
+        TcpKeepalive
+    ),
+    gated_capability!(
+        "transport.tcp_keepalive_retries",
+        "0; inert when tcp_keepalive_ms is 0",
+        TcpKeepalive
+    ),
+    capability!(
+        "transport.rate_limit_rps",
+        "0 (disabled); otherwise requests per rate_limit_period_ms"
+    ),
+    gated_capability!(
+        "transport.rate_limit_period_ms",
+        "1000; inert when rate_limit_rps is 0",
+        RateLimit
+    ),
     capability!("transport.endpoint_concurrency_limit", "256"),
     capability!("transport.endpoint_buffer_size", "1024"),
     capability!("transport.connect_retries", "component default"),
-    capability!("transport.retry_backoff_ms", "100"),
+    gated_capability!(
+        "transport.retry_backoff_ms",
+        "100; inert when connect_retries is 0",
+        ConnectionRetries
+    ),
     capability!(
         "transport.receiver_ipc_decode_support",
         "build-gated: IPC codec feature graph",
@@ -144,7 +203,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.sql_pool_acquire_timeout_ms", "10000"),
     capability!("logging.router", "warn,tiberius=error; or inherit YAML filter"),
     capability!("logging.collector", "unset"),
-    capability!("logging.maintenance", "unset"),
+    capability!("logging.maintenance", "unset; inert when maintenance is disabled"),
     capability!("router.refresh_interval_ms", "1000"),
     capability!("router.max_snapshot_age_ms", "15000"),
     capability!("router.max_future_skew_ms", "2000"),
@@ -235,11 +294,13 @@ const CAPABILITIES: &[Capability] = &[
     ),
     capability!("collector.runtime.workers", "clamp(c/4,2,16)"),
     capability!("collector.runtime.blocking_workers", "clamp(2c,32,128)"),
+    capability!("collector.runtime.blocking_fs_reserve", "1"),
     capability!("collector.runtime.upload_limit", "32"),
     capability!("collector.runtime.task_limit", "clamp(4c,64,256)"),
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
@@ -345,8 +406,11 @@ const CAPABILITIES: &[Capability] = &[
         "maintenance.optimize_upload_buffer_bytes",
         "8388608; buffered_multipart only"
     ),
-    capability!("maintenance.interval_secs", "one-shot"),
-    capability!("maintenance.max_idle_backoff_secs", "3600"),
+    capability!("maintenance.interval_secs", "OAT: 60s; standalone CLI: one-shot"),
+    capability!(
+        "maintenance.max_idle_backoff_secs",
+        "OAT: chosen interval (60s when omitted); standalone CLI: 3600s"
+    ),
     capability!("maintenance.max_cycles", "unlimited"),
     capability!("maintenance.max_consecutive_stale_plans", "8; inclusive 1..=1024"),
     capability!("maintenance.max_concurrent_tables", "1"),
@@ -413,6 +477,142 @@ pub fn capability_table() -> &'static [Capability] {
 }
 
 impl Tunables {
+    /// Classifies explicitly configured, non-null leaves without parsing the serialized
+    /// representation back into a typed configuration. Startup verification is not
+    /// inferred from projection alone.
+    ///
+    /// # Errors
+    /// Returns an error for invalid settings or an unclassified leaf.
+    pub fn classify_oat_leaves(&self) -> Result<Value> {
+        self.validate_for_oat()?;
+        let requested = serde_json::to_value(self)?;
+        let maintenance_enabled = requested.pointer("/maintenance/enabled") == Some(&Value::Bool(true));
+        let connection_retries_disabled = requested
+            .pointer("/transport/connect_retries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0;
+        let http2_keepalive_disabled = requested
+            .pointer("/transport/keepalive_interval_ms")
+            .and_then(Value::as_u64)
+            == Some(0);
+        let adaptive_http2_window = requested.pointer("/transport/adaptive_window") == Some(&Value::Bool(true));
+        let tcp_keepalive_disabled =
+            requested.pointer("/transport/tcp_keepalive_ms").and_then(Value::as_u64) == Some(0);
+        let rate_limit_disabled = requested
+            .pointer("/transport/rate_limit_rps")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0;
+        let mut inert_fields = Vec::new();
+        let mut projection_only = Vec::new();
+        let mut runner_controls = Vec::new();
+        #[derive(Clone, Copy)]
+        struct ClassificationContext {
+            maintenance_enabled: bool,
+            connection_retries_disabled: bool,
+            http2_keepalive_disabled: bool,
+            adaptive_http2_window: bool,
+            tcp_keepalive_disabled: bool,
+            rate_limit_disabled: bool,
+        }
+        fn visit(
+            value: &Value,
+            path: &mut Vec<String>,
+            context: ClassificationContext,
+            dictionary_disabled: bool,
+            inert: &mut Vec<Value>,
+            projection: &mut Vec<Value>,
+            controls: &mut Vec<Value>,
+        ) -> Result<()> {
+            if let Value::Object(object) = value {
+                let per_column =
+                    path.len() >= 3 && path[path.len() - 3] == "parquet_writer" && path[path.len() - 2] == "columns";
+                let disabled = per_column && object.get("dictionary_enabled") == Some(&Value::Bool(false));
+                for (key, value) in object {
+                    path.push(key.clone());
+                    visit(value, path, context, disabled, inert, projection, controls)?;
+                    path.pop();
+                }
+                return Ok(());
+            }
+            if value.is_null() || path.is_empty() {
+                return Ok(());
+            }
+            let mut catalog_path: Vec<&str> = path.iter().map(String::as_str).collect();
+            if catalog_path.starts_with(&["maintenance", "parquet_writer"]) {
+                catalog_path.remove(0);
+            }
+            if catalog_path.len() >= 4 && catalog_path[0] == "parquet_writer" && catalog_path[1] == "columns" {
+                catalog_path[2] = "*";
+            }
+            let name = catalog_path.join(".");
+            let capability = CAPABILITIES
+                .iter()
+                .find(|entry| entry.name == name)
+                .with_context(|| format!("OAT tunable leaf missing from capability catalog: {}", path.join(".")))?;
+            let name = path.join(".");
+            let (destination, reason) = if !context.maintenance_enabled
+                && (name == "logging.maintenance"
+                    || (name.starts_with("maintenance.") && name != "maintenance.enabled"))
+            {
+                (inert, "maintenance_disabled")
+            } else if name == "client.max_rows" {
+                (inert, "duration_based_run")
+            } else if capability.gate == Some(ApplicabilityGate::ConnectionRetries)
+                && context.connection_retries_disabled
+            {
+                (inert, "connection_retries_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::Http2Keepalive) && context.http2_keepalive_disabled {
+                (inert, "http2_keepalive_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::FixedHttp2Window) && context.adaptive_http2_window {
+                (inert, "adaptive_http2_window")
+            } else if capability.gate == Some(ApplicabilityGate::TcpKeepalive) && context.tcp_keepalive_disabled {
+                (inert, "tcp_keepalive_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::RateLimit) && context.rate_limit_disabled {
+                (inert, "rate_limit_disabled")
+            } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
+                (inert, "dictionary_disabled")
+            } else if matches!(
+                name.as_str(),
+                "maintenance.enabled" | "maintenance.operations" | "maintenance.apply"
+            ) {
+                (controls, "maintenance_runner_control")
+            } else if name == "logging.router" && value == "inherit" {
+                (controls, "router_log_filter_inheritance")
+            } else {
+                (projection, "consumer_startup_proof_unverified")
+            };
+            destination.push(serde_json::json!({"path":name,"reason":reason}));
+            Ok(())
+        }
+        visit(
+            &requested,
+            &mut Vec::new(),
+            ClassificationContext {
+                maintenance_enabled,
+                connection_retries_disabled,
+                http2_keepalive_disabled,
+                adaptive_http2_window,
+                tcp_keepalive_disabled,
+                rate_limit_disabled,
+            },
+            false,
+            &mut inert_fields,
+            &mut projection_only,
+            &mut runner_controls,
+        )?;
+        for entries in [&mut inert_fields, &mut projection_only, &mut runner_controls] {
+            entries.sort_unstable_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        }
+        Ok(serde_json::json!({
+            "inert_fields": inert_fields,
+            "projection_only": projection_only,
+            "runner_controls": runner_controls,
+            "consumer_verified": [],
+        }))
+    }
+
     /// Parses and validates a complete OAT tunables object using the typed registry.
     ///
     /// # Errors
@@ -526,6 +726,12 @@ impl Tunables {
             bail!("configure Arrow IPC compression in arrow_ipc.compression, not in both sections");
         }
         if let Some(transport) = &self.transport {
+            if transport
+                .rate_limit_period_ms
+                .is_some_and(|period| !(1..=86_400_000).contains(&period))
+            {
+                bail!("transport.rate_limit_period_ms must be between 1 and 86400000");
+            }
             let message_bytes = transport.max_message_bytes.unwrap_or(default_message_bytes);
             let flight_bytes = transport.max_flight_data_bytes.unwrap_or(default_flight_bytes);
             if message_bytes == 0 || message_bytes > i32::MAX as u64 {
@@ -567,6 +773,10 @@ impl Tunables {
                 (
                     "transport.tcp_keepalive_ms",
                     transport.tcp_keepalive_ms.unwrap_or(60_000),
+                ),
+                (
+                    "transport.tcp_keepalive_interval_ms",
+                    transport.tcp_keepalive_interval_ms.unwrap_or(0),
                 ),
                 ("transport.retry_backoff_ms", transport.retry_backoff_ms.unwrap_or(100)),
             ] {
@@ -691,7 +901,11 @@ impl Tunables {
                 ComponentRole::Client => None,
                 ComponentRole::Router => None,
                 ComponentRole::Collector => logging.collector,
-                ComponentRole::Maintenance => logging.maintenance,
+                ComponentRole::Maintenance => self
+                    .maintenance
+                    .as_ref()
+                    .filter(|settings| settings.enabled == Some(true))
+                    .and(logging.maintenance),
             });
             if let Some(level) = level {
                 selected.insert("RUST_LOG".to_owned(), level.as_str().to_owned());
@@ -821,27 +1035,29 @@ impl Tunables {
                     for (field, value) in [
                         ("RUNTIME_WORKERS", runtime.workers),
                         ("BLOCKING_WORKERS", runtime.blocking_workers),
+                        ("BLOCKING_FS_RESERVE", runtime.blocking_fs_reserve),
                         ("UPLOAD_LIMIT", runtime.upload_limit),
                         ("TASK_LIMIT", runtime.task_limit),
                         ("READ_AHEAD", runtime.read_ahead),
                         ("BATCH_ROWS", runtime.batch_rows),
                         ("CPU_WORKERS", runtime.cpu_workers),
+                        ("CPU_QUEUE_JOBS", runtime.cpu_queue_jobs),
                     ] {
                         if let Some(value) = value {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
-                        if let Some(upload) = &collector.upload {
-                            if let Some(mode) = upload.mode {
-                                output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
-                            }
-                            for (field, value) in [
-                                ("UPLOAD_BUFFER_CAPACITY_BYTES", upload.buffer_capacity_bytes),
-                                ("UPLOAD_REQUEST_CONCURRENCY", upload.request_concurrency),
-                            ] {
-                                if let Some(value) = value {
-                                    output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
-                                }
-                            }
+                    }
+                }
+                if let Some(upload) = &collector.upload {
+                    if let Some(mode) = upload.mode {
+                        output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
+                    }
+                    for (field, value) in [
+                        ("UPLOAD_BUFFER_CAPACITY_BYTES", upload.buffer_capacity_bytes),
+                        ("UPLOAD_REQUEST_CONCURRENCY", upload.request_concurrency),
+                    ] {
+                        if let Some(value) = value {
+                            output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
                     }
                 }
@@ -851,6 +1067,13 @@ impl Tunables {
                 continue;
             }
             if section == "maintenance" {
+                if self
+                    .maintenance
+                    .as_ref()
+                    .is_none_or(|settings| settings.enabled != Some(true))
+                {
+                    continue;
+                }
                 let mut value = section_value.clone();
                 if let Some(object) = value.as_object_mut() {
                     object.remove("enabled");
@@ -1482,14 +1705,22 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
     for (name, value, minimum, maximum) in [
         ("workers", runtime.workers, 1, 64),
         ("blocking_workers", runtime.blocking_workers, 2, 256),
+        ("blocking_fs_reserve", runtime.blocking_fs_reserve, 1, 255),
         ("upload_limit", runtime.upload_limit, 1, 256),
         ("task_limit", runtime.task_limit, 2, 1_024),
         ("read_ahead", runtime.read_ahead, 1, 128),
         ("batch_rows", runtime.batch_rows, 1, 262_144),
         ("cpu_workers", runtime.cpu_workers, 1, 128),
+        ("cpu_queue_jobs", runtime.cpu_queue_jobs, 1, 128),
     ] {
         if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
             bail!("collector.runtime.{name} must be between {minimum} and {maximum}");
+        }
+    }
+    if let Some(reserve) = runtime.blocking_fs_reserve {
+        let workers = runtime.blocking_workers.unwrap_or(32);
+        if reserve >= workers {
+            bail!("collector.runtime.blocking_fs_reserve must be less than blocking_workers (minimum default 32)");
         }
     }
     Ok(())
@@ -1497,33 +1728,14 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
 
 fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     let enabled = maintenance.enabled.unwrap_or(false);
-    let has_tunables = serde_json::to_value(maintenance)?.as_object().is_some_and(|object| {
-        object.iter().any(|(key, value)| match key.as_str() {
-            "enabled" | "apply" => value == true,
-            "operations" => value.as_array().is_some_and(|values| !values.is_empty()),
-            _ => !value.is_null(),
-        })
-    });
-    if !enabled {
-        if has_tunables {
-            bail!("maintenance settings require maintenance.enabled=true");
-        }
-        return Ok(());
-    }
-    let operations = maintenance
-        .operations
-        .as_deref()
-        .context("maintenance.enabled requires a nonempty operations list")?;
-    if operations.is_empty() {
+    let operations = maintenance.operations.as_deref().unwrap_or_default();
+    if enabled && operations.is_empty() {
         bail!("maintenance.enabled requires a nonempty operations list");
     }
     if operations.iter().collect::<std::collections::HashSet<_>>().len() != operations.len() {
         bail!("maintenance.operations must not contain duplicates");
     }
-    let has_operation = |operation| operations.contains(&operation);
-    if maintenance.apply == Some(true) && !enabled {
-        bail!("maintenance.apply=true requires maintenance.enabled=true");
-    }
+    let has_operation = |operation| !enabled || operations.contains(&operation);
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
     if maintenance.optimize_upload_mode.is_some() || maintenance.optimize_upload_buffer_bytes.is_some() {
         if !has_optimize {
@@ -2057,6 +2269,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_queue_and_reserve_are_strict_and_omitted_from_existing_config() -> Result<()> {
+        let old = serde_json::json!({"collector":{"runtime":{"cpu_workers":4,"blocking_workers":4}}});
+        let old_config = Tunables::parse_oat_json(old.clone())?;
+        let serialized = serde_json::to_value(old_config)?;
+        assert!(serialized["collector"]["runtime"].get("cpu_queue_jobs").is_none());
+        assert!(serialized["collector"]["runtime"].get("blocking_fs_reserve").is_none());
+        let mut valid = old;
+        valid["collector"]["runtime"]["cpu_queue_jobs"] = serde_json::json!(2);
+        valid["collector"]["runtime"]["blocking_fs_reserve"] = serde_json::json!(2);
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS"], "2");
+        assert_eq!(env["ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE"], "2");
+        for (field, value) in [
+            ("cpu_queue_jobs", serde_json::json!(0)),
+            ("cpu_queue_jobs", serde_json::json!(129)),
+            ("cpu_queue_jobs", serde_json::json!("2")),
+            ("cpu_queue_jobs", serde_json::json!(null)),
+            ("blocking_fs_reserve", serde_json::json!(0)),
+            ("blocking_fs_reserve", serde_json::json!(4)),
+            ("blocking_fs_reserve", serde_json::json!(1.5)),
+            ("blocking_fs_reserve", serde_json::json!(null)),
+        ] {
+            let mut candidate = valid.clone();
+            candidate["collector"]["runtime"][field] = value;
+            assert!(Tunables::parse_oat_json(candidate).is_err(), "{field}");
+        }
+        let queue = serde_json::json!({"collector":{"runtime":{"cpu_workers":1,"cpu_queue_jobs":128}}});
+        let env = Tunables::parse_oat_json(queue)?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS"], "128");
+        for (reserve, workers, accepted) in [
+            (31, None, true),
+            (32, None, false),
+            (32, Some(32), false),
+            (32, Some(33), true),
+        ] {
+            let mut candidate = serde_json::json!({"collector":{"runtime":{"blocking_fs_reserve":reserve}}});
+            if let Some(workers) = workers {
+                candidate["collector"]["runtime"]["blocking_workers"] = serde_json::json!(workers);
+            }
+            assert_eq!(Tunables::parse_oat_json(candidate).is_ok(), accepted);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn collector_upload_validation_and_projection() -> Result<()> {
         let valid = serde_json::json!({"collector": {
             "runtime": {"upload_limit": 1},
@@ -2066,6 +2323,13 @@ mod tests {
         assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_MODE"], "buffered_multipart");
         assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"], "1048576");
         assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"], "16");
+        let upload_only = serde_json::json!({"collector":{"upload":{
+            "mode":"buffered_multipart", "buffer_capacity_bytes":1048576, "request_concurrency":2
+        }}});
+        let env = Tunables::parse_oat_json(upload_only)?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_MODE"], "buffered_multipart");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"], "1048576");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"], "2");
 
         for (field, value) in [
             ("mode", serde_json::json!("stream")),
@@ -2565,7 +2829,12 @@ mod tests {
             "trace,tiberius=error"
         );
         assert_eq!(config.environment_for(ComponentRole::Collector)?["RUST_LOG"], "info");
-        assert_eq!(config.environment_for(ComponentRole::Maintenance)?["RUST_LOG"], "warn");
+        assert!(config.environment_for(ComponentRole::Maintenance)?.is_empty());
+        let enabled = Tunables::parse_oat_json(serde_json::json!({
+            "logging": {"maintenance": "warn"},
+            "maintenance": {"enabled": true, "operations": ["optimize"]}
+        }))?;
+        assert_eq!(enabled.environment_for(ComponentRole::Maintenance)?["RUST_LOG"], "warn");
         for invalid in [
             r#"{"router":{"sql_pool_max_size":1025}}"#,
             r#"{"router":{"sql_pool_max_size":0,"sql_pool_acquire_timeout_ms":100}}"#,
@@ -2848,7 +3117,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(error_text(disabled.validate()).contains("enabled=true"));
+        disabled.validate_for_oat()?;
+        assert!(disabled.environment_for(ComponentRole::Maintenance)?.is_empty());
         let enabled_without_operations = Tunables {
             maintenance: Some(MaintenanceTunables {
                 enabled: Some(true),

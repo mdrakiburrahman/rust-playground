@@ -17,7 +17,7 @@ test('keeps observations exploratory until official sustainable evidence is comp
   assert.match(svg, /Sustainable leaderboard \| official evidence only/);
   assert.match(svg, /No qualified winner: complete official evidence is missing or invalid/);
   assert.match(svg, /Exploratory \/ failed observations \(not ranked\)/);
-  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 110 rows\/s/);
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; no committed-rate observation \(varied factor coverage unknown/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
 
@@ -33,7 +33,7 @@ test('preserves Delta rate after Kustainer death and nulls only unavailable down
   assert.equal(validated!.qapUnhealthyCatalogs, null);
   assert.equal(validated!.collectorOnly, true);
   const svg = renderCampaignResults([...rows, result], 'C1');
-  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: 50\).*emulator exited/);
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited/);
   assert.throws(() => validateCampaignMeasurements([{ ...result, qapCompletionPercent: 100 }]), /unavailable downstream metrics to be null/);
   assert.throws(() => validateCampaignMeasurements([{ ...result, comment: null }]), /dead Kustainer requires a concrete comment/);
 });
@@ -119,6 +119,13 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
   };
   const evidence = {
     version: 1,
+    inert_fields: [],
+    projection_only: [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ],
+    runner_controls: [],
+    consumer_verified: [],
     overload_guard: {
       status: 'complete', run_id: cell, run_start_ms: start - 30_000, measurement_end_ms: end,
       requested_container_memory_limit_bytes: null,
@@ -801,7 +808,7 @@ test('reads one sustained run of contiguous emitter buckets but keeps missing de
     officialRuns: [sourceShapedRun(1, [1, 1, 1, 1, 1], 1_000_000)],
   };
   const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; no committed-rate observation/);
   assert.match(svg, /complete five-operation maintenance due-work evidence is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
@@ -881,4 +888,347 @@ test('sorts qualified leaderboard metrics by descending mean then candidate name
     { candidate: 'beta', mean: 140 },
   ];
   assert.deepEqual(sortCampaignLeaderboard(items).map(item => item.candidate), ['beta', 'zeta', 'alpha', 'tie-z']);
+});
+
+function coveredCandidate(candidate: string, rate: number, sequence: number) {
+  return Array.from({ length: 3 }, (_, index) => {
+    const run = sourceShapedRun(sequence + index, [rate, rate, rate, rate, rate], 1_000_000);
+    attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+    const evidence = JSON.parse(run.rows[0]!.evidence_json);
+    evidence.backlog = syntheticBacklog();
+    run.rows[0]!.evidence_json = JSON.stringify(evidence);
+    run.config.tunables.parquet_writer.defaults.compression = candidate;
+    return {
+      cohort: 'C1', candidate, factorX: 'codec', valueX: candidate, factorY: 'level', valueY: '3',
+      repeat: index + 1, expectedRepeats: 3, committedRowsPerSecond: rate,
+      factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'parquet_writer.defaults.compression_level'],
+      officialRuns: [run],
+    };
+  });
+}
+
+function mutateFactorEvidence(
+  result: ReturnType<typeof coveredCandidate>[number],
+  mutate: (evidence: Record<string, unknown>) => void,
+): void {
+  const row = result.officialRuns[0]!.rows[0]!;
+  const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+  mutate(evidence);
+  row.evidence_json = JSON.stringify(evidence);
+}
+
+test('qualifies fully covered runner-control factors', () => {
+  const candidate = coveredCandidate('runner', 100, 220).map(row => ({
+    ...row, factorConfigPaths: ['maintenance.enabled', 'maintenance.apply'],
+  }));
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.runner_controls = [
+        { path: 'maintenance.enabled', reason: 'maintenance_runner_control' },
+        { path: 'maintenance.apply', reason: 'maintenance_runner_control' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), /runner \(3\/3\)/);
+});
+
+test('nulls a duration-based run when the varied factor is a one-shot row limit', () => {
+  const candidate = coveredCandidate('one-shot-limit', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.client.max_rows', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: { max_rows: 129 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'client.max_rows', reason: 'duration_based_run' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: client\.max_rows: duration_based_run/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
+test('nulls connection backoff when connection retries are disabled', () => {
+  const candidate = coveredCandidate('backoff', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.transport.retry_backoff_ms', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { transport: { retry_backoff_ms: 37 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'transport.retry_backoff_ms', reason: 'connection_retries_disabled' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: transport\.retry_backoff_ms: connection_retries_disabled/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
+test('nulls HTTP/2 factors that are overridden or disabled', () => {
+  for (const [field, reason] of [
+    ['stream_window_bytes', 'adaptive_http2_window'],
+    ['keepalive_timeout_ms', 'http2_keepalive_disabled'],
+    ['tcp_keepalive_retries', 'tcp_keepalive_disabled'],
+    ['rate_limit_period_ms', 'rate_limit_disabled'],
+  ] as const) {
+    const candidate = coveredCandidate('http2', 100, 235).map(row => ({
+      ...row, factorConfigPaths: [`tunables.transport.${field}`, 'parquet_writer.defaults.compression'],
+    }));
+    for (const row of candidate) {
+      Object.assign(row.officialRuns[0]!.config.tunables, { transport: { [field]: 2000 } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `transport.${field}`, reason }];
+        evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+      });
+    }
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.ok(svg.includes(`inert: transport.${field}: ${reason}`));
+    assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+  }
+});
+
+test('nulls a per-column dictionary page limit when dictionary is explicitly disabled on that column', () => {
+  const candidate = coveredCandidate('dictionary-off', 100, 240).map(row => ({
+    ...row,
+    factorX: 'dictionary_page_size_limit',
+    valueX: '4096',
+    factorY: 'codec',
+    valueY: 'dictionary-off',
+    factorConfigPaths: [
+      'tunables.parquet_writer.per_column.payload.dictionary_page_size_limit',
+      'parquet_writer.defaults.compression',
+    ],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables.parquet_writer, {
+      per_column: {
+        payload: { dictionary_enabled: false, dictionary_page_size_limit: 4096 },
+        other: { dictionary_enabled: true, dictionary_page_size_limit: 4096 },
+      },
+    });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{
+        path: 'parquet_writer.per_column.payload.dictionary_page_size_limit',
+        reason: 'dictionary_disabled',
+      }];
+      evidence.projection_only = [{
+        path: 'parquet_writer.defaults.compression',
+        reason: 'consumer_startup_proof_unverified',
+      }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /dictionary-off: unqualified.*no committed-rate observation \(inert: parquet_writer\.per_column\.payload\.dictionary_page_size_limit: dictionary_disabled/);
+  assert.doesNotMatch(svg, /dictionary-off \(3\/3\)|observed mean 100 rows\/s|>100\*?<\/text>/);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{
+        path: 'parquet_writer.per_column.other.dictionary_page_size_limit',
+        reason: 'dictionary_disabled',
+      }];
+    });
+  }
+  const unrelatedSvg = renderCampaignResults(candidate, 'C1');
+  assert.match(unrelatedSvg, /varied factor coverage unknown/);
+  assert.doesNotMatch(unrelatedSvg, /dictionary-off: unqualified.*\(inert:/);
+});
+
+test('fails closed on duplicate or unknown classifications even with otherwise complete coverage', () => {
+  for (const scenario of ['unknown', 'duplicate', 'verified'] as const) {
+    const candidate = coveredCandidate('runner', 100, 230);
+    for (const row of candidate) {
+      mutateFactorEvidence(row, evidence => {
+        evidence.projection_only = [];
+        evidence.consumer_verified = [
+          { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+          { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+        ];
+      });
+    }
+    mutateFactorEvidence(candidate[1]!, evidence => {
+      if (scenario === 'unknown') {
+        evidence.consumer_verified = [
+          { path: 'parquet_writer.defaults.compression', reason: 'new_runner_reason' },
+          { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+        ];
+      } else if (scenario === 'duplicate') {
+        evidence.projection_only = [
+          { path: 'tunables.parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+        ];
+      } else {
+        evidence.consumer_verified = [
+          { path: 'tunables.parquet_writer.defaults.compression', reason: 'unrecognized' },
+        ];
+      }
+    });
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /runner \(3\/3\)|observed mean 100 rows\/s|>100<\/text>/);
+  }
+});
+
+test('excludes an entire cell when any repeat has an inert factor, including unprefixed evidence paths', () => {
+  const active = coveredCandidate('active', 100, 100);
+  const inert = coveredCandidate('inert', 900, 110);
+  mutateFactorEvidence(inert[1]!, evidence => {
+    evidence.inert_fields = [{ path: 'parquet_writer.defaults.compression_level', reason: 'maintenance_disabled' }];
+    evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+  });
+  const svg = renderCampaignResults([...active, ...inert], 'C1');
+  assert.match(svg, /No qualified winner/);
+  assert.doesNotMatch(svg, /inert \(3\/3\)/);
+  assert.match(svg, /inert: unqualified.*no committed-rate observation \(inert: parquet_writer\.defaults\.compression_level: maintenance_disabled/);
+  assert.doesNotMatch(svg, />900(?:\.00)?</);
+});
+
+test('nulls projection-only observations pending independent applicability proof and matches prefixed evidence paths', () => {
+  const projected = coveredCandidate('projected', 800, 120);
+  mutateFactorEvidence(projected[0]!, evidence => {
+    evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+      { path: 'tunables.parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const svg = renderCampaignResults([...coveredCandidate('active', 100, 130), ...projected], 'C1');
+  assert.match(svg, /No qualified winner/);
+  assert.doesNotMatch(svg, /projected \(3\/3\)/);
+  assert.match(svg, />null<\/text>/);
+  assert.doesNotMatch(svg, />800\*?<\/text>|observed mean 800 rows\/s/);
+  assert.match(svg, /projected: unqualified.*no committed-rate observation \(consumption unproven; applicability unknown: .*tunables\.parquet_writer\.defaults\.compression_level: consumer_startup_proof_unverified/);
+});
+
+test('a projection-only repeat nulls its whole cell and preserves a dead Kustainer comment', () => {
+  const candidate = coveredCandidate('projected-death', 800, 250);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+      ];
+    });
+  }
+  mutateFactorEvidence(candidate[1]!, evidence => {
+    evidence.consumer_verified = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+    ];
+    evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const results = candidate.map(row => row.repeat === 2 ?
+    { ...row, diedFirst: 'Kustainer', comment: 'emulator exited before downstream observation' } : row);
+  const svg = renderCampaignResults(results, 'C1');
+  assert.match(svg, /consumption unproven; applicability unknown/);
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited before downstream observation/);
+  assert.doesNotMatch(svg, /projected-death \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+});
+
+test('an active cell retains its committed rate after Kustainer death', () => {
+  const candidate = coveredCandidate('active-death', 800, 260);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+      ];
+    });
+  }
+  const results = candidate.map(row => row.repeat === 2 ?
+    { ...row, diedFirst: 'Kustainer', comment: 'emulator exited before downstream observation' } : row);
+  const [death] = validateCampaignMeasurements([results[1]!]);
+  assert.equal(death!.committedRowsPerSecond, 800);
+  assert.equal(death!.qapCompletionPercent, null);
+  assert.equal(death!.qapPendingArtifacts, null);
+  assert.equal(death!.qapUnhealthyCatalogs, null);
+  const svg = renderCampaignResults(results, 'C1');
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: 800\).*emulator exited before downstream observation/);
+  assert.match(svg, />800\*?<\/text>/);
+});
+
+test('fails closed on missing or malformed coverage and does not infer a legacy factor path', () => {
+  const mutations: Array<(evidence: Record<string, unknown>) => void> = [
+    evidence => { delete evidence.inert_fields; },
+    evidence => { delete evidence.projection_only; },
+    evidence => { delete evidence.runner_controls; },
+    evidence => { delete evidence.consumer_verified; },
+    evidence => { evidence.inert_fields = null; },
+    evidence => { evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: '' }]; },
+    evidence => { evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'new_reason' }]; },
+    evidence => { evidence.inert_fields = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }]; },
+    evidence => { evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+      { path: 'tunables.parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+    ]; },
+    evidence => {
+      evidence.inert_fields = [{ path: 'parquet_writer.defaults.compression', reason: 'maintenance_disabled' }];
+      evidence.projection_only = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    },
+    evidence => { evidence.inert_fields = [{ path: 'unrelated', reason: 'unrecognized' }]; },
+    evidence => { evidence.inert_fields = [{ path: 'tunables..bad', reason: 'maintenance_disabled' }]; },
+    evidence => { evidence.projection_only = []; },
+    evidence => { evidence.projection_only = [{ path: 'parquet_writer.defaults', reason: 'consumer_startup_proof_unverified' }]; },
+    evidence => { evidence.runner_controls = [{ path: 'other', reason: 'unrecognized' }]; },
+    evidence => { evidence.consumer_verified = [{ path: 'other', reason: 'unrecognized' }]; },
+    evidence => {
+      evidence.runner_controls = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'unrecognized' }];
+    },
+    evidence => {
+      evidence.consumer_verified = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'unrecognized' }];
+    },
+    evidence => { evidence.runner_controls = null; },
+    evidence => {
+      evidence.runner_controls = [{ path: 'other', reason: 'unrecognized' }];
+      evidence.consumer_verified = [{ path: 'tunables.other', reason: 'unrecognized' }];
+    },
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const candidate = coveredCandidate('unknown', 700, 150 + index * 3);
+    mutateFactorEvidence(candidate[1]!, mutate);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /unknown \(3\/3\)|observed mean 700|>700<\/text>/);
+  }
+  const legacy = coveredCandidate('legacy', 700, 170).map(row => ({ ...row, factorConfigPaths: undefined }));
+  const svg = renderCampaignResults(legacy, 'C1');
+  assert.match(svg, /varied factor coverage unknown/);
+  assert.doesNotMatch(svg, /legacy \(3\/3\)|observed mean 700/);
+  const invalidJson = coveredCandidate('bad-json', 700, 190);
+  invalidJson[1]!.officialRuns[0]!.rows[0]!.evidence_json = '{';
+  const invalidSvg = renderCampaignResults(invalidJson, 'C1');
+  assert.match(invalidSvg, /varied factor coverage unknown/);
+  assert.doesNotMatch(invalidSvg, /bad-json \(3\/3\)|observed mean 700/);
+});
+
+test('empty arrays do not establish factor coverage and unrelated classifications do not cover a leaf', () => {
+  const candidate = coveredCandidate('active', 100, 180);
+  mutateFactorEvidence(candidate[0]!, evidence => {
+    evidence.projection_only = [];
+  });
+  assert.match(renderCampaignResults(candidate, 'C1'), /varied factor coverage unknown/);
+  mutateFactorEvidence(candidate[0]!, evidence => {
+    evidence.inert_fields = [{ path: 'tunables.parquet_writer.defaults.other', reason: 'maintenance_disabled' }];
+    evidence.projection_only = [
+      { path: 'collector.other', reason: 'consumer_startup_proof_unverified' },
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /varied factor coverage unknown/);
+  assert.doesNotMatch(svg, /active \(3\/3\)|observed mean 100 rows\/s/);
+});
+
+test('inert evidence dominates missing coverage for candidates sharing a heatmap cell', () => {
+  const complete = coveredCandidate('shared', 100, 200);
+  const other = coveredCandidate('other', 900, 210).map(row => ({ ...row, valueX: 'shared' }));
+  for (const row of other) row.officialRuns[0]!.config.tunables.parquet_writer.defaults.compression = 'shared';
+  mutateFactorEvidence(other[0]!, evidence => {
+    evidence.inert_fields = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'maintenance_disabled' }];
+    delete evidence.projection_only;
+  });
+  const svg = renderCampaignResults([...complete, ...other], 'C1');
+  assert.doesNotMatch(svg, /shared \(3\/3\)|other \(3\/3\)|observed mean (?:100|900) rows\/s|>(?:100|900)<\/text>/);
+  assert.match(svg, /inert: tunables\.parquet_writer\.defaults\.compression: maintenance_disabled/);
 });

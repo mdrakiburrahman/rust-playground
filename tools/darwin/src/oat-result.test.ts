@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Table, Utf8, tableFromArrays, tableFromIPC, tableToIPC, vectorFromArray } from "apache-arrow";
 import { Compression, readParquet, Table as WasmTable, WriterPropertiesBuilder, writeParquet } from "parquet-wasm";
-import { assertParityProcessRevision, DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION, DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION, extractClientEvidence, extractClientReports, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
+import { assertParityProcessRevision, DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION, DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION, extractClientEvidence, extractClientReports, extractInertTunableFields, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
 import { artifactHash, hashTsx } from "./identity-reconcile.js";
 import type { OatMeasurement } from "./metrics-adapter.js";
 
@@ -27,6 +27,32 @@ function reportFor(profile: ClientDataProfile) {
   };
   return { phase_counters: { preparation, payload_manifest: payloadManifest, measurement_window: { client_resources: clientResources } } };
 }
+
+test("inert tunable evidence is distinguished from unavailable or malformed evidence", () => {
+  const field = { path: "logging.maintenance", reason: "maintenance_disabled" };
+  assert.equal(extractInertTunableFields({}), null);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [] }), []);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [field] }), [field]);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [
+    { path: "client.max_rows", reason: "duration_based_run" },
+  ] }), [{ path: "client.max_rows", reason: "duration_based_run" }]);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [
+    { path: "transport.retry_backoff_ms", reason: "connection_retries_disabled" },
+  ] }), [{ path: "transport.retry_backoff_ms", reason: "connection_retries_disabled" }]);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [
+    { path: "transport.stream_window_bytes", reason: "adaptive_http2_window" },
+    { path: "transport.keepalive_timeout_ms", reason: "http2_keepalive_disabled" },
+    { path: "transport.tcp_keepalive_retries", reason: "tcp_keepalive_disabled" },
+    { path: "transport.rate_limit_period_ms", reason: "rate_limit_disabled" },
+  ] })?.map(entry => entry.reason), ["adaptive_http2_window", "http2_keepalive_disabled", "tcp_keepalive_disabled", "rate_limit_disabled"]);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [field, {
+    path: "parquet_writer.columns.customer_id.dictionary_page_size_limit", reason: "dictionary_disabled",
+  }] })?.map(entry => entry.reason), ["maintenance_disabled", "dictionary_disabled"]);
+  assert.throws(() => extractInertTunableFields({ inert_fields: null }), /invalid inert_fields/);
+  assert.throws(() => extractInertTunableFields({ inert_fields: [field, field] }), /invalid inert_fields/);
+  assert.throws(() => extractInertTunableFields({ inert_fields: [{ ...field, reason: "other" }] }), /invalid inert_fields/);
+  assert.throws(() => extractInertTunableFields({ inert_fields: [{ ...field, extra: true }] }), /invalid inert_fields/);
+});
 
 test("multiple reports bind client images, configs, CPU and checked completed totals", () => {
   const make = () => ({
@@ -153,6 +179,10 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
     }));
     const evidence = {
       version: 1,
+      inert_fields: [{ path: "logging.maintenance", reason: "maintenance_disabled" }],
+      projection_only: [{ path: "collector.upload.mode", reason: "consumer_startup_proof_unverified" }],
+      runner_controls: [{ path: "maintenance.enabled", reason: "maintenance_runner_control" }],
+      consumer_verified: [{ path: "client.workers", reason: "consumer_startup_readback" }],
       processes: [{ component: "collector", source_revision: revision, log_complete: true,
         image_id: `sha256:${"b".repeat(64)}`, effective_config_source: "consumer_startup_readback",
         effective_config: { commit_telemetry: { schema_version: 1, scope: "new_ingestion_addfiles_after_sync", clock: "system_unix_ms" } },
@@ -263,6 +293,10 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION, 1);
     assert.equal(DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION, 1);
     assert.equal(result.kind, "diagnostic-only");
+    assert.deepEqual(result.inert_fields, evidence.inert_fields);
+    assert.deepEqual(result.projection_only, evidence.projection_only);
+    assert.deepEqual(result.runner_controls, evidence.runner_controls);
+    assert.deepEqual(result.consumer_verified, evidence.consumer_verified);
     assert.equal(result.diagnosticOnlyRealistic, true);
     assert.equal(result.diagnosticRealisticReconciliationVersion, 1);
     assert.equal(result.deliveryIdentity?.verified, true);
@@ -292,6 +326,15 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(result.activeRows, 5);
     assert.equal(result.measurement.durableRowsPerSecond, 3 / 150);
     assert.deepEqual(decoded.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
+    evidence.consumer_verified.push({ path: "client.workers", reason: "consumer_startup_readback" });
+    await writeResult();
+    await assert.rejects(read(), /invalid consumer_verified/);
+    evidence.consumer_verified.pop();
+    evidence.runner_controls.push({ path: "client.workers", reason: "maintenance_runner_control" });
+    await writeResult();
+    await assert.rejects(read(), /duplicate tunable coverage path/);
+    evidence.runner_controls.pop();
+    await writeResult();
     await assert.rejects(readReconciledOatResult(resultPath, join(root, "snapshots"), table, revision,
       { codec: "zstd", level: 3 }, "realistic", undefined, { tools, outputDir: root }, diagnostic),
     /requires the unchanged default writer/);

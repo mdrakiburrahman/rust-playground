@@ -271,7 +271,12 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.to_ascii_lowercase();
-                    if !matches!(lower.as_str(), "authority_timeout" | "listener_tasks_per_fd")
+                    let public_endpoint_limit = matches!(
+                        lower.as_str(),
+                        "endpoint_concurrency_limit" | "endpoint_buffer_size"
+                    ) && value.as_u64().is_some();
+                    if !public_endpoint_limit
+                        && !matches!(lower.as_str(), "authority_timeout" | "listener_tasks_per_fd")
                         && ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
                             .iter()
                             .any(|private| lower.contains(private))
@@ -494,6 +499,7 @@ fn router_readback_path(variable: &str) -> Result<String> {
         | "MAX_TABLE_ENTRIES"
         | "MAX_OLDEST_BUFFER_AGE_MS"
         | "HARD_PRESSURE_BPS"
+        | "EXCLUDED_ADMISSION_GAUGES"
         | "WARMUP_MS"
         | "MINIMUM_WARMUP_BPS"
         | "LEASE_TTL_MS"
@@ -543,6 +549,16 @@ fn verify_process_configuration_recording(
         }
         if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
             expected = Value::Null;
+        }
+        if name == "ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES" {
+            expected = json!(
+                expected
+                    .as_str()
+                    .context("router excluded admission gauges must be comma separated")?
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+            );
         }
         if matches!(role, ComponentRole::Maintenance) && name == "ARROWCOL_MAINT_OPERATION_TIMEOUT_SECS" {
             continue;
@@ -837,6 +853,8 @@ fn process_evidence_for_cell(
                     });
             result.push(json!({
                 "component": role_name(role),
+                "instance_id": log.instance_id,
+                "startup_tunables_verified": true,
                 "effective_config": observed.then_some(effective),
                 "writer_policy_overrides": writer_policy,
                 "writer_policy_scope": "configured_startup_overrides_not_complete_schema_resolved_or_exercised_file_properties",
@@ -1675,6 +1693,28 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn disabled_maintenance_logging_does_not_require_a_process() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "logging": {"maintenance": "warn"},
+            "maintenance": {"enabled": false}
+        }))?;
+        assert_eq!(process_evidence(&config, &[])?, json!([]));
+        assert_eq!(
+            inert_tunable_fields(&config)?,
+            vec![json!({"path":"logging.maintenance","reason":"maintenance_disabled"})]
+        );
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "logging": {"maintenance": "warn"},
+            "maintenance": {"enabled": true, "operations": ["optimize"]}
+        }))?;
+        assert!(inert_tunable_fields(&config)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn process_log_filter_fails_closed_when_retained_byte_cap_is_exceeded() {
         let mut output = String::new();
         let mut retained_bytes = MAX_RETAINED_PROCESS_LOG_BYTES;
@@ -1694,9 +1734,125 @@ mod startup_readback_tests {
             .is_err()
         );
         let readback = process_configurations(
-            "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":1,\"secret_file\":\"private\",\"endpoint\":\"https://private\"}\n",
+            "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":1,\"secret_file\":\"private\",\"endpoint\":\"https://private\",\"endpoint_concurrency_limit\":12,\"endpoint_buffer_size\":14}\n",
         )?;
-        assert_eq!(readback, json!({"batch_rows":1}));
+        assert_eq!(readback, json!({"batch_rows":1,"endpoint_concurrency_limit":12,"endpoint_buffer_size":14}));
+        assert!(public_tuning_value(&json!({"endpoint_buffer_size":"https://private"}))
+            .is_some_and(|value| value == json!({})));
+        Ok(())
+    }
+
+    #[test]
+    fn router_excluded_gauges_require_matching_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "router": {"excluded_admission_gauges": ["cpu_utilization_bps", "active_streams"]}
+        }))?;
+        let log_filter = role_environment(&config, ComponentRole::Router)?["RUST_LOG"].clone();
+        let observed = json!({"log_filter": log_filter, "routing":{"excluded_admission_gauges":["cpu_utilization_bps","active_streams"]}});
+        verify_process_configuration(&config, ComponentRole::Router, &observed)?;
+        assert!(verify_process_configuration(&config, ComponentRole::Router, &json!({"routing":{}})).is_err());
+        assert!(verify_process_configuration(
+            &config, ComponentRole::Router, &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
+        ).is_err());
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "router": {"excluded_admission_gauges": []}
+        }))?;
+        verify_process_configuration(
+            &config, ComponentRole::Router, &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires cargo build --package arrowcol-router-rust"]
+    fn router_excluded_gauges_reach_actual_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "router": {"excluded_admission_gauges": ["cpu_utilization_bps", "active_streams"]}
+        }))?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let binary = root.join("target").join("debug")
+            .join(format!("arrowcol-router-rust{}", std::env::consts::EXE_SUFFIX));
+        let output = std::process::Command::new(binary)
+            .env_clear()
+            .envs(role_environment(&config, ComponentRole::Router)?)
+            .arg("--config")
+            .arg(root.join("projects/arrowcol-router-rust/config.smoke.yaml"))
+            .arg("--validate-and-exit")
+            .output()
+            .context("launch actual router for startup propagation")?;
+        anyhow::ensure!(output.status.success(), "router validation failed: {}", String::from_utf8_lossy(&output.stderr));
+        let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
+        let observed = process_configurations(&text)?;
+        verify_process_configuration(&config, ComponentRole::Router, &observed)?;
+        let process = json!({
+            "component": "router", "instance_id": "router-1", "log_complete": true,
+            "startup_tunables_verified": true, "effective_config_source": "consumer_startup_readback",
+            "effective_config": observed,
+        });
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_router_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        assert_eq!(covered["consumer_verified"], json!([{
+            "path": "router.excluded_admission_gauges", "reason": "consumer_startup_readback"
+        }]));
+        let mut wrong = process.clone();
+        wrong["effective_config"]["routing"]["excluded_admission_gauges"] = json!([]);
+        for processes in [json!([]), json!([wrong]), json!([process.clone(), process])] {
+            let mut uncovered = initial.clone();
+            let replicas = if processes.as_array().context("process array")?.len() == 2 { 2 } else { 1 };
+            promote_router_readback(&config, &mut uncovered, Some(&processes), replicas)?;
+            assert_eq!(uncovered, initial);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parquet_policy_reaches_consumer_startup_configuration() -> Result<()> {
+        const CHILD: &str = "OAT_PARQUET_STARTUP_CHILD";
+        const PREFIX: &str = "OAT_PARQUET_STARTUP_READBACK ";
+        if std::env::var_os(CHILD).is_some() {
+            println!("{PREFIX}{}", arrow_deltalake::writer::effective_startup_config_json()?);
+            return Ok(());
+        }
+        let cases = [
+            json!({"defaults":{"compression":"uncompressed"}}),
+            json!({"defaults":{"compression":"snappy"}}),
+            json!({"defaults":{"compression":"gzip","compression_level":6}}),
+            json!({"defaults":{"compression":"brotli","compression_level":1}}),
+            json!({"defaults":{"compression":"lz4"}}),
+            json!({"defaults":{"compression":"lz4_raw"}}),
+            json!({"defaults":{"compression":"zstd","compression_level":3},
+                "columns":{"customer_id":{"compression":"snappy","dictionary_enabled":true}},
+                "writer_version":"v2","max_row_group_rows":16384,"max_row_group_bytes":1048576,
+                "data_page_row_count_limit":2048,"write_batch_size":512,
+                "offset_index_enabled":true,"column_index_truncate_length":64,
+                "statistics_truncate_length":64}),
+        ];
+        for policy in cases {
+            let mut config: OatConfig = serde_json::from_str(include_str!(
+                "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+            ))?;
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy}))?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "runner::startup_readback_tests::parquet_policy_reaches_consumer_startup_configuration", "--nocapture"])
+                .env_clear()
+                .env(CHILD, "1")
+                .envs(role_environment(&config, ComponentRole::Collector)?)
+                .output()?;
+            let stdout = String::from_utf8(output.stdout)?;
+            anyhow::ensure!(output.status.success(), "writer startup failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            let observed: Value = serde_json::from_str(stdout.lines()
+                .find_map(|line| line.split_once(PREFIX).map(|(_, json)| json))
+                .context("writer startup readback missing")?)?;
+            verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
+        }
         Ok(())
     }
 
@@ -1904,6 +2060,429 @@ mod startup_readback_tests {
             observed["runtime_threads"],
             observed["resolution"]["available_parallelism"]
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod consumer_startup_projection_tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn commit_and_pressure_reach_actual_collector_startup() -> Result<()> {
+        struct TempRoot(PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct Child(std::process::Child);
+        impl Child {
+            fn stop(&mut self) -> Result<()> {
+                if self.0.try_wait()?.is_none() {
+                    self.0.kill()?;
+                    self.0.wait()?;
+                }
+                Ok(())
+            }
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.stop();
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("oat-collector-readback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let root = TempRoot(root);
+        let yaml_path = root.0.join("config.yaml");
+        let log_path = root.0.join("stderr.log");
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector": {
+                "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13},
+                "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
+                    "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
+                    "buffered_batches_limit":123,"pressure_interval":"3s",
+                    "heartbeat_interval":"4s","registration_ttl":"30s"}
+            }
+        }))?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/arrowcol-dataflow-rust");
+        let mut text = None;
+        for attempt in 0..3 {
+            let flight = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let admin = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let flight_port = flight.local_addr()?.port();
+            let admin_port = admin.local_addr()?.port();
+            let yaml = format!(r#"
+version: otel_dataflow/v1
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  isolated:
+    pipelines:
+      ingest:
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "127.0.0.1:{flight_port}"
+              admin_listening_addr: "127.0.0.1:{admin_port}"
+              catalog:
+                type: memory
+              routing:
+                type: memory
+              registration:
+                instance_key: isolated-startup-test
+                flight_endpoint: "127.0.0.1:{flight_port}"
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: "{}/data"
+              routing:
+                type: memory
+        connections:
+          - from: flight
+            to: delta
+"#, root.0.display());
+            std::fs::write(&yaml_path, yaml)?;
+            drop((flight, admin));
+            let mut child = Child(std::process::Command::new(&binary)
+                .args(["--num-cores", "1", "--config"])
+                .arg(&yaml_path)
+                .env_clear()
+                .envs(role_environment(&config, ComponentRole::Collector)?)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&log_path)?)
+                .spawn()?);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let output = std::fs::read_to_string(&log_path)?;
+                if output.contains("Address already in use") {
+                    if attempt < 2 {
+                        child.stop().context("stop collector after bind collision")?;
+                        break;
+                    }
+                    bail!("collector bind collision after three attempts: {output}");
+                }
+                if let Some(status) = child.0.try_wait()? {
+                    bail!("collector exited before both readbacks ({status}): {output}");
+                }
+                let listening = [flight_port, admin_port].into_iter().all(|port| {
+                    std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                        Duration::from_millis(100),
+                    ).is_ok()
+                });
+                if listening && output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Some(status) = child.0.try_wait()? {
+                        let output = std::fs::read_to_string(&log_path)?;
+                        if output.contains("Address already in use") && attempt < 2 {
+                            break;
+                        }
+                        bail!("collector exited during listener startup ({status}): {output}");
+                    }
+                    child.stop().context("stop isolated collector")?;
+                    text = Some(output);
+                    break;
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "collector readback timed out: {output}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if text.is_some() {
+                break;
+            }
+        }
+        let observed = process_configurations(&text.context("collector did not produce readback")?)?;
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let process = json!({
+            "component": "collector", "instance_id": "collector-1", "log_complete": true,
+            "startup_tunables_verified": true, "effective_config_source": "consumer_startup_readback",
+            "effective_config": observed,
+        });
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 11);
+        assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
+        let mut wrong_process = process.clone();
+        wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
+        let mut missing_process = process.clone();
+        missing_process["effective_config"]["pressure"].as_object_mut().context("pressure object")?.remove("buffered_rows_limit");
+        let mut incomplete_process = process.clone();
+        incomplete_process["log_complete"] = json!(false);
+        for processes in [
+            json!([]), json!([wrong_process]), json!([missing_process]), json!([incomplete_process]),
+            json!([process.clone(), process.clone()]),
+        ] {
+            let mut uncovered = initial.clone();
+            let replicas = if processes.as_array().context("process array")?.len() == 2 { 2 } else { 1 };
+            promote_collector_readback(&config, &mut uncovered, Some(&processes), replicas)?;
+            assert_eq!(uncovered, initial);
+        }
+        for (group, fields) in [
+            ("commit", &["batch_window", "max_files_per_commit", "max_pending_files"][..]),
+            ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
+                "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
+                "heartbeat_interval", "registration_ttl"][..]),
+        ] {
+            for field in fields {
+                let mut missing = observed.clone();
+                missing[group].as_object_mut().context("missing readback group")?
+                    .remove(*field).context("consumer omitted requested field")?;
+                anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
+                    "verifier accepted missing {group}.{field}");
+            }
+        }
+        let mut wrong = observed;
+        wrong["commit"]["max_files_per_commit"] = json!(8);
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn parquet_policy_reaches_actual_collector_startup() -> Result<()> {
+        fn leaf_paths(value: &Value, path: &mut Vec<String>, leaves: &mut Vec<Vec<String>>) {
+            if let Some(fields) = value.as_object() {
+                for (key, value) in fields {
+                    path.push(key.clone());
+                    leaf_paths(value, path, leaves);
+                    path.pop();
+                }
+            } else {
+                leaves.push(path.clone());
+            }
+        }
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(format!("arrowcol-dataflow-rust{}", std::env::consts::EXE_SUFFIX));
+        let cases = [
+            json!({"defaults":{"compression":"uncompressed"}}),
+            json!({"defaults":{"compression":"snappy"}}),
+            json!({"defaults":{"compression":"gzip","compression_level":6}}),
+            json!({"defaults":{"compression":"brotli","compression_level":1}}),
+            json!({"defaults":{"compression":"lz4"}}),
+            json!({"defaults":{"compression":"lz4_raw"}}),
+            json!({"defaults":{"compression":"zstd","compression_level":3,"encoding":"plain",
+                    "dictionary_enabled":true,"dictionary_page_size_limit":2048,
+                    "data_page_size_limit":4096,"statistics":"chunk","write_page_header_statistics":true,
+                    "bloom_filter_enabled":true,"bloom_filter_fpp":0.05,"bloom_filter_ndv":1024,
+                    "data_page_v2_compression_ratio_threshold":1.5},
+                "columns":{"customer_id":{"compression":"gzip","compression_level":5,
+                    "encoding":"delta_byte_array","dictionary_enabled":true,"dictionary_page_size_limit":1024,
+                    "data_page_size_limit":2048,"statistics":"page","write_page_header_statistics":false,
+                    "bloom_filter_enabled":true,"bloom_filter_fpp":0.1,"bloom_filter_ndv":512,
+                    "data_page_v2_compression_ratio_threshold":1.2}},
+                "writer_version":"v2","max_row_group_rows":16384,"max_row_group_bytes":1048576,
+                "data_page_row_count_limit":2048,"write_batch_size":512,
+                "offset_index_enabled":true,"column_index_truncate_length":64,
+                "statistics_truncate_length":64}),
+        ];
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for policy in cases {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy.clone()}))?;
+            let output = std::process::Command::new(&binary)
+                .arg("--help")
+                .env_clear()
+                .envs(role_environment(&config, ComponentRole::Collector)?)
+                .output()
+                .context("launch collector for Parquet policy readback")?;
+            anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+            let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+            verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            let mut leaves = Vec::new();
+            leaf_paths(&policy, &mut Vec::new(), &mut leaves);
+            for path in leaves {
+                let mut missing = observed.clone();
+                let mut parent = &mut missing["parquet_writer"];
+                for part in &path[..path.len() - 1] {
+                    parent = parent.get_mut(part).context("missing policy parent")?;
+                }
+                parent.as_object_mut().context("policy parent must be an object")?
+                    .remove(&path[path.len() - 1]).context("consumer omitted requested policy leaf")?;
+                anyhow::ensure!(
+                    verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
+                    "verifier accepted missing Parquet leaf {}", path.join(".")
+                );
+            }
+            let mut wrong = observed.clone();
+            wrong["parquet_writer"]["defaults"]["compression"] = json!("invalid-compression");
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
+            observed.as_object_mut().context("startup readback must be an object")?.remove("parquet_writer");
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        }
+        Ok(())
+    }
+
+    fn actual_client_startup(binary: &Path, config: &OatConfig) -> Result<Value> {
+        let table = config.tables.first().context("startup fixture needs a table")?;
+        let mut command = std::process::Command::new(binary);
+        command.env_clear().envs(role_environment(config, ComponentRole::Client)?);
+        command.args([
+            "--endpoint", "http://127.0.0.1:0", "--table", table,
+            "--rows", &config.rows_per_table.to_string(),
+            "--concurrency", &config.dmv_concurrency.to_string(),
+        ]);
+        let output = command.output().context("launch actual client binary")?;
+        anyhow::ensure!(!output.status.success(), "unreachable endpoint unexpectedly succeeded");
+        let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
+        anyhow::ensure!(text.lines().any(|line| line.starts_with("OAT_CLIENT_EFFECTIVE_CONFIG ")),
+            "consumer omitted startup envelope");
+        process_configurations(&text)
+    }
+
+    // Real binary output, not a fabricated effective-config envelope. Each sample must
+    // differ from the same binary's baseline so a dropped env var cannot pass by default.
+    #[test]
+    #[ignore = "requires built arrowcol-dmv and an unreachable local endpoint"]
+    fn client_leaf_adapters_use_actual_consumer_startup() -> Result<()> {
+        let cases = [
+            (json!({"client":{"payload_customer_id":"synthetic-customer"}}), "payload_customer_id"),
+            (json!({"client":{"corpus_rows":127}}), "corpus_rows"),
+            (json!({"client":{"corpus_bytes":4096}}), "corpus_bytes"),
+            (json!({"client":{"batch_rows":257}}), "batch_rows"),
+            (json!({"client":{"workers":7}}), "workers"),
+            (json!({"client":{"runtime_threads":5}}), "runtime_threads"),
+            (json!({"client":{"data_mode":"independent"}}), "data_mode"),
+            (json!({"client":{"data_profile":"realistic"}}), "data_profile"),
+            (json!({"client":{"string_length_distribution":"uniform"}}), "string_length_distribution"),
+            (json!({"client":{"value_variation":"per_row"}}), "value_variation"),
+            (json!({"client":{"guid_uniqueness":"per_row"}}), "guid_uniqueness"),
+            (json!({"client":{"string_width":31}}), "string_width"),
+            (json!({"client":{"cardinality":31}}), "cardinality"),
+            (json!({"client":{"null_fraction":0.2}}), "null_fraction"),
+            (json!({"client":{"skew":0.3}}), "skew"),
+            (json!({"client":{"entropy":0.8}}), "entropy"),
+            (json!({"client":{"seed":29}}), "seed"),
+            (json!({"client":{"max_memory_bytes":268435456}}), "max_memory_bytes"),
+            (json!({"client":{"interval_us":7}}), "interval_us"),
+            (json!({"client":{"connections_per_worker":3}}), "connections_per_worker"),
+            (json!({"client":{"streams_per_worker":7}}), "streams_per_worker"),
+            (json!({"client":{"max_rows":129}}), "max_rows"),
+            (json!({"client":{"pod_ordinal":3}}), "pod_ordinal"),
+            (json!({"client":{"stream_retry_max_attempts":3}}), "stream_retry_max_attempts"),
+            (json!({"client":{"stream_retry_base_backoff_ms":13}}), "stream_retry_base_backoff_ms"),
+            (json!({"client":{"stream_retry_max_backoff_ms":300}}), "stream_retry_max_backoff_ms"),
+            (json!({"transport":{"max_flight_data_bytes":1048576}}), "max_flight_data_bytes"),
+            (json!({"transport":{"max_message_bytes":8388608}}), "max_message_bytes"),
+            (json!({"transport":{"max_frame_bytes":32768}}), "max_frame_bytes"),
+            (json!({"transport":{"grpc_send_compression":"gzip"}}), "grpc_send_compression"),
+            (json!({"transport":{"grpc_accept_compression":"zstd"}}), "grpc_accept_compression"),
+            (json!({"transport":{"header_table_bytes":8192}}), "header_table_bytes"),
+            (json!({"transport":{"max_header_list_bytes":32768}}), "max_header_list_bytes"),
+            (json!({"transport":{"stream_window_bytes":2097152}}), "stream_window_bytes"),
+            (json!({"transport":{"connection_window_bytes":33554432}}), "connection_window_bytes"),
+            (json!({"transport":{"adaptive_window":true}}), "adaptive_window"),
+            (json!({"transport":{"keepalive_interval_ms":2000}}), "keepalive_interval_ms"),
+            (json!({"transport":{"keepalive_timeout_ms":3000}}), "keepalive_timeout_ms"),
+            (json!({"transport":{"keepalive_while_idle":false}}), "keepalive_while_idle"),
+            (json!({"transport":{"connect_timeout_ms":1234}}), "connect_timeout_ms"),
+            (json!({"transport":{"request_timeout_ms":1200}}), "request_timeout_ms"),
+            (json!({"transport":{"tcp_nodelay":false}}), "tcp_nodelay"),
+            (json!({"transport":{"tcp_keepalive_ms":1000}}), "tcp_keepalive_ms"),
+            (json!({"transport":{"tcp_keepalive_interval_ms":500}}), "tcp_keepalive_interval_ms"),
+            (json!({"transport":{"tcp_keepalive_retries":3}}), "tcp_keepalive_retries"),
+            (json!({"transport":{"rate_limit_rps":123}}), "rate_limit_rps"),
+            (json!({"transport":{"rate_limit_rps":123,"rate_limit_period_ms":250}}), "rate_limit_period_ms"),
+            (json!({"transport":{"connect_retries":3}}), "connect_retries"),
+            (json!({"transport":{"retry_backoff_ms":1}}), "retry_backoff_ms"),
+            (json!({"transport":{"endpoint_concurrency_limit":23}}), "endpoint_concurrency_limit"),
+            (json!({"transport":{"endpoint_buffer_size":37}}), "endpoint_buffer_size"),
+            (json!({"transport":{"ipc_compression":"zstd"}}), "ipc_compression"),
+            (json!({"arrow_ipc":{"compression":"zstd"}}), "ipc_compression"),
+        ];
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("target").join("debug")
+            .join(format!("arrowcol-dmv{}", std::env::consts::EXE_SUFFIX));
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        // Keep legacy sentinel resolutions deterministic and distinct from the test values.
+        config.rows_per_table = 128;
+        config.dmv_concurrency = 1;
+        config.tunables = arrowcol_tunables::Tunables::default();
+        let baseline = actual_client_startup(&binary, &config).context("read baseline client startup")?;
+        for (mut input, field) in cases {
+            // Automatic worker counts depend on the machine, so avoid accidental collisions.
+            if field == "workers" && baseline.get(field) == Some(&json!(7)) {
+                input["client"]["workers"] = json!(11);
+            }
+            if field == "runtime_threads" && baseline.get(field) == Some(&json!(5)) {
+                input["client"]["runtime_threads"] = json!(11);
+            }
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(input.clone())
+                .with_context(|| format!("invalid startup fixture {input}"))?;
+            let observed = actual_client_startup(&binary, &config)
+                .with_context(|| format!("read consumer startup for {input}"))?;
+            let actual = observed.get(field).with_context(|| format!("consumer omitted {field} for {input}"))?;
+            anyhow::ensure!(Some(actual) != baseline.get(field), "{field} did not differ from baseline for {input}");
+            verify_process_configuration(&config, ComponentRole::Client, &observed)
+                .with_context(|| format!("verify real consumer startup for {input}"))?;
+            if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
+                | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
+                | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
+                | "keepalive_timeout_ms" | "keepalive_while_idle"
+                | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
+                | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
+                | "rate_limit_period_ms"
+                | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
+                config.clients_per_table = 1;
+                let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
+                let initial = tunable_leaf_evidence(&config)?;
+                let mut covered = initial.clone();
+                promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
+                assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 1);
+                let mut wrong_report = report.clone();
+                wrong_report["consumer_effective_config"][field] = json!("wrong");
+                for reports in [vec![], vec![wrong_report], vec![report.clone(), report]] {
+                    let mut uncovered = initial.clone();
+                    config.clients_per_table = if reports.len() == 2 { 2 } else { 1 };
+                    promote_client_readback(&config, &mut uncovered, Some(&reports))?;
+                    assert_eq!(uncovered, initial);
+                }
+            }
+            let mut missing = observed.clone();
+            missing.as_object_mut().context("consumer startup is not an object")?.remove(field);
+            anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &missing).is_err(),
+                "adapter accepted missing {field} for {input}");
+            let mut wrong = observed;
+            wrong[field] = json!("intentional-mismatch");
+            anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &wrong).is_err(),
+                "adapter accepted wrong {field} for {input}");
+        }
+        config.clients_per_table = 1;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
+            "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
+            "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false,
+            "tcp_keepalive_ms":0, "tcp_keepalive_interval_ms":500, "tcp_keepalive_retries":3,
+            "rate_limit_period_ms":250
+        }}))?;
+        let observed = actual_client_startup(&binary, &config)?;
+        let mut coverage = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut coverage, Some(&vec![json!({
+            "client_id":"client-1", "consumer_effective_config":observed
+        })]))?;
+        for field in ["transport.stream_window_bytes", "transport.connection_window_bytes",
+            "transport.keepalive_timeout_ms", "transport.keepalive_while_idle",
+            "transport.tcp_keepalive_interval_ms", "transport.tcp_keepalive_retries",
+            "transport.rate_limit_period_ms"] {
+            assert!(coverage["inert_fields"].as_array().context("missing inert fields")?
+                .iter().any(|entry| entry["path"] == field));
+            assert!(!coverage["consumer_verified"].as_array().context("missing verified fields")?
+                .iter().any(|entry| entry["path"] == field));
+        }
         Ok(())
     }
 }

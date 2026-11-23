@@ -61,6 +61,16 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
 | `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
 | `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
+| `collector.runtime.blocking_fs_reserve` | Integer `1..=255`, default `1`, strictly less than `blocking_workers`. Values above `31` require an explicit `blocking_workers`; otherwise the host default is at least 32. Reserves blocking threads for filesystem handoffs. |
+| `collector.runtime.cpu_queue_jobs` | Integer `1..=128`, default resolved `cpu_workers`. Bounds queued CPU jobs independently of worker count. |
+| `logging.maintenance` | Inert when maintenance is disabled because no maintenance process is running; listed in the cell's `tunables_json.inert_fields` and `evidence_json.inert_fields`, and Darwin receipt `inert_fields`. A null receipt field means evidence was unavailable, not that no fields were inert. |
+| `maintenance.*` | Except for the `enabled` runner control, fields are inert when maintenance is disabled. Values remain range- and cross-field-validated; enabling the role also requires the corresponding operations. |
+| `parquet_writer.columns.<column>.dictionary_page_size_limit` | Inert if the same column explicitly disables dictionary encoding. Inert factors are not ranked or attributed effects. |
+
+Coverage evidence distinguishes runner controls, inert fields, and projected fields
+whose consumer startup verification is unproven. Missing coverage remains unknown;
+projection-only cells are null until applicability is proven and are excluded from
+selection and effect claims.
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal
@@ -274,6 +284,12 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | Client latency | Per-worker process-cumulative percentiles, explicitly including preflight/warm-up. Do not average percentiles or label them measurement-only. |
 | Generator metrics | Prepared corpus sizes, memory reservation and preparation CPU/wall timing reported by the client. Prepared mode does not generate/encode in the hot path. |
 | Startup readback | Concrete process settings remain in `effective_config`; `writer_policy_overrides` separately records configured Parquet policy, never schema-resolved or exercised file properties. |
+| Coverage | Explicit commit, pressure and excluded router gauge leaves are `consumer_verified` only when every expected role instance has a distinct identity and matching complete startup readback for the projected values. Per table, client message and frame limits, header limits, applicable HTTP/2 windows and keepalive, timeouts, TCP_NODELAY and endpoint concurrency/buffering require matching readbacks from all expected distinct clients. Upload settings remain `projection_only`: local `file:` tables bypass upload. Other projected leaves remain `projection_only` unless independently proven; this is startup configuration evidence, not proof of durable ingestion or a throughput effect. |
+| One-shot row limit | `client.max_rows` limits one-shot sends and is inert for OAT's duration-based runs. Client preparation still rejects a nonzero value smaller than one corpus batch. |
+| Connection retry backoff | `transport.retry_backoff_ms` is inert when `transport.connect_retries` is zero or omitted (the client default). |
+| HTTP/2 applicability | Initial stream and connection windows are overridden by adaptive window mode. Keepalive timeout and idle behavior are inert when the keepalive interval is zero. |
+| TCP applicability | TCP keepalive retransmission interval and retry count are inert when `tcp_keepalive_ms` is zero. |
+| Client request limiting | `transport.rate_limit_period_ms` is `1..=86400000`, default `1000`, and inert when `rate_limit_rps` is zero. Despite its legacy name, `rate_limit_rps` is the maximum requests per configured period, per connection. |
 | Layout application | Table-effective layout records are kept separate from startup policy, including catalog/Parquet overlay precedence. Disabled layout has null inapplicable limits. Records cover observed file construction, not a full-run policy history or proof those files committed. Missing table proof, ambiguous table hashes or truncated policy evidence fail explicitly. |
 | Primary durable output throughput | Newly committed, synced ingestion AddFiles whose producer commit-finished timestamp lies in `[start,end)` and whose ingress belongs to the current cell, deduplicated by table hash and Delta version. Rows/files/bytes and rows per exact window second include warm-up backlog committed in-window. OPTIMIZE rewrites are excluded. Complete logs and observed ingestion-only telemetry/clock capability are required; known zero differs from missing telemetry. Cross-node clock skew is not measured. |
 | Ingress-cohort commit evidence | Separately retains commits whose ingestion stamps lie wholly within the client window. Prior/warm-up commits are excluded here; mixed-window or uncertain reconciliation yields null plus a reason. This stricter attribution is not the primary output-throughput metric. |

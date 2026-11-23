@@ -4521,6 +4521,24 @@ fn result_rows(
     } else {
         None
     };
+    let mut leaf_evidence = tunable_leaf_evidence(config)?;
+    promote_collector_readback(
+        config,
+        &mut leaf_evidence,
+        client_run.evidence.processes.as_ref(),
+        replicas,
+    )?;
+    let router_replicas = if config.platform.kind == crate::config::OatMode::Local {
+        1
+    } else {
+        replicas
+    };
+    promote_router_readback(
+        config,
+        &mut leaf_evidence,
+        client_run.evidence.processes.as_ref(),
+        router_replicas,
+    )?;
     let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
@@ -4543,6 +4561,10 @@ fn result_rows(
         "effective_stop_budgets": config.maintenance_stop_budget()?,
         "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "inert_fields": leaf_evidence["inert_fields"],
+        "projection_only": leaf_evidence["projection_only"],
+        "runner_controls": leaf_evidence["runner_controls"],
+        "consumer_verified": leaf_evidence["consumer_verified"],
         "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
         "cpu_quota": cpu_quota_evidence,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
@@ -4606,6 +4628,20 @@ fn result_rows(
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let mut table_tunables = tunables.clone();
+        let mut table_leaf_evidence = leaf_evidence.clone();
+        promote_client_readback(
+            config,
+            &mut table_leaf_evidence,
+            client_run.evidence.client_reports.get(&table),
+        )?;
+        for field in [
+            "inert_fields",
+            "projection_only",
+            "runner_controls",
+            "consumer_verified",
+        ] {
+            table_tunables[field] = table_leaf_evidence[field].clone();
+        }
         if let Some((_, reason)) = reconciliation_failure {
             table_tunables["failure"] = json!(reason);
         }
@@ -4655,6 +4691,10 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                evidence["inert_fields"] = table_leaf_evidence["inert_fields"].clone();
+                evidence["projection_only"] = table_leaf_evidence["projection_only"].clone();
+                evidence["runner_controls"] = table_leaf_evidence["runner_controls"].clone();
+                evidence["consumer_verified"] = table_leaf_evidence["consumer_verified"].clone();
                 evidence["ownership_samples"] = json!(client_run.pinning.samples);
                 if let Some(fleet) = &config.platform.fleet {
                     let mut pool_rates = BTreeMap::<String, f64>::new();
@@ -5385,7 +5425,9 @@ async fn run_clients_inner(
                     }
                 };
                 let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
-                if let Err(error) = evidence.record_client(&effective_client_config, &handle.table, &output) {
+                if let Err(error) =
+                    evidence.record_client(&effective_client_config, &handle.table, &handle.client_id, &output)
+                {
                     let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
                     return match cleanup {
                         Ok(()) => Err(error),
@@ -17636,9 +17678,13 @@ mod tests {
 
     #[test]
     fn local_qap_deadline_keeps_progress_and_exact_snapshot_coverage_without_changing_delta_results() -> Result<()> {
-        let config: OatConfig = serde_json::from_str(include_str!(
+        let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance": {"enabled": false},
+            "logging": {"maintenance": "debug"}
+        }))?;
         let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
         let table = config.tables[0].clone();
         let external = qap_bindings(run, std::slice::from_ref(&table))?
@@ -17742,6 +17788,10 @@ mod tests {
         )?;
         assert_eq!(rows[0].status, "succeeded");
         let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
+        let tunables: Value = serde_json::from_str(&rows[0].tunables_json)?;
+        let inert = json!([{"path": "logging.maintenance", "reason": "maintenance_disabled"}]);
+        assert_eq!(tunables["inert_fields"], inert);
+        assert_eq!(result["inert_fields"], inert);
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
         assert_eq!(result["downstream_status"], "unavailable");
         assert!(result["ownership_samples"][0]["observed_at_unix_ms"].is_u64());

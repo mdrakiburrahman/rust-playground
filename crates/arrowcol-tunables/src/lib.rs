@@ -102,6 +102,8 @@ pub struct TransportTunables {
     pub tcp_keepalive_interval_ms: Option<u64>,
     pub tcp_keepalive_retries: Option<u32>,
     pub rate_limit_rps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_period_ms: Option<u64>,
     pub endpoint_concurrency_limit: Option<usize>,
     pub endpoint_buffer_size: Option<usize>,
     pub connect_retries: Option<u32>,
@@ -369,12 +371,29 @@ pub struct PressureTunables {
 pub struct RuntimeTunables {
     pub workers: Option<usize>,
     pub blocking_workers: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub blocking_fs_reserve: Option<usize>,
     pub upload_limit: Option<usize>,
     pub task_limit: Option<usize>,
     pub read_ahead: Option<usize>,
     pub batch_rows: Option<usize>,
     pub cpu_workers: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub cpu_queue_jobs: Option<usize>,
     pub generated_partition_fast_path: Option<bool>,
+}
+
+fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    usize::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

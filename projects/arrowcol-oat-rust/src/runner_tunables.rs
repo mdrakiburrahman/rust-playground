@@ -1,6 +1,166 @@
 use arrowcol_tunables::ComponentRole;
 use otel_arrow_dfe_config::engine::EngineConfig;
 
+fn tunable_leaf_evidence(config: &OatConfig) -> Result<Value> {
+    config.tunables.classify_oat_leaves()
+}
+
+fn verified_processes<'a>(
+    config: &OatConfig, processes: Option<&'a Value>, role: ComponentRole, replicas: u32,
+) -> Option<Vec<&'a Value>> {
+    let processes = processes?.as_array()?.iter()
+        .filter(|process| process["component"] == role_name(role))
+        .collect::<Vec<_>>();
+    let identities = processes.iter()
+        .filter_map(|process| process["instance_id"].as_str().filter(|id| !id.is_empty()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if replicas == 0 || processes.len() != replicas as usize || identities.len() != processes.len()
+        || processes.iter().any(|process| {
+            process["log_complete"] != true
+                || process["startup_tunables_verified"] != true
+                || process["effective_config_source"] != "consumer_startup_readback"
+                || {
+                    let mut observed = process["effective_config"].clone();
+                    if matches!(role, ComponentRole::Collector)
+                        && let Some(fields) = observed.as_object_mut()
+                        && !process["writer_policy_overrides"].is_null()
+                    {
+                        fields.insert("parquet_writer".to_owned(), process["writer_policy_overrides"].clone());
+                    }
+                    verify_process_configuration(config, role, &observed).is_err()
+                }
+        }) {
+        return None;
+    }
+    Some(processes)
+}
+
+fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
+    let Some(collectors) = verified_processes(config, processes, ComponentRole::Collector, replicas) else {
+        return Ok(());
+    };
+    let environment = role_environment(config, ComponentRole::Collector)?;
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
+        .into_iter()
+        .filter_map(|name| environment.get(name).map(|value| (name, value)))
+        .map(|(name, value)| Ok((name, serde_json::from_str::<Value>(value)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let projection = evidence["projection_only"]
+        .as_array_mut()
+        .context("projection_only must be an array")?;
+    let mut promoted = Vec::new();
+    projection.retain(|entry| {
+        let Some(path) = entry["path"].as_str() else {
+            return true;
+        };
+        let (section, field, variable) = match path {
+            "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
+            | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
+            "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
+            | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
+            | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
+            | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => ("pressure", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"),
+            _ => return true,
+        };
+        if projected.get(variable).and_then(|value| value.get(field)).is_none() {
+            return true;
+        }
+        if collectors.iter().any(|process| process["effective_config"][section].get(field).is_none()) {
+            return true;
+        }
+        promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+        false
+    });
+    evidence["consumer_verified"]
+        .as_array_mut()
+        .context("consumer_verified must be an array")?
+        .extend(promoted);
+    Ok(())
+}
+
+fn promote_router_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
+    let Some(routers) = verified_processes(config, processes, ComponentRole::Router, replicas) else {
+        return Ok(());
+    };
+    if !role_environment(config, ComponentRole::Router)?.contains_key("ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")
+        || routers.iter().any(|process| process.pointer("/effective_config/routing/excluded_admission_gauges").is_none())
+    {
+        return Ok(());
+    }
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
+    let mut promoted = Vec::new();
+    projection.retain(|entry| {
+        if entry["path"] == "router.excluded_admission_gauges" {
+            promoted.push(json!({"path": entry["path"], "reason": "consumer_startup_readback"}));
+            false
+        } else {
+            true
+        }
+    });
+    evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
+    Ok(())
+}
+
+fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Option<&Vec<Value>>) -> Result<()> {
+    let Some(reports) = reports else {
+        return Ok(());
+    };
+    let ids = reports.iter()
+        .filter_map(|report| report["client_id"].as_str().filter(|id| !id.is_empty()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if reports.len() != config.clients_per_table || ids.len() != reports.len()
+        || reports.is_empty()
+        || reports.iter().any(|report| verify_process_configuration(config, ComponentRole::Client, &report["consumer_effective_config"]).is_err())
+    {
+        return Ok(());
+    }
+    let environment = role_environment(config, ComponentRole::Client)?;
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
+    let mut promoted = Vec::new();
+    projection.retain(|entry| {
+        let (field, variable) = match entry["path"].as_str() {
+            Some("transport.max_message_bytes") => ("max_message_bytes", "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES"),
+            Some("transport.max_flight_data_bytes") => ("max_flight_data_bytes", "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES"),
+            Some("transport.max_frame_bytes") => ("max_frame_bytes", "ARROWCOL_CLIENT_MAX_FRAME_BYTES"),
+            Some("transport.header_table_bytes") => ("header_table_bytes", "ARROWCOL_CLIENT_HEADER_TABLE_BYTES"),
+            Some("transport.max_header_list_bytes") => ("max_header_list_bytes", "ARROWCOL_CLIENT_MAX_HEADER_LIST_BYTES"),
+            Some("transport.stream_window_bytes") => ("stream_window_bytes", "ARROWCOL_CLIENT_STREAM_WINDOW_BYTES"),
+            Some("transport.connection_window_bytes") => ("connection_window_bytes", "ARROWCOL_CLIENT_CONNECTION_WINDOW_BYTES"),
+            Some("transport.adaptive_window") => ("adaptive_window", "ARROWCOL_CLIENT_ADAPTIVE_WINDOW"),
+            Some("transport.keepalive_interval_ms") => ("keepalive_interval_ms", "ARROWCOL_CLIENT_KEEPALIVE_INTERVAL_MS"),
+            Some("transport.keepalive_timeout_ms") => ("keepalive_timeout_ms", "ARROWCOL_CLIENT_KEEPALIVE_TIMEOUT_MS"),
+            Some("transport.keepalive_while_idle") => ("keepalive_while_idle", "ARROWCOL_CLIENT_KEEPALIVE_WHILE_IDLE"),
+            Some("transport.connect_timeout_ms") => ("connect_timeout_ms", "ARROWCOL_CLIENT_CONNECT_TIMEOUT_MS"),
+            Some("transport.request_timeout_ms") => ("request_timeout_ms", "ARROWCOL_CLIENT_REQUEST_TIMEOUT_MS"),
+            Some("transport.tcp_nodelay") => ("tcp_nodelay", "ARROWCOL_CLIENT_TCP_NODELAY"),
+            Some("transport.tcp_keepalive_ms") => ("tcp_keepalive_ms", "ARROWCOL_CLIENT_TCP_KEEPALIVE_MS"),
+            Some("transport.tcp_keepalive_interval_ms") => ("tcp_keepalive_interval_ms", "ARROWCOL_CLIENT_TCP_KEEPALIVE_INTERVAL_MS"),
+            Some("transport.tcp_keepalive_retries") => ("tcp_keepalive_retries", "ARROWCOL_CLIENT_TCP_KEEPALIVE_RETRIES"),
+            Some("transport.rate_limit_period_ms") => ("rate_limit_period_ms", "ARROWCOL_CLIENT_RATE_LIMIT_PERIOD_MS"),
+            Some("transport.endpoint_concurrency_limit") => ("endpoint_concurrency_limit", "ARROWCOL_CLIENT_ENDPOINT_CONCURRENCY_LIMIT"),
+            Some("transport.endpoint_buffer_size") => ("endpoint_buffer_size", "ARROWCOL_CLIENT_ENDPOINT_BUFFER_SIZE"),
+            _ => return true,
+        };
+        if !environment.contains_key(variable)
+            || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
+        {
+            return true;
+        }
+        promoted.push(json!({"path": entry["path"], "reason": "consumer_startup_readback"}));
+        false
+    });
+    evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
+    Ok(())
+}
+
+#[cfg(test)]
+fn inert_tunable_fields(config: &OatConfig) -> Result<Vec<Value>> {
+    Ok(tunable_leaf_evidence(config)?["inert_fields"]
+        .as_array()
+        .context("inert_fields must be an array")?
+        .clone())
+}
+
 fn capability_evidence() -> Vec<Value> {
     arrowcol_tunables::capability_table()
         .iter()
@@ -8,6 +168,7 @@ fn capability_evidence() -> Vec<Value> {
             json!({
                 "name": capability.name,
                 "default": capability.default,
+                "consumer_startup_proof": "not_established_by_capability_catalog",
                 "boundary": match capability.boundary {
                     arrowcol_tunables::ApplyBoundary::PerCellRuntime => "per_cell_runtime",
                     arrowcol_tunables::ApplyBoundary::ProcessStartup => "process_startup",
@@ -64,7 +225,9 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             if config.platform.kind == crate::config::OatMode::Local
                 && (config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
                     || config.platform.local.partitioned_table_bootstrap)
-                && let Some(granularity) = config.tunables.maintenance.as_ref().and_then(|settings| settings.granularity)
+                && let Some(granularity) = config.tunables.maintenance.as_ref()
+                    .filter(|settings| settings.enabled == Some(true))
+                    .and_then(|settings| settings.granularity)
             {
                 let value = serde_json::to_value(granularity)?;
                 environment.insert(
@@ -490,6 +653,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         assert_eq!(bootstrap.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY"), Some(&json!("hour")));
         config.platform.local.partitioned_table_bootstrap = false;
         config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.enabled = Some(false);
+        let disabled = compose_tunables(&config)?;
+        assert!(disabled.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.enabled = Some(true);
         config.tunables.maintenance.as_mut().context("maintenance missing")?.granularity = None;
         let unset = compose_tunables(&config)?;
         assert!(unset.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
@@ -555,9 +722,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         if std::env::var_os("OAT_UPLOAD_RUNTIME_CHILD").is_some() {
             let actual = serde_json::to_value(arrow_deltalake::DeltaRuntimeConfig::from_env()?)?;
             let expected: Value = serde_json::from_str(&std::env::var("OAT_UPLOAD_RUNTIME_EXPECTED")?)?;
-            for key in ["upload_mode", "upload_buffer_capacity_bytes", "upload_request_concurrency", "upload_limit"] {
-                assert_eq!(actual[key], expected[key], "{key}");
+            for (key, value) in expected.as_object().context("expected runtime configuration must be an object")? {
+                assert_eq!(actual[key], *value, "{key}");
             }
+            println!("OAT_UPLOAD_RUNTIME_READBACK {actual}");
             return Ok(());
         }
         for (tunables, expected) in [
@@ -565,6 +733,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
              json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1})),
             (json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
              json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256})),
+            (json!({"collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":2}}}),
+             json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":2,"upload_limit":32})),
+            (json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
+             json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2})),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
@@ -583,7 +755,65 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 "collector upload runtime rehearsal failed: {stdout}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            let actual: Value = serde_json::from_str(
+                stdout
+                    .lines()
+                    .find_map(|line| line.split_once("OAT_UPLOAD_RUNTIME_READBACK ").map(|(_, json)| json))
+                    .context("collector runtime readback missing")?,
+            )?;
+            let mut config = config()?;
+            config.tunables = settings;
+            verify_process_configuration(&config, ComponentRole::Collector, &json!({"runtime":actual}))?;
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({"runtime":{}})).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn upload_only_reaches_actual_collector_startup() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("debug")
+            .join(format!("arrowcol-dataflow-rust{}", std::env::consts::EXE_SUFFIX));
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":3}}
+        }))?;
+        let output = std::process::Command::new(binary)
+            .arg("--help")
+            .env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?)
+            .output()
+            .context("launch actual collector for startup readback")?;
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+        let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+        assert_eq!(observed["runtime"]["upload_mode"], "buffered_multipart");
+        assert_eq!(observed["runtime"]["upload_buffer_capacity_bytes"], 1048576);
+        assert_eq!(observed["runtime"]["upload_request_concurrency"], 3);
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let process = json!({
+            "component": "collector", "instance_id": "collector-1", "log_complete": true,
+            "startup_tunables_verified": true, "effective_config_source": "consumer_startup_readback",
+            "effective_config": observed,
+        });
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        assert_eq!(covered, initial);
+        let mut wrong_process = process;
+        wrong_process["effective_config"]["runtime"]["upload_mode"] = json!("put_create");
+        let mut uncovered = initial.clone();
+        promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong_process])), 1)?;
+        assert_eq!(uncovered, initial);
+        let mut missing = observed.clone();
+        missing["runtime"].as_object_mut().context("missing runtime readback")?.remove("upload_mode");
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err());
+        let mut wrong = observed;
+        wrong["runtime"]["upload_request_concurrency"] = json!(2);
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
         Ok(())
     }
 

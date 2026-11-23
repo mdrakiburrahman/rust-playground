@@ -45,8 +45,10 @@ pub struct DeltaRuntimeConfig {
     /// Async I/O workers: default cores / 4, clamped to 2..=16; allowed 1..=64.
     pub runtime_workers: usize,
     /// Blocking I/O workers: default cores * 2, clamped to 32..=128; allowed 2..=256.
-    /// One worker is reserved for Tokio's filesystem handoffs.
     pub blocking_workers: usize,
+    /// Blocking workers reserved for filesystem handoffs: default 1.
+    #[serde(default = "default_blocking_fs_reserve")]
+    pub blocking_fs_reserve: usize,
     /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
     /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
@@ -63,11 +65,17 @@ pub struct DeltaRuntimeConfig {
     /// allowed 1..=262144.
     pub batch_rows: usize,
     /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
-    /// The waiting queue holds at most this many additional jobs.
     pub cpu_workers: usize,
+    /// CPU queue capacity, 1..=128; absent means the resolved CPU worker count.
+    #[serde(default)]
+    pub cpu_queue_jobs: Option<usize>,
     /// Skip row-wise grouping for internally generated single ingestion partitions.
     #[serde(default)]
     pub generated_partition_fast_path: bool,
+}
+
+fn default_blocking_fs_reserve() -> usize {
+    1
 }
 
 impl Default for DeltaRuntimeConfig {
@@ -81,6 +89,7 @@ impl DeltaRuntimeConfig {
         Self {
             runtime_workers: (cores / 4).clamp(2, 16),
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
+            blocking_fs_reserve: 1,
             upload_limit: 32,
             upload_mode: UploadMode::PutCreate,
             upload_buffer_capacity_bytes: DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES,
@@ -89,6 +98,7 @@ impl DeltaRuntimeConfig {
             read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
+            cpu_queue_jobs: None,
             generated_partition_fast_path: false,
         }
     }
@@ -112,6 +122,7 @@ impl DeltaRuntimeConfig {
         for (name, value) in [
             ("RUNTIME_WORKERS", &mut config.runtime_workers),
             ("BLOCKING_WORKERS", &mut config.blocking_workers),
+            ("BLOCKING_FS_RESERVE", &mut config.blocking_fs_reserve),
             ("UPLOAD_LIMIT", &mut config.upload_limit),
             ("UPLOAD_BUFFER_CAPACITY_BYTES", &mut config.upload_buffer_capacity_bytes),
             ("UPLOAD_REQUEST_CONCURRENCY", &mut config.upload_request_concurrency),
@@ -135,6 +146,14 @@ impl DeltaRuntimeConfig {
                 *value = raw.parse().with_context(|| format!("parse {name}"))?;
             }
         }
+        let name = "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS";
+        if let Some(raw) = lookup(name)? {
+            anyhow::ensure!(
+                !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()),
+                "{name} must be an unsigned decimal integer"
+            );
+            config.cpu_queue_jobs = Some(raw.parse().with_context(|| format!("parse {name}"))?);
+        }
         let mode_name = "ARROWCOL_COLLECTOR_UPLOAD_MODE";
         if let Some(raw) = lookup(mode_name)? {
             config.upload_mode = match raw.as_str() {
@@ -157,6 +176,7 @@ impl DeltaRuntimeConfig {
                 "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES and ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY require ARROWCOL_COLLECTOR_UPLOAD_MODE=buffered_multipart"
             );
         }
+        config.cpu_queue_jobs = Some(config.cpu_queue_jobs.unwrap_or(config.cpu_workers));
         config.validate()?;
         Ok(config)
     }
@@ -178,6 +198,16 @@ impl DeltaRuntimeConfig {
             anyhow::ensure!(
                 (min..=max).contains(&value),
                 "ARROWCOL_COLLECTOR_{name} must be in {min}..={max}, got {value}"
+            );
+        }
+        anyhow::ensure!(
+            self.blocking_fs_reserve > 0 && self.blocking_fs_reserve < self.blocking_workers,
+            "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE must be positive and less than BLOCKING_WORKERS"
+        );
+        if let Some(queue) = self.cpu_queue_jobs {
+            anyhow::ensure!(
+                (1..=128).contains(&queue),
+                "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS must be in 1..=128"
             );
         }
         if self.upload_mode == UploadMode::BufferedMultipart {
@@ -244,8 +274,8 @@ thread_local! {
 }
 
 impl CpuPool {
-    fn new(workers: usize) -> Result<Self> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<CpuJob>(workers);
+    fn new(workers: usize, queue_jobs: usize) -> Result<Self> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<CpuJob>(queue_jobs);
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
@@ -308,8 +338,10 @@ impl CpuPool {
 static CPU_POOL: OnceLock<std::result::Result<CpuPool, String>> = OnceLock::new();
 
 fn cpu_pool() -> Result<&'static CpuPool> {
-    let workers = runtime_config()?.cpu_workers;
-    match CPU_POOL.get_or_init(|| CpuPool::new(workers).map_err(|error| format!("{error:#}"))) {
+    let config = runtime_config()?;
+    let workers = config.cpu_workers;
+    let queue_jobs = config.cpu_queue_jobs.unwrap_or(workers);
+    match CPU_POOL.get_or_init(|| CpuPool::new(workers, queue_jobs).map_err(|error| format!("{error:#}"))) {
         Ok(pool) => Ok(pool),
         Err(error) => anyhow::bail!("{error}"),
     }
@@ -465,6 +497,16 @@ impl Drop for Permit {
 impl SharedExecutor {
     fn new() -> Result<Self> {
         let config = runtime_config()?;
+        let blocking_capacity = config
+            .blocking_workers
+            .checked_sub(config.blocking_fs_reserve)
+            .filter(|&capacity| capacity > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "blocking filesystem reserve must be smaller than the blocking worker count",
+                )
+            })?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.runtime_workers)
             .max_blocking_threads(config.blocking_workers)
@@ -476,8 +518,8 @@ impl SharedExecutor {
             runtime,
             admission: Arc::new(Admission::new(config.task_limit)),
             // Admitted synchronous jobs may wait on tokio::fs, which uses this
-            // same blocking pool. Keep one slot free for its filesystem work.
-            blocking_admission: Arc::new(tokio::sync::Semaphore::new(config.blocking_workers - 1)),
+            // same blocking pool. Keep the configured slots free for filesystem work.
+            blocking_admission: Arc::new(tokio::sync::Semaphore::new(blocking_capacity)),
             upload_admission: Arc::new(tokio::sync::Semaphore::new(config.upload_limit)),
             background_failure: Arc::new(Mutex::new(None)),
         })
@@ -755,6 +797,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_queue_and_blocking_reserve_resolve_and_validate() -> Result<()> {
+        let config = DeltaRuntimeConfig::from_lookup(|name| {
+            Ok(match name {
+                "ARROWCOL_COLLECTOR_CPU_WORKERS" => Some("4".to_owned()),
+                "ARROWCOL_COLLECTOR_BLOCKING_WORKERS" => Some("4".to_owned()),
+                _ => None,
+            })
+        })?;
+        assert_eq!(config.cpu_queue_jobs, Some(4));
+        assert_eq!(config.blocking_fs_reserve, 1);
+        for (knob, value) in [
+            ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "0"),
+            ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "129"),
+            ("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "1.5"),
+            ("ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE", "0"),
+            ("ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE", "4"),
+        ] {
+            assert!(
+                DeltaRuntimeConfig::from_lookup(|name| {
+                    Ok(if name == knob {
+                        Some(value.to_owned())
+                    } else if matches!(
+                        name,
+                        "ARROWCOL_COLLECTOR_CPU_WORKERS" | "ARROWCOL_COLLECTOR_BLOCKING_WORKERS"
+                    ) {
+                        Some("4".to_owned())
+                    } else {
+                        None
+                    })
+                })
+                .is_err(),
+                "{knob}={value}"
+            );
+        }
+        let tuned = DeltaRuntimeConfig::from_lookup(|name| {
+            Ok(match name {
+                "ARROWCOL_COLLECTOR_CPU_WORKERS" | "ARROWCOL_COLLECTOR_BLOCKING_WORKERS" => Some("4".to_owned()),
+                "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS" => Some("5".to_owned()),
+                "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE" => Some("2".to_owned()),
+                _ => None,
+            })
+        })?;
+        assert_eq!((tuned.cpu_queue_jobs, tuned.blocking_fs_reserve), (Some(5), 2));
+        Ok(())
+    }
+
+    #[test]
     fn upload_mode_is_strict_and_buffer_settings_require_multipart() -> Result<()> {
         let default = DeltaRuntimeConfig::for_cores(1);
         assert_eq!(default.upload_mode, UploadMode::PutCreate);
@@ -802,7 +891,7 @@ mod tests {
 
     #[test]
     fn cpu_jobs_keep_panics_nested_calls_and_io_independent() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(CpuPool::new(1, 1)?);
         let nested_pool = Arc::clone(&pool);
         let caller = std::thread::current().id();
         let (worker, answer) = pool.run(move || {
@@ -828,7 +917,7 @@ mod tests {
 
     #[test]
     fn cpu_queue_and_execution_are_bounded() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(CpuPool::new(1, 1)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
@@ -855,7 +944,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cpu_async_admission_does_not_block_the_caller_runtime() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(CpuPool::new(1, 1)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
