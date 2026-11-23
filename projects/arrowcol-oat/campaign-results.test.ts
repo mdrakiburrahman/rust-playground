@@ -917,14 +917,16 @@ function mutateFactorEvidence(
   row.evidence_json = JSON.stringify(evidence);
 }
 
-test('qualifies fully covered runner-control factors using both known reason codes', () => {
-  const candidate = coveredCandidate('runner', 100, 220);
+test('qualifies fully covered runner-control factors', () => {
+  const candidate = coveredCandidate('runner', 100, 220).map(row => ({
+    ...row, factorConfigPaths: ['maintenance.enabled', 'maintenance.apply'],
+  }));
   for (const row of candidate) {
     mutateFactorEvidence(row, evidence => {
       evidence.projection_only = [];
       evidence.runner_controls = [
-        { path: 'tunables.parquet_writer.defaults.compression', reason: 'maintenance_runner_control' },
-        { path: 'parquet_writer.defaults.compression_level', reason: 'router_log_filter_inheritance' },
+        { path: 'maintenance.enabled', reason: 'maintenance_runner_control' },
+        { path: 'maintenance.apply', reason: 'maintenance_runner_control' },
       ];
     });
   }
@@ -977,23 +979,23 @@ test('nulls a per-column dictionary page limit when dictionary is explicitly dis
   assert.doesNotMatch(unrelatedSvg, /dictionary-off: unqualified.*\(inert:/);
 });
 
-test('fails closed on duplicate or unknown runner classifications even with otherwise complete coverage', () => {
+test('fails closed on duplicate or unknown classifications even with otherwise complete coverage', () => {
   for (const scenario of ['unknown', 'duplicate', 'verified'] as const) {
     const candidate = coveredCandidate('runner', 100, 230);
     for (const row of candidate) {
       mutateFactorEvidence(row, evidence => {
         evidence.projection_only = [];
-        evidence.runner_controls = [
-          { path: 'parquet_writer.defaults.compression', reason: 'maintenance_runner_control' },
-          { path: 'parquet_writer.defaults.compression_level', reason: 'router_log_filter_inheritance' },
+        evidence.consumer_verified = [
+          { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+          { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
         ];
       });
     }
     mutateFactorEvidence(candidate[1]!, evidence => {
       if (scenario === 'unknown') {
-        evidence.runner_controls = [
+        evidence.consumer_verified = [
           { path: 'parquet_writer.defaults.compression', reason: 'new_runner_reason' },
-          { path: 'parquet_writer.defaults.compression_level', reason: 'router_log_filter_inheritance' },
+          { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
         ];
       } else if (scenario === 'duplicate') {
         evidence.projection_only = [
@@ -1046,15 +1048,15 @@ test('a projection-only repeat nulls its whole cell and preserves a dead Kustain
   for (const row of candidate) {
     mutateFactorEvidence(row, evidence => {
       evidence.projection_only = [];
-      evidence.runner_controls = [
-        { path: 'parquet_writer.defaults.compression', reason: 'maintenance_runner_control' },
-        { path: 'parquet_writer.defaults.compression_level', reason: 'router_log_filter_inheritance' },
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
       ];
     });
   }
   mutateFactorEvidence(candidate[1]!, evidence => {
-    evidence.runner_controls = [
-      { path: 'parquet_writer.defaults.compression', reason: 'maintenance_runner_control' },
+    evidence.consumer_verified = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
     ];
     evidence.projection_only = [
       { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
@@ -1066,6 +1068,29 @@ test('a projection-only repeat nulls its whole cell and preserves a dead Kustain
   assert.match(svg, /consumption unproven; applicability unknown/);
   assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited before downstream observation/);
   assert.doesNotMatch(svg, /projected-death \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+});
+
+test('an active cell retains its committed rate after Kustainer death', () => {
+  const candidate = coveredCandidate('active-death', 800, 260);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+      ];
+    });
+  }
+  const results = candidate.map(row => row.repeat === 2 ?
+    { ...row, diedFirst: 'Kustainer', comment: 'emulator exited before downstream observation' } : row);
+  const [death] = validateCampaignMeasurements([results[1]!]);
+  assert.equal(death!.committedRowsPerSecond, 800);
+  assert.equal(death!.qapCompletionPercent, null);
+  assert.equal(death!.qapPendingArtifacts, null);
+  assert.equal(death!.qapUnhealthyCatalogs, null);
+  const svg = renderCampaignResults(results, 'C1');
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: 800\).*emulator exited before downstream observation/);
+  assert.match(svg, />800\*?<\/text>/);
 });
 
 test('fails closed on missing or malformed coverage and does not infer a legacy factor path', () => {

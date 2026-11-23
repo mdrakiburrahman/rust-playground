@@ -318,7 +318,7 @@ function factorCoverage(row: CampaignMeasurement): FactorCoverage {
         ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled']],
         ['projection_only', projected, ['consumer_startup_proof_unverified']],
         ['runner_controls', undefined, ['maintenance_runner_control', 'router_log_filter_inheritance']],
-        ['consumer_verified', undefined, []],
+        ['consumer_verified', undefined, ['consumer_startup_readback']],
       ] as const) {
         const entries = evidence[field];
         if (!Array.isArray(entries)) { incomplete = true; continue; }
