@@ -46,6 +46,7 @@ tempfile = "3"
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+arrow = { version = "58.3", default-features = false, features = ["ipc"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber.workspace = true
 tokio = { version = "1", features = ["macros"] }

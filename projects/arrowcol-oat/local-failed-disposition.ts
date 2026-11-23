@@ -10,6 +10,32 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 type Json = Record<string, unknown>;
 
+export type PreloadProofPins = {
+  invocation: string;
+  run: string;
+  cell: string;
+  table: string;
+  collectorImage: string;
+  collectorRevision: string;
+  receiptSha256: string;
+  markerSha256: string;
+  resultSha256: string;
+  logSha256: string;
+};
+
+const reviewedPreloadPins: PreloadProofPins = Object.freeze({
+  invocation: '89fdefa5-855d-46ea-93ea-481fd77cbd2e',
+  run: '8d46570b-791e-43c6-a25a-4832c5cbee81',
+  cell: '241b7533-1025-441c-b8b2-ae9bbc547c1e',
+  table: 'sqlserver_availability_replica_states',
+  collectorImage: 'sha256:c6ed6724f3323ca120fe50f93fccf505c48eb593cd3b7c2e5c8ce85b92a8a93e',
+  collectorRevision: '3630d3e4301bc3ba8f9f69a308d077cebee6d12a',
+  receiptSha256: '9c288590a651a8fcdbe1ba9fa242ed235b565923416392e5bbbb6c9701d359a8',
+  markerSha256: '9dafe9bf79d8dd0f3c7398a2abcbe851a0a931fec4f319d8bfe5fa0facf9d12e',
+  resultSha256: 'b6dc74b976de44d22f4ee328f4add64cdf36060e05bb7b268191cac3eeea7ee1',
+  logSha256: '04fd38d33e9ac82af23be0d5fcefb078128a0bc939329e50f7bb3a19a7663503',
+});
+
 function object(value: unknown, label: string): Json {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`Invalid ${label}`);
   return value as Json;
@@ -65,10 +91,13 @@ function projectName(base: unknown, cell: string, length: number, compactLength:
 }
 
 async function inspect(
-  receiptPath: string, markerPath: string, env: RecoveryEnvironment,
+  receiptPath: string, markerPath: string, env: RecoveryEnvironment, preload?: PreloadProofPins,
 ): Promise<Json> {
   const receiptBytes = await boundedFile(receiptPath, 1024 * 1024);
   const markerBytes = await boundedFile(markerPath, 1024 * 1024);
+  if (preload && (sha256(receiptBytes) !== preload.receiptSha256 || sha256(markerBytes) !== preload.markerSha256)) {
+    throw new Error('Pre-load receipt or marker hash mismatch');
+  }
   const receipt = object(JSON.parse(receiptBytes.toString('utf8')), 'receipt');
   const marker = object(JSON.parse(markerBytes.toString('utf8')), 'ownership marker');
   const invocation = string(receipt.invocation_id, 'invocation');
@@ -84,6 +113,9 @@ async function inspect(
       marker.serverPid !== receipt.server_pid || marker.serverStartTicks !== receipt.server_start_ticks ||
       marker.serverExecutable !== receipt.server_executable || marker.serverUrl !== receipt.server_url) {
     throw new Error('Failed receipt and ownership marker do not match');
+  }
+  if (preload && (invocation !== preload.invocation || run !== preload.run)) {
+    throw new Error('Pre-load invocation or run does not match the pinned identity');
   }
   if (typeof receipt.source_config_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.source_config_sha256)) {
     throw new Error('Source configuration hash is invalid');
@@ -120,6 +152,18 @@ async function inspect(
       !Array.isArray(config.dfe_worker_concurrency) || config.dfe_worker_concurrency.length !== 1) {
     throw new Error('Local disposition requires exactly one configured cell');
   }
+  if (preload && ((config.clients_per_table_sweep !== undefined && config.clients_per_table_sweep !== null) ||
+      config.replica_counts[0] !== 1 || config.dfe_worker_concurrency[0] !== 32 ||
+      config.tables[0] !== preload.table)) {
+    throw new Error('Pre-load configuration is not the pinned single-cell profile');
+  }
+  if (preload) {
+    const local = object(platform.local, 'local platform');
+    const image = object(local.collector_image_override, 'collector image');
+    if (image.image_id !== preload.collectorImage || image.source_revision !== preload.collectorRevision) {
+      throw new Error('Pre-load collector image does not match the pinned configuration');
+    }
+  }
   const resultUrl = new URL(string(config.result_url, 'result URL'));
   if (resultUrl.protocol !== 'file:' || resultUrl.search || resultUrl.hash || resultUrl.hostname) throw new Error('Unsafe local result URL');
   const resultPath = fileURLToPath(resultUrl);
@@ -131,25 +175,50 @@ async function inspect(
   const logPath = join(runRoot, 'run.log');
   const resultBytes = await boundedFile(resultPath);
   const logBytes = await boundedFile(logPath);
+  if (preload && (sha256(resultBytes) !== preload.resultSha256 || sha256(logBytes) !== preload.logSha256)) {
+    throw new Error('Pre-load result or log hash mismatch');
+  }
   const [{ tableFromIPC }, { readParquet }] = await Promise.all([import('apache-arrow'), import('parquet-wasm')]);
   const table = tableFromIPC(readParquet(resultBytes).intoIPCStream());
   if (table.numRows !== 1) throw new Error('Expected exactly one failed cell result');
   const row = table.toArray()[0];
   const cell = string(row.run_id, 'cell');
   const evidence = object(JSON.parse(string(row.evidence_json, 'cell evidence')), 'cell evidence');
-  const guard = object(evidence.overload_guard, 'overload evidence');
-  const failedCell = row.status === 'failed' ||
-    (row.status === 'pinning_violation' && row.pinning_ok === false && status.error.includes('pinning_violation'));
-  if (!uuid.test(cell) || row.mode !== 'local' || !failedCell ||
-      row.table !== config.tables[0] || guard.run_id !== cell) throw new Error('Failed cell identity mismatch');
+  if (preload) {
+    const tunables = object(JSON.parse(string(row.tunables_json, 'cell tunables')), 'cell tunables');
+    if (!uuid.test(cell) || cell !== preload.cell || row.mode !== 'local' || row.status !== 'failed' ||
+        row.table !== config.tables[0] || tunables.orchestration_run_id !== run ||
+        Number(row.replicas) !== 1 || Number(row.dfe_worker_concurrency) !== 32 ||
+        tunables.dfe_worker_concurrency !== 32 ||
+        evidence.overload_guard !== null || evidence.overload_stop !== null ||
+        evidence.preload_delta !== null || evidence.durable_rows_per_second !== null ||
+        evidence.client_schedule !== null || evidence.client_phase_reports !== null ||
+        evidence.durable_commits !== null || evidence.durable_bytes !== null ||
+        object(evidence.rows, 'cell rows').delta_committed !== null) {
+      throw new Error('Pre-load failed cell or startup error does not match');
+    }
+  } else {
+    const guard = object(evidence.overload_guard, 'overload evidence');
+    const failedCell = row.status === 'failed' ||
+      (row.status === 'pinning_violation' && row.pinning_ok === false && status.error.includes('pinning_violation'));
+    if (!uuid.test(cell) || row.mode !== 'local' || !failedCell ||
+        row.table !== config.tables[0] || guard.run_id !== cell) throw new Error('Failed cell identity mismatch');
+  }
   const project = projectName(platform.compose_project, cell, 15, 32);
   const legacy = projectName(platform.compose_project, cell, 39, 8);
   const log = logBytes.toString('utf8');
-  if (!log.includes(run) || !log.includes(project) || !log.includes(status.error)) throw new Error('Run log does not bind the failure and cell');
+  const startupFailure = `dependency failed to start: container ${project}-dataflow-1-1 exited (127)`;
+  if (!log.includes(run) || !log.includes(project) || !log.includes(status.error) ||
+      (preload && (!status.error.includes('prepare isolated OAT matrix-cell platform') ||
+        !status.error.includes('start remaining local OAT stack failed') ||
+        !status.error.includes(startupFailure) || !log.includes(startupFailure) ||
+        !log.includes(`[oat] Preserving OAT server for unresolved run receipt ${receiptPath}`)))) {
+    throw new Error('Run log does not bind the failure and cell');
+  }
   const stateInfo = await lstat(stateRoot);
   if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink()) throw new Error('Invalid local state root');
   const entries = await readdir(stateRoot);
-  if (entries.some(name => uuid.test(name) || /^\.arrowcol-oat-owner-.*\.json$/.test(name))) {
+  if (preload ? entries.length !== 0 : entries.some(name => uuid.test(name) || /^\.arrowcol-oat-owner-.*\.json$/.test(name))) {
     throw new Error('Local state contains an unresolved cell or owner');
   }
   for (const name of [project, legacy]) {
@@ -167,7 +236,13 @@ async function inspect(
   const bootId = await env.bootId();
   if (!uuid.test(bootId)) throw new Error('Host boot identity unavailable');
   return {
-    version: 1, kind: 'verified-local-failed-cleanup', invocation_id: invocation, run_id: run,
+    version: 1, kind: preload ? 'verified-preload-failed-cleanup-read-only' : 'verified-local-failed-cleanup',
+    ...(preload ? {
+      disposition: 'not-recorded', qualification: 'not-evaluated',
+      failure: 'collector dependency exited 127 during stack startup',
+      underlying_error: 'not-established-from-retained-artifacts',
+    } : {}),
+    invocation_id: invocation, run_id: run,
     cell_id: cell, project, boot_id: bootId, receipt_sha256: sha256(receiptBytes),
     marker_path: markerPath, marker_sha256: sha256(markerBytes), result_path: resultPath,
     result_sha256: sha256(resultBytes), log_path: logPath, log_sha256: sha256(logBytes),
@@ -177,16 +252,48 @@ async function inspect(
   };
 }
 
+export async function inspectPinnedPreloadFailure(
+  receiptPath: string, markerPath: string, pins: PreloadProofPins, env: RecoveryEnvironment = environment,
+): Promise<Json> {
+  const first = await inspect(receiptPath, markerPath, env, pins);
+  const second = await inspect(receiptPath, markerPath, env, pins);
+  if (JSON.stringify(first) !== JSON.stringify(second)) throw new Error('Pre-load evidence changed during inspection');
+  return first;
+}
+
+export async function inspectReviewedPreloadFailure(
+  receiptPath: string, markerPath: string,
+): Promise<Json> {
+  return inspectPinnedPreloadFailure(receiptPath, markerPath, reviewedPreloadPins);
+}
+
+async function dispositionProof(receiptPath: string, markerPath: string, env: RecoveryEnvironment): Promise<Json> {
+  if (basename(receiptPath) !== `${reviewedPreloadPins.invocation}.json`) return inspect(receiptPath, markerPath, env);
+  const proof = await inspectPinnedPreloadFailure(receiptPath, markerPath, reviewedPreloadPins, env);
+  return { ...proof, kind: 'verified-preload-failed-cleanup', disposition: 'recorded' };
+}
+
+async function assertNoConflictingAksDisposition(receiptPath: string): Promise<void> {
+  try {
+    await lstat(`${receiptPath}.failed-aks-disposition`);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error('Conflicting AKS disposition exists');
+}
+
 export async function assertLocalFailedDisposition(
   receiptPath: string, dispositionPath: string, env: RecoveryEnvironment = environment,
 ): Promise<void> {
+  if (basename(receiptPath) === `${reviewedPreloadPins.invocation}.json`) await assertNoConflictingAksDisposition(receiptPath);
   const saved = object(JSON.parse((await boundedFile(dispositionPath, 1024 * 1024)).toString('utf8')), 'local disposition');
   const markerPath = string(saved.marker_path, 'marker path');
   const { recorded_at_unix_ms: recordedAt, ...recordedProof } = saved;
   if (typeof recordedAt !== 'number' || !Number.isSafeInteger(recordedAt) || recordedAt <= 0 || recordedAt > Date.now()) {
     throw new Error('Local disposition timestamp is invalid');
   }
-  const expected = await inspect(receiptPath, markerPath, env);
+  const expected = await dispositionProof(receiptPath, markerPath, env);
   if (JSON.stringify(recordedProof) !== JSON.stringify(expected)) throw new Error('Local failure disposition or evidence changed');
 }
 
@@ -196,7 +303,8 @@ export async function recordLocalFailedDisposition(
   if (!uuid.test(invocation)) throw new Error('Invalid invocation ID');
   const receiptPath = resolve(root, `${invocation}.json`);
   const dispositionPath = receiptPath + localDispositionSuffix;
-  const proof = await inspect(receiptPath, markerPath, env);
+  if (invocation === reviewedPreloadPins.invocation) await assertNoConflictingAksDisposition(receiptPath);
+  const proof = await dispositionProof(receiptPath, markerPath, env);
   if (proof.invocation_id !== invocation) throw new Error('Invocation does not match receipt');
   const temporary = `${dispositionPath}.${randomUUID()}.tmp`;
   let created = false;
@@ -209,8 +317,9 @@ export async function recordLocalFailedDisposition(
     } finally {
       await file.close();
     }
-    const verified = await inspect(receiptPath, markerPath, env);
+    const verified = await dispositionProof(receiptPath, markerPath, env);
     if (JSON.stringify(verified) !== JSON.stringify(proof)) throw new Error('Recovery evidence changed while recording');
+    if (invocation === reviewedPreloadPins.invocation) await assertNoConflictingAksDisposition(receiptPath);
     await link(temporary, dispositionPath);
     const directory = await open(dirname(receiptPath), 'r');
     try { await directory.sync(); } finally { await directory.close(); }

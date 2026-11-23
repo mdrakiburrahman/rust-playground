@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { verifyDeliveryIdentitySet } from "./delivery-identity.ts";
+import { parseManifestJson, verifyDeliveryIdentitySet } from "./delivery-identity.ts";
 import { verifierArtifactSha256, verifyActiveParquetIdentitySet } from "./delivery-identity-cli.ts";
 
 const run = "a".repeat(32);
@@ -43,6 +43,27 @@ const manifest = (ranges = [range(0, 0, 2, "warmup"), range(1, 1, 3, "measuremen
 const rows = [identity(0, 0), identity(0, 1), identity(1, 0), identity(1, 1), identity(1, 2), identity(2, 0), identity(2, 1)];
 async function* stream(values: readonly string[]) { yield* values; }
 
+test("raw manifest parsing preserves u64 tokens and rejects duplicates and overflow", async () => {
+  const source = JSON.stringify(manifest()).replace("999000000", "18446744073709551615");
+  const parsed = parseManifestJson(source) as { ranges: { first_send_unix_ns: unknown }[] };
+  assert.equal(parsed.ranges[0]!.first_send_unix_ns, "18446744073709551615");
+  assert.equal((await verifyDeliveryIdentitySet([parsed], stream(rows), options)).observedRows, 7);
+  const overflow = parseManifestJson(source.replace("18446744073709551615", "18446744073709551616"));
+  await assert.rejects(verifyDeliveryIdentitySet([overflow], stream(rows), options), /u64/);
+  const rounded = manifest();
+  rounded.ranges[0]!.first_send_unix_ns = Number.MAX_SAFE_INTEGER + 1;
+  await assert.rejects(verifyDeliveryIdentitySet([rounded], stream(rows), options), /send timestamp/);
+  assert.throws(() => parseManifestJson('{"x":1,"\\u0078":2}'), /duplicate/);
+  assert.throws(() => parseManifestJson('{"x":[1,]}'), /invalid/);
+});
+
+test("worker ids are limited to 0 through 1023 in manifests and observed identities", async () => {
+  const high = manifest([range(0, 0, 1, "warmup", 1023)]);
+  assert.equal((await verifyDeliveryIdentitySet([high], stream([identity(0, 0, 1023)]), options)).observedRows, 1);
+  await assert.rejects(verifyDeliveryIdentitySet([manifest([range(0, 0, 1, "warmup", 1024)])], stream([]), options), /worker/);
+  await assert.rejects(verifyDeliveryIdentitySet([high], stream([identity(0, 0, 1024)]), options), /worker/);
+});
+
 test("whole snapshot includes warmup/drain, permits file reordering and independent client namespaces", async () => {
   const second = { ...manifest(), run_uuid: "d".repeat(32) };
   const values = [...rows.slice(3), ...rows.slice(0, 3), ...rows.map(value => value.replace(run, "d".repeat(32)))];
@@ -50,6 +71,17 @@ test("whole snapshot includes warmup/drain, permits file reordering and independ
   assert.equal(verdict.expectedRows, 14);
   assert.equal(verdict.observedRows, 14);
   assert.deepEqual(verdict.cohortRows, { unscheduled: 0, warmup: 4, measurement: 6, post_window: 4 });
+});
+
+test("clients may reuse worker IDs only in disjoint incarnations and every client's rows must be present", async () => {
+  const otherIncarnation = "e".repeat(32);
+  const second = { ...manifest(), incarnation_uuid: otherIncarnation };
+  const otherRows = rows.map(row => row.replace(incarnation, otherIncarnation));
+  assert.equal((await verifyDeliveryIdentitySet([manifest(), second], stream([...rows, ...otherRows]), options)).observedRows, 14);
+  await assert.rejects(verifyDeliveryIdentitySet([manifest(), second], stream([...rows, ...otherRows.slice(1)]), options), /missing/);
+  await assert.rejects(verifyDeliveryIdentitySet([manifest(), second],
+    stream([...rows, ...otherRows.slice(0, -1), otherRows[0]!]), options), /duplicate/);
+  await assert.rejects(verifyDeliveryIdentitySet([manifest(), manifest()], stream([...rows, ...rows]), options), /duplicate terminal/);
 });
 
 test("legitimate one-shot v1 deliveries are included separately without inventing a measurement window", async () => {
@@ -127,7 +159,7 @@ test("stream adapter keeps original nanosecond bytes/cohorts and rejects aliasin
   try {
     const paths = [join(dir, "warmup.parquet"), join(dir, "measurement.parquet"), join(dir, "drain.parquet")];
     await Promise.all([rows.slice(0, 2), rows.slice(2, 5), rows.slice(5)].map((values, index) => writeFile(paths[index]!, values.join("\n") + "\n")));
-    const decoder = join(dir, "decoder");
+    const decoder = join(dir, "decoder.cjs");
     const script = "#!/usr/bin/env node\nconst fs=require('node:fs');const text=fs.readFileSync(process.argv[3],'utf8');process.stdout.write(text);process.stderr.write('DELIVERY_IDENTITY_READER_COMPLETED rows='+(text.split('\\n').length-1)+'\\n');\n";
     await writeFile(decoder, script, { mode: 0o755 });
     const manifestPath = join(dir, "manifest.json");
@@ -160,7 +192,7 @@ test("early identity failure and interruption stop/reap exact decoders despite i
   const dir = await mkdtemp(join(tmpdir(), "delivery-decoder-cleanup-"));
   try {
     const file = join(dir, "active.parquet");
-    const decoder = join(dir, "decoder");
+    const decoder = join(dir, "decoder.cjs");
     await writeFile(file, "");
     const manifestPath = join(dir, "manifest.json");
     await writeFile(manifestPath, JSON.stringify(manifest()));

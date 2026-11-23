@@ -23,9 +23,10 @@ required before relying on this path.
 `nonCollectorImages` object with immutable image IDs for `catalog`, `client`,
 `maintenance`, `router`, and `sqlserver`. Build and retain provenance for
 both collector images; labels alone do not prove source provenance. The two
-collector roles must differ, while all other roles remain fixed. The generated
-partition shortcut is not requested. This profile uses 14 client workers and
-a 16 GiB client budget, not the historical 1 GiB client profile.
+collector roles must differ, while all other roles remain fixed. The baseline
+does not request the generated partition shortcut; the candidate enables it.
+This profile uses 14 client workers and a 5 GiB client budget, not the
+historical 1 GiB client profile.
 
 The codec smoke copies only `compression` and `compression_level` from the
 allowlisted candidate into the guarded qualification profile; it does not
@@ -205,6 +206,10 @@ the receipt-owning runtime after verified cleanup. It appends a disposition
 without changing the failed receipt; each subsequent launch rechecks its
 evidence and same-host resource absence. Missing evidence, active writers,
 resources or a changed host boot block recovery. Do not retry until cleanup is
-confirmed. Fresh HOME and restricted paths prevent accidental credential
+confirmed. The separately pinned pre-load failure for invocation
+`89fdefa5-855d-46ea-93ea-481fd77cbd2e` also uses this command: it rechecks the
+four original hashes and startup failure without requiring a guard record.
+This only records cleanup; it does not rank or retry the failed run.
+Fresh HOME and restricted paths prevent accidental credential
 inheritance; they are not a security sandbox. Run candidate workloads only in
 throwaway environments and never pass the Darwin model token to builds or runs.

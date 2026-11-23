@@ -4,7 +4,7 @@ import { mkdir, readFile, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { inspectParityHost } from "./parity-preflight.js";
 import { buildFooterInspector } from "./parity-replay.js";
-import { qualificationConfig } from "./qualification-config.js";
+import { qualificationConfig, REALISTIC_CLIENT_MEMORY_BUDGET_BYTES } from "./qualification-config.js";
 import { runObservedArm } from "./qualification-observer.js";
 import { cleanEnv, prepareIdentityTools, prepareReplayRuntime, replayCompressionArm, replayTypedCompressionArm, sha256, type QualifiedArm } from "./replay.js";
 import { bindCodeArm, bindCompressionArm, codeCommonConfigHash, type CodeRole } from "./tier2-binding.js";
@@ -140,13 +140,14 @@ export async function replayQualification(
         || !Number.isSafeInteger(Number(output))) throw new Error("invalid decoded row count");
       return Number(output);
     };
-    const execute = async (label: string, selected: CodeRole, deadlineUnixMs: number) => {
+    const execute = async (label: string, selected: CodeRole, deadlineUnixMs: number, enableFastPath = false) => {
       await readOriginalDeadline(join(plan, "deadline.json"), planHash);
-      const host = await inspectParityHost(16 * 1024 ** 3, 86 * 1024 ** 3);
+      const host = await inspectParityHost(REALISTIC_CLIENT_MEMORY_BUDGET_BYTES, 86 * 1024 ** 3);
       const images = { ...nonCollectorImages, collector: selected.imageId };
       const bound = compression
         ? bindCompressionArm(compressionSeed, codecCandidate, config, images, selected).config
-        : bindCodeArm(config, images, selected);
+        : bindCodeArm(config, images, selected, enableFastPath
+          ? { kind: "candidate", generated_partition_fast_path: true } : undefined);
       const qualified = {
           collectorRevision: selected.revision, expectedImages: images, deadlineUnixMs, decodeFile,
           launch: (root, run) => runObservedArm(root, run, {
@@ -183,10 +184,12 @@ export async function replayQualification(
       controllerSha256: binaryHash, observerSha256, workloadSha256: smoke.clientEvidence.payloadCorpusSha256,
       normalizedConfigSha256: configHash, treatmentSha256: hash("generated_partition_fast_path not requested; legacy capability may be unavailable"),
     };
-    const candidateBinding = { ...baseBinding, collectorImageId: candidate.imageId, collectorRevision: candidate.revision };
+    const candidateBinding = { ...baseBinding, collectorImageId: candidate.imageId, collectorRevision: candidate.revision,
+      treatmentSha256: hash("generated_partition_fast_path=true") };
     const runArm = async (pair: number, armRole: ArmRole, binding: ArmBinding, armDeadline: number): Promise<Tier2Arm> => {
       const selected = collectorForBinding(binding, baseline, candidate);
-      const result = await execute(`${armRole}-${pair}`, selected, armDeadline);
+      const result = await execute(`${armRole}-${pair}`, selected, armDeadline,
+        binding.treatmentSha256 === candidateBinding.treatmentSha256);
       if (result.clientEvidence.payloadCorpusSha256 !== baseBinding.workloadSha256 || !result.observer
         || result.deliveryIdentity?.verified !== true || result.cellRunId === smoke.cellRunId || result.runRoot === smoke.runRoot) {
         throw new Error("arm corpus, identity, or freshness differs from frozen smoke");

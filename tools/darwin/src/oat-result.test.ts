@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertParityProcessRevision, extractClientEvidence, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
+import { assertParityProcessRevision, extractClientEvidence, extractClientReports, extractStoppedReceipts, readReconciledOatResult, type ClientDataProfile } from "./oat-result.js";
 import type { OatMeasurement } from "./metrics-adapter.js";
 
 function reportFor(profile: ClientDataProfile) {
@@ -21,6 +21,31 @@ function reportFor(profile: ClientDataProfile) {
   };
   return { phase_counters: { preparation, payload_manifest: payloadManifest, measurement_window: { client_resources: clientResources } } };
 }
+
+test("multiple reports bind client images, configs, CPU and checked completed totals", () => {
+  const make = () => ({
+    ...reportFor("realistic"),
+    execution_image: { source: "docker_container_inspect", image_id: `sha256:${"e".repeat(64)}` },
+    consumer_effective_config: { workers: 8 },
+    phase_counters: { ...reportFor("realistic").phase_counters,
+      process_cumulative: { completed_rows: 10, ambiguous_rows: 0 } },
+  });
+  const first = make();
+  const second = make();
+  const result = extractClientReports([first, second], "realistic");
+  assert.equal(result.totalCompletedRows, 20);
+  assert.equal(result.clientEvidence.cpu.coreEquivalents, 5);
+  assert.equal(result.reports.length, 2);
+  assert.deepEqual(result.reports.map(report => report.config), [{ workers: 8 }, { workers: 8 }]);
+  assert.throws(() => extractClientReports([first, { ...second,
+    execution_image: { ...second.execution_image, image_id: `sha256:${"f".repeat(64)}` } }], "realistic"), /images differ/);
+  assert.throws(() => extractClientReports([first, { ...second, consumer_effective_config: null }], "realistic"), /client readback/);
+  assert.throws(() => extractClientReports([first, { ...second, phase_counters: { ...second.phase_counters,
+    process_cumulative: { completed_rows: Number.MAX_SAFE_INTEGER, ambiguous_rows: 0 } } }], "realistic"), /overflow/);
+  assert.throws(() => extractClientReports([first, { ...second, phase_counters: { ...second.phase_counters,
+    process_cumulative: { completed_rows: 10, ambiguous_rows: 1 } } }], "realistic"), /ambiguous/);
+  assert.throws(() => extractClientReports([], "realistic"), /1024/);
+});
 
 test("a control revision applies only to the collector", () => {
   const collector = { component: "collector", source_revision: "main" };

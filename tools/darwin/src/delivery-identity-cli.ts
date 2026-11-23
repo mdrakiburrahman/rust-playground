@@ -4,7 +4,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { verifyDeliveryIdentitySet, type IdentityOptions } from "./delivery-identity.ts";
+import { parseManifestJson, verifyDeliveryIdentitySet, type IdentityOptions } from "./delivery-identity.ts";
 
 export interface SnapshotInput {
   table: string;
@@ -150,7 +150,7 @@ export async function verifyActiveParquetIdentitySet(input: SnapshotInput, optio
     manifestBytes += bytes.length;
     if (bytes.length > 1_048_576 || manifestBytes > 64 * 1024 * 1024) throw new Error("original manifest sources exceed memory bound");
     if (await fileIdentity(canonical) !== identity) throw new Error("terminal manifest source changed while reading");
-    manifests.push(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+    manifests.push(parseManifestJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
     manifestSources.push({ path: canonical, identity, sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length });
   }
   const decoder = await realpath(options.decoderPath);

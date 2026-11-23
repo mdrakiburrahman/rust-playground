@@ -33,7 +33,7 @@ fn oat_policy(run_id: &str) -> RoutingPolicy {
 async fn initialize_memory_oat_pin(engine: &RoutingEngine, run_id: &str, now: UnixMillis, expires_at: UnixMillis) {
     let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
     let pins = engine
-        .initialize_run_table_pins(run_id, &expected, expires_at, now)
+        .initialize_run_table_pins_with_clock(run_id, &expected, expires_at, now, || Ok(now))
         .await
         .unwrap_or_else(|error| panic!("initialize complete fixture OAT pin set and owner: {error}"));
     assert_eq!(pins.len(), 1);
@@ -334,7 +334,9 @@ async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
         .unwrap_or_else(|error| panic!("refresh right: {error}"));
     let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
     let prepared = left
-        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .initialize_run_table_pins_with_clock(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001), || {
+            Ok(millis(100_001))
+        })
         .await
         .unwrap_or_else(|error| panic!("initialize and bind complete OAT pin set: {error}"));
     assert_eq!(prepared.len(), 1);

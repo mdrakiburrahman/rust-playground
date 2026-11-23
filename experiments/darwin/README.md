@@ -1,7 +1,7 @@
 # Darwin recipe index
 
 | Item | Current status |
-|---|---|
+| --- | --- |
 | `darwin.yaml` | External manifest indexing ten complete lane Configs; paths are relative to the manifest. |
 | Code lanes and `throughput-config` | Designs only; the pinned evaluator refuses them. |
 | `compression-config` | Only Zstd level changes are permitted. One real pair is diagnostic and always returns `valid=0`; it cannot qualify a winner. |
