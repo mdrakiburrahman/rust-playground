@@ -1788,6 +1788,17 @@ mod overload_guard_tests {
             );
             assert!(platform.collector_metrics_url.is_some());
 
+            state["fail"] = Value::Null;
+            state["routerExited"] = json!(true);
+            fs::write(root.join("state.json"), state.to_string())?;
+            let error = local_compose_endpoint(&config, &platform, "router", "50050", "/metrics")
+                .await
+                .err()
+                .context("exited router unexpectedly admitted")?;
+            assert!(error.to_string().contains("state=exited exit_code=17"));
+            assert!(error.to_string().contains("fixture router failed"));
+            state["routerExited"] = json!(false);
+
             state["fail"] = json!("router");
             fs::write(root.join("state.json"), state.to_string())?;
             assert!(
@@ -2377,7 +2388,10 @@ mod overload_guard_tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await?;
                 let mut request = [0; 1024];
-                assert!(socket.read(&mut request).await? > 0);
+                let received = socket.read(&mut request).await?;
+                if received == 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty request"));
+                }
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await?;
                 if incomplete {
                     std::future::pending::<()>().await;

@@ -47,8 +47,10 @@ include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
+include!("runner_router_readiness.rs");
 include!("runner_overload.rs");
 include!("runner_admission_diagnostics.rs");
+include!("runner_realistic_diagnostic_admission.rs");
 include!("runner_fixture.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1892,6 +1894,23 @@ impl Platform for LocalPlatform {
     }
 
     async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str, _replicas: u32) -> Result<()> {
+        let containerized = Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+        let host_network = if containerized {
+            let hostname =
+                fs::read_to_string("/proc/sys/kernel/hostname").context("read harness container hostname")?;
+            let mut inspect = Command::new("docker");
+            inspect.args(["inspect", "--format", "{{.HostConfig.NetworkMode}}", hostname.trim()]);
+            let output = run_command(inspect, "inspect harness container network mode").await?;
+            String::from_utf8(output.stdout)?.trim() == "host"
+        } else {
+            false
+        };
+        crate::local::validate_container_endpoints(
+            containerized,
+            host_network,
+            config.platform.local.bind_host,
+            config.platform.local.endpoint_host.as_deref(),
+        )?;
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.refresh_endpoints(config).await
@@ -5028,6 +5047,8 @@ async fn run_clients_inner(
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
+    let _ = diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;
+
     let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
     if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
         let readback = async {
@@ -5121,6 +5142,13 @@ async fn run_clients_inner(
             };
         }
     };
+    let schedule_admission = diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;
+    let diagnostic_reference = if schedule_admission.is_some() {
+        Some(std::env::var(DIAGNOSTIC_REFERENCE_ENV).context("diagnostic reference is missing before schedule")?)
+    } else {
+        None
+    };
+    diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
     let schedule_created_at_unix_ms = unix_time_ms_u64()?;
     let run_start_unix_ms = schedule_created_at_unix_ms
@@ -5148,10 +5176,14 @@ async fn run_clients_inner(
         )
         .context("shared OAT measurement end timestamp overflow")?;
     let delivery = tokio::time::timeout_at(schedule_deadline, async {
-        platform
-            .arm_clients(config, project_run_id, run_start_unix_ms)
-            .await
-            .context("arm common OAT client schedule")?;
+        schedule_after_diagnostic_admission(
+            diagnostic_reference.as_deref(),
+            schedule_admission.as_ref(),
+            project_run_id,
+            || platform.arm_clients(config, project_run_id, run_start_unix_ms),
+        )?
+        .await
+        .context("arm common OAT client schedule")?;
         local_progress(
             config,
             &format!(
@@ -8320,6 +8352,13 @@ async fn local_compose_endpoint(
             .context("Docker daemon endpoint not resolved")?,
         path,
     )?;
+    if service == "router" && container_port == "50050" {
+        wait_for_local_router(&endpoint, Duration::from_secs(120), || {
+            local_router_state(config, platform)
+        })
+        .await?;
+        return Ok(endpoint);
+    }
     let url = Url::parse(&endpoint)?;
     let host = url
         .host_str()
@@ -8330,8 +8369,8 @@ async fn local_compose_endpoint(
         tokio::net::TcpStream::connect((host, url.port_or_known_default().context("local endpoint has no port")?)),
     )
     .await
-    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host, not a loopback fallback"))?
-    .with_context(|| format!("connect local {service} endpoint {endpoint}"))?;
+    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"))?
+    .with_context(|| format!("connect local {service} endpoint {endpoint}; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"))?;
     Ok(endpoint)
 }
 

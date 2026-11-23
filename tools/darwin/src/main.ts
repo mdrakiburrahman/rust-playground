@@ -101,11 +101,14 @@ async function main(args: string[]): Promise<void> {
       parseParityProfile(option(args, "--profile", "historical-parity-diagnostic")),
       args.includes("--generated-partition-fast-path") ?
         parsePartitionFastPath(option(args, "--generated-partition-fast-path")) : undefined,
+      args.includes("--diagnostic-prelaunch-only"),
     );
-    console.log("@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
+    const prelaunchOnly = args.includes("--diagnostic-prelaunch-only");
+    console.log(prelaunchOnly ? "@FEEDBACK Diagnostic prelaunch only; no arm started."
+      : "@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
     console.log(`@RESULT ${JSON.stringify({ version: 1,
       experiment: receipt.profile === "historical-parity-diagnostic" ? "historical-parity" : receipt.profile, valid: 0,
-      combined_score: 0, accepted: false, reason: "single local parity arm", receipt })}`);
+      combined_score: 0, accepted: false, reason: prelaunchOnly ? "diagnostic prelaunch only" : "single local parity arm", receipt })}`);
     return;
   }
   if (command === "qualify" || command === "qualify-codec-smoke") {

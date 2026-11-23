@@ -7,10 +7,17 @@ appendFileSync(join(root, 'commands'), `${args.join(' ')}\n`);
 const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) as {
   scaled: boolean;
   fail?: string;
+  routerExited?: boolean;
   before: Record<string, number>;
   after: Record<string, number>;
 };
-if (args.includes('up')) {
+if (args[0] === 'inspect') {
+  console.log(state.routerExited ? 'exited|17' : 'running|0');
+} else if (args[0] === 'logs') {
+  console.log('fixture router failed');
+} else if (args.includes('ps')) {
+  console.log('a'.repeat(64));
+} else if (args.includes('up')) {
   state.scaled = true;
   writeFileSync(join(root, 'state.json'), JSON.stringify(state));
 } else if (args.includes('port')) {
