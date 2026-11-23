@@ -27,6 +27,8 @@ export interface RuntimeConfig {
   deltaRoot: string;
   effective_stop_budgets: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
   images: { sqlserver: string; catalog: string; router: string; dataflow: string; maintenance?: string };
+  collectorBuildProfileHash?: string;
+  collectorBuildImages?: Record<string, string>;
   maintenance?: { tables: string[]; operations: string[]; apply: boolean; granularity?: 'minute' | 'hour' | 'day' };
   quiver?: boolean;
   resources?: RuntimeResources;
@@ -100,7 +102,7 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'effective_stop_budgets', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas', 'collectorPool', 'collectorNode'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas', 'collectorPool', 'collectorNode', 'collectorBuildProfileHash', 'collectorBuildImages'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   parseEffectiveStopBudgets(c.effective_stop_budgets);
@@ -113,6 +115,14 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (Object.hasOwn(c, 'campaignProfile') && !scaleOut) throw new Error('campaignProfile must be scale_out_single_table');
   if (!scaleOut && ['hotTable', 'collectorReplicas', 'routerReplicas'].some(key => Object.hasOwn(c, key)))
     throw new Error('scale-out fields require campaignProfile scale_out_single_table');
+  if (Object.hasOwn(c, 'collectorBuildProfileHash') && (typeof c.collectorBuildProfileHash !== 'string' || !/^[a-f0-9]{64}$/.test(c.collectorBuildProfileHash))) throw new Error('collectorBuildProfileHash must be a full lowercase SHA-256 profile hash');
+  if (Object.hasOwn(c, 'collectorBuildImages')) {
+    const profiles = c.collectorBuildImages;
+    if (!profiles || typeof profiles !== 'object' || Array.isArray(profiles) || Object.entries(profiles).some(([hash, image]) =>
+      !/^[a-f0-9]{64}$/.test(hash) || typeof image !== 'string' ||
+      !/^[a-z0-9]+\.azurecr\.io\/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$/.test(image)))
+      throw new Error('collectorBuildImages must map profile hashes to digest-pinned ACR images');
+  }
   if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
   if (Object.hasOwn(c, 'resources')) validateResources(c.resources, scaleOut);
   if (scaleOut) {

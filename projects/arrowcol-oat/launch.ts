@@ -12,6 +12,7 @@ import { assertLocalFailedDisposition, localDispositionSuffix, recordLocalFailed
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { collectorBuildProfileHash, parseCollectorBuildProfile } from './collector-build-profile.js';
 
 export interface OatRunStatus {
   id: string;
@@ -1567,6 +1568,17 @@ export async function readOatConfigForMode(
   if (!isRecord(parsed)) throw new Error('OAT config must be a JSON object');
   parseDataFlowVerdictPolicy(parsed.dataflow_verdict_policy);
   const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
+  const tunables = isRecord(parsed.tunables) ? parsed.tunables : {};
+  const collectorProfile = parseCollectorBuildProfile(tunables.collector);
+  if (collectorProfile) {
+    const profileHash = collectorBuildProfileHash(collectorProfile);
+    if (platform.collector_build_profile_hash !== undefined && platform.collector_build_profile_hash !== profileHash) {
+      throw new Error('platform.collector_build_profile_hash does not match tunables.collector build profile');
+    }
+    platform.collector_build_profile_hash = profileHash;
+  } else if (Object.hasOwn(platform, 'collector_build_profile_hash')) {
+    throw new Error('platform.collector_build_profile_hash requires an explicit tunables.collector build profile');
+  }
   if (mode === 'local' && isRecord(platform.local)) {
     const local = { ...platform.local };
     if (local.bind_host == null || local.endpoint_host == null) {
