@@ -90,7 +90,8 @@ fn compose_maintenance(config: &OatConfig, services: &mut serde_json::Map<String
         worker["build"] = json!({
             "context": std::env::current_dir()?,
             "dockerfile": "crates/delta-maintenance/Dockerfile",
-            "labels": { "org.opencontainers.image.revision": std::env::var("GIT_SHA").unwrap_or_else(|_| "unknown".to_owned()) },
+            "args": { "VCS_REF": std::env::var("GIT_SHA").unwrap_or_else(|_| "local".to_owned()) },
+            "labels": { "org.opencontainers.image.revision": std::env::var("GIT_SHA").unwrap_or_else(|_| "local".to_owned()) },
         });
     }
     services.insert("delta-maintenance".to_owned(), worker);

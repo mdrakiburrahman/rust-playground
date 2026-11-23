@@ -1019,6 +1019,9 @@ struct ClientProgress {
 #[async_trait::async_trait]
 trait Platform: Send + Sync {
     fn kind(&self) -> crate::config::OatMode;
+    async fn prebuild(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
+    }
     fn workload_endpoint(&self, config: &OatConfig) -> String;
     fn delta_root(&self) -> Option<&str> {
         None
@@ -1114,6 +1117,10 @@ trait Platform: Send + Sync {
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         None
     }
+    fn local_lifecycle_timing(&self) -> Option<Value> {
+        None
+    }
+    fn record_setup_seconds(&mut self, _seconds: f64) {}
     fn resource_evidence(&self) -> Option<Value> {
         None
     }
@@ -1267,6 +1274,8 @@ struct LocalPlatform {
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
     shutdown_drain_evidence: Option<Value>,
+    build_seconds: Option<f64>,
+    setup_seconds: Option<f64>,
     maintenance_cell_baseline: Vec<ProcessLog>,
 }
 
@@ -1871,6 +1880,21 @@ impl Platform for LocalPlatform {
         crate::config::OatMode::Local
     }
 
+    async fn prebuild(&mut self, config: &OatConfig) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        let result = prebuild_local_platform(config, self).await;
+        self.build_seconds = Some(started.elapsed().as_secs_f64());
+        result
+    }
+
+    fn local_lifecycle_timing(&self) -> Option<Value> {
+        Some(json!({"build_seconds": self.build_seconds, "setup_seconds": self.setup_seconds}))
+    }
+
+    fn record_setup_seconds(&mut self, seconds: f64) {
+        self.setup_seconds = Some(seconds);
+    }
+
     async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
         local_process_logs(config, self).await
     }
@@ -2083,6 +2107,7 @@ impl LocalPlatform {
             .compose_state_root
             .as_deref()
             .context("local compose state root is missing")?;
+        let source_revision = local_build_source_revision()?;
         let state_dir = std::env::current_dir()?.join(state_root).join(run_id);
         crate::local::absolute_directory(&state_dir)?;
         if let Some(destination) = &config.platform.local.snapshot_root {
@@ -2113,6 +2138,8 @@ impl LocalPlatform {
             }
         };
         let control_dir = state_dir.join("control");
+        let mut environment = environment;
+        environment.insert("GIT_SHA".to_owned(), source_revision);
         Ok(Self {
             run_id: run_id.to_owned(),
             state_dir,
@@ -2124,6 +2151,8 @@ impl LocalPlatform {
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            build_seconds: None,
+            setup_seconds: None,
             maintenance_cell_baseline: Vec::new(),
         })
     }
@@ -3537,15 +3566,22 @@ async fn run_isolated_cell(
             return outcome;
         }
     };
-    let lifecycle_started_at = tokio::time::Instant::now();
-    let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
-    let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id, replicas)).await {
-                Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
-                Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
-            }
+            platform.prebuild(&config).await.context("untimed prebuild of local OAT images and initializer")?;
+            let lifecycle_started_at = tokio::time::Instant::now();
+            let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
+            let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
+            let setup_started_at = tokio::time::Instant::now();
+            let setup_result = match tokio::time::timeout_at(
+                setup_deadline,
+                platform.ensure_stack(&config, orchestration_id, replicas),
+            ).await {
+                Ok(result) => result.context("prepare isolated OAT matrix-cell platform"),
+                Err(_) => Err(anyhow::anyhow!("planned pre-cell setup deadline expired; normal platform cleanup follows")),
+            };
+            platform.record_setup_seconds(setup_started_at.elapsed().as_secs_f64());
+            setup_result?;
             let timing = config.timing_budget()?;
             require_lifecycle_remaining_at(
                 tokio::time::Instant::now(),
@@ -3635,6 +3671,22 @@ async fn run_isolated_cell(
             None => error,
         });
     }
+    if let Some(evidence) = platform.local_lifecycle_timing()
+        && let Err(error) = attach_local_lifecycle_timing(&mut outcome, evidence)
+    {
+        for row in &mut outcome.rows {
+            row.status = "failed".to_owned();
+            let message = format!("serialize local lifecycle timing evidence: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message.clone(),
+            });
+        }
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("serialize local lifecycle timing evidence: {error:#}")),
+            None => error,
+        });
+    }
     outcome
 }
 
@@ -3652,6 +3704,18 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
         evidence["shutdown_drain"] = shutdown_drain.clone();
         row.evidence_json =
             Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
+    }
+    Ok(())
+}
+
+fn attach_local_lifecycle_timing(outcome: &mut MatrixOutcome, timing: Value) -> Result<()> {
+    for row in &mut outcome.rows {
+        let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
+        let mut evidence: Value =
+            serde_json::from_str(evidence_json).context("parse cell evidence before timing update")?;
+        evidence["local_lifecycle_timing"] = timing.clone();
+        row.evidence_json =
+            Some(serde_json::to_string(&evidence).context("serialize cell evidence with local lifecycle timing")?);
     }
     Ok(())
 }
@@ -7956,11 +8020,9 @@ fn local_table_initializer_command(config: &OatConfig, workspace: &Path, argumen
 }
 
 async fn initialize_local_maintenance_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
-    let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
-        || config.platform.local.partitioned_table_bootstrap;
-    if !partitioned && (config.campaign_profile.is_some() || !maintenance_enabled(config) || config.tables.len() != 1) {
+    let Some(partitioned) = local_maintenance_table_initialization_mode(config) else {
         return Ok(());
-    }
+    };
     let [table] = config.tables.as_slice() else {
         bail!("local initialization requires exactly one table");
     };
@@ -7971,18 +8033,6 @@ async fn initialize_local_maintenance_table(config: &OatConfig, platform: &Local
         local_initializer_args(table, &dataflow_root, false)?
     };
     let workspace = std::env::current_dir()?;
-    let mut build = Command::new("cargo");
-    build.args([
-        "build",
-        "--locked",
-        "--package",
-        "arrowcol-loadgen",
-        "--bin",
-        "arrowcol-loadgen",
-    ]);
-    build.current_dir(&workspace);
-    run_streaming_command(build, "build setup-only local table initializer").await?;
-
     let initialize = local_table_initializer_command(config, &workspace, arguments)?;
     run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
         .await
@@ -7991,6 +8041,172 @@ async fn initialize_local_maintenance_table(config: &OatConfig, platform: &Local
 
 fn local_collector_profile_tag(profile_hash: &str) -> String {
     format!("arrowcol-oat/dataflow:profile-{profile_hash}")
+}
+
+fn local_build_source_revision() -> Result<String> {
+    let revision = std::env::var("GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local".to_owned());
+    if revision != "local" && !is_lower_hex_string(&revision, 40) {
+        bail!("GIT_SHA must be 'local' or a full 40-character lowercase Git revision for local image builds");
+    }
+    Ok(revision)
+}
+
+fn local_prebuild_image_sources(
+    config: &OatConfig,
+    source_revision: &str,
+) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let profile_hash = config.collector_build_profile_hash();
+    let collector = profile_hash
+        .as_deref()
+        .map(local_collector_profile_tag)
+        .unwrap_or_else(|| "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev".to_owned());
+    let collector_role = if config.platform.local.collector_image_override.is_some() {
+        "collector_build"
+    } else {
+        "collector"
+    };
+    let mut images = vec![
+        (
+            "catalog".to_owned(),
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev".to_owned(),
+            Some(source_revision.to_owned()),
+            None,
+        ),
+        ("client".to_owned(), "arrowcol-oat-client:local".to_owned(), None, None),
+        (
+            collector_role.to_owned(),
+            collector,
+            Some(source_revision.to_owned()),
+            profile_hash,
+        ),
+        (
+            "router".to_owned(),
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust:dev".to_owned(),
+            Some(source_revision.to_owned()),
+            None,
+        ),
+        (
+            "sqlserver".to_owned(),
+            "arrowcol-loadtest/sqlserver:2022-cu27".to_owned(),
+            None,
+            None,
+        ),
+    ];
+    if maintenance_enabled(config) {
+        let external = config.maintenance_image.is_some();
+        images.push((
+            "maintenance".to_owned(),
+            config
+                .maintenance_image
+                .as_deref()
+                .unwrap_or("arrowcol-oat/maintenance:local")
+                .to_owned(),
+            (!external).then(|| source_revision.to_owned()),
+            None,
+        ));
+    }
+    if let Some(override_image) = &config.platform.local.collector_image_override {
+        images.push((
+            "collector".to_owned(),
+            override_image.image_id.clone(),
+            Some(override_image.source_revision.clone()),
+            None,
+        ));
+    }
+    images
+}
+
+async fn inspect_local_prebuild_image(
+    role: &str,
+    image: &str,
+    expected_revision: Option<&str>,
+    expected_profile_hash: Option<&str>,
+) -> Result<Value> {
+    let mut inspect = Command::new("docker");
+    inspect.args([
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}",
+        image,
+    ]);
+    let output = run_command(inspect, &format!("inspect prebuilt local {role} image")).await?;
+    let observed = String::from_utf8(output.stdout)?;
+    let fields = observed.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 {
+        bail!("prebuilt local {role} image metadata must contain image ID, source revision, and profile hash");
+    }
+    let image_id = local_client_image_id(fields[0])?.to_owned();
+    let revision = (fields[1] != "<no value>").then(|| fields[1].to_owned());
+    let profile_hash = (fields[2] != "<no value>").then(|| fields[2].to_owned());
+    if let Some(expected) = expected_revision {
+        if expected_profile_hash.is_some() {
+            verify_collector_profile_image(&observed, expected, expected_profile_hash.unwrap())?;
+        } else if role == "collector" && image.starts_with("sha256:") {
+            verify_collector_image(&format!("{} {}", fields[0], fields[1]), image, expected)?;
+        } else if revision.as_deref() != Some(expected) {
+            bail!("prebuilt local {role} image source revision does not match the requested revision");
+        }
+    }
+    if let Some(expected) = expected_profile_hash
+        && profile_hash.as_deref() != Some(expected)
+    {
+        bail!("prebuilt local {role} image profile hash does not match the requested build profile");
+    }
+    Ok(json!({"image": image, "image_id": image_id, "source_revision": revision, "profile_hash": profile_hash}))
+}
+
+async fn local_prebuild_manifest(config: &OatConfig) -> Result<Value> {
+    let source_revision = local_build_source_revision()?;
+    let mut images = serde_json::Map::new();
+    for (role, image, expected_revision, expected_profile_hash) in
+        local_prebuild_image_sources(config, &source_revision)
+    {
+        let identity = inspect_local_prebuild_image(
+            &role,
+            &image,
+            expected_revision.as_deref(),
+            expected_profile_hash.as_deref(),
+        )
+        .await?;
+        images.insert(role, identity);
+    }
+    Ok(json!({"version": 1, "source_revision": source_revision, "images": images}))
+}
+
+async fn write_local_prebuild_manifest(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let manifest = local_prebuild_manifest(config).await?;
+    tokio::fs::write(
+        platform.state_dir.join("prebuild-images.json"),
+        serde_json::to_vec(&manifest).context("serialize local prebuild image manifest")?,
+    )
+    .await
+    .context("write local prebuild image manifest")
+}
+
+async fn verify_local_prebuild_manifest(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let path = platform.state_dir.join("prebuild-images.json");
+    let expected: Value = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .context("read local prebuild image manifest")?,
+    )
+    .context("parse local prebuild image manifest")?;
+    let actual = local_prebuild_manifest(config).await?;
+    if expected != actual {
+        bail!("local prebuilt image IDs or source-revision labels changed before setup");
+    }
+    Ok(())
+}
+
+fn local_maintenance_table_initialization_mode(config: &OatConfig) -> Option<bool> {
+    let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        || config.platform.local.partitioned_table_bootstrap;
+    (partitioned || (config.campaign_profile.is_none() && maintenance_enabled(config) && config.tables.len() == 1))
+        .then_some(partitioned)
 }
 
 fn verify_collector_profile_image(
@@ -8218,7 +8434,7 @@ fn stable_local_images_pin_roles_and_refuse_drift_before_overlay_changes() -> Re
     Ok(())
 }
 
-async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+async fn prebuild_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     run_npx_runtime(
         &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
         &[
@@ -8232,8 +8448,21 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         ],
     )
     .await
-    .context("render run-owned dataflow profile before starting local workloads")?;
-    initialize_local_maintenance_table(config, platform).await?;
+    .context("render run-owned dataflow profile before local prebuild")?;
+    if local_maintenance_table_initialization_mode(config).is_some() {
+        let mut build = Command::new("cargo");
+        build.args([
+            "build",
+            "--locked",
+            "--package",
+            "arrowcol-loadgen",
+            "--bin",
+            "arrowcol-loadgen",
+        ]);
+        build.current_dir(std::env::current_dir()?);
+        run_streaming_command(build, "build setup-only local table initializer").await?;
+    }
+
     let base_project = config
         .platform
         .compose_project
@@ -8248,8 +8477,9 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     let build_project = if config.platform.local.stable_image_build {
         format!("{base_project}-images")
     } else {
-        project.clone()
+        project
     };
+    let source_revision = local_build_source_revision()?;
     let mut build_client = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
@@ -8257,22 +8487,40 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "oat",
     );
     platform.add_compose_environment(&mut build_client);
+    build_client.env("GIT_SHA", &source_revision);
     build_client.args(["build", "oat-client"]);
     if maintenance_enabled(config) && config.maintenance_image.is_none() {
         build_client.arg("delta-maintenance");
     }
-    run_streaming_command(build_client, "build OAT client container").await?;
-    if config.platform.local.stable_image_build {
-        let mut build_stack = compose_command(
-            compose_file,
-            config.platform.compose_override_file.as_deref(),
-            &build_project,
-            "benchmark",
-        );
-        platform.add_compose_environment(&mut build_stack);
-        build_stack.args(["build", "sqlserver", "arrowcol-catalog", "dataflow-1", "router"]);
-        run_streaming_command(build_stack, "build stable local OAT images").await?;
-    }
+    run_streaming_command(build_client, "prebuild OAT client image").await?;
+
+    let mut build_stack = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &build_project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut build_stack);
+    build_stack.env("GIT_SHA", &source_revision);
+    build_stack.args(["build", "sqlserver", "arrowcol-catalog", "dataflow-1", "router"]);
+    run_streaming_command(build_stack, "prebuild local OAT stack images").await?;
+    write_local_prebuild_manifest(config, platform).await
+}
+
+async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    verify_local_prebuild_manifest(config, platform).await?;
+    initialize_local_maintenance_table(config, platform).await?;
+    let base_project = config
+        .platform
+        .compose_project
+        .as_deref()
+        .context("local compose project name is missing")?;
+    let compose_file = config
+        .platform
+        .compose_file
+        .as_deref()
+        .context("local compose file is missing")?;
+    let project = scoped_compose_project(base_project, &platform.run_id);
     pin_local_maintenance_image(config, platform).await?;
     if config.platform.local.stable_image_build {
         pin_stable_local_images(config, platform).await?;
@@ -8286,12 +8534,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
-    up.args(["up", "--detach"]);
-    up.arg(if config.platform.local.stable_image_build {
-        "--no-build"
-    } else {
-        "--build"
-    });
+    up.args(["up", "--detach", "--no-build"]);
     up.args(["--wait", "--wait-timeout", "600", "sqlserver"]);
     run_streaming_command(up, "start local OAT SQL Server")
         .await
@@ -8306,9 +8549,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         );
         platform.add_compose_environment(&mut migration);
         migration.args(["run", "--rm", "--no-deps"]);
-        if config.platform.local.stable_image_build {
-            migration.args(["--pull", "never"]);
-        }
+        migration.args(["--pull", "never"]);
         migration.arg(service);
         run_streaming_command(migration, &format!("run local OAT {service}")).await?;
     }
@@ -8320,12 +8561,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
-    up.args(["up", "--detach"]);
-    up.arg(if config.platform.local.stable_image_build {
-        "--no-build"
-    } else {
-        "--build"
-    });
+    up.args(["up", "--detach", "--no-build"]);
     up.args([
         "--wait",
         "--wait-timeout",
@@ -8360,7 +8596,16 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut downstream);
-    downstream.args(["up", "--detach", "--no-deps", "--wait", "--wait-timeout", "60", "kusto"]);
+    downstream.args([
+        "up",
+        "--detach",
+        "--no-build",
+        "--no-deps",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "kusto",
+    ]);
     if run_streaming_command(downstream, "start optional local Kustainer")
         .await
         .is_err()
@@ -8395,10 +8640,7 @@ async fn scale_local_arrowcols(
     );
     platform.add_compose_environment(&mut up);
     up.env("LOADTEST_CPUS", concurrency.to_string());
-    up.args(["up", "--detach"]);
-    if config.platform.local.stable_image_build {
-        up.arg("--no-build");
-    }
+    up.args(["up", "--detach", "--no-build"]);
     up.args([
         "--wait",
         "--wait-timeout",
@@ -16424,6 +16666,8 @@ mod tests {
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            build_seconds: None,
+            setup_seconds: None,
             maintenance_cell_baseline: Vec::new(),
         };
         fs::write(fixture.join("mode"), "stop_failure")?;

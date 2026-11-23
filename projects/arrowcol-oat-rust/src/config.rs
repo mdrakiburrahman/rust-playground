@@ -469,6 +469,7 @@ pub(crate) fn parse_memory_bytes(value: &str) -> Result<u64> {
 #[serde(deny_unknown_fields)]
 pub struct LocalOptions {
     pub collector_memory_limit_bytes: Option<u64>,
+    pub setup_timeout_ms: Option<u64>,
     pub bind_host: Option<std::net::IpAddr>,
     pub endpoint_host: Option<String>,
     pub snapshot_root: Option<String>,
@@ -535,6 +536,9 @@ const MAX_CLIENT_SCHEDULE_WAIT_SECONDS: u64 = 2_160;
 pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 pub(crate) const CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS: u64 = 180;
+pub(crate) const DEFAULT_LOCAL_SETUP_TIMEOUT_MS: u64 = 1_260_000;
+const LOCAL_SETUP_TIMEOUT_MIN_MS: u64 = 30_000;
+const LOCAL_SETUP_TIMEOUT_MAX_MS: u64 = 86_400_000;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
 const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -1010,7 +1014,10 @@ impl OatConfig {
                 .checked_mul(rollout_timeout_ms)
                 .context("OAT AKS setup timeout overflow")?
         } else {
-            1_260_000
+            self.platform
+                .local
+                .setup_timeout_ms
+                .unwrap_or(DEFAULT_LOCAL_SETUP_TIMEOUT_MS)
         };
         let resource_counter_snapshot_budget_ms = if self.platform.kind == OatMode::Aks {
             AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS
@@ -1047,6 +1054,14 @@ impl OatConfig {
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
         let computed_profile_hash = self.collector_build_profile_hash();
+        if self
+            .platform
+            .local
+            .setup_timeout_ms
+            .is_some_and(|timeout| !(LOCAL_SETUP_TIMEOUT_MIN_MS..=LOCAL_SETUP_TIMEOUT_MAX_MS).contains(&timeout))
+        {
+            bail!("platform.local.setup_timeout_ms must be integer milliseconds in 30000..=86400000");
+        }
         if computed_profile_hash.is_some()
             && self.platform.kind == OatMode::Local
             && !self.platform.local.stable_image_build
@@ -1648,6 +1663,36 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_setup_timeout_is_strictly_bounded() -> Result<()> {
+        let mut config = valid();
+        config.platform.local.setup_timeout_ms = Some(0);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("platform.local.setup_timeout_ms")
+        );
+
+        config.platform.local.setup_timeout_ms = Some(LOCAL_SETUP_TIMEOUT_MIN_MS);
+        config.validate()?;
+        config.platform.local.setup_timeout_ms = Some(LOCAL_SETUP_TIMEOUT_MAX_MS);
+        config.validate()?;
+        config.platform.local.setup_timeout_ms = Some(LOCAL_SETUP_TIMEOUT_MAX_MS + 1);
+        assert!(config.validate().unwrap_err().to_string().contains("30000..=86400000"));
+
+        config.platform.kind = OatMode::Local;
+        config.platform.local.setup_timeout_ms = None;
+        assert_eq!(
+            config.timing_budget()?.pre_cell_setup_timeout_ms,
+            DEFAULT_LOCAL_SETUP_TIMEOUT_MS
+        );
+        config.platform.local.setup_timeout_ms = Some(45_000);
+        assert_eq!(config.timing_budget()?.pre_cell_setup_timeout_ms, 45_000);
+        Ok(())
+    }
 
     #[test]
     fn collector_cpu_preflight_parses_linux_flags_and_sse3_alias() {

@@ -8,6 +8,7 @@
     "kustomize_overlay": null,
     "local": {
       "bind_host": null,
+      "setup_timeout_ms": 1260000,
       "endpoint_host": null,
       "snapshot_root": null
     }
