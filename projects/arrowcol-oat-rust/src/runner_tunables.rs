@@ -51,22 +51,24 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
-        let section = match path {
+        let (section, field, variable, grouped) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
-            | "collector.commit.max_pending_files" => "commit",
+            | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG", true),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
             | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
-            | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => "pressure",
+            | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => ("pressure", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_PRESSURE_CONFIG", true),
+            "collector.upload.mode" => ("runtime", "upload_mode", "ARROWCOL_COLLECTOR_UPLOAD_MODE", false),
+            "collector.upload.buffer_capacity_bytes" => ("runtime", "upload_buffer_capacity_bytes", "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES", false),
+            "collector.upload.request_concurrency" => ("runtime", "upload_request_concurrency", "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY", false),
             _ => return true,
         };
-        let field = path.rsplit('.').next().unwrap_or_default();
-        let variable = if section == "commit" {
-            "ARROWCOL_COLLECTOR_COMMIT_CONFIG"
+        let projected_field = if grouped {
+            projected.get(variable).and_then(|value| value.get(field)).is_some()
         } else {
-            "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"
+            environment.contains_key(variable)
         };
-        if projected.get(variable).and_then(|value| value.get(field)).is_none() {
+        if !projected_field {
             return true;
         }
         if collectors.iter().any(|process| process["effective_config"][section].get(field).is_none()) {
@@ -723,6 +725,21 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         assert_eq!(observed["runtime"]["upload_buffer_capacity_bytes"], 1048576);
         assert_eq!(observed["runtime"]["upload_request_concurrency"], 3);
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let process = json!({
+            "component": "collector", "instance_id": "collector-1", "log_complete": true,
+            "startup_tunables_verified": true, "effective_config_source": "consumer_startup_readback",
+            "effective_config": observed,
+        });
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 3);
+        assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
+        let mut wrong_process = process;
+        wrong_process["effective_config"]["runtime"]["upload_mode"] = json!("put_create");
+        let mut uncovered = initial.clone();
+        promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong_process])), 1)?;
+        assert_eq!(uncovered, initial);
         let mut missing = observed.clone();
         missing["runtime"].as_object_mut().context("missing runtime readback")?.remove("upload_mode");
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err());
