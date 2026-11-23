@@ -145,7 +145,7 @@ async fn diagnostic_command(mut command: Command, description: &str) -> Result<S
     let output = tokio::time::timeout(Duration::from_secs(30), run_command(command, description))
         .await
         .context("diagnostic CPU readback timed out")??;
-    Ok(String::from_utf8(output.stdout).context("diagnostic CPU readback is not UTF-8")?)
+    String::from_utf8(output.stdout).context("diagnostic CPU readback is not UTF-8")
 }
 
 async fn diagnostic_container_cpu_readback(id: &str, requested: &BTreeSet<u32>) -> Result<Value> {
@@ -678,21 +678,42 @@ mod realistic_diagnostic_admission_tests {
             ..Default::default()
         };
         let pin = "a".repeat(64);
-        assert!(validate_diagnostic_live_fleet(&config, &[handle.clone()], &[client.clone()], run, &pin).is_ok());
-        assert!(validate_diagnostic_live_fleet(&config, &[], &[client.clone()], run, &pin).is_err());
         assert!(
-            validate_diagnostic_live_fleet(&config, &[handle.clone(), handle.clone()], &[client.clone()], run, &pin)
-                .is_err()
+            validate_diagnostic_live_fleet(
+                &config,
+                std::slice::from_ref(&handle),
+                std::slice::from_ref(&client),
+                run,
+                &pin
+            )
+            .is_ok()
         );
+        assert!(validate_diagnostic_live_fleet(&config, &[], std::slice::from_ref(&client), run, &pin).is_err());
         assert!(
-            validate_diagnostic_live_fleet(&config, &[handle.clone()], &[client.clone(), client.clone()], run, &pin)
-                .is_err()
+            validate_diagnostic_live_fleet(
+                &config,
+                &[handle.clone(), handle.clone()],
+                std::slice::from_ref(&client),
+                run,
+                &pin
+            )
+            .is_err()
         );
         assert!(
             validate_diagnostic_live_fleet(
                 &config,
-                &[handle.clone()],
-                &[client.clone()],
+                std::slice::from_ref(&handle),
+                &[client.clone(), client.clone()],
+                run,
+                &pin
+            )
+            .is_err()
+        );
+        assert!(
+            validate_diagnostic_live_fleet(
+                &config,
+                std::slice::from_ref(&handle),
+                std::slice::from_ref(&client),
                 "00000000-0000-4000-8000-000000000002",
                 &pin
             )
@@ -700,10 +721,10 @@ mod realistic_diagnostic_admission_tests {
         );
         let mut wrong = client.clone();
         wrong.schedule_received = true;
-        assert!(validate_diagnostic_live_fleet(&config, &[handle.clone()], &[wrong], run, &pin).is_err());
+        assert!(validate_diagnostic_live_fleet(&config, std::slice::from_ref(&handle), &[wrong], run, &pin).is_err());
         let mut wrong = client.clone();
         wrong.failure = Some("failed".into());
-        assert!(validate_diagnostic_live_fleet(&config, &[handle.clone()], &[wrong], run, &pin).is_err());
+        assert!(validate_diagnostic_live_fleet(&config, std::slice::from_ref(&handle), &[wrong], run, &pin).is_err());
         let mut wrong = client.clone();
         wrong.output.clear();
         assert!(validate_diagnostic_live_fleet(&config, &[handle], &[wrong], run, &pin).is_err());
@@ -728,7 +749,10 @@ mod realistic_diagnostic_admission_tests {
         wrong["phase"] = json!("measurement");
         assert!(validate_diagnostic_prepared_metrics(&output(&wrong), &pin, "test").is_err());
         wrong = value.clone();
-        wrong.as_object_mut().unwrap().remove("measurement_window");
+        wrong
+            .as_object_mut()
+            .context("fixture is not an object")?
+            .remove("measurement_window");
         assert!(validate_diagnostic_prepared_metrics(&output(&wrong), &pin, "test").is_err());
         let duplicate = output(&value).replacen(
             "\"admitted_live_slots\":28",
