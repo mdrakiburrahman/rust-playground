@@ -13,7 +13,7 @@ type JsonObject = Record<string, unknown>;
 
 export interface InertTunableField {
   path: string;
-  reason: "maintenance_disabled" | "dictionary_disabled" | "duration_based_run" | "connection_retries_disabled" | "http2_keepalive_disabled" | "adaptive_http2_window" | "tcp_keepalive_disabled" | "rate_limit_disabled";
+  reason: "maintenance_disabled" | "dictionary_disabled" | "duration_based_run" | "connection_retries_disabled" | "stream_retries_disabled" | "http2_keepalive_disabled" | "adaptive_http2_window" | "tcp_keepalive_disabled" | "rate_limit_disabled";
 }
 
 export interface ProjectionOnlyField {
@@ -46,7 +46,7 @@ function extractFields<R extends string>(evidence: JsonObject, key: string, reas
 }
 
 export function extractInertTunableFields(evidence: JsonObject): InertTunableField[] | null {
-  return extractFields(evidence, "inert_fields", ["maintenance_disabled", "dictionary_disabled", "duration_based_run", "connection_retries_disabled", "http2_keepalive_disabled", "adaptive_http2_window", "tcp_keepalive_disabled", "rate_limit_disabled"] as const);
+  return extractFields(evidence, "inert_fields", ["maintenance_disabled", "dictionary_disabled", "duration_based_run", "connection_retries_disabled", "stream_retries_disabled", "http2_keepalive_disabled", "adaptive_http2_window", "tcp_keepalive_disabled", "rate_limit_disabled"] as const);
 }
 
 function object(value: unknown, label: string): JsonObject {

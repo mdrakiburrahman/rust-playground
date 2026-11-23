@@ -2433,6 +2433,7 @@ groups:
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
                 | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
                 | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "max_memory_bytes"
+                | "stream_retry_max_attempts" | "stream_retry_base_backoff_ms" | "stream_retry_max_backoff_ms"
                 | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
                 | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
                 | "keepalive_timeout_ms" | "keepalive_while_idle"

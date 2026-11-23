@@ -109,6 +109,40 @@ fn tcp_keepalive_options_follow_the_enable_setting() -> Result<()> {
 }
 
 #[test]
+fn stream_backoff_is_inert_when_no_retry_is_allowed() -> Result<()> {
+    for (attempts, inert) in [(1, true), (2, false)] {
+        let tunables = Tunables::parse_oat_json(json!({"client":{
+            "stream_retry_max_attempts":attempts,
+            "stream_retry_base_backoff_ms":13,
+            "stream_retry_max_backoff_ms":300
+        }}))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        for path in [
+            "client.stream_retry_base_backoff_ms",
+            "client.stream_retry_max_backoff_ms",
+        ] {
+            assert_eq!(
+                evidence["inert_fields"]
+                    .as_array()
+                    .context("missing inert fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path && entry["reason"] == "stream_retries_disabled"),
+                inert
+            );
+            assert_eq!(
+                evidence["projection_only"]
+                    .as_array()
+                    .context("missing projected fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path),
+                !inert
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn rate_limit_period_is_strict_and_inert_when_disabled() -> Result<()> {
     let unchanged = Tunables::parse_oat_json(json!({"transport":{"rate_limit_rps": 2}}))?;
     assert!(

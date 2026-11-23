@@ -23,6 +23,7 @@ pub struct Capability {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplicabilityGate {
     ConnectionRetries,
+    StreamRetries,
     Http2Keepalive,
     FixedHttp2Window,
     TcpKeepalive,
@@ -109,8 +110,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
     capability!("client.max_rows", "0; one-shot only, inert in duration-based OAT cells"),
     capability!("client.stream_retry_max_attempts", "4"),
-    capability!("client.stream_retry_base_backoff_ms", "10"),
-    capability!("client.stream_retry_max_backoff_ms", "250"),
+    gated_capability!("client.stream_retry_base_backoff_ms", "10", StreamRetries),
+    gated_capability!("client.stream_retry_max_backoff_ms", "250", StreamRetries),
     capability!("transport.ipc_compression", "none (compatibility alias)"),
     capability!("arrow_ipc.compression", "none"),
     capability!(
@@ -492,6 +493,11 @@ impl Tunables {
             .and_then(Value::as_u64)
             .unwrap_or(0)
             == 0;
+        let stream_retries_disabled = requested
+            .pointer("/client/stream_retry_max_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(4)
+            == 1;
         let http2_keepalive_disabled = requested
             .pointer("/transport/keepalive_interval_ms")
             .and_then(Value::as_u64)
@@ -511,6 +517,7 @@ impl Tunables {
         struct ClassificationContext {
             maintenance_enabled: bool,
             connection_retries_disabled: bool,
+            stream_retries_disabled: bool,
             http2_keepalive_disabled: bool,
             adaptive_http2_window: bool,
             tcp_keepalive_disabled: bool,
@@ -563,6 +570,8 @@ impl Tunables {
                 && context.connection_retries_disabled
             {
                 (inert, "connection_retries_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::StreamRetries) && context.stream_retries_disabled {
+                (inert, "stream_retries_disabled")
             } else if capability.gate == Some(ApplicabilityGate::Http2Keepalive) && context.http2_keepalive_disabled {
                 (inert, "http2_keepalive_disabled")
             } else if capability.gate == Some(ApplicabilityGate::FixedHttp2Window) && context.adaptive_http2_window {
@@ -592,6 +601,7 @@ impl Tunables {
             ClassificationContext {
                 maintenance_enabled,
                 connection_retries_disabled,
+                stream_retries_disabled,
                 http2_keepalive_disabled,
                 adaptive_http2_window,
                 tcp_keepalive_disabled,
