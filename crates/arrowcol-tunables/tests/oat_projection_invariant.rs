@@ -377,6 +377,7 @@ fn candidates(path: &str) -> Vec<Value> {
         json!(16_777_216),
         json!(536_870_912),
         json!(1_073_741_824_u64),
+        json!(4_294_967_296_u64),
         json!(true),
         json!(false),
         json!("1s"),
