@@ -314,6 +314,9 @@ fn fixture(path: &str, value: Value) -> Value {
 }
 
 fn candidates(path: &str) -> Vec<Value> {
+    if path == "collector.runtime.generated_partition_binding" {
+        return vec![json!("proven_constant")];
+    }
     if path == "arrow_ipc.alignment" {
         return vec![json!(8)];
     }
@@ -532,6 +535,36 @@ fn duration_run_classifies_one_shot_max_rows_as_inert() -> Result<()> {
         }])
     );
     assert_eq!(evidence["projection_only"], json!([]));
+    Ok(())
+}
+
+#[test]
+fn generated_partition_binding_requires_a_named_string_mode() -> Result<()> {
+    let empty = Tunables::parse_oat_json(json!({"collector":{"runtime":{}}}))?;
+    assert!(
+        !empty
+            .environment_for(ComponentRole::Collector)?
+            .contains_key("ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING")
+    );
+    assert!(
+        serde_json::to_value(empty)?["collector"]["runtime"]
+            .get("generated_partition_binding")
+            .is_none()
+    );
+    for bad in [
+        Value::Null,
+        json!(true),
+        json!(1),
+        json!(""),
+        json!("PROVEN_CONSTANT"),
+        json!("proven_constant "),
+        json!({"proven_constant":null}),
+    ] {
+        let error = Tunables::parse_oat_json(fixture("collector.runtime.generated_partition_binding", bad))
+            .err()
+            .context("invalid binding unexpectedly accepted")?;
+        assert!(format!("{error:#}").contains("collector.runtime.generated_partition_binding"));
+    }
     Ok(())
 }
 

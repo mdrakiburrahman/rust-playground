@@ -289,6 +289,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
             "collector.runtime.partition_grouping" => Some(("partition_grouping", "ARROWCOL_COLLECTOR_PARTITION_GROUPING")),
             "collector.runtime.file_mapping_cache" => Some(("file_mapping_cache", "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE")),
+            "collector.runtime.generated_partition_binding" => Some(("generated_partition_binding", "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING")),
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
             _ => None,
         };

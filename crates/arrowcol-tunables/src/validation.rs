@@ -324,6 +324,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.partition_grouping", "scalar_map"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.runtime.file_mapping_cache", "false"),
+    capability!("collector.runtime.generated_partition_binding", "revalidate_rows"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
     capability!("collector.upload.request_concurrency", "2"),
@@ -1160,6 +1161,12 @@ impl Tunables {
                                 arrow_deltalake::TimestampKernel::FusedChecked => "fused_checked",
                             }
                             .into(),
+                        );
+                    }
+                    if let Some(binding) = runtime.generated_partition_binding {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING".to_owned(),
+                            binding.as_str().to_owned(),
                         );
                     }
                     if let Some(enabled) = runtime.generated_partition_fast_path {
