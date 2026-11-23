@@ -151,6 +151,59 @@ fn commit_window_output(
     Ok(result)
 }
 
+fn annotate_zero_durable_output(evidence: &mut Value) {
+    let full = evidence.pointer("/durable_commits/output_throughput").cloned().unwrap_or(Value::Null);
+    let full_interval = full["measurement_start_unix_ms"].as_u64().zip(full["measurement_end_unix_ms"].as_u64());
+    let guard_timestamp = evidence.get("overload_stop")
+        .filter(|stop| stop["classification"] == "above_ceiling")
+        .and_then(|stop| stop["timestamp_ms"].as_u64());
+    let teardown_failed = evidence["teardown_outcome"] == "failed";
+    let no_reported_attempts = full_interval.is_some_and(|(start, end)| {
+        start < end && evidence.pointer("/rows/attempted").and_then(Value::as_u64) == Some(0)
+            && evidence.pointer("/rows/attempted_scope").and_then(Value::as_str)
+                == Some("measurement_start_to_completed_process_snapshot_interval_not_exact_window")
+            && evidence["client_phase_reports"].as_array().is_some_and(|reports| {
+                !reports.is_empty() && reports.iter().all(|report| {
+                    let counters = &report["phase_counters"];
+                    counters["measurement_window"]["start_unix_ms"].as_u64() == Some(start)
+                        && counters["measurement_window"]["end_unix_ms"].as_u64() == Some(end)
+                        && counters["workers"].as_array().is_some_and(|workers| {
+                            !workers.is_empty() && workers.iter().all(|worker| worker["attempted_rows"].as_u64() == Some(0))
+                        })
+                })
+            })
+    });
+    let annotate = |window: &mut Value| {
+        if window["rows"].as_u64() != Some(0)
+            || window.get("unavailable_reason").is_some_and(|reason| !reason.is_null()) {
+            return;
+        }
+        let interval = window["measurement_start_unix_ms"].as_u64().zip(window["measurement_end_unix_ms"].as_u64());
+        let valid_interval = interval.filter(|(start, end)| start < end);
+        let (classification, basis) = if guard_timestamp.zip(valid_interval).is_some_and(|(trip, (_, end))| trip < end) {
+            ("overload_guard_trip_observed", "guard_trip_observed_before_window_end")
+        } else if teardown_failed {
+            ("teardown_failure_observed", "cell_teardown_failed_after_measurement")
+        } else if no_reported_attempts && valid_interval.zip(full_interval).is_some_and(|((start, end), (full_start, full_end))| {
+            start >= full_start && end <= full_end
+        }) {
+            ("client_inactivity_observed", "no_attempts_in_reported_snapshot_interval_not_exact_window")
+        } else {
+            ("cause_not_established", "insufficient_evidence_to_classify_observed_context")
+        };
+        window["zero_output_reason"] = json!({
+            "classification": classification,
+            "basis": basis,
+            "causality": "not_established",
+        });
+    };
+    if let Some(window) = evidence.pointer_mut("/durable_commits/output_throughput") { annotate(window); }
+    if let Some(windows) = evidence.pointer_mut("/durable_commits/complete_30_second_commit_windows").and_then(Value::as_array_mut) {
+        for window in windows { annotate(window); }
+    }
+    if let Some(window) = evidence.get_mut("commit_window_output_throughput") { annotate(window); }
+}
+
 fn unavailable_cumulative_output(reason: &str) -> Value {
     json!({
         "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
@@ -985,6 +1038,71 @@ fn local_delta_mismatch(reason: impl Into<String>, details: Value) -> Value {
     result
 }
 
+
+#[cfg(test)]
+mod zero_durable_output_tests {
+    use super::*;
+
+    fn evidence() -> Value {
+        let window = |start, end, rows| json!({"measurement_start_unix_ms":start,"measurement_end_unix_ms":end,"rows":rows});
+        json!({"durable_commits":{"output_throughput":window(1000, 61000, json!(0)),
+            "complete_30_second_commit_windows":[window(1000, 31000, json!(0)), window(31000, 61000, json!(0)),
+                window(61000, 91000, json!(7)), window(91000, 121000, Value::Null)]},
+            "commit_window_output_throughput":window(1000, 61000, json!(0))})
+    }
+
+    #[test]
+    fn zero_output_context_respects_window_boundaries_and_never_changes_other_values() {
+        let mut value = evidence();
+        let nonzero = value["durable_commits"]["complete_30_second_commit_windows"][2].clone();
+        let unavailable = value["durable_commits"]["complete_30_second_commit_windows"][3].clone();
+        value["overload_stop"] = json!({"classification":"above_ceiling","timestamp_ms":40000});
+        annotate_zero_durable_output(&mut value);
+        let full = &value["durable_commits"]["output_throughput"]["zero_output_reason"];
+        assert_eq!(full["classification"], "overload_guard_trip_observed");
+        assert_eq!(full["causality"], "not_established");
+        assert_eq!(value["commit_window_output_throughput"]["zero_output_reason"], *full);
+        let windows = &value["durable_commits"]["complete_30_second_commit_windows"];
+        assert_eq!(windows[0]["zero_output_reason"]["classification"], "cause_not_established");
+        assert_eq!(windows[1]["zero_output_reason"]["classification"], "overload_guard_trip_observed");
+        assert_eq!(windows[2], nonzero);
+        assert_eq!(windows[3], unavailable);
+    }
+
+    #[test]
+    fn teardown_failure_is_context_not_proof_and_unavailable_windows_stay_unmodified() {
+        let mut value = evidence();
+        value["teardown_outcome"] = json!("failed");
+        value["durable_commits"]["complete_30_second_commit_windows"][0]["unavailable_reason"] = json!("logs_incomplete");
+        let unavailable = value["durable_commits"]["complete_30_second_commit_windows"][0].clone();
+        annotate_zero_durable_output(&mut value);
+        assert_eq!(value["durable_commits"]["complete_30_second_commit_windows"][0], unavailable);
+        assert_eq!(value["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        assert_eq!(value["durable_commits"]["output_throughput"]["zero_output_reason"]["causality"], "not_established");
+    }
+
+    #[test]
+    fn client_inactivity_requires_complete_reported_snapshot_counters() -> Result<()> {
+        let mut value = evidence();
+        value["rows"] = json!({"attempted":0,"attempted_scope":"measurement_start_to_completed_process_snapshot_interval_not_exact_window"});
+        value["client_phase_reports"] = json!([{ "phase_counters": { "workers": [{"attempted_rows":0}],
+            "measurement_window":{"start_unix_ms":1000,"end_unix_ms":61000} }}]);
+        let mut unknown = value.clone();
+        unknown["client_phase_reports"][0]["phase_counters"]["workers"][0]["attempted_rows"] = Value::Null;
+        annotate_zero_durable_output(&mut unknown);
+        assert_eq!(unknown["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "cause_not_established");
+        value["client_phase_reports"][0]["phase_counters"]["workers"].as_array_mut().context("missing workers array")?.push(json!({"attempted_rows":1}));
+        let mut active = value.clone();
+        active["rows"]["attempted"] = json!(1);
+        annotate_zero_durable_output(&mut active);
+        assert_eq!(active["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "cause_not_established");
+        value["client_phase_reports"][0]["phase_counters"]["workers"][1]["attempted_rows"] = json!(0);
+        annotate_zero_durable_output(&mut value);
+        assert_eq!(value["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "client_inactivity_observed");
+        assert_eq!(value["durable_commits"]["complete_30_second_commit_windows"][0]["zero_output_reason"]["basis"], "no_attempts_in_reported_snapshot_interval_not_exact_window");
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod local_delta_reconciliation_tests {

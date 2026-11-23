@@ -4170,6 +4170,7 @@ fn attach_teardown_outcome(outcome: &mut MatrixOutcome, status: &str) -> Result<
             evidence["screen_v1_csv_reason"] = json!("cell_failed");
             evidence["commit_window_output_usage"] = json!("diagnostic_only");
         }
+        annotate_zero_durable_output(&mut evidence);
         row.evidence_json = Some(serde_json::to_string(&evidence)?);
     }
     Ok(())
