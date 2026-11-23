@@ -346,7 +346,10 @@ function factorCoverage(row: CampaignMeasurement): FactorCoverage {
     reason: 'inert: ' + [...new Set(inert)].join('; ') + (incomplete ? '; varied factor coverage unknown' : ''),
   };
   if (incomplete) return unknown;
-  if (projected.length) return { status: 'projection_only', reason: 'consumption unproven: ' + [...new Set(projected)].join('; ') };
+  if (projected.length) return {
+    status: 'projection_only',
+    reason: 'consumption unproven; applicability unknown: ' + [...new Set(projected)].join('; '),
+  };
   return { status: 'active', reason: 'factor coverage complete' };
 }
 
@@ -894,7 +897,7 @@ function summarizeCandidates(rows: CampaignMeasurement[], cells: Map<string, Cel
     const coverage = cells.get(JSON.stringify([group[0]!.valueX, group[0]!.valueY]))!.coverage;
     const qualified = coverage.status === 'active' && expectedRepeats !== null && expectedRepeats >= 3 && completeSet && completed.length === expectedRepeats;
     const officialRepeatRates = completed.map(item => average(item.evidence.rates));
-    const observedRates = coverage.status === 'inert' || coverage.status === 'unknown' ? [] :
+    const observedRates = coverage.status !== 'active' ? [] :
       group.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
     const rates = qualified ? officialRepeatRates : observedRates;
     const deaths = group.map(row => row.diedFirst).filter((value): value is string => value !== null && value !== undefined);
@@ -948,7 +951,7 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     cells.set(key, cell);
   }
   const rates = [...cells.values()].flatMap(cell =>
-    cell.coverage.status === 'inert' || cell.coverage.status === 'unknown' ? [] : cell.rates);
+    cell.coverage.status !== 'active' ? [] : cell.rates);
   const minimum = rates.length ? Math.min(...rates) : 0;
   const maximum = rates.length ? Math.max(...rates) : 0;
   const summaries = summarizeCandidates(rows, cells);
@@ -968,7 +971,7 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   const parts: string[] = [
     '<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '">',
     '<title id="title">' + escapeXml(cohort + ' throughput heatmap and sustainable leaderboard') + '</title>',
-    '<desc id="desc">Committed new rows per second; repeat ranges are ranked only with complete official campaign evidence. Unqualified rates remain exploratory and null rates are not plotted as zero.</desc>',
+    '<desc id="desc">Committed new rows per second; repeat ranges are ranked only with complete official campaign evidence. Projection-only factors render null until independent applicability proof is available. Null rates are not plotted as zero.</desc>',
     '<rect width="100%" height="100%" fill="#ffffff"/>',
     '<g fill="#1f2328" font-family="Segoe UI, Arial, sans-serif">',
     svgText(40, 42, cohort + ' | committed new rows/s', 22, 'bold'),
@@ -983,17 +986,17 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     xValues.forEach((x, columnIndex) => {
       const cell = cells.get(JSON.stringify([x, value]));
       const xPosition = heatX + 120 + columnIndex * cellWidth;
-      if (!cell || !cell.rates.length || cell.coverage.status === 'inert' || cell.coverage.status === 'unknown') {
+      if (!cell || !cell.rates.length || cell.coverage.status !== 'active') {
         parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="#f6f8fa" stroke="#d0d7de"/>');
         parts.push(svgText(xPosition + 8, y + 22, 'null', 11));
       } else {
         const mean = average(cell.rates);
         parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="' + cellColor(mean, minimum, maximum) + '" stroke="#8c959f"/>');
-        parts.push(svgText(xPosition + 8, y + 22, numberLabel(mean) + (cell.coverage.status === 'projection_only' ? '*' : ''), 11, 'bold'));
+        parts.push(svgText(xPosition + 8, y + 22, numberLabel(mean), 11, 'bold'));
       }
     });
   });
-  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | observed means; null = unavailable; * consumption unproven', 11));
+  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | null includes projection-only: consumption unproven; applicability unknown', 11));
   const barStart = leaderboardX + 190;
   const barWidth = 300;
   if (!leaderboard.length) parts.push(svgText(leaderboardX, 112, 'No qualified winner: complete official evidence is missing or invalid.', 12, 'bold'));
@@ -1013,7 +1016,7 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   if (!deaths.length) parts.push(svgText(40, noteY + 25, 'No failure recorded in these rows.', 12));
   deaths.slice(0, 8).forEach((row, index) => {
     const coverage = cells.get(JSON.stringify([row.valueX, row.valueY]))!.coverage;
-    const rate = row.committedRowsPerSecond === null || coverage.status === 'inert' || coverage.status === 'unknown' ?
+    const rate = row.committedRowsPerSecond === null || coverage.status !== 'active' ?
       'committed rows/s: null' : 'committed rows/s: ' + numberLabel(row.committedRowsPerSecond);
     const status = row.collectorOnly ? 'collector-only; downstream metrics: null; ' : '';
     const comment = row.comment ? ' — ' + row.comment : '';

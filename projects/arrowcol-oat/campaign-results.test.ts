@@ -808,7 +808,7 @@ test('reads one sustained run of contiguous emitter buckets but keeps missing de
     officialRuns: [sourceShapedRun(1, [1, 1, 1, 1, 1], 1_000_000)],
   };
   const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; no committed-rate observation/);
   assert.match(svg, /complete five-operation maintenance due-work evidence is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
@@ -1025,7 +1025,7 @@ test('excludes an entire cell when any repeat has an inert factor, including unp
   assert.doesNotMatch(svg, />900(?:\.00)?</);
 });
 
-test('keeps projection-only observations visible but unranked and matches prefixed evidence paths', () => {
+test('nulls projection-only observations pending independent applicability proof and matches prefixed evidence paths', () => {
   const projected = coveredCandidate('projected', 800, 120);
   mutateFactorEvidence(projected[0]!, evidence => {
     evidence.projection_only = [
@@ -1036,8 +1036,36 @@ test('keeps projection-only observations visible but unranked and matches prefix
   const svg = renderCampaignResults([...coveredCandidate('active', 100, 130), ...projected], 'C1');
   assert.match(svg, /No qualified winner/);
   assert.doesNotMatch(svg, /projected \(3\/3\)/);
-  assert.match(svg, />800\*<\/text>/);
-  assert.match(svg, /projected: unqualified.*observed mean 800 rows\/s \(consumption unproven: .*tunables\.parquet_writer\.defaults\.compression_level: consumer_startup_proof_unverified/);
+  assert.match(svg, />null<\/text>/);
+  assert.doesNotMatch(svg, />800\*?<\/text>|observed mean 800 rows\/s/);
+  assert.match(svg, /projected: unqualified.*no committed-rate observation \(consumption unproven; applicability unknown: .*tunables\.parquet_writer\.defaults\.compression_level: consumer_startup_proof_unverified/);
+});
+
+test('a projection-only repeat nulls its whole cell and preserves a dead Kustainer comment', () => {
+  const candidate = coveredCandidate('projected-death', 800, 250);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.runner_controls = [
+        { path: 'parquet_writer.defaults.compression', reason: 'maintenance_runner_control' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'router_log_filter_inheritance' },
+      ];
+    });
+  }
+  mutateFactorEvidence(candidate[1]!, evidence => {
+    evidence.runner_controls = [
+      { path: 'parquet_writer.defaults.compression', reason: 'maintenance_runner_control' },
+    ];
+    evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const results = candidate.map(row => row.repeat === 2 ?
+    { ...row, diedFirst: 'Kustainer', comment: 'emulator exited before downstream observation' } : row);
+  const svg = renderCampaignResults(results, 'C1');
+  assert.match(svg, /consumption unproven; applicability unknown/);
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited before downstream observation/);
+  assert.doesNotMatch(svg, /projected-death \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
 });
 
 test('fails closed on missing or malformed coverage and does not infer a legacy factor path', () => {

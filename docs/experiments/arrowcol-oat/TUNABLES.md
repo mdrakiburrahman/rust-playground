@@ -69,7 +69,8 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 
 Coverage evidence distinguishes runner controls, inert fields, and projected fields
 whose consumer startup verification is unproven. Missing coverage remains unknown;
-projection-only rates are marked and excluded from selection and effect claims.
+projection-only cells are null until applicability is proven and are excluded from
+selection and effect claims.
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal

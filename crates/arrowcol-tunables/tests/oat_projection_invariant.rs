@@ -428,11 +428,20 @@ fn accepted_typed_leaves_have_one_evidence_classification() -> Result<()> {
             .classify_oat_leaves()
             .with_context(|| format!("{path}: classify accepted input"))?;
         let concrete = path.replace('*', "customer_id");
-        let count = ["inert_fields", "projection_only", "runner_controls"]
-            .iter()
-            .flat_map(|key| evidence[*key].as_array().expect("classification array"))
-            .filter(|item| item["path"] == concrete)
-            .count();
+        let mut count = 0;
+        for key in [
+            "inert_fields",
+            "projection_only",
+            "runner_controls",
+            "consumer_verified",
+        ] {
+            count += evidence[key]
+                .as_array()
+                .context("classification array missing")?
+                .iter()
+                .filter(|item| item["path"] == concrete)
+                .count();
+        }
         if count != 1 {
             errors.push(format!("{path}: classified {count} times"));
         }
@@ -458,12 +467,15 @@ fn evidence_classification_uses_only_requested_non_null_leaves() -> Result<()> {
             "path": "logging.maintenance", "reason": "maintenance_disabled"
         }])
     );
-    assert!(evidence["projection_only"].as_array().unwrap().iter().any(|entry| {
+    let projected = evidence["projection_only"]
+        .as_array()
+        .context("projection_only missing")?;
+    assert!(projected.iter().any(|entry| {
         entry
             == &json!({"path":"parquet_writer.defaults.bloom_filter_fpp",
             "reason":"consumer_startup_proof_unverified"})
     }));
-    assert!(evidence["projection_only"].as_array().unwrap().iter().any(|entry| {
+    assert!(projected.iter().any(|entry| {
         entry
             == &json!({"path":"collector.upload.request_concurrency",
             "reason":"consumer_startup_proof_unverified"})

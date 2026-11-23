@@ -954,10 +954,10 @@ impl Tunables {
                 continue;
             }
             if section == "maintenance" {
-                if !self
+                if self
                     .maintenance
                     .as_ref()
-                    .is_some_and(|settings| settings.enabled == Some(true))
+                    .is_none_or(|settings| settings.enabled != Some(true))
                 {
                     continue;
                 }
