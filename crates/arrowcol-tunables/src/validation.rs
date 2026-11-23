@@ -85,6 +85,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.runtime_threads", "0 (automatic)"),
     capability!("client.data_mode", "shared"),
     capability!("client.data_profile", "diagnostic"),
+    capability!("client.send_iter", "clone_vec"),
     capability!(
         "client.string_length_distribution",
         "uniform (realistic), fixed (diagnostic)"
@@ -701,6 +702,11 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
+        if let Some(send_iter) = value.get("client").and_then(|client| client.get("send_iter"))
+            && !matches!(send_iter.as_str(), Some("clone_vec" | "arc_cursor"))
+        {
+            bail!("client.send_iter must be clone_vec or arc_cursor");
+        }
         for (field, maximum) in [
             ("optimize_upload_concurrency", 16),
             ("bin_concurrency", 8),
@@ -755,9 +761,7 @@ impl Tunables {
         let tunables: Self = serde_json::from_value(value).map_err(|error| {
             if error.to_string().starts_with("collector.channel_capacity")
                 || error.to_string().starts_with("collector.limits.batch_channel_capacity")
-                || error
-                    .to_string()
-                    .starts_with("collector.limits.put_result_channel_capacity")
+                || error.to_string().starts_with("collector.limits.put_result_channel_capacity")
             {
                 anyhow::anyhow!("{error}")
             } else {
@@ -3697,6 +3701,13 @@ mod tests {
         assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"], "20");
         assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_MAX_BACKOFF_MS"], "400");
         Ok(())
+    }
+
+    #[test]
+    fn client_send_iter_rejects_unknown_value() {
+        let error = Tunables::parse_oat_json(serde_json::json!({"client":{"send_iter":"cursor"}}))
+            .expect_err("unknown send iterator must fail");
+        assert!(error.to_string().contains("send_iter"), "{error:#}");
     }
 
     #[test]
