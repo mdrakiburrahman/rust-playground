@@ -86,6 +86,7 @@ export async function reconcileStoppedSnapshot(
   measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
   rawPreload: unknown, decodeFile?: (path: string, active: boolean) => Promise<number>,
   verifyActive?: (paths: string[]) => Promise<void>,
+  verifyAllActiveCodecs = false,
 ): Promise<{
   rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number;
   activeFileRows: FileGeometry; windowFileRows: FileGeometry;
@@ -239,7 +240,7 @@ export async function reconcileStoppedSnapshot(
     try {
       const fileMetadata = metadata.fileMetadata();
       try { footerRows = fileMetadata.numRows(); } finally { fileMetadata.free(); }
-      if (selectedPaths.has(add.path)) {
+      if (selectedPaths.has(add.path) || (verifyAllActiveCodecs && active.has(add.path))) {
         if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
         for (const group of metadata.rowGroups()) {
           const columns = group.columns();

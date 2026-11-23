@@ -49,6 +49,7 @@ include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
 include!("runner_overload.rs");
 include!("runner_admission_diagnostics.rs");
+include!("runner_realistic_diagnostic_admission.rs");
 include!("runner_fixture.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4997,6 +4998,8 @@ async fn run_clients_inner(
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
+    diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients).await?;
+
     let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
     if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
         let readback = async {
@@ -5090,6 +5093,7 @@ async fn run_clients_inner(
             };
         }
     };
+    diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
     let schedule_created_at_unix_ms = unix_time_ms_u64()?;
     let run_start_unix_ms = schedule_created_at_unix_ms
