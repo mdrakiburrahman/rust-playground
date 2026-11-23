@@ -1928,6 +1928,20 @@ mod measurement_evidence_tests {
         let realistic = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
         assert_eq!(realistic["preparation"]["steady_state_generation"], true);
         assert_eq!(realistic["preparation"]["corpus_rows"], 65_536);
+        for key in [
+            "configured_live_slots",
+            "admitted_live_slots",
+            "live_identity_batch_bytes",
+            "live_identity_batch_reservation_bytes",
+            "corpus_memory_reservation_bytes",
+            "memory_reservation_bytes",
+            "max_memory_bytes",
+        ] {
+            assert_eq!(realistic["preparation"][key], prepared[key], "{key}");
+            let mut invalid = prepared.clone();
+            invalid[key] = json!("not an unsigned number");
+            assert!(client_preparation(Some(&invalid), ClientDataProfile::Realistic).is_err());
+        }
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_err());
         snapshots[1].measurement_window.as_mut().context("test measurement window")?.client_resources =
             Some(json!({"cpu_core_equivalents": 2.5}));
@@ -2171,8 +2185,14 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
         "corpus_rows",
         "corpus_decoded_bytes",
         "corpus_encoded_bytes",
+        "corpus_memory_reservation_bytes",
         "retained_encoded_bytes",
         "memory_reservation_bytes",
+        "configured_live_slots",
+        "admitted_live_slots",
+        "live_identity_batch_bytes",
+        "live_identity_batch_reservation_bytes",
+        "max_memory_bytes",
     ] {
         if let Some(value) = object.get(key) {
             if value.as_u64().is_none() {

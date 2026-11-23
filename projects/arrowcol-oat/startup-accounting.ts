@@ -196,7 +196,8 @@ export function requireMatchedStartupAccounting(
   const seenArms = new Set<string>();
   const validatedArms = arms.map((arm): MatchedStartupAccountingArm => {
     if (!isRecord(arm) || !hasExactKeys(arm, ARM_KEYS)
-      || typeof arm.arm_id !== 'string' || arm.arm_id.trim() !== arm.arm_id || arm.arm_id === '') {
+      || typeof arm.arm_id !== 'string' || arm.arm_id.trim() !== arm.arm_id || arm.arm_id === ''
+      || !Array.isArray(arm.expected_client_ids)) {
       throw new Error('Matched startup accounting contains a missing, malformed, or extra arm field.');
     }
     if (seenArms.has(arm.arm_id)) {
