@@ -303,6 +303,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.runtime.parquet_column_workers", "1"),
     capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.upload.mode", "put_create"),
@@ -1127,6 +1128,12 @@ impl Tunables {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
                     }
+                    if let Some(value) = runtime.parquet_column_workers {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS".to_owned(),
+                            value.to_string(),
+                        );
+                    }
                 }
                 if let Some(upload) = &collector.upload {
                     if let Some(mode) = upload.mode {
@@ -1831,6 +1838,12 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
             bail!("collector.runtime.{name} must be between {minimum} and {maximum}");
         }
     }
+    if runtime
+        .parquet_column_workers
+        .is_some_and(|value| !(1..=16).contains(&value))
+    {
+        bail!("collector.runtime.parquet_column_workers must be between 1 and 16");
+    }
     if let Some(reserve) = runtime.blocking_fs_reserve {
         let workers = runtime.blocking_workers.unwrap_or(32);
         if reserve >= workers {
@@ -2412,12 +2425,19 @@ mod tests {
         let serialized = serde_json::to_value(old_config)?;
         assert!(serialized["collector"]["runtime"].get("cpu_queue_jobs").is_none());
         assert!(serialized["collector"]["runtime"].get("blocking_fs_reserve").is_none());
+        assert!(
+            serialized["collector"]["runtime"]
+                .get("parquet_column_workers")
+                .is_none()
+        );
         let mut valid = old;
         valid["collector"]["runtime"]["cpu_queue_jobs"] = serde_json::json!(2);
         valid["collector"]["runtime"]["blocking_fs_reserve"] = serde_json::json!(2);
+        valid["collector"]["runtime"]["parquet_column_workers"] = serde_json::json!(4);
         let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
         assert_eq!(env["ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS"], "2");
         assert_eq!(env["ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE"], "2");
+        assert_eq!(env["ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS"], "4");
         for (field, value) in [
             ("cpu_queue_jobs", serde_json::json!(0)),
             ("cpu_queue_jobs", serde_json::json!(129)),
@@ -2427,10 +2447,19 @@ mod tests {
             ("blocking_fs_reserve", serde_json::json!(4)),
             ("blocking_fs_reserve", serde_json::json!(1.5)),
             ("blocking_fs_reserve", serde_json::json!(null)),
+            ("parquet_column_workers", serde_json::json!(0)),
+            ("parquet_column_workers", serde_json::json!(17)),
+            ("parquet_column_workers", serde_json::json!(1.5)),
+            ("parquet_column_workers", serde_json::json!("4")),
+            ("parquet_column_workers", serde_json::json!(null)),
         ] {
             let mut candidate = valid.clone();
             candidate["collector"]["runtime"][field] = value;
-            assert!(Tunables::parse_oat_json(candidate).is_err(), "{field}");
+            let error = error_text(Tunables::parse_oat_json(candidate));
+            assert!(!error.is_empty(), "{field}");
+            if field == "parquet_column_workers" {
+                assert!(error.contains("collector.runtime.parquet_column_workers"), "{error}");
+            }
         }
         let queue = serde_json::json!({"collector":{"runtime":{"cpu_workers":1,"cpu_queue_jobs":128}}});
         let env = Tunables::parse_oat_json(queue)?.environment_for(ComponentRole::Collector)?;

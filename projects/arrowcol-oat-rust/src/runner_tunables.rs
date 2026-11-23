@@ -286,6 +286,9 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.read_ahead" => Some(("read_ahead", "ARROWCOL_COLLECTOR_READ_AHEAD")),
             "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
             "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
+            "collector.runtime.parquet_column_workers" => {
+                Some(("parquet_column_workers", "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS"))
+            }
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
             _ => None,
         };
@@ -1028,6 +1031,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
              json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":2,"upload_limit":32})),
             (json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
              json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2})),
+            (json!({"collector":{"runtime":{"parquet_column_workers":4}}}),
+             json!({"parquet_column_workers":4})),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
@@ -1062,7 +1067,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
 
     #[test]
     #[ignore = "requires built arrowcol-dataflow-rust"]
-    fn upload_only_reaches_actual_collector_startup() -> Result<()> {
+    fn runtime_and_upload_overrides_reach_actual_collector_startup() -> Result<()> {
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -1071,7 +1076,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             .join(format!("arrowcol-dataflow-rust{}", std::env::consts::EXE_SUFFIX));
         let mut config = config()?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":3}}
+            "collector":{
+                "upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":3},
+                "runtime":{"parquet_column_workers":4}
+            }
         }))?;
         let output = std::process::Command::new(binary)
             .arg("--help")
@@ -1084,6 +1092,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         assert_eq!(observed["runtime"]["upload_mode"], "buffered_multipart");
         assert_eq!(observed["runtime"]["upload_buffer_capacity_bytes"], 1048576);
         assert_eq!(observed["runtime"]["upload_request_concurrency"], 3);
+        assert_eq!(observed["runtime"]["parquet_column_workers"], 4);
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
             "component": "collector", "instance_id": "collector-1", "log_complete": true,

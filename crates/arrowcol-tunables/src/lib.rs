@@ -386,6 +386,12 @@ pub struct RuntimeTunables {
     pub batch_rows: Option<usize>,
     pub cpu_workers: Option<usize>,
     #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_parquet_column_workers"
+    )]
+    pub parquet_column_workers: Option<u8>,
+    #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_usize"
     )]
@@ -398,6 +404,15 @@ where
     D: serde::Deserializer<'de>,
 {
     usize::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_parquet_column_workers<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u8::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.runtime.parquet_column_workers must be an unsigned integer"))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
