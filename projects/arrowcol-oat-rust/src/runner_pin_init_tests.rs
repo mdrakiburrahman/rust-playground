@@ -117,6 +117,62 @@ mod pin_init_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires a built arrowcol-loadgen binary; creates empty local tables without load"]
+    async fn local_setup_initializer_commits_only_explicit_delta_stats_metadata() -> Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
+        let table = "sqlserver_availability_replica_states";
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for partitioned in [false, true] {
+            for columns in [None, Some(json!([])), Some(json!(["customer_id"]))] {
+                let root = std::env::temp_dir().join(format!("local-stats-init-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&root)?;
+                let mut commit = json!({});
+                if let Some(columns) = &columns {
+                    commit["delta_stats_columns"] = columns.clone();
+                }
+                config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                    "collector": {"commit":commit, "runtime":{"parquet_column_workers":4}}
+                }))?;
+                let arguments = local_initializer_args(table, &root, partitioned)?;
+                let mut initialize = local_table_initializer_command(&config, &workspace, arguments.clone())?;
+                assert!(!initialize.as_std().get_envs()
+                    .any(|(name, _)| name == "ARROWCOL_PARQUET_COLUMN_WORKERS"));
+                let output = initialize.output().await?;
+                ensure!(output.status.success(), "local creation failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                let table_root = root.join("telemetry/sqlserver").join(table);
+                let path = table_root.join("_delta_log/00000000000000000000.json");
+                let original = fs::read(&path)?;
+                let log = std::str::from_utf8(&original)?;
+                let actions = log.lines().map(serde_json::from_str::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let metadata = actions.iter().find_map(|action| action.get("metaData")).context("committed metadata missing")?;
+                let properties = &metadata["configuration"];
+                if let Some(columns) = &columns {
+                    let columns = serde_json::from_value::<Vec<String>>(columns.clone())?;
+                    ensure!(delta_stats_properties_match(&columns, properties), "local committed stats selection differs");
+                    let text = String::from_utf8(output.stderr)?;
+                    config.tables = vec![table.to_owned()];
+                    assert_eq!(collector_delta_stats_records(&config, &text)?.len(), 1);
+                } else {
+                    assert!(properties.get("delta.dataSkippingStatsColumns").is_none());
+                    assert!(properties.get("delta.dataSkippingNumIndexedCols").is_none());
+                }
+                assert_eq!(metadata["partitionColumns"].as_array().context("partition columns missing")?.len(),
+                    usize::from(partitioned));
+                assert_eq!(fs::read_dir(table_root.join("_delta_log"))?.count(), 1);
+                let retry = local_table_initializer_command(&config, &workspace, arguments)?.output().await?;
+                assert!(!retry.status.success());
+                assert_eq!(fs::read(&path)?, original);
+                fs::remove_dir_all(&root)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn emitted_pin_init_environment_passes_real_ownership_gate() -> Result<()> {
         let root = std::env::temp_dir().join(format!("pin-env-{}", uuid::Uuid::new_v4()));

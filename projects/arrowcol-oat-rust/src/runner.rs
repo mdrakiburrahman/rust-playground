@@ -7926,6 +7926,19 @@ fn local_initializer_args(table: &str, dataflow_root: &Path, partitioned: bool) 
     ])
 }
 
+fn local_table_initializer_command(config: &OatConfig, workspace: &Path, arguments: Vec<String>) -> Result<Command> {
+    let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
+    initialize.args(arguments);
+    initialize.current_dir(workspace);
+    initialize.env_remove("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS");
+    if let Some(value) =
+        role_environment(config, ComponentRole::Collector)?.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+    {
+        initialize.env("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS", value);
+    }
+    Ok(initialize)
+}
+
 async fn initialize_local_maintenance_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
         || config.platform.local.partitioned_table_bootstrap;
@@ -7954,9 +7967,7 @@ async fn initialize_local_maintenance_table(config: &OatConfig, platform: &Local
     build.current_dir(&workspace);
     run_streaming_command(build, "build setup-only local table initializer").await?;
 
-    let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
-    initialize.args(arguments);
-    initialize.current_dir(workspace);
+    let initialize = local_table_initializer_command(config, &workspace, arguments)?;
     run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
         .await
         .context("setup local table before starting Dataflow or any DMV client")
