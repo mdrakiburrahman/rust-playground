@@ -760,7 +760,8 @@ mod realistic_diagnostic_admission_tests {
         let reference_run = "00000000-0000-4000-8000-000000000002";
         let corpus = "a".repeat(64);
         let client_id = format!("oat-{run}-sqlserver_availability_replica_states-c1");
-        let mut proof = validate_diagnostic_prepared_metrics(&output(&prepared()), &corpus, &client_id)?;
+        let metrics = output(&prepared()).replace("client_id=test", &format!("client_id={client_id}"));
+        let mut proof = validate_diagnostic_prepared_metrics(&metrics, &corpus, &client_id)?;
         proof["client_mapping"] = json!({
             "table": "sqlserver_availability_replica_states",
             "client_ordinal": 1,
