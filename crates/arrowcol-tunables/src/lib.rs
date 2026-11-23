@@ -414,9 +414,15 @@ pub struct LimitsTunables {
     pub max_metadata_bytes: Option<usize>,
     pub max_schema_bytes: Option<usize>,
     pub max_message_bytes: Option<usize>,
-    #[serde(deserialize_with = "deserialize_batch_channel_capacity")]
+    #[serde(
+        deserialize_with = "deserialize_batch_channel_capacity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub batch_channel_capacity: Option<usize>,
-    #[serde(deserialize_with = "deserialize_put_result_channel_capacity")]
+    #[serde(
+        deserialize_with = "deserialize_put_result_channel_capacity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub put_result_channel_capacity: Option<usize>,
     pub max_stream_duration: Option<String>,
     pub admission_timeout: Option<String>,
@@ -429,7 +435,7 @@ macro_rules! receiver_channel_deserializer {
         where
             D: serde::Deserializer<'de>,
         {
-            Option::<usize>::deserialize(deserializer).map_err(|_| {
+            usize::deserialize(deserializer).map(Some).map_err(|_| {
                 serde::de::Error::custom(concat!(
                     "collector.limits.",
                     $field,
