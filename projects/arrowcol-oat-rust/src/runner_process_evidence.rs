@@ -589,6 +589,15 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
             "ARROWCOL_COLLECTOR_LAYOUT_ENABLED" => "/layout/process_policy/enabled".to_owned(),
+            "ARROWCOL_COLLECTOR_SORT_OPTIONS" => {
+                expected = serde_json::to_value(
+                    expected.as_str().context("collector sort options must be comma separated")?
+                        .split(',')
+                        .map(arrow_deltalake::layout::SortKeyOptions::from_property)
+                        .collect::<Result<Vec<_>>>()?
+                )?;
+                "/layout/process_policy/sort_options".to_owned()
+            }
             "ARROWCOL_COLLECTOR_SORT_COLUMNS" | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS" => {
                 expected = json!(
                     expected
@@ -1006,7 +1015,7 @@ fn process_evidence_for_cell(
         name.starts_with("ARROWCOL_COLLECTOR_LAYOUT_")
             || matches!(
                 name.as_str(),
-                "ARROWCOL_COLLECTOR_SORT_COLUMNS" | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS"
+                "ARROWCOL_COLLECTOR_SORT_COLUMNS" | "ARROWCOL_COLLECTOR_SORT_OPTIONS" | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS"
             )
     }) {
         let mut identities = std::collections::BTreeMap::new();

@@ -58,6 +58,11 @@ pub const PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES: &[(&str, &str, &str)] = &
         "arrowcol.layout.sortColumns",
     ),
     (
+        "ARROWCOL_LAYOUT_SORT_OPTIONS",
+        "ARROWCOL_COLLECTOR_SORT_OPTIONS",
+        "arrowcol.layout.sortOptions",
+    ),
+    (
         "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
         "ARROWCOL_COLLECTOR_BLOOM_COLUMNS",
         "arrowcol.layout.bloomColumns",
@@ -2590,6 +2595,9 @@ impl LayoutReadback {
             ] {
                 config[name] = serde_json::Value::Null;
             }
+            if config.get("sort_options").is_some() {
+                config["sort_options"] = serde_json::Value::Null;
+            }
         }
         Ok(serde_json::json!({
             "component": "layout",
@@ -2598,7 +2606,7 @@ impl LayoutReadback {
             "table_name": telemetry_table_name(url),
             "applied": self.enabled,
             "inactive_controls": if self.enabled { Vec::<&str>::new() } else {
-                vec!["sort_columns", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
+                vec!["sort_columns", "sort_options", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
             },
             "precedence": ["table_properties", "process_policy", "registry_defaults"],
             "encoding_precedence": ["parquet_config", "resolved_layout", "parquet_defaults"],

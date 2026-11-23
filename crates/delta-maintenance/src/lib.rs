@@ -832,6 +832,16 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
         ] {
             props.insert(key.into(), value);
         }
+        if let Some(options) = &layout.sort_options {
+            props.insert(
+                "arrowcol.layout.sortOptions".into(),
+                options
+                    .iter()
+                    .map(|option| option.to_property())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
     }
     props.extend(settings.process_properties.clone());
     props
@@ -1092,6 +1102,7 @@ fn layout_policy_sources(settings: &Settings, table_properties: &BTreeMap<String
     let keys = [
         "arrowcol.layout.enabled",
         "arrowcol.layout.sortColumns",
+        "arrowcol.layout.sortOptions",
         "arrowcol.layout.bloomColumns",
         "arrowcol.layout.maxRows",
         "arrowcol.layout.maxInputSize",

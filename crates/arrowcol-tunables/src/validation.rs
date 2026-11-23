@@ -261,6 +261,7 @@ const CAPABILITIES: &[Capability] = &[
         "collector.layout.sort_columns",
         "customer_id (comma-separated, ordered)"
     ),
+    capability!("collector.layout.sort_options", "ascending, nulls last per sort column"),
     capability!(
         "collector.layout.bloom_columns",
         "customer_id (comma-separated; empty disables Bloom filters)"
@@ -1058,6 +1059,16 @@ impl Tunables {
                     if let Some(columns) = &layout.sort_columns {
                         output.insert("ARROWCOL_COLLECTOR_SORT_COLUMNS".to_owned(), columns.join(","));
                     }
+                    if let Some(options) = &layout.sort_options {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_SORT_OPTIONS".to_owned(),
+                            options
+                                .iter()
+                                .map(|option| option.to_property())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                    }
                     if let Some(columns) = &layout.bloom_columns {
                         output.insert("ARROWCOL_COLLECTOR_BLOOM_COLUMNS".to_owned(), columns.join(","));
                     }
@@ -1440,6 +1451,7 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
         return Ok(());
     };
     let has_overrides = layout.sort_columns.is_some()
+        || layout.sort_options.is_some()
         || layout.bloom_columns.is_some()
         || layout.max_rows.is_some()
         || layout.max_input_bytes.is_some()
@@ -1447,6 +1459,21 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
         || layout.page_rows.is_some();
     if layout.enabled == Some(false) && has_overrides {
         bail!("collector.layout settings require enabled=true; disabled layout would ignore them");
+    }
+    if let Some(options) = &layout.sort_options {
+        let columns = layout
+            .sort_columns
+            .as_ref()
+            .context("collector.layout.sort_options requires explicit sort_columns")?;
+        if options.is_empty()
+            || options.len() != columns.len()
+            || options
+                .iter()
+                .zip(columns)
+                .any(|(option, column)| option.column != *column)
+        {
+            bail!("collector.layout.sort_options must match sort_columns exactly in order");
+        }
     }
     let max_rows = layout.max_rows.unwrap_or(262_144);
     if max_rows == 0 || max_rows > u32::MAX as usize {
@@ -2569,6 +2596,38 @@ mod tests {
                 value["collector"]["layout"][field] = serde_json::json!(columns);
                 assert!(Tunables::parse_oat_json(value).is_err());
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sort_options_are_strict_and_projected_in_key_order() -> Result<()> {
+        let valid = serde_json::json!({"collector":{"layout":{
+            "enabled":true, "sort_columns":["customer_id","value"],
+            "sort_options":[
+                {"column":"customer_id","direction":"descending","nulls":"first"},
+                {"column":"value","direction":"ascending","nulls":"last"}
+            ]
+        }}});
+        let tunables = Tunables::parse_oat_json(valid)?;
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        assert_eq!(
+            env["ARROWCOL_COLLECTOR_SORT_OPTIONS"],
+            "customer_id:descending:first,value:ascending:last"
+        );
+        assert!(
+            !Tunables::default()
+                .environment_for(ComponentRole::Collector)?
+                .contains_key("ARROWCOL_COLLECTOR_SORT_OPTIONS")
+        );
+        for invalid in [
+            serde_json::json!({"collector":{"layout":{"sort_columns":["customer_id"],"sort_options":[{"column":"customer_id","direction":"sideways","nulls":"last"}]}}}),
+            serde_json::json!({"collector":{"layout":{"sort_columns":["customer_id"],"sort_options":[{"column":"customer_id","direction":"ascending","nulls":"middle"}]}}}),
+            serde_json::json!({"collector":{"layout":{"sort_columns":["customer_id"],"sort_options":[{"column":"value","direction":"ascending","nulls":"last"}]}}}),
+            serde_json::json!({"collector":{"layout":{"sort_options":[{"column":"customer_id","direction":"ascending","nulls":"last"}]}}}),
+            serde_json::json!({"collector":{"layout":{"enabled":false,"sort_columns":["customer_id"],"sort_options":[{"column":"customer_id","direction":"ascending","nulls":"last"}]}}}),
+        ] {
+            assert!(Tunables::parse_oat_json(invalid).is_err());
         }
         Ok(())
     }

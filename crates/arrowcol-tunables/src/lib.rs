@@ -333,6 +333,8 @@ pub struct CommitTunables {
 pub struct LayoutTunables {
     pub enabled: Option<bool>,
     pub sort_columns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_options: Option<Vec<arrow_deltalake::layout::SortKeyOptions>>,
     pub bloom_columns: Option<Vec<String>>,
     pub max_rows: Option<usize>,
     pub max_input_bytes: Option<usize>,

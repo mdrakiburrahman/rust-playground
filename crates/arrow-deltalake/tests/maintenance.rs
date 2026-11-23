@@ -1883,6 +1883,7 @@ fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let layout = LayoutPolicy {
         sort_columns: vec!["customer_id".into()],
+        sort_options: None,
         max_rows: 2,
         max_input_bytes: 1024 * 1024,
         row_group_rows: 2,

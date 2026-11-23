@@ -769,16 +769,18 @@ impl OatConfig {
                     .collector
                     .as_ref()
                     .and_then(|collector| collector.layout.as_ref());
-                for (writer, enabled, columns) in [
+                for (writer, enabled, columns, options) in [
                     (
                         self.tunables.parquet_writer.as_ref(),
                         collector_layout.and_then(|layout| layout.enabled),
                         collector_layout.and_then(|layout| layout.sort_columns.as_ref()),
+                        collector_layout.and_then(|layout| layout.sort_options.as_ref()),
                     ),
                     (
                         maintenance.and_then(|settings| settings.parquet_writer.as_ref()),
                         maintenance.and_then(|settings| settings.layout_enabled),
                         maintenance.and_then(|settings| settings.layout_sort_columns.as_ref()),
+                        None,
                     ),
                 ] {
                     if let Some(writer) = writer {
@@ -790,10 +792,15 @@ impl OatConfig {
                         };
                         let verified_sort = sort
                             .into_iter()
-                            .map(|path| arrowcol_tunables::ParquetSortColumn {
+                            .enumerate()
+                            .map(|(index, path)| arrowcol_tunables::ParquetSortColumn {
                                 path,
-                                descending: false,
-                                nulls_first: false,
+                                descending: options.and_then(|options| options.get(index)).is_some_and(|option| {
+                                    option.direction == arrow_deltalake::layout::SortDirection::Descending
+                                }),
+                                nulls_first: options.and_then(|options| options.get(index)).is_some_and(|option| {
+                                    option.nulls == arrow_deltalake::layout::NullPlacement::First
+                                }),
                             })
                             .collect::<Vec<_>>();
                         writer
@@ -825,6 +832,7 @@ impl OatConfig {
                 .sort_columns
                 .clone()
                 .unwrap_or_else(|| vec!["customer_id".to_owned()]),
+            sort_options: layout.sort_options.clone(),
             bloom_columns: layout
                 .bloom_columns
                 .clone()
@@ -2260,6 +2268,32 @@ mod tests {
             .first_mut()
             .context("sorting column missing")?
             .descending = true;
+        sorted
+            .tunables
+            .collector
+            .as_mut()
+            .unwrap()
+            .layout
+            .as_mut()
+            .unwrap()
+            .sort_options = Some(vec![arrow_deltalake::layout::SortKeyOptions {
+            column: "customer_id".to_owned(),
+            direction: arrow_deltalake::layout::SortDirection::Descending,
+            nulls: arrow_deltalake::layout::NullPlacement::Last,
+        }]);
+        sorted.validate()?;
+        sorted
+            .tunables
+            .collector
+            .as_mut()
+            .unwrap()
+            .layout
+            .as_mut()
+            .unwrap()
+            .sort_options
+            .as_mut()
+            .unwrap()[0]
+            .direction = arrow_deltalake::layout::SortDirection::Ascending;
         let mismatch = sorted
             .validate()
             .err()
