@@ -2397,7 +2397,7 @@ groups:
             (json!({"transport":{"rate_limit_rps":123}}), "rate_limit_rps"),
             (json!({"transport":{"rate_limit_rps":123,"rate_limit_period_ms":250}}), "rate_limit_period_ms"),
             (json!({"transport":{"connect_retries":3}}), "connect_retries"),
-            (json!({"transport":{"retry_backoff_ms":1}}), "retry_backoff_ms"),
+            (json!({"transport":{"connect_retries":1,"retry_backoff_ms":1}}), "retry_backoff_ms"),
             (json!({"transport":{"endpoint_concurrency_limit":23}}), "endpoint_concurrency_limit"),
             (json!({"transport":{"endpoint_buffer_size":37}}), "endpoint_buffer_size"),
             (json!({"transport":{"ipc_compression":"zstd"}}), "ipc_compression"),
@@ -2438,14 +2438,21 @@ groups:
                 | "keepalive_timeout_ms" | "keepalive_while_idle"
                 | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
                 | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
-                | "rate_limit_period_ms"
+                | "rate_limit_period_ms" | "rate_limit_rps" | "connect_retries" | "retry_backoff_ms"
+                | "grpc_send_compression" | "grpc_accept_compression" | "ipc_compression"
                 | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
                 config.clients_per_table = 1;
                 let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
                 let initial = tunable_leaf_evidence(&config)?;
                 let mut covered = initial.clone();
                 promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
-                assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 1);
+                let path = if input.get("arrow_ipc").is_some() {
+                    "arrow_ipc.compression".to_owned()
+                } else {
+                    format!("{}.{}", if input.get("client").is_some() { "client" } else { "transport" }, field)
+                };
+                assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+                    .iter().any(|entry| entry["path"] == path), "missing verified field {path}");
                 let mut wrong_report = report.clone();
                 wrong_report["consumer_effective_config"][field] = json!("wrong");
                 for reports in [vec![], vec![wrong_report], vec![report.clone(), report]] {
