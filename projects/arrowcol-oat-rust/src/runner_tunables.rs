@@ -679,7 +679,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             inject_deployment_environment(&mut deployment, "dataflow", &environment)?;
             assert!(deployment["spec"]["template"]["spec"]["containers"][0]["env"]
                 .as_array().context("deployment environment")?
-                .iter().any(|entry| entry["name"] == ENV && entry["value"] == enabled.to_string()));
+                .iter().any(|entry| entry["name"] == ENV && entry["value"].as_str() == Some(environment[ENV].as_str())));
             let actual = json!({"runtime":{"generated_partition_fast_path":enabled}});
             verify_process_configuration(&config, ComponentRole::Collector, &actual)?;
             assert!(verify_process_configuration(

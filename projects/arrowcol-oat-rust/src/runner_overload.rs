@@ -1633,7 +1633,7 @@ mod overload_guard_tests {
             ("/HostConfig/CgroupnsMode", json!("host")),
         ] {
             let mut changed = inspect.clone();
-            *changed.pointer_mut(path).unwrap() = value;
+            *changed.pointer_mut(path).context("missing guard fixture field")? = value;
             assert!(guard.inspect(&changed).is_err(), "{path}");
         }
         let stats = json!({
