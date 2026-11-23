@@ -14,6 +14,38 @@ pub use arrowcol_routing::AdmissionPressureGauge;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::str::FromStr;
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CollectorCpuQuota {
+    Cores(f64),
+    Unlimited(UnlimitedCpuQuota),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlimitedCpuQuota {
+    Unlimited,
+}
+
+impl CollectorCpuQuota {
+    pub fn nano_cpus(self) -> Result<u64, &'static str> {
+        match self {
+            Self::Unlimited(_) => Ok(0),
+            Self::Cores(cores)
+                if cores.is_finite()
+                    && cores >= 0.000_000_001
+                    && cores <= 4096.0
+                    && (cores * 1_000_000_000.0).fract() == 0.0 =>
+            {
+                Ok((cores * 1_000_000_000.0) as u64)
+            }
+            Self::Cores(_) => Err(
+                "platform.local.collector_cpu_quota must be a positive decimal (nanocore precision, at most 4096) or \"unlimited\"",
+            ),
+        }
+    }
+}
+
 /// Payload customer IDs are bounded printable identifiers, not delivery identities.
 #[must_use]
 pub fn valid_payload_customer_id(value: &str) -> bool {

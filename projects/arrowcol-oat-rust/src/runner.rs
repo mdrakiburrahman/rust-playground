@@ -41,6 +41,7 @@ include!("runner_failure_tests.rs");
 include!("runner_pin_init_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
+include!("runner_cpu_quota.rs");
 include!("runner_process_evidence.rs");
 include!("runner_parity_evidence.rs");
 include!("runner_commit_evidence.rs");
@@ -4660,7 +4661,7 @@ fn result_rows(
             "throttling": throttling,
         }))
     } else {
-        None
+        client_run.evidence.cpu_quota.clone()
     };
     let mut leaf_evidence = tunable_leaf_evidence(config)?;
     promote_collector_readback(
@@ -8732,6 +8733,7 @@ async fn scale_local_arrowcols(
     replicas: u32,
     concurrency: u32,
 ) -> Result<()> {
+    validate_local_collector_cpu_quota(config).await?;
     let base_project = config
         .platform
         .compose_project
@@ -8761,6 +8763,9 @@ async fn scale_local_arrowcols(
         "dataflow-1",
     ]);
     run_streaming_command(up, "scale local ArrowCol containers").await?;
+    let quota_readback = capture_local_cpu_quota(config, &platform.run_id, &platform.environment).await?;
+    verify_local_cpu_quota(config, concurrency, &quota_readback)?;
+    println!("[oat] collector CPU quota: {quota_readback}");
     if let Some(cpus) = &config.platform.local.collector_cpus {
         let mut ps = compose_command(
             compose_file,

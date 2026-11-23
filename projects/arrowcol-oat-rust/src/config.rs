@@ -541,6 +541,7 @@ pub struct LocalOptions {
     pub expected_image_ids: Option<std::collections::BTreeMap<String, String>>,
     pub collector_image_override: Option<CollectorImageOverride>,
     pub collector_cpus: Option<Vec<u32>>,
+    pub collector_cpu_quota: Option<arrowcol_tunables::CollectorCpuQuota>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1189,6 +1190,9 @@ impl OatConfig {
                 bail!("collector image override requires a stable build, immutable image ID and full source revision");
             }
         }
+        if let Some(quota) = self.platform.local.collector_cpu_quota {
+            quota.nano_cpus().map_err(anyhow::Error::msg)?;
+        }
         if let Some(cpus) = &self.platform.local.collector_cpus
             && (!self.platform.local.stable_image_build
                 || cpus.is_empty()
@@ -1397,6 +1401,7 @@ impl OatConfig {
                     || self.platform.local.expected_image_ids.is_some()
                     || self.platform.local.collector_image_override.is_some()
                     || self.platform.local.collector_cpus.is_some()
+                    || self.platform.local.collector_cpu_quota.is_some()
                     || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");

@@ -732,6 +732,12 @@ fn capability_evidence() -> Vec<Value> {
                 },
             })
         })
+        .chain(std::iter::once(json!({
+            "name": "platform.local.collector_cpu_quota",
+            "default": "coupled_to_dfe_worker_concurrency",
+            "boundary": "per_cell_runtime",
+            "consumer_startup_proof": "docker_inspect_and_cgroup_v2",
+        })))
         .collect()
 }
 
@@ -815,6 +821,9 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
     }
     if let Some(cpus) = &config.platform.local.collector_cpus {
         collector["cpuset"] = json!(cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+    }
+    if let Some(quota) = config.platform.local.collector_cpu_quota {
+        collector["cpus"] = json!(quota.nano_cpus().map_err(anyhow::Error::msg)? as f64 / 1_000_000_000.0);
     }
     collector["stop_grace_period"] = json!(format!("{}s", config.collector_stop_grace_seconds));
     collector["ports"] = json!([{

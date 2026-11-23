@@ -10,6 +10,24 @@
 | Durability | Requested WAL class is recorded separately from consumer evidence. Nondefault weaker durability must not be compared as equivalent to durable configurations. |
 | Cleanup | Only run-owned resources/configuration are changed. Existing namespace, identity, pinning and cleanup guards remain required. Never delete a resource group to clean up an experiment. |
 
+## Collector CPU quota
+
+| Setting | Type and range | Default | Apply boundary | Influence and interactions |
+| --- | --- | --- | --- | --- |
+| `platform.local.collector_cpu_quota` | Positive JSON decimal, nanocore precision, at most the Docker host's logical CPUs (maximum 4096), or `"unlimited"` | Unset: `coupled_to_dfe_worker_concurrency` | Per-cell container creation | Overrides only the collector Docker CPU quota. Does not change `dfe_worker_concurrency` / `--num-cores` or the independent `collector_cpus` cpuset. `"unlimited"` removes the container quota, not ancestor cgroup limits. |
+
+`cpu_quota.collector` records the source, requested quota, Docker `NanoCpus`,
+and effective cgroup-v2 `cpu.max`. Startup rejects a quota mismatch before load.
+`cpu_quota.throttling` records measurement-boundary snapshots and per-container
+`nr_periods`, `nr_throttled`, and `throttled_usec` deltas, with actual snapshot
+timestamps. Interrupted windows, counter resets and replaced containers are
+unavailable, never zero-filled. Snapshot cadence and command latency can shift
+the boundary timestamps; inspect them when comparing short windows.
+
+AKS already configures `platform.resources.collector.limits.cpu` independently
+of worker concurrency (including the existing explicit uncapped mode); it does
+not consume this local-only field.
+
 ## Collector build profile and image arms
 
 These controls are rebuild-only. The canonical profile key is `allocator=<value>;lto=<value>;codegen_units=<value>;opt_level=<value>;target_cpu=<value>`; its SHA-256 selects the profile-specific image tag and isolated BuildKit target cache. OAT selects the matching local image or digest-pinned AKS image; a missing or mismatched image fails before the arm starts. Omitted build fields preserve the Cargo release defaults and existing image path.

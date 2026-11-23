@@ -371,6 +371,7 @@ mod official_cell_measurement_tests {
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 struct CellEvidence {
+    cpu_quota: Option<Value>,
     overload_guard: Option<Value>,
     overload_stop: Option<Value>,
     downstream_comment: Option<String>,
@@ -1318,12 +1319,21 @@ impl ResourceSampler {
                 let mut interval = tokio::time::interval(PUBLICATION_BACKLOG_SAMPLING_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut resource_tasks = tokio::task::JoinSet::<Result<ResourceSample>>::new();
+                let mut quota_start = None;
+                let mut quota_end = None;
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {}
                         _ = stop_receiver.changed() => break,
                     }
                     let now = unix_time_ms_u64()?;
+                    if let ResourceSamplerSource::Local { run_id, environment, .. } = &source {
+                        if now >= start && now < end && quota_start.is_none() {
+                            quota_start = Some(local_cpu_quota_observation(&config, run_id, environment).await);
+                        } else if now >= end && quota_end.is_none() {
+                            quota_end = Some(local_cpu_quota_observation(&config, run_id, environment).await);
+                        }
+                    }
                     while let Some(sample) = native_tasks.try_join_next() {
                         match sample {
                             Ok(Ok(sample)) if native_samples.len() < NATIVE_TELEMETRY_MAX_SAMPLES => native_samples.push(sample),
@@ -1503,6 +1513,9 @@ impl ResourceSampler {
                         evidence.backlog_sampling_failures += 1;
                     }
                 }
+                if matches!(&source, ResourceSamplerSource::Local { .. }) {
+                    evidence.cpu_quota = Some(local_cpu_quota_window(&config, start, end, quota_start.as_ref(), quota_end.as_ref()));
+                }
                 evidence.resource_sampling_failures += resource_tasks.len() as u64;
                 if let Some(source) = native {
                     native_failures += native_tasks.len() as u64;
@@ -1566,6 +1579,7 @@ impl ResourceSampler {
                 evidence.overload_stop = sampled.overload_stop;
             }
             evidence.resource_samples = sampled.resource_samples;
+            evidence.cpu_quota = sampled.cpu_quota;
             if sampled.native_telemetry.is_some() {
                 evidence.native_telemetry = sampled.native_telemetry;
             }
