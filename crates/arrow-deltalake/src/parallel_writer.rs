@@ -101,14 +101,14 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
                     continue;
                 }
                 let average_row_bytes = current_bytes / self.row_group_rows;
-                if let Some(rows_that_fit) = (max_bytes - current_bytes).checked_div(average_row_bytes) {
-                    if rows > rows_that_fit {
-                        if rows_that_fit == 0 {
-                            self.flush().await?;
-                            continue;
-                        }
-                        rows = rows_that_fit;
+                if let Some(rows_that_fit) = (max_bytes - current_bytes).checked_div(average_row_bytes)
+                    && rows > rows_that_fit
+                {
+                    if rows_that_fit == 0 {
+                        self.flush().await?;
+                        continue;
                     }
+                    rows = rows_that_fit;
                 }
             }
 
