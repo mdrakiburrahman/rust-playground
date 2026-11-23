@@ -10,6 +10,22 @@
 | Durability | Requested WAL class is recorded separately from consumer evidence. Nondefault weaker durability must not be compared as equivalent to durable configurations. |
 | Cleanup | Only run-owned resources/configuration are changed. Existing namespace, identity, pinning and cleanup guards remain required. Never delete a resource group to clean up an experiment. |
 
+## Collector build profile and image arms
+
+These controls are rebuild-only. The canonical profile key is `allocator=<value>;lto=<value>;codegen_units=<value>;opt_level=<value>;target_cpu=<value>`; its SHA-256 selects the profile-specific image tag and isolated BuildKit target cache. OAT selects the matching local image or digest-pinned AKS image; a missing or mismatched image fails before the arm starts. Omitted build fields preserve the Cargo release defaults and existing image path.
+
+| Setting | Type and range | Default | Apply boundary | Influence and interactions |
+| --- | --- | --- | --- | --- |
+| `collector.allocator` | `system` or `mimalloc` | `system` | Collector image rebuild | Global allocator and allocation contention; compiled feature and read back at startup. Cross-validates with allocator environment controls. |
+| `collector.lto` | `off`, `thin`, or `fat` | `off` | Collector image rebuild | Link-time optimization and binary code generation; affects compile time and may interact with codegen-unit count. |
+| `collector.codegen_units` | Integer `1..=256` | `16` | Collector image rebuild | Parallel code generation and optimization scope; interacts with LTO. |
+| `collector.opt_level` | Integer `2` or `3` | `3` | Collector image rebuild | LLVM optimization level; may trade build time and code size for runtime speed. |
+| `collector.target_cpu` | `generic`, `x86-64-v2`, `x86-64-v3`, or `x86-64-v4`; `native` is forbidden | `generic` | Collector image rebuild and CPU preflight | Enables the selected x86-64 ISA baseline. Local OAT checks host CPU flags; AKS requires matching Node Feature Discovery CPU labels on every eligible collector node. Missing flags or labels fail closed before launch; no throughput result is accepted. |
+| `collector.panic` | Unsupported | Rust release default (`unwind`) | Not configurable | `panic=abort` is not exposed because panic/unwind behavior participates in the collector startup and shutdown error contract. |
+| PGO | Unsupported | N/A | Not configurable | Requires a representative training run and profile artifact lifecycle; no safe, deterministic profile collection/consumption pipeline exists in the image build. |
+| BOLT | Unsupported | N/A | Not configurable | Requires post-link instrumentation, profile collection and binary rewrite tooling that are not present in the image pipeline. |
+
+Every profile hash, requested field, image identity, and compiled startup value is recorded separately. A startup-profile mismatch is a failed arm, never a throughput result.
 ## Client data profile and identity
 
 | Setting | Contract |
