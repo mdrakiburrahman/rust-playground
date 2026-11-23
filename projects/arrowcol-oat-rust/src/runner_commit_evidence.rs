@@ -1493,6 +1493,17 @@ mod commit_evidence_tests {
         assert_eq!(clean.rows[0].status, "failed");
         assert!(clean.rows[0].failure.as_deref().is_some_and(|failure| failure.contains("teardown_delivery_ambiguous")));
         assert!(clean.rows[0].rows_per_second.is_none());
+        let mut zero_row = row.clone();
+        let mut zero_evidence: Value = serde_json::from_str(zero_row.evidence_json.as_deref().context("missing evidence")?)?;
+        zero_evidence["durable_commits"]["output_throughput"]["rows"] = json!(0);
+        zero_evidence["durable_commits"]["complete_30_second_commit_windows"][0]["rows"] = json!(0);
+        zero_row.evidence_json = Some(zero_evidence.to_string());
+        let mut zero_outcome = finish_matrix_cell(&config, "orchestration", "run", 1, 1, Ok(vec![zero_row]), Err(anyhow::anyhow!("drain failed")));
+        attach_teardown_outcome(&mut zero_outcome, "failed")?;
+        let final_evidence: Value = serde_json::from_str(zero_outcome.rows[0].evidence_json.as_deref().context("missing final evidence")?)?;
+        assert_eq!(final_evidence["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        assert_eq!(final_evidence["durable_commits"]["complete_30_second_commit_windows"][0]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        assert_eq!(final_evidence["commit_window_output_throughput"]["zero_output_reason"]["classification"], "teardown_failure_observed");
         let mut outcome = finish_matrix_cell(
             &config,
             "orchestration",
