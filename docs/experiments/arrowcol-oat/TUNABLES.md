@@ -79,6 +79,14 @@ whose consumer startup verification is unproven. Missing coverage remains unknow
 projection-only cells are null until applicability is proven and are excluded from
 selection and effect claims.
 
+| Unsupported process control | Reason |
+| --- | --- |
+| Delta I/O `disable_lifo_slot` | The pinned Tokio API requires the `tokio_unstable` build configuration; it is not an OAT runtime field. |
+| DFE scheduler builder options | The DFE engine constructs its current-thread Tokio runtime internally without a collector-side builder hook. Delta I/O settings do not change it. |
+| Receiver socket buffers and TCP options | The DFE listener is bound and listening before the collector receives it; the current listener API offers no pre-bind socket-option hook or effective socket readback. |
+| Allocator environment tuning | `MALLOC_*` and `MIMALLOC_*` are not typed OAT fields here. The effective allocator build readback does not establish that an environment option was consumed. Even with mimalloc for the Rust heap, C libraries can still use glibc allocation. |
+| Transparent huge pages / `madvise` | No verified collector allocation or process-level control/readback is available; kernel policy alone does not establish actual huge-page use. |
+
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal
 publication results. Kernel commit-time identity, schema, retention and ownership
