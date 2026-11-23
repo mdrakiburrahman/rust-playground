@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
-use arrowcol_tunables::{DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, Tunables};
+use arrowcol_tunables::{
+    CollectorBuildProfile, CollectorTargetCpu, DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, Tunables,
+};
 use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 use url::Url;
@@ -123,6 +126,8 @@ pub struct PlatformConfig {
     pub kustomize_overlay: Option<String>,
     pub runtime_config_file: Option<String>,
     pub bootstrap_env_file: Option<String>,
+    #[serde(default)]
+    pub collector_build_profile_hash: Option<String>,
     #[serde(default)]
     pub local: LocalOptions,
     #[serde(default)]
@@ -569,6 +574,11 @@ impl EffectiveStopBudgets {
     }
 }
 
+pub fn collector_build_profile_hash(profile: CollectorBuildProfile) -> String {
+    let digest = Sha256::digest(profile.canonical_key().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 impl OatConfig {
     pub(crate) fn cgroup_guard_requested_limits(&self) -> Result<(u64, u64)> {
         let pressure = self
@@ -586,6 +596,51 @@ impl OatConfig {
             .filter(|value| *value > 0)
             .context("cgroup RSS guard requires a positive requested buffered-byte limit")?;
         Ok((rss, buffered))
+    }
+
+    fn verify_local_cpu_profile(&self) -> Result<()> {
+        if self.platform.kind != OatMode::Local {
+            return Ok(());
+        }
+        let Some(target_cpu) = self
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.target_cpu)
+        else {
+            return Ok(());
+        };
+        let required = match target_cpu {
+            CollectorTargetCpu::Generic => &[][..],
+            CollectorTargetCpu::X86_64V2 => &["cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2"][..],
+            CollectorTargetCpu::X86_64V3 => &[
+                "cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "bmi1", "bmi2", "fma",
+                "abm", "movbe", "xsave",
+            ][..],
+            CollectorTargetCpu::X86_64V4 => &[
+                "cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "bmi1", "bmi2", "fma",
+                "abm", "movbe", "xsave", "avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl",
+            ][..],
+        };
+        if required.is_empty() {
+            return Ok(());
+        }
+        let cpu_info = std::fs::read_to_string("/proc/cpuinfo")
+            .context("collector.target_cpu preflight cannot read host CPU flags")?;
+        let flags = cpu_info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:").map(str::split_whitespace))
+            .map(|values| values.collect::<HashSet<_>>())
+            .context("collector.target_cpu preflight cannot find host CPU flags")?;
+        let missing: Vec<_> = required.iter().copied().filter(|flag| !flags.contains(flag)).collect();
+        if !missing.is_empty() {
+            bail!(
+                "collector.target_cpu {} requires unavailable host CPU flags: {}",
+                target_cpu.as_str(),
+                missing.join(", ")
+            );
+        }
+        Ok(())
     }
 
     fn validate_campaign_profile(&self) -> Result<()> {
@@ -1002,6 +1057,20 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        if let Some(profile_hash) = &self.platform.collector_build_profile_hash {
+            let profile = self
+                .tunables
+                .collector
+                .as_ref()
+                .filter(|collector| collector.has_build_profile())
+                .context("platform.collector_build_profile_hash requires tunables.collector build-profile fields")?
+                .build_profile();
+            let expected = collector_build_profile_hash(profile);
+            if profile_hash != &expected {
+                bail!("platform.collector_build_profile_hash does not match the effective collector build profile");
+            }
+        }
+        self.verify_local_cpu_profile()?;
         if self
             .platform
             .local
@@ -1837,6 +1906,7 @@ mod tests {
                 kustomize_overlay: None,
                 runtime_config_file: Some(runtime_config.to_string_lossy().into_owned()),
                 bootstrap_env_file: Some(bootstrap_env.to_string_lossy().into_owned()),
+                collector_build_profile_hash: None,
                 local: LocalOptions::default(),
                 resources: None,
                 fleet: None,
@@ -2638,6 +2708,7 @@ mod tests {
             kustomize_overlay: None,
             runtime_config_file: None,
             bootstrap_env_file: None,
+            collector_build_profile_hash: None,
             local: LocalOptions::default(),
             resources: None,
             fleet: None,
@@ -2717,6 +2788,7 @@ mod tests {
             kustomize_overlay: None,
             runtime_config_file: None,
             bootstrap_env_file: None,
+            collector_build_profile_hash: None,
             local: LocalOptions::default(),
             resources: None,
             fleet: None,
@@ -2792,6 +2864,7 @@ mod tests {
             kustomize_overlay: None,
             runtime_config_file: None,
             bootstrap_env_file: None,
+            collector_build_profile_hash: None,
             local: LocalOptions::default(),
             resources: None,
             fleet: None,

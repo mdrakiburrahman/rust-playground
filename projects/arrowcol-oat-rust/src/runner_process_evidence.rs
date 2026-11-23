@@ -896,6 +896,29 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
 }
 
 #[cfg(test)]
+fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
+    if !matches!(role, ComponentRole::Collector) { return Ok(()); }
+    let Some(expected_hash) = config.platform.collector_build_profile_hash.as_deref() else { return Ok(()); };
+    let profile = config.tunables.collector.as_ref()
+        .filter(|collector| collector.has_build_profile())
+        .context("collector build-profile readback was requested without typed build-profile settings")?
+        .build_profile();
+    let expected = json!({
+        "profile_hash": expected_hash,
+        "allocator": profile.allocator.as_str(),
+        "lto": profile.lto.as_str(),
+        "codegen_units": profile.codegen_units,
+        "opt_level": profile.opt_level.as_u8(),
+        "target_cpu": profile.target_cpu.as_str(),
+    });
+    for (field, value) in expected.as_object().context("expected build profile must be an object")? {
+        if observed.get(field) != Some(value) {
+            bail!("collector startup build readback for {field} does not match the requested profile");
+        }
+    }
+    Ok(())
+}
+
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
     let mut logs = logs.to_vec();
     let router_environment = config.tunables.environment_for(ComponentRole::Router)?;
@@ -953,6 +976,7 @@ fn process_evidence_for_cell(
                 bail!("maintenance operation log was truncated; safety outcomes cannot be established");
             }
             let resolved = process_configurations(&log.text)?;
+            verify_collector_build_profile_readback(config, role, &resolved)?;
             verify_process_configuration_recording(config, role, &resolved, diff)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
             let maintenance_tables = if matches!(role, ComponentRole::Maintenance) {
@@ -1748,6 +1772,29 @@ mod startup_readback_tests {
             &json!({"cpu_pressure":"off"}),
         )
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn collector_build_profile_is_recorded_from_consumer_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(json!({"collector":{"allocator":"mimalloc","lto":"thin",
+            "codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"}}))?;
+        let profile = config.tunables.collector.as_ref().context("collector tunables")?.build_profile();
+        let hash = crate::config::collector_build_profile_hash(profile);
+        config.platform.collector_build_profile_hash = Some(hash.clone());
+        let log = format!("arrowcol_effective_config {}\n", json!({"component":"build","config":{
+            "profile_hash":hash,"allocator":"mimalloc","lto":"thin","codegen_units":8,
+            "opt_level":2,"target_cpu":"x86-64-v3"}}));
+        let observed = process_configurations(&log)?;
+        verify_collector_build_profile_readback(&config, ComponentRole::Collector, &observed)?;
+        assert_eq!(observed["profile_hash"], hash);
+        assert_eq!(observed["codegen_units"], 8);
+        let mut wrong = observed.clone();
+        wrong["target_cpu"] = json!("generic");
+        assert!(verify_collector_build_profile_readback(&config, ComponentRole::Collector, &wrong).is_err());
         Ok(())
     }
 

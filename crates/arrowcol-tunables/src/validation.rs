@@ -3730,8 +3730,8 @@ mod tests {
             ("target_cpu", serde_json::json!(4)),
         ] {
             let error = Tunables::parse_oat_json(serde_json::json!({"collector": {field: value}}))
-                .expect_err("invalid build profile was accepted")
-                .to_string();
+                .expect_err("invalid build profile was accepted");
+            let error = format!("{error:#}");
             assert!(error.contains(&format!("collector.{field}")), "{field}: {error}");
         }
         Ok(())

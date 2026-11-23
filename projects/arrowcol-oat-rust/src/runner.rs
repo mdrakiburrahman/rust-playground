@@ -7953,6 +7953,23 @@ async fn initialize_local_maintenance_table(config: &OatConfig, platform: &Local
         .context("setup local table before starting Dataflow or any DMV client")
 }
 
+fn local_collector_profile_tag(profile_hash: &str) -> String {
+    format!("arrowcol-oat/dataflow:profile-{profile_hash}")
+}
+
+fn verify_collector_profile_image(observed: &str, profile_hash: &str) -> Result<String> {
+    let fields = observed.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3
+        || !fields[0].starts_with("sha256:")
+        || fields[1].len() != 40
+        || !fields[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+        || fields[2] != profile_hash
+    {
+        bail!("local collector image profile hash or revision provenance does not match the requested build profile");
+    }
+    Ok(fields[0].to_owned())
+}
+
 async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     if !maintenance_enabled(config) {
         bail!("stable local images require the maintenance role");
@@ -7979,14 +7996,46 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
         ("sqlserver", "arrowcol-loadtest/sqlserver:2022-cu27"),
     ];
     let mut images = BTreeMap::new();
-    for (role, source) in sources {
-        let mut inspect = Command::new("docker");
-        inspect.args(["image", "inspect", "--format", "{{.Id}}", source]);
-        let output = run_command(inspect, "resolve stable local image").await?;
-        let image = String::from_utf8(output.stdout)?;
-        images.insert(role.to_owned(), local_client_image_id(&image)?.to_owned());
+    for (role, default_source) in sources {
+        let source = if role == "collector" {
+            config
+                .platform
+                .collector_build_profile_hash
+                .as_deref()
+                .map(local_collector_profile_tag)
+                .unwrap_or_else(|| default_source.to_owned())
+        } else {
+            default_source.to_owned()
+        };
+        let image = if role == "collector" {
+            if let Some(profile_hash) = config.platform.collector_build_profile_hash.as_deref() {
+                let mut inspect = Command::new("docker");
+                inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
+                let output = run_command(inspect, "resolve profile-specific local collector image").await?;
+                let observed = String::from_utf8(output.stdout)?;
+                verify_collector_profile_image(&observed, profile_hash)?
+            } else {
+                let mut inspect = Command::new("docker");
+                inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);
+                let output = run_command(inspect, "resolve stable local image").await?;
+                let observed = String::from_utf8(output.stdout)?;
+                local_client_image_id(&observed)?.to_owned()
+            }
+        } else {
+            let mut inspect = Command::new("docker");
+            inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);
+            let output = run_command(inspect, "resolve stable local image").await?;
+            let observed = String::from_utf8(output.stdout)?;
+            local_client_image_id(&observed)?.to_owned()
+        };
+        images.insert(role.to_owned(), image);
     }
     if let Some(collector) = &config.platform.local.collector_image_override {
+        if config.platform.collector_build_profile_hash.is_some() {
+            bail!(
+                "platform.local.collector_image_override cannot be combined with platform.collector_build_profile_hash"
+            );
+        }
         let mut inspect = Command::new("docker");
         inspect.args([
             "image",
@@ -8003,9 +8052,25 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
     let path = platform.state_dir.join("tunables.compose.json");
     let mut overlay: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
     apply_stable_local_images(&mut overlay, &images, config.platform.local.expected_image_ids.as_ref())?;
-    tokio::fs::write(&path, serde_json::to_vec(&overlay)?).await?;
+    tokio::fs::write(&path, serde_json::to_vec(&overlay)?)?;
     println!("[oat] immutable local images: {}", serde_json::to_string(&images)?);
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn profile_hash_selects_and_validates_local_collector_image() {
+    let profile_hash = "a".repeat(64);
+    assert_eq!(
+        local_collector_profile_tag(&profile_hash),
+        format!("arrowcol-oat/dataflow:profile-{profile_hash}")
+    );
+    let observed = format!("sha256:{} {} {}", "b".repeat(64), "c".repeat(40), profile_hash);
+    assert_eq!(
+        verify_collector_profile_image(&observed, &profile_hash).unwrap(),
+        format!("sha256:{}", "b".repeat(64))
+    );
+    assert!(verify_collector_profile_image(&observed, &"d".repeat(64)).is_err());
 }
 
 fn verify_collector_image(observed: &str, image_id: &str, source_revision: &str) -> Result<()> {
@@ -10642,6 +10707,139 @@ fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, rep
     Ok(())
 }
 
+fn required_cpu_feature_labels(target_cpu: arrowcol_tunables::CollectorTargetCpu) -> &'static [&'static str] {
+    match target_cpu {
+        arrowcol_tunables::CollectorTargetCpu::Generic => &[],
+        arrowcol_tunables::CollectorTargetCpu::X86_64V2 => {
+            &["CX16", "LAHF", "POPCNT", "SSE3", "SSSE3", "SSE4_1", "SSE4_2"]
+        }
+        arrowcol_tunables::CollectorTargetCpu::X86_64V3 => &[
+            "CX16", "LAHF", "POPCNT", "SSE3", "SSSE3", "SSE4_1", "SSE4_2", "AVX", "AVX2", "BMI1", "BMI2", "FMA", "ABM",
+            "MOVBE", "XSAVE",
+        ],
+        arrowcol_tunables::CollectorTargetCpu::X86_64V4 => &[
+            "CX16", "LAHF", "POPCNT", "SSE3", "SSSE3", "SSE4_1", "SSE4_2", "AVX", "AVX2", "BMI1", "BMI2", "FMA", "ABM",
+            "MOVBE", "XSAVE", "AVX512F", "AVX512BW", "AVX512CD", "AVX512DQ", "AVX512VL",
+        ],
+    }
+}
+
+async fn verify_aks_cpu_profile(config: &OatConfig) -> Result<()> {
+    let Some(target_cpu) = config
+        .tunables
+        .collector
+        .as_ref()
+        .and_then(|collector| collector.target_cpu)
+    else {
+        return Ok(());
+    };
+    let required = required_cpu_feature_labels(target_cpu);
+    if required.is_empty() {
+        return Ok(());
+    }
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command.args(["get", "nodes", "-o", "json"]);
+    let output = run_command(command, "preflight AKS collector CPU features").await?;
+    let nodes: Value = serde_json::from_slice(&output.stdout).context("parse AKS node CPU feature inventory")?;
+    let items = nodes
+        .get("items")
+        .and_then(Value::as_array)
+        .context("AKS node inventory has no items")?;
+    let selected_node = config
+        .platform
+        .fleet
+        .as_ref()
+        .map(|fleet| fleet.collector.node.as_str());
+    let mut checked = 0;
+    for node in items {
+        let name = node
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .context("AKS node inventory omitted a node name")?;
+        if selected_node.is_some_and(|selected| selected != name) {
+            continue;
+        }
+        if node.pointer("/spec/unschedulable").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let ready = node
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition["type"] == "Ready" && condition["status"] == "True")
+            });
+        if !ready {
+            continue;
+        }
+        checked += 1;
+        let labels = node
+            .pointer("/metadata/labels")
+            .and_then(Value::as_object)
+            .context("AKS node has no CPU feature labels")?;
+        let missing: Vec<_> = required
+            .iter()
+            .filter(|feature| {
+                let key = format!("feature.node.kubernetes.io/cpu-cpuid.{feature}");
+                labels.get(&key).and_then(Value::as_bool) != Some(true)
+                    && labels.get(&key).and_then(Value::as_str) != Some("true")
+            })
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "collector.target_cpu {} is unsupported on AKS node {name}; CPU feature labels missing: {}",
+                target_cpu.as_str(),
+                missing.join(", ")
+            );
+        }
+    }
+    if checked == 0 {
+        bail!(
+            "collector.target_cpu {} preflight found no Ready schedulable AKS collector nodes with verifiable CPU labels",
+            target_cpu.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn select_aks_collector_profile_image(runtime_config: &mut Value, profile_hash: &str) -> Result<()> {
+    let image = runtime_config
+        .get("collectorBuildImages")
+        .and_then(|profiles| profiles.get(profile_hash))
+        .and_then(Value::as_str)
+        .with_context(|| {
+            format!("AKS runtime config is missing the collector image for build profile {profile_hash}")
+        })?;
+    if !image.contains("@sha256:") {
+        bail!("AKS collector build-profile image must be pinned by manifest digest");
+    }
+    let images = runtime_config
+        .get_mut("images")
+        .and_then(Value::as_object_mut)
+        .context("AKS runtime config images must be an object")?;
+    images.insert("dataflow".to_owned(), json!(image));
+    runtime_config["collectorBuildProfileHash"] = json!(profile_hash);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn aks_profile_hash_selects_digest_pinned_collector_image() {
+    let hash = "a".repeat(64);
+    let image = format!("registry.azurecr.io/dataflow@sha256:{}", "b".repeat(64));
+    let mut runtime = json!({"images":{"dataflow":"registry.azurecr.io/dataflow@sha256:cccc"},
+        "collectorBuildImages":{(hash.clone()):image.clone()}});
+    select_aks_collector_profile_image(&mut runtime, &hash).unwrap();
+    assert_eq!(runtime["images"]["dataflow"], image);
+    assert_eq!(runtime["collectorBuildProfileHash"], hash);
+    assert!(select_aks_collector_profile_image(&mut runtime, &"d".repeat(64)).is_err());
+}
+
 async fn prepare_aks_platform(
     config: &OatConfig,
     platform: &mut AksPlatform,
@@ -10649,6 +10847,7 @@ async fn prepare_aks_platform(
     replicas: u32,
 ) -> Result<()> {
     require_single_scale_out_collector(config, replicas)?;
+    verify_aks_cpu_profile(config).await?;
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -10684,6 +10883,9 @@ async fn prepare_aks_platform(
         serde_json::from_slice(&runtime_bytes).context("parse deployed-stamp runtime config JSON")?;
     if runtime_config.get("stamp").and_then(Value::as_str) != config.stamp.as_deref() {
         bail!("deployed-stamp runtime config does not match the OAT-selected stamp");
+    }
+    if let Some(profile_hash) = config.platform.collector_build_profile_hash.as_deref() {
+        select_aks_collector_profile_image(&mut runtime_config, profile_hash)?;
     }
     let shared_data_root = runtime_config
         .get("deltaRoot")
