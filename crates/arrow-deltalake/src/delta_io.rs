@@ -212,7 +212,9 @@ impl DeltaRuntimeConfig {
         }
         let name = "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE";
         if let Some(raw) = lookup(name)? {
-            config.file_mapping_cache = raw.parse::<bool>().with_context(|| format!("{name} must be true or false"))?;
+            config.file_mapping_cache = raw
+                .parse::<bool>()
+                .with_context(|| format!("{name} must be true or false"))?;
         }
         if config.upload_mode == UploadMode::PutCreate {
             anyhow::ensure!(

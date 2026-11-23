@@ -2423,7 +2423,11 @@ fn flatten_environment(value: &Value, prefix: &str, output: &mut BTreeMap<String
 mod tests {
     #[test]
     fn file_mapping_cache_rejects_non_boolean_values() {
-        for bad in [serde_json::json!("false"), serde_json::json!(null), serde_json::json!(1)] {
+        for bad in [
+            serde_json::json!("false"),
+            serde_json::json!(null),
+            serde_json::json!(1),
+        ] {
             let value = serde_json::json!({"collector":{"runtime":{"file_mapping_cache":bad}}});
             assert!(error_text(Tunables::parse_oat_json(value)).contains("file_mapping_cache"));
         }
@@ -3206,7 +3210,7 @@ mod tests {
             serde_json::json!(1.5),
         ] {
             let result = Tunables::parse_oat_json(serde_json::json!({"collector":{"layout":{"detach_ratio":ratio}}}));
-            assert!(format!("{:#}", result.unwrap_err()).contains("collector.layout.detach_ratio"));
+            assert!(error_text(result).contains("collector.layout.detach_ratio"));
         }
         assert!(
             Tunables::parse_oat_json(serde_json::json!({"collector":{"layout":{"detach_ratio":2,"enabled":false}}}))
