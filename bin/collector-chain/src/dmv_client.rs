@@ -188,6 +188,8 @@ pub struct Options {
     pub max_memory_bytes: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_INTERVAL_US", default_value_t = 0)]
     pub interval_us: u64,
+    #[arg(long, env = "ARROWCOL_CLIENT_QUIESCE_TIMEOUT_MS")]
+    pub quiesce_timeout_ms: Option<u64>,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER", default_value_t = 1)]
     pub connections_per_worker: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_POD_ORDINAL", default_value_t = 0)]
@@ -299,6 +301,12 @@ impl Options {
             "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
             "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
         });
+        let quiesce_timeout_ms = self.quiesce_timeout_ms.unwrap_or(self.request_timeout_ms);
+        anyhow::ensure!(
+            (self.request_timeout_ms..=86_400_000).contains(&quiesce_timeout_ms) && self.request_timeout_ms > 0,
+            "quiesce-timeout-ms must be at least request-timeout-ms and at most 86400000"
+        );
+        self.quiesce_timeout_ms = Some(quiesce_timeout_ms);
         let corpus_rows_source = if self.corpus_bytes > 0 {
             "corpus_bytes_estimate_deferred_until_preparation"
         } else if self.corpus_rows == 0 {
@@ -842,6 +850,8 @@ struct Attempt<'a> {
     send_started: bool,
     started: Instant,
     finished: bool,
+    measurement: Option<&'a Measurement>,
+    send_unix_ns: u64,
 }
 
 struct Measurement {
@@ -855,6 +865,11 @@ struct Measurement {
     raw_window_bytes: Vec<AtomicU64>,
     wire_window_bytes: Vec<AtomicU64>,
     window_latency: Vec<Mutex<[u64; 64]>>,
+    window_completed_sends: Vec<AtomicU64>,
+    window_timed_out_sends: Vec<AtomicU64>,
+    window_ambiguous_sends: Vec<AtomicU64>,
+    stop: tokio::sync::watch::Sender<bool>,
+    deadline_expired: AtomicBool,
     resource_start: Mutex<Option<ResourceSample>>,
     resource_end: Mutex<Option<ResourceSample>>,
     rejected_streams: AtomicU64,
@@ -907,6 +922,17 @@ impl Measurement {
             window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| Mutex::new([0; 64]))
                 .collect(),
+            window_completed_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            window_timed_out_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            window_ambiguous_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            stop: tokio::sync::watch::channel(false).0,
+            deadline_expired: AtomicBool::new(false),
             resource_start: Mutex::new(None),
             resource_end: Mutex::new(None),
             rejected_streams: AtomicU64::new(0),
@@ -918,6 +944,35 @@ impl Measurement {
             ambiguous_streams: AtomicU64::new(0),
             ambiguous_rows: AtomicU64::new(0),
         })
+    }
+
+    fn stopped(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    async fn wait_stopped(&self) {
+        let mut stop = self.stop.subscribe();
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    fn record_send_outcome(&self, send_unix_ns: u64, completed: bool, timed_out: bool, ambiguous: bool) {
+        let ms = send_unix_ns / 1_000_000;
+        if ms >= self.start_unix_ms && ms < self.end_unix_ms {
+            let index = ((ms - self.start_unix_ms) / 30_000) as usize;
+            if completed {
+                self.window_completed_sends[index].fetch_add(1, Ordering::Relaxed);
+            }
+            if timed_out {
+                self.window_timed_out_sends[index].fetch_add(1, Ordering::Relaxed);
+            }
+            if ambiguous {
+                self.window_ambiguous_sends[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn record_completion(
@@ -1002,6 +1057,10 @@ impl Measurement {
                     "completed_flight_data_bytes_configured_ipc_compression": self.wire_window_bytes[index].load(Ordering::Relaxed),
                     "completed_raw_arrow_bytes": self.raw_window_bytes[index].load(Ordering::Relaxed),
                     "completed_wire_bytes": self.wire_window_bytes[index].load(Ordering::Relaxed),
+                    "completed_sends": self.window_completed_sends[index].load(Ordering::Relaxed),
+                    "timed_out_sends": self.window_timed_out_sends[index].load(Ordering::Relaxed),
+                    "ambiguous_sends": self.window_ambiguous_sends[index].load(Ordering::Relaxed),
+                    "send_outcome_scope": "attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous",
                     "send_latency_us": latency_percentiles(&latency),
                     "send_latency_scope": "attempts_grouped_by_fresh_send_timestamp_in_half_open_window"
                 })
@@ -1059,15 +1118,30 @@ impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         if !self.finished {
             if self.send_started
-                && let Some((client, index)) = self.manifest
+                && let Some(measurement) = self.measurement
             {
+                measurement.record_send_outcome(
+                    self.send_unix_ns,
+                    false,
+                    measurement.deadline_expired.load(Ordering::Relaxed),
+                    true,
+                );
+            }
+            if let Some((client, index)) = self.manifest {
                 let mut records = client
                     .logical_batches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(record) = records.get_mut(index) {
-                    record.outcome = ManifestOutcome::Ambiguous;
+                    if self.send_started {
+                        record.outcome = ManifestOutcome::Ambiguous;
+                    } else if record.outcome == ManifestOutcome::Pending {
+                        record.outcome = ManifestOutcome::NotAdmitted;
+                    }
                 }
+            }
+            if !self.send_started {
+                return;
             }
             self.counters
                 .cancelled_rows
@@ -1733,6 +1807,25 @@ impl PreparedClient {
         measurement_start_unix_ms: u64,
         measurement_end_unix_ms: u64,
     ) -> Result<ContinuousReport> {
+        self.run_continuous_with_termination(
+            scheduled_start_unix_ms,
+            measurement_start_unix_ms,
+            measurement_end_unix_ms,
+            termination_signal(),
+        )
+        .await
+    }
+
+    async fn run_continuous_with_termination<F>(
+        self: &Arc<Self>,
+        scheduled_start_unix_ms: u64,
+        measurement_start_unix_ms: u64,
+        measurement_end_unix_ms: u64,
+        termination: F,
+    ) -> Result<ContinuousReport>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
         let measurement = Arc::new(Measurement::new(
             measurement_start_unix_ms,
             measurement_end_unix_ms,
@@ -1742,11 +1835,12 @@ impl PreparedClient {
             .measurement
             .lock()
             .map_err(|_| anyhow::anyhow!("measurement state poisoned"))? = Some(Arc::clone(&measurement));
+        tokio::pin!(termination);
         while unix_ms()? < scheduled_start_unix_ms {
-            tokio::time::sleep(Duration::from_millis(
-                scheduled_start_unix_ms.saturating_sub(unix_ms()?).min(10),
-            ))
-            .await;
+            tokio::select! {
+                result = &mut termination => { result?; anyhow::bail!("client received SIGTERM before scheduled start"); },
+                () = tokio::time::sleep(Duration::from_millis(scheduled_start_unix_ms.saturating_sub(unix_ms()?).min(10))) => {},
+            }
         }
         let scheduled_start_observed_unix_ms = unix_ms()?;
         anyhow::ensure!(
@@ -1760,11 +1854,17 @@ impl PreparedClient {
                 let measurement = Arc::clone(&measurement);
                 tasks.spawn(async move {
                     let channel = this.channels[worker][slot % this.channels[worker].len()].clone();
-                    replenish_until(measurement.end_unix_ms, this.options.interval_us, || async {
-                        this.send_continuous_one(worker, channel.clone(), this.next_batch(worker), &measurement)
-                            .await
-                    })
-                    .await
+                    while !measurement.stopped() && unix_ms()? < measurement.end_unix_ms {
+                        if !this.send_continuous_one(worker, channel.clone(), this.next_batch(worker), &measurement).await? { break; }
+                        if this.options.interval_us > 0 {
+                            let remaining = measurement.end_unix_ms.saturating_sub(unix_ms()?);
+                            tokio::select! {
+                                () = tokio::time::sleep(Duration::from_micros(this.options.interval_us.min(remaining.saturating_mul(1000)))) => {},
+                                () = measurement.wait_stopped() => break,
+                            }
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
                 });
             }
         }
@@ -1797,9 +1897,29 @@ impl PreparedClient {
         };
         tokio::pin!(resource_end);
         let mut resource_end_recorded = false;
+        let mut quiescing = false;
+        let mut terminated = false;
+        let quiesce_timeout = Duration::from_millis(
+            self.options
+                .quiesce_timeout_ms
+                .unwrap_or(self.options.request_timeout_ms),
+        );
+        let deadline = tokio::time::sleep(Duration::from_secs(86_400));
+        tokio::pin!(deadline);
         loop {
+            if quiescing && tasks.is_empty() {
+                break;
+            }
             tokio::select! {
-                result = &mut phase, if measurement_started.is_none() => {
+                biased;
+                result = &mut termination, if !quiescing => {
+                    result?;
+                    terminated = true;
+                    quiescing = true;
+                    measurement.stop.send_replace(true);
+                    deadline.as_mut().reset(tokio::time::Instant::now() + quiesce_timeout);
+                }
+                result = &mut phase, if measurement_started.is_none() && !quiescing => {
                     match result {
                         Ok(started) => measurement_started = Some(started),
                         Err(error) => {
@@ -1809,15 +1929,27 @@ impl PreparedClient {
                         }
                     }
                 }
-                result = &mut resource_end, if !resource_end_recorded => {
+                result = &mut resource_end, if !resource_end_recorded && !quiescing => {
                     match result {
-                        Ok(()) => resource_end_recorded = true,
+                        Ok(()) => {
+                            resource_end_recorded = true;
+                            quiescing = true;
+                            measurement.stop.send_replace(true);
+                            let elapsed_since_end = Duration::from_millis(unix_ms()?.saturating_sub(measurement_end_unix_ms));
+                            deadline.as_mut().reset(tokio::time::Instant::now() + quiesce_timeout.saturating_sub(elapsed_since_end));
+                        },
                         Err(error) => {
                             tasks.abort_all();
                             while tasks.join_next().await.is_some() {}
                             return Err(error);
                         }
                     }
+                }
+                () = &mut deadline, if quiescing && !tasks.is_empty() => {
+                    measurement.deadline_expired.store(true, Ordering::Relaxed);
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    anyhow::bail!("client quiesce deadline exceeded; in-flight sends are ambiguous");
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     match result {
@@ -1836,6 +1968,9 @@ impl PreparedClient {
                 }
                 else => break,
             }
+        }
+        if terminated {
+            anyhow::bail!("client received SIGTERM; in-flight sends drained");
         }
         Ok(ContinuousReport {
             completed_rows: measurement.rows.load(Ordering::Relaxed),
@@ -1967,12 +2102,16 @@ impl PreparedClient {
         logical: &LogicalBatch,
         measurement: Option<&Measurement>,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
+        if let Some(measurement) = measurement
+            && (measurement.stopped() || unix_ms()? >= measurement.end_unix_ms)
+        {
+            if let Some(index) = logical.manifest_index {
+                self.record_manifest_outcome(index, ManifestOutcome::NotAdmitted, Some(unix_ms()?))?;
+            }
+            return Ok(None);
+        }
         let batch = &logical.batch;
         let counters = &self.counters[worker];
-        counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
-        counters
-            .attempted_bytes
-            .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
         let mut attempt = Attempt {
             counters,
             batch,
@@ -1980,6 +2119,8 @@ impl PreparedClient {
             send_started: false,
             started: Instant::now(),
             finished: false,
+            measurement,
+            send_unix_ns: 0,
         };
         let observation = SendObservation::fresh()?;
         let mut request = Request::new(stream::iter(send_frames(&batch.data, self.options.send_iter)));
@@ -1987,15 +2128,38 @@ impl PreparedClient {
         let result = tokio::time::timeout(timeout, async {
             request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
             request.set_timeout(timeout);
+            if let Some(measurement) = measurement
+                && (measurement.stopped() || unix_ms()? >= measurement.end_unix_ms)
+            {
+                return Ok(None);
+            }
             if let Some(index) = logical.manifest_index {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
-                attempt.send_started = true;
             }
-            completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
+            counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
+            counters
+                .attempted_bytes
+                .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
+            attempt.send_started = true;
+            attempt.send_unix_ns = observation.send_unix_ns;
+            completed_admission(self.options.client(channel).do_put(request).await?.into_inner())
+                .await
+                .map(Some)
         })
-        .await
-        .context("DMV upload timeout")
-        .and_then(std::convert::identity);
+        .await;
+        let timed_out = result.is_err();
+        let result = result.context("DMV upload timeout").and_then(std::convert::identity);
+        let result = match result {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => {
+                if let Some(index) = logical.manifest_index {
+                    self.record_manifest_outcome(index, ManifestOutcome::NotAdmitted, Some(unix_ms()?))?;
+                }
+                attempt.finished = true;
+                return Ok(None);
+            }
+            Err(error) => Err(error),
+        };
         if let Some(index) = logical.manifest_index {
             let outcome = match &result {
                 Ok(_) => ManifestOutcome::Acknowledged,
@@ -2010,6 +2174,23 @@ impl PreparedClient {
         } else {
             None
         };
+        if attempt.send_started
+            && let Some(measurement) = measurement
+        {
+            let timeout_status = result.as_ref().err().is_some_and(|error| {
+                error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<tonic::Status>()
+                        .is_some_and(|status| status.code() == tonic::Code::DeadlineExceeded)
+                })
+            });
+            measurement.record_send_outcome(
+                observation.send_unix_ns,
+                result.is_ok(),
+                timed_out || timeout_status,
+                result.as_ref().err().is_some_and(is_ambiguous_continuous_error),
+            );
+        }
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Some(measurement) = measurement {
@@ -2075,7 +2256,10 @@ impl PreparedClient {
                 .context("acquire realistic live-batch memory reservation")
         };
         let window_end = async move {
-            tokio::time::sleep_until(deadline).await;
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {},
+                () = measurement.wait_stopped() => {},
+            }
             Ok::<(), anyhow::Error>(())
         };
         self.send_continuous_one_with_admission(
@@ -2086,7 +2270,7 @@ impl PreparedClient {
             ContinuousAdmission {
                 acquire_permit,
                 window_end,
-                window_open: || Ok::<bool, anyhow::Error>(unix_ms()? < end_unix_ms),
+                window_open: || Ok::<bool, anyhow::Error>(!measurement.stopped() && unix_ms()? < end_unix_ms),
             },
         )
         .await
@@ -2109,6 +2293,12 @@ impl PreparedClient {
             return Ok(false);
         };
         for attempt in 1..=self.options.stream_retry_max_attempts {
+            if measurement.stopped() || unix_ms()? >= measurement.end_unix_ms {
+                if let Some(index) = logical.manifest_index {
+                    self.record_manifest_outcome(index, ManifestOutcome::NotAdmitted, Some(unix_ms()?))?;
+                }
+                return Ok(false);
+            }
             match self
                 .send_encoded_one(worker, channel.clone(), &logical, Some(measurement))
                 .await
@@ -2127,12 +2317,14 @@ impl PreparedClient {
                     counters.retried_streams.fetch_add(1, Ordering::Relaxed);
                     counters.retried_rows.fetch_add(batch.rows, Ordering::Relaxed);
                     measurement.record_retry(batch.rows, unix_ms()?);
-                    tokio::time::sleep(stream_retry_backoff(
-                        self.options.stream_retry_base_backoff_ms,
-                        self.options.stream_retry_max_backoff_ms,
-                        attempt,
-                    ))
-                    .await;
+                    tokio::select! {
+                        () = tokio::time::sleep(stream_retry_backoff(
+                            self.options.stream_retry_base_backoff_ms,
+                            self.options.stream_retry_max_backoff_ms,
+                            attempt,
+                        )) => {},
+                        () = measurement.wait_stopped() => return Ok(false),
+                    }
                 }
                 Err(error) if is_ambiguous_continuous_error(&error) => {
                     let counters = &self.counters[worker];
@@ -2286,6 +2478,20 @@ fn unix_ms() -> Result<u64> {
     )?)
 }
 
+async fn termination_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        signal.recv().await.context("SIGTERM listener closed")?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<Result<()>>().await
+    }
+}
+
+#[cfg(test)]
 async fn replenish_until<F, Fut>(end_unix_ms: u64, interval_us: u64, mut send: F) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -4594,6 +4800,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_batch_at_quiescence_is_definitively_unsent() -> Result<()> {
+        let client = manifest_test_client()?;
+        let template = realistic_test_batch(&client).await?;
+        let logical = client.prepare_logical_batch(0, &template).await?;
+        let now = unix_ms()?;
+        let measurement = Measurement::new(now, now + 60_000, 2)?;
+        measurement.stop.send_replace(true);
+        let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        assert!(
+            client
+                .send_encoded_one(0, channel, &logical, Some(&measurement))
+                .await?
+                .is_none()
+        );
+        client.ensure_terminal_manifest_complete()?;
+        let records = client
+            .logical_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(records[0].attempts, 0);
+        assert_eq!(records[0].outcome, ManifestOutcome::NotAdmitted);
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancellation_releases_a_prepared_realistic_batch_permit() -> Result<()> {
         let client = Arc::new(manifest_test_client()?);
         let template = realistic_test_batch(&client).await?;
@@ -4894,6 +5126,9 @@ mod tests {
         measurement.record_send_latency(200, 40_000_000_000)?;
         measurement.record_send_latency(300, 69_999_000_000)?;
         measurement.record_send_latency(400, 70_000_000_000)?;
+        measurement.record_send_outcome(10_000_000_000, true, false, false);
+        measurement.record_send_outcome(39_999_000_000, false, true, true);
+        measurement.record_send_outcome(40_000_000_000, false, false, true);
         measurement.record_completion(0, 100, 900, 1000, 9_999);
         measurement.record_completion(0, 200, 1800, 2000, 10_000);
         measurement.record_completion(0, 300, 2700, 3000, 69_999);
@@ -4912,6 +5147,10 @@ mod tests {
             snapshot["windows"][0]["completed_flight_data_bytes_configured_ipc_compression"],
             2000
         );
+        assert_eq!(snapshot["windows"][0]["completed_sends"], 1);
+        assert_eq!(snapshot["windows"][0]["timed_out_sends"], 1);
+        assert_eq!(snapshot["windows"][0]["ambiguous_sends"], 1);
+        assert_eq!(snapshot["windows"][1]["ambiguous_sends"], 1);
         assert_eq!(snapshot["windows"][0]["send_latency_us"]["samples"], 2);
         assert_eq!(snapshot["windows"][1]["send_latency_us"]["samples"], 2);
         Ok(())
@@ -5154,6 +5393,97 @@ mod tests {
             total >= report.completed_rows + 16,
             "late slow acknowledgement must be drained but excluded from measurement"
         );
+        state.slow_next.store(true, Ordering::SeqCst);
+        let signal_start = unix_ms()? + 100;
+        let (terminate, terminated) = tokio::sync::oneshot::channel();
+        let signal_client = Arc::clone(&client);
+        let signal_run = tokio::spawn(async move {
+            signal_client
+                .run_continuous_with_termination(signal_start, signal_start + 25, signal_start + 2_000, async {
+                    terminated.await.context("test termination sender dropped")?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.slow_next.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let termination_started = Instant::now();
+        terminate
+            .send(())
+            .map_err(|()| anyhow::anyhow!("termination listener dropped"))?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stopped = client
+                    .measurement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|m| m.stopped());
+                if stopped {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let attempted_at_stop: u64 = client
+            .counters
+            .iter()
+            .map(|c| c.attempted_rows.load(Ordering::SeqCst))
+            .sum();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            client
+                .counters
+                .iter()
+                .map(|c| c.attempted_rows.load(Ordering::SeqCst))
+                .sum::<u64>(),
+            attempted_at_stop
+        );
+        assert!(
+            signal_run
+                .await?
+                .err()
+                .context("expected SIGTERM termination")?
+                .to_string()
+                .contains("SIGTERM")
+        );
+        assert!(termination_started.elapsed() >= Duration::from_millis(150));
+        assert!(!state.slow_next.load(Ordering::SeqCst));
+        let mut timeout_options = client.options.clone();
+        timeout_options.workers = 1;
+        timeout_options.streams_per_worker = 1;
+        timeout_options.request_timeout_ms = 100;
+        timeout_options.quiesce_timeout_ms = Some(100);
+        let timeout_client = PreparedClient::prepare(
+            &endpoint,
+            "timeout",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            timeout_options,
+        )
+        .await?;
+        state.slow_next.store(true, Ordering::SeqCst);
+        let start = unix_ms()? + 100;
+        timeout_client
+            .run_continuous_with_termination(start, start, start + 50, std::future::pending())
+            .await?;
+        let timeout_metrics = timeout_client.metrics("completed")?;
+        assert_eq!(
+            timeout_metrics["measurement_window"]["windows"][0]["timed_out_sends"],
+            1
+        );
+        assert_eq!(
+            timeout_metrics["measurement_window"]["windows"][0]["ambiguous_sends"],
+            1
+        );
+        drop(timeout_client);
         drop(client);
         let mut limited_options = Cli::try_parse_from(["test", "--workers", "1"])?
             .options

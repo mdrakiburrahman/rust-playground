@@ -1015,6 +1015,24 @@ impl OatConfig {
         }
     }
 
+    pub(crate) fn client_quiesce_timeout_ms(&self) -> u64 {
+        let request = self
+            .tunables
+            .transport
+            .as_ref()
+            .and_then(|t| t.request_timeout_ms)
+            .unwrap_or(30_000);
+        self.tunables
+            .client
+            .as_ref()
+            .and_then(|c| c.quiesce_timeout_ms)
+            .unwrap_or(request)
+    }
+
+    pub(crate) fn client_stop_grace_seconds(&self) -> u64 {
+        self.client_quiesce_timeout_ms().div_ceil(1_000).saturating_add(10)
+    }
+
     pub(crate) fn timing_budget(&self) -> Result<RunTimingBudget> {
         if !(1..=1_800).contains(&self.schedule_lead_seconds) {
             bail!("schedule_lead_seconds must be between 1 and 1800");
@@ -1032,7 +1050,9 @@ impl OatConfig {
         let client_job_lifetime_seconds = schedule_wait_seconds
             .checked_add(self.warmup_seconds)
             .and_then(|seconds| seconds.checked_add(self.measure_seconds))
-            .and_then(|seconds| seconds.checked_add(CLIENT_JOB_CLEANUP_GRACE_SECONDS))
+            .and_then(|seconds| {
+                seconds.checked_add(CLIENT_JOB_CLEANUP_GRACE_SECONDS.max(self.client_stop_grace_seconds()))
+            })
             .context("OAT client Job lifetime budget overflow")?;
         let minimum_pin_ttl_ms = client_job_lifetime_seconds
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
@@ -1251,6 +1271,10 @@ impl OatConfig {
         }
         if self.reconciliation_settle_timeout_seconds > 1_800 {
             bail!("reconciliation_settle_timeout_seconds must be between 0 and 1800");
+        }
+        let quiesce_timeout_ms = self.client_quiesce_timeout_ms();
+        if quiesce_timeout_ms >= self.collector_stop_grace_seconds.saturating_mul(1_000) {
+            bail!("client.quiesce_timeout_ms must be less than collector_stop_grace_seconds");
         }
         if !(30..=3_600).contains(&self.collector_stop_grace_seconds) {
             bail!("collector_stop_grace_seconds must be between 30 and 3600");
@@ -2415,6 +2439,30 @@ mod tests {
             retention_size_cap_bytes: Some(minimum_per_core.saturating_mul(256)),
             ..Default::default()
         });
+        config.validate()
+    }
+
+    #[test]
+    fn quiesce_deadline_must_fit_collector_grace() -> Result<()> {
+        let mut config = valid();
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables {
+            quiesce_timeout_ms: Some(300_000),
+            ..Default::default()
+        });
+        assert!(
+            config
+                .validate()
+                .err()
+                .context("deadline must be rejected")?
+                .to_string()
+                .contains("client.quiesce_timeout_ms")
+        );
+        config
+            .tunables
+            .client
+            .as_mut()
+            .context("missing client tunables")?
+            .quiesce_timeout_ms = Some(299_999);
         config.validate()
     }
 

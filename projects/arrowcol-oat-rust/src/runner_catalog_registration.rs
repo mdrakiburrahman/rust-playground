@@ -330,6 +330,7 @@ async fn run_aks_catalog_registration_stage(
             job_name: &job_name,
             args: &[],
             run_seconds: i64::try_from(crate::config::CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS)?,
+            stop_grace_seconds: config.client_stop_grace_seconds(),
         },
         &config_map_name,
     )?;
@@ -705,6 +706,7 @@ mod catalog_registration_tests {
                 job_name: "register",
                 args: &[],
                 run_seconds: 180,
+                stop_grace_seconds: 30,
             },
             "register-config",
         )?;

@@ -107,6 +107,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.seed", "component default"),
     capability!("client.max_memory_bytes", "536870912"),
     capability!("client.interval_us", "0"),
+    capability!("client.quiesce_timeout_ms", "inherits transport.request_timeout_ms"),
     capability!("client.connections_per_worker", "1"),
     capability!("client.pod_ordinal", "0 (per-client GUID salt; u32)"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
@@ -796,6 +797,18 @@ impl Tunables {
             }
             if client.batch_rows.is_some_and(|rows| rows > i32::MAX as usize) {
                 bail!("client.batch_rows exceeds Arrow's supported variable-width range");
+            }
+            if let Some(quiesce) = client.quiesce_timeout_ms {
+                let request = self
+                    .transport
+                    .as_ref()
+                    .and_then(|transport| transport.request_timeout_ms)
+                    .unwrap_or(30_000);
+                if !(request..=86_400_000).contains(&quiesce) {
+                    bail!(
+                        "client.quiesce_timeout_ms must be at least transport.request_timeout_ms and at most 86400000"
+                    );
+                }
             }
             if client.interval_us.is_some_and(|interval| interval > 86_400_000_000) {
                 bail!("client.interval_us must not exceed 86400000000");
@@ -2706,6 +2719,27 @@ mod tests {
             let value = serde_json::json!({"collector":{"runtime":{"file_mapping_cache":bad}}});
             assert!(error_text(Tunables::parse_oat_json(value)).contains("file_mapping_cache"));
         }
+    }
+
+    #[test]
+    fn quiesce_timeout_rejects_invalid_values_and_projects_to_client() -> anyhow::Result<()> {
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(29_999),
+            serde_json::json!(86_400_001),
+            serde_json::json!("bad"),
+        ] {
+            let error = Tunables::parse_oat_json(serde_json::json!({"client": {"quiesce_timeout_ms": value}}))
+                .err()
+                .context("invalid quiesce timeout was accepted")?;
+            assert!(format!("{error:#}").contains("quiesce_timeout_ms"));
+        }
+        let config = Tunables::parse_oat_json(serde_json::json!({"client": {"quiesce_timeout_ms": 45_000}}))?;
+        assert_eq!(
+            config.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_QUIESCE_TIMEOUT_MS"],
+            "45000"
+        );
+        Ok(())
     }
 
     fn error_text<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> String {

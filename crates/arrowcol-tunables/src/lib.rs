@@ -73,6 +73,8 @@ pub struct ClientTunables {
     pub seed: Option<u64>,
     pub max_memory_bytes: Option<u64>,
     pub interval_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiesce_timeout_ms: Option<u64>,
     pub connections_per_worker: Option<usize>,
     pub pod_ordinal: Option<u32>,
     pub streams_per_worker: Option<usize>,

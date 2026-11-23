@@ -150,7 +150,6 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
         let measurement_window_end_unix_ms = measurement_window_start_unix_ms
             .checked_add(args.duration_secs.saturating_mul(1_000))
             .ok_or_else(|| anyhow::anyhow!("shared measurement end timestamp overflow"))?;
-        wait_until_unix_ms(run_start_unix_ms, unix_time_ms).await?;
         let report = client
             .run_continuous(
                 run_start_unix_ms,
@@ -272,6 +271,7 @@ fn unix_time_ms() -> Result<u64> {
     )?)
 }
 
+#[cfg(test)]
 async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>) -> Result<()> {
     loop {
         let current = now()?;

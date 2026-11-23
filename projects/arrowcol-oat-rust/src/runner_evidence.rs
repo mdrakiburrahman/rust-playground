@@ -746,6 +746,19 @@ impl CellEvidence {
         Ok(())
     }
 
+    fn record_cancelled_client(&mut self, table: &str, client_id: &str, output: Option<&str>) {
+        let terminal = output.and_then(|output| cancelled_client_window(output, self.measurement_window));
+        let phase_counters = match terminal {
+            Some((phase, window)) => json!({"terminal_phase": phase, "measurement_window": window}),
+            None => json!({"measurement_window": null, "unavailable_reason": "terminal_client_window_unavailable"}),
+        };
+        let effective = output.and_then(|output| process_configurations(output).ok());
+        self.client_reports.entry(table.to_owned()).or_default().push(json!({
+            "client_id": client_id, "table": table, "status": "diagnostic_only",
+            "phase_counters": phase_counters, "consumer_effective_config": effective,
+        }));
+    }
+
     fn client_snapshot_total(&self, table: &str, field: &str) -> Option<u64> {
         let reports = self.client_reports.get(table)?;
         if reports.is_empty() {
@@ -2010,6 +2023,7 @@ mod measurement_evidence_tests {
             "measurement_window": {
                 "start_unix_ms": 10, "end_unix_ms": 20, "completed_rows": 5,
                 "completed_bytes": 25, "worker_completed_rows": [5], "pilot_window_rows": [],
+                "windows": [{"completed_sends": 2, "timed_out_sends": 1, "ambiguous_sends": 1}],
                 "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
             },
         });
@@ -2021,6 +2035,9 @@ mod measurement_evidence_tests {
         assert_eq!(output["workers"][0]["rejected_rows"], 0);
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
+        assert_eq!(output["measurement_window"]["windows"][0]["completed_sends"], 2);
+        assert_eq!(output["measurement_window"]["windows"][0]["timed_out_sends"], 1);
+        assert_eq!(output["measurement_window"]["windows"][0]["ambiguous_sends"], 1);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
         assert!(output["delivery_cumulative"]["retried_streams"].is_null());
         snapshots[1].workers[0].retried_streams = Some(2);
@@ -2250,6 +2267,36 @@ struct ClientLatency {
     precision: String,
 }
 
+fn cancelled_client_window(output: &str, expected: Option<(u64, u64)>) -> Option<(String, Value)> {
+    let (start, end) = expected?;
+    if start >= end { return None; }
+    let mut terminal = None;
+    for line in output.lines().filter_map(|line| line.strip_prefix("OAT_CLIENT_METRICS ")) {
+        let snapshot: Value = serde_json::from_str(line).ok()?;
+        if matches!(snapshot["phase"].as_str(), Some("failed" | "completed")) {
+            if terminal.is_some() { return None; }
+            terminal = Some(snapshot);
+        }
+    }
+    let snapshot = terminal?;
+    if snapshot["version"].as_u64() != Some(1) || snapshot["scope"].as_str() != Some("process_cumulative") { return None; }
+    let window = snapshot.get("measurement_window")?;
+    if window["start_unix_ms"].as_u64() != Some(start)
+        || window["end_unix_ms"].as_u64() != Some(end)
+        || window["scope"].as_str() != Some("per_stream_admission_completion_observed_in_half_open_shared_unix_window") { return None; }
+    let windows = window["windows"].as_array()?;
+    if u64::try_from(windows.len()).ok()? != (end - start).div_ceil(30_000) { return None; }
+    for (index, item) in windows.iter().enumerate() {
+        let bucket_start = start.checked_add(u64::try_from(index).ok()?.checked_mul(30_000)?)?;
+        if item["start_unix_ms"].as_u64() != Some(bucket_start)
+            || item["end_unix_ms"].as_u64() != Some(end.min(bucket_start.saturating_add(30_000)))
+            || item["send_outcome_scope"].as_str() != Some("attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous")
+            || ["completed_sends", "timed_out_sends", "ambiguous_sends"].iter().any(|key| item[*key].as_u64().is_none())
+            || item["timed_out_sends"].as_u64()? > item["ambiguous_sends"].as_u64()? { return None; }
+    }
+    Some((snapshot["phase"].as_str()?.to_owned(), window.clone()))
+}
+
 #[derive(serde::Deserialize)]
 struct ClientCounterSnapshot {
     version: u64,
@@ -2286,6 +2333,8 @@ struct ClientMeasurementWindow {
     ambiguous_rows: u64,
     worker_completed_rows: Vec<u64>,
     pilot_window_rows: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows: Option<Vec<Value>>,
     scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_resources: Option<Value>,
@@ -2457,6 +2506,37 @@ fn client_phase_evidence(output: &str, data_profile: ClientDataProfile) -> Resul
 mod downstream_runner_tests {
     use super::*;
 
+    #[test]
+    fn cancelled_client_retains_window_outcomes_only_as_diagnostic_evidence() {
+        let bucket = |start, end, completed, timed_out, ambiguous| json!({
+            "start_unix_ms": start, "end_unix_ms": end,
+            "completed_sends": completed, "timed_out_sends": timed_out, "ambiguous_sends": ambiguous,
+            "send_outcome_scope": "attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous"
+        });
+        let terminal = json!({"version": 1, "phase": "failed", "scope": "process_cumulative",
+            "measurement_window": {"start_unix_ms": 1000, "end_unix_ms": 61000,
+                "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+                "windows": [bucket(1000, 31000, 2, 1, 1), bucket(31000, 61000, 3, 2, 4)]}});
+        let output = format!("OAT_CLIENT_METRICS {terminal}\n");
+        let mut evidence = CellEvidence { measurement_window: Some((1000, 61000)), ..Default::default() };
+        evidence.record_cancelled_client("table", "client-1", Some(&output));
+        let report = &evidence.client_reports["table"][0];
+        assert_eq!(report["status"], "diagnostic_only");
+        assert_eq!(report["phase_counters"]["terminal_phase"], "failed");
+        assert_eq!(report["phase_counters"]["measurement_window"]["windows"][0]["completed_sends"], 2);
+        assert_eq!(report["phase_counters"]["measurement_window"]["windows"][1]["timed_out_sends"], 2);
+        assert_eq!(report["phase_counters"]["measurement_window"]["windows"][1]["ambiguous_sends"], 4);
+        assert_eq!(evidence.client_snapshot_total("table", "client_completed_rows"), None);
+        assert_eq!(evidence.client_cumulative_total("table", "completed_rows"), None);
+        evidence.record_cancelled_client("table", "client-2", None);
+        assert_eq!(evidence.client_reports["table"][1]["phase_counters"]["unavailable_reason"], "terminal_client_window_unavailable");
+        assert!(cancelled_client_window(&output, Some((1000, 61001))).is_none());
+        assert!(cancelled_client_window(&format!("{output}{output}"), Some((1000, 61000))).is_none());
+        let mut malformed = terminal;
+        malformed["measurement_window"]["windows"][0]["ambiguous_sends"] = json!(0);
+        assert!(cancelled_client_window(&format!("OAT_CLIENT_METRICS {malformed}\n"), Some((1000, 61000))).is_none());
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Fault {
         InitUnavailable,
@@ -2472,6 +2552,7 @@ mod downstream_runner_tests {
         ScheduleArmBlocked,
         ScheduleAckBlocked,
         ScheduleAckCancellationFailed,
+        CancellationCapture,
     }
 
     struct FaultPlatform {
@@ -2660,6 +2741,18 @@ mod downstream_runner_tests {
                 bail!("fixture_cancel_failed");
             }
             Ok(())
+        }
+        async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+            self.cancel_client(config, handle).await?;
+            if !matches!(self.fault, Fault::CancellationCapture) { return Ok(None); }
+            if handle.client_id == "client-2" { bail!("fixture terminal logs unavailable"); }
+            let terminal = json!({"version":1,"phase":"failed","scope":"process_cumulative",
+                "measurement_window":{"start_unix_ms":1000,"end_unix_ms":31000,
+                    "scope":"per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+                    "windows":[{"start_unix_ms":1000,"end_unix_ms":31000,"completed_sends":3,
+                        "timed_out_sends":1,"ambiguous_sends":2,
+                        "send_outcome_scope":"attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous"}]}});
+            Ok(Some(format!("OAT_CLIENT_METRICS {terminal}\n")))
         }
         async fn process_logs(&self, _: &OatConfig) -> Result<Vec<ProcessLog>> {
             Ok(vec![ProcessLog {
@@ -2855,6 +2948,31 @@ mod downstream_runner_tests {
             return Ok((Vec::new(), platform));
         }
         Ok((result?, platform))
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_each_terminal_report_when_another_capture_fails() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        let platform = FaultPlatform {
+            kind: crate::config::OatMode::Local, fault: Fault::CancellationCapture,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+            pin_init_calls: 0, qap_initialization_calls: 0, client_fleet_prepared: false,
+            client_schedule_wait_seconds: None, unresolved: false, arm_attempts: 0, arm_started: None,
+            delivery_drop_ms: std::sync::atomic::AtomicU64::new(0), cancellations: std::sync::Mutex::new(Vec::new()),
+        };
+        let handles = (1..=2).map(|id| ClientHandle { client_id: format!("client-{id}"),
+            table: "table".to_owned(), process: ClientProcess::Local { container_id: format!("container-{id}") } }).collect::<Vec<_>>();
+        let mut evidence = CellEvidence { measurement_window: Some((1000, 31000)), ..Default::default() };
+        let result = cancel_active_clients_with_evidence(&platform, &config, &handles, &[true, true], &mut evidence).await;
+        assert!(result.is_err());
+        let reports = &evidence.client_reports["table"];
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0]["phase_counters"]["measurement_window"]["windows"][0]["completed_sends"], 3);
+        assert_eq!(reports[0]["phase_counters"]["measurement_window"]["windows"][0]["ambiguous_sends"], 2);
+        assert_eq!(reports[1]["phase_counters"]["unavailable_reason"], "terminal_client_window_unavailable");
+        assert_eq!(platform.cancellations.lock().unwrap().len(), 2);
+        Ok(())
     }
 
     #[tokio::test]

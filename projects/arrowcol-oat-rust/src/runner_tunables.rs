@@ -552,6 +552,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.connections_per_worker") => ("connections_per_worker", "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER"),
             Some("client.streams_per_worker") => ("streams_per_worker", "ARROWCOL_CLIENT_STREAMS_PER_WORKER"),
             Some("client.interval_us") => ("interval_us", "ARROWCOL_CLIENT_INTERVAL_US"),
+            Some("client.quiesce_timeout_ms") => ("quiesce_timeout_ms", "ARROWCOL_CLIENT_QUIESCE_TIMEOUT_MS"),
             Some("client.data_mode") => ("data_mode", "ARROWCOL_CLIENT_DATA_MODE"),
             Some("client.data_profile") => ("data_profile", "ARROWCOL_CLIENT_DATA_PROFILE"),
             Some("client.send_iter") => ("send_iter", "ARROWCOL_CLIENT_SEND_ITER"),
@@ -809,6 +810,7 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
     let services = overlay["services"]
         .as_object_mut()
         .context("Compose tunable services missing")?;
+    services.entry("oat-client").or_insert_with(|| json!({}))["stop_grace_period"] = json!(format!("{}s", config.client_stop_grace_seconds()));
     let collector = services.entry("dataflow-1").or_insert_with(|| json!({}));
     if let Some(bytes) = config.platform.local.collector_memory_limit_bytes {
         collector["mem_limit"] = json!(bytes);
@@ -1118,6 +1120,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let mut overlay = compose_tunables(&config)?;
         local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
         assert!(overlay["services"]["dataflow-1"].get("mem_limit").is_none());
+        assert_eq!(overlay["services"]["oat-client"]["stop_grace_period"], "40s");
         config.platform.local.collector_memory_limit_bytes = Some(4 * 1024_u64.pow(3));
         config.validate()?;
         local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
