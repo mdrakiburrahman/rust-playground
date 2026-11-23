@@ -17,6 +17,12 @@ pub struct Capability {
     pub name: &'static str,
     pub default: &'static str,
     pub boundary: ApplyBoundary,
+    gate: Option<ApplicabilityGate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicabilityGate {
+    ConnectionRetries,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +47,7 @@ macro_rules! capability {
             name: $name,
             default: $default,
             boundary: ApplyBoundary::ProcessStartup,
+            gate: None,
         }
     };
     ($name:literal, $default:literal, $boundary:ident) => {
@@ -48,6 +55,18 @@ macro_rules! capability {
             name: $name,
             default: $default,
             boundary: ApplyBoundary::$boundary,
+            gate: None,
+        }
+    };
+}
+
+macro_rules! gated_capability {
+    ($name:literal, $default:literal, $gate:ident) => {
+        Capability {
+            name: $name,
+            default: $default,
+            boundary: ApplyBoundary::ProcessStartup,
+            gate: Some(ApplicabilityGate::$gate),
         }
     };
 }
@@ -120,7 +139,11 @@ const CAPABILITIES: &[Capability] = &[
     capability!("transport.endpoint_concurrency_limit", "256"),
     capability!("transport.endpoint_buffer_size", "1024"),
     capability!("transport.connect_retries", "component default"),
-    capability!("transport.retry_backoff_ms", "100"),
+    gated_capability!(
+        "transport.retry_backoff_ms",
+        "100; inert when connect_retries is 0",
+        ConnectionRetries
+    ),
     capability!(
         "transport.receiver_ipc_decode_support",
         "build-gated: IPC codec feature graph",
@@ -428,13 +451,23 @@ impl Tunables {
         self.validate_for_oat()?;
         let requested = serde_json::to_value(self)?;
         let maintenance_enabled = requested.pointer("/maintenance/enabled") == Some(&Value::Bool(true));
+        let connection_retries_disabled = requested
+            .pointer("/transport/connect_retries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0;
         let mut inert_fields = Vec::new();
         let mut projection_only = Vec::new();
         let mut runner_controls = Vec::new();
+        #[derive(Clone, Copy)]
+        struct ClassificationContext {
+            maintenance_enabled: bool,
+            connection_retries_disabled: bool,
+        }
         fn visit(
             value: &Value,
             path: &mut Vec<String>,
-            maintenance_enabled: bool,
+            context: ClassificationContext,
             dictionary_disabled: bool,
             inert: &mut Vec<Value>,
             projection: &mut Vec<Value>,
@@ -446,7 +479,7 @@ impl Tunables {
                 let disabled = per_column && object.get("dictionary_enabled") == Some(&Value::Bool(false));
                 for (key, value) in object {
                     path.push(key.clone());
-                    visit(value, path, maintenance_enabled, disabled, inert, projection, controls)?;
+                    visit(value, path, context, disabled, inert, projection, controls)?;
                     path.pop();
                 }
                 return Ok(());
@@ -462,17 +495,22 @@ impl Tunables {
                 catalog_path[2] = "*";
             }
             let name = catalog_path.join(".");
-            if !CAPABILITIES.iter().any(|entry| entry.name == name) {
-                bail!("OAT tunable leaf missing from capability catalog: {}", path.join("."));
-            }
+            let capability = CAPABILITIES
+                .iter()
+                .find(|entry| entry.name == name)
+                .with_context(|| format!("OAT tunable leaf missing from capability catalog: {}", path.join(".")))?;
             let name = path.join(".");
-            let (destination, reason) = if !maintenance_enabled
+            let (destination, reason) = if !context.maintenance_enabled
                 && (name == "logging.maintenance"
                     || (name.starts_with("maintenance.") && name != "maintenance.enabled"))
             {
                 (inert, "maintenance_disabled")
             } else if name == "client.max_rows" {
                 (inert, "duration_based_run")
+            } else if capability.gate == Some(ApplicabilityGate::ConnectionRetries)
+                && context.connection_retries_disabled
+            {
+                (inert, "connection_retries_disabled")
             } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
                 (inert, "dictionary_disabled")
             } else if matches!(
@@ -491,7 +529,10 @@ impl Tunables {
         visit(
             &requested,
             &mut Vec::new(),
-            maintenance_enabled,
+            ClassificationContext {
+                maintenance_enabled,
+                connection_retries_disabled,
+            },
             false,
             &mut inert_fields,
             &mut projection_only,

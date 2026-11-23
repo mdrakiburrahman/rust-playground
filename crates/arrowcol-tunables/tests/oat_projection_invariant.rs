@@ -11,6 +11,33 @@ use std::time::Duration;
 const TUNABLES_SOURCE: &str = include_str!("../src/lib.rs");
 const WRITER_SOURCE: &str = include_str!("../../arrow-deltalake/src/writer.rs");
 
+#[test]
+fn connection_backoff_is_inert_only_when_retries_are_disabled() -> Result<()> {
+    for (retries, expected) in [(None, true), (Some(0), true), (Some(2), false)] {
+        let mut transport = json!({"retry_backoff_ms": 37});
+        if let Some(retries) = retries {
+            transport["connect_retries"] = json!(retries);
+        }
+        let tunables = Tunables::parse_oat_json(json!({"transport": transport}))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        let inert = evidence["inert_fields"].as_array().context("missing inert fields")?;
+        assert_eq!(
+            inert.iter().any(|entry| entry["path"] == "transport.retry_backoff_ms"
+                && entry["reason"] == "connection_retries_disabled"),
+            expected
+        );
+        assert_eq!(
+            evidence["projection_only"]
+                .as_array()
+                .context("missing projected fields")?
+                .iter()
+                .any(|entry| entry["path"] == "transport.retry_backoff_ms"),
+            !expected
+        );
+    }
+    Ok(())
+}
+
 // The scanner deliberately fails on unfamiliar field syntax rather than silently skipping it.
 // Vecs of scalar values and sorting_columns are treated as atomic values. The latter's
 // element schema is guarded separately below.

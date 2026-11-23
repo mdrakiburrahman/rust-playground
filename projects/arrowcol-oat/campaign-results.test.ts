@@ -949,6 +949,22 @@ test('nulls a duration-based run when the varied factor is a one-shot row limit'
   assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
 });
 
+test('nulls connection backoff when connection retries are disabled', () => {
+  const candidate = coveredCandidate('backoff', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.transport.retry_backoff_ms', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { transport: { retry_backoff_ms: 37 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'transport.retry_backoff_ms', reason: 'connection_retries_disabled' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: transport\.retry_backoff_ms: connection_retries_disabled/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
 test('nulls a per-column dictionary page limit when dictionary is explicitly disabled on that column', () => {
   const candidate = coveredCandidate('dictionary-off', 100, 240).map(row => ({
     ...row,

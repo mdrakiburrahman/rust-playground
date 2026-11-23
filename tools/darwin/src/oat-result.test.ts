@@ -36,6 +36,9 @@ test("inert tunable evidence is distinguished from unavailable or malformed evid
   assert.deepEqual(extractInertTunableFields({ inert_fields: [
     { path: "client.max_rows", reason: "duration_based_run" },
   ] }), [{ path: "client.max_rows", reason: "duration_based_run" }]);
+  assert.deepEqual(extractInertTunableFields({ inert_fields: [
+    { path: "transport.retry_backoff_ms", reason: "connection_retries_disabled" },
+  ] }), [{ path: "transport.retry_backoff_ms", reason: "connection_retries_disabled" }]);
   assert.deepEqual(extractInertTunableFields({ inert_fields: [field, {
     path: "parquet_writer.columns.customer_id.dictionary_page_size_limit", reason: "dictionary_disabled",
   }] })?.map(entry => entry.reason), ["maintenance_disabled", "dictionary_disabled"]);
