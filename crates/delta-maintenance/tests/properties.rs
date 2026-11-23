@@ -1165,8 +1165,10 @@ fn startup_readback_reports_effective_optimize_upload_settings() -> Result<()> {
 fn retention_overrides_are_validated_against_physical_table_policy_before_operations() -> Result<()> {
     let (root, mut settings, mut source) = fixture()?;
     settings.operations = vec![Operation::PruneLog];
-    settings.log_retention_ms = Some(7_200_000);
-    let error = startup_configuration(&settings).expect_err("below default physical retention");
+    settings.log_retention_ms = Some(14 * 24 * 60 * 60 * 1000);
+    let error = startup_configuration(&settings)
+        .err()
+        .context("below default physical retention accepted")?;
     assert!(error.to_string().contains("maintenance.log_retention_secs"));
     settings.log_retention_ms = Some(2_592_000_000);
     let readback = startup_configuration(&settings)?;

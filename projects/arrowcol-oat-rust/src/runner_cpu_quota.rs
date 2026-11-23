@@ -143,11 +143,27 @@ mod local_cpu_quota_tests {
     use super::*;
 
     #[test]
+    fn invalid_control_values_name_the_exact_oat_field() -> Result<()> {
+        let config: Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let mut candidate = config.clone();
+        candidate["platform"]["local"]["collector_cpu_quota"] = json!("max");
+        let error = serde_json::from_value::<OatConfig>(candidate).err().context("invalid quota accepted")?;
+        assert!(error.to_string().contains("platform.local.collector_cpu_quota"), "{error}");
+        let mut candidate = config;
+        candidate["overload_guard"]["container_memory_metric"] = json!("working-set");
+        let error = serde_json::from_value::<OatConfig>(candidate).err().context("invalid metric accepted")?;
+        assert!(error.to_string().contains("overload_guard.container_memory_metric"), "{error}");
+        Ok(())
+    }
+
+    #[test]
     fn quota_overlay_is_independent_and_rejects_invalid_input() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
-        for invalid in [json!(-1), json!(0), json!("max"), json!("2"), json!(true), json!({})] {
+        for invalid in [json!(-1), json!(0), json!(4097), json!(0.0000000001), json!("max"), json!("2"), json!(true), json!({})] {
             let parsed = serde_json::from_value::<arrowcol_tunables::CollectorCpuQuota>(invalid);
             assert!(parsed.is_err() || parsed.is_ok_and(|quota| quota.nano_cpus().is_err()));
         }

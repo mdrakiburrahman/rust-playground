@@ -2710,8 +2710,7 @@ mod tests {
                 "enabled":true, "apply":false, "operations":["prune_log"], "log_retention_secs":seconds
             }})
         };
-        let error = Tunables::parse_oat_json(candidate(7200)).expect_err("unsafe retention");
-        assert!(format!("{error:#}").contains("maintenance.log_retention_secs"));
+        assert!(error_text(Tunables::parse_oat_json(candidate(7200))).contains("maintenance.log_retention_secs"));
         let valid = Tunables::parse_oat_json(candidate(2_592_000))?;
         assert_eq!(
             valid.environment_for(ComponentRole::Maintenance)?["ARROWCOL_MAINT_LOG_RETENTION_SECS"],
