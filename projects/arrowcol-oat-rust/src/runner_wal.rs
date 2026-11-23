@@ -112,6 +112,7 @@ fn verify_wal_configuration(config: &OatConfig, observed: &Value) -> Result<()> 
         .pointer("/wal/instances")
         .and_then(Value::as_array)
         .context("configured WAL has no complete consumer aggregate readback")?;
+    ensure!(!instances.is_empty(), "configured WAL has an empty consumer aggregate readback");
     let milliseconds = |value: Option<u64>| value.map(|value| json!((u128::from(value) * 1_000_000).to_string()));
     let requested = [
         ("wal_flush_interval_ns", milliseconds(settings.flush_interval_ms)),
