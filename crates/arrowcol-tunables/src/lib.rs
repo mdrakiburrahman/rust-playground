@@ -407,6 +407,8 @@ pub struct RuntimeTunables {
     )]
     pub partition_grouping: Option<PartitionGrouping>,
     pub generated_partition_fast_path: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_binding")]
+    pub generated_partition_binding: Option<arrow_deltalake::GeneratedPartitionBinding>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_file_mapping_cache")]
     pub file_mapping_cache: Option<bool>,
 }
@@ -435,6 +437,14 @@ fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(
     serde_json::from_value(serde_json::Value::String(raw))
         .map(Some)
         .map_err(|e| serde::de::Error::custom(format!("collector.runtime.timestamp_kernel: {e}")))
+}
+
+fn deserialize_binding<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<arrow_deltalake::GeneratedPartitionBinding>, D::Error> {
+    arrow_deltalake::GeneratedPartitionBinding::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("collector.runtime.generated_partition_binding: {error}")))
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

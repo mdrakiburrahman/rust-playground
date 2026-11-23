@@ -1711,6 +1711,38 @@ mod io_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn coalesced_generated_ingestion_preserves_rows_and_rejects_mismatches() -> Result<()> {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+
+        // Runtime configuration and OTel instruments are process-wide. Use a fresh
+        // process per arm so the real writer and its counters see the selected mode.
+        if std::env::var_os("G7_BINDING_TEST_CHILD").is_none() {
+            for mode in ["revalidate_rows", "proven_constant"] {
+                for fast_path in ["false", "true"] {
+                    let output = std::process::Command::new(std::env::current_exe()?)
+                        .args([
+                            "--exact",
+                            "delta::io_tests::coalesced_generated_ingestion_preserves_rows_and_rejects_mismatches",
+                        ])
+                        .env("G7_BINDING_TEST_CHILD", "1")
+                        .env("ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING", mode)
+                        .env("ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH", fast_path)
+                        .output()?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    anyhow::ensure!(
+                        output.status.success() && stdout.contains("1 passed;"),
+                        "{mode}/{fast_path}: {stdout} {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
         let directory = tempfile::tempdir()?;
         let url = Url::from_directory_path(fs::canonicalize(directory.path())?)
             .map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
@@ -1727,7 +1759,18 @@ mod io_tests {
             .stage_coalesced_publications(
                 vec![
                     (input_batch()?, "first".into(), 0, 3_600_000),
-                    (input_batch()?, "second".into(), 0, 3_600_000),
+                    (
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(arrow::array::Int32Array::from(vec![43])),
+                                Arc::new(arrow::array::StringArray::from(vec!["1970-01-01"])),
+                            ],
+                        )?,
+                        "second".into(),
+                        0,
+                        3_600_000,
+                    ),
                 ],
                 2,
             )
@@ -1745,7 +1788,32 @@ mod io_tests {
             .as_any()
             .downcast_ref::<arrow::array::Int32Array>()
             .context("ids")?;
-        assert_eq!(ids.values(), &[42, 42]);
+        assert_eq!(ids.values(), &[42, 43]);
+        provider.force_flush()?;
+        let mut paths = BTreeMap::new();
+        for resource in exporter.get_finished_metrics()? {
+            for metric in resource.scope_metrics().flat_map(|scope| scope.metrics()) {
+                if metric.name() == "delta.partition.binding.batches"
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    for point in sum.data_points() {
+                        let attribute = point
+                            .attributes()
+                            .find(|kv| kv.key.as_str() == "path")
+                            .context("binding path")?;
+                        paths.insert(attribute.value.as_str().into_owned(), point.value());
+                    }
+                }
+            }
+        }
+        if std::env::var("ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING")? == "proven_constant" {
+            assert_eq!(
+                paths,
+                BTreeMap::from([("proven_constant".into(), 1), ("fallback_revalidate_rows".into(), 1)])
+            );
+        } else {
+            assert!(paths.is_empty());
+        }
         table.commit_files(&staged)?;
         let log = fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;
         assert!(log.lines().any(|line| {
@@ -1760,6 +1828,14 @@ mod io_tests {
                 Arc::new(arrow::array::StringArray::from(vec!["1970-01-01", "1970-01-02"])),
             ],
         )?;
+        // Binding the correct first-row value through the public API is not proof.
+        let mut direct = table.new_file_partitioned(
+            supplied.schema(),
+            BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some("1970-01-01".to_owned()))]),
+        )?;
+        let error = direct.write(&supplied).await.err().context("accepted a mixed partition")?;
+        assert!(error.to_string().contains("differs from bound write context"));
+        drop(direct);
         let error = match table
             .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2)
             .await
@@ -2392,9 +2468,14 @@ impl Display for CoalescedGroupCapacityExceeded {
 
 impl Error for CoalescedGroupCapacityExceeded {}
 
+// Travels with one input (or a row selection of it), never with the whole file:
+// a caller-supplied column can land in the very same partition as a generated one.
+#[derive(Clone)]
+struct GeneratedIngestion(Arc<str>);
+
 struct CoalescedPartitionOutput {
     values: BTreeMap<String, Option<String>>,
-    files: Vec<Vec<RecordBatch>>,
+    files: Vec<Vec<(RecordBatch, Option<GeneratedIngestion>)>>,
     file_rows: Vec<usize>,
     file_bytes: Vec<usize>,
 }
@@ -4037,6 +4118,7 @@ impl DeltaTable {
                 None
             };
             let mut generated_ingestion = false;
+            let mut proof = None;
             if let Some(expected) = &expected_ingestion
                 && batch.schema().field_with_name(INGESTION_PARTITION).is_err()
             {
@@ -4053,6 +4135,11 @@ impl DeltaTable {
                 ])));
                 batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
                 generated_ingestion = true;
+                if runtime.generated_partition_binding == crate::GeneratedPartitionBinding::ProvenConstant
+                    && partitions == [INGESTION_PARTITION]
+                {
+                    proof = Some(GeneratedIngestion(Arc::from(expected.as_str())));
+                }
             }
             if let Some(schema) = &schema {
                 if schema.as_ref() != batch.schema().as_ref() {
@@ -4165,7 +4252,7 @@ impl DeltaTable {
                             .context("coalesced output file count overflow")?;
                     }
                     let rows = batch.num_rows();
-                    partition.files[0].push(batch);
+                    partition.files[0].push((batch, proof.clone()));
                     partition.file_rows[0] = partition.file_rows[0]
                         .checked_add(rows)
                         .context("coalesced partition row count overflow")?;
@@ -4226,7 +4313,7 @@ impl DeltaTable {
                     partition.file_bytes[file] = partition.file_bytes[file]
                         .checked_add(bytes)
                         .context("coalesced partition memory count overflow")?;
-                    partition.files[file].push(chunk);
+                    partition.files[file].push((chunk, proof.clone()));
                     start += rows;
                 }
             }
@@ -4283,8 +4370,8 @@ impl DeltaTable {
                             layout.is_some(),
                         )?;
                     }
-                    for batch in &batches {
-                        writer.write(batch).await?;
+                    for (batch, proof) in &batches {
+                        writer.write_bound(batch, proof.as_ref()).await?;
                     }
                     writer.stage().await
                 }
@@ -5241,10 +5328,14 @@ impl DeltaFileWriter {
     /// # Errors
     /// Rejects incompatible batches and returns write/statistics errors.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_bound(batch, None).await
+    }
+
+    async fn write_bound(&mut self, batch: &RecordBatch, proof: Option<&GeneratedIngestion>) -> Result<()> {
         if self.failed {
             bail!("Delta file previously failed; refusing further writes");
         }
-        let result = self.write_batch(batch).await;
+        let result = self.write_batch(batch, proof).await;
         if result.is_err() {
             self.failed = true;
         }
@@ -5263,7 +5354,7 @@ impl DeltaFileWriter {
         self.accepted_input_bytes
     }
 
-    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    async fn write_batch(&mut self, batch: &RecordBatch, proof: Option<&GeneratedIngestion>) -> Result<()> {
         let build_started = Instant::now();
         let input_bytes = record_batch_logical_bytes(batch)?;
         let mut batch = if self.canonical_input {
@@ -5271,27 +5362,47 @@ impl DeltaFileWriter {
         } else {
             normalize::batch_with_kernel(batch, runtime_config()?.timestamp_kernel)?
         };
-        for (name, expected) in &self.partition_values {
-            if let Ok(index) = batch.schema().index_of(name) {
-                for row in 0..batch.num_rows() {
-                    let actual = crate::partition::value(batch.column(index).as_ref(), row)?;
-                    if actual != *expected {
-                        bail!("batch partition value differs from bound write context");
+        if let Some(GeneratedIngestion(value)) = proof {
+            let field_schema = batch.schema();
+            let field = field_schema.field_with_name(INGESTION_PARTITION)?;
+            anyhow::ensure!(
+                self.partition_values.len() == 1
+                    && self
+                        .partition_values
+                        .get(INGESTION_PARTITION)
+                        .and_then(Option::as_deref)
+                        == Some(value.as_ref())
+                    && field.data_type() == &arrow::datatypes::DataType::Utf8
+                    && !field.is_nullable(),
+                "generated partition proof differs from bound write context"
+            );
+            crate::telemetry::partition_binding("proven_constant");
+        } else if !self.partition_values.is_empty() {
+            if runtime_config()?.generated_partition_binding == crate::GeneratedPartitionBinding::ProvenConstant {
+                crate::telemetry::partition_binding("fallback_revalidate_rows");
+            }
+            for (name, expected) in &self.partition_values {
+                if let Ok(index) = batch.schema().index_of(name) {
+                    for row in 0..batch.num_rows() {
+                        let actual = crate::partition::value(batch.column(index).as_ref(), row)?;
+                        if actual != *expected {
+                            bail!("batch partition value differs from bound write context");
+                        }
                     }
+                } else {
+                    let mut fields = batch.schema().fields().to_vec();
+                    fields.push(Arc::new(arrow::datatypes::Field::new(
+                        name,
+                        arrow::datatypes::DataType::Utf8,
+                        expected.is_none(),
+                    )));
+                    let mut columns = batch.columns().to_vec();
+                    columns.push(Arc::new(arrow::array::StringArray::from(vec![
+                        expected.as_deref();
+                        batch.num_rows()
+                    ])));
+                    batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
                 }
-            } else {
-                let mut fields = batch.schema().fields().to_vec();
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    name,
-                    arrow::datatypes::DataType::Utf8,
-                    expected.is_none(),
-                )));
-                let mut columns = batch.columns().to_vec();
-                columns.push(Arc::new(arrow::array::StringArray::from(vec![
-                    expected.as_deref();
-                    batch.num_rows()
-                ])));
-                batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
             }
         }
         if self.schema.field_with_name(INGESTION_PARTITION).is_ok()

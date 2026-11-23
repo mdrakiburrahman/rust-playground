@@ -74,6 +74,39 @@ impl PartitionGrouping {
     }
 }
 
+/// Writer-side validation of a bound ingestion partition (independent of grouping).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(try_from = "String", rename_all = "snake_case")]
+pub enum GeneratedPartitionBinding {
+    #[default]
+    RevalidateRows,
+    ProvenConstant,
+}
+
+impl GeneratedPartitionBinding {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RevalidateRows => "revalidate_rows",
+            Self::ProvenConstant => "proven_constant",
+        }
+    }
+}
+
+impl TryFrom<String> for GeneratedPartitionBinding {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: String) -> Result<Self> {
+        match raw.as_str() {
+            "revalidate_rows" => Ok(Self::RevalidateRows),
+            "proven_constant" => Ok(Self::ProvenConstant),
+            _ => {
+                anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}")
+            }
+        }
+    }
+}
+
 /// Stable size and row counters for one completed Parquet file.
 ///
 /// `input_bytes` is the logical size of the Arrow slices accepted by the

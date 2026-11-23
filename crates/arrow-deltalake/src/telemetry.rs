@@ -196,6 +196,7 @@ impl MetricsReporter for KernelReporter {
 struct PublicationMetrics {
     events: Counter<u64>,
     duration: Histogram<f64>,
+    binding_batches: Counter<u64>,
     committed_rows: Counter<u64>,
     committed_files: Counter<u64>,
     committed_input_bytes: Counter<u64>,
@@ -209,12 +210,17 @@ fn publications() -> &'static PublicationMetrics {
         PublicationMetrics {
             events: meter.u64_counter("delta.publication.events").build(),
             duration: meter.f64_histogram("delta.publication.duration").with_unit("s").build(),
+            binding_batches: meter.u64_counter("delta.partition.binding.batches").build(),
             committed_rows: meter.u64_counter("delta.commit.rows").build(),
             committed_files: meter.u64_counter("delta.commit.files").build(),
             committed_input_bytes: meter.u64_counter("delta.commit.input_bytes").with_unit("By").build(),
             committed_bytes: meter.u64_counter("delta.commit.parquet_bytes").with_unit("By").build(),
         }
     })
+}
+
+pub(crate) fn partition_binding(path: &'static str) {
+    publications().binding_batches.add(1, &[KeyValue::new("path", path)]);
 }
 
 /// Counts only newly committed AddFiles after the local durability barrier.

@@ -81,6 +81,9 @@ pub struct DeltaRuntimeConfig {
     /// Skip row-wise grouping for internally generated single ingestion partitions.
     #[serde(default)]
     pub generated_partition_fast_path: bool,
+    /// Row binding policy; does not enable the grouping fast path.
+    #[serde(default)]
+    pub generated_partition_binding: crate::GeneratedPartitionBinding,
     /// Reuse the bound logical projection and evaluator within one file.
     #[serde(default)]
     pub file_mapping_cache: bool,
@@ -120,6 +123,7 @@ impl DeltaRuntimeConfig {
             partition_grouping: crate::PartitionGrouping::default(),
             generated_partition_fast_path: false,
             file_mapping_cache: false,
+            generated_partition_binding: crate::GeneratedPartitionBinding::RevalidateRows,
         }
     }
 
@@ -193,6 +197,10 @@ impl DeltaRuntimeConfig {
             config.partition_grouping = raw
                 .try_into()
                 .map_err(|message: &str| anyhow::anyhow!("{name}: {message}"))?;
+        }
+        let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING";
+        if let Some(raw) = lookup(name)? {
+            config.generated_partition_binding = raw.try_into().context(name)?;
         }
         let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH";
         if let Some(raw) = lookup(name)? {
@@ -714,6 +722,29 @@ mod tests {
         }
         for raw in ["", "TYPED_RUNS", "typed_runs ", "auto"] {
             assert!(DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned()))).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_partition_binding_is_strictly_opt_in() -> Result<()> {
+        let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING";
+        assert_eq!(
+            DeltaRuntimeConfig::from_lookup(|_| Ok(None))?
+                .generated_partition_binding
+                .as_str(),
+            "revalidate_rows"
+        );
+        for raw in ["revalidate_rows", "proven_constant"] {
+            let config = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))?;
+            assert_eq!(config.generated_partition_binding.as_str(), raw);
+            assert!(!config.generated_partition_fast_path);
+        }
+        for raw in ["", "true", "PROVEN_CONSTANT", "proven_constant "] {
+            let error = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))
+                .err()
+                .context("invalid binding unexpectedly accepted")?;
+            assert!(format!("{error:#}").contains(name));
         }
         Ok(())
     }
