@@ -71,7 +71,7 @@ fn setup_only_cli_requires_explicit_partition_opt_in() -> Result<()> {
     let root = tempfile::tempdir()?;
     let output = run_initializer(root.path(), false)?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("requires --partition-by-ingestion-date"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires exactly one partition mode"));
     assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
     Ok(())
 }
