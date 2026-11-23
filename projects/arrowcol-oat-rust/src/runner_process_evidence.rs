@@ -995,10 +995,9 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
     Ok(records)
 }
 
-#[cfg(test)]
 fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
     if !matches!(role, ComponentRole::Collector) { return Ok(()); }
-    let Some(expected_hash) = config.platform.collector_build_profile_hash.as_deref() else { return Ok(()); };
+    let Some(expected_hash) = config.collector_build_profile_hash() else { return Ok(()); };
     let profile = config.tunables.collector.as_ref()
         .filter(|collector| collector.has_build_profile())
         .context("collector build-profile readback was requested without typed build-profile settings")?
@@ -1019,6 +1018,7 @@ fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRo
     Ok(())
 }
 
+#[cfg(test)]
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
     let mut logs = logs.to_vec();
     let router_environment = config.tunables.environment_for(ComponentRole::Router)?;

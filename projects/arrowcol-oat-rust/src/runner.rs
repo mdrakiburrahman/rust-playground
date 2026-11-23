@@ -8019,8 +8019,7 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
     for (role, default_source) in sources {
         let source = if role == "collector" {
             config
-                .platform
-                .collector_build_profile_hash
+                .collector_build_profile_hash()
                 .as_deref()
                 .map(local_collector_profile_tag)
                 .unwrap_or_else(|| default_source.to_owned())
@@ -8028,12 +8027,12 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
             default_source.to_owned()
         };
         let image = if role == "collector" {
-            if let Some(profile_hash) = config.platform.collector_build_profile_hash.as_deref() {
+            if let Some(profile_hash) = config.collector_build_profile_hash() {
                 let mut inspect = Command::new("docker");
                 inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
                 let output = run_command(inspect, "resolve profile-specific local collector image").await?;
                 let observed = String::from_utf8(output.stdout)?;
-                verify_collector_profile_image(&observed, profile_hash)?
+                verify_collector_profile_image(&observed, &profile_hash)?
             } else {
                 let mut inspect = Command::new("docker");
                 inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);
@@ -8051,11 +8050,6 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
         images.insert(role.to_owned(), image);
     }
     if let Some(collector) = &config.platform.local.collector_image_override {
-        if config.platform.collector_build_profile_hash.is_some() {
-            bail!(
-                "platform.local.collector_image_override cannot be combined with platform.collector_build_profile_hash"
-            );
-        }
         let mut inspect = Command::new("docker");
         inspect.args([
             "image",
@@ -8072,7 +8066,7 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
     let path = platform.state_dir.join("tunables.compose.json");
     let mut overlay: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
     apply_stable_local_images(&mut overlay, &images, config.platform.local.expected_image_ids.as_ref())?;
-    tokio::fs::write(&path, serde_json::to_vec(&overlay)?)?;
+    tokio::fs::write(&path, serde_json::to_vec(&overlay)?).await?;
     println!("[oat] immutable local images: {}", serde_json::to_string(&images)?);
     Ok(())
 }
@@ -10832,6 +10826,7 @@ fn select_aks_collector_profile_image(runtime_config: &mut Value, profile_hash: 
         .get("collectorBuildImages")
         .and_then(|profiles| profiles.get(profile_hash))
         .and_then(Value::as_str)
+        .map(str::to_owned)
         .with_context(|| {
             format!("AKS runtime config is missing the collector image for build profile {profile_hash}")
         })?;
@@ -10904,8 +10899,8 @@ async fn prepare_aks_platform(
     if runtime_config.get("stamp").and_then(Value::as_str) != config.stamp.as_deref() {
         bail!("deployed-stamp runtime config does not match the OAT-selected stamp");
     }
-    if let Some(profile_hash) = config.platform.collector_build_profile_hash.as_deref() {
-        select_aks_collector_profile_image(&mut runtime_config, profile_hash)?;
+    if let Some(profile_hash) = config.collector_build_profile_hash() {
+        select_aks_collector_profile_image(&mut runtime_config, &profile_hash)?;
     }
     let shared_data_root = runtime_config
         .get("deltaRoot")
