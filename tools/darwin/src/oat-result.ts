@@ -13,7 +13,7 @@ type JsonObject = Record<string, unknown>;
 
 export interface InertTunableField {
   path: string;
-  reason: "maintenance_disabled" | "dictionary_disabled" | "duration_based_run" | "connection_retries_disabled" | "http2_keepalive_disabled" | "adaptive_http2_window" | "tcp_keepalive_disabled" | "rate_limit_disabled";
+  reason: "maintenance_disabled" | "dictionary_disabled" | "duration_based_run" | "connection_retries_disabled" | "stream_retries_disabled" | "http2_keepalive_disabled" | "adaptive_http2_window" | "tcp_keepalive_disabled" | "rate_limit_disabled";
 }
 
 export interface ProjectionOnlyField {
@@ -28,7 +28,7 @@ export interface RunnerControlField {
 
 export interface ConsumerVerifiedField {
   path: string;
-  reason: "consumer_startup_readback";
+  reason: "consumer_startup_readback" | "consumer_table_writer_readback";
 }
 
 function extractFields<R extends string>(evidence: JsonObject, key: string, reasons: readonly R[]): { path: string; reason: R }[] | null {
@@ -46,7 +46,7 @@ function extractFields<R extends string>(evidence: JsonObject, key: string, reas
 }
 
 export function extractInertTunableFields(evidence: JsonObject): InertTunableField[] | null {
-  return extractFields(evidence, "inert_fields", ["maintenance_disabled", "dictionary_disabled", "duration_based_run", "connection_retries_disabled", "http2_keepalive_disabled", "adaptive_http2_window", "tcp_keepalive_disabled", "rate_limit_disabled"] as const);
+  return extractFields(evidence, "inert_fields", ["maintenance_disabled", "dictionary_disabled", "duration_based_run", "connection_retries_disabled", "stream_retries_disabled", "http2_keepalive_disabled", "adaptive_http2_window", "tcp_keepalive_disabled", "rate_limit_disabled"] as const);
 }
 
 function object(value: unknown, label: string): JsonObject {
@@ -317,7 +317,7 @@ export async function readReconciledOatResult(
   const inertFields = extractInertTunableFields(evidence);
   const projectionOnly = extractFields(evidence, "projection_only", ["consumer_startup_proof_unverified"] as const);
   const runnerControls = extractFields(evidence, "runner_controls", ["maintenance_runner_control", "router_log_filter_inheritance"] as const);
-  const consumerVerified = extractFields(evidence, "consumer_verified", ["consumer_startup_readback"] as const);
+  const consumerVerified = extractFields(evidence, "consumer_verified", ["consumer_startup_readback", "consumer_table_writer_readback"] as const);
   const coveragePaths = [inertFields, projectionOnly, runnerControls, consumerVerified]
     .flatMap(fields => fields?.map(field => field.path) ?? []);
   if (new Set(coveragePaths).size !== coveragePaths.length) throw new Error("duplicate tunable coverage path");

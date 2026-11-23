@@ -44,7 +44,8 @@ test("inert tunable evidence is distinguished from unavailable or malformed evid
     { path: "transport.keepalive_timeout_ms", reason: "http2_keepalive_disabled" },
     { path: "transport.tcp_keepalive_retries", reason: "tcp_keepalive_disabled" },
     { path: "transport.rate_limit_period_ms", reason: "rate_limit_disabled" },
-  ] })?.map(entry => entry.reason), ["adaptive_http2_window", "http2_keepalive_disabled", "tcp_keepalive_disabled", "rate_limit_disabled"]);
+    { path: "client.stream_retry_base_backoff_ms", reason: "stream_retries_disabled" },
+  ] })?.map(entry => entry.reason), ["adaptive_http2_window", "http2_keepalive_disabled", "tcp_keepalive_disabled", "rate_limit_disabled", "stream_retries_disabled"]);
   assert.deepEqual(extractInertTunableFields({ inert_fields: [field, {
     path: "parquet_writer.columns.customer_id.dictionary_page_size_limit", reason: "dictionary_disabled",
   }] })?.map(entry => entry.reason), ["maintenance_disabled", "dictionary_disabled"]);
@@ -182,7 +183,10 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       inert_fields: [{ path: "logging.maintenance", reason: "maintenance_disabled" }],
       projection_only: [{ path: "collector.upload.mode", reason: "consumer_startup_proof_unverified" }],
       runner_controls: [{ path: "maintenance.enabled", reason: "maintenance_runner_control" }],
-      consumer_verified: [{ path: "client.workers", reason: "consumer_startup_readback" }],
+      consumer_verified: [
+        { path: "client.workers", reason: "consumer_startup_readback" },
+        { path: "parquet_writer.max_row_group_rows", reason: "consumer_table_writer_readback" },
+      ],
       processes: [{ component: "collector", source_revision: revision, log_complete: true,
         image_id: `sha256:${"b".repeat(64)}`, effective_config_source: "consumer_startup_readback",
         effective_config: { commit_telemetry: { schema_version: 1, scope: "new_ingestion_addfiles_after_sync", clock: "system_unix_ms" } },

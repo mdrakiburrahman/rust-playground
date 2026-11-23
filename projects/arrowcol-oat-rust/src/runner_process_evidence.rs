@@ -2108,7 +2108,9 @@ mod consumer_startup_projection_tests {
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
-                    "heartbeat_interval":"4s","registration_ttl":"30s"}
+                    "heartbeat_interval":"4s","registration_ttl":"30s"},
+                "runtime":{"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
+                    "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4}
             }
         }))?;
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2212,7 +2214,7 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 11);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 19);
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
@@ -2234,6 +2236,8 @@ groups:
             ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
                 "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
                 "heartbeat_interval", "registration_ttl"][..]),
+            ("runtime", &["runtime_workers", "blocking_workers", "blocking_fs_reserve", "task_limit",
+                "read_ahead", "batch_rows", "cpu_workers", "cpu_queue_jobs"][..]),
         ] {
             for field in fields {
                 let mut missing = observed.clone();
@@ -2241,6 +2245,10 @@ groups:
                     .remove(*field).context("consumer omitted requested field")?;
                 anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
                     "verifier accepted missing {group}.{field}");
+                let mut wrong = observed.clone();
+                wrong[group][*field] = json!("wrong");
+                anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err(),
+                    "verifier accepted wrong {group}.{field}");
             }
         }
         let mut wrong = observed;
@@ -2302,6 +2310,42 @@ groups:
             anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
             let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
             verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            if policy.get("max_row_group_rows").is_some() {
+                config.tables.push("sqlserver_availability_replica_states".to_owned());
+                let events = config.tables.iter().map(|table| Ok(format!(
+                    "arrowcol_effective_config {}\n", json!({
+                        "component":"layout", "scope":"table_effective", "table_id":"a".repeat(64),
+                        "table_name":canonical_dmv_table_name(table)?,
+                        "config":{"enabled":true, "sort_columns":[], "bloom_columns":[],
+                            "max_rows":65536, "max_input_bytes":1048576,
+                            "row_group_rows":policy["max_row_group_rows"], "page_rows":policy["data_page_row_count_limit"]}
+                    })
+                ))).collect::<Result<String>>()?;
+                let tables = collector_layout_records(&config, &events)?;
+                let mut process = json!({
+                    "component":"collector", "instance_id":"collector-1", "log_complete":true,
+                    "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+                    "effective_config":observed, "writer_policy_overrides":observed["parquet_writer"],
+                    "layout_table_policies":tables,
+                });
+                let initial = tunable_leaf_evidence(&config)?;
+                let mut covered = initial.clone();
+                promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+                for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit"] {
+                    assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
+                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"));
+                }
+                process["layout_table_policies"][0]["config"]["row_group_rows"] = json!(1);
+                let mut uncovered = initial.clone();
+                promote_collector_readback(&config, &mut uncovered, Some(&json!([process.clone()])), 1)?;
+                assert!(uncovered["projection_only"].as_array().context("missing projection fields")?
+                    .iter().any(|entry| entry["path"] == "parquet_writer.max_row_group_rows"));
+                process["layout_table_policies"].as_array_mut().context("missing table policies")?.remove(0);
+                let mut missing = initial.clone();
+                promote_collector_readback(&config, &mut missing, Some(&json!([process])), 1)?;
+                assert_eq!(missing, initial);
+                config.tables.pop();
+            }
             let mut leaves = Vec::new();
             leaf_paths(&policy, &mut Vec::new(), &mut leaves);
             for path in leaves {
@@ -2397,7 +2441,7 @@ groups:
             (json!({"transport":{"rate_limit_rps":123}}), "rate_limit_rps"),
             (json!({"transport":{"rate_limit_rps":123,"rate_limit_period_ms":250}}), "rate_limit_period_ms"),
             (json!({"transport":{"connect_retries":3}}), "connect_retries"),
-            (json!({"transport":{"retry_backoff_ms":1}}), "retry_backoff_ms"),
+            (json!({"transport":{"connect_retries":1,"retry_backoff_ms":1}}), "retry_backoff_ms"),
             (json!({"transport":{"endpoint_concurrency_limit":23}}), "endpoint_concurrency_limit"),
             (json!({"transport":{"endpoint_buffer_size":37}}), "endpoint_buffer_size"),
             (json!({"transport":{"ipc_compression":"zstd"}}), "ipc_compression"),
@@ -2431,19 +2475,29 @@ groups:
             verify_process_configuration(&config, ComponentRole::Client, &observed)
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
+                | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
+                | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "max_memory_bytes"
+                | "stream_retry_max_attempts" | "stream_retry_base_backoff_ms" | "stream_retry_max_backoff_ms"
                 | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
                 | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
                 | "keepalive_timeout_ms" | "keepalive_while_idle"
                 | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
                 | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
-                | "rate_limit_period_ms"
+                | "rate_limit_period_ms" | "rate_limit_rps" | "connect_retries" | "retry_backoff_ms"
+                | "grpc_send_compression" | "grpc_accept_compression" | "ipc_compression"
                 | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
                 config.clients_per_table = 1;
                 let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
                 let initial = tunable_leaf_evidence(&config)?;
                 let mut covered = initial.clone();
                 promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
-                assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 1);
+                let path = if input.get("arrow_ipc").is_some() {
+                    "arrow_ipc.compression".to_owned()
+                } else {
+                    format!("{}.{}", if input.get("client").is_some() { "client" } else { "transport" }, field)
+                };
+                assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+                    .iter().any(|entry| entry["path"] == path), "missing verified field {path}");
                 let mut wrong_report = report.clone();
                 wrong_report["consumer_effective_config"][field] = json!("wrong");
                 for reports in [vec![], vec![wrong_report], vec![report.clone(), report]] {
@@ -2463,6 +2517,19 @@ groups:
                 "adapter accepted wrong {field} for {input}");
         }
         config.clients_per_table = 1;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":{
+            "workers":0, "runtime_threads":0, "batch_rows":0, "streams_per_worker":0
+        }}))?;
+        let auto = actual_client_startup(&binary, &config)?;
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        let mut report = json!({"client_id":"client-1", "consumer_effective_config":auto});
+        promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
+        assert_eq!(covered["consumer_verified"].as_array().context("missing verified fields")?.len(), 4);
+        report["consumer_effective_config"]["resolution"]["requested"]["workers"] = json!(1);
+        let mut unverified = initial;
+        promote_client_readback(&config, &mut unverified, Some(&vec![report]))?;
+        assert!(unverified["consumer_verified"].as_array().context("missing verified fields")?.is_empty());
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
             "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
             "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false,

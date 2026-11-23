@@ -109,6 +109,40 @@ fn tcp_keepalive_options_follow_the_enable_setting() -> Result<()> {
 }
 
 #[test]
+fn stream_backoff_is_inert_when_no_retry_is_allowed() -> Result<()> {
+    for (attempts, inert) in [(1, true), (2, false)] {
+        let tunables = Tunables::parse_oat_json(json!({"client":{
+            "stream_retry_max_attempts":attempts,
+            "stream_retry_base_backoff_ms":13,
+            "stream_retry_max_backoff_ms":300
+        }}))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        for path in [
+            "client.stream_retry_base_backoff_ms",
+            "client.stream_retry_max_backoff_ms",
+        ] {
+            assert_eq!(
+                evidence["inert_fields"]
+                    .as_array()
+                    .context("missing inert fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path && entry["reason"] == "stream_retries_disabled"),
+                inert
+            );
+            assert_eq!(
+                evidence["projection_only"]
+                    .as_array()
+                    .context("missing projected fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path),
+                !inert
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn rate_limit_period_is_strict_and_inert_when_disabled() -> Result<()> {
     let unchanged = Tunables::parse_oat_json(json!({"transport":{"rate_limit_rps": 2}}))?;
     assert!(
@@ -711,6 +745,35 @@ fn disabled_column_dictionary_makes_its_page_limit_inert() -> Result<()> {
             {"path": "parquet_writer.columns.customer_id.dictionary_page_size_limit", "reason": "dictionary_disabled"}
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn dictionary_page_limits_follow_global_and_column_overrides() -> Result<()> {
+    for (enabled_override, default_inert) in [(false, true), (true, false)] {
+        let tunables = Tunables::parse_oat_json(json!({
+            "parquet_writer": {
+                "defaults":{"dictionary_enabled":false,"dictionary_page_size_limit":4096},
+                "columns":{
+                    "inherited":{"dictionary_page_size_limit":1024},
+                    "override":{"dictionary_enabled":enabled_override,"dictionary_page_size_limit":2048}
+                }
+            }
+        }))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        let inert = evidence["inert_fields"].as_array().context("missing inert fields")?;
+        let has = |path: &str| {
+            inert
+                .iter()
+                .any(|entry| entry["path"] == path && entry["reason"] == "dictionary_disabled")
+        };
+        assert_eq!(has("parquet_writer.defaults.dictionary_page_size_limit"), default_inert);
+        assert!(has("parquet_writer.columns.inherited.dictionary_page_size_limit"));
+        assert_eq!(
+            has("parquet_writer.columns.override.dictionary_page_size_limit"),
+            !enabled_override
+        );
+    }
     Ok(())
 }
 

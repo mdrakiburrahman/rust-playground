@@ -965,6 +965,22 @@ test('nulls connection backoff when connection retries are disabled', () => {
   assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
 });
 
+test('nulls stream backoff when stream retries are disabled', () => {
+  const candidate = coveredCandidate('stream-backoff', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.client.stream_retry_base_backoff_ms', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: { stream_retry_base_backoff_ms: 13 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'client.stream_retry_base_backoff_ms', reason: 'stream_retries_disabled' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: client\.stream_retry_base_backoff_ms: stream_retries_disabled/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
 test('nulls HTTP/2 factors that are overridden or disabled', () => {
   for (const [field, reason] of [
     ['stream_window_bytes', 'adaptive_http2_window'],
@@ -1123,6 +1139,25 @@ test('a projection-only repeat nulls its whole cell and preserves a dead Kustain
   assert.match(svg, /consumption unproven; applicability unknown/);
   assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited before downstream observation/);
   assert.doesNotMatch(svg, /projected-death \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+});
+
+test('accepts table-writer readback for active Parquet limits', () => {
+  const candidate = coveredCandidate('writer-limits', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.parquet_writer.max_row_group_rows', 'tunables.parquet_writer.data_page_row_count_limit'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { parquet_writer: {
+      max_row_group_rows: 16384, data_page_row_count_limit: 2048,
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.max_row_group_rows', reason: 'consumer_table_writer_readback' },
+        { path: 'parquet_writer.data_page_row_count_limit', reason: 'consumer_table_writer_readback' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), />800\*?<\/text>/);
 });
 
 test('an active cell retains its committed rate after Kustainer death', () => {

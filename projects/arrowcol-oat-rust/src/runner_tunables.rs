@@ -40,6 +40,13 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         return Ok(());
     };
     let environment = role_environment(config, ComponentRole::Collector)?;
+    let parquet_policy: Option<Value> = environment.get("ARROWCOL_PARQUET_CONFIG")
+        .map(|value| serde_json::from_str(value)).transpose()?;
+    let expected_tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let table_policies = collectors.iter()
+        .flat_map(|process| process["layout_table_policies"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
     let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
@@ -53,6 +60,54 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        let parquet_field = match path {
+            "parquet_writer.max_row_group_rows" => Some(("max_row_group_rows", "row_group_rows")),
+            "parquet_writer.data_page_row_count_limit" => Some(("data_page_row_count_limit", "page_rows")),
+            _ => None,
+        };
+        if let Some((requested_field, observed_field)) = parquet_field {
+            let Some(requested) = parquet_policy.as_ref().and_then(|policy| policy.get(requested_field))
+                .filter(|value| value.as_u64().is_some_and(|number| number > 0)) else {
+                return true;
+            };
+            let observed_tables = table_policies.iter()
+                .filter_map(|policy| policy["table_name"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !expected_tables.is_empty()
+                && collectors.iter().all(|process| process["layout_table_policies"].is_array())
+                && expected_tables.iter().all(|table| observed_tables.contains(table.as_str()))
+                && table_policies.iter().all(|policy| {
+                    policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
+                        && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
+                        && policy["config"]["enabled"] == true
+                        && policy["config"][observed_field] == *requested
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
+                return false;
+            }
+            return true;
+        }
+        let runtime = match path {
+            "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
+            "collector.runtime.blocking_workers" => Some(("blocking_workers", "ARROWCOL_COLLECTOR_BLOCKING_WORKERS")),
+            "collector.runtime.blocking_fs_reserve" => Some(("blocking_fs_reserve", "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE")),
+            "collector.runtime.task_limit" => Some(("task_limit", "ARROWCOL_COLLECTOR_TASK_LIMIT")),
+            "collector.runtime.read_ahead" => Some(("read_ahead", "ARROWCOL_COLLECTOR_READ_AHEAD")),
+            "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
+            "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
+            "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
+            _ => None,
+        };
+        if let Some((field, variable)) = runtime {
+            if environment.contains_key(variable)
+                && collectors.iter().all(|process| process["effective_config"]["runtime"].get(field).is_some())
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
@@ -119,7 +174,22 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
     let mut promoted = Vec::new();
     projection.retain(|entry| {
         let (field, variable) = match entry["path"].as_str() {
+            Some("client.workers") => ("workers", "ARROWCOL_CLIENT_WORKERS"),
+            Some("client.runtime_threads") => ("runtime_threads", "ARROWCOL_CLIENT_RUNTIME_THREADS"),
+            Some("client.batch_rows") => ("batch_rows", "ARROWCOL_CLIENT_BATCH_ROWS"),
+            Some("client.connections_per_worker") => ("connections_per_worker", "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER"),
+            Some("client.streams_per_worker") => ("streams_per_worker", "ARROWCOL_CLIENT_STREAMS_PER_WORKER"),
+            Some("client.interval_us") => ("interval_us", "ARROWCOL_CLIENT_INTERVAL_US"),
+            Some("client.data_mode") => ("data_mode", "ARROWCOL_CLIENT_DATA_MODE"),
+            Some("client.data_profile") => ("data_profile", "ARROWCOL_CLIENT_DATA_PROFILE"),
+            Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
+            Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
+            Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
+            Some("client.stream_retry_max_backoff_ms") => ("stream_retry_max_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_BACKOFF_MS"),
             Some("transport.max_message_bytes") => ("max_message_bytes", "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES"),
+            Some("transport.grpc_send_compression") => ("grpc_send_compression", "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION"),
+            Some("transport.grpc_accept_compression") => ("grpc_accept_compression", "ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION"),
+            Some("transport.ipc_compression") | Some("arrow_ipc.compression") => ("ipc_compression", "ARROWCOL_CLIENT_IPC_COMPRESSION"),
             Some("transport.max_flight_data_bytes") => ("max_flight_data_bytes", "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES"),
             Some("transport.max_frame_bytes") => ("max_frame_bytes", "ARROWCOL_CLIENT_MAX_FRAME_BYTES"),
             Some("transport.header_table_bytes") => ("header_table_bytes", "ARROWCOL_CLIENT_HEADER_TABLE_BYTES"),
@@ -137,6 +207,9 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("transport.tcp_keepalive_interval_ms") => ("tcp_keepalive_interval_ms", "ARROWCOL_CLIENT_TCP_KEEPALIVE_INTERVAL_MS"),
             Some("transport.tcp_keepalive_retries") => ("tcp_keepalive_retries", "ARROWCOL_CLIENT_TCP_KEEPALIVE_RETRIES"),
             Some("transport.rate_limit_period_ms") => ("rate_limit_period_ms", "ARROWCOL_CLIENT_RATE_LIMIT_PERIOD_MS"),
+            Some("transport.rate_limit_rps") => ("rate_limit_rps", "ARROWCOL_CLIENT_RATE_LIMIT_RPS"),
+            Some("transport.connect_retries") => ("connect_retries", "ARROWCOL_CLIENT_CONNECT_RETRIES"),
+            Some("transport.retry_backoff_ms") => ("retry_backoff_ms", "ARROWCOL_CLIENT_RETRY_BACKOFF_MS"),
             Some("transport.endpoint_concurrency_limit") => ("endpoint_concurrency_limit", "ARROWCOL_CLIENT_ENDPOINT_CONCURRENCY_LIMIT"),
             Some("transport.endpoint_buffer_size") => ("endpoint_buffer_size", "ARROWCOL_CLIENT_ENDPOINT_BUFFER_SIZE"),
             _ => return true,
