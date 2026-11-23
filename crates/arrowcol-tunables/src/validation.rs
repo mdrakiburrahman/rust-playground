@@ -110,7 +110,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("transport.keepalive_interval_ms", "10000"),
     capability!("transport.keepalive_timeout_ms", "20000"),
     capability!("transport.keepalive_while_idle", "true"),
-    capability!("transport.connect_timeout_ms", "0 (inherit request timeout)"),
+    capability!("transport.connect_timeout_ms", "30000"),
     capability!("transport.request_timeout_ms", "component default"),
     capability!("transport.tcp_nodelay", "true"),
     capability!("transport.tcp_keepalive_ms", "component default"),
@@ -144,7 +144,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.sql_pool_acquire_timeout_ms", "10000"),
     capability!("logging.router", "warn,tiberius=error; or inherit YAML filter"),
     capability!("logging.collector", "unset"),
-    capability!("logging.maintenance", "unset"),
+    capability!("logging.maintenance", "unset; inert when maintenance is disabled"),
     capability!("router.refresh_interval_ms", "1000"),
     capability!("router.max_snapshot_age_ms", "15000"),
     capability!("router.max_future_skew_ms", "2000"),
@@ -235,11 +235,13 @@ const CAPABILITIES: &[Capability] = &[
     ),
     capability!("collector.runtime.workers", "clamp(c/4,2,16)"),
     capability!("collector.runtime.blocking_workers", "clamp(2c,32,128)"),
+    capability!("collector.runtime.blocking_fs_reserve", "1"),
     capability!("collector.runtime.upload_limit", "32"),
     capability!("collector.runtime.task_limit", "clamp(4c,64,256)"),
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
     capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
@@ -568,6 +570,10 @@ impl Tunables {
                     "transport.tcp_keepalive_ms",
                     transport.tcp_keepalive_ms.unwrap_or(60_000),
                 ),
+                (
+                    "transport.tcp_keepalive_interval_ms",
+                    transport.tcp_keepalive_interval_ms.unwrap_or(0),
+                ),
                 ("transport.retry_backoff_ms", transport.retry_backoff_ms.unwrap_or(100)),
             ] {
                 if value > 86_400_000 || (field.ends_with("timeout_ms") && value == 0) {
@@ -821,27 +827,29 @@ impl Tunables {
                     for (field, value) in [
                         ("RUNTIME_WORKERS", runtime.workers),
                         ("BLOCKING_WORKERS", runtime.blocking_workers),
+                        ("BLOCKING_FS_RESERVE", runtime.blocking_fs_reserve),
                         ("UPLOAD_LIMIT", runtime.upload_limit),
                         ("TASK_LIMIT", runtime.task_limit),
                         ("READ_AHEAD", runtime.read_ahead),
                         ("BATCH_ROWS", runtime.batch_rows),
                         ("CPU_WORKERS", runtime.cpu_workers),
+                        ("CPU_QUEUE_JOBS", runtime.cpu_queue_jobs),
                     ] {
                         if let Some(value) = value {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
-                        if let Some(upload) = &collector.upload {
-                            if let Some(mode) = upload.mode {
-                                output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
-                            }
-                            for (field, value) in [
-                                ("UPLOAD_BUFFER_CAPACITY_BYTES", upload.buffer_capacity_bytes),
-                                ("UPLOAD_REQUEST_CONCURRENCY", upload.request_concurrency),
-                            ] {
-                                if let Some(value) = value {
-                                    output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
-                                }
-                            }
+                    }
+                }
+                if let Some(upload) = &collector.upload {
+                    if let Some(mode) = upload.mode {
+                        output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
+                    }
+                    for (field, value) in [
+                        ("UPLOAD_BUFFER_CAPACITY_BYTES", upload.buffer_capacity_bytes),
+                        ("UPLOAD_REQUEST_CONCURRENCY", upload.request_concurrency),
+                    ] {
+                        if let Some(value) = value {
+                            output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
                     }
                 }
@@ -1482,15 +1490,27 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
     for (name, value, minimum, maximum) in [
         ("workers", runtime.workers, 1, 64),
         ("blocking_workers", runtime.blocking_workers, 2, 256),
+        ("blocking_fs_reserve", runtime.blocking_fs_reserve, 1, 255),
         ("upload_limit", runtime.upload_limit, 1, 256),
         ("task_limit", runtime.task_limit, 2, 1_024),
         ("read_ahead", runtime.read_ahead, 1, 128),
         ("batch_rows", runtime.batch_rows, 1, 262_144),
         ("cpu_workers", runtime.cpu_workers, 1, 128),
+        ("cpu_queue_jobs", runtime.cpu_queue_jobs, 1, 128),
     ] {
         if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
             bail!("collector.runtime.{name} must be between {minimum} and {maximum}");
         }
+    }
+    if let (Some(reserve), Some(workers)) = (runtime.blocking_fs_reserve, runtime.blocking_workers)
+        && reserve >= workers
+    {
+        bail!("collector.runtime.blocking_fs_reserve must be less than blocking_workers");
+    }
+    if let (Some(queue), Some(workers)) = (runtime.cpu_queue_jobs, runtime.cpu_workers)
+        && queue > workers
+    {
+        bail!("collector.runtime.cpu_queue_jobs must not exceed cpu_workers");
     }
     Ok(())
 }
@@ -2057,6 +2077,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_queue_and_reserve_are_strict_and_omitted_from_existing_config() -> Result<()> {
+        let old = serde_json::json!({"collector":{"runtime":{"cpu_workers":4,"blocking_workers":4}}});
+        let old_config = Tunables::parse_oat_json(old.clone())?;
+        let serialized = serde_json::to_value(old_config)?;
+        assert!(serialized["collector"]["runtime"].get("cpu_queue_jobs").is_none());
+        assert!(serialized["collector"]["runtime"].get("blocking_fs_reserve").is_none());
+        let mut valid = old;
+        valid["collector"]["runtime"]["cpu_queue_jobs"] = serde_json::json!(2);
+        valid["collector"]["runtime"]["blocking_fs_reserve"] = serde_json::json!(2);
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS"], "2");
+        assert_eq!(env["ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE"], "2");
+        for (field, value) in [
+            ("cpu_queue_jobs", serde_json::json!(0)),
+            ("cpu_queue_jobs", serde_json::json!(5)),
+            ("cpu_queue_jobs", serde_json::json!("2")),
+            ("cpu_queue_jobs", serde_json::json!(null)),
+            ("blocking_fs_reserve", serde_json::json!(0)),
+            ("blocking_fs_reserve", serde_json::json!(4)),
+            ("blocking_fs_reserve", serde_json::json!(1.5)),
+            ("blocking_fs_reserve", serde_json::json!(null)),
+        ] {
+            let mut candidate = valid.clone();
+            candidate["collector"]["runtime"][field] = value;
+            assert!(Tunables::parse_oat_json(candidate).is_err(), "{field}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn collector_upload_validation_and_projection() -> Result<()> {
         let valid = serde_json::json!({"collector": {
             "runtime": {"upload_limit": 1},
@@ -2066,6 +2116,13 @@ mod tests {
         assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_MODE"], "buffered_multipart");
         assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"], "1048576");
         assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"], "16");
+        let upload_only = serde_json::json!({"collector":{"upload":{
+            "mode":"buffered_multipart", "buffer_capacity_bytes":1048576, "request_concurrency":2
+        }}});
+        let env = Tunables::parse_oat_json(upload_only)?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_MODE"], "buffered_multipart");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"], "1048576");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"], "2");
 
         for (field, value) in [
             ("mode", serde_json::json!("stream")),

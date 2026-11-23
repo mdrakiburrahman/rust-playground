@@ -61,6 +61,9 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
 | `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
 | `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
+| `collector.runtime.blocking_fs_reserve` | Integer `1..=255`, default `1`, strictly less than resolved `blocking_workers`. Reserves blocking threads for filesystem handoffs. |
+| `collector.runtime.cpu_queue_jobs` | Integer `1..=128`, default resolved `cpu_workers`, no greater than resolved `cpu_workers`. Bounds queued CPU jobs without changing worker count. |
+| `logging.maintenance` | Inert when maintenance is disabled because no maintenance process is running. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal
