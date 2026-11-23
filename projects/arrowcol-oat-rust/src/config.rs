@@ -79,16 +79,31 @@ pub struct OatConfig {
     pub website_url: String,
 }
 
-fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurrency: usize) -> Result<()> {
+#[derive(Serialize)]
+pub(crate) struct ClientMemoryPreflightEstimate {
+    pub required_bytes: u64,
+    pub max_memory_bytes: u64,
+    pub corpus_bytes: u64,
+    pub corpus_copies: usize,
+    pub data_mode: DataMode,
+    pub workers: usize,
+    pub worker_source: &'static str,
+    pub realistic_live_slots: usize,
+}
+
+pub(crate) fn client_memory_preflight_estimate(
+    client: Option<&ClientTunables>,
+    concurrency: usize,
+) -> Result<Option<ClientMemoryPreflightEstimate>> {
     const DEFAULT_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
     const CORPUS_RESERVATION_NUMERATOR: u64 = 40_014;
     const CORPUS_RESERVATION_DENOMINATOR: u64 = 10_000;
     const LIVE_SLOT_RESERVATION_BYTES: u64 = 260_000_000;
     const EXTRA_RESERVATION_BYTES: u64 = 1024 * 1024 * 1024;
 
-    let Some(client) = client else { return Ok(()) };
+    let Some(client) = client else { return Ok(None) };
     let Some(corpus_bytes) = client.corpus_bytes.filter(|bytes| *bytes > 0) else {
-        return Ok(());
+        return Ok(None);
     };
     let data_mode = client.data_mode.unwrap_or(DataMode::Shared);
     let data_profile = client.data_profile.unwrap_or(ClientDataProfile::Diagnostic);
@@ -129,12 +144,35 @@ fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurren
         .and_then(|bytes| bytes.checked_add(EXTRA_RESERVATION_BYTES))
         .context("client conservative workload reservation overflow")?;
     let max_memory_bytes = client.max_memory_bytes.unwrap_or(DEFAULT_MAX_MEMORY_BYTES);
-    if max_memory_bytes < required_bytes {
+    Ok(Some(ClientMemoryPreflightEstimate {
+        required_bytes,
+        max_memory_bytes,
+        corpus_bytes,
+        corpus_copies: copies,
+        data_mode,
+        workers,
+        worker_source: if !needs_worker_count {
+            "not_needed"
+        } else if client.workers.is_some_and(|value| value > 0) {
+            "configured"
+        } else {
+            "oat_host_available_parallelism_at_recomputation"
+        },
+        realistic_live_slots: live_slots,
+    }))
+}
+
+fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurrency: usize) -> Result<()> {
+    if let Some(estimate) = client_memory_preflight_estimate(client, concurrency)?
+        && estimate.max_memory_bytes < estimate.required_bytes
+    {
         bail!(
-            "tunables.client.max_memory_bytes={} is below the conservative workload reservation of {} bytes (corpus_bytes={}, data_mode={data_mode:?}, configured_live_slots={live_slots}); increase max_memory_bytes or reduce corpus size, workers, or streams_per_worker",
-            max_memory_bytes,
-            required_bytes,
-            corpus_bytes,
+            "tunables.client.max_memory_bytes={} is below the conservative workload reservation of {} bytes (corpus_bytes={}, data_mode={:?}, configured_live_slots={}); increase max_memory_bytes or reduce corpus size, workers, or streams_per_worker",
+            estimate.max_memory_bytes,
+            estimate.required_bytes,
+            estimate.corpus_bytes,
+            estimate.data_mode,
+            estimate.realistic_live_slots
         );
     }
     Ok(())
