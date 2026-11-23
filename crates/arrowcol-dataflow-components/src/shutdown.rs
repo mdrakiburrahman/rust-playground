@@ -37,6 +37,7 @@ struct PendingPublication {
     active_admissions: usize,
     owner_failed: bool,
     send_succeeded: bool,
+    cancelled: bool,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -44,6 +45,36 @@ struct PendingCounts {
     never_staged: usize,
     staged: usize,
     nacked: usize,
+    cancelled_ambiguous: usize,
+}
+
+struct AdmissionGuard<'a> {
+    shutdown: &'a RoutingShutdown,
+    publication_id: PublicationId,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(mut pending) = self.shutdown.pending.lock() else {
+            self.shutdown.record_failure();
+            return;
+        };
+        if let Some(entry) = pending.get_mut(&self.publication_id)
+            && entry.generation == self.generation
+        {
+            if let Some(active) = entry.active_admissions.checked_sub(1) {
+                entry.active_admissions = active;
+                entry.cancelled = true;
+            } else {
+                self.shutdown.record_failure();
+            }
+        }
+    }
 }
 
 impl RoutingShutdown {
@@ -130,6 +161,7 @@ impl RoutingShutdown {
                         active_admissions: 0,
                         owner_failed: false,
                         send_succeeded: false,
+                        cancelled: false,
                     });
                 }
             }
@@ -156,6 +188,7 @@ impl RoutingShutdown {
                     active_admissions: 0,
                     owner_failed: false,
                     send_succeeded: false,
+                    cancelled: false,
                 });
             }
         }
@@ -166,7 +199,9 @@ impl RoutingShutdown {
     ///
     /// The identity is tracked before sending so a fast publication outcome cannot precede it. An
     /// explicit send error hands the message back, so that identity never reached the exporter. A
-    /// cancelled send keeps the identity: a dropped flume send can already have been delivered.
+    /// cancelled send remains tracked because a dropped flume send can already have been delivered.
+    /// At terminal shutdown, an unstaged cancelled send is classified as ambiguous rather than
+    /// mistaken for an acknowledged publication that failed to drain.
     ///
     /// # Errors
     /// Reports poisoned publication accounting; an unforgettable identity stays tracked.
@@ -189,6 +224,7 @@ impl RoutingShutdown {
                         active_admissions: 1,
                         owner_failed: false,
                         send_succeeded: false,
+                        cancelled: false,
                     });
                     (generation, true)
                 }
@@ -201,6 +237,12 @@ impl RoutingShutdown {
                     (pending.generation, false)
                 }
             }
+        };
+        let mut guard = AdmissionGuard {
+            shutdown: self,
+            publication_id,
+            generation,
+            armed: true,
         };
         let result = send.await;
         let mut pending = self
@@ -222,6 +264,7 @@ impl RoutingShutdown {
                 entry.owner_failed
                     && entry.active_admissions == 0
                     && !entry.send_succeeded
+                    && !entry.cancelled
                     && entry.state == PublicationState::NeverStaged
             }
             _ => false,
@@ -229,6 +272,7 @@ impl RoutingShutdown {
         if remove {
             pending.remove(&publication_id);
         }
+        guard.armed = false;
         Ok(result)
     }
 
@@ -258,12 +302,19 @@ impl RoutingShutdown {
             let mut counts = PendingCounts::default();
             for publication in pending.values() {
                 match publication.state {
+                    PublicationState::NeverStaged
+                        if publication.cancelled
+                            && !publication.send_succeeded
+                            && publication.active_admissions == 0 =>
+                    {
+                        counts.cancelled_ambiguous += 1;
+                    }
                     PublicationState::NeverStaged => counts.never_staged += 1,
                     PublicationState::Staged => counts.staged += 1,
                     PublicationState::Nacked => counts.nacked += 1,
                 }
             }
-            (pending.len(), counts)
+            (pending.len() - counts.cancelled_ambiguous, counts)
         };
         let retired = self
             .workers
@@ -276,6 +327,12 @@ impl RoutingShutdown {
         let state = terminal_state(clean, failed);
         let now = now_unix_millis().map_err(anyhow::Error::msg)?;
         let mut errors = Vec::new();
+        if counts.cancelled_ambiguous != 0 {
+            tracing::warn!(
+                cancelled_ambiguous = counts.cancelled_ambiguous,
+                "cancelled admissions had no observed publication outcome; delivery remains ambiguous"
+            );
+        }
         if failed {
             tracing::error!(
                 never_staged = counts.never_staged,
@@ -507,6 +564,24 @@ mod tests {
         );
         assert!(shutdown.finish(true).await.is_err());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_full_channel_send_is_ambiguous_until_staged() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let (sender, receiver) = flume::bounded(1);
+        sender.send(1)?;
+        let send = shutdown.admit_publication(publication, sender.send_async(2));
+        assert!(tokio::time::timeout(Duration::from_millis(10), send).await.is_err());
+        assert_eq!(receiver.try_recv()?, 1);
+        assert!(receiver.try_recv().is_err());
+        shutdown.finish(true).await?;
+
+        shutdown.publication_staged(publication)?;
+        assert!(shutdown.finish(true).await.is_err());
+        shutdown.publication_finished(publication, true)?;
+        shutdown.finish(true).await
     }
 
     #[tokio::test]
