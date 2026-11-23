@@ -119,6 +119,15 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
     let mut promoted = Vec::new();
     projection.retain(|entry| {
         let (field, variable) = match entry["path"].as_str() {
+            Some("client.workers") => ("workers", "ARROWCOL_CLIENT_WORKERS"),
+            Some("client.runtime_threads") => ("runtime_threads", "ARROWCOL_CLIENT_RUNTIME_THREADS"),
+            Some("client.batch_rows") => ("batch_rows", "ARROWCOL_CLIENT_BATCH_ROWS"),
+            Some("client.connections_per_worker") => ("connections_per_worker", "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER"),
+            Some("client.streams_per_worker") => ("streams_per_worker", "ARROWCOL_CLIENT_STREAMS_PER_WORKER"),
+            Some("client.interval_us") => ("interval_us", "ARROWCOL_CLIENT_INTERVAL_US"),
+            Some("client.data_mode") => ("data_mode", "ARROWCOL_CLIENT_DATA_MODE"),
+            Some("client.data_profile") => ("data_profile", "ARROWCOL_CLIENT_DATA_PROFILE"),
+            Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("transport.max_message_bytes") => ("max_message_bytes", "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES"),
             Some("transport.max_flight_data_bytes") => ("max_flight_data_bytes", "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES"),
             Some("transport.max_frame_bytes") => ("max_frame_bytes", "ARROWCOL_CLIENT_MAX_FRAME_BYTES"),

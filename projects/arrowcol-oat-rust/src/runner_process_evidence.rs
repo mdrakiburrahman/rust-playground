@@ -2431,6 +2431,8 @@ groups:
             verify_process_configuration(&config, ComponentRole::Client, &observed)
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
+                | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
+                | "streams_per_worker" | "interval_us" | "data_mode" | "data_profile" | "max_memory_bytes"
                 | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
                 | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
                 | "keepalive_timeout_ms" | "keepalive_while_idle"
@@ -2463,6 +2465,19 @@ groups:
                 "adapter accepted wrong {field} for {input}");
         }
         config.clients_per_table = 1;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":{
+            "workers":0, "runtime_threads":0, "batch_rows":0, "streams_per_worker":0
+        }}))?;
+        let auto = actual_client_startup(&binary, &config)?;
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        let mut report = json!({"client_id":"client-1", "consumer_effective_config":auto});
+        promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
+        assert_eq!(covered["consumer_verified"].as_array().context("missing verified fields")?.len(), 4);
+        report["consumer_effective_config"]["resolution"]["requested"]["workers"] = json!(1);
+        let mut unverified = initial;
+        promote_client_readback(&config, &mut unverified, Some(&vec![report]))?;
+        assert!(unverified["consumer_verified"].as_array().context("missing verified fields")?.is_empty());
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
             "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
             "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false,
