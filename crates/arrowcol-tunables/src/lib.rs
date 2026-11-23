@@ -478,12 +478,34 @@ pub struct LimitsTunables {
     pub max_metadata_bytes: Option<usize>,
     pub max_schema_bytes: Option<usize>,
     pub max_message_bytes: Option<usize>,
+    #[serde(deserialize_with = "deserialize_batch_channel_capacity")]
     pub batch_channel_capacity: Option<usize>,
+    #[serde(deserialize_with = "deserialize_put_result_channel_capacity")]
     pub put_result_channel_capacity: Option<usize>,
     pub max_stream_duration: Option<String>,
     pub admission_timeout: Option<String>,
     pub max_ddl_bytes: Option<usize>,
 }
+
+macro_rules! receiver_channel_deserializer {
+    ($function:ident, $field:literal) => {
+        fn $function<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Option::<usize>::deserialize(deserializer).map_err(|_| {
+                serde::de::Error::custom(concat!(
+                    "collector.limits.",
+                    $field,
+                    " must be a non-negative integer"
+                ))
+            })
+        }
+    };
+}
+
+receiver_channel_deserializer!(deserialize_batch_channel_capacity, "batch_channel_capacity");
+receiver_channel_deserializer!(deserialize_put_result_channel_capacity, "put_result_channel_capacity");
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

@@ -751,7 +751,12 @@ impl Tunables {
             }
         }
         let tunables: Self = serde_json::from_value(value).map_err(|error| {
-            if error.to_string().starts_with("collector.channel_capacity") {
+            if error.to_string().starts_with("collector.channel_capacity")
+                || error.to_string().starts_with("collector.limits.batch_channel_capacity")
+                || error
+                    .to_string()
+                    .starts_with("collector.limits.put_result_channel_capacity")
+            {
                 anyhow::anyhow!("{error}")
             } else {
                 anyhow::Error::new(error).context("parse OAT tunables")
@@ -1885,6 +1890,14 @@ fn validate_limits(limits: Option<&LimitsTunables>) -> Result<()> {
     ] {
         positive(&format!("collector.limits.{name}"), Some(value))?;
     }
+    for (name, value) in [
+        ("batch_channel_capacity", limits.batch_channel_capacity),
+        ("put_result_channel_capacity", limits.put_result_channel_capacity),
+    ] {
+        if value.is_some_and(|capacity| capacity > (usize::MAX >> 3)) {
+            bail!("collector.limits.{name} exceeds Semaphore::MAX_PERMITS");
+        }
+    }
     if schema > message {
         bail!("collector.limits.max_schema_bytes must not exceed max_message_bytes");
     }
@@ -2712,6 +2725,33 @@ mod tests {
         }))?;
         let serialized = serde_json::to_value(partial)?;
         Tunables::parse_oat_json(serialized)?;
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_channels_reject_capacities_above_semaphore_limit() -> Result<()> {
+        for field in ["batch_channel_capacity", "put_result_channel_capacity"] {
+            let valid = serde_json::json!({"collector":{"limits":{field: 7}}});
+            let parsed = Tunables::parse_oat_json(valid)?;
+            Tunables::parse_oat_json(serde_json::to_value(parsed)?)?;
+            let maximum = serde_json::json!({"collector":{"limits":{field:usize::MAX >> 3}}});
+            Tunables::parse_oat_json(maximum)?;
+            for capacity in [0, (usize::MAX >> 3) + 1] {
+                let value = serde_json::json!({"collector":{"limits":{field:capacity}}});
+                let error = error_text(Tunables::parse_oat_json(value));
+                assert!(error.contains(&format!("collector.limits.{field}")), "{error}");
+            }
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!("untrusted"),
+                serde_json::json!(true),
+            ] {
+                let value = serde_json::json!({"collector":{"limits":{field:invalid}}});
+                let error = error_text(Tunables::parse_oat_json(value));
+                assert!(error.contains(&format!("collector.limits.{field}")), "{error}");
+                assert!(!error.contains("untrusted"), "{error}");
+            }
+        }
         Ok(())
     }
 

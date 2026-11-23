@@ -85,7 +85,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "installed_estimator_not_full_run_history"
         });
-    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG", "ARROWCOL_COLLECTOR_LIMITS_CONFIG",
         "ARROWCOL_COLLECTOR_BATCHING_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
@@ -418,6 +418,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
             | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
             | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => ("pressure", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"),
+            "collector.limits.batch_channel_capacity" | "collector.limits.put_result_channel_capacity" =>
+                ("limits", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_LIMITS_CONFIG"),
             _ => return true,
         };
         if projected.get(variable).and_then(|value| value.get(field)).is_none() {
