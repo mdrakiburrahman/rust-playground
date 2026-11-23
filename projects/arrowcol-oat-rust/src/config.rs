@@ -1062,6 +1062,9 @@ impl OatConfig {
         {
             bail!("platform.local.setup_timeout_ms must be integer milliseconds in 30000..=86400000");
         }
+        if self.platform.kind == OatMode::Local && self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            bail!("scale_out_single_table exploratory runs require AKS");
+        }
         if computed_profile_hash.is_some()
             && self.platform.kind == OatMode::Local
             && !self.platform.local.stable_image_build
@@ -1692,6 +1695,15 @@ mod tests {
         config.platform.local.setup_timeout_ms = Some(45_000);
         assert_eq!(config.timing_budget()?.pre_cell_setup_timeout_ms, 45_000);
         Ok(())
+    }
+
+    #[test]
+    fn config_validation_rejects_local_scale_out_campaign_before_startup() {
+        let mut config = valid();
+        config.platform.kind = OatMode::Local;
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("scale_out_single_table exploratory runs require AKS"));
     }
 
     #[test]
