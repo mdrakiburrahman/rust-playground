@@ -318,14 +318,11 @@ fn fixture(path: &str, value: Value) -> Value {
         input["maintenance"]["optimize_upload_mode"] = json!("buffered_multipart");
     }
     if path == "collector.layout.sort_options" {
-        set(
-            &mut input,
-            &["collector", "layout", "sort_columns"],
-            json!(["customer_id"]),
-        );
+        set(&mut input, &["collector", "layout", "sort_columns"], json!(["customer_id"]));
     }
     if path == "maintenance.layout_sort_options" {
-        input["maintenance"]["layout_sort_columns"] = json!(["customer_id"]);
+        set(&mut input, &["maintenance", "layout_enabled"], json!(true));
+        set(&mut input, &["maintenance", "layout_sort_columns"], json!(["customer_id"]));
     }
     if path.ends_with(".compression_level") {
         let mut parent = parts[..parts.len() - 1].to_vec();
@@ -363,6 +360,13 @@ fn candidates(path: &str) -> Vec<Value> {
     }
     if path.ends_with("sorting_columns") {
         return vec![json!([{ "path": "customer_id", "descending": false, "nulls_first": false }])];
+    }
+    if path.ends_with("sort_options") {
+        return vec![json!([{
+            "column": "customer_id",
+            "direction": "descending",
+            "nulls": "last"
+        }])];
     }
     if path.ends_with("sort_columns") || path.ends_with("bloom_columns") {
         return vec![json!(["customer_id", "timestamp"])];
@@ -587,6 +591,21 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
             Duration::from_millis(amount)
         })
         .to_string()
+    } else if path.ends_with("sort_options") {
+        value
+            .as_array()
+            .context("sort options must be an array")?
+            .iter()
+            .map(|option| {
+                Ok(format!(
+                    "{}:{}:{}",
+                    option["column"].as_str().context("sort option column missing")?,
+                    option["direction"].as_str().context("sort option direction missing")?,
+                    option["nulls"].as_str().context("sort option null placement missing")?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(",")
     } else {
         scalar(value)
     };
