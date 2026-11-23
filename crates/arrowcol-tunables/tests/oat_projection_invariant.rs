@@ -302,11 +302,19 @@ fn fixture(path: &str, value: Value) -> Value {
         input["maintenance"]["optimize_upload_mode"] = json!("buffered_multipart");
     }
     if path == "collector.layout.sort_options" {
-        set(&mut input, &["collector", "layout", "sort_columns"], json!(["customer_id"]));
+        set(
+            &mut input,
+            &["collector", "layout", "sort_columns"],
+            json!(["customer_id"]),
+        );
     }
     if path == "maintenance.layout_sort_options" {
         set(&mut input, &["maintenance", "layout_enabled"], json!(true));
-        set(&mut input, &["maintenance", "layout_sort_columns"], json!(["customer_id"]));
+        set(
+            &mut input,
+            &["maintenance", "layout_sort_columns"],
+            json!(["customer_id"]),
+        );
     }
     if path.ends_with(".compression_level") {
         let mut parent = parts[..parts.len() - 1].to_vec();
