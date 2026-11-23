@@ -621,6 +621,11 @@ pub fn verify_collector_target_cpu_flags(target_cpu: &str, cpu_info: &str, field
     Ok(())
 }
 
+/// Returns the Rust target features required by the selected CPU profile.
+///
+/// # Errors
+///
+/// Returns an error when the requested CPU profile is unsupported.
 pub fn required_rust_target_features(target_cpu: &str) -> Result<&'static [&'static str], String> {
     const V2: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2"];
     const V3: &[&str] = &[
