@@ -654,7 +654,8 @@ mod tests {
         }
         for raw in ["", "1", "TRUE", "true "] {
             let error = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))
-                .expect_err("malformed sort interleave setting must fail");
+                .err()
+                .context("malformed sort interleave setting must fail")?;
             assert!(format!("{error:#}").contains(name));
         }
         Ok(())
