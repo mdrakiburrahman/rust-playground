@@ -2402,7 +2402,7 @@ groups:
         for policy in cases {
             let mut input = json!({"parquet_writer":policy.clone()});
             if policy.get("max_row_group_rows").is_some() {
-                input["collector"] = json!({"layout":{"enabled":true, "sort_columns":[],
+                input["collector"] = json!({"layout":{"enabled":true, "sort_columns":["customer_id","value"],
                     "bloom_columns":["value","customer_id"], "max_rows":65536, "max_input_bytes":1048576,
                     "row_group_rows":16384, "page_rows":2048}});
             }
@@ -2422,7 +2422,7 @@ groups:
                     "arrowcol_effective_config {}\n", json!({
                         "component":"layout", "scope":"table_effective", "table_id":"a".repeat(64),
                         "table_name":canonical_dmv_table_name(table)?,
-                        "config":{"enabled":true, "sort_columns":[], "bloom_columns":["value","customer_id"],
+                        "config":{"enabled":true, "sort_columns":["customer_id","value"], "bloom_columns":["customer_id","value"],
                             "max_rows":65536, "max_input_bytes":1048576,
                             "row_group_rows":policy["max_row_group_rows"], "page_rows":policy["data_page_row_count_limit"]},
                         "parquet_columns":{
@@ -2488,6 +2488,25 @@ groups:
                 let projected = |evidence: &Value, path: &str| {
                     evidence["projection_only"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
                 };
+                for bloom in [
+                    json!(["customer_id"]),
+                    json!(["customer_id", "value", "extra"]),
+                    json!(["customer_id", "value", "value"]),
+                    json!(["customer_id", 1]),
+                    Value::Null,
+                ] {
+                    let mut changed = process.clone();
+                    changed["layout_table_policies"][1]["config"]["bloom_columns"] = bloom;
+                    let mut result = initial.clone();
+                    promote_collector_readback(&config, &mut result, Some(&json!([changed])), 1)?;
+                    assert!(projected(&result, "collector.layout.bloom_columns"));
+                }
+                let mut reordered_sort = process.clone();
+                reordered_sort["layout_table_policies"][1]["config"]["sort_columns"] =
+                    json!(["value", "customer_id"]);
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([reordered_sort])), 1)?;
+                assert!(projected(&result, "collector.layout.sort_columns"));
                 assert!(projected(&covered, "parquet_writer.defaults.write_page_header_statistics"));
                 let mut malformed_options = process["layout_table_policies"][0]["parquet_column_options"].clone();
                 malformed_options["value"]["dictionary_enabled"] = json!("true");
@@ -2544,6 +2563,8 @@ groups:
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([disabled])), 1)?;
                 assert!(projected(&result, "parquet_writer.max_row_group_rows"));
+                assert!(projected(&result, "collector.layout.bloom_columns"));
+                assert!(projected(&result, "collector.layout.sort_columns"));
                 assert!(!projected(&result, "parquet_writer.defaults.compression"));
                 process["layout_table_policies"][0]["config"]["row_group_rows"] = json!(1);
                 let mut uncovered = initial.clone();

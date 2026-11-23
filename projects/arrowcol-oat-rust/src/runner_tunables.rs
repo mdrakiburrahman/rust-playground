@@ -5,6 +5,19 @@ fn tunable_leaf_evidence(config: &OatConfig) -> Result<Value> {
     config.tunables.classify_oat_leaves()
 }
 
+fn same_column_membership(requested: &Value, observed: &Value) -> bool {
+    fn columns(value: &Value) -> Option<std::collections::BTreeSet<&str>> {
+        let array = value.as_array()?;
+        let columns = array.iter().map(Value::as_str)
+            .collect::<Option<std::collections::BTreeSet<_>>>()?;
+        (columns.len() == array.len()).then_some(columns)
+    }
+    match (columns(requested), columns(observed)) {
+        (Some(requested), Some(observed)) => requested == observed,
+        _ => false,
+    }
+}
+
 fn verified_processes<'a>(
     config: &OatConfig, processes: Option<&'a Value>, role: ComponentRole, replicas: u32,
 ) -> Option<Vec<&'a Value>> {
@@ -82,7 +95,12 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             if tables_covered && requested.is_some()
                 && table_policies.iter().all(|record| {
                     (field == "enabled" || record["config"]["enabled"] == true)
-                        && record["config"].get(field) == requested
+                        && if field == "bloom_columns" {
+                            requested.zip(record["config"].get(field))
+                                .is_some_and(|(requested, observed)| same_column_membership(requested, observed))
+                        } else {
+                            record["config"].get(field) == requested
+                        }
                 })
             {
                 promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
