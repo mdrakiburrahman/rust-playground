@@ -86,6 +86,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.data_mode", "shared"),
     capability!("client.data_profile", "diagnostic"),
     capability!("client.send_iter", "clone_vec"),
+    capability!("client.identity_builder", "formatted_rows"),
     capability!(
         "client.string_length_distribution",
         "uniform (realistic), fixed (diagnostic)"
@@ -663,6 +664,11 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
+        if let Some(builder) = value.get("client").and_then(|client| client.get("identity_builder"))
+            && !matches!(builder.as_str(), Some("formatted_rows" | "direct_utf8"))
+        {
+            bail!("client.identity_builder must be formatted_rows or direct_utf8");
+        }
         if let Some(send_iter) = value.get("client").and_then(|client| client.get("send_iter"))
             && !matches!(send_iter.as_str(), Some("clone_vec" | "arc_cursor"))
         {
@@ -700,6 +706,11 @@ impl Tunables {
 
     fn validate_with_transport_defaults(&self, default_message_bytes: u64, default_flight_bytes: u64) -> Result<()> {
         if let Some(client) = &self.client {
+            if client.identity_builder == Some(ClientIdentityBuilder::DirectUtf8)
+                && client.data_profile != Some(ClientDataProfile::Realistic)
+            {
+                bail!("client.identity_builder=direct_utf8 requires client.data_profile=realistic");
+            }
             if client
                 .payload_customer_id
                 .as_deref()
@@ -3085,6 +3096,17 @@ mod tests {
         assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"], "20");
         assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_MAX_BACKOFF_MS"], "400");
         Ok(())
+    }
+
+    #[test]
+    fn client_identity_builder_rejects_invalid_values_and_profiles() {
+        for value in [
+            serde_json::json!({"client":{"identity_builder":"unknown"}}),
+            serde_json::json!({"client":{"identity_builder":"direct_utf8"}}),
+        ] {
+            let error = Tunables::parse_oat_json(value).expect_err("invalid identity builder must fail");
+            assert!(error.to_string().contains("identity_builder"), "{error:#}");
+        }
     }
 
     #[test]
