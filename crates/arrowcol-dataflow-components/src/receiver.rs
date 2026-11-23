@@ -980,25 +980,40 @@ async fn admin_capabilities(State(state): State<AdminState>) -> impl IntoRespons
 async fn admin_pressure(State(state): State<AdminState>) -> Response {
     let mut diagnostic = PressureDiagnosticSample::start();
     let handler_started = diagnostic.as_ref().map(|_| Instant::now());
-    let response = match state.metrics.pressure_for_admin(diagnostic.as_mut()) {
-        Ok(mut pressure) => {
-            if state.direct_topology && state.metrics.ready() {
-                pressure.resolved_buffering_mode = "memory_only";
+    let span = tracing::Span::current();
+    pressure_task_response(tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        let response = match state.metrics.pressure_for_admin(diagnostic.as_mut()) {
+            Ok(mut pressure) => {
+                if state.direct_topology && state.metrics.ready() {
+                    pressure.resolved_buffering_mode = "memory_only";
+                }
+                let serialization_started = diagnostic.as_ref().map(|_| Instant::now());
+                let response = Json(pressure).into_response();
+                if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), serialization_started) {
+                    diagnostic.record_serialization(started.elapsed());
+                }
+                response
             }
-            let serialization_started = diagnostic.as_ref().map(|_| Instant::now());
-            let response = Json(pressure).into_response();
-            if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), serialization_started) {
-                diagnostic.record_serialization(started.elapsed());
-            }
-            response
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if let (Some(mut diagnostic), Some(started)) = (diagnostic, handler_started) {
+            diagnostic.record_handler_total(started.elapsed());
+            diagnostic.finish();
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    if let (Some(mut diagnostic), Some(started)) = (diagnostic, handler_started) {
-        diagnostic.record_handler_total(started.elapsed());
-        diagnostic.finish();
+        response
+    }))
+    .await
+}
+
+async fn pressure_task_response(task: tokio::task::JoinHandle<Response>) -> Response {
+    match task.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "pressure snapshot task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-    response
 }
 
 async fn admin_metrics(State(state): State<AdminState>) -> Response {
@@ -1039,6 +1054,69 @@ pub(crate) mod tests {
         state.direct_topology = false;
         assert_eq!(mode(state).await?, "unknown");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn pressure_response_matches_direct_snapshot() -> anyhow::Result<()> {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        metrics.set_healthy(true);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
+        metrics.set_accepting(true);
+        let state = AdminState {
+            metrics: Arc::clone(&metrics),
+            max_request_bytes: 4096,
+            direct_topology: true,
+        };
+        let mut snapshot = metrics.pressure_for_admin(None).map_err(anyhow::Error::msg)?;
+        snapshot.resolved_buffering_mode = "memory_only";
+        let mut expected = serde_json::to_value(snapshot)?;
+        let response = admin_pressure(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        let mut actual: serde_json::Value = serde_json::from_slice(&body)?;
+        for value in [&mut expected, &mut actual] {
+            value
+                .as_object_mut()
+                .expect("pressure object")
+                .remove("actual_rss_bytes");
+            let rich = value["rich"].as_object_mut().expect("rich pressure object");
+            rich.remove("observed_at_unix_ms");
+            rich.remove("rss_bytes");
+        }
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pressure_task_runs_off_runtime_thread_and_handles_join_failures() {
+        let runtime_thread = std::thread::current().id();
+        let response = pressure_task_response(tokio::task::spawn_blocking(move || {
+            assert_ne!(std::thread::current().id(), runtime_thread);
+            StatusCode::NO_CONTENT.into_response()
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = pressure_task_response(tokio::task::spawn_blocking(|| -> Response {
+            panic!("pressure task failed");
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let task = tokio::spawn(async { std::future::pending::<Response>().await });
+        task.abort();
+        assert_eq!(
+            pressure_task_response(task).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     use std::sync::Mutex;
