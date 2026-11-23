@@ -2330,6 +2330,31 @@ mod tests {
             .err()
             .context("inconsistent sorting metadata was accepted")?;
         assert!(format!("{mismatch:#}").contains("sorting metadata must match"));
+        let mut maintenance = valid();
+        maintenance.tables = vec![table.identity().table().as_str().to_owned()];
+        maintenance.tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "maintenance":{"enabled":true,"operations":["optimize"],
+                "layout_sort_columns":["customer_id"],
+                "layout_sort_options":[{"column":"customer_id","direction":"descending","nulls":"first"}],
+                "parquet_writer":{"sorting_columns":[{"path":"customer_id","descending":true,"nulls_first":true}]}}
+        }))?;
+        maintenance.validate()?;
+        maintenance
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("maintenance")?
+            .parquet_writer
+            .as_mut()
+            .context("writer")?
+            .sorting_columns
+            .as_mut()
+            .context("sorting columns")?[0]
+            .descending = false;
+        assert!(
+            format!("{:#}", maintenance.validate().expect_err("wrong metadata accepted"))
+                .contains("sorting metadata must match")
+        );
         Ok(())
     }
 
