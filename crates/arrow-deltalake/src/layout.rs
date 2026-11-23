@@ -18,6 +18,63 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
 
+/// Collector execution strategy; maintenance always uses its existing file sorter.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum SortExecution {
+    #[default]
+    Concatenate,
+    StreamUnordered,
+    VerifyOrder,
+}
+
+impl std::str::FromStr for SortExecution {
+    type Err = anyhow::Error;
+    fn from_str(raw: &str) -> Result<Self> {
+        match raw {
+            "concatenate" => Ok(Self::Concatenate),
+            "stream_unordered" => Ok(Self::StreamUnordered),
+            "verify_order" => Ok(Self::VerifyOrder),
+            _ => anyhow::bail!("unknown collector layout sort_execution: {raw}"),
+        }
+    }
+}
+
+impl TryFrom<String> for SortExecution {
+    type Error = anyhow::Error;
+    fn try_from(raw: String) -> Result<Self> {
+        raw.parse()
+    }
+}
+
+impl SortExecution {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Concatenate => "concatenate",
+            Self::StreamUnordered => "stream_unordered",
+            Self::VerifyOrder => "verify_order",
+        }
+    }
+
+    /// # Errors
+    /// Rejects a streaming strategy incompatible with the resolved file layout.
+    pub fn validate(self, enabled: bool, has_keys: bool) -> Result<()> {
+        match self {
+            Self::Concatenate => (),
+            Self::StreamUnordered => ensure!(
+                enabled && !has_keys,
+                "stream_unordered requires enabled layout with empty sort_columns"
+            ),
+            Self::VerifyOrder => ensure!(
+                enabled && has_keys,
+                "verify_order requires enabled layout with non-empty sort_columns"
+            ),
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SortDirection {
@@ -305,6 +362,16 @@ impl FileSortBuffer {
     /// # Errors
     /// Rejects mismatched schemas or a single batch exceeding the file budget.
     pub fn try_push(&mut self, batch: &RecordBatch) -> Result<bool> {
+        if !self.try_admit(batch)? {
+            return Ok(false);
+        }
+        if batch.num_rows() > 0 {
+            self.batches.push(batch.clone());
+        }
+        Ok(true)
+    }
+
+    fn try_admit(&mut self, batch: &RecordBatch) -> Result<bool> {
         ensure!(batch.schema() == self.schema, "file-sort schema changed");
         let bytes = batch.get_array_memory_size();
         ensure!(
@@ -323,7 +390,6 @@ impl FileSortBuffer {
             return Ok(false);
         }
         if batch.num_rows() > 0 {
-            self.batches.push(batch.clone());
             self.rows = rows;
             self.input_bytes = input_bytes;
         }
@@ -358,8 +424,17 @@ impl FileSortBuffer {
         if self.policy.sort_columns.is_empty() {
             return Ok(batch);
         }
-        let columns = self
-            .policy
+        let columns = self.sort_columns(&batch)?;
+        let indices = lexsort_to_indices(&columns, None)?;
+        let arrays = batch
+            .columns()
+            .iter()
+            .map(|column| take(column, &indices, None))
+            .collect::<arrow::error::Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(self.schema, arrays)?)
+    }
+    fn sort_columns(&self, batch: &RecordBatch) -> Result<Vec<SortColumn>> {
+        self.policy
             .sort_columns
             .iter()
             .enumerate()
@@ -380,14 +455,69 @@ impl FileSortBuffer {
                     }),
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
-        let indices = lexsort_to_indices(&columns, None)?;
-        let arrays = batch
-            .columns()
-            .iter()
-            .map(|column| take(column, &indices, None))
-            .collect::<arrow::error::Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(self.schema, arrays)?)
+            .collect()
+    }
+}
+
+#[cfg(feature = "delta")]
+pub(crate) struct PublicationSorter {
+    buffer: FileSortBuffer,
+    mode: SortExecution,
+    last_keys: Vec<arrow::array::ArrayRef>,
+}
+
+#[cfg(feature = "delta")]
+impl PublicationSorter {
+    pub(crate) fn new(schema: SchemaRef, policy: LayoutPolicy, mode: SortExecution) -> Result<Self> {
+        mode.validate(true, !policy.sort_columns.is_empty())?;
+        Ok(Self {
+            buffer: FileSortBuffer::new(schema, policy)?,
+            mode,
+            last_keys: Vec::new(),
+        })
+    }
+
+    /// Returns true when the admitted batch should be encoded immediately.
+    pub(crate) fn admit(&mut self, batch: &RecordBatch) -> Result<bool> {
+        let buffered = self.mode == SortExecution::Concatenate;
+        let admitted = if buffered {
+            self.buffer.try_push(batch)?
+        } else {
+            self.buffer.try_admit(batch)?
+        };
+        ensure!(
+            admitted,
+            "publication exceeds sorted-file budget; split upstream into independently identified publications"
+        );
+        if self.mode == SortExecution::VerifyOrder && batch.num_rows() > 0 {
+            let keys = self.buffer.sort_columns(batch)?;
+            for (left, right) in self.last_keys.iter().zip(&keys) {
+                let cmp = arrow::array::make_comparator(
+                    left.as_ref(),
+                    right.values.as_ref(),
+                    right.options.unwrap_or_default(),
+                )?;
+                match cmp(0, 0) {
+                    std::cmp::Ordering::Less => break,
+                    std::cmp::Ordering::Equal => (),
+                    std::cmp::Ordering::Greater => anyhow::bail!("verify_order: unsorted batch boundary"),
+                }
+            }
+            let cmp = arrow::compute::LexicographicalComparator::try_new(&keys)?;
+            ensure!(
+                (1..batch.num_rows()).all(|i| !cmp.compare(i - 1, i).is_gt()),
+                "verify_order: unsorted rows within batch"
+            );
+            self.last_keys = keys
+                .iter()
+                .map(|key| key.values.slice(batch.num_rows() - 1, 1))
+                .collect();
+        }
+        Ok(!buffered)
+    }
+
+    pub(crate) fn into_buffer(self) -> Option<FileSortBuffer> {
+        (self.mode == SortExecution::Concatenate).then_some(self.buffer)
     }
 }
 
@@ -490,10 +620,33 @@ mod tests {
             ..LayoutPolicy::default()
         };
         let properties = policy.writer_properties(&schema)?;
-        let mut buffer = FileSortBuffer::new(Arc::clone(&schema), policy)?;
+        let mut buffer = FileSortBuffer::new(Arc::clone(&schema), policy.clone())?;
         assert!(buffer.try_push(&a)?);
         assert!(buffer.try_push(&b)?);
         let sorted = buffer.finish()?;
+        #[cfg(feature = "delta")]
+        {
+            let verify = || PublicationSorter::new(Arc::clone(&schema), policy.clone(), SortExecution::VerifyOrder);
+            let mut verifier = verify()?;
+            // The reference sort includes primary/secondary nulls and mixed directions.
+            for i in 0..sorted.num_rows() {
+                assert!(verifier.admit(&sorted.slice(i, 1))?);
+                assert!(verifier.admit(&sorted.slice(i, 0))?);
+            }
+            assert!(verify()?.admit(&sorted)?);
+            let equal = sorted.slice(0, 1);
+            let repeated = concat_batches(&schema, [&equal, &equal])?;
+            let mut verifier = verify()?;
+            assert!(verifier.admit(&repeated)?);
+            assert!(verifier.admit(&equal)?);
+            assert!(verify()?.admit(&a).is_err());
+            for i in 1..sorted.num_rows() {
+                let mut verifier = verify()?;
+                assert!(verifier.admit(&sorted.slice(i, 1))?);
+                assert!(verifier.admit(&sorted.slice(i, 0))?);
+                assert!(verifier.admit(&sorted.slice(i - 1, 1)).is_err());
+            }
+        }
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("mixed.parquet");
         let mut writer = ArrowWriter::try_new(std::fs::File::create(&file)?, Arc::clone(&schema), Some(properties))?;

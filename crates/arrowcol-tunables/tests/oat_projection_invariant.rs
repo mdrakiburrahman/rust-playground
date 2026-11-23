@@ -298,10 +298,14 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "collector.upload.buffer_capacity_bytes" || path == "collector.upload.request_concurrency" {
         input["collector"] = json!({"upload": {"mode": "buffered_multipart"}});
     }
-    if matches!(
-        path,
-        "maintenance.optimize_upload_buffer_bytes" | "maintenance.optimize_upload_concurrency"
-    ) {
+    if matches!(path, "collector.layout.sort_options" | "collector.layout.sort_execution") {
+        input["collector"] = json!({"layout":{"enabled":true,"sort_columns":["customer_id"]}});
+    }
+    if path == "maintenance.layout_sort_options" {
+        input["maintenance"]["layout_enabled"] = json!(true);
+        input["maintenance"]["layout_sort_columns"] = json!(["customer_id"]);
+    }
+    if matches!(path, "maintenance.optimize_upload_buffer_bytes" | "maintenance.optimize_upload_concurrency") {
         input["maintenance"]["optimize_upload_mode"] = json!("buffered_multipart");
     }
     if path.ends_with(".compression_level") {
@@ -314,6 +318,18 @@ fn fixture(path: &str, value: Value) -> Value {
 }
 
 fn candidates(path: &str) -> Vec<Value> {
+    if path == "collector.runtime.timestamp_kernel" {
+        return vec![json!("fused_checked")];
+    }
+    if path == "collector.layout.sort_execution" {
+        return vec![json!("verify_order")];
+    }
+    if matches!(
+        path,
+        "collector.layout.sort_options" | "maintenance.layout_sort_options"
+    ) {
+        return vec![json!([{"column":"customer_id","direction":"descending","nulls":"first"}])];
+    }
     if path == "collector.runtime.generated_partition_binding" {
         return vec![json!("proven_constant")];
     }
@@ -434,7 +450,7 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
             ComponentRole::Collector,
             format!(
                 "ARROWCOL_COLLECTOR_{}{}",
-                if ["sort_columns", "bloom_columns"].contains(&parts[2]) {
+                if ["sort_columns", "sort_options", "bloom_columns"].contains(&parts[2]) {
                     ""
                 } else {
                     "LAYOUT_"
@@ -501,6 +517,24 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
     };
     let expected = if path == "logging.router" {
         format!("{},tiberius=error", scalar(value))
+    } else if matches!(
+        path,
+        "collector.layout.sort_options" | "maintenance.layout_sort_options"
+    ) {
+        value
+            .as_array()
+            .context("sort options array")?
+            .iter()
+            .map(|key| {
+                Ok(format!(
+                    "{}:{}:{}",
+                    key["column"].as_str().context("column")?,
+                    key["direction"].as_str().context("direction")?,
+                    key["nulls"].as_str().context("nulls")?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(",")
     } else if path == "wal.retention_size_cap_bytes" {
         format!(
             "{} B",

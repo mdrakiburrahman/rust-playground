@@ -840,6 +840,7 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             .context("collector layout omitted enabled state")?;
         let mut policy = serde_json::Map::from_iter([("enabled".to_owned(), json!(enabled))]);
         for field in [
+            "sort_execution",
             "sort_columns",
             "bloom_columns",
             "max_rows",
@@ -854,6 +855,12 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
                 if !actual.is_null() {
                     bail!("disabled collector layout reported applicable settings");
                 }
+            } else if field == "sort_execution" {
+                let mode: arrow_deltalake::layout::SortExecution = serde_json::from_value(actual.clone())?;
+                let keys = value["config"]["sort_columns"]
+                    .as_array()
+                    .context("missing sort columns")?;
+                mode.validate(true, !keys.is_empty())?;
             } else if matches!(field, "sort_columns" | "bloom_columns") {
                 let columns = actual.as_array().context("collector layout columns must be arrays")?;
                 if !columns.iter().all(|column| {
@@ -1780,7 +1787,7 @@ mod startup_readback_tests {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
-        let policy = json!({"enabled":true,"sort_columns":["customer_id"],"bloom_columns":[],
+        let policy = json!({"enabled":true,"sort_execution":"verify_order","sort_columns":["customer_id"],"bloom_columns":[],
             "max_rows":777,"max_input_bytes":1_048_576,"row_group_rows":123,"page_rows":17});
         config.tunables = serde_json::from_value(json!({"collector":{"layout":policy}}))?;
         let startup = format!(
@@ -1839,7 +1846,7 @@ mod startup_readback_tests {
         ))?;
         let mut event = json!({"component":"layout","scope":"table_effective","table_id":"a".repeat(64),
             "table_name":canonical_dmv_table_name(&config.tables[0])?,
-            "config":{"enabled":false,"sort_columns":null,"bloom_columns":null,"max_rows":null,
+            "config":{"enabled":false,"sort_execution":null,"sort_columns":null,"bloom_columns":null,"max_rows":null,
                 "max_input_bytes":null,"row_group_rows":null,"page_rows":null}});
         let records = collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n"))?;
         assert_eq!(records[0]["config"]["enabled"], false);
@@ -2440,8 +2447,19 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 36);
-        assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
+        assert_eq!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .len(),
+            36
+        );
+        assert!(
+            covered["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .is_empty()
+        );
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
         let mut missing_process = process.clone();
@@ -2458,15 +2476,52 @@ groups:
             assert_eq!(uncovered, initial);
         }
         for (group, fields) in [
-            ("batching", &["coalesce_publications", "age_flush_policy", "pipeline_depth",
-                "max_arrow_memory_per_flush", "max_rows_per_flush", "max_batches_per_flush",
-                "max_age", "max_concurrent_flushes"][..]),
-            ("commit", &["batch_window", "max_files_per_commit", "max_pending_files"][..]),
-            ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
-                "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
-                "heartbeat_interval", "registration_ttl"][..]),
-            ("runtime", &["file_mapping_cache", "runtime_workers", "blocking_workers", "blocking_fs_reserve", "task_limit",
-                "read_ahead", "batch_rows", "cpu_workers", "cpu_queue_jobs", "partition_grouping", "generated_partition_binding"][..]),
+            (
+                "batching",
+                &[
+                    "coalesce_publications",
+                    "age_flush_policy",
+                    "pipeline_depth",
+                    "max_arrow_memory_per_flush",
+                    "max_rows_per_flush",
+                    "max_batches_per_flush",
+                    "max_age",
+                    "max_concurrent_flushes",
+                ][..],
+            ),
+            (
+                "commit",
+                &["batch_window", "max_files_per_commit", "max_pending_files"][..],
+            ),
+            (
+                "pressure",
+                &[
+                    "max_concurrent_streams",
+                    "rss_limit_bytes",
+                    "buffered_bytes_limit",
+                    "buffered_rows_limit",
+                    "buffered_batches_limit",
+                    "pressure_interval",
+                    "heartbeat_interval",
+                    "registration_ttl",
+                ][..],
+            ),
+            (
+                "runtime",
+                &[
+                    "file_mapping_cache",
+                    "runtime_workers",
+                    "blocking_workers",
+                    "blocking_fs_reserve",
+                    "task_limit",
+                    "read_ahead",
+                    "batch_rows",
+                    "cpu_workers",
+                    "cpu_queue_jobs",
+                    "partition_grouping",
+                    "generated_partition_binding",
+                ][..],
+            ),
         ] {
             for field in fields {
                 let mut missing = observed.clone();
@@ -2542,7 +2597,7 @@ groups:
         for policy in cases {
             let mut input = json!({"parquet_writer":policy.clone()});
             if policy.get("max_row_group_rows").is_some() {
-                input["collector"] = json!({"layout":{"enabled":true, "sort_columns":["customer_id","value"],
+                input["collector"] = json!({"layout":{"enabled":true, "sort_execution":"verify_order", "sort_columns":["customer_id","value"],
                     "bloom_columns":["value","customer_id"], "max_rows":65536, "max_input_bytes":1048576,
                     "row_group_rows":16384, "page_rows":2048}});
             }
@@ -2562,7 +2617,7 @@ groups:
                     "arrowcol_effective_config {}\n", json!({
                         "component":"layout", "scope":"table_effective", "table_id":"a".repeat(64),
                         "table_name":canonical_dmv_table_name(table)?,
-                        "config":{"enabled":true, "sort_columns":["customer_id","value"], "bloom_columns":["customer_id","value"],
+                        "config":{"enabled":true, "sort_execution":"verify_order", "sort_columns":["customer_id","value"], "bloom_columns":["customer_id","value"],
                             "max_rows":65536, "max_input_bytes":1048576,
                             "row_group_rows":policy["max_row_group_rows"], "page_rows":policy["data_page_row_count_limit"]},
                         "parquet_columns":{
@@ -2594,7 +2649,16 @@ groups:
                 let initial = tunable_leaf_evidence(&config)?;
                 let mut covered = initial.clone();
                 promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-                for field in ["enabled", "sort_columns", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"] {
+                for field in [
+                    "enabled",
+                    "sort_execution",
+                    "sort_columns",
+                    "bloom_columns",
+                    "max_rows",
+                    "max_input_bytes",
+                    "row_group_rows",
+                    "page_rows",
+                ] {
                     let path = format!("collector.layout.{field}");
                     assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
                         .iter().any(|entry| entry["path"] == path), "missing table readback for {path}");

@@ -337,6 +337,11 @@ pub struct LayoutTunables {
         deserialize_with = "deserialize_detach_ratio"
     )]
     pub detach_ratio: Option<u8>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_sort_execution"
+    )]
+    pub sort_execution: Option<arrow_deltalake::layout::SortExecution>,
     pub enabled: Option<bool>,
     pub sort_columns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -445,6 +450,12 @@ fn deserialize_binding<'de, D: serde::Deserializer<'de>>(
     arrow_deltalake::GeneratedPartitionBinding::deserialize(deserializer)
         .map(Some)
         .map_err(|error| serde::de::Error::custom(format!("collector.runtime.generated_partition_binding: {error}")))
+}
+
+fn deserialize_present_sort_execution<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<arrow_deltalake::layout::SortExecution>, D::Error> {
+    arrow_deltalake::layout::SortExecution::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

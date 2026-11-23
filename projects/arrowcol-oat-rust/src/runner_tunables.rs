@@ -115,8 +115,18 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             return true;
         }
         if let Some(field) = path.strip_prefix("collector.layout.")
-            && matches!(field, "enabled" | "sort_columns" | "bloom_columns" | "max_rows"
-                | "max_input_bytes" | "row_group_rows" | "page_rows" | "detach_ratio")
+            && matches!(
+                field,
+                "enabled"
+                    | "sort_execution"
+                    | "sort_columns"
+                    | "bloom_columns"
+                    | "max_rows"
+                    | "max_input_bytes"
+                    | "row_group_rows"
+                    | "page_rows"
+                    | "detach_ratio"
+            )
         {
             let requested = layout_policy.as_ref().and_then(|policy| policy.get(field))
                 .filter(|value| !value.is_null());
@@ -287,9 +297,16 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.read_ahead" => Some(("read_ahead", "ARROWCOL_COLLECTOR_READ_AHEAD")),
             "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
             "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
-            "collector.runtime.partition_grouping" => Some(("partition_grouping", "ARROWCOL_COLLECTOR_PARTITION_GROUPING")),
-            "collector.runtime.file_mapping_cache" => Some(("file_mapping_cache", "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE")),
-            "collector.runtime.generated_partition_binding" => Some(("generated_partition_binding", "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING")),
+            "collector.runtime.partition_grouping" => {
+                Some(("partition_grouping", "ARROWCOL_COLLECTOR_PARTITION_GROUPING"))
+            }
+            "collector.runtime.file_mapping_cache" => {
+                Some(("file_mapping_cache", "ARROWCOL_COLLECTOR_FILE_MAPPING_CACHE"))
+            }
+            "collector.runtime.generated_partition_binding" => Some((
+                "generated_partition_binding",
+                "ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING",
+            )),
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
             _ => None,
         };
