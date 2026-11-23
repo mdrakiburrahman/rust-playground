@@ -8130,33 +8130,83 @@ async fn inspect_local_prebuild_image(
         "image",
         "inspect",
         "--format",
-        "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}",
+        "{{.Id}} {{if index .Config.Labels \"org.opencontainers.image.revision\"}}{{index .Config.Labels \"org.opencontainers.image.revision\"}}{{else}}-{{end}} {{if index .Config.Labels \"org.opencontainers.image.profile\"}}{{index .Config.Labels \"org.opencontainers.image.profile\"}}{{else}}-{{end}}",
         image,
     ]);
     let output = run_command(inspect, &format!("inspect prebuilt local {role} image")).await?;
     let observed = String::from_utf8(output.stdout)?;
+    local_prebuild_image_identity(role, image, &observed, expected_revision, expected_profile_hash)
+}
+
+fn local_prebuild_image_identity(
+    role: &str,
+    image: &str,
+    observed: &str,
+    expected_revision: Option<&str>,
+    expected_profile_hash: Option<&str>,
+) -> Result<Value> {
     let fields = observed.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 3 {
         bail!("prebuilt local {role} image metadata must contain image ID, source revision, and profile hash");
     }
     let image_id = local_client_image_id(fields[0])?.to_owned();
-    let revision = (fields[1] != "<no value>").then(|| fields[1].to_owned());
-    let profile_hash = (fields[2] != "<no value>").then(|| fields[2].to_owned());
-    if let Some(expected) = expected_revision {
-        if expected_profile_hash.is_some() {
-            verify_collector_profile_image(&observed, expected, expected_profile_hash.unwrap())?;
-        } else if role == "collector" && image.starts_with("sha256:") {
+    let revision = (fields[1] != "-").then(|| fields[1].to_owned());
+    let profile_hash = (fields[2] != "-").then(|| fields[2].to_owned());
+    if let Some(expected_profile) = expected_profile_hash {
+        let expected_revision = expected_revision.context("collector profile image requires a source revision")?;
+        verify_collector_profile_image(observed, expected_revision, expected_profile)?;
+    } else if let Some(expected) = expected_revision {
+        if role == "collector" && image.starts_with("sha256:") {
             verify_collector_image(&format!("{} {}", fields[0], fields[1]), image, expected)?;
         } else if revision.as_deref() != Some(expected) {
             bail!("prebuilt local {role} image source revision does not match the requested revision");
         }
     }
-    if let Some(expected) = expected_profile_hash
-        && profile_hash.as_deref() != Some(expected)
-    {
-        bail!("prebuilt local {role} image profile hash does not match the requested build profile");
-    }
     Ok(json!({"image": image, "image_id": image_id, "source_revision": revision, "profile_hash": profile_hash}))
+}
+
+#[cfg(test)]
+#[test]
+fn prebuild_image_identity_checks_revision_and_profile_labels() -> Result<()> {
+    let image_id = format!("sha256:{}", "c".repeat(64));
+    let revision = "a".repeat(40);
+    let profile = "b".repeat(64);
+    let observed = format!("{image_id} {revision} {profile}");
+    let actual = local_prebuild_image_identity(
+        "collector",
+        "arrowcol-oat/dataflow:profile-test",
+        &observed,
+        Some(&revision),
+        Some(&profile),
+    )?;
+    assert_eq!(actual["image_id"], image_id);
+    assert_eq!(actual["source_revision"], revision);
+    assert_eq!(actual["profile_hash"], profile);
+    assert!(
+        local_prebuild_image_identity(
+            "collector",
+            "arrowcol-oat/dataflow:profile-test",
+            &observed,
+            Some(&"d".repeat(40)),
+            Some(&profile),
+        )
+        .is_err()
+    );
+    assert!(
+        local_prebuild_image_identity(
+            "collector",
+            "arrowcol-oat/dataflow:profile-test",
+            &observed,
+            Some(&revision),
+            Some(&"e".repeat(64)),
+        )
+        .is_err()
+    );
+    let no_revision = format!("{image_id} - -");
+    assert!(local_prebuild_image_identity("router", "router:dev", &no_revision, Some(&revision), None).is_err());
+    let external = local_prebuild_image_identity("client", "client:local", &no_revision, None, None)?;
+    assert!(external["source_revision"].is_null());
+    Ok(())
 }
 
 async fn local_prebuild_manifest(config: &OatConfig) -> Result<Value> {
