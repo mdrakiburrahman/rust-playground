@@ -75,6 +75,23 @@ export function cpuTicks(text:string){
 type Counter={at:number;ns:number|null};
 type Sample={target:number;host_at:number;ticks:ReturnType<typeof cpuTicks>;counters:Record<string,Counter>};
 const skew=1000;
+// Engine 27 one-shot stats do not echo the container ID. Bind the response by its
+// full-ID socket request and a live inspect of that same immutable resource.
+export async function readEngineCounter(project:string, member:Member, request=engine):Promise<Counter>{
+  assert(/^[a-f0-9]{64}$/.test(member.id),'missing full Engine container ID');
+  const path='/containers/'+member.id;
+  const c=await request(path+'/json');
+  assert.equal(c.Id,member.id,'Engine inspect identity mismatch');
+  assert.equal(c.Config.Labels['com.docker.compose.project'],project);
+  assert.equal(c.Config.Labels['com.docker.compose.service'],member.service);
+  assert(c.State.Status==='running' && c.State.StartedAt===member.started && c.RestartCount===member.restarts,'container lifetime changed');
+  const s=await request(path+'/stats?stream=false&one-shot=true');
+  for(const key of ['id','Id','ID']) if(Object.hasOwn(s,key)) assert.equal(s[key],member.id,'Engine stats identity mismatch');
+  const ns=s.cpu_stats?.cpu_usage?.total_usage,at=typeof s.read==='string'?Date.parse(s.read):NaN;
+  assert(Number.isSafeInteger(ns)&&ns>=0,'invalid Engine CPU counter');
+  assert(Number.isSafeInteger(at)&&at>0,'invalid Engine sample time');
+  return {at,ns};
+}
 async function sample(plan:Plan,target:number):Promise<Sample>{
   // Check membership ahead of each boundary. Sample just inside the last boundary so
   // a normally exiting client still has a live cgroup. Record actual times, never extrapolate.
@@ -84,10 +101,7 @@ async function sample(plan:Plan,target:number):Promise<Sample>{
   const [host,rows]=await Promise.all([readFile('/proc/stat','utf8').then(text=>({host_at:Date.now(),ticks:cpuTicks(text)})),
     Promise.all(plan.containers.map(async c=>{
       if(c.state==='exited')return [c.id,{at:Date.now(),ns:null}] as const;
-      const s=await engine(`/containers/${c.id}/stats?stream=false&one-shot=true`);
-      const ns=s.cpu_stats?.cpu_usage?.total_usage,at=Date.parse(s.read);
-      assert.equal(s.id,c.id);assert(Number.isSafeInteger(ns)&&ns>=0,'invalid Engine CPU counter');
-      return [c.id,{at,ns}] as const;
+      return [c.id,await readEngineCounter(plan.project,c)] as const;
     }))]);
   for(const t of [host.host_at,...rows.map(([,v])=>v.at)]) assert(Math.abs(t-target)<=skew,'CPU boundary skew exceeded');
   return {target,...host,counters:Object.fromEntries(rows)};
