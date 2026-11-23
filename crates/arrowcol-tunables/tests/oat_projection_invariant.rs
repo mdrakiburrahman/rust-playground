@@ -356,6 +356,8 @@ fn candidates(path: &str) -> Vec<Value> {
         json!("customer_id"),
         json!("shared"),
         json!("diagnostic"),
+        json!("clone_vec"),
+        json!("formatted_rows"),
         json!("fixed"),
         json!("cardinality"),
         json!("none"),
