@@ -84,6 +84,51 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        let column_option = path.strip_prefix("parquet_writer.defaults.")
+            .map(|field| (None, field))
+            .or_else(|| path.strip_prefix("parquet_writer.columns.").and_then(|path| {
+                path.rsplit_once('.').map(|(column, field)| (Some(column), field))
+            }));
+        if let Some((column, field)) = column_option
+            && matches!(field, "encoding" | "dictionary_enabled" | "dictionary_page_size_limit"
+                | "data_page_size_limit" | "statistics" | "write_page_header_statistics"
+                | "bloom_filter_enabled" | "bloom_filter_fpp" | "bloom_filter_ndv"
+                | "data_page_v2_compression_ratio_threshold")
+        {
+            let Some(policy) = parquet_policy.as_ref() else { return true; };
+            let options = if let Some(column) = column {
+                policy.get("columns").and_then(|columns| columns.get(column))
+            } else {
+                policy.get("defaults")
+            };
+            let Some(requested) = options.and_then(|options| options.get(field)).filter(|value| !value.is_null()) else {
+                return true;
+            };
+            let matches = tables_covered && table_policies.iter().all(|record| {
+                let Some(columns) = record["parquet_column_options"].as_object().filter(|columns| !columns.is_empty()) else {
+                    return false;
+                };
+                let applicable = |actual: &Value| {
+                    (field != "dictionary_page_size_limit" || actual["dictionary_enabled"] == true)
+                        && (!matches!(field, "bloom_filter_fpp" | "bloom_filter_ndv") || actual["bloom_filter_enabled"] == true)
+                        && (field != "data_page_v2_compression_ratio_threshold" || record["parquet_properties"]["writer_version"] == "v2")
+                };
+                if let Some(column) = column {
+                    columns.get(column).is_some_and(|actual| applicable(actual) && actual.get(field) == Some(requested))
+                } else {
+                    let effective = columns.iter().filter(|(name, actual)| {
+                        applicable(actual) && policy.get("columns").and_then(|columns| columns.get(*name))
+                            .and_then(|options| options.get(field)).is_none_or(Value::is_null)
+                    }).collect::<Vec<_>>();
+                    !effective.is_empty() && effective.iter().all(|(_, actual)| actual.get(field) == Some(requested))
+                }
+            });
+            if matches {
+                promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
+                return false;
+            }
+            return true;
+        }
         let codec = if path == "parquet_writer.defaults.compression" {
             Some((None, "compression"))
         } else if path == "parquet_writer.defaults.compression_level" {
