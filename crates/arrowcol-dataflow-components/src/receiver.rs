@@ -1319,6 +1319,15 @@ pub(crate) mod tests {
         }
     }
 
+    struct FullChannelSender(flume::Sender<()>);
+
+    #[async_trait]
+    impl PdataSender for FullChannelSender {
+        async fn send(&self, _correlation_id: u64, _pdata: OtapPdata) -> Result<(), PdataSendError> {
+            self.0.send_async(()).await.map_err(|_| PdataSendError::Closed)
+        }
+    }
+
     fn envelope() -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
             publication_id: Some(arrowcol_protocol::PublicationId::new()),
@@ -1550,20 +1559,23 @@ pub(crate) mod tests {
     /// Guarantees: The cancelled send removes its pending pressure entry instead of blocking drain forever.
     #[tokio::test]
     async fn cancelled_backpressured_send_releases_pending_pressure() {
-        let gate = Arc::new(Semaphore::new(0));
+        let (sender, receiver) = flume::bounded(1);
+        sender.send(()).expect("fill channel");
         let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
         metrics.configure_receiver(1, 1_000_000, 1_000_000, 100, 10, 1);
         metrics.configure_exporter(1);
+        metrics.configure_publication_backlog(1).expect("backlog capacity");
+        let pending = Arc::new(PendingTracker::new(Arc::clone(&metrics)));
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = Arc::clone(&semaphore).acquire_owned().await.expect("permit");
         let envelope = envelope();
         metrics.stream_started(&envelope.table);
+        let before = metrics.pressure().expect("pressure before admission");
+        let before_backlog = metrics.publication_backlog_snapshot();
+        let before_capacity = metrics.prometheus();
         let mut lifecycle = DfeStreamLifecycle {
-            sender: Arc::new(CaptureSender {
-                sent: Mutex::new(Vec::new()),
-                gate: Some(gate),
-            }),
-            pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
+            sender: Arc::new(FullChannelSender(sender)),
+            pending: Arc::clone(&pending),
             metrics: Arc::clone(&metrics),
             envelope,
             client_send_observation: None,
@@ -1572,10 +1584,53 @@ pub(crate) mod tests {
             durable: None,
         };
 
-        let send = lifecycle.push_batch(batch());
-        assert!(tokio::time::timeout(Duration::from_millis(20), send).await.is_err());
+        let mut send = Box::pin(lifecycle.push_batch(batch()));
+        assert!(futures::poll!(&mut send).is_pending());
+        assert_eq!(pending.pending_ids().len(), 1);
+        let during = metrics.pressure().expect("pressure during admission");
+        assert!(during.rich.buffered_bytes.current().get() > 0);
+        assert!(during.rich.buffered_rows.current().get() > 0);
+        assert_eq!(during.rich.buffered_batches.current().get(), 1);
+        drop(send);
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.pending_ids().is_empty());
         let pressure = metrics.pressure().expect("pressure");
-        assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+        assert_eq!(
+            pressure.rich.buffered_bytes.current(),
+            before.rich.buffered_bytes.current()
+        );
+        assert_eq!(
+            pressure.rich.buffered_rows.current(),
+            before.rich.buffered_rows.current()
+        );
+        assert_eq!(
+            pressure.rich.buffered_batches.current(),
+            before.rich.buffered_batches.current()
+        );
+        assert_eq!(pressure.rich.oldest_buffer_age_ms, before.rich.oldest_buffer_age_ms);
+        let table = &pressure.rich.tables[0];
+        let before_table = &before.rich.tables[0];
+        assert_eq!(table.buffered_bytes, before_table.buffered_bytes);
+        assert_eq!(table.buffered_rows, before_table.buffered_rows);
+        assert_eq!(table.buffered_batches, before_table.buffered_batches);
+        assert_eq!(table.oldest_buffer_age_ms, before_table.oldest_buffer_age_ms);
+        let backlog = metrics.publication_backlog_snapshot();
+        assert_eq!(backlog.available, before_backlog.available);
+        assert_eq!(backlog.publications, before_backlog.publications);
+        assert_eq!(backlog.rows, before_backlog.rows);
+        assert_eq!(backlog.logical_bytes, before_backlog.logical_bytes);
+        assert_eq!(backlog.oldest_age, before_backlog.oldest_age);
+        let capacity = metrics.prometheus();
+        for scope in ["global", "table"] {
+            for resource in ["bytes", "rows", "batches"] {
+                let prefix =
+                    format!("arrowcol_exporter_capacity_reserved{{scope=\"{scope}\",resource=\"{resource}\"}} ");
+                let line = capacity.lines().find(|line| line.starts_with(&prefix));
+                assert_eq!(line, before_capacity.lines().find(|line| line.starts_with(&prefix)));
+                assert!(line.is_some(), "missing capacity evidence: {prefix}");
+            }
+        }
         Box::new(lifecycle).abort(StreamAbortReason::ClientCancelled).await;
     }
 
