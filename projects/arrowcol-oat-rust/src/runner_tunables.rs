@@ -318,8 +318,17 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         if let Some((field, variable)) = runtime {
             if environment.contains_key(variable)
                 && collectors.iter().all(|process| process["effective_config"]["runtime"].get(field).is_some())
+                && (field != "cpu_thread_stack_size" || collectors.iter().all(|process| {
+                    process["effective_config"]["cpu_pool"]["thread_stack_size"]
+                        == process["effective_config"]["runtime"][field]
+                }))
             {
-                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                let reason = if field == "cpu_thread_stack_size" {
+                    "consumer_cpu_pool_readback"
+                } else {
+                    "consumer_startup_readback"
+                };
+                promoted.push(json!({"path": path, "reason": reason}));
                 return false;
             }
             return true;
@@ -1176,6 +1185,30 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         observed["runtime"]["timestamp_kernel"] = json!("reference");
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_stack_evidence_requires_the_started_pool() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"runtime":{"cpu_thread_stack_size":4194304}}
+        }))?;
+        let mut process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"runtime":{"cpu_thread_stack_size":4194304}}
+        });
+        for observed in [None, Some(2097152), Some(4194304)] {
+            if let Some(size) = observed {
+                process["effective_config"]["cpu_pool"] = json!({"thread_stack_size":size});
+            }
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.runtime.cpu_thread_stack_size"),
+                observed == Some(4194304));
+        }
         Ok(())
     }
 
