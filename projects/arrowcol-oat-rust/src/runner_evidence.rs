@@ -2380,7 +2380,7 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
             if columns > fields || rows.checked_mul(columns) != Some(eligible_rows) || null_rows > eligible_rows {
                 bail!("inconsistent client generator_applicability null counts");
             }
-            for name in ["pod_ordinal", "guid_uniqueness", "value_variation", "string_width"] {
+            for name in ["pod_ordinal", "guid_uniqueness", "value_variation", "string_width", "entropy"] {
               if let Some(guid) = table.get(name) {
                 let columns = guid["eligible_columns"].as_u64()
                     .with_context(|| format!("client generator_applicability {name} eligible_columns must be unsigned"))?;
