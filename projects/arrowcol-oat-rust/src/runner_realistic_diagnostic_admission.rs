@@ -823,7 +823,7 @@ mod realistic_diagnostic_admission_tests {
         let mut wrong_id = exact_reference.clone();
         wrong_id["clients"][0]["logical_client_id"] = json!("sqlserver_availability_replica_states:2");
         let mut wrong_count = exact_reference.clone();
-        wrong_count["clients"].as_array_mut().expect("client roster").push(json!({
+        wrong_count["clients"].as_array_mut().context("client roster")?.push(json!({
             "logical_client_id": "sqlserver_availability_replica_states:2",
             "corpus_memory_reservation_bytes": 100,
         }));
