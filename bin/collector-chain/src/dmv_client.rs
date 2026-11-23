@@ -4613,6 +4613,16 @@ mod tests {
             .downcast_ref::<StringArray>()
             .context("string array")?;
         assert!(strings.iter().all(|value| value == Some("aaaaaaa")));
+        options.string_width = 23;
+        options.string_length_distribution = Some(StringLengthDistribution::Uniform);
+        let variable = synthetic_batch(&table, "client", 100, 0, 0, &options)?;
+        let strings = variable
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("string array")?;
+        assert!(strings.iter().flatten().any(|value| value.len() < 23));
+        options.string_length_distribution = Some(StringLengthDistribution::Fixed);
         let values = repeated
             .column(2)
             .as_any()

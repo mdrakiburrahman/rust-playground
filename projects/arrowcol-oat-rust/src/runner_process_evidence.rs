@@ -3164,7 +3164,7 @@ groups:
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row","string_width":31}
+            "client":{"pod_ordinal":3,"guid_uniqueness":"per_row","value_variation":"per_row","string_width":31,"string_length_distribution":"uniform"}
         }))?;
         let observed = actual_client_startup(&binary, &config)?;
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(0);
@@ -3192,6 +3192,8 @@ groups:
             .iter().any(|entry| entry["path"] == "client.value_variation"));
         assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
             .iter().any(|entry| entry["path"] == "client.string_width"));
+        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "client.string_length_distribution"));
         let mut absent = report.clone();
         absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
         let mut uncovered = initial.clone();
@@ -3217,6 +3219,18 @@ groups:
         }
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
+        prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(8);
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "client":{"string_width":1,"string_length_distribution":"uniform"}
+        }))?;
+        let observed = actual_client_startup(&binary, &config)?;
+        let mut width_one = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut width_one, Some(&vec![json!({
+            "client_id":"client-1","table":table,"consumer_effective_config":observed,
+            "phase_counters":{"preparation":client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?}
+        })]))?;
+        assert!(width_one["inert_fields"].as_array().context("inert_fields array")?.iter()
+            .any(|entry| entry["path"] == "client.string_length_distribution" && entry["reason"] == "one_byte_maximum_width"));
         for profile in ["diagnostic", "realistic"] {
             config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
                 "client":{"string_width":0,"data_profile":profile}
