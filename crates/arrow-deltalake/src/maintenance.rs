@@ -2752,6 +2752,7 @@ impl OptimizeConfig {
             if self
                 .small_file_bytes
                 .checked_mul(u64::from(self.input_prefetch_files))
+                .and_then(|bytes| bytes.checked_mul(self.bin_concurrency as u64))
                 .is_none_or(|bytes| bytes > MAX_OPTIMIZE_PREFETCH_BYTES)
             {
                 return invalid("input_prefetch_files encoded input budget exceeds 512 MiB");
@@ -3304,6 +3305,19 @@ impl DeltaTable {
                 MaintenanceErrorKind::InvalidPlan,
                 "upload_concurrency requires buffered multipart upload",
             ));
+        }
+        if let Some(buffer_bytes) = upload_buffer_bytes
+            && (config.upload_concurrency > 1 || config.bin_concurrency > 1)
+        {
+            let budget = buffer_bytes
+                .checked_mul(config.upload_concurrency + 1)
+                .and_then(|bytes| bytes.checked_mul(config.bin_concurrency));
+            if budget.is_none_or(|bytes| bytes > 536_870_912) {
+                return Err(fail(
+                    MaintenanceErrorKind::InvalidPlan,
+                    "upload_concurrency and bin_concurrency buffer budget exceeds 512 MiB",
+                ));
+            }
         }
         let state = self.validated_active_state(prepared, config.max_active_files)?;
         let writer_config = match writer_config {
