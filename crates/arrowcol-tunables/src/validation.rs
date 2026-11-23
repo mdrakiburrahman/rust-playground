@@ -3118,6 +3118,33 @@ mod tests {
             (serde_json::json!({"client":{"workers":"bad"}}), "client.workers"),
             (serde_json::json!({"client":{"seed":"bad"}}), "client.seed"),
             (
+                serde_json::json!({"client":{"pod_ordinal":4_294_967_296_u64}}),
+                "client.pod_ordinal",
+            ),
+            (
+                serde_json::json!({"client":{"string_width":65_537}}),
+                "client.string_width",
+            ),
+            (serde_json::json!({"client":{"cardinality":0}}), "client.cardinality"),
+            (
+                serde_json::json!({"client":{"null_fraction":1.1}}),
+                "client.null_fraction",
+            ),
+            (serde_json::json!({"client":{"skew":1.1}}), "client.skew"),
+            (serde_json::json!({"client":{"entropy":-0.1}}), "client.entropy"),
+            (
+                serde_json::json!({"client":{"guid_uniqueness":"bad"}}),
+                "client.guid_uniqueness",
+            ),
+            (
+                serde_json::json!({"client":{"value_variation":"bad"}}),
+                "client.value_variation",
+            ),
+            (
+                serde_json::json!({"client":{"string_length_distribution":"bad"}}),
+                "client.string_length_distribution",
+            ),
+            (
                 serde_json::json!({"transport":{"grpc_send_compression":"bad"}}),
                 "transport.grpc_send_compression",
             ),
