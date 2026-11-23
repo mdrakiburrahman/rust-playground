@@ -895,6 +895,9 @@ pub struct FlightReceiverConfig {
     /// Flight resource limits.
     #[serde(default)]
     pub limits: RuntimeLimitsConfig,
+    /// Flight accepted-socket settings.
+    #[serde(default)]
+    pub socket: arrowcol_tunables::CollectorSocketTunables,
     /// Enables durable admission through native Quiver persistence.
     ///
     /// The topology must route this receiver into a `processor:durable_buffer`
@@ -923,6 +926,7 @@ impl FlightReceiverConfig {
             }
         }
         apply_json_environment(&mut self.limits, "ARROWCOL_COLLECTOR_LIMITS_CONFIG", None)?;
+        apply_json_environment(&mut self.socket, "ARROWCOL_COLLECTOR_SOCKET_CONFIG", None)?;
         apply_json_environment(
             &mut self.registration,
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
@@ -945,6 +949,7 @@ impl FlightReceiverConfig {
         serde_json::json!({
             "cpu_pressure": self.cpu_pressure,
             "limits": self.limits,
+            "socket": self.socket,
             "pressure": {
                 "max_concurrent_streams": self.registration.max_concurrent_streams,
                 "rss_limit_bytes": self.registration.rss_limit_bytes,

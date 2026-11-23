@@ -580,6 +580,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_BATCHING_CONFIG" => "/batching".to_owned(),
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
+            "ARROWCOL_COLLECTOR_SOCKET_CONFIG" => "/socket".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
             "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
@@ -2341,6 +2342,7 @@ mod consumer_startup_projection_tests {
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
                     "heartbeat_interval":"4s","registration_ttl":"30s"},
+                "socket":{"tcp_nodelay":true},
                 "runtime":{"file_mapping_cache":true,"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
                     "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4,"partition_grouping":"typed_runs",
                     "generated_partition_binding":"proven_constant"}
@@ -2417,7 +2419,8 @@ groups:
                         Duration::from_millis(100),
                     ).is_ok()
                 });
-                if listening && output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#) {
+                if listening && output.contains(r#""component":"receiver""#) && output.contains(r#""component":"exporter""#)
+                    && output.contains(r#""scope":"accepted_flight_socket""#) {
                     std::thread::sleep(Duration::from_millis(100));
                     if let Some(status) = child.0.try_wait()? {
                         let output = std::fs::read_to_string(&log_path)?;
@@ -2439,6 +2442,7 @@ groups:
         }
         let observed = process_configurations(&text.context("collector did not produce readback")?)?;
         assert_eq!(observed["dfe_worker_concurrency"], 2);
+        assert_eq!(observed["socket_effective"]["tcp_nodelay"], true);
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
             "component": "collector", "instance_id": "collector-1", "log_complete": true,
@@ -2448,19 +2452,17 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(
-            covered["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?
-                .len(),
-            36
-        );
-        assert!(
-            covered["projection_only"]
-                .as_array()
-                .context("projection_only array")?
-                .is_empty()
-        );
+        let verified = covered["consumer_verified"].as_array().context("consumer_verified array")?;
+        assert_eq!(verified.len(), 37);
+        for path in [
+            "collector.socket.tcp_nodelay",
+            "collector.runtime.file_mapping_cache",
+            "collector.runtime.partition_grouping",
+            "collector.runtime.generated_partition_binding",
+        ] {
+            assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
+        }
+        assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
         let mut missing_process = process.clone();

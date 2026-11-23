@@ -37,6 +37,7 @@ use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::OtapPayload;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -596,13 +597,27 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             registration_shutdown,
         ));
         let flight_shutdown = shutdown.child_token();
+        let tcp_nodelay = self.config.socket.tcp_nodelay;
         let mut flight = tokio::spawn(async move {
+            let mut reported = false;
+            let incoming = TcpListenerStream::new(flight_listener).map(move |result| {
+                result.and_then(|stream| {
+                    let (stream, actual) = configure_flight_socket(stream, tcp_nodelay)?;
+                    if let Some(actual) = actual
+                        && !reported
+                    {
+                        eprintln!(
+                            "arrowcol_effective_config {}",
+                            serde_json::json!({"socket_effective":{"tcp_nodelay":actual,"scope":"accepted_flight_socket"}})
+                        );
+                        reported = true;
+                    }
+                    Ok(stream)
+                })
+            });
             Server::builder()
                 .add_service(service.into_tonic_service())
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(flight_listener),
-                    flight_shutdown.cancelled_owned(),
-                )
+                .serve_with_incoming_shutdown(incoming, flight_shutdown.cancelled_owned())
                 .await
         });
         let admin_shutdown = shutdown.child_token();
@@ -685,6 +700,23 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             }
         }
     }
+}
+
+fn configure_flight_socket(
+    stream: tokio::net::TcpStream,
+    tcp_nodelay: Option<bool>,
+) -> std::io::Result<(tokio::net::TcpStream, Option<bool>)> {
+    let Some(requested) = tcp_nodelay else {
+        return Ok((stream, None));
+    };
+    stream.set_nodelay(requested)?;
+    let actual = stream.nodelay()?;
+    if actual != requested {
+        return Err(std::io::Error::other(
+            "accepted Flight socket TCP_NODELAY differs from requested value",
+        ));
+    }
+    Ok((stream, Some(actual)))
 }
 
 fn correlation_id(call_data: &CallData) -> Option<u64> {
@@ -1149,6 +1181,23 @@ pub(crate) mod tests {
     use tonic::metadata::MetadataValue;
 
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_flight_socket_applies_tcp_nodelay() -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let _client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (stream, _) = listener.accept().await?;
+        let (stream, observed) = configure_flight_socket(stream, Some(true))?;
+        assert_eq!(observed, Some(true));
+        assert!(stream.nodelay()?);
+        let (stream, observed) = configure_flight_socket(stream, None)?;
+        assert_eq!(observed, None);
+        assert!(stream.nodelay()?);
+        let (stream, observed) = configure_flight_socket(stream, Some(false))?;
+        assert_eq!(observed, Some(false));
+        assert!(!stream.nodelay()?);
+        Ok(())
+    }
 
     pub(crate) struct CaptureSender {
         pub(crate) sent: Mutex<Vec<(u64, OtapPdata)>>,

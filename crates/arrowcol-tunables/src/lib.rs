@@ -237,6 +237,7 @@ pub struct CollectorTunables {
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+    pub socket: Option<CollectorSocketTunables>,
     pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
 }
@@ -247,6 +248,23 @@ pub struct CollectorUploadTunables {
     pub mode: Option<CollectorUploadMode>,
     pub buffer_capacity_bytes: Option<usize>,
     pub request_concurrency: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorSocketTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_bool"
+    )]
+    pub tcp_nodelay: Option<bool>,
+}
+
+fn deserialize_present_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
