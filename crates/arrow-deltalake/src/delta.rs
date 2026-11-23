@@ -1408,6 +1408,12 @@ mod io_tests {
         let expected_codec = codec_readback["parquet_columns"]["id"]["compression"]
             .as_str()
             .context("missing codec readback")?;
+        assert_eq!(codec_readback["config"]["enabled"], true);
+        assert_eq!(codec_readback["config"]["sort_columns"], serde_json::json!(["id"]));
+        assert_eq!(codec_readback["config"]["bloom_columns"], serde_json::json!(["id"]));
+        assert_eq!(codec_readback["config"]["max_rows"], 3);
+        assert_eq!(codec_readback["config"]["row_group_rows"], 2);
+        assert_eq!(codec_readback["config"]["page_rows"], 1);
         for group in reader.metadata().row_groups() {
             let actual = match group.column(0).compression() {
                 parquet::basic::Compression::UNCOMPRESSED => "uncompressed",
@@ -1422,6 +1428,16 @@ mod io_tests {
             assert_eq!(actual, expected_codec);
         }
         assert_eq!(reader.metadata().num_row_groups(), 2);
+        let row_group_limit = codec_readback["config"]["row_group_rows"]
+            .as_i64()
+            .context("missing row-group limit")?;
+        assert!(
+            reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .all(|group| group.num_rows() <= row_group_limit)
+        );
         assert!(
             reader
                 .metadata()
@@ -1465,6 +1481,15 @@ mod io_tests {
             Some("1970-01-01-01-00")
         );
         assert!(writer.sorter.is_none());
+        let disabled_readback = table
+            .layout_readback
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .as_ref()
+            .context("missing disabled layout readback")?
+            .event(&table.url, crate::writer::process_config()?)?;
+        assert_eq!(disabled_readback["config"]["enabled"], false);
+        assert!(disabled_readback["config"]["sort_columns"].is_null());
         assert_eq!(writer.adaptive_file_config(&defaults)?.target_parquet_bytes, 64);
         drop(writer);
         properties.insert("arrowcol.layout.rowGroupRows".into(), "0".into());
