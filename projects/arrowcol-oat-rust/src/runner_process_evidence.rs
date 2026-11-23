@@ -2108,7 +2108,9 @@ mod consumer_startup_projection_tests {
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
-                    "heartbeat_interval":"4s","registration_ttl":"30s"}
+                    "heartbeat_interval":"4s","registration_ttl":"30s"},
+                "runtime":{"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
+                    "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4}
             }
         }))?;
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2212,7 +2214,7 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 11);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 19);
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
@@ -2234,6 +2236,8 @@ groups:
             ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
                 "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
                 "heartbeat_interval", "registration_ttl"][..]),
+            ("runtime", &["runtime_workers", "blocking_workers", "blocking_fs_reserve", "task_limit",
+                "read_ahead", "batch_rows", "cpu_workers", "cpu_queue_jobs"][..]),
         ] {
             for field in fields {
                 let mut missing = observed.clone();
@@ -2241,6 +2245,10 @@ groups:
                     .remove(*field).context("consumer omitted requested field")?;
                 anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
                     "verifier accepted missing {group}.{field}");
+                let mut wrong = observed.clone();
+                wrong[group][*field] = json!("wrong");
+                anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err(),
+                    "verifier accepted wrong {group}.{field}");
             }
         }
         let mut wrong = observed;
