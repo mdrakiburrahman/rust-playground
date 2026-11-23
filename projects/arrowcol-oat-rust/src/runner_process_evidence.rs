@@ -2334,7 +2334,7 @@ mod consumer_startup_projection_tests {
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
                     "heartbeat_interval":"4s","registration_ttl":"30s"},
-                "runtime":{"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
+                "runtime":{"file_mapping_cache":true,"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
                     "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4,"partition_grouping":"typed_runs"}
             }
         }))?;
@@ -2464,7 +2464,7 @@ groups:
             ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
                 "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
                 "heartbeat_interval", "registration_ttl"][..]),
-            ("runtime", &["runtime_workers", "blocking_workers", "blocking_fs_reserve", "task_limit",
+            ("runtime", &["file_mapping_cache", "runtime_workers", "blocking_workers", "blocking_fs_reserve", "task_limit",
                 "read_ahead", "batch_rows", "cpu_workers", "cpu_queue_jobs", "partition_grouping"][..]),
         ] {
             for field in fields {
