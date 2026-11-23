@@ -249,6 +249,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.max_age", "5s in OAT YAML; 30s component default"),
     capability!("collector.batching.max_concurrent_flushes", "4"),
     capability!("collector.batching.pipeline_depth", "1"),
+    capability!("collector.batching.stage_file_concurrency", "1"),
     capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
     capability!(
         "collector.batching.adaptive_file.min_input_bytes",
@@ -336,6 +337,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.runtime.cpu_dispatch", "shared_fifo"),
+    capability!("collector.runtime.cpu_placement", "os"),
     capability!("collector.runtime.parquet_column_workers", "1"),
     capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
     capability!("collector.runtime.partition_grouping", "scalar_map"),
@@ -1228,6 +1231,12 @@ impl Tunables {
                     }
                 }
                 if let Some(runtime) = &collector.runtime {
+                    if let Some(dispatch) = runtime.cpu_dispatch {
+                        output.insert("ARROWCOL_COLLECTOR_CPU_DISPATCH".into(), dispatch.as_str().into());
+                    }
+                    if let Some(placement) = runtime.cpu_placement {
+                        output.insert("ARROWCOL_COLLECTOR_CPU_PLACEMENT".into(), placement.as_str().into());
+                    }
                     if let Some(grouping) = runtime.partition_grouping {
                         output.insert(
                             "ARROWCOL_COLLECTOR_PARTITION_GROUPING".to_owned(),
@@ -1815,6 +1824,9 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
         bail!("collector.batching.max_concurrent_flushes exceeds Semaphore::MAX_PERMITS");
     }
     let depth = batching.pipeline_depth.unwrap_or(1);
+    if !(1..=16).contains(&batching.stage_file_concurrency.unwrap_or(1)) {
+        bail!("collector.batching.stage_file_concurrency must be an integer in 1..=16");
+    }
     if !(1..=64).contains(&depth) {
         bail!("collector.batching.pipeline_depth must be in 1..=64");
     }

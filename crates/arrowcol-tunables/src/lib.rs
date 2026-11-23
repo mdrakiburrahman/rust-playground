@@ -875,6 +875,11 @@ pub struct BatchingTunables {
     pub max_age: Option<String>,
     pub max_concurrent_flushes: Option<usize>,
     pub pipeline_depth: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stage_file_concurrency"
+    )]
+    pub stage_file_concurrency: Option<usize>,
     pub adaptive_file: Option<AdaptiveFileTunables>,
 }
 
@@ -1001,6 +1006,16 @@ pub struct RuntimeTunables {
     pub batch_rows: Option<usize>,
     pub cpu_workers: Option<usize>,
     #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cpu_dispatch"
+    )]
+    pub cpu_dispatch: Option<arrow_deltalake::CpuDispatch>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cpu_placement"
+    )]
+    pub cpu_placement: Option<arrow_deltalake::CpuPlacement>,
+    #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_parquet_column_workers"
@@ -1068,15 +1083,40 @@ fn deserialize_present_partition_grouping<'de, D: serde::Deserializer<'de>>(
         .map_err(|error| serde::de::Error::custom(format!("collector.runtime.partition_grouping: {error}")))
 }
 
+fn deserialize_mode<'de, D, T>(d: D, path: &str) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw = String::deserialize(d)
+        .map_err(|_| <D::Error as serde::de::Error>::custom(format!("{path} must be a string")))?;
+    serde_json::from_value(serde_json::Value::String(raw))
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("{path}: {error}")))
+}
+
+fn deserialize_cpu_dispatch<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CpuDispatch>, D::Error> {
+    deserialize_mode(d, "collector.runtime.cpu_dispatch")
+}
+
+fn deserialize_cpu_placement<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CpuPlacement>, D::Error> {
+    deserialize_mode(d, "collector.runtime.cpu_placement")
+}
+
+fn deserialize_stage_file_concurrency<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.batching.stage_file_concurrency must be an integer in 1..=16"))
+}
+
 fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::TimestampKernel>, D::Error> {
-    // Deserialize a string first: serde's externally tagged object enum form is not a tunable value.
-    let raw = String::deserialize(d)
-        .map_err(|_| <D::Error as serde::de::Error>::custom("collector.runtime.timestamp_kernel must be a string"))?;
-    serde_json::from_value(serde_json::Value::String(raw))
-        .map(Some)
-        .map_err(|e| serde::de::Error::custom(format!("collector.runtime.timestamp_kernel: {e}")))
+    deserialize_mode(d, "collector.runtime.timestamp_kernel")
 }
 
 fn deserialize_binding<'de, D: serde::Deserializer<'de>>(

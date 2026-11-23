@@ -46,6 +46,71 @@ pub mod sizing;
 pub mod telemetry;
 pub mod writer;
 
+/// Queue discipline for the dedicated CPU workers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum CpuDispatch {
+    #[default]
+    SharedFifo,
+    BoundedShards,
+}
+
+impl CpuDispatch {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedFifo => "shared_fifo",
+            Self::BoundedShards => "bounded_shards",
+        }
+    }
+}
+
+impl TryFrom<String> for CpuDispatch {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "shared_fifo" => Ok(Self::SharedFifo),
+            "bounded_shards" => Ok(Self::BoundedShards),
+            _ => Err("expected shared_fifo or bounded_shards"),
+        }
+    }
+}
+
+/// Affinity policy for CPU workers, independent of the I/O runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum CpuPlacement {
+    #[default]
+    Os,
+    CompactAllowed,
+    ScatterAllowed,
+}
+
+impl CpuPlacement {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::CompactAllowed => "compact_allowed",
+            Self::ScatterAllowed => "scatter_allowed",
+        }
+    }
+}
+
+impl TryFrom<String> for CpuPlacement {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "os" => Ok(Self::Os),
+            "compact_allowed" => Ok(Self::CompactAllowed),
+            "scatter_allowed" => Ok(Self::ScatterAllowed),
+            _ => Err("expected os, compact_allowed or scatter_allowed"),
+        }
+    }
+}
+
 /// How the writer groups rows by their Delta partition values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]

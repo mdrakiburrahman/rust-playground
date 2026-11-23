@@ -45,6 +45,9 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["thread"] }
+
 [dev-dependencies]
 arrow = { version = "58.3", default-features = false, features = ["ipc"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
