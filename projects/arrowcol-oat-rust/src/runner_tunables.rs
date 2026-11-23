@@ -279,6 +279,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             return true;
         }
         let runtime = match path {
+            "collector.runtime.timestamp_kernel" => Some(("timestamp_kernel", "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL")),
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
             "collector.runtime.blocking_workers" => Some(("blocking_workers", "ARROWCOL_COLLECTOR_BLOCKING_WORKERS")),
             "collector.runtime.blocking_fs_reserve" => Some(("blocking_fs_reserve", "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE")),
@@ -1021,6 +1022,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             return Ok(());
         }
         for (tunables, expected) in [
+            (json!({"collector":{"runtime":{"timestamp_kernel":"fused_checked"}}}), json!({"timestamp_kernel":"fused_checked"})),
             (json!({"collector":{"runtime":{"upload_limit":1},"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":16}}}),
              json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1})),
             (json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
@@ -1130,6 +1132,24 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         Ok(serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?)
+    }
+
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn timestamp_kernel_reaches_actual_collector_startup() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arrowcol-dataflow-rust");
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"runtime":{"timestamp_kernel":"fused_checked"}}
+        }))?;
+        let output = std::process::Command::new(binary).arg("--help").env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?).output()?;
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+        let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        observed["runtime"]["timestamp_kernel"] = json!("reference");
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        Ok(())
     }
 
     #[test]

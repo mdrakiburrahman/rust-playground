@@ -315,6 +315,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.blocking_workers", "clamp(2c,32,128)"),
     capability!("collector.runtime.blocking_fs_reserve", "1"),
     capability!("collector.runtime.upload_limit", "32"),
+    capability!("collector.runtime.timestamp_kernel", "reference"),
     capability!("collector.runtime.task_limit", "clamp(4c,64,256)"),
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
@@ -1148,6 +1149,16 @@ impl Tunables {
                         output.insert(
                             "ARROWCOL_COLLECTOR_PARTITION_GROUPING".to_owned(),
                             grouping.as_str().to_owned(),
+                        );
+                    }
+                    if let Some(kernel) = runtime.timestamp_kernel {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL".into(),
+                            match kernel {
+                                arrow_deltalake::TimestampKernel::Reference => "reference",
+                                arrow_deltalake::TimestampKernel::FusedChecked => "fused_checked",
+                            }
+                            .into(),
                         );
                     }
                     if let Some(enabled) = runtime.generated_partition_fast_path {
@@ -2551,6 +2562,19 @@ mod tests {
         no_coalescing["collector"]["batching"]["coalesce_publications"] = serde_json::json!(false);
         assert!(Tunables::parse_oat_json(no_coalescing).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn timestamp_kernel_rejects_non_string_or_unknown_values() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!("fused"),
+            serde_json::json!({"reference":null}),
+        ] {
+            let value = serde_json::json!({"collector":{"runtime":{"timestamp_kernel":bad}}});
+            assert!(error_text(Tunables::parse_oat_json(value)).contains("timestamp_kernel"));
+        }
     }
 
     #[test]

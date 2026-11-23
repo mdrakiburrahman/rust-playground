@@ -365,3 +365,12 @@ pub(crate) mod sync_hook {
         Ok(())
     }
 }
+
+/// Timestamp conversion used for raw Delta inputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampKernel {
+    #[default]
+    Reference,
+    FusedChecked,
+}

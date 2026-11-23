@@ -3886,7 +3886,7 @@ impl DeltaTable {
                 batch,
             )]);
         }
-        let normalized = normalize::batch(&batch)?;
+        let normalized = normalize::batch_with_kernel(&batch, runtime_config()?.timestamp_kernel)?;
         let snapshot = match self.existing_snapshot()? {
             Some(snapshot) => snapshot,
             None => {
@@ -4004,7 +4004,7 @@ impl DeltaTable {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect()
         });
-        let first = normalize::batch(first_batch)?;
+        let first = normalize::batch_with_kernel(first_batch, runtime_config()?.timestamp_kernel)?;
         let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&first.schema())?)?;
         let layout = publication_layout(&first.schema(), &resolved)?;
         if let Some(policy) = &layout {
@@ -4029,7 +4029,7 @@ impl DeltaTable {
             if stamp < 0 || !unique.insert(app_id.clone()) {
                 bail!("invalid or duplicate coalesced publication identity");
             }
-            batch = normalize::batch(&batch)?;
+            batch = normalize::batch_with_kernel(&batch, runtime_config()?.timestamp_kernel)?;
             let identity_schema = batch.schema();
             let expected_ingestion = if partitioned_ingestion {
                 Some(format_ingestion_partition(stamp, &granularity)?)
@@ -5234,7 +5234,7 @@ impl DeltaFileWriter {
         let mut batch = if self.canonical_input {
             normalize::canonical_batch(batch)?
         } else {
-            normalize::batch(batch)?
+            normalize::batch_with_kernel(batch, runtime_config()?.timestamp_kernel)?
         };
         for (name, expected) in &self.partition_values {
             if let Ok(index) = batch.schema().index_of(name) {
