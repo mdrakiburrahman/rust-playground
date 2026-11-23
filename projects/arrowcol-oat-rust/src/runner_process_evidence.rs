@@ -2431,6 +2431,8 @@ groups:
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
             if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
                 | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
+                | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
+                | "keepalive_timeout_ms" | "keepalive_while_idle"
                 | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
                 | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
                 config.clients_per_table = 1;
@@ -2456,6 +2458,23 @@ groups:
             wrong[field] = json!("intentional-mismatch");
             anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &wrong).is_err(),
                 "adapter accepted wrong {field} for {input}");
+        }
+        config.clients_per_table = 1;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
+            "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
+            "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false
+        }}))?;
+        let observed = actual_client_startup(&binary, &config)?;
+        let mut coverage = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut coverage, Some(&vec![json!({
+            "client_id":"client-1", "consumer_effective_config":observed
+        })]))?;
+        for field in ["transport.stream_window_bytes", "transport.connection_window_bytes",
+            "transport.keepalive_timeout_ms", "transport.keepalive_while_idle"] {
+            assert!(coverage["inert_fields"].as_array().context("missing inert fields")?
+                .iter().any(|entry| entry["path"] == field));
+            assert!(!coverage["consumer_verified"].as_array().context("missing verified fields")?
+                .iter().any(|entry| entry["path"] == field));
         }
         Ok(())
     }
