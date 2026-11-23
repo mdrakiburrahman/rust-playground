@@ -53,6 +53,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         return Ok(());
     };
     let environment = role_environment(config, ComponentRole::Collector)?;
+    let stats_columns = environment.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+        .map(|value| serde_json::from_str::<Vec<String>>(value)).transpose()?;
     let parquet_policy: Option<Value> = environment.get("ARROWCOL_PARQUET_CONFIG")
         .map(|value| serde_json::from_str(value)).transpose()?;
     let layout_policy = config.tunables.collector.as_ref().and_then(|collector| collector.layout.as_ref())
@@ -99,6 +101,26 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        if path == "collector.commit.delta_stats_columns" {
+            let policies = collectors.iter()
+                .flat_map(|process| process["delta_stats_table_metadata"].as_array().into_iter().flatten())
+                .collect::<Vec<_>>();
+            let covered = !expected_tables.is_empty()
+                && collectors.iter().all(|process| process["delta_stats_table_metadata"].is_array())
+                && expected_tables.iter().all(|table| policies.iter().any(|policy| policy["table_name"] == *table))
+                && policies.iter().all(|policy| {
+                    policy["scope"] == "committed_table_metadata"
+                        && policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
+                        && policy["table_id"].as_str().is_some_and(|id| !id.is_empty())
+                        && policy["version"].as_u64().is_some()
+                        && stats_columns.as_ref().is_some_and(|columns| delta_stats_properties_match(columns, &policy["properties"]))
+                });
+            if covered {
+                promoted.push(json!({"path": path, "reason": "committed_table_metadata_readback"}));
+                return false;
+            }
+            return true;
+        }
         if let Some(field) = path.strip_prefix("collector.batching.adaptive_file.")
             && matches!(field, "target_parquet_bytes" | "min_input_bytes" | "max_input_bytes"
                 | "cold_start_parquet_ratio" | "ewma_weight" | "min_parquet_ratio" | "max_parquet_ratio")

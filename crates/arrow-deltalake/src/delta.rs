@@ -1951,6 +1951,106 @@ mod io_tests {
         )?)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn delta_stats_creation_selects_committed_stats_without_adopting_existing_properties() -> Result<()> {
+        use arrow::array::ArrayRef;
+        const CASE: &str = "ARROWCOL_TEST_DELTA_STATS_CASE";
+        let Ok(case) = std::env::var(CASE) else {
+            for (case, columns) in [
+                ("selected", r#"["id"]"#),
+                ("disabled", "[]"),
+                ("unknown", r#"["missing"]"#),
+                ("existing", "[]"),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe()?)
+                    .args(["delta::io_tests::delta_stats_creation_selects_committed_stats_without_adopting_existing_properties",
+                        "--exact", "--nocapture"])
+                    .env(CASE, case)
+                    .env(crate::delta_stats::ENVIRONMENT, columns)
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(());
+        };
+        let directory = tempfile::tempdir()?;
+        let input = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(arrow::array::Int32Array::from(vec![42])) as ArrayRef),
+            ("ignored", Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef),
+        ])?;
+        if case == "existing" {
+            let url = Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+            let catalog = DeltaTable::open_catalog(url)?;
+            catalog.commit_catalog(
+                None,
+                input.schema(),
+                Vec::new(),
+                BTreeMap::from([(crate::delta_stats::COLUMNS_PROPERTY.to_owned(), "id".to_owned())]),
+                None,
+            )?;
+            drop(catalog);
+        }
+        let table = DeltaTable::open(directory.path())?;
+        let creation = table.new_file(input.schema());
+        if matches!(case.as_str(), "unknown" | "existing") {
+            let error = creation.err().context("invalid stats policy unexpectedly adopted")?;
+            assert!(format!("{error:#}").contains("collector.commit.delta_stats_columns"));
+            if case == "unknown" {
+                assert!(!directory.path().join("_delta_log").exists());
+            } else {
+                assert_eq!(table.version()?, 0);
+                let metadata = table
+                    .snapshot()?
+                    .table_configuration()
+                    .metadata()
+                    .configuration()
+                    .clone();
+                assert_eq!(metadata[crate::delta_stats::COLUMNS_PROPERTY], "id");
+                assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
+            }
+            return Ok(());
+        }
+        let mut writer = creation?;
+        writer.write(&input).await?;
+        assert_eq!(writer.finish().await?.version, 1);
+        let log = fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;
+        let actions = log
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let add = actions
+            .iter()
+            .find_map(|action| action.get("add"))
+            .context("missing committed Add")?;
+        let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().context("missing committed stats")?)?;
+        assert_eq!(stats["numRecords"], 1);
+        if case == "selected" {
+            assert_eq!(stats["minValues"], serde_json::json!({"id":42}));
+            assert_eq!(stats["maxValues"], serde_json::json!({"id":42}));
+            assert_eq!(stats["nullCount"], serde_json::json!({"id":0}));
+        } else {
+            for field in ["minValues", "maxValues", "nullCount"] {
+                assert!(stats[field].is_null() || stats[field].as_object().is_some_and(|fields| fields.is_empty()));
+            }
+        }
+        let snapshot = table.snapshot()?;
+        let policy = crate::delta_stats::DeltaStatsPolicy::from_env()?.context("missing policy")?;
+        policy.verify_metadata(
+            &snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )?;
+        Ok(())
+    }
+
     /// Scenario: a concurrent subprocess inherits the writer's descriptor before exec.
     /// Guarantees: the last owner releases its lock even while a duplicate descriptor remains open.
     #[cfg(unix)]
@@ -2662,6 +2762,7 @@ pub struct DeltaTable {
     bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     layout_readback: Mutex<Option<LayoutReadback>>,
+    stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
 }
@@ -3331,6 +3432,7 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
+            stats_readback: Mutex::new(None),
             reuse_snapshots: false,
             publication_fence,
             session,
@@ -3619,6 +3721,7 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
+            stats_readback: Mutex::new(None),
             reuse_snapshots,
             publication_fence,
             session: None,
@@ -3779,6 +3882,7 @@ impl DeltaTable {
     }
 
     fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
+        let stats_policy = crate::delta_stats::DeltaStatsPolicy::from_env()?;
         let mut schema_guard = None;
         loop {
             let existing = self.existing_snapshot()?;
@@ -3804,6 +3908,7 @@ impl DeltaTable {
                 None => self.snapshot()?,
             };
             Self::validate_retention(&snapshot)?;
+            self.verify_stats_readback(&snapshot, stats_policy.as_ref())?;
             if !self.partition_columns.is_empty()
                 && snapshot.table_configuration().metadata().partition_columns() != self.partition_columns
             {
@@ -3857,9 +3962,16 @@ impl DeltaTable {
     }
 
     fn create_schema(&self, incoming: SchemaRef, fresh_fence: Option<Arc<dyn PublicationFence>>) -> Result<()> {
+        let stats_policy = crate::delta_stats::DeltaStatsPolicy::from_env()?;
+        if let Some(policy) = &stats_policy {
+            policy.validate_schema(&incoming)?;
+        }
         let schema = Arc::new(StructType::try_from_arrow(incoming)?);
         let mut builder =
             delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake");
+        if let Some(policy) = &stats_policy {
+            builder = builder.with_table_properties(policy.properties());
+        }
         if !self.partition_columns.is_empty() {
             builder = builder.with_data_layout(delta_kernel::transaction::data_layout::DataLayout::partitioned(
                 self.partition_columns.clone(),
@@ -3890,6 +4002,45 @@ impl DeltaTable {
                 }
             }
         }
+        self.verify_stats_readback(&self.snapshot()?, stats_policy.as_ref())?;
+        Ok(())
+    }
+
+    fn verify_stats_readback(
+        &self,
+        snapshot: &SnapshotRef,
+        policy: Option<&crate::delta_stats::DeltaStatsPolicy>,
+    ) -> Result<()> {
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+        let schema: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
+        policy.validate_schema(&schema)?;
+        let metadata = snapshot.table_configuration().metadata();
+        let properties = metadata
+            .configuration()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        policy.verify_metadata(&properties)?;
+        let properties = properties
+            .into_iter()
+            .filter(|(key, _)| key == crate::delta_stats::COLUMNS_PROPERTY || key == crate::delta_stats::COUNT_PROPERTY)
+            .collect::<BTreeMap<_, _>>();
+        let next = (metadata.id().to_owned(), properties.clone());
+        let mut previous = self.stats_readback.lock().map_err(|error| anyhow::anyhow!("{error}"))?;
+        if previous.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        let event = serde_json::json!({
+            "scope": "committed_table_metadata",
+            "table_name": telemetry_table_name(&self.url),
+            "table_id": metadata.id(),
+            "version": snapshot.version(),
+            "properties": properties,
+        });
+        eprintln!("arrowcol_delta_stats_config {event}");
+        *previous = Some(next);
         Ok(())
     }
 

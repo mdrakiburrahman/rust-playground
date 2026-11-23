@@ -448,6 +448,20 @@ pub struct CommitTunables {
     pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_delta_stats_columns"
+    )]
+    pub delta_stats_columns: Option<Vec<String>>,
+}
+
+fn deserialize_delta_stats_columns<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.commit.delta_stats_columns must be an array of column paths"))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

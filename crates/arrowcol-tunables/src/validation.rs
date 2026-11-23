@@ -284,6 +284,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.batch_window", "2s in OAT YAML; 10s component default"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
+    capability!(
+        "collector.commit.delta_stats_columns",
+        "existing Delta stats defaults; creation only"
+    ),
     capability!("collector.limits.max_metadata_bytes", "16384"),
     capability!("collector.limits.grpc_accept_compression", "none"),
     capability!("collector.limits.grpc_send_compression", "none"),
@@ -1112,6 +1116,12 @@ impl Tunables {
                 if let Some(value) = &collector.commit {
                     let mut value = value.clone();
                     canonicalize_optional_duration(&mut value.batch_window, "collector.commit.batch_window")?;
+                    if let Some(columns) = value.delta_stats_columns.take() {
+                        output.insert(
+                            arrow_deltalake::delta_stats::ENVIRONMENT.to_owned(),
+                            serde_json::to_string(&columns)?,
+                        );
+                    }
                     insert_json_config("ARROWCOL_COLLECTOR_COMMIT_CONFIG", &value, &mut output)?;
                 }
                 if let Some(value) = &collector.exporter {
@@ -1824,6 +1834,51 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
 
 fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     let commit = commit.cloned().unwrap_or_default();
+    if let Some(columns) = &commit.delta_stats_columns {
+        arrow_deltalake::delta_stats::DeltaStatsPolicy {
+            columns: columns.clone(),
+        }
+        .validate()?;
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn delta_stats_selection_is_strict_and_projected_separately() -> Result<()> {
+        for columns in [serde_json::json!([]), serde_json::json!(["id", "nested.value"])] {
+            let tunables = Tunables::parse_oat_json(serde_json::json!({
+                "collector": {"commit": {"delta_stats_columns": columns}}
+            }))?;
+            let environment = tunables.environment_for(ComponentRole::Collector)?;
+            assert_eq!(
+                environment[arrow_deltalake::delta_stats::ENVIRONMENT],
+                columns.to_string()
+            );
+            if let Some(commit) = environment.get("ARROWCOL_COLLECTOR_COMMIT_CONFIG") {
+                let commit: Value = serde_json::from_str(commit)?;
+                assert!(commit.get("delta_stats_columns").is_none());
+            }
+        }
+        for columns in [
+            serde_json::json!(null),
+            serde_json::json!("id"),
+            serde_json::json!([1]),
+            serde_json::json!(["id", "id"]),
+            serde_json::json!(["a,,b"]),
+            serde_json::json!(["nested."]),
+        ] {
+            let error = Tunables::parse_oat_json(serde_json::json!({
+                "collector": {"commit": {"delta_stats_columns": columns}}
+            }))
+            .expect_err("invalid stats columns accepted");
+            assert!(format!("{error:#}").contains("collector.commit.delta_stats_columns"));
+        }
+        assert!(
+            !Tunables::default()
+                .environment_for(ComponentRole::Collector)?
+                .contains_key(arrow_deltalake::delta_stats::ENVIRONMENT)
+        );
+        Ok(())
+    }
     validate_duration("collector.commit.batch_window", commit.batch_window.as_deref(), "10s")?;
     let files = commit.max_files_per_commit.unwrap_or(64);
     let pending = commit.max_pending_files.unwrap_or(256);
