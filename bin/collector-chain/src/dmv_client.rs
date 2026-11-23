@@ -3844,6 +3844,21 @@ mod tests {
         for codec in [IpcCompression::None, IpcCompression::Lz4Frame, IpcCompression::Zstd] {
             options.ipc_compression = codec;
             let encoded = encode(&table, "v1", batch.clone(), &options).await?;
+            let mut observed_codecs = Vec::new();
+            for data in &encoded {
+                let message = arrow_ipc::root_as_message(&data.data_header)
+                    .map_err(|error| anyhow::anyhow!("invalid IPC header: {error:?}"))?;
+                if let Some(record_batch) = message.header_as_record_batch() {
+                    observed_codecs.push(record_batch.compression().map(|compression| compression.codec()));
+                }
+            }
+            let expected = match codec {
+                IpcCompression::None => None,
+                IpcCompression::Lz4Frame => Some(arrow_ipc::CompressionType::LZ4_FRAME),
+                IpcCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
+            };
+            assert!(!observed_codecs.is_empty());
+            assert!(observed_codecs.iter().all(|observed| *observed == expected));
             let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(encoded.into_iter().map(Ok)))
                 .try_collect::<Vec<_>>()
                 .await?;
