@@ -713,67 +713,8 @@ impl Tunables {
         {
             bail!("client.send_iter must be clone_vec or arc_cursor");
         }
-        for (field, maximum) in [
-            ("optimize_upload_concurrency", 16),
-            ("bin_concurrency", 8),
-            ("input_prefetch_files", 8),
-        ] {
-            if let Some(setting) = value.get("maintenance").and_then(|section| section.get(field))
-                && !setting.is_null()
-                && !setting.as_u64().is_some_and(|number| (1..=maximum).contains(&number))
-            {
-                bail!("maintenance.{field} must be an integer within 1..={maximum}");
-            }
-        }
-        if let Some(disabled) = value.pointer("/collector/thp_disabled")
-            && !disabled.is_boolean()
-        {
-            bail!("collector.thp_disabled must be a boolean");
-        }
-        if let Some(socket) = value.pointer("/collector/socket")
-            && !socket.is_object()
-        {
-            bail!("collector.socket must be an object");
-        }
-        if let Some(value) = value.pointer("/collector/socket/tcp_nodelay")
-            && !value.is_boolean()
-        {
-            bail!("collector.socket.tcp_nodelay must be a boolean");
-        }
-        for name in ["recv_buffer_bytes", "send_buffer_bytes"] {
-            if let Some(value) = value.pointer(&format!("/collector/socket/{name}")) {
-                anyhow::ensure!(
-                    value.as_u64().and_then(|value| usize::try_from(value).ok()).is_some(),
-                    "collector.socket.{name} must be an unsigned integer"
-                );
-            }
-        }
-        if let Some(runtime) = value.pointer("/collector/runtime").and_then(Value::as_object) {
-            for name in [
-                "event_interval",
-                "global_queue_interval",
-                "thread_stack_size",
-                "thread_keep_alive_ms",
-                "cpu_thread_stack_size",
-            ] {
-                if let Some(value) = runtime.get(name) {
-                    anyhow::ensure!(
-                        value.as_u64().and_then(|value| usize::try_from(value).ok()).is_some(),
-                        "collector.runtime.{name} must be an unsigned integer"
-                    );
-                }
-            }
-        }
-        let tunables: Self = serde_json::from_value(value).map_err(|error| {
-            if error.to_string().starts_with("collector.channel_capacity")
-                || error.to_string().starts_with("collector.limits.batch_channel_capacity")
-                || error.to_string().starts_with("collector.limits.put_result_channel_capacity")
-            {
-                anyhow::anyhow!("{error}")
-            } else {
-                anyhow::Error::new(error).context("parse OAT tunables")
-            }
-        })?;
+        let tunables: Self = serde_path_to_error::deserialize(value)
+            .map_err(|error| anyhow::anyhow!("parse OAT tunables: {error}"))?;
         tunables.validate_for_oat()?;
         Ok(tunables)
     }
@@ -3724,6 +3665,24 @@ mod tests {
                 bail!("invalid identity builder must fail");
             };
             assert!(error.to_string().contains("identity_builder"), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_client_and_transport_values_name_their_fields() -> Result<()> {
+        for (input, field) in [
+            (serde_json::json!({"client":{"workers":"bad"}}), "client.workers"),
+            (serde_json::json!({"client":{"seed":"bad"}}), "client.seed"),
+            (
+                serde_json::json!({"transport":{"grpc_send_compression":"bad"}}),
+                "transport.grpc_send_compression",
+            ),
+        ] {
+            let Err(error) = Tunables::parse_oat_json(input) else {
+                bail!("malformed {field} must fail");
+            };
+            assert!(error.to_string().contains(field), "{error:#}");
         }
         Ok(())
     }
