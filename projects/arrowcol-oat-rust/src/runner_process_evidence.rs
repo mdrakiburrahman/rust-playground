@@ -2311,6 +2311,7 @@ groups:
             let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
             verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
             if policy.get("max_row_group_rows").is_some() {
+                config.tables.push("sqlserver_availability_replica_states".to_owned());
                 let events = config.tables.iter().map(|table| Ok(format!(
                     "arrowcol_effective_config {}\n", json!({
                         "component":"layout", "scope":"table_effective", "table_id":"a".repeat(64),
@@ -2339,10 +2340,11 @@ groups:
                 promote_collector_readback(&config, &mut uncovered, Some(&json!([process.clone()])), 1)?;
                 assert!(uncovered["projection_only"].as_array().context("missing projection fields")?
                     .iter().any(|entry| entry["path"] == "parquet_writer.max_row_group_rows"));
-                process["layout_table_policies"] = json!([]);
+                process["layout_table_policies"].as_array_mut().context("missing table policies")?.remove(0);
                 let mut missing = initial.clone();
                 promote_collector_readback(&config, &mut missing, Some(&json!([process])), 1)?;
                 assert_eq!(missing, initial);
+                config.tables.pop();
             }
             let mut leaves = Vec::new();
             leaf_paths(&policy, &mut Vec::new(), &mut leaves);
