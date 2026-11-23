@@ -1,7 +1,7 @@
 export const STARTUP_ACCOUNTING_EXPECTED = Object.freeze({
   admitted_live_slots: 28,
   configured_live_slots: 28,
-  live_identity_batch_bytes: 152_920_064,
+  live_identity_batch_bytes: 184_639_488,
   max_memory_bytes: 5_368_709_120,
 });
 

@@ -55,10 +55,10 @@ function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
       client_id: clientId,
       configured_live_slots: 28,
       admitted_live_slots: 28,
-      live_identity_batch_bytes: 152_920_064,
-      live_identity_batch_reservation_bytes: 28 * 152_920_064,
+      live_identity_batch_bytes: 184_639_488,
+      live_identity_batch_reservation_bytes: 28 * 184_639_488,
       corpus_memory_reservation_bytes: 100,
-      memory_reservation_bytes: 100 + 28 * 152_920_064,
+      memory_reservation_bytes: 100 + 28 * 184_639_488,
       max_memory_bytes: CLIENT_MEMORY,
     }],
   };
@@ -69,9 +69,9 @@ function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
     payload_corpus_sha256: expected.corpus,
     configured_live_slots: 28,
     admitted_live_slots: 28,
-    live_identity_batch_bytes: 152_920_064,
+    live_identity_batch_bytes: 184_639_488,
     corpus_memory_reservation_bytes: 100,
-    memory_reservation_bytes: 100 + 28 * 152_920_064,
+    memory_reservation_bytes: 100 + 28 * 184_639_488,
     expected_client_ids: [clientId],
     client_mapping: { table: "sqlserver_availability_replica_states", client_ordinal: 1, client_id: clientId },
     startup_accounting: startup,
@@ -96,6 +96,7 @@ function firstArmReceipt(expected: ReturnType<typeof diagnosticPins>): {
     images: expected.images,
     diagnostic_profile: {
       data_profile: "realistic",
+      string_width: 63,
       seed: 20260923,
       workers: 14,
       streams_per_worker: 2,
@@ -222,6 +223,7 @@ test("derives realistic diagnostic from an unchanged historical seed", async () 
   const config = realisticDiagnosticConfig(original) as any;
   assert.deepEqual(original, copy);
   assert.equal(config.tunables.client.data_profile, "realistic");
+  assert.equal(config.tunables.client.string_width, 63);
   assert.equal(config.tunables.client.seed, 20260923);
   assert.equal(config.tunables.client.workers, 14);
   assert.equal(config.tunables.client.streams_per_worker, 2);
@@ -297,13 +299,13 @@ test("requires a single matching pre-schedule diagnostic proof", () => {
   const clientId = "oat-00000000-0000-4000-8000-000000000001-sqlserver_availability_replica_states-c1";
   const startup = { schema_version: 1, capture_point: "client_ready_before_arm",
     clients: [{ client_id: clientId, configured_live_slots: 28, admitted_live_slots: 28,
-      live_identity_batch_bytes: 152_920_064, live_identity_batch_reservation_bytes: 28 * 152_920_064,
-      corpus_memory_reservation_bytes: 100, memory_reservation_bytes: 100 + 28 * 152_920_064,
+      live_identity_batch_bytes: 184_639_488, live_identity_batch_reservation_bytes: 28 * 184_639_488,
+      corpus_memory_reservation_bytes: 100, memory_reservation_bytes: 100 + 28 * 184_639_488,
       max_memory_bytes: CLIENT_MEMORY }] };
   const proof = { kind: "diagnostic-only", phase: "before_schedule", payload_corpus_sha256: corpus,
     data_profile: "realistic", client_mapping: { table: "sqlserver_availability_replica_states", client_ordinal: 1, client_id: clientId },
-    configured_live_slots: 28, admitted_live_slots: 28, live_identity_batch_bytes: 152_920_064,
-    corpus_memory_reservation_bytes: 100, memory_reservation_bytes: 100 + 28 * 152_920_064,
+    configured_live_slots: 28, admitted_live_slots: 28, live_identity_batch_bytes: 184_639_488,
+    corpus_memory_reservation_bytes: 100, memory_reservation_bytes: 100 + 28 * 184_639_488,
     observed_at_unix_ms: 1000, expected_client_ids: [clientId], startup_accounting: startup };
   const line = `[oat] diagnostic admission: ${JSON.stringify(proof)}\n`;
   const schedule = { effective: { schedule_created_at_unix_ms: 1001 } };
@@ -336,16 +338,16 @@ test("compares observed corpus reservations across diagnostic arms", () => {
   const receipt = (bytes: unknown, run: string) => {
     const clientId = `oat-00000000-0000-4000-8000-${run}-sqlserver_availability_replica_states-c1`;
     return { kind: "diagnostic-only", qualification: "not-evaluated", seed_sha256: "b".repeat(64),
-    diagnostic_profile: { data_profile: "realistic", seed: 20260923, workers: 14, streams_per_worker: 2,
+    diagnostic_profile: { data_profile: "realistic", string_width: 63, seed: 20260923, workers: 14, streams_per_worker: 2,
       runtime_threads: 14, connections_per_worker: 2, max_memory_bytes: CLIENT_MEMORY },
     diagnostic_admission: { kind: "diagnostic-only", phase: "before_schedule",
       data_profile: "realistic", payload_corpus_sha256: "a".repeat(64), expected_client_ids: [clientId],
       client_mapping: { table: "sqlserver_availability_replica_states", client_ordinal: 1, client_id: clientId },
       startup_accounting: { schema_version: 1, capture_point: "client_ready_before_arm",
         clients: [{ client_id: clientId, configured_live_slots: 28, admitted_live_slots: 28,
-          live_identity_batch_bytes: 152_920_064, live_identity_batch_reservation_bytes: 28 * 152_920_064,
+          live_identity_batch_bytes: 184_639_488, live_identity_batch_reservation_bytes: 28 * 184_639_488,
           corpus_memory_reservation_bytes: bytes,
-          memory_reservation_bytes: typeof bytes === "number" ? bytes + 28 * 152_920_064 : bytes,
+          memory_reservation_bytes: typeof bytes === "number" ? bytes + 28 * 184_639_488 : bytes,
           max_memory_bytes: CLIENT_MEMORY }] } } };
   };
   const a = "000000000001";
@@ -361,6 +363,9 @@ test("compares observed corpus reservations across diagnostic arms", () => {
   const wrongWorkers = receipt(123, b);
   wrongWorkers.diagnostic_profile.workers = 8;
   assert.throws(() => requireMatchingCorpusReservation(receipt(123, a), wrongWorkers));
+  const legacyWidth = receipt(123, b);
+  Reflect.deleteProperty(legacyWidth.diagnostic_profile, "string_width");
+  assert.throws(() => requireMatchingCorpusReservation(receipt(123, a), legacyWidth));
   const wrongMapping = receipt(123, b);
   wrongMapping.diagnostic_admission.client_mapping.client_ordinal = 2;
   assert.throws(() => requireMatchingCorpusReservation(receipt(123, a), wrongMapping));

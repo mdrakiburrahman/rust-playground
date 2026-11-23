@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { tableFromIPC } from "apache-arrow";
 import { readParquet } from "parquet-wasm";
-import { requireMatchedStartupAccounting, requireStartupAccounting } from "../../../projects/arrowcol-oat/startup-accounting.js";
+import { STARTUP_ACCOUNTING_EXPECTED, requireMatchedStartupAccounting, requireStartupAccounting } from "../../../projects/arrowcol-oat/startup-accounting.js";
 import * as oatResult from "./oat-result.js";
 import { parseManifestJson } from "./delivery-identity.js";
 import { extractClientEvidence, extractStoppedReceipts, readReconciledOatResult } from "./oat-result.js";
@@ -15,11 +15,11 @@ import { assertParityEvidence, inspectParityHost } from "./parity-preflight.js";
 import { buildFooterInspector, parseCollectorCpus, parityCpuAllocation, parityImageIds } from "./parity-replay.js";
 import { cleanEnv, hasPinnedSubmodules, localReplayOptions, prepareIdentityTools, prepareReplayRuntime, sha256 } from "./replay.js";
 import type { SnapshotManifest } from "./snapshot.js";
-import { CLIENT_MEMORY, COLLECTOR_MEMORY, COLLECTOR_SOURCE_BASE, diagnosticPaths, realisticDiagnosticConfig } from "./realistic-diagnostic-config.js";
+import { CLIENT_MEMORY, COLLECTOR_MEMORY, COLLECTOR_SOURCE_BASE, DIAGNOSTIC_STRING_WIDTH, diagnosticPaths, realisticDiagnosticConfig } from "./realistic-diagnostic-config.js";
 
 type JsonObject = Record<string, unknown>;
 const DIAGNOSTIC_WORKLOAD_PROFILE = Object.freeze({
-  data_profile: "realistic", seed: 20260923, workers: 14, streams_per_worker: 2,
+  data_profile: "realistic", string_width: DIAGNOSTIC_STRING_WIDTH, seed: 20260923, workers: 14, streams_per_worker: 2,
   runtime_threads: 14, connections_per_worker: 2, max_memory_bytes: CLIENT_MEMORY,
 });
 const DIAGNOSTIC_LOGICAL_CLIENT = "sqlserver_availability_replica_states:1";
@@ -217,7 +217,7 @@ export function validateFrozenComparisonProfile(
       || client.logical_client_id !== DIAGNOSTIC_LOGICAL_CLIENT
       || !Number.isSafeInteger(client.corpus_memory_reservation_bytes)
       || Number(client.corpus_memory_reservation_bytes) <= 0
-      || Number(client.corpus_memory_reservation_bytes) + 28 * 152_920_064 > CLIENT_MEMORY) {
+      || Number(client.corpus_memory_reservation_bytes) + 28 * STARTUP_ACCOUNTING_EXPECTED.live_identity_batch_bytes > CLIENT_MEMORY) {
       throw new Error("comparison profile client reservation is missing or invalid");
     }
     return {
@@ -392,10 +392,10 @@ export function validateDiagnosticProof(log: string, corpus: string, schedule: u
   const effective = object(object(schedule, "schedule").effective, "effective schedule");
   if (proof.kind !== "diagnostic-only" || proof.phase !== "before_schedule"
     || proof.payload_corpus_sha256 !== corpus || proof.configured_live_slots !== 28
-    || proof.admitted_live_slots !== 28 || proof.live_identity_batch_bytes !== 152_920_064
+    || proof.admitted_live_slots !== 28 || proof.live_identity_batch_bytes !== STARTUP_ACCOUNTING_EXPECTED.live_identity_batch_bytes
     || !Number.isSafeInteger(proof.corpus_memory_reservation_bytes) || Number(proof.corpus_memory_reservation_bytes) <= 0
     || !Number.isSafeInteger(proof.memory_reservation_bytes)
-    || Number(proof.memory_reservation_bytes) !== Number(proof.corpus_memory_reservation_bytes) + 28 * 152_920_064
+    || Number(proof.memory_reservation_bytes) !== Number(proof.corpus_memory_reservation_bytes) + 28 * STARTUP_ACCOUNTING_EXPECTED.live_identity_batch_bytes
     || Number(proof.memory_reservation_bytes) > CLIENT_MEMORY
     || !Number.isSafeInteger(proof.observed_at_unix_ms) || !Number.isSafeInteger(effective.schedule_created_at_unix_ms)
     || Number(proof.observed_at_unix_ms) > Number(effective.schedule_created_at_unix_ms)) {

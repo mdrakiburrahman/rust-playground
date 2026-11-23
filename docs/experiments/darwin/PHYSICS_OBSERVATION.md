@@ -42,6 +42,22 @@ Decoder children are stopped and reaped on early failure or interruption.
 | Matched corpus | First-arm mode explicitly establishes a reference only after its receipt is reconciled. A matched arm requires the SHA-256 of a frozen comparison profile and its referenced completed receipt, with identical source, harness, seed, image and corpus pins. It copies both exact inputs and checks the same logical client's reservation at readiness, immediately before scheduling, and after the run. `--compare-reservations FIRST_RECEIPT SECOND_RECEIPT` remains a post-run comparison helper. |
 | Results | This is a fixed-image collector CPU-scaling diagnostic, not a main-vs-candidate qualification or verdict. Whole-snapshot delivery equality includes warmup and drain; reconciled durable throughput uses deduplicated commits finishing in `[start,end)`, not client cohort membership. |
 
+### Diagnostic client profile correction
+
+Use a fresh reference for the **width-63** profile. Do not compare it to a receipt from the earlier implicit Realistic width of 96. This changes generated string lengths, not the default generator, batch size, estimator, or admission policy.
+
+The startup validator at `9f8d543c` and diagnostic gate at `b67fadd3` used 152,920,064 B; `8f94395c` carried it into matched accounting. None records a producing configuration or measurement, and the client source did not change from `b67fadd3` to `b12f7f06`. For the fixed 22-column replica-states table, customer `direct-e64-confirmwide`, and 65,536 rows per batch/corpus, the four-copy estimate is `4 × 65,536 × identity_row_bytes + 22 × 4,096`. Five width-dependent fields remain after substituting the logical endpoint identity, so `identity_row_bytes = 389 + 5 × string_width` for explicit positive widths. The old gate implies 583 B/row, or width 38.8: no integer width yields it.
+
+| Explicit width | Measured reservation per live batch (B) | Admitted / configured |
+| ---: | ---: | ---: |
+| 38 | 151,871,488 | 28 / 28 |
+| 39 | 153,182,208 | 28 / 28 |
+| **63** | **184,639,488** | **28 / 28** |
+| 64 | 185,950,208 | 27 / 28 |
+| 96 (previous default) | 227,893,248 | 22 / 28 |
+
+Width 63 is the closest admissible width to 96 with the row count, batch boundaries, 14 × 2 topology, seed 20260923 and 5 GiB cap unchanged. Two independent pending-schedule registrations produced logical corpus SHA-256 `40de89ded1a9dd7784e761ecbaa690ca48d9f2d3cf66ed4d5d935e882ebbf90c` and zero decoded rows. Each reserved 172,580,864 B for the corpus plus 5,169,905,664 B for 28 live batches, or 5,342,486,528 B total. The corpus reservation is still observed and compared across arms, not hard-coded into admission.
+
 ## Table-only storage intervention
 
 **Not implemented or measured.** The current exporter reads `state/<run_id>/dataflow/telemetry/sqlserver/<table>` after stopping the writers. Changing a single container mount, relocating all of `compose_state_root`, or using a symlink would not establish a valid table-only comparison.

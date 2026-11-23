@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { requireMatchedStartupAccounting, requireStartupAccounting } from './startup-accounting.js';
 
-const liveBatchBytes = 152_920_064;
+const liveBatchBytes = 184_639_488;
 const liveBatchReservationBytes = liveBatchBytes * 28;
 const maxMemoryBytes = 5_368_709_120;
 
@@ -59,6 +59,14 @@ test('rejects live-slot, batch-byte, reservation, and memory-limit mismatches', 
   ]) {
     assert.throws(() => requireStartupAccounting(evidence([invalid]), ['oat-run-table-c1']));
   }
+});
+
+test('rejects the superseded per-batch gate even when the reservation arithmetic balances', () => {
+  const c = client('oat-run-table-c1');
+  c.live_identity_batch_bytes = 152_920_064;
+  c.live_identity_batch_reservation_bytes = 28 * c.live_identity_batch_bytes;
+  c.memory_reservation_bytes = c.corpus_memory_reservation_bytes + c.live_identity_batch_reservation_bytes;
+  assert.throws(() => requireStartupAccounting(evidence([c]), [c.client_id]));
 });
 
 test('fails closed on missing, unparseable, zero, extra, or unexpected client evidence', () => {

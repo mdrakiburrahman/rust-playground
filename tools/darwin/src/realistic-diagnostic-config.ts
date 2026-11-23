@@ -10,6 +10,7 @@ function object(value: unknown, name: string): JsonObject {
 }
 
 export const COLLECTOR_SOURCE_BASE = "ad83c6376086f020a7d4e8cffd66994eedb537fe";
+export const DIAGNOSTIC_STRING_WIDTH = 63;
 export const CLIENT_MEMORY = 5 * 1024 ** 3;
 export const COLLECTOR_MEMORY = 86 * 1024 ** 3;
 
@@ -47,6 +48,7 @@ export function realisticDiagnosticConfig(seed: unknown): JsonObject {
     throw new Error("frozen parity pressure, guard, timing or topology changed");
   }
   client.data_profile = "realistic";
+  client.string_width = DIAGNOSTIC_STRING_WIDTH;
   client.seed = 20260923;
   client.workers = 14;
   client.runtime_threads = 14;
