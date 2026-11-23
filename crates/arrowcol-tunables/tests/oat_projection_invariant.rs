@@ -38,6 +38,47 @@ fn connection_backoff_is_inert_only_when_retries_are_disabled() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn http2_options_are_inert_only_when_their_feature_is_disabled_or_overridden() -> Result<()> {
+    for (adaptive, interval) in [(true, 0), (true, 10_000), (false, 0), (false, 10_000)] {
+        let tunables = Tunables::parse_oat_json(json!({"transport": {
+            "adaptive_window": adaptive, "stream_window_bytes": 1_048_576,
+            "connection_window_bytes": 16_777_216, "keepalive_interval_ms": interval,
+            "keepalive_timeout_ms": 2000, "keepalive_while_idle": false
+        }}))?;
+        let evidence = tunables.classify_oat_leaves()?;
+        for (path, reason) in [
+            ("transport.stream_window_bytes", "adaptive_http2_window"),
+            ("transport.connection_window_bytes", "adaptive_http2_window"),
+            ("transport.keepalive_timeout_ms", "http2_keepalive_disabled"),
+            ("transport.keepalive_while_idle", "http2_keepalive_disabled"),
+        ] {
+            let expected_inert = if reason == "adaptive_http2_window" {
+                adaptive
+            } else {
+                interval == 0
+            };
+            assert_eq!(
+                evidence["inert_fields"]
+                    .as_array()
+                    .context("missing inert fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path && entry["reason"] == reason),
+                expected_inert
+            );
+            assert_eq!(
+                evidence["projection_only"]
+                    .as_array()
+                    .context("missing projected fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path),
+                !expected_inert
+            );
+        }
+    }
+    Ok(())
+}
+
 // The scanner deliberately fails on unfamiliar field syntax rather than silently skipping it.
 // Vecs of scalar values and sorting_columns are treated as atomic values. The latter's
 // element schema is guarded separately below.

@@ -965,6 +965,27 @@ test('nulls connection backoff when connection retries are disabled', () => {
   assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
 });
 
+test('nulls HTTP/2 factors that are overridden or disabled', () => {
+  for (const [field, reason] of [
+    ['stream_window_bytes', 'adaptive_http2_window'],
+    ['keepalive_timeout_ms', 'http2_keepalive_disabled'],
+  ] as const) {
+    const candidate = coveredCandidate('http2', 100, 235).map(row => ({
+      ...row, factorConfigPaths: [`tunables.transport.${field}`, 'parquet_writer.defaults.compression'],
+    }));
+    for (const row of candidate) {
+      Object.assign(row.officialRuns[0]!.config.tunables, { transport: { [field]: 2000 } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `transport.${field}`, reason }];
+        evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+      });
+    }
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.ok(svg.includes(`inert: transport.${field}: ${reason}`));
+    assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+  }
+});
+
 test('nulls a per-column dictionary page limit when dictionary is explicitly disabled on that column', () => {
   const candidate = coveredCandidate('dictionary-off', 100, 240).map(row => ({
     ...row,

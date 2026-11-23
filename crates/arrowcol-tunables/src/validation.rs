@@ -23,6 +23,8 @@ pub struct Capability {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplicabilityGate {
     ConnectionRetries,
+    Http2Keepalive,
+    FixedHttp2Window,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,12 +125,28 @@ const CAPABILITIES: &[Capability] = &[
     capability!("transport.max_frame_bytes", "16384"),
     capability!("transport.header_table_bytes", "component default"),
     capability!("transport.max_header_list_bytes", "16384"),
-    capability!("transport.stream_window_bytes", "1048576"),
-    capability!("transport.connection_window_bytes", "16777216"),
+    gated_capability!(
+        "transport.stream_window_bytes",
+        "1048576; overridden by adaptive_window",
+        FixedHttp2Window
+    ),
+    gated_capability!(
+        "transport.connection_window_bytes",
+        "16777216; overridden by adaptive_window",
+        FixedHttp2Window
+    ),
     capability!("transport.adaptive_window", "false"),
     capability!("transport.keepalive_interval_ms", "10000"),
-    capability!("transport.keepalive_timeout_ms", "20000"),
-    capability!("transport.keepalive_while_idle", "true"),
+    gated_capability!(
+        "transport.keepalive_timeout_ms",
+        "20000; inert when keepalive_interval_ms is 0",
+        Http2Keepalive
+    ),
+    gated_capability!(
+        "transport.keepalive_while_idle",
+        "true; inert when keepalive_interval_ms is 0",
+        Http2Keepalive
+    ),
     capability!("transport.connect_timeout_ms", "30000"),
     capability!("transport.request_timeout_ms", "component default"),
     capability!("transport.tcp_nodelay", "true"),
@@ -456,6 +474,11 @@ impl Tunables {
             .and_then(Value::as_u64)
             .unwrap_or(0)
             == 0;
+        let http2_keepalive_disabled = requested
+            .pointer("/transport/keepalive_interval_ms")
+            .and_then(Value::as_u64)
+            == Some(0);
+        let adaptive_http2_window = requested.pointer("/transport/adaptive_window") == Some(&Value::Bool(true));
         let mut inert_fields = Vec::new();
         let mut projection_only = Vec::new();
         let mut runner_controls = Vec::new();
@@ -463,6 +486,8 @@ impl Tunables {
         struct ClassificationContext {
             maintenance_enabled: bool,
             connection_retries_disabled: bool,
+            http2_keepalive_disabled: bool,
+            adaptive_http2_window: bool,
         }
         fn visit(
             value: &Value,
@@ -511,6 +536,10 @@ impl Tunables {
                 && context.connection_retries_disabled
             {
                 (inert, "connection_retries_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::Http2Keepalive) && context.http2_keepalive_disabled {
+                (inert, "http2_keepalive_disabled")
+            } else if capability.gate == Some(ApplicabilityGate::FixedHttp2Window) && context.adaptive_http2_window {
+                (inert, "adaptive_http2_window")
             } else if dictionary_disabled && path.last().is_some_and(|field| field == "dictionary_page_size_limit") {
                 (inert, "dictionary_disabled")
             } else if matches!(
@@ -532,6 +561,8 @@ impl Tunables {
             ClassificationContext {
                 maintenance_enabled,
                 connection_retries_disabled,
+                http2_keepalive_disabled,
+                adaptive_http2_window,
             },
             false,
             &mut inert_fields,
