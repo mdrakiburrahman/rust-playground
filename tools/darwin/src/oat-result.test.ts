@@ -183,7 +183,10 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       inert_fields: [{ path: "logging.maintenance", reason: "maintenance_disabled" }],
       projection_only: [{ path: "collector.upload.mode", reason: "consumer_startup_proof_unverified" }],
       runner_controls: [{ path: "maintenance.enabled", reason: "maintenance_runner_control" }],
-      consumer_verified: [{ path: "client.workers", reason: "consumer_startup_readback" }],
+      consumer_verified: [
+        { path: "client.workers", reason: "consumer_startup_readback" },
+        { path: "parquet_writer.max_row_group_rows", reason: "consumer_table_writer_readback" },
+      ],
       processes: [{ component: "collector", source_revision: revision, log_complete: true,
         image_id: `sha256:${"b".repeat(64)}`, effective_config_source: "consumer_startup_readback",
         effective_config: { commit_telemetry: { schema_version: 1, scope: "new_ingestion_addfiles_after_sync", clock: "system_unix_ms" } },

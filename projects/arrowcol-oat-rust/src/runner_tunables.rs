@@ -40,6 +40,13 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         return Ok(());
     };
     let environment = role_environment(config, ComponentRole::Collector)?;
+    let parquet_policy: Option<Value> = environment.get("ARROWCOL_PARQUET_CONFIG")
+        .map(|value| serde_json::from_str(value)).transpose()?;
+    let expected_tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let table_policies = collectors.iter()
+        .flat_map(|process| process["layout_table_policies"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
     let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
@@ -53,6 +60,34 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        let parquet_field = match path {
+            "parquet_writer.max_row_group_rows" => Some(("max_row_group_rows", "row_group_rows")),
+            "parquet_writer.data_page_row_count_limit" => Some(("data_page_row_count_limit", "page_rows")),
+            _ => None,
+        };
+        if let Some((requested_field, observed_field)) = parquet_field {
+            let Some(requested) = parquet_policy.as_ref().and_then(|policy| policy.get(requested_field))
+                .filter(|value| value.as_u64().is_some_and(|number| number > 0)) else {
+                return true;
+            };
+            let observed_tables = table_policies.iter()
+                .filter_map(|policy| policy["table_name"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !expected_tables.is_empty()
+                && collectors.iter().all(|process| process["layout_table_policies"].is_array())
+                && expected_tables.iter().all(|table| observed_tables.contains(table.as_str()))
+                && table_policies.iter().all(|policy| {
+                    policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
+                        && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
+                        && policy["config"]["enabled"] == true
+                        && policy["config"][observed_field] == *requested
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
+                return false;
+            }
+            return true;
+        }
         let runtime = match path {
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
             "collector.runtime.blocking_workers" => Some(("blocking_workers", "ARROWCOL_COLLECTOR_BLOCKING_WORKERS")),

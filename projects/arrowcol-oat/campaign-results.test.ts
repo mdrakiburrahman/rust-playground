@@ -1141,6 +1141,25 @@ test('a projection-only repeat nulls its whole cell and preserves a dead Kustain
   assert.doesNotMatch(svg, /projected-death \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
 });
 
+test('accepts table-writer readback for active Parquet limits', () => {
+  const candidate = coveredCandidate('writer-limits', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.parquet_writer.max_row_group_rows', 'tunables.parquet_writer.data_page_row_count_limit'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { parquet_writer: {
+      max_row_group_rows: 16384, data_page_row_count_limit: 2048,
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.max_row_group_rows', reason: 'consumer_table_writer_readback' },
+        { path: 'parquet_writer.data_page_row_count_limit', reason: 'consumer_table_writer_readback' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), />800\*?<\/text>/);
+});
+
 test('an active cell retains its committed rate after Kustainer death', () => {
   const candidate = coveredCandidate('active-death', 800, 260);
   for (const row of candidate) {

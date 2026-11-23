@@ -2310,6 +2310,40 @@ groups:
             anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
             let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
             verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            if policy.get("max_row_group_rows").is_some() {
+                let events = config.tables.iter().map(|table| Ok(format!(
+                    "arrowcol_effective_config {}\n", json!({
+                        "component":"layout", "scope":"table_effective", "table_id":"a".repeat(64),
+                        "table_name":canonical_dmv_table_name(table)?,
+                        "config":{"enabled":true, "sort_columns":[], "bloom_columns":[],
+                            "max_rows":65536, "max_input_bytes":1048576,
+                            "row_group_rows":policy["max_row_group_rows"], "page_rows":policy["data_page_row_count_limit"]}
+                    })
+                ))).collect::<Result<String>>()?;
+                let tables = collector_layout_records(&config, &events)?;
+                let mut process = json!({
+                    "component":"collector", "instance_id":"collector-1", "log_complete":true,
+                    "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+                    "effective_config":observed, "writer_policy_overrides":observed["parquet_writer"],
+                    "layout_table_policies":tables,
+                });
+                let initial = tunable_leaf_evidence(&config)?;
+                let mut covered = initial.clone();
+                promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+                for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit"] {
+                    assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
+                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"));
+                }
+                process["layout_table_policies"][0]["config"]["row_group_rows"] = json!(1);
+                let mut uncovered = initial.clone();
+                promote_collector_readback(&config, &mut uncovered, Some(&json!([process.clone()])), 1)?;
+                assert!(uncovered["projection_only"].as_array().context("missing projection fields")?
+                    .iter().any(|entry| entry["path"] == "parquet_writer.max_row_group_rows"));
+                process["layout_table_policies"] = json!([]);
+                let mut missing = initial.clone();
+                promote_collector_readback(&config, &mut missing, Some(&json!([process])), 1)?;
+                assert_eq!(missing, initial);
+            }
             let mut leaves = Vec::new();
             leaf_paths(&policy, &mut Vec::new(), &mut leaves);
             for path in leaves {
