@@ -2825,6 +2825,7 @@ mod downstream_runner_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.platform.kind = kind;
+        config.overload_guard.enabled = false;
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         if let Some(lead) = lead {
             config.schedule_lead_seconds = lead;
