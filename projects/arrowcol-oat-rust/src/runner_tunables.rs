@@ -1102,7 +1102,23 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered, initial);
+        let mut expected = initial.clone();
+        let projection = expected["projection_only"]
+            .as_array_mut()
+            .context("projection_only must be an array")?;
+        let index = projection
+            .iter()
+            .position(|entry| entry["path"] == "collector.runtime.parquet_column_workers")
+            .context("column workers projection is missing")?;
+        projection.remove(index);
+        expected["consumer_verified"]
+            .as_array_mut()
+            .context("consumer_verified must be an array")?
+            .push(json!({
+                "path": "collector.runtime.parquet_column_workers",
+                "reason": "consumer_startup_readback"
+            }));
+        assert_eq!(covered, expected);
         let mut wrong_process = process;
         wrong_process["effective_config"]["runtime"]["upload_mode"] = json!("put_create");
         let mut uncovered = initial.clone();
