@@ -1182,9 +1182,9 @@ test('rejects recognized proof reasons on paths their producers cannot emit', ()
   const cases = [
     ['consumer_verified', 'client.string_width', 'committed_table_metadata_readback'],
     ['consumer_verified', 'collector.commit.delta_stats_columns', 'consumer_startup_and_prepared_corpus'],
-    ['inert_fields', 'client.string_width', 'no_nullable_generated_columns'],
+    ['inert_fields', 'client.entropy', 'no_nullable_generated_columns'],
     ['inert_fields', 'client.cardinality', 'no_eligible_generated_rows'],
-    ['inert_fields', 'client.string_width', 'all_values_skewed'],
+    ['inert_fields', 'client.seed', 'all_values_skewed'],
     ['inert_fields', 'client.value_variation', 'one_byte_maximum_width'],
   ] as const;
   for (const [index, [classification, path, reason]] of cases.entries()) {
