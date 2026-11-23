@@ -68,9 +68,6 @@ pub struct DeltaRuntimeConfig {
     /// Skip row-wise grouping for internally generated single ingestion partitions.
     #[serde(default)]
     pub generated_partition_fast_path: bool,
-    /// Gather sorted rows with Arrow interleave rather than row-wise copies.
-    #[serde(default)]
-    pub sort_interleave: bool,
 }
 
 impl Default for DeltaRuntimeConfig {
@@ -93,7 +90,6 @@ impl DeltaRuntimeConfig {
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
             generated_partition_fast_path: false,
-            sort_interleave: false,
         }
     }
 
@@ -150,14 +146,6 @@ impl DeltaRuntimeConfig {
         let name = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH";
         if let Some(raw) = lookup(name)? {
             config.generated_partition_fast_path = match raw.as_str() {
-                "true" => true,
-                "false" => false,
-                _ => anyhow::bail!("{name} must be 'true' or 'false', got {raw:?}"),
-            };
-        }
-        let name = "ARROWCOL_COLLECTOR_SORT_INTERLEAVE";
-        if let Some(raw) = lookup(name)? {
-            config.sort_interleave = match raw.as_str() {
                 "true" => true,
                 "false" => false,
                 _ => anyhow::bail!("{name} must be 'true' or 'false', got {raw:?}"),
@@ -640,23 +628,6 @@ mod tests {
         }
         for raw in ["", "1", "TRUE", "true "] {
             assert!(DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned()))).is_err());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn sort_interleave_is_strictly_opt_in() -> Result<()> {
-        let name = "ARROWCOL_COLLECTOR_SORT_INTERLEAVE";
-        assert!(!DeltaRuntimeConfig::from_lookup(|_| Ok(None))?.sort_interleave);
-        for (raw, expected) in [("true", true), ("false", false)] {
-            let config = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))?;
-            assert_eq!(config.sort_interleave, expected);
-        }
-        for raw in ["", "1", "TRUE", "true "] {
-            let error = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))
-                .err()
-                .context("malformed sort interleave setting must fail")?;
-            assert!(format!("{error:#}").contains(name));
         }
         Ok(())
     }

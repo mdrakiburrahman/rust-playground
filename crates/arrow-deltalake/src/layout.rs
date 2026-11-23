@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, ensure};
 use arrow::array::RecordBatch;
-use arrow::compute::{SortColumn, SortOptions, concat, concat_batches, interleave, lexsort_to_indices, take};
+use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use parquet::basic::Compression;
 use parquet::file::metadata::SortingColumn;
@@ -254,17 +254,6 @@ impl FileSortBuffer {
     /// # Errors
     /// Returns Arrow concatenation, ordering, or permutation errors.
     pub fn finish(self) -> Result<RecordBatch> {
-        #[cfg(feature = "delta")]
-        let interleave = crate::delta_io::runtime_config()?.sort_interleave;
-        #[cfg(not(feature = "delta"))]
-        let interleave = false;
-        self.finish_with_interleave(interleave)
-    }
-
-    fn finish_with_interleave(self, enabled: bool) -> Result<RecordBatch> {
-        if enabled && self.interleave_eligible() {
-            return self.finish_interleaved();
-        }
         let batch = concat_batches(&self.schema, &self.batches)?;
         if batch.num_rows() == 0 {
             return Ok(batch);
@@ -294,104 +283,6 @@ impl FileSortBuffer {
             .collect::<arrow::error::Result<Vec<_>>>()?;
         Ok(RecordBatch::try_new(self.schema, arrays)?)
     }
-
-    fn interleave_eligible(&self) -> bool {
-        use arrow::datatypes::DataType;
-
-        let supported = !self.batches.is_empty()
-            && !self.policy.sort_columns.is_empty()
-            && self.batches.iter().all(|batch| {
-                batch.columns().iter().all(|column| {
-                    column.null_count() == 0
-                        && (column.data_type().primitive_width().is_some()
-                            || matches!(
-                                column.data_type(),
-                                DataType::Boolean
-                                    | DataType::Utf8
-                                    | DataType::LargeUtf8
-                                    | DataType::Binary
-                                    | DataType::LargeBinary
-                            ))
-                })
-            });
-        if !supported {
-            return false;
-        }
-        // Limit gather coordinates and per-batch pointer vectors to less than
-        // the non-sort buffers that the original concatenation would copy.
-        let Some(gather_budget) = self.rows.checked_mul(4 * std::mem::size_of::<usize>()) else {
-            return false;
-        };
-        let payload = self.batches.iter().try_fold(0usize, |total, batch| {
-            batch
-                .columns()
-                .iter()
-                .zip(self.schema.fields())
-                .try_fold(total, |total, (column, field)| {
-                    if self.policy.sort_columns.contains(field.name()) {
-                        Some(total)
-                    } else {
-                        total.checked_add(column.to_data().get_slice_memory_size().ok()?)
-                    }
-                })
-        });
-        payload.is_some_and(|bytes| bytes >= gather_budget)
-    }
-
-    fn finish_interleaved(self) -> Result<RecordBatch> {
-        let columns = self
-            .policy
-            .sort_columns
-            .iter()
-            .map(|name| {
-                let index = self.schema.index_of(name)?;
-                let inputs = self
-                    .batches
-                    .iter()
-                    .map(|batch| batch.column(index).as_ref())
-                    .collect::<Vec<_>>();
-                Ok(SortColumn {
-                    values: concat(&inputs)?,
-                    options: Some(SortOptions {
-                        descending: false,
-                        nulls_first: false,
-                    }),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let indices = lexsort_to_indices(&columns, None)?;
-        drop(columns);
-        let mut end = 0usize;
-        let ends = self
-            .batches
-            .iter()
-            .map(|batch| {
-                end += batch.num_rows();
-                end
-            })
-            .collect::<Vec<_>>();
-        let gather = indices
-            .values()
-            .iter()
-            .map(|index| {
-                let row = *index as usize;
-                let batch = ends.partition_point(|end| *end <= row);
-                (batch, row - if batch == 0 { 0 } else { ends[batch - 1] })
-            })
-            .collect::<Vec<_>>();
-        drop(indices);
-        let arrays = (0..self.schema.fields().len())
-            .map(|index| {
-                let inputs = self
-                    .batches
-                    .iter()
-                    .map(|batch| batch.column(index).as_ref())
-                    .collect::<Vec<_>>();
-                interleave(&inputs, &gather)
-            })
-            .collect::<arrow::error::Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(self.schema, arrays)?)
-    }
 }
 
 #[cfg(test)]
@@ -403,77 +294,6 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
-
-    #[test]
-    fn interleaved_sort_preserves_ties_and_parquet_bytes() -> Result<()> {
-        let make = |keys, values| -> Result<RecordBatch> {
-            let original = batch(keys, values)?;
-            let mut fields = original.schema().fields().to_vec();
-            fields.push(Arc::new(Field::new("payload", DataType::Utf8, false)));
-            let mut columns = original.columns().to_vec();
-            columns.push(Arc::new(StringArray::from_iter_values(
-                (0..original.num_rows()).map(|i| format!("{i}{}", "x".repeat(128))),
-            )));
-            Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
-        };
-        let batches = [
-            make(vec!["z", "a", "z", "a"], vec![1, 2, 3, 4])?,
-            make(vec!["a", "z", "a", "z"], vec![5, 6, 7, 8])?,
-        ];
-        let policy = LayoutPolicy {
-            row_group_rows: 4,
-            page_rows: 2,
-            ..LayoutPolicy::default()
-        };
-        let build = |enabled| -> Result<RecordBatch> {
-            let mut buffer = FileSortBuffer::new(batches[0].schema(), policy.clone())?;
-            for batch in &batches {
-                assert!(buffer.try_push(batch)?);
-            }
-            assert!(buffer.interleave_eligible());
-            buffer.finish_with_interleave(enabled)
-        };
-        let reference = build(false)?;
-        let actual = build(true)?;
-        assert_eq!(actual, reference);
-        let properties = policy.writer_properties(&reference.schema())?;
-        let encode = |batch: &RecordBatch| -> Result<Vec<u8>> {
-            let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(properties.clone()))?;
-            writer.write(batch)?;
-            Ok(writer.into_inner()?)
-        };
-        assert_eq!(encode(&actual)?, encode(&reference)?);
-        Ok(())
-    }
-
-    #[test]
-    fn interleaved_sort_falls_back_for_nullable_inputs() -> Result<()> {
-        let narrow = batch(vec!["a", "b"], vec![1, 2])?;
-        let mut narrow_buffer = FileSortBuffer::new(narrow.schema(), LayoutPolicy::default())?;
-        assert!(narrow_buffer.try_push(&narrow)?);
-        assert!(!narrow_buffer.interleave_eligible());
-        assert_eq!(narrow_buffer.finish_with_interleave(true)?.num_rows(), 2);
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("customer_id", DataType::Utf8, true),
-            Field::new("value", DataType::Int32, false),
-        ]));
-        let input = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec![Some("z"), None, Some("a")])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-            ],
-        )?;
-        let build = |enabled| -> Result<RecordBatch> {
-            let mut buffer = FileSortBuffer::new(Arc::clone(&schema), LayoutPolicy::default())?;
-            assert!(buffer.try_push(&input)?);
-            assert!(!buffer.interleave_eligible());
-            buffer.finish_with_interleave(enabled)
-        };
-        assert_eq!(build(false)?, build(true)?);
-        Ok(())
-    }
 
     fn batch(customers: Vec<&str>, values: Vec<i32>) -> Result<RecordBatch> {
         Ok(RecordBatch::try_new(
