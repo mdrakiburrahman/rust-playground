@@ -555,9 +555,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         if std::env::var_os("OAT_UPLOAD_RUNTIME_CHILD").is_some() {
             let actual = serde_json::to_value(arrow_deltalake::DeltaRuntimeConfig::from_env()?)?;
             let expected: Value = serde_json::from_str(&std::env::var("OAT_UPLOAD_RUNTIME_EXPECTED")?)?;
-            for key in ["upload_mode", "upload_buffer_capacity_bytes", "upload_request_concurrency", "upload_limit"] {
-                assert_eq!(actual[key], expected[key], "{key}");
+            for (key, value) in expected.as_object().context("expected runtime configuration must be an object")? {
+                assert_eq!(actual[key], *value, "{key}");
             }
+            println!("OAT_UPLOAD_RUNTIME_READBACK {actual}");
             return Ok(());
         }
         for (tunables, expected) in [
@@ -565,6 +566,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
              json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1})),
             (json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
              json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256})),
+            (json!({"collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":2}}}),
+             json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":2,"upload_limit":32})),
+            (json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
+             json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2})),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
@@ -583,6 +588,16 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 "collector upload runtime rehearsal failed: {stdout}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            let actual: Value = serde_json::from_str(
+                stdout
+                    .lines()
+                    .find_map(|line| line.split_once("OAT_UPLOAD_RUNTIME_READBACK ").map(|(_, json)| json))
+                    .context("collector runtime readback missing")?,
+            )?;
+            let mut config = config()?;
+            config.tunables = settings;
+            verify_process_configuration(&config, ComponentRole::Collector, &json!({"runtime":actual}))?;
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({"runtime":{}})).is_err());
         }
         Ok(())
     }
