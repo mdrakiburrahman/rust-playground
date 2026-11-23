@@ -31,6 +31,19 @@ The codec smoke copies only `compression` and `compression_level` from the
 allowlisted candidate into the guarded qualification profile; it does not
 change the baseline or run a comparison. It is not yet live-validated. The
 Darwin runner and its existing pair evaluator remain Zstd-level-only.
+For this smoke the two collector roles may be identical; the code trial still
+requires distinct roles.
+
+| Candidate codec | Allowed level |
+| --- | --- |
+| `uncompressed`, `snappy`, `lz4`, `lz4_raw` | `null` or omitted |
+| `gzip` | `null` or 0–9 |
+| `brotli` | `null` or 0–11 |
+| `zstd` | `null` or 1–22 |
+
+`null` selects the writer's codec-specific default. Footer metadata proves the
+codec, not its level; the requested level must also match both startup and
+pre-admission readbacks.
 
 The driver writes an exclusive original 24-hour deadline and retains failed
 locks for manual owned-cell recovery; it does not resume interrupted series or

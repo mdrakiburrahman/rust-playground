@@ -90,7 +90,7 @@ export async function replayQualification(
   for (const collector of [baseline, candidate]) {
     bindCodeArm(config, { ...nonCollectorImages, collector: collector.imageId }, collector);
   }
-  if (baseline.imageId === candidate.imageId && baseline.revision === candidate.revision) {
+  if (!compression && baseline.imageId === candidate.imageId && baseline.revision === candidate.revision) {
     throw new Error("layout trial requires a distinct candidate collector");
   }
   const planHash = hash(JSON.stringify({ revision: manifest.commit, configHash, seedHash, baseline, candidate,
