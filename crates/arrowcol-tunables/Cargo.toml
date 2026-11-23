@@ -10,6 +10,7 @@ description = "Typed, validated ArrowCol performance tuning contract"
 anyhow.workspace = true
 arrow-deltalake = { path = "../arrow-deltalake", default-features = false }
 arrowcol-routing = { path = "../arrowcol-routing" }
+arrowcol-props = { path = "../arrowcol-props" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"

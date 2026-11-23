@@ -1160,3 +1160,55 @@ fn startup_readback_reports_effective_optimize_upload_settings() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn retention_overrides_are_validated_against_physical_table_policy_before_operations() -> Result<()> {
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::PruneLog];
+    settings.log_retention_ms = Some(7_200_000);
+    let error = startup_configuration(&settings).expect_err("below default physical retention");
+    assert!(error.to_string().contains("maintenance.log_retention_secs"));
+    settings.log_retention_ms = Some(2_592_000_000);
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(
+        readback["physical_retention_floor"]["delta.logRetentionDuration"],
+        2_592_000_000_u64
+    );
+    source
+        .0
+        .properties
+        .insert("delta.logRetentionDuration".into(), "interval 60 days".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(!results.is_empty());
+    assert!(results.iter().all(|result| {
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("maintenance.log_retention_secs"))
+    }));
+    assert_eq!(inventory(root.path())?, before);
+    settings.operations = vec![Operation::Vacuum];
+    settings.log_retention_ms = None;
+    source
+        .0
+        .properties
+        .insert("delta.deletedFileRetentionDuration".into(), "interval 14 days".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(results.iter().all(|result| {
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("maintenance.vacuum_retention_secs"))
+    }));
+    assert_eq!(inventory(root.path())?, before);
+    settings.allow_short_vacuum_retention = true;
+    assert_eq!(
+        startup_configuration(&settings)?["operation_settings"]["allow_short_vacuum_retention"],
+        true
+    );
+    Ok(())
+}

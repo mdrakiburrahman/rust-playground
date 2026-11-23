@@ -2451,6 +2451,16 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         maintenance.checkpoint_every_commits.or(Some(100)),
     )?;
     positive("maintenance.log_retention_secs", maintenance.log_retention_secs)?;
+    let default_log_floor =
+        arrowcol_props::resolve(&BTreeMap::new(), &BTreeMap::new())?.unsigned("delta.logRetentionDuration")? / 1000;
+    if maintenance
+        .log_retention_secs
+        .is_some_and(|retention| retention < default_log_floor)
+    {
+        bail!(
+            "maintenance.log_retention_secs must be at least {default_log_floor}, the default table delta.logRetentionDuration; physical table policy is checked again by the maintenance consumer"
+        );
+    }
     positive(
         "maintenance.max_prune_files",
         maintenance.max_prune_files.or(Some(10_000)),
@@ -2585,9 +2595,6 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     if vacuum_retention < 604_800 && maintenance.allow_short_vacuum_retention != Some(true) {
         bail!("vacuum_retention_secs below seven days requires allow_short_vacuum_retention=true");
     }
-    if maintenance.allow_short_vacuum_retention == Some(true) && vacuum_retention >= 604_800 {
-        bail!("allow_short_vacuum_retention only applies below seven days");
-    }
     Ok(())
 }
 
@@ -2696,6 +2703,23 @@ fn flatten_environment(value: &Value, prefix: &str, output: &mut BTreeMap<String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_retention_below_table_default_fails_before_projection() -> anyhow::Result<()> {
+        let candidate = |seconds| {
+            serde_json::json!({"maintenance":{
+                "enabled":true, "apply":false, "operations":["prune_log"], "log_retention_secs":seconds
+            }})
+        };
+        let error = Tunables::parse_oat_json(candidate(7200)).expect_err("unsafe retention");
+        assert!(format!("{error:#}").contains("maintenance.log_retention_secs"));
+        let valid = Tunables::parse_oat_json(candidate(2_592_000))?;
+        assert_eq!(
+            valid.environment_for(ComponentRole::Maintenance)?["ARROWCOL_MAINT_LOG_RETENTION_SECS"],
+            "2592000"
+        );
+        Ok(())
+    }
+
     #[test]
     fn file_mapping_cache_rejects_non_boolean_values() {
         for bad in [
