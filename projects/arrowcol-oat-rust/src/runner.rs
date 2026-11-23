@@ -1158,6 +1158,17 @@ struct OwnedKubectlProcess {
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
 }
 
+#[derive(Default)]
+struct PressureHttpTiming {
+    remaining_budget_at_first_poll_ms: Option<u64>,
+    headers_ms: Option<u64>,
+    body_ms: Option<u64>,
+}
+
+fn monotonic_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 struct PublicationBacklogScraper {
     endpoint: String,
     _tunnel: Option<OwnedKubectlProcess>,
@@ -1196,6 +1207,20 @@ impl PublicationBacklogScraper {
     }
 
     async fn read_endpoint(&self, endpoint: &str) -> Result<String> {
+        self.read_endpoint_timed(endpoint, None).await
+    }
+
+    async fn read_endpoint_timed(
+        &self,
+        endpoint: &str,
+        mut timing: Option<(&mut PressureHttpTiming, tokio::time::Instant)>,
+    ) -> Result<String> {
+        let started = tokio::time::Instant::now();
+        if let Some((timing, deadline)) = timing.as_mut() {
+            timing.remaining_budget_at_first_poll_ms =
+                Some(monotonic_millis(deadline.saturating_duration_since(started)));
+        }
+
         const MAX_METRICS_BYTES: u64 = 1_048_576;
         let response = self
             .client
@@ -1203,6 +1228,9 @@ impl PublicationBacklogScraper {
             .send()
             .await
             .context("request collector admin metrics")?;
+        if let Some((timing, _)) = timing.as_mut() {
+            timing.headers_ms = Some(monotonic_millis(started.elapsed()));
+        }
         if !response.status().is_success() {
             bail!("collector admin metrics returned HTTP {}", response.status());
         }
@@ -1219,6 +1247,9 @@ impl PublicationBacklogScraper {
                 bail!("collector admin metrics exceeded the evidence size limit");
             }
             body.extend_from_slice(&chunk);
+        }
+        if let Some((timing, _)) = timing.as_mut() {
+            timing.body_ms = Some(monotonic_millis(started.elapsed()));
         }
         String::from_utf8(body).context("collector admin metrics are not UTF-8")
     }
