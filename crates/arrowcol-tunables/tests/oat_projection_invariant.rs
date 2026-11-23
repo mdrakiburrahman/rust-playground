@@ -664,12 +664,28 @@ fn duration_run_classifies_one_shot_max_rows_as_inert() -> Result<()> {
 #[test]
 fn cpu_modes_and_stage_concurrency_require_typed_named_values() -> Result<()> {
     for (path, invalid) in [
-        ("collector.runtime.cpu_dispatch", vec![Value::Null, json!(true), json!("bounded"), json!({"bounded_shards":null})]),
-        ("collector.runtime.cpu_placement", vec![Value::Null, json!(1), json!("compact"), json!({"os":null})]),
-        ("collector.batching.stage_file_concurrency", vec![Value::Null, json!("1"), json!(1.5), json!(-1), json!(0), json!(17)]),
+        (
+            "collector.runtime.cpu_dispatch",
+            vec![
+                Value::Null,
+                json!(true),
+                json!("bounded"),
+                json!({"bounded_shards":null}),
+            ],
+        ),
+        (
+            "collector.runtime.cpu_placement",
+            vec![Value::Null, json!(1), json!("compact"), json!({"os":null})],
+        ),
+        (
+            "collector.batching.stage_file_concurrency",
+            vec![Value::Null, json!("1"), json!(1.5), json!(-1), json!(0), json!(17)],
+        ),
     ] {
         for bad in invalid {
-            let error = Tunables::parse_oat_json(fixture(path, bad)).err().context("invalid value accepted")?;
+            let error = Tunables::parse_oat_json(fixture(path, bad))
+                .err()
+                .context("invalid value accepted")?;
             assert!(format!("{error:#}").contains(path), "{error:#}");
         }
     }
@@ -679,15 +695,19 @@ fn cpu_modes_and_stage_concurrency_require_typed_named_values() -> Result<()> {
     assert!(!environment.contains_key("ARROWCOL_COLLECTOR_CPU_PLACEMENT"));
     assert!(!environment.contains_key("ARROWCOL_COLLECTOR_BATCHING_CONFIG"));
     for (dispatch, placement, concurrency) in [
-        ("shared_fifo", "os", 1), ("bounded_shards", "compact_allowed", 8), ("bounded_shards", "scatter_allowed", 16),
+        ("shared_fifo", "os", 1),
+        ("bounded_shards", "compact_allowed", 8),
+        ("bounded_shards", "scatter_allowed", 16),
     ] {
         let input = json!({"collector":{"runtime":{"cpu_dispatch":dispatch,"cpu_placement":placement},
                                        "batching":{"stage_file_concurrency":concurrency}}});
         let env = Tunables::parse_oat_json(input)?.environment_for(ComponentRole::Collector)?;
         assert_eq!(env["ARROWCOL_COLLECTOR_CPU_DISPATCH"], dispatch);
         assert_eq!(env["ARROWCOL_COLLECTOR_CPU_PLACEMENT"], placement);
-        assert_eq!(serde_json::from_str::<Value>(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?,
-                   json!({"stage_file_concurrency": concurrency}));
+        assert_eq!(
+            serde_json::from_str::<Value>(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?,
+            json!({"stage_file_concurrency": concurrency})
+        );
     }
     Ok(())
 }
