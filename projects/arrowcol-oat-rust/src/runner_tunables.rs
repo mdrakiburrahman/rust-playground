@@ -57,7 +57,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
         });
-    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
+        "ARROWCOL_COLLECTOR_BATCHING_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
         .map(|(name, value)| Ok((name, serde_json::from_str::<Value>(value)?)))
@@ -233,6 +234,10 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             return true;
         }
         let (section, field, variable) = match path {
+            "collector.batching.max_arrow_memory_per_flush" | "collector.batching.max_rows_per_flush"
+            | "collector.batching.max_batches_per_flush" | "collector.batching.max_age"
+            | "collector.batching.max_concurrent_flushes" =>
+                ("batching", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_BATCHING_CONFIG"),
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"

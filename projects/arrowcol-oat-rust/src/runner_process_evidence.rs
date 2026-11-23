@@ -2185,6 +2185,8 @@ mod consumer_startup_projection_tests {
         ))?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector": {
+                "batching":{"max_arrow_memory_per_flush":134217728,"max_rows_per_flush":777777,
+                    "max_batches_per_flush":333,"max_age":"12s","max_concurrent_flushes":2},
                 "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13},
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
@@ -2295,7 +2297,7 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 19);
+        assert_eq!(covered["consumer_verified"].as_array().context("consumer_verified array")?.len(), 24);
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         let mut wrong_process = process.clone();
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
@@ -2313,6 +2315,8 @@ groups:
             assert_eq!(uncovered, initial);
         }
         for (group, fields) in [
+            ("batching", &["max_arrow_memory_per_flush", "max_rows_per_flush", "max_batches_per_flush",
+                "max_age", "max_concurrent_flushes"][..]),
             ("commit", &["batch_window", "max_files_per_commit", "max_pending_files"][..]),
             ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
                 "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
