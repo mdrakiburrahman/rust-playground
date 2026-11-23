@@ -5123,9 +5123,10 @@ fn result_rows(
             },
             "client": {
                 "requested_concurrency_per_process": config.dmv_concurrency,
+                "requested_concurrency_per_worker": config.dmv_concurrency,
                 "limit_cpu": requested.client.limits.cpu,
                 "limit_millicores": client_limit_millicores,
-                "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
+                "concurrency_per_cpu_core": config.dmv_concurrency.map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
             },
             "throttling": throttling,
         }))
@@ -5635,8 +5636,6 @@ async fn run_clients_inner(
                 format!("oat-{project_run_id}-{table}-c{}", client_index + 1),
                 "--rows".to_owned(),
                 client_config.rows_per_table.to_string(),
-                "--concurrency".to_owned(),
-                client_config.dmv_concurrency.to_string(),
                 "--table".to_owned(),
                 table.clone(),
                 "--edge-secret-file".to_owned(),
@@ -5654,6 +5653,9 @@ async fn run_clients_inner(
                 "--schedule-timeout-secs".to_owned(),
                 timing_budget.schedule_wait_seconds.to_string(),
             ];
+            if let Some(concurrency) = client_config.dmv_concurrency {
+                arguments.extend(["--concurrency".to_owned(), concurrency.to_string()]);
+            }
             if config.pilot_mode {
                 arguments.push("--pilot".to_owned());
             }

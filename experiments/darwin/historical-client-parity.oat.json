@@ -27,7 +27,6 @@
   "tables": ["sqlserver_availability_replica_states"],
   "rows_per_table": 8192,
   "clients_per_table": 1,
-  "dmv_concurrency": 32,
   "qap_endpoint": "http://127.0.0.1:8080",
   "qap_timeout_seconds": 60,
   "replica_counts": [1],

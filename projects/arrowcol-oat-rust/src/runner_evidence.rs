@@ -810,6 +810,7 @@ impl CellEvidence {
         let effective = process_configurations(output)?;
         crate::runner::verify_oat_client_build_profile_readback(config, &effective)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
+        let concurrency_readback = verify_dmv_concurrency_readback(config, &effective)?;
         let data_profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
         let counters = client_phase_evidence(output, data_profile)?;
         if let Some(window) = counters.get("measurement_window").filter(|value| !value.is_null()) {
@@ -826,6 +827,7 @@ impl CellEvidence {
             "phase_counters": counters,
             "admission_readback": client_admission_readback(output),
             "consumer_effective_config": effective,
+            "concurrency_readback": concurrency_readback,
             "execution_image": client_image_evidence(output)?,
         }));
         Ok(())
@@ -850,6 +852,9 @@ impl CellEvidence {
         if let Some(previous) = reports.iter_mut().find(|old| old["client_id"] == report["client_id"]) {
             if report["consumer_effective_config"].is_null() {
                 report["consumer_effective_config"] = previous["consumer_effective_config"].clone();
+            }
+            if report["concurrency_readback"].is_null() {
+                report["concurrency_readback"] = previous["concurrency_readback"].clone();
             }
             for key in ["preparation", "rejection"] {
                 if report["admission_readback"][key].is_null() {
@@ -2625,7 +2630,7 @@ fn client_admission_for_table(config: &OatConfig, run_id: &str, table: &str, rep
                     .as_ref()
                     .and_then(|client| client.streams_per_worker)
                     .filter(|streams| *streams > 0)
-                    .unwrap_or(config.dmv_concurrency);
+                    .unwrap_or(config.effective_dmv_concurrency());
                 u64::try_from(streams).ok()
             })
         });
@@ -2687,7 +2692,7 @@ fn client_admission_for_table(config: &OatConfig, run_id: &str, table: &str, rep
         let (estimate, estimate_reason) = match resolved.as_ref() {
             Some(config) => match crate::config::client_memory_preflight_estimate(
                 config.tunables.client.as_ref(),
-                config.dmv_concurrency,
+                config.effective_dmv_concurrency(),
             ) {
                 Ok(Some(estimate)) => (Some(estimate), None),
                 Ok(None) => (None, Some("preflight_corpus_bytes_not_configured")),
@@ -3324,8 +3329,19 @@ mod downstream_runner_tests {
         async fn finish_client(&self, config: &OatConfig, _: ClientHandle) -> Result<String> {
             let start = self.start.load(std::sync::atomic::Ordering::SeqCst) + config.warmup_seconds * 1000;
             let end = start + config.measure_seconds * 1000;
+            let requested_streams = config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).unwrap_or(0);
+            let concurrency = config.effective_dmv_concurrency();
+            let (streams, source) = if requested_streams == 0 {
+                (concurrency, "legacy_concurrency")
+            } else {
+                (requested_streams, "explicit_streams_per_worker")
+            };
+            let effective = json!({"workers":1,"streams_per_worker":streams});
+            let resolution = json!({"version":1,"requested":{"streams_per_worker":requested_streams},
+                "legacy":{"concurrency":concurrency},"resolved":{"streams_per_worker":streams},
+                "streams_per_worker_source":source});
             Ok(format!(
-                "OAT_CLIENT_BUILD_PROFILE {{\"lto\":\"off\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}}\nmeasured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
+                "OAT_CLIENT_EFFECTIVE_CONFIG {effective}\nOAT_CLIENT_RESOLUTION {resolution}\nOAT_CLIENT_BUILD_PROFILE {{\"lto\":\"off\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}}\nmeasured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
                 config.measure_seconds,
                 100.0 / config.measure_seconds as f64
             ))
