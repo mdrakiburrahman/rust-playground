@@ -703,6 +703,22 @@ impl Tunables {
                 bail!("maintenance.{field} must be an integer within 1..={maximum}");
             }
         }
+        if let Some(runtime) = value.pointer("/collector/runtime").and_then(Value::as_object) {
+            for name in [
+                "event_interval",
+                "global_queue_interval",
+                "thread_stack_size",
+                "thread_keep_alive_ms",
+                "cpu_thread_stack_size",
+            ] {
+                if let Some(value) = runtime.get(name) {
+                    anyhow::ensure!(
+                        value.as_u64().and_then(|value| usize::try_from(value).ok()).is_some(),
+                        "collector.runtime.{name} must be an unsigned integer"
+                    );
+                }
+            }
+        }
         let tunables: Self = serde_json::from_value(value).context("parse OAT tunables")?;
         tunables.validate_for_oat()?;
         Ok(tunables)

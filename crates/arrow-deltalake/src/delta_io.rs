@@ -591,6 +591,28 @@ impl Drop for Permit {
     }
 }
 
+fn configured_io_builder(config: &DeltaRuntimeConfig) -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .worker_threads(config.runtime_workers)
+        .max_blocking_threads(config.blocking_workers)
+        .thread_name("delta-io")
+        .enable_all();
+    if let Some(value) = config.event_interval {
+        builder.event_interval(value as u32);
+    }
+    if let Some(value) = config.global_queue_interval {
+        builder.global_queue_interval(value as u32);
+    }
+    if let Some(value) = config.thread_stack_size {
+        builder.thread_stack_size(value);
+    }
+    if let Some(value) = config.thread_keep_alive_ms {
+        builder.thread_keep_alive(std::time::Duration::from_millis(value as u64));
+    }
+    builder
+}
+
 impl SharedExecutor {
     fn new() -> Result<Self> {
         let config = runtime_config()?;
@@ -604,25 +626,9 @@ impl SharedExecutor {
                     "blocking filesystem reserve must be smaller than the blocking worker count",
                 )
             })?;
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(config.runtime_workers)
-            .max_blocking_threads(config.blocking_workers)
-            .thread_name("delta-io")
-            .enable_all();
-        if let Some(value) = config.event_interval {
-            builder.event_interval(value as u32);
-        }
-        if let Some(value) = config.global_queue_interval {
-            builder.global_queue_interval(value as u32);
-        }
-        if let Some(value) = config.thread_stack_size {
-            builder.thread_stack_size(value);
-        }
-        if let Some(value) = config.thread_keep_alive_ms {
-            builder.thread_keep_alive(std::time::Duration::from_millis(value as u64));
-        }
-        let runtime = builder.build().context("create shared Delta I/O runtime")?;
+        let runtime = configured_io_builder(config)
+            .build()
+            .context("create shared Delta I/O runtime")?;
         Ok(Self {
             runtime,
             admission: Arc::new(Admission::new(config.task_limit)),
@@ -967,14 +973,8 @@ mod tests {
                 .as_deref(),
             Some("delta-cpu-0")
         );
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .event_interval(config.event_interval.context("event interval")? as u32)
-            .global_queue_interval(config.global_queue_interval.context("global queue interval")? as u32)
-            .thread_stack_size(config.thread_stack_size.context("thread stack")?)
-            .thread_keep_alive(std::time::Duration::from_millis(
-                config.thread_keep_alive_ms.context("keep alive")? as u64,
-            ));
+        let mut builder = configured_io_builder(&config);
+        assert!(format!("{builder:?}").contains("thread_stack_size: Some(2097152)"));
         let runtime = builder.build()?;
         assert_eq!(runtime.block_on(async { 42 }), 42);
         Ok(())
