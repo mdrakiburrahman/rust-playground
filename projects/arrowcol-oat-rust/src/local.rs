@@ -578,10 +578,6 @@ mod tests {
             (Some(loopback), Some("172.17.0.1")),
             (Some(gateway), Some("localhost")),
             (Some(gateway), Some("[::1]")),
-            (Some(wildcard_v4), None),
-            (Some(wildcard_v6), None),
-            (Some(gateway), Some("0.0.0.0")),
-            (Some(gateway), Some("::")),
         ] {
             let error = validate_container_endpoints(true, false, bind, endpoint)
                 .err()
@@ -589,6 +585,22 @@ mod tests {
                 .to_string();
             assert!(error.contains("platform.local.bind_host") && error.contains("platform.local.endpoint_host"));
             assert!(error.contains("gateway"));
+        }
+        for bind in [wildcard_v4, wildcard_v6] {
+            let error = validate_container_endpoints(true, false, Some(bind), None)
+                .err()
+                .context("container wildcard bind without an advertised endpoint was accepted")?
+                .to_string();
+            assert!(error.contains("wildcard bind requires a concrete"));
+            assert!(error.contains("platform.local.bind_host") && error.contains("platform.local.endpoint_host"));
+        }
+        for endpoint in ["0.0.0.0", "::"] {
+            let error = validate_container_endpoints(true, false, Some(gateway), Some(endpoint))
+                .err()
+                .context("wildcard advertised endpoint was accepted")?
+                .to_string();
+            assert!(error.contains("platform.local.endpoint_host"));
+            assert!(error.contains("unicast"));
         }
         validate_container_endpoints(false, false, None, None)?;
         validate_container_endpoints(false, false, Some(wildcard_v4), Some("172.17.0.1"))?;
