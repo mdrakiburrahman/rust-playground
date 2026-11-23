@@ -820,10 +820,11 @@ impl CellEvidence {
                 bail!("client phase counters disagree with the armed window or measured-row report");
             }
         }
-        self.client_reports.entry(table.to_owned()).or_default().push(json!({
+        self.store_client_report(table, json!({
             "client_id": client_id,
             "table": table,
             "phase_counters": counters,
+            "admission_readback": client_admission_readback(output),
             "consumer_effective_config": effective,
             "execution_image": client_image_evidence(output)?,
         }));
@@ -837,10 +838,36 @@ impl CellEvidence {
             None => json!({"measurement_window": null, "unavailable_reason": "terminal_client_window_unavailable"}),
         };
         let effective = output.and_then(|output| process_configurations(output).ok());
-        self.client_reports.entry(table.to_owned()).or_default().push(json!({
+        self.store_client_report(table, json!({
             "client_id": client_id, "table": table, "status": "diagnostic_only",
             "phase_counters": phase_counters, "consumer_effective_config": effective,
+            "admission_readback": output.map(client_admission_readback),
         }));
+    }
+
+    fn store_client_report(&mut self, table: &str, mut report: Value) {
+        let reports = self.client_reports.entry(table.to_owned()).or_default();
+        if let Some(previous) = reports.iter_mut().find(|old| old["client_id"] == report["client_id"]) {
+            if report["consumer_effective_config"].is_null() {
+                report["consumer_effective_config"] = previous["consumer_effective_config"].clone();
+            }
+            for key in ["preparation", "rejection"] {
+                if report["admission_readback"][key].is_null() {
+                    report["admission_readback"][key] = previous["admission_readback"][key].clone();
+                }
+            }
+            if previous["admission_readback"]["status"] == "malformed"
+                || report["admission_readback"]["status"].is_null()
+                || report["admission_readback"]["status"] == "unavailable"
+            {
+                report["admission_readback"]["status"] = previous["admission_readback"]["status"].clone();
+                report["admission_readback"]["malformed_reasons"] =
+                    previous["admission_readback"]["malformed_reasons"].clone();
+            }
+            *previous = report;
+        } else {
+            reports.push(report);
+        }
     }
 
     fn client_snapshot_total(&self, table: &str, field: &str) -> Option<u64> {
@@ -2451,6 +2478,273 @@ fn client_payload_hash_scope(profile: ClientDataProfile) -> &'static str {
     }
 }
 
+fn client_admission_readback(output: &str) -> Value {
+    let mut preparation = None;
+    let mut rejection = None;
+    let mut malformed = Vec::new();
+    let mut tagged = false;
+    for line in output.lines() {
+        if let Some(raw) = line.strip_prefix("OAT_CLIENT_METRICS ") {
+            tagged = true;
+            match serde_json::from_str::<Value>(raw) {
+                Ok(snapshot) => {
+                    if snapshot["version"] != 1 || snapshot["scope"] != "process_cumulative" {
+                        malformed.push("client_metrics_malformed");
+                    }
+                    if let Some(value) = snapshot.get("preparation").filter(|value| !value.is_null()) {
+                        if !value.is_object() {
+                            malformed.push("preparation_not_object");
+                        } else {
+                            if preparation.as_ref().is_some_and(|previous| previous != value) {
+                                malformed.push("preparation_changed_between_snapshots");
+                            }
+                            preparation = Some(value.clone());
+                        }
+                    }
+                }
+                Err(_) => malformed.push("client_metrics_malformed"),
+            }
+        }
+        if let Some(raw) = line.strip_prefix("OAT_CLIENT_ADMISSION_REJECTED ") {
+            tagged = true;
+            match serde_json::from_str::<Value>(raw) {
+                Ok(value) => {
+                    let required = value["configured_slots"].as_u64()
+                        .zip(value["corpus_reservation_bytes"].as_u64())
+                        .zip(value["per_live_batch_reservation_bytes"].as_u64())
+                        .map(|((slots, corpus), per_batch)| u128::from(corpus) + u128::from(slots) * u128::from(per_batch));
+                    let required_valid = required.is_some_and(|required| {
+                        value["required_reservation_bytes_exact"].as_str() == Some(required.to_string().as_str())
+                            && match u64::try_from(required) {
+                                Ok(required) => value["required_reservation_bytes"].as_u64() == Some(required),
+                                Err(_) => value.get("required_reservation_bytes").is_some_and(Value::is_null),
+                            }
+                    });
+                    if rejection.is_some()
+                        || !required_valid
+                        || value["version"] != 1
+                        || value["status"] != "client_under_admission"
+                        || value["configured_slots"].as_u64().is_none()
+                        || value["admitted_slots"].as_u64().is_none()
+                        || value["corpus_reservation_bytes"].as_u64().is_none()
+                        || value["per_live_batch_reservation_bytes"].as_u64().is_none()
+                        || value["max_memory_bytes"].as_u64().is_none()
+                        || value["required_reservation_bytes_exact"].as_str().is_none()
+                    {
+                        malformed.push("admission_rejection_malformed");
+                    }
+                    rejection = Some(value);
+                }
+                Err(_) => malformed.push("admission_rejection_malformed"),
+            }
+        }
+    }
+    json!({"preparation": preparation, "rejection": rejection,
+        "status": if !malformed.is_empty() { "malformed" } else if tagged { "reported" } else { "unavailable" },
+        "malformed_reasons": malformed})
+}
+
+fn client_admission_for_table(config: &OatConfig, run_id: &str, table: &str, reports: Option<&Vec<Value>>) -> Value {
+    let mut clients = Vec::new();
+    let mut seen = HashSet::new();
+    let mut failure = None;
+    for report in reports.into_iter().flatten() {
+        let client_id = report["client_id"].as_str();
+        let slot = client_id
+            .and_then(|id| id.strip_prefix(&format!("{run_id}:{table}:")))
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|index| *index > 0 && *index <= config.clients_per_table);
+        let duplicate = slot.is_some_and(|index| !seen.insert(index));
+        let resolved = slot
+            .and_then(|index| resolved_fleet_client_config(config, index - 1).ok())
+            .or_else(|| config.platform.fleet.is_none().then(|| config.clone()));
+        let profile = resolved.as_ref().map(|config| {
+            config
+                .tunables
+                .client
+                .as_ref()
+                .and_then(|client| client.data_profile)
+                .unwrap_or_default()
+        });
+        let raw = &report["admission_readback"];
+        let preparation = raw.get("preparation").filter(|value| value.is_object()).or_else(|| {
+            report
+                .pointer("/phase_counters/preparation")
+                .filter(|value| value.is_object())
+        });
+        let rejection = raw.get("rejection").filter(|value| value.is_object());
+        let malformed_fields = preparation.is_some_and(|value| {
+            [
+                "configured_live_slots",
+                "admitted_live_slots",
+                "memory_reservation_bytes",
+                "corpus_memory_reservation_bytes",
+                "live_identity_batch_bytes",
+                "live_identity_batch_reservation_bytes",
+                "max_memory_bytes",
+            ]
+            .iter()
+            .any(|key| {
+                value
+                    .get(*key)
+                    .is_some_and(|field| !field.is_null() && field.as_u64().is_none())
+            })
+        });
+        let malformed = raw["status"] == "malformed" || malformed_fields;
+        let rejected =
+            rejection.is_some_and(|value| value["version"] == 1 && value["status"] == "client_under_admission");
+        let read = |key: &str| preparation.and_then(|value| value.get(key)).and_then(Value::as_u64);
+        let configured =
+            read("configured_live_slots").or_else(|| rejection.and_then(|value| value["configured_slots"].as_u64()));
+        let admitted =
+            read("admitted_live_slots").or_else(|| rejection.and_then(|value| value["admitted_slots"].as_u64()));
+        let total = read("memory_reservation_bytes");
+        let corpus = read("corpus_memory_reservation_bytes")
+            .or_else(|| rejection.and_then(|value| value["corpus_reservation_bytes"].as_u64()));
+        let per_live = read("live_identity_batch_bytes")
+            .or_else(|| rejection.and_then(|value| value["per_live_batch_reservation_bytes"].as_u64()));
+        let live = read("live_identity_batch_reservation_bytes");
+        let max = read("max_memory_bytes").or_else(|| rejection.and_then(|value| value["max_memory_bytes"].as_u64()));
+        let effective = &report["consumer_effective_config"];
+        let worker_input = effective["workers"].as_u64().or_else(|| {
+            resolved.as_ref().and_then(|config| {
+                config
+                    .tunables
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.workers)
+                    .filter(|workers| *workers > 0)
+                    .and_then(|workers| u64::try_from(workers).ok())
+            })
+        });
+        let streams_input = effective["streams_per_worker"].as_u64().or_else(|| {
+            resolved.as_ref().and_then(|config| {
+                let streams = config
+                    .tunables
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.streams_per_worker)
+                    .filter(|streams| *streams > 0)
+                    .unwrap_or(config.dmv_concurrency);
+                u64::try_from(streams).ok()
+            })
+        });
+        let inputs = worker_input.zip(streams_input);
+        let expected_slots = inputs.and_then(|(workers, streams)| workers.checked_mul(streams));
+        let reason = if rejected
+            || profile == Some(ClientDataProfile::Realistic)
+                && configured
+                    .zip(admitted)
+                    .is_some_and(|(configured, admitted)| admitted < configured)
+        {
+            Some("client_under_admission")
+        } else if profile == Some(ClientDataProfile::Realistic) && (malformed || duplicate || slot.is_none()) {
+            Some("client_admission_evidence_malformed")
+        } else if profile == Some(ClientDataProfile::Realistic) {
+            match (configured, admitted, total, corpus, per_live, live, max) {
+                (
+                    Some(configured),
+                    Some(admitted),
+                    Some(total),
+                    Some(corpus),
+                    Some(per_live),
+                    Some(live),
+                    Some(max),
+                ) => {
+                    if configured == 0
+                        || admitted != configured
+                        || corpus == 0
+                        || per_live == 0
+                        || inputs.is_some() && expected_slots.is_none()
+                        || expected_slots.is_some_and(|expected| expected != configured)
+                        || preparation
+                            .and_then(|value| value["data_profile"].as_str())
+                            .is_some_and(|value| value != "realistic")
+                        || per_live.checked_mul(admitted) != Some(live)
+                        || corpus.checked_add(live) != Some(total)
+                        || total > max
+                    {
+                        Some("client_reservation_inconsistent")
+                    } else {
+                        None
+                    }
+                }
+                _ => Some("client_admission_evidence_unavailable"),
+            }
+        } else if profile.is_none() {
+            Some("client_admission_evidence_unavailable")
+        } else if admitted.is_some_and(|count| count != 0)
+            || matches!((total, corpus, live, max), (Some(total), Some(corpus), Some(live), Some(max))
+                if live != 0 || corpus.checked_add(live) != Some(total) || total > max)
+        {
+            Some("client_reservation_inconsistent")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            failure.get_or_insert(reason);
+        }
+        let (estimate, estimate_reason) = match resolved.as_ref() {
+            Some(config) => match crate::config::client_memory_preflight_estimate(
+                config.tunables.client.as_ref(),
+                config.dmv_concurrency,
+            ) {
+                Ok(Some(estimate)) => (Some(estimate), None),
+                Ok(None) => (None, Some("preflight_corpus_bytes_not_configured")),
+                Err(_) => (None, Some("preflight_estimate_calculation_failed")),
+            },
+            None => (None, Some("client_configuration_unavailable")),
+        };
+        let estimated_bytes = estimate.as_ref().map(|estimate| estimate.required_bytes);
+        clients.push(json!({
+            "client_id": client_id, "client_index": slot,
+            "data_profile": profile.map(client_profile_name),
+            "status": if reason.is_some() { "failed" } else if malformed || configured.is_none() || admitted.is_none() || total.is_none() { "unavailable" } else { "reported" },
+            "reason": reason.or_else(|| if malformed { Some("client_admission_evidence_malformed") } else { (configured.is_none() || admitted.is_none() || total.is_none()).then_some("client_admission_evidence_unavailable") }),
+            "malformed_reasons": raw["malformed_reasons"], "malformed_preparation_fields": malformed_fields,
+            "configured_live_slots": configured, "admitted_live_slots": admitted,
+            "expected_live_slots_from_known_client_inputs": expected_slots,
+            "memory_reservation_bytes": total, "corpus_memory_reservation_bytes": corpus,
+            "live_identity_batch_bytes": per_live, "live_identity_batch_reservation_bytes": live,
+            "max_memory_bytes": max, "rejection": rejection,
+            "preflight_comparison": {
+                "status": if estimated_bytes.zip(total).is_some() { "compared" } else { "unavailable" },
+                "estimate": estimate,
+                "unavailable_reason": estimate_reason.or_else(|| total.is_none().then_some("client_reservation_unavailable")),
+                "estimate_provenance": "recomputed_on_oat_host_at_result_time_not_captured_validation_inputs",
+                "guaranteed_upper_bound": false,
+                "actual_reservation_exceeds_estimate": estimated_bytes.zip(total).map(|(estimate, actual)| actual > estimate),
+                "actual_reservation_bytes": total,
+            }
+        }));
+    }
+    for index in 1..=config.clients_per_table {
+        if seen.contains(&index) {
+            continue;
+        }
+        let resolved = resolved_fleet_client_config(config, index - 1).ok();
+        let profile = resolved.as_ref().map(|config| {
+            config
+                .tunables
+                .client
+                .as_ref()
+                .and_then(|client| client.data_profile)
+                .unwrap_or_default()
+        });
+        if profile == Some(ClientDataProfile::Realistic) {
+            failure.get_or_insert("client_admission_evidence_unavailable");
+        }
+        clients.push(json!({"client_id": null, "client_index": index, "data_profile": profile.map(client_profile_name),
+            "status": "unavailable", "reason": "client_admission_evidence_unavailable", "configured_live_slots": null,
+            "admitted_live_slots": null, "memory_reservation_bytes": null, "corpus_memory_reservation_bytes": null,
+            "live_identity_batch_bytes": null, "live_identity_batch_reservation_bytes": null, "max_memory_bytes": null,
+            "preflight_comparison": {"status":"unavailable", "estimate":null, "unavailable_reason":"client_reservation_unavailable",
+                "estimate_provenance":"recomputed_on_oat_host_at_result_time_not_captured_validation_inputs", "guaranteed_upper_bound":false}}));
+    }
+    json!({"status": if failure.is_some() { "failed" } else if clients.iter().any(|client| client["status"] == "unavailable") { "unavailable" } else { "reported" },
+        "failure": failure, "clients": clients})
+}
+
 fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) -> Result<Value> {
     let Some(value) = value else {
         if data_profile == ClientDataProfile::Realistic {
@@ -2604,6 +2898,196 @@ mod downstream_runner_tests {
     use super::*;
 
     #[test]
+    fn admission_readback_classifies_realistic_and_legacy_diagnostic_rows() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.truncate(1);
+        config.clients_per_table = 1;
+        config.tunables = serde_json::from_value(json!({"client": {
+            "data_profile": "realistic", "workers": 2, "streams_per_worker": 1,
+            "corpus_bytes": 100, "max_memory_bytes": 3_000_000_000_u64
+        }}))?;
+        let table = config.tables[0].clone();
+        let id = format!("run:{table}:1");
+        let preparation = json!({"configured_live_slots":2, "admitted_live_slots":2,
+            "memory_reservation_bytes":1000, "corpus_memory_reservation_bytes":700,
+            "live_identity_batch_bytes":150, "live_identity_batch_reservation_bytes":300, "max_memory_bytes":2000});
+        let report = |value: Value| {
+            json!({"client_id":id, "admission_readback":{"preparation":value},
+            "consumer_effective_config":{"workers":2,"streams_per_worker":1}})
+        };
+        let qualified = client_admission_for_table(&config, "run", &table, Some(&vec![report(preparation.clone())]));
+        assert_eq!(qualified["clients"][0]["status"], "reported");
+        assert!(qualified["failure"].is_null());
+        assert_eq!(
+            qualified["clients"][0]["preflight_comparison"]["estimate"]["required_bytes"],
+            1_593_742_225_u64
+        );
+        assert_eq!(
+            qualified["clients"][0]["preflight_comparison"]["guaranteed_upper_bound"],
+            false
+        );
+        assert_eq!(
+            qualified["clients"][0]["preflight_comparison"]["actual_reservation_exceeds_estimate"],
+            false
+        );
+        let mut larger = preparation.clone();
+        larger["corpus_memory_reservation_bytes"] = json!(2_000_000_000_u64);
+        larger["memory_reservation_bytes"] = json!(2_000_000_300_u64);
+        larger["max_memory_bytes"] = json!(3_000_000_000_u64);
+        let compared = client_admission_for_table(&config, "run", &table, Some(&vec![report(larger)]));
+        assert!(compared["failure"].is_null());
+        assert_eq!(
+            compared["clients"][0]["preflight_comparison"]["actual_reservation_exceeds_estimate"],
+            true
+        );
+        for (field, value, reason) in [
+            ("admitted_live_slots", json!(1), "client_under_admission"),
+            (
+                "memory_reservation_bytes",
+                json!(999),
+                "client_reservation_inconsistent",
+            ),
+            (
+                "configured_live_slots",
+                json!("invalid"),
+                "client_admission_evidence_malformed",
+            ),
+            (
+                "live_identity_batch_reservation_bytes",
+                Value::Null,
+                "client_admission_evidence_unavailable",
+            ),
+        ] {
+            let mut changed = preparation.clone();
+            changed[field] = value;
+            let admission = client_admission_for_table(&config, "run", &table, Some(&vec![report(changed)]));
+            assert_eq!(admission["failure"], reason);
+        }
+        let output = format!(
+            "OAT_CLIENT_METRICS {}\nOAT_CLIENT_METRICS invalid-json\n",
+            json!({
+                "version":1,"scope":"process_cumulative","preparation":preparation
+            })
+        );
+        let mut captured = CellEvidence::default();
+        captured.record_cancelled_client(&table, &id, Some(&output));
+        captured.record_cancelled_client(&table, &id, None);
+        let malformed = client_admission_for_table(&config, "run", &table, captured.client_reports.get(&table));
+        assert_eq!(malformed["failure"], "client_admission_evidence_malformed");
+        assert_eq!(malformed["clients"][0]["configured_live_slots"], 2);
+        assert_eq!(
+            malformed["clients"][0]["malformed_reasons"][0],
+            "client_metrics_malformed"
+        );
+        let mut overflow = config.clone();
+        overflow
+            .tunables
+            .client
+            .as_mut()
+            .context("missing fixture client")?
+            .corpus_bytes = Some(u64::MAX);
+        let evidence = client_admission_for_table(&overflow, "run", &table, Some(&vec![report(preparation.clone())]));
+        assert_eq!(
+            evidence["clients"][0]["preflight_comparison"]["unavailable_reason"],
+            "preflight_estimate_calculation_failed"
+        );
+        let missing = client_admission_for_table(&config, "run", &table, None);
+        assert_eq!(missing["failure"], "client_admission_evidence_unavailable");
+        assert!(missing["clients"][0]["client_id"].is_null());
+        assert!(missing["clients"][0]["admitted_live_slots"].is_null());
+        config.tunables = serde_json::from_value(json!({"client":{"data_profile":"diagnostic"}}))?;
+        let diagnostic = client_admission_for_table(
+            &config,
+            "run",
+            &table,
+            Some(&vec![report(json!({
+                "configured_live_slots":2,"admitted_live_slots":0,"memory_reservation_bytes":700
+            }))]),
+        );
+        assert!(diagnostic["failure"].is_null());
+        assert_eq!(diagnostic["clients"][0]["admitted_live_slots"], 0);
+        let mut diagnostic_capture = CellEvidence::default();
+        let output = format!(
+            "OAT_CLIENT_METRICS {}\nOAT_CLIENT_ADMISSION_REJECTED invalid-json\n",
+            json!({
+                "version":1,"scope":"process_cumulative","preparation":{"configured_live_slots":2,"admitted_live_slots":0,"memory_reservation_bytes":700}
+            })
+        );
+        diagnostic_capture.record_cancelled_client(&table, &id, Some(&output));
+        let malformed_diagnostic =
+            client_admission_for_table(&config, "run", &table, diagnostic_capture.client_reports.get(&table));
+        assert!(malformed_diagnostic["failure"].is_null());
+        assert_eq!(
+            malformed_diagnostic["clients"][0]["reason"],
+            "client_admission_evidence_malformed"
+        );
+        let legacy = client_admission_for_table(&config, "run", &table, None);
+        assert!(legacy["failure"].is_null());
+        assert_eq!(legacy["clients"][0]["status"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn admission_rejection_is_preserved_in_failed_result_row() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.truncate(1);
+        config.clients_per_table = 1;
+        config.tunables = serde_json::from_value(json!({"client":{"data_profile":"realistic"}}))?;
+        let table = config.tables[0].clone();
+        let id = format!("run:{table}:1");
+        let rejection = json!({"version":1,"status":"client_under_admission","configured_slots":4,"admitted_slots":1,
+            "required_reservation_bytes":1300,"required_reservation_bytes_exact":"1300","max_memory_bytes":1000,
+            "corpus_reservation_bytes":500,"per_live_batch_reservation_bytes":200});
+        let mut inconsistent = rejection.clone();
+        inconsistent["required_reservation_bytes_exact"] = json!("1299");
+        let malformed = client_admission_readback(&format!("OAT_CLIENT_ADMISSION_REJECTED {inconsistent}\n"));
+        assert_eq!(malformed["status"], "malformed");
+        assert_eq!(malformed["rejection"]["configured_slots"], 4);
+        let output = format!("OAT_CLIENT_ADMISSION_REJECTED {rejection}\n");
+        let mut evidence = CellEvidence::default();
+        evidence.record_cancelled_client(&table, &id, Some(&output));
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            "run",
+            1,
+            1,
+            CellMeasurements {
+                clients: ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: PinningReport::default(),
+                    qap_tables: Vec::new(),
+                    failure: Some("readiness failed".to_owned()),
+                    evidence,
+                },
+                started_at_ms: 1000,
+                qap: QapMetrics::default(),
+                resources: None,
+                resource_evidence: None,
+            },
+        )?;
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0]
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("client_under_admission"))
+        );
+        let evidence: Value =
+            serde_json::from_str(rows[0].evidence_json.as_deref().context("missing result evidence")?)?;
+        let client = &evidence["client_admission"]["clients"][0];
+        assert_eq!(client["configured_live_slots"], 4);
+        assert_eq!(client["admitted_live_slots"], 1);
+        assert!(client["memory_reservation_bytes"].is_null());
+        assert_eq!(client["rejection"]["required_reservation_bytes_exact"], "1300");
+        Ok(())
+    }
+
+    #[test]
     fn cancelled_client_retains_window_outcomes_only_as_diagnostic_evidence() {
         let bucket = |start, end, completed, timed_out, ambiguous| json!({
             "start_unix_ms": start, "end_unix_ms": end,
@@ -2650,6 +3134,7 @@ mod downstream_runner_tests {
         ScheduleAckBlocked,
         ScheduleAckCancellationFailed,
         CancellationCapture,
+        AdmissionRejected,
     }
 
     struct FaultPlatform {
@@ -2762,9 +3247,9 @@ mod downstream_runner_tests {
         async fn start_client(
             &mut self,
             _: &OatConfig,
-            _: &str,
+            run_id: &str,
             table: &str,
-            _: usize,
+            client_index: usize,
             arguments: &[String],
         ) -> Result<ClientHandle> {
             self.clients_started += 1;
@@ -2773,7 +3258,10 @@ mod downstream_runner_tests {
                 .map(|pair| pair[1].parse())
                 .transpose()?;
             Ok(ClientHandle {
-                client_id: format!("client-{}", self.clients_started),
+                client_id: if matches!(self.fault, Fault::AdmissionRejected) {
+                    format!("{run_id}:{table}:{client_index}")
+                } else {
+                    format!("client-{}", self.clients_started)},
                 table: table.to_owned(),
                 process: ClientProcess::Local {
                     container_id: "fake".to_owned(),
@@ -2790,6 +3278,18 @@ mod downstream_runner_tests {
                     dropped_after_ms: &self.delivery_drop_ms,
                 };
                 return std::future::pending().await;
+            }
+            if matches!(self.fault, Fault::AdmissionRejected) {
+                let rejection = json!({"version":1,"status":"client_under_admission","configured_slots":4,"admitted_slots":1,
+                    "required_reservation_bytes":1300,"required_reservation_bytes_exact":"1300","max_memory_bytes":1000,
+                    "corpus_reservation_bytes":500,"per_live_batch_reservation_bytes":200});
+                return Ok(ClientProgress {
+                    ready: false,
+                    schedule_received: false,
+                    completed: true,
+                    failure: Some("client_under_admission".to_owned()),
+                    output: format!("OAT_CLIENT_ADMISSION_REJECTED {rejection}\n"),
+                });
             }
             Ok(ClientProgress {
                 ready: true,
@@ -3017,6 +3517,9 @@ mod downstream_runner_tests {
         ))?;
         config.platform.kind = kind;
         config.overload_guard.enabled = false;
+        if matches!(fault, Fault::AdmissionRejected) {
+            config.tunables = serde_json::from_value(json!({"client":{"data_profile":"realistic"}}))?;
+        }
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         if let Some(lead) = lead {
             config.schedule_lead_seconds = lead;
@@ -3045,6 +3548,27 @@ mod downstream_runner_tests {
             return Ok((Vec::new(), platform));
         }
         Ok((result?, platform))
+    }
+
+    #[tokio::test]
+    async fn admission_rejection_during_readiness_reaches_failed_result() -> Result<()> {
+        let (rows, platform) =
+            run_fault_with_lead(Fault::AdmissionRejected, crate::config::OatMode::Local, None).await?;
+        assert_eq!(platform.arm_attempts, 0);
+        assert_eq!(platform.qap_initialization_calls, 0);
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0]
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("client_under_admission"))
+        );
+        let evidence: Value =
+            serde_json::from_str(rows[0].evidence_json.as_deref().context("missing failure evidence")?)?;
+        assert_eq!(evidence["client_admission"]["clients"][0]["configured_live_slots"], 4);
+        assert_eq!(evidence["client_admission"]["clients"][0]["admitted_live_slots"], 1);
+        assert!(evidence["client_admission"]["clients"][0]["memory_reservation_bytes"].is_null());
+        Ok(())
     }
 
     #[tokio::test]
