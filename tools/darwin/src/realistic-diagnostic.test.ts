@@ -436,5 +436,11 @@ test("attributes only a complete guard and an identity-bound cgroup peak", () =>
   assert.equal(outcome({cgroup:{...cg,docker:{...cg.docker,oom_killed:true},stat:null,events:null}}).memory_limited,true);
   assert.equal(outcome({cgroup:{...cg,stat:{anon:1}}}).memory_limited,null);
   assert.equal(outcome({memory_signal:"process_rss"}).permits_cpu_attribution,false);
+  const exited = {collector_id:id, ps_all_ids:[id], docker:{...cg.docker,status:"exited",exit_code:1}, read_error:"docker exec: not running"};
+  const failed = outcome({cgroup:exited,guard_status:null,guard_cap:null,memory_signal:null});
+  assert.deepEqual(failed.terminal_snapshot, exited);
+  assert.equal(failed.guard_engaged,null);
+  assert.equal(failed.collector_cgroup_lifetime_peak_bytes,null);
+  assert.equal(failed.permits_cpu_attribution,false);
   assert.equal(memoryOutcome("").permits_cpu_attribution, false);
 });

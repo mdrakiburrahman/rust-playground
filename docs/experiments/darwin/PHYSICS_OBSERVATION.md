@@ -79,3 +79,30 @@ Width 63 is the closest admissible width to 96 with the row count, batch boundar
 **Not implemented or measured.** The current exporter reads `state/<run_id>/dataflow/telemetry/sqlserver/<table>` after stopping the writers. Changing a single container mount, relocating all of `compose_state_root`, or using a symlink would not establish a valid table-only comparison.
 
 A candidate implementation would create a bounded, run-owned tmpfs mount at that exact table path **before** the stack starts, with no change to catalog, router, control or other state. It must prove the same mount and source identity in the runner/exporter and Docker daemon namespaces, verify the mounted table seen by catalog, collector, Kusto and maintenance (including read-only flags), and record filesystem type, mount ID, device, inode, capacity and source/target paths before scheduling and after stop. It must retain the mount and stopped data on failure, export and verify the stopped snapshot before any unmount, then unmount only the verified run-owned mount before state cleanup. Reject unsupported mount propagation, symlinks, mismatched identities or ambiguous cleanup. Tmpfs occupancy consumes host memory; budget its maximum separately while retaining the unchanged pre-schedule 75% check. No storage effect or valid arm is implied by this design.
+
+### Named, matched diagnostic comparisons
+
+Omit `--arm` for the original fixed-image profile. For a named series, append
+`--arm candidate-baseline` to `--establish-reference`; each treatment instead uses
+`--comparison-profile PROFILE_PATH PROFILE_SHA256 REFERENCE_RECEIPT_PATH --arm NAME`.
+Use the same candidate pins file (identical bytes), host boot, trusted runtime,
+stack size and run parent throughout. Use the mask matching the chosen row.
+
+| Arm | Exact change from candidate baseline |
+|---|---|
+| `candidate-baseline` | Collector CPUs 0–7, 8 engine/runtime workers, 12 simultaneous flushes, 128 files/commit |
+| `software-main` | Only the source/image pair below; software comparison, **not** single-resource causality |
+| `cpu-16`, `cpu-24` | CPUs 0–15 or 0–23; engine `--num-cores`, DFE concurrency and runtime CPU workers move together to 16 or 24 |
+| `writer-flush-6` | `batching.max_concurrent_flushes` 12 → 6 (exporter flush-slot semaphore, not writer threads) |
+| `commit-files-64` | `commit.max_files_per_commit` 128 → 64 |
+
+Candidate source `ad83c6376086f020a7d4e8cffd66994eedb537fe` requires image
+`sha256:66c9d807973182594d6244a93f412a2b2c1da8b3bed30cfa528610ae50d67e68`;
+main source `3630d3e4301bc3ba8f9f69a308d077cebee6d12a` requires image
+`sha256:23a418cf48ab1765b6ab7b1a1bd647ee2486357db37865027b60df1ca4ee4c49`.
+Rebuilding an image under the same revision label is not a substitute.
+Before scheduling, OAT checks live process settings and the project service roster,
+reverses just the manifest's exact treatment and compares the resulting digest with
+the bound baseline. Missing readback or a second setting change rejects the arm.
+Existing memory, saturation and durability gates still apply; a terminal read after
+client failure records inspect evidence even when the exited cgroup cannot be read.

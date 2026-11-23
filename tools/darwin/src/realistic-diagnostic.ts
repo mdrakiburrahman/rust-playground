@@ -8,6 +8,7 @@ import { tableFromIPC } from "apache-arrow";
 import { readParquet } from "parquet-wasm";
 import { STARTUP_ACCOUNTING_EXPECTED, requireMatchedStartupAccounting, requireStartupAccounting } from "../../../projects/arrowcol-oat/startup-accounting.js";
 import { fitsDiagnosticBound, memoryOutcome } from "./diagnostic-memory.js";
+import { arms, armName, candidate, type Arm } from "../../../projects/arrowcol-oat/diagnostic-arm.js";
 import { cpuWindowReceipt } from "../../../projects/arrowcol-oat/diagnostic-cpu.js";
 import * as oatResult from "./oat-result.js";
 import { parseManifestJson } from "./delivery-identity.js";
@@ -53,8 +54,8 @@ function kustainer(raw: unknown): Kustainer {
   return {state:k.state, image:k.image};
 }
 type DiagnosticReference =
-  | { mode: "first" }
-  | { mode: "matched"; kind: "diagnostic-comparison-profile"; qualification: "not-evaluated";
+  | { mode: "first"; arm?: "candidate-baseline" }
+  | { mode: "matched"; arm?: {name: Exclude<Arm,"candidate-baseline">;baseline_sha256:string}; kind: "diagnostic-comparison-profile"; qualification: "not-evaluated";
       profile_sha256: string; receipt_sha256: string; run_id: string; corpus_sha256: string;
       collector_memory_limit_bytes: number; kustainer: Kustainer; clients: DiagnosticClientReservation[] };
 type DiagnosticReferenceInput =
@@ -146,8 +147,8 @@ export function freezeDiagnosticComparisonProfile(
     || receipt.footer_sha256 !== expected.footer
     || !isDeepStrictEqual(receipt.images, expected.images)
     || !isDeepStrictEqual(receipt.diagnostic_profile, DIAGNOSTIC_WORKLOAD_PROFILE)
-    || !isDeepStrictEqual(initial.reference, { mode: "first" })
-    || !isDeepStrictEqual(recheck.reference, { mode: "first" })) {
+    || !(isDeepStrictEqual(initial.reference, {mode:"first"}) || isDeepStrictEqual(initial.reference,{mode:"first",arm:"candidate-baseline"}))
+    || !isDeepStrictEqual(recheck.reference, initial.reference)) {
     throw new Error("reference receipt is not a completed, explicit first diagnostic arm");
   }
   const initialProof = validateDiagnosticProof(
@@ -290,8 +291,18 @@ export function validateDiagnosticReferenceProof(
   proofs: readonly JsonObject[],
   reference: DiagnosticReference,
 ): void {
+  if (reference.arm !== undefined) {
+    const name = reference.mode === "first" ? reference.arm : reference.arm.name;
+    const witness = object(proofs[0]?.arm_contract, "named arm proof");
+    string(witness.baseline_sha256, /^[a-f0-9]{64}$/, "arm comparison digest");
+    if (witness.name !== name || !isDeepStrictEqual(witness.manifest, arms[name])
+      || proofs.some(p => !isDeepStrictEqual(p.arm_contract, witness))
+      || (reference.mode === "matched" && witness.baseline_sha256 !== reference.arm.baseline_sha256)) {
+      throw new Error("named arm did not match its declared setting and bound reference");
+    }
+  }
   if (reference.mode === "first") {
-    if (proofs.some(proof => !isDeepStrictEqual(proof.reference, { mode: "first" }))) {
+    if (proofs.some(proof => !isDeepStrictEqual(proof.reference, reference))) {
       throw new Error("first-arm reference establishment is not explicit");
     }
     return;
@@ -537,7 +548,7 @@ export function diagnosticInputBytes(
 export async function runRealisticDiagnostic(options: {
   repo: string; home: string; root: string; snapshot: string; output: string; pinsFile: string;
   bindHost: string; endpointHost: string; collectorCpus: string; clientCpus: string; stackBytes: number;
-  reference: DiagnosticReferenceInput;
+  reference: DiagnosticReferenceInput; arm?: Arm;
 }) {
   const paths = diagnosticPaths(options.root, options.snapshot, options.output);
   if (!/^[0-9a-fA-F:.]+$/.test(options.bindHost) || !/^[0-9a-fA-F:.]+$/.test(options.endpointHost)) {
@@ -547,6 +558,12 @@ export async function runRealisticDiagnostic(options: {
   const clientCpus = parseCollectorCpus(options.clientCpus);
   if (!isDeepStrictEqual(clientCpus, [24,25,26,27,28,29]) || cpus.some(cpu => clientCpus.includes(cpu) || cpu === 30 || cpu === 31)) throw new Error("invalid diagnostic collector, client or support CPU mask");
   const expected = diagnosticPins(JSON.parse(await readFile(options.pinsFile, "utf8")));
+  const name=options.arm===undefined?undefined:armName(options.arm);
+  const recipe=name===undefined?undefined:arms[name];
+  const pinsDigest=await sha256(options.pinsFile);
+  const freeze={pins_sha256:pinsDigest,stack_bytes:options.stackBytes};
+  if(recipe && (!isDeepStrictEqual(cpus,Array.from({length:recipe.cores},(_,i)=>i)) || expected.collectorSource!==candidate.source_revision || expected.images.collector!==candidate.image_id))throw Error("named arm requires exact frozen candidate pins and collector stratum");
+  if(name && (options.reference.mode==='establish')!==(name==='candidate-baseline'))throw Error("named treatment requires a bound candidate baseline");
   let reference: DiagnosticReference;
   let comparisonProfile: FrozenComparisonProfile | undefined;
   let comparisonProfileBytes: Buffer | undefined;
@@ -555,7 +572,7 @@ export async function runRealisticDiagnostic(options: {
   let referenceReceiptBytes: Buffer | undefined;
   let referenceReceiptPath: string | undefined;
   if (options.reference.mode === "establish") {
-    reference = { mode: "first" };
+    reference = name==='candidate-baseline'?{mode:"first",arm:name}:{mode:"first"};
   } else {
     comparisonProfilePath = await realpath(string(options.reference.profilePath, /^\/.+/, "comparison profile path"));
     comparisonProfileSha256 = options.reference.profileSha256;
@@ -566,8 +583,15 @@ export async function runRealisticDiagnostic(options: {
       comparisonProfileBytes, options.reference.profileSha256, referenceReceiptBytes, expected,
     );
     reference = diagnosticReference(comparisonProfile, options.reference.profileSha256);
+    const bound=JSON.parse(referenceReceiptBytes.toString('utf8'));
+    if(name && name!=='candidate-baseline'){
+      const w=bound.pre_schedule_admission?.arm_contract;
+      if(reference.mode!=='matched' || !isDeepStrictEqual(bound.diagnostic_admission?.reference,{mode:'first',arm:'candidate-baseline'}) || !isDeepStrictEqual(bound.named_freeze,freeze) || w?.name!=='candidate-baseline' || !isDeepStrictEqual(w.manifest,arms['candidate-baseline']) || !isDeepStrictEqual(w,bound.diagnostic_admission?.arm_contract))throw Error('missing exact named reference evidence');
+      reference.arm={name,baseline_sha256:string(w.baseline_sha256,/^[0-9a-f]{64}$/,'named reference witness')};
+    }else if(bound.pre_schedule_admission?.arm_contract)throw Error('named baseline requires explicit treatment');
   }
   if (expected.collectorSource !== COLLECTOR_SOURCE_BASE) throw new Error("diagnostic collector must be built from the frozen collector source");
+  if(recipe){expected.collectorSource=recipe.collector.source_revision;expected.images={...expected.images,collector:recipe.collector.image_id};}
   if (Reflect.get(oatResult, "DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION") !== 1) {
     throw new Error("trusted diagnostic-realistic snapshot reconciliation is unavailable; no measurement may be scheduled");
   }
@@ -602,6 +626,7 @@ export async function runRealisticDiagnostic(options: {
   if (object(files["experiments/darwin/historical-parity.oat.json"], "seed manifest").sha256 !== expected.seed
     || await sha256(seedPath) !== expected.seed) throw new Error("seed pin differs from trusted snapshot");
   const config = realisticDiagnosticConfig(JSON.parse(await readFile(seedPath, "utf8")), cpus);
+  if(recipe){const c=object(object(config.tunables,'tunables').collector,'collector');object(c.batching,'batching').max_concurrent_flushes=recipe.flushes;object(c.commit,'commit').max_files_per_commit=recipe.commitFiles;}
   const lock = join(options.home, "data", "evaluating");
   await mkdir(dirname(lock), { recursive: true });
   await mkdir(lock);
@@ -623,6 +648,9 @@ export async function runRealisticDiagnostic(options: {
       if (await sha256(fileURLToPath(new URL(name, import.meta.url))) !== await sha256(join(runtime, "tools", "darwin", "src", name))) {
         throw new Error("diagnostic launcher differs from the pinned runtime source");
       }
+    }
+    if (name && await sha256(join(repo, "projects/arrowcol-oat/diagnostic-arm.ts")) !== await sha256(join(runtime, "projects/arrowcol-oat/diagnostic-arm.ts"))) {
+      throw new Error("named comparator differs from pinned source");
     }
     const oatSource = join(runtime, "projects", "arrowcol-oat-rust", "src");
     verifyDiagnosticHook(await readFile(join(oatSource, "runner.rs"), "utf8"));
@@ -790,6 +818,7 @@ export async function runRealisticDiagnostic(options: {
       run_id: row.run_id,
       reference_establishment: reference.mode === "first" ? "explicit-first-arm" : null,
       diagnostic_reference: reference,
+      ...(recipe?{named_freeze:freeze,named_contract:recipe}:{}),
       comparison_profile_sha256: reference.mode === "matched" ? reference.profile_sha256 : null,
       reference_receipt_sha256: reference.mode === "matched" ? reference.receipt_sha256 : null,
       reference_run_id: reference.mode === "matched" ? reference.run_id : null,
@@ -856,8 +885,10 @@ async function main() {
   }
   const [repo, home, root, snapshot, output, pinsFile, bindHost, endpointHost, collectorCpus, clientCpus, stack, ...referenceArgs] = process.argv.slice(2);
   if (!repo || !home || !root || !snapshot || !output || !pinsFile || !bindHost || !endpointHost || !collectorCpus || !clientCpus || !stack) {
-    throw new Error("usage: realistic-diagnostic.ts REPO HOME RUN_ROOT SNAPSHOT_DIR OUTPUT_DIR PINS_JSON BIND_IP ENDPOINT_IP COLLECTOR_CPUS CLIENT_CPUS STACK_BYTES (--establish-reference | --comparison-profile PROFILE_PATH PROFILE_SHA256 REFERENCE_RECEIPT_PATH); or --compare-reservations FIRST_RECEIPT SECOND_RECEIPT");
+    throw new Error("usage: realistic-diagnostic.ts REPO HOME RUN_ROOT SNAPSHOT_DIR OUTPUT_DIR PINS_JSON BIND_IP ENDPOINT_IP COLLECTOR_CPUS CLIENT_CPUS STACK_BYTES (--establish-reference | --comparison-profile PROFILE_PATH PROFILE_SHA256 REFERENCE_RECEIPT_PATH) [--arm NAME]; or --compare-reservations FIRST_RECEIPT SECOND_RECEIPT");
   }
+  let arm:Arm|undefined;
+  if(referenceArgs.at(-2)==="--arm"){arm=armName(referenceArgs.pop());referenceArgs.pop();}
   let reference: DiagnosticReferenceInput;
   if (referenceArgs.length === 1 && referenceArgs[0] === "--establish-reference") {
     reference = { mode: "establish" };
@@ -873,7 +904,7 @@ async function main() {
   }
   const result = await runRealisticDiagnostic({
     repo, home, root, snapshot, output, pinsFile, bindHost, endpointHost,
-    collectorCpus, clientCpus, stackBytes: Number(stack), reference,
+    collectorCpus, clientCpus, stackBytes: Number(stack), reference, arm,
   });
   console.log(JSON.stringify({
     kind: "diagnostic-only", qualification: "not-evaluated",

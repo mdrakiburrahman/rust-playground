@@ -201,10 +201,10 @@ fn diagnostic_worker_strata_reject_mismatched_config_and_live_engine() -> Result
 fn diagnostic_and_ordinary_local_startup_validate_first_cell_not_last() -> Result<()> {
     let first = first_local_concurrency(&[3, 7])? as usize;
     assert_eq!(
-        verify_diagnostic_engine_argv("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\03\0", first)?,
+        verify_diagnostic_engine_argv("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\x003\0", first)?,
         3
     );
-    assert!(verify_diagnostic_engine_argv("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\07\0", first).is_err());
+    assert!(verify_diagnostic_engine_argv("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\x007\0", first).is_err());
     assert!(first_local_concurrency(&[]).is_err());
     assert!(first_local_concurrency(&[0, 7]).is_err());
     Ok(())

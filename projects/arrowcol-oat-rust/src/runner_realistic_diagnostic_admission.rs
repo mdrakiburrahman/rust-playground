@@ -9,9 +9,14 @@ const DIAGNOSTIC_COLLECTOR_MEMORY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 #[serde(tag = "mode", deny_unknown_fields)]
 enum DiagnosticReference {
     #[serde(rename = "first")]
-    First,
+    First {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arm: Option<BaselineArm>,
+    },
     #[serde(rename = "matched")]
     Matched {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arm: Option<Box<MatchedArm>>,
         kind: String,
         qualification: String,
         profile_sha256: String,
@@ -24,6 +29,30 @@ enum DiagnosticReference {
     },
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BaselineArm {
+    CandidateBaseline,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TreatmentArm {
+    SoftwareMain,
+    #[serde(rename = "cpu-16")]
+    Cpu16,
+    #[serde(rename = "cpu-24")]
+    Cpu24,
+    #[serde(rename = "writer-flush-6")]
+    WriterFlush6,
+    #[serde(rename = "commit-files-64")]
+    CommitFiles64,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatchedArm {
+    name: TreatmentArm,
+    baseline_sha256: String,
+}
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct DiagnosticClientReservation {
@@ -34,7 +63,11 @@ struct DiagnosticClientReservation {
 fn validate_diagnostic_reference(raw: &str, proof: &Value, run_id: &str) -> Result<Value> {
     ensure!(raw.len() <= 16_384, "diagnostic comparison profile is oversized");
     let value = serde_json::from_str::<DiagnosticJson>(raw)?.0;
-    let reference: DiagnosticReference = serde_json::from_value(value)?;
+    let reference: DiagnosticReference = serde_json::from_value(value.clone())?;
+    ensure!(
+        serde_json::to_value(&reference)? == value,
+        "noncanonical diagnostic reference"
+    );
     if let DiagnosticReference::Matched {
         kind,
         qualification,
@@ -45,6 +78,7 @@ fn validate_diagnostic_reference(raw: &str, proof: &Value, run_id: &str) -> Resu
         collector_memory_limit_bytes,
         kustainer,
         clients,
+        arm,
     } = &reference
     {
         let valid_hash = |hash: &str| {
@@ -66,6 +100,7 @@ fn validate_diagnostic_reference(raw: &str, proof: &Value, run_id: &str) -> Resu
         ensure!(
             kind == "diagnostic-comparison-profile"
                 && qualification == "not-evaluated"
+                && arm.as_ref().is_none_or(|a| valid_hash(&a.baseline_sha256))
                 && valid_hash(profile_sha256)
                 && valid_hash(receipt_sha256)
                 && valid_hash(corpus_sha256)
@@ -94,6 +129,20 @@ fn schedule_after_diagnostic_admission<T>(
     match (raw_reference, proof) {
         (Some(raw), Some(proof)) => {
             let reference = validate_diagnostic_reference(raw, proof, run_id)?;
+            if let Some(arm) = reference.get("arm") {
+                let witness = &proof["arm_contract"];
+                if reference["mode"] == "first" {
+                    ensure!(
+                        witness["name"] == *arm && witness["baseline_sha256"].as_str().is_some_and(|s| s.len() == 64),
+                        "named baseline witness missing"
+                    );
+                } else {
+                    ensure!(
+                        witness["name"] == arm["name"] && witness["baseline_sha256"] == arm["baseline_sha256"],
+                        "named treatment differs from bound baseline"
+                    );
+                }
+            }
             if reference["mode"] == "matched" {
                 ensure!(
                     reference["kustainer"] == proof["kustainer"]
@@ -682,6 +731,45 @@ async fn diagnostic_admission_or_cancel(
         Ok(None) => Ok(None),
         Err(error) => Err(error),
     };
+    let result = match result {
+        Ok(Some(mut proof)) if proof["reference"].get("arm").is_some() => {
+            async {
+                let arm = &proof["reference"]["arm"];
+                let name = arm
+                    .as_str()
+                    .or_else(|| arm["name"].as_str())
+                    .context("missing named arm")?;
+                let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
+                let observed = parity_admission_readback(config, &logs, clients, false)?;
+                ensure!(
+                    proof["cpu_isolation"]["collector"]["container_id"] == logs[0].instance_id,
+                    "collector lifetime changed between CPU and settings readback"
+                );
+                let source = logs[0]
+                    .source_revision
+                    .as_deref()
+                    .context("collector source label unavailable")?;
+                let mut tool = Command::new("node");
+                tool.args(["--import", "tsx", "projects/arrowcol-oat/diagnostic-arm.ts", name]);
+                tool.arg(serde_json::to_string(config)?)
+                    .arg(proof["cpu_isolation"].to_string())
+                    .arg(observed.to_string())
+                    .arg(source);
+                proof["arm_contract"] = serde_json::from_str(
+                    &diagnostic_command(tool, "validate named diagnostic setting and live readback").await?,
+                )?;
+                if proof["reference"]["mode"] == "matched" {
+                    ensure!(
+                        proof["arm_contract"]["baseline_sha256"] == proof["reference"]["arm"]["baseline_sha256"],
+                        "unexpected effective configuration or roster difference"
+                    );
+                }
+                Ok(Some(proof))
+            }
+            .await
+        }
+        rest => rest,
+    };
     match result {
         Ok(Some(proof)) => {
             let label = if pre_schedule {
@@ -864,6 +952,37 @@ mod realistic_diagnostic_admission_tests {
             }],
         });
         let schedule_calls = Cell::new(0);
+        let mut named = exact_reference.clone();
+        named["arm"] = json!({"name":"cpu-16", "baseline_sha256":"d".repeat(64)});
+        proof["reference"] = named.clone();
+        for invalid in [
+            Value::Null,
+            json!({"name":"cpu-24", "baseline_sha256":"d".repeat(64)}),
+            json!({"name":"cpu-16", "baseline_sha256":"e".repeat(64)}),
+        ] {
+            proof["arm_contract"] = invalid;
+            assert!(
+                schedule_after_diagnostic_admission(Some(&named.to_string()), Some(&proof), run, || panic!(
+                    "invalid treatment scheduled"
+                ))
+                .is_err()
+            );
+        }
+        proof["arm_contract"] = named["arm"].clone();
+        schedule_after_diagnostic_admission(Some(&named.to_string()), Some(&proof), run, || ())?;
+        for invalid in [
+            json!({"name":"unlisted", "baseline_sha256":"d".repeat(64)}),
+            json!({"name":"cpu-16", "baseline_sha256":"d".repeat(64), "skip":true}),
+        ] {
+            named["arm"] = invalid;
+            proof["reference"] = named.clone();
+            assert!(
+                schedule_after_diagnostic_admission(Some(&named.to_string()), Some(&proof), run, || panic!(
+                    "invalid manifest scheduled"
+                ))
+                .is_err()
+            );
+        }
         let mut mismatched_reference = exact_reference.clone();
         mismatched_reference["clients"][0]["corpus_memory_reservation_bytes"] = json!(101);
         proof["reference"] = mismatched_reference.clone();
@@ -1201,6 +1320,43 @@ async fn diagnostic_stop_capture(config: &OatConfig, run: &str, phase: &str) {
     }
 }
 
+// An unsuccessful run may have no guard report. Observe the container anyway,
+// before propagating the original error to cleanup.
+async fn finish_client_run(
+    outcome: Result<ClientRun>,
+    capture: impl AsyncFnOnce(Option<&Value>, Option<&Value>),
+) -> Result<ClientRun> {
+    let evidence = outcome.as_ref().ok().map(|r| &r.evidence);
+    capture(
+        evidence.and_then(|e| e.overload_guard.as_ref()),
+        evidence.and_then(|e| e.overload_stop.as_ref()),
+    )
+    .await;
+    outcome
+}
+
+#[tokio::test]
+async fn client_run_error_still_captures_terminal_without_guard() -> Result<()> {
+    let mut captured = false;
+    let original = std::io::Error::other("client failure");
+    let result = finish_client_run(Err(original.into()), async |guard, stop| {
+        assert!(guard.is_none() && stop.is_none());
+        captured = true;
+    })
+    .await;
+    assert!(captured);
+    assert_eq!(
+        result
+            .err()
+            .context("original client error missing")?
+            .downcast::<std::io::Error>()
+            .context("original error type changed")?
+            .to_string(),
+        "client failure"
+    );
+    Ok(())
+}
+
 async fn diagnostic_terminal_memory(
     config: &OatConfig,
     run: &str,
@@ -1212,10 +1368,10 @@ async fn diagnostic_terminal_memory(
 }
 
 #[test]
-fn diagnostic_memory_parser_requires_unique_complete_counters() {
+fn diagnostic_memory_parser_requires_unique_complete_counters() -> Result<()> {
     let keys = ["anon", "file"];
     assert_eq!(
-        diagnostic_memory_fields("anon 5\nfile 7\nother 1\n", &keys).unwrap(),
+        diagnostic_memory_fields("anon 5\nfile 7\nother 1\n", &keys)?,
         json!({"anon":5,"file":7})
     );
     for bad in [
@@ -1226,4 +1382,5 @@ fn diagnostic_memory_parser_requires_unique_complete_counters() {
     ] {
         assert!(diagnostic_memory_fields(bad, &keys).is_err());
     }
+    Ok(())
 }

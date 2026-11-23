@@ -4322,22 +4322,19 @@ async fn run_matrix_cell(
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
-    let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
-    if config
-        .platform
-        .compose_project
-        .as_deref()
-        .is_some_and(|p| p.starts_with("diagnostic-"))
-    {
-        let memory = diagnostic_terminal_memory(
-            config,
-            run_id,
-            client_run.evidence.overload_guard.as_ref(),
-            client_run.evidence.overload_stop.as_ref(),
-        )
-        .await;
-        println!("[oat] diagnostic terminal memory: {memory}");
-    }
+    let outcome = run_clients(config, run_id, &assigned_tables, platform, replicas).await;
+    let mut client_run = finish_client_run(outcome, async |guard, stop| {
+        if config
+            .platform
+            .compose_project
+            .as_deref()
+            .is_some_and(|p| p.starts_with("diagnostic-"))
+        {
+            let memory = diagnostic_terminal_memory(config, run_id, guard, stop).await;
+            println!("[oat] diagnostic terminal memory: {memory}");
+        }
+    })
+    .await?;
     let diagnostics_root = Path::new("out/arrowcol-oat/admission-diagnostics");
     if let Err(error) = platform.finish_resource_measurement(config).await {
         retain_admission_diagnostics(
