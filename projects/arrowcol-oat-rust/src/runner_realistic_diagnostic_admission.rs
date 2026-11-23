@@ -1,8 +1,96 @@
 const DIAGNOSTIC_CORPUS_ENV: &str = "OAT_DIAGNOSTIC_CORPUS_SHA256";
 const DIAGNOSTIC_CLIENT_CPUS_ENV: &str = "OAT_DIAGNOSTIC_CLIENT_CPUS";
+const DIAGNOSTIC_REFERENCE_ENV: &str = "OAT_DIAGNOSTIC_REFERENCE";
 const DIAGNOSTIC_LIVE_BATCH_BYTES: u64 = 152_920_064;
 const DIAGNOSTIC_CLIENT_MEMORY_BYTES: u64 = 5_368_709_120;
 const DIAGNOSTIC_COLLECTOR_MEMORY_BYTES: u64 = 86 * 1024 * 1024 * 1024;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "mode", deny_unknown_fields)]
+enum DiagnosticReference {
+    #[serde(rename = "first")]
+    First,
+    #[serde(rename = "matched")]
+    Matched {
+        kind: String,
+        qualification: String,
+        profile_sha256: String,
+        receipt_sha256: String,
+        run_id: String,
+        corpus_sha256: String,
+        clients: Vec<DiagnosticClientReservation>,
+    },
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticClientReservation {
+    logical_client_id: String,
+    corpus_memory_reservation_bytes: u64,
+}
+
+fn validate_diagnostic_reference(raw: &str, proof: &Value, run_id: &str) -> Result<Value> {
+    ensure!(raw.len() <= 16_384, "diagnostic comparison profile is oversized");
+    let value = serde_json::from_str::<DiagnosticJson>(raw)?.0;
+    let reference: DiagnosticReference = serde_json::from_value(value)?;
+    if let DiagnosticReference::Matched {
+        kind,
+        qualification,
+        profile_sha256,
+        receipt_sha256,
+        run_id: reference_run_id,
+        corpus_sha256,
+        clients,
+    } = &reference
+    {
+        let valid_hash = |hash: &str| {
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let mapping = proof.get("client_mapping").context("missing diagnostic client mapping")?;
+        let logical_client_id = format!(
+            "{}:{}",
+            mapping["table"].as_str().context("missing diagnostic table")?,
+            mapping["client_ordinal"].as_u64().context("missing diagnostic client ordinal")?
+        );
+        ensure!(
+            kind == "diagnostic-comparison-profile"
+                && qualification == "not-evaluated"
+                && valid_hash(profile_sha256)
+                && valid_hash(receipt_sha256)
+                && valid_hash(corpus_sha256)
+                && uuid::Uuid::parse_str(reference_run_id)?.to_string() == *reference_run_id
+                && reference_run_id != run_id
+                && corpus_sha256 == proof["payload_corpus_sha256"].as_str().unwrap_or_default()
+                && clients.len() == 1
+                && clients[0].logical_client_id == logical_client_id
+                && clients[0].corpus_memory_reservation_bytes > 0
+                && proof["corpus_memory_reservation_bytes"].as_u64()
+                    == Some(clients[0].corpus_memory_reservation_bytes),
+            "diagnostic comparison profile differs from the prepared client"
+        );
+    }
+    Ok(serde_json::to_value(reference)?)
+}
+
+fn schedule_after_diagnostic_admission<T>(
+    raw_reference: Option<&str>,
+    proof: Option<&Value>,
+    run_id: &str,
+    schedule: impl FnOnce() -> T,
+) -> Result<T> {
+    match (raw_reference, proof) {
+        (Some(raw), Some(proof)) => {
+            let reference = validate_diagnostic_reference(raw, proof, run_id)?;
+            ensure!(
+                proof.get("reference") == Some(&reference),
+                "diagnostic schedule proof differs from its frozen comparison profile"
+            );
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("diagnostic schedule proof and reference must be present together"),
+    }
+    Ok(schedule())
+}
 
 fn diagnostic_host_memory_admission(meminfo: &str, collector_cap: Option<u64>) -> Result<Value> {
     let read = |name: &str| -> Result<u64> {
@@ -451,6 +539,7 @@ fn validate_diagnostic_live_fleet(
     clients: &[ClientProgress],
     run_id: &str,
     expected: &str,
+    raw_reference: &str,
 ) -> Result<Value> {
     ensure!(
         config.platform.kind == crate::config::OatMode::Local
@@ -474,7 +563,14 @@ fn validate_diagnostic_live_fleet(
         "diagnostic client handle differs from the active run and table"
     );
     let expected_client_id = format!("oat-{run_id}-{}-c1", config.tables[0]);
-    validate_diagnostic_prepared_metrics(&client.output, expected, &expected_client_id)
+    let mut proof = validate_diagnostic_prepared_metrics(&client.output, expected, &expected_client_id)?;
+    proof["client_mapping"] = json!({
+        "table": config.tables[0],
+        "client_ordinal": 1,
+        "client_id": expected_client_id,
+    });
+    proof["reference"] = validate_diagnostic_reference(raw_reference, &proof, run_id)?;
+    Ok(proof)
 }
 
 async fn diagnostic_admission_or_cancel(
@@ -484,7 +580,7 @@ async fn diagnostic_admission_or_cancel(
     clients: &[ClientProgress],
     run_id: &str,
     pre_schedule: bool,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     let result = (|| {
         let Some(expected) = diagnostic_expected_pin(
             config.platform.compose_project.as_deref(),
@@ -494,7 +590,8 @@ async fn diagnostic_admission_or_cancel(
             return Ok(None);
         };
         require_diagnostic_parity_precheck(std::env::var("OAT_DARWIN_PARITY_PRECHECK"))?;
-        validate_diagnostic_live_fleet(config, handles, clients, run_id, &expected)
+        let reference = std::env::var(DIAGNOSTIC_REFERENCE_ENV).context("diagnostic reference is missing")?;
+        validate_diagnostic_live_fleet(config, handles, clients, run_id, &expected, &reference)
             .map(|proof| Some((proof, run_id.to_owned())))
     })();
     let result = match result {
@@ -513,9 +610,9 @@ async fn diagnostic_admission_or_cancel(
                 "diagnostic admission"
             };
             println!("[oat] {label}: {proof}");
-            Ok(())
+            Ok(Some(proof))
         }
-        Ok(None) => Ok(()),
+        Ok(None) => Ok(None),
         Err(error) => {
             let cleanup = cancel_clients(platform, config, handles).await;
             match cleanup {
@@ -533,13 +630,13 @@ async fn diagnostic_recheck_or_cancel(
     platform: &mut dyn Platform,
     handles: &[ClientHandle],
     run_id: &str,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     let enabled = diagnostic_expected_pin(
         config.platform.compose_project.as_deref(),
         std::env::var(DIAGNOSTIC_CORPUS_ENV),
     );
     match enabled {
-        Ok(None) => Ok(()),
+        Ok(None) => Ok(None),
         Ok(Some(_)) => match poll_clients(platform, config, handles).await {
             Ok(clients) => diagnostic_admission_or_cancel(config, platform, handles, &clients, run_id, true).await,
             Err(error) => match cancel_clients(platform, config, handles).await {
@@ -656,6 +753,59 @@ mod realistic_diagnostic_admission_tests {
     }
 
     #[test]
+    fn schedule_callback_is_gated_by_each_clients_frozen_reservation() -> Result<()> {
+        use std::cell::Cell;
+
+        let run = "00000000-0000-4000-8000-000000000001";
+        let reference_run = "00000000-0000-4000-8000-000000000002";
+        let corpus = "a".repeat(64);
+        let client_id = format!("oat-{run}-sqlserver_availability_replica_states-c1");
+        let mut proof = validate_diagnostic_prepared_metrics(&output(&prepared()), &corpus, &client_id)?;
+        proof["client_mapping"] = json!({
+            "table": "sqlserver_availability_replica_states",
+            "client_ordinal": 1,
+            "client_id": client_id,
+        });
+        let exact_reference = json!({
+            "mode": "matched",
+            "kind": "diagnostic-comparison-profile",
+            "qualification": "not-evaluated",
+            "profile_sha256": "b".repeat(64),
+            "receipt_sha256": "c".repeat(64),
+            "run_id": reference_run,
+            "corpus_sha256": corpus,
+            "clients": [{
+                "logical_client_id": "sqlserver_availability_replica_states:1",
+                "corpus_memory_reservation_bytes": 100,
+            }],
+        });
+        let schedule_calls = Cell::new(0);
+        let mut mismatched_reference = exact_reference.clone();
+        mismatched_reference["clients"][0]["corpus_memory_reservation_bytes"] = json!(101);
+        proof["reference"] = mismatched_reference.clone();
+        assert!(
+            schedule_after_diagnostic_admission(
+                Some(&mismatched_reference.to_string()),
+                Some(&proof),
+                run,
+                || schedule_calls.set(schedule_calls.get() + 1),
+            )
+            .is_err()
+        );
+        assert_eq!(schedule_calls.get(), 0, "a one-byte mismatch must not enter the schedule callback");
+
+        proof["reference"] = exact_reference.clone();
+        schedule_after_diagnostic_admission(
+            Some(&exact_reference.to_string()),
+            Some(&proof),
+            run,
+            || schedule_calls.set(schedule_calls.get() + 1),
+        )?;
+        assert_eq!(schedule_calls.get(), 1, "an exact per-client match must enter the schedule callback");
+        Ok(())
+    }
+
+    #[test]
     fn live_fleet_requires_exact_run_owned_waiting_client() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -684,18 +834,25 @@ mod realistic_diagnostic_admission_tests {
                 std::slice::from_ref(&handle),
                 std::slice::from_ref(&client),
                 run,
-                &pin
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_ok()
         );
-        assert!(validate_diagnostic_live_fleet(&config, &[], std::slice::from_ref(&client), run, &pin).is_err());
+        assert!(
+            validate_diagnostic_live_fleet(
+                &config, &[], std::slice::from_ref(&client), run, &pin, r#"{"mode":"first"}"#
+            )
+            .is_err()
+        );
         assert!(
             validate_diagnostic_live_fleet(
                 &config,
                 &[handle.clone(), handle.clone()],
                 std::slice::from_ref(&client),
                 run,
-                &pin
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_err()
         );
@@ -705,7 +862,8 @@ mod realistic_diagnostic_admission_tests {
                 std::slice::from_ref(&handle),
                 &[client.clone(), client.clone()],
                 run,
-                &pin
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_err()
         );
@@ -715,19 +873,35 @@ mod realistic_diagnostic_admission_tests {
                 std::slice::from_ref(&handle),
                 std::slice::from_ref(&client),
                 "00000000-0000-4000-8000-000000000002",
-                &pin
+                &pin,
+                r#"{"mode":"first"}"#
             )
             .is_err()
         );
         let mut wrong = client.clone();
         wrong.schedule_received = true;
-        assert!(validate_diagnostic_live_fleet(&config, std::slice::from_ref(&handle), &[wrong], run, &pin).is_err());
+        assert!(
+            validate_diagnostic_live_fleet(
+                &config, std::slice::from_ref(&handle), &[wrong], run, &pin, r#"{"mode":"first"}"#
+            )
+            .is_err()
+        );
         let mut wrong = client.clone();
         wrong.failure = Some("failed".into());
-        assert!(validate_diagnostic_live_fleet(&config, std::slice::from_ref(&handle), &[wrong], run, &pin).is_err());
+        assert!(
+            validate_diagnostic_live_fleet(
+                &config, std::slice::from_ref(&handle), &[wrong], run, &pin, r#"{"mode":"first"}"#
+            )
+            .is_err()
+        );
         let mut wrong = client.clone();
         wrong.output.clear();
-        assert!(validate_diagnostic_live_fleet(&config, &[handle], &[wrong], run, &pin).is_err());
+        assert!(
+            validate_diagnostic_live_fleet(
+                &config, &[handle], &[wrong], run, &pin, r#"{"mode":"first"}"#
+            )
+            .is_err()
+        );
         Ok(())
     }
 
