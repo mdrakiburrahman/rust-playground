@@ -4675,6 +4675,7 @@ mod tests {
         options.value_variation = Some(ValueVariation::PerRow);
         let per_row = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
         assert_ne!(cardinal.column_by_name("value"), per_row.column_by_name("value"));
+        assert_ne!(repeated.column_by_name("value"), per_row.column_by_name("value"));
         options.seed = options.seed.wrapping_add(1);
         let other_seed = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
         assert_ne!(per_row.column_by_name("value"), other_seed.column_by_name("value"));
