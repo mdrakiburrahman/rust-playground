@@ -7140,7 +7140,7 @@ fn run_table_initializer_cloud_env(config: &OatConfig, platform: &AksPlatform, r
     if url.scheme() != "abfss" || url.host_str() != Some(format!("{account}.dfs.core.windows.net").as_str()) {
         bail!("run-table initializer Delta account does not match the validated Azure stamp");
     }
-    Ok(json!([
+    let mut environment = json!([
         { "name": "ARROWCOL_DELTA_ROOT", "value": root },
         { "name": "ARROWCOL_AZURE_MODE", "value": "stamped" },
         { "name": "AZURE_SUBSCRIPTION_ID", "value": subscription },
@@ -7149,7 +7149,16 @@ fn run_table_initializer_cloud_env(config: &OatConfig, platform: &AksPlatform, r
         { "name": "AZURE_STORAGE_ACCOUNT", "value": account },
         { "name": "AZURE_STORAGE_CHECKPOINT_CONTAINER", "value": "checkpoints" },
         { "name": "ARROWCOL_RESET_GENERATION", "valueFrom": { "secretKeyRef": { "name": "arrowcol-generation", "key": "generation" } } },
-    ]))
+    ]);
+    if let Some(value) =
+        role_environment(config, ComponentRole::Collector)?.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+    {
+        environment
+            .as_array_mut()
+            .context("initializer environment must be an array")?
+            .push(json!({"name": "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS", "value": value}));
+    }
+    Ok(environment)
 }
 
 fn created_pin_init_job_uid(output: &str, namespace: &str, job_name: &str, run_id: &str) -> Result<String> {

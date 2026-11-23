@@ -538,7 +538,7 @@ fn verify_process_configuration_recording(
         verify_maintenance_controls(config, observed)?;
     }
     for (name, expected) in role_environment(config, role)? {
-        if name.starts_with("ARROWCOL_WAL_") {
+        if name.starts_with("ARROWCOL_WAL_") || name == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS" {
             continue;
         }
         let mut expected = serde_json::from_str::<Value>(&expected).unwrap_or(Value::String(expected));
@@ -763,6 +763,47 @@ fn parquet_column_options_readback(value: &Value) -> Option<Value> {
     Some(value.clone())
 }
 
+fn collector_delta_stats_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
+    let tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let environment = role_environment(config, ComponentRole::Collector)?;
+    let requested = environment.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+        .map(|value| serde_json::from_str::<Vec<String>>(value)).transpose()?;
+    let mut records = Vec::new();
+    for line in text.lines().filter_map(|line| line.strip_prefix("arrowcol_delta_stats_config ")) {
+        let value: Value = serde_json::from_str(line).context("invalid collector.commit.delta_stats_columns readback")?;
+        let table = value["table_name"].as_str().context("Delta stats omitted table identity")?;
+        if !tables.contains(table) {
+            continue;
+        }
+        ensure!(value["scope"] == "committed_table_metadata", "Delta stats readback is not committed metadata");
+        ensure!(value["table_id"].as_str().is_some_and(|id| !id.is_empty()), "Delta stats omitted committed table id");
+        ensure!(value["version"].as_u64().is_some(), "Delta stats omitted committed version");
+        let properties = value["properties"].as_object().context("Delta stats omitted committed properties")?;
+        ensure!(properties.iter().all(|(name, value)| {
+            matches!(name.as_str(), "delta.dataSkippingStatsColumns" | "delta.dataSkippingNumIndexedCols") && value.is_string()
+        }), "invalid committed Delta stats properties");
+        if let Some(columns) = &requested {
+            ensure!(delta_stats_properties_match(columns, &value["properties"]),
+                "collector.commit.delta_stats_columns differs from committed table metadata");
+        }
+        if !records.contains(&value) {
+            ensure!(records.len() < 256, "Delta stats metadata evidence exceeded its bound");
+            records.push(value);
+        }
+    }
+    Ok(records)
+}
+
+fn delta_stats_properties_match(columns: &[String], properties: &Value) -> bool {
+    if columns.is_empty() {
+        properties["delta.dataSkippingNumIndexedCols"] == "0"
+            && properties.get("delta.dataSkippingStatsColumns").is_none()
+    } else {
+        properties["delta.dataSkippingStatsColumns"] == columns.join(",")
+    }
+}
+
 fn collector_adaptive_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
     let tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
@@ -972,6 +1013,11 @@ fn process_evidence_for_cell(
             } else {
                 None
             };
+            let stats_tables = if matches!(role, ComponentRole::Collector) {
+                Some(collector_delta_stats_records(config, &log.text)?)
+            } else {
+                None
+            };
             let mut effective = resolved;
             let fields = effective
                 .as_object_mut()
@@ -1007,6 +1053,7 @@ fn process_evidence_for_cell(
                 "maintenance_operation_outcomes": maintenance_outcomes,
                 "layout_table_policies": layout_tables,
                 "adaptive_table_policies": adaptive_tables,
+                "delta_stats_table_metadata": stats_tables,
                 "layout_policy_scope": "startup_process_policy_only_table_properties_and_parquet_overlays_may_override",
             }));
         }
@@ -1035,6 +1082,22 @@ fn process_evidence_for_cell(
             if !identities.contains_key(canonical_dmv_table_name(table)?.as_str()) {
                 bail!("configured collector layout has no matching table-effective file-construction evidence");
             }
+        }
+    }
+    if role_environment(config, ComponentRole::Collector)?.contains_key("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS") {
+        let mut identities = std::collections::BTreeMap::new();
+        for process in &result {
+            for record in process["delta_stats_table_metadata"].as_array().into_iter().flatten() {
+                let table = record["table_name"].as_str().context("Delta stats table name missing")?;
+                let id = record["table_id"].as_str().context("Delta stats table id missing")?;
+                ensure!(identities.insert(table, id).is_none_or(|previous| previous == id),
+                    "Delta stats table identity is ambiguous across processes");
+                ensure!(process["log_complete"] == true, "Delta stats metadata log is incomplete");
+            }
+        }
+        for table in &config.tables {
+            ensure!(identities.contains_key(canonical_dmv_table_name(table)?.as_str()),
+                "collector.commit.delta_stats_columns has no matching committed table metadata readback");
         }
     }
     Ok(json!(result))
@@ -1499,6 +1562,56 @@ async fn aks_process_logs_for_role(config: &OatConfig, role_filter: Option<Compo
 #[cfg(test)]
 mod startup_readback_tests {
     use super::*;
+
+    #[test]
+    fn delta_stats_promotion_requires_committed_metadata_for_every_table() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.push("sqlserver_availability_replica_states".to_owned());
+        for columns in [json!([]), json!(["replica_id"])] {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "collector": {"commit": {"delta_stats_columns": columns}}
+            }))?;
+            let properties = if columns.as_array().context("columns array")?.is_empty() {
+                json!({"delta.dataSkippingNumIndexedCols": "0"})
+            } else {
+                json!({"delta.dataSkippingStatsColumns": "replica_id"})
+            };
+            let log = config.tables.iter().map(|table| Ok(format!("arrowcol_delta_stats_config {}\n", json!({
+                "scope":"committed_table_metadata", "table_name":canonical_dmv_table_name(table)?,
+                "table_id":format!("{}-id", table), "version":0, "properties":properties
+            })))).collect::<Result<String>>()?;
+            let records = collector_delta_stats_records(&config, &log)?;
+            let process = json!({"component":"collector", "instance_id":"one", "log_complete":true,
+                "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+                "effective_config":{}, "delta_stats_table_metadata":records});
+            let initial = tunable_leaf_evidence(&config)?;
+            let mut complete = initial.clone();
+            promote_collector_readback(&config, &mut complete, Some(&json!([process.clone()])), 1)?;
+            assert!(complete["consumer_verified"].as_array().context("verified fields")?.iter()
+                .any(|entry| entry["path"] == "collector.commit.delta_stats_columns"
+                    && entry["reason"] == "committed_table_metadata_readback"));
+            for field in ["properties", "scope", "version", "table_id"] {
+                let mut bad = process.clone();
+                bad["delta_stats_table_metadata"][1][field] = Value::Null;
+                let mut evidence = initial.clone();
+                promote_collector_readback(&config, &mut evidence, Some(&json!([bad])), 1)?;
+                assert_eq!(evidence, initial, "{field}");
+            }
+            let mut missing = process.clone();
+            missing["delta_stats_table_metadata"].as_array_mut().context("metadata array")?.pop();
+            let mut evidence = initial.clone();
+            promote_collector_readback(&config, &mut evidence, Some(&json!([missing])), 1)?;
+            assert_eq!(evidence, initial);
+            let bad = json!({"scope":"committed_table_metadata",
+                "table_name":canonical_dmv_table_name(&config.tables[0])?,
+                "table_id":"id", "version":0,
+                "properties":{"delta.dataSkippingStatsColumns":"wrong"}});
+            assert!(collector_delta_stats_records(&config, &format!("arrowcol_delta_stats_config {bad}\n")).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn adaptive_policy_requires_matching_installed_readback_for_every_table() -> Result<()> {

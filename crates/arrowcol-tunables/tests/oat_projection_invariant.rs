@@ -326,6 +326,9 @@ fn fixture(path: &str, value: Value) -> Value {
 }
 
 fn candidates(path: &str) -> Vec<Value> {
+    if path == "collector.commit.delta_stats_columns" {
+        return vec![json!(["customer_id", "timestamp"])];
+    }
     if path == "arrow_ipc.alignment" {
         return vec![json!(8)];
     }
@@ -406,6 +409,14 @@ fn scalar(value: &Value) -> String {
 }
 
 fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Option<String>, String)> {
+    if path == "collector.commit.delta_stats_columns" {
+        return Ok((
+            ComponentRole::Collector,
+            "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS".to_owned(),
+            None,
+            value.to_string(),
+        ));
+    }
     let parts: Vec<_> = path.split('.').collect();
     let (role, key, pointer) = match parts[0] {
         "client" | "transport" => (

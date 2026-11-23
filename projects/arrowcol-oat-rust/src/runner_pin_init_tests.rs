@@ -96,6 +96,26 @@ mod pin_init_tests {
     }
 
     #[test]
+    fn fresh_initializer_receives_only_explicit_delta_stats_selection() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (mut config, platform, _) = fixture(root.path())?;
+        let absent = run_table_initializer_cloud_env(&config, &platform, RUN)?;
+        assert!(!absent.as_array().context("initializer environment")?.iter()
+            .any(|entry| entry["name"] == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS"));
+        for columns in [json!([]), json!(["replica_id"])] {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "collector": {"commit": {"delta_stats_columns": columns}}
+            }))?;
+            let actual = run_table_initializer_cloud_env(&config, &platform, RUN)?;
+            let field = actual.as_array().context("initializer environment")?.iter()
+                .find(|entry| entry["name"] == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+                .context("missing creation-time stats policy")?;
+            assert_eq!(field["value"], columns.to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn emitted_pin_init_environment_passes_real_ownership_gate() -> Result<()> {
         let root = std::env::temp_dir().join(format!("pin-env-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root)?;
