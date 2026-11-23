@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { CLIENT_MEMORY, COLLECTOR_MEMORY, diagnosticPaths, realisticDiagnosticConfig } from "./realistic-diagnostic-config.js";
@@ -188,6 +189,7 @@ test("freezes a non-circular first-arm profile and binds its per-client reservat
   ));
   const mismatch = structuredClone(later.diagnostic_admission);
   mismatch.corpus_memory_reservation_bytes = 101;
+  mismatch.startup_accounting.clients[0]!.corpus_memory_reservation_bytes = 101;
   assert.throws(() => validateDiagnosticReferenceProof([mismatch], matchedReference));
 });
 
@@ -254,7 +256,7 @@ test("requires distinct, normalized run-owned diagnostic paths", () => {
 test("requires a single diagnostic hook between readiness and parity precheck", () => {
   const include = 'include!("runner_realistic_diagnostic_admission.rs");';
   const ready = "let ready_clients = loop {";
-  const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
+  const hook = "let _ = diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
   const recheck = "let schedule_admission = diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
   const memoryHook = "diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;";
   const scheduleGate = "schedule_after_diagnostic_admission(";
@@ -373,9 +375,11 @@ test("requires configured, effective and physically disjoint CPU allocations", (
 
 test("launch environment passes the required pin and parity precheck without inheriting overrides", () => {
   const pin = "a".repeat(64);
-  const env = diagnosticLaunchEnv("/run/home", 8 * 1024 * 1024, "/run/tools", pin, [8, 9]);
+  const reference = { mode: "first" as const };
+  const env = diagnosticLaunchEnv("/run/home", 8 * 1024 * 1024, "/run/tools", pin, [8, 9], reference);
   assert.equal(env.OAT_DIAGNOSTIC_CORPUS_SHA256, pin);
   assert.equal(env.OAT_DARWIN_PARITY_PRECHECK, "1");
   assert.equal(env.OAT_DIAGNOSTIC_CLIENT_CPUS, "8,9");
-  assert.throws(() => diagnosticLaunchEnv("/run/home", 8 * 1024 * 1024, "/run/tools", "bad", [8, 9]));
+  assert.equal(env.OAT_DIAGNOSTIC_REFERENCE, JSON.stringify(reference));
+  assert.throws(() => diagnosticLaunchEnv("/run/home", 8 * 1024 * 1024, "/run/tools", "bad", [8, 9], reference));
 });
