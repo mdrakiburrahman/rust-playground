@@ -87,7 +87,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     await writeResult(evidence);
     await writeFile(receiptPath, JSON.stringify(receipt));
     await writeFile(markerPath, JSON.stringify(marker));
-    await writeFile(logPath, `${run} ${project} ${startupError}\n[oat] Preserving OAT server for unresolved run receipt ${invocation}`);
+    await writeFile(logPath, `${run} ${project} ${startupError}\n[oat] Preserving OAT server for unresolved run receipt ${receiptPath}`);
     const files = [receiptPath, markerPath, resultPath, logPath];
     const original = await Promise.all(files.map(file => readFile(file)));
     const pins = {

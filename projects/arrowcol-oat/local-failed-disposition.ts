@@ -199,7 +199,7 @@ async function inspect(
       (preload && (!status.error.includes('prepare isolated OAT matrix-cell platform') ||
         !status.error.includes('start remaining local OAT stack failed') ||
         !status.error.includes(startupFailure) || !log.includes(startupFailure) ||
-        !log.includes(`[oat] Preserving OAT server for unresolved run receipt ${invocation}`)))) {
+        !log.includes(`[oat] Preserving OAT server for unresolved run receipt ${receiptPath}`)))) {
     throw new Error('Run log does not bind the failure and cell');
   }
   const stateInfo = await lstat(stateRoot);
