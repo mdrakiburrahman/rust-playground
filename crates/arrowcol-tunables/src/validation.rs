@@ -751,10 +751,8 @@ impl Tunables {
         oat_collector_defaults: bool,
     ) -> Result<()> {
         if let Some(client) = &self.client {
-            if client.identity_builder == Some(ClientIdentityBuilder::DirectUtf8)
-                && client.data_profile != Some(ClientDataProfile::Realistic)
-            {
-                bail!("client.identity_builder=direct_utf8 requires client.data_profile=realistic");
+            if client.identity_builder.is_some() && client.data_profile != Some(ClientDataProfile::Realistic) {
+                bail!("client.identity_builder requires client.data_profile=realistic");
             }
             if client
                 .payload_customer_id
@@ -3660,6 +3658,7 @@ mod tests {
         for value in [
             serde_json::json!({"client":{"identity_builder":"unknown"}}),
             serde_json::json!({"client":{"identity_builder":"direct_utf8"}}),
+            serde_json::json!({"client":{"identity_builder":"formatted_rows","data_profile":"diagnostic"}}),
         ] {
             let Err(error) = Tunables::parse_oat_json(value) else {
                 bail!("invalid identity builder must fail");
