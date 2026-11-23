@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "codegen_units": option_env!("COLLECTOR_BUILD_CODEGEN_UNITS").and_then(|value| value.parse::<u16>().ok()).unwrap_or(16),
             "opt_level": option_env!("COLLECTOR_BUILD_OPT_LEVEL").and_then(|value| value.parse::<u8>().ok()).unwrap_or(3),
             "target_cpu": option_env!("COLLECTOR_BUILD_TARGET_CPU").unwrap_or("generic"),
+            "source_revision": option_env!("COLLECTOR_BUILD_SOURCE_REVISION"),
             "log_filter": std::env::var("RUST_LOG").ok(),
         }
     });

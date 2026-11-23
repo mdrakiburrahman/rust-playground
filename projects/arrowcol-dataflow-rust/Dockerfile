@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 ARG PROFILE_HASH=65f0a48e5711a4fb91141fc590b170e6b614798bb14e6f952dd440c3be547108
+ARG VCS_REF=local
 FROM rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 ARG PROFILE_HASH
+ARG VCS_REF
 ARG BUILD_ALLOCATOR=system
 ARG BUILD_LTO=off
 ARG BUILD_CODEGEN_UNITS=16
@@ -18,9 +20,14 @@ COPY projects /workspace/projects
 COPY submodules/otel-arrow /workspace/submodules/otel-arrow
 RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rust-playground-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=rust-playground-target-${PROFILE_HASH},target=/workspace/target-${PROFILE_HASH},sharing=locked \
+    --mount=type=cache,id=rust-playground-target-${PROFILE_HASH}-${VCS_REF},target=/workspace/target-${PROFILE_HASH}-${VCS_REF},sharing=locked \
     set -eu; \
     case "${BUILD_ALLOCATOR}" in system|mimalloc) ;; *) echo 'invalid BUILD_ALLOCATOR' >&2; exit 2 ;; esac; \
+    case "${VCS_REF}" in \
+      local) ;; \
+      ''|*[!0-9a-f]*) echo 'VCS_REF must be local or a full 40-character lowercase Git revision' >&2; exit 2 ;; \
+      *) [ "${#VCS_REF}" -eq 40 ] || { echo 'VCS_REF must be local or a full 40-character lowercase Git revision' >&2; exit 2; } ;; \
+    esac; \
     case "${BUILD_CODEGEN_UNITS}" in ''|*[!0-9]*) echo 'invalid BUILD_CODEGEN_UNITS' >&2; exit 2 ;; esac; \
     [ "${BUILD_CODEGEN_UNITS}" -ge 1 ] && [ "${BUILD_CODEGEN_UNITS}" -le 256 ] || { echo 'invalid BUILD_CODEGEN_UNITS' >&2; exit 2; }; \
     case "${BUILD_OPT_LEVEL}" in 2|3) ;; *) echo 'invalid BUILD_OPT_LEVEL' >&2; exit 2 ;; esac; \
@@ -28,9 +35,10 @@ RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo
     profile_key="allocator=${BUILD_ALLOCATOR};lto=${BUILD_LTO};codegen_units=${BUILD_CODEGEN_UNITS};opt_level=${BUILD_OPT_LEVEL};target_cpu=${BUILD_TARGET_CPU}"; \
     actual_profile_hash=$(printf '%s' "$profile_key" | sha256sum | cut -d ' ' -f 1); \
     [ "$actual_profile_hash" = "${PROFILE_HASH}" ] || { echo 'PROFILE_HASH does not match build arguments' >&2; exit 2; }; \
-    export CARGO_TARGET_DIR=/workspace/target-${PROFILE_HASH}; \
+    export CARGO_TARGET_DIR=/workspace/target-${PROFILE_HASH}-${VCS_REF}; \
     export COLLECTOR_BUILD_PROFILE_HASH=${PROFILE_HASH} COLLECTOR_BUILD_ALLOCATOR=${BUILD_ALLOCATOR}; \
     export COLLECTOR_BUILD_LTO=${BUILD_LTO} COLLECTOR_BUILD_CODEGEN_UNITS=${BUILD_CODEGEN_UNITS}; \
+    export COLLECTOR_BUILD_SOURCE_REVISION=${VCS_REF}; \
     export COLLECTOR_BUILD_OPT_LEVEL=${BUILD_OPT_LEVEL} COLLECTOR_BUILD_TARGET_CPU=${BUILD_TARGET_CPU}; \
     export ARROWCOL_BUILD_LTO=${BUILD_LTO} ARROWCOL_BUILD_CODEGEN_UNITS=${BUILD_CODEGEN_UNITS}; \
     export ARROWCOL_BUILD_OPT_LEVEL=${BUILD_OPT_LEVEL} ARROWCOL_BUILD_TARGET_CPU=${BUILD_TARGET_CPU}; \

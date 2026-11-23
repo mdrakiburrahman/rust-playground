@@ -1076,6 +1076,7 @@ fn process_evidence_for_cell(
                 bail!("maintenance operation log was truncated; safety outcomes cannot be established");
             }
             let resolved = process_configurations(&log.text)?;
+            let startup_source_revision = resolved.get("source_revision").and_then(Value::as_str).map(str::to_owned);
             verify_collector_build_profile_readback(config, role, &resolved)?;
             verify_process_configuration_recording(config, role, &resolved, diff)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
@@ -1129,6 +1130,7 @@ fn process_evidence_for_cell(
                 "image": log.image,
                 "image_id": log.image_id,
                 "source_revision": log.source_revision,
+                "startup_source_revision": startup_source_revision,
                 "log_complete": log.complete,
             "raw_log_bytes": log.raw_log_bytes,
             "raw_log_lines": log.raw_log_lines,
@@ -1967,6 +1969,44 @@ mod startup_readback_tests {
         let mut wrong = observed.clone();
         wrong["target_cpu"] = json!("generic");
         assert!(verify_collector_build_profile_readback(&config, ComponentRole::Collector, &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn collector_startup_source_revision_is_distinct_from_image_label_and_missing_stays_missing() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let startup_revision = "a".repeat(40);
+        let label_revision = "b".repeat(40);
+        let make_log = |text: String| ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "collector-test".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: Some(label_revision.clone()),
+            complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 1,
+            stdout: text.clone(),
+            stderr: String::new(),
+            text,
+        };
+        let startup = format!("arrowcol_effective_config {}\n", json!({
+            "component": "build",
+            "config": {"source_revision": startup_revision}
+        }));
+        let evidence = process_evidence(&config, &[make_log(startup)])?;
+        let collector = evidence.as_array().context("missing process evidence rows")?
+            .iter().find(|entry| entry["component"] == "collector").context("missing collector evidence")?;
+        assert_eq!(collector["startup_source_revision"], startup_revision);
+        assert_eq!(collector["source_revision"], label_revision);
+
+        let evidence = process_evidence(&config, &[make_log("unrelated startup output\n".to_owned())])?;
+        let collector = evidence.as_array().context("missing process evidence rows")?
+            .iter().find(|entry| entry["component"] == "collector").context("missing collector evidence")?;
+        assert!(collector["startup_source_revision"].is_null());
+        assert_eq!(collector["source_revision"], label_revision);
         Ok(())
     }
 
