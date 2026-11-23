@@ -4462,6 +4462,13 @@ mod tests {
                     .any(|entry| entry["path"] == format!("collector.{field}"))
             );
         }
+        let thin_local = Tunables::parse_oat_json(serde_json::json!({"collector": {"lto": "thin-local"}}))?;
+        let thin_local_profile = thin_local.collector.context("collector profile")?.build_profile();
+        assert_eq!(thin_local_profile.lto.as_str(), "thin-local");
+        assert_eq!(
+            thin_local_profile.canonical_key(),
+            "allocator=system;lto=thin-local;codegen_units=16;opt_level=3;target_cpu=generic"
+        );
         for (field, value) in [
             ("allocator", serde_json::json!("jemalloc")),
             ("allocator", serde_json::json!(false)),

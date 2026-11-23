@@ -31,6 +31,7 @@ RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo
     case "${BUILD_CODEGEN_UNITS}" in ''|*[!0-9]*) echo 'invalid BUILD_CODEGEN_UNITS' >&2; exit 2 ;; esac; \
     [ "${BUILD_CODEGEN_UNITS}" -ge 1 ] && [ "${BUILD_CODEGEN_UNITS}" -le 256 ] || { echo 'invalid BUILD_CODEGEN_UNITS' >&2; exit 2; }; \
     case "${BUILD_OPT_LEVEL}" in 2|3) ;; *) echo 'invalid BUILD_OPT_LEVEL' >&2; exit 2 ;; esac; \
+    case "${BUILD_LTO}" in off|thin-local|thin|fat) ;; *) echo 'invalid BUILD_LTO' >&2; exit 2 ;; esac; \
     case "${BUILD_TARGET_CPU}" in generic|x86-64-v2|x86-64-v3|x86-64-v4) ;; *) echo 'invalid BUILD_TARGET_CPU' >&2; exit 2 ;; esac; \
     profile_key="allocator=${BUILD_ALLOCATOR};lto=${BUILD_LTO};codegen_units=${BUILD_CODEGEN_UNITS};opt_level=${BUILD_OPT_LEVEL};target_cpu=${BUILD_TARGET_CPU}"; \
     actual_profile_hash=$(printf '%s' "$profile_key" | sha256sum | cut -d ' ' -f 1); \
@@ -44,10 +45,10 @@ RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo
     export ARROWCOL_BUILD_OPT_LEVEL=${BUILD_OPT_LEVEL} ARROWCOL_BUILD_TARGET_CPU=${BUILD_TARGET_CPU}; \
     features=''; \
     if [ "${BUILD_ALLOCATOR}" = mimalloc ]; then features='--features allocator-mimalloc'; fi; \
-    if [ "${PROFILE_HASH}" != '65f0a48e5711a4fb91141fc590b170e6b614798bb14e6f952dd440c3be547108' ]; then \
-      case "${BUILD_LTO}" in off) export CARGO_PROFILE_RELEASE_LTO=false ;; thin|fat) export CARGO_PROFILE_RELEASE_LTO=${BUILD_LTO} ;; *) echo 'invalid BUILD_LTO' >&2; exit 2 ;; esac; \
-      export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${BUILD_CODEGEN_UNITS}; \
-      export CARGO_PROFILE_RELEASE_OPT_LEVEL=${BUILD_OPT_LEVEL}; \
+    case "${BUILD_LTO}" in off) export CARGO_PROFILE_RELEASE_LTO=off ;; thin-local) export CARGO_PROFILE_RELEASE_LTO=false ;; thin|fat) export CARGO_PROFILE_RELEASE_LTO=${BUILD_LTO} ;; esac; \
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${BUILD_CODEGEN_UNITS}; \
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL=${BUILD_OPT_LEVEL}; \
+    if [ "${BUILD_TARGET_CPU}" != generic ]; then \
       export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C target-cpu=${BUILD_TARGET_CPU}"; \
     fi; \
     cargo build --locked --release --package arrowcol-dataflow-rust ${features} \

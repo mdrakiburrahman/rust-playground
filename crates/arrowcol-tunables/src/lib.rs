@@ -287,6 +287,8 @@ impl CollectorAllocator {
 pub enum CollectorLto {
     #[default]
     Off,
+    #[serde(rename = "thin-local")]
+    ThinLocal,
     Thin,
     Fat,
 }
@@ -294,6 +296,7 @@ impl CollectorLto {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::ThinLocal => "thin-local",
             Self::Thin => "thin",
             Self::Fat => "fat",
         }
@@ -571,8 +574,9 @@ fn deserialize_collector_lto<'de, D>(d: D) -> Result<Option<CollectorLto>, D::Er
 where
     D: Deserializer<'de>,
 {
-    deserialize_profile_enum(d, "collector.lto", "off, thin or fat", |v| match v {
+    deserialize_profile_enum(d, "collector.lto", "off, thin-local, thin or fat", |v| match v {
         "off" => Some(CollectorLto::Off),
+        "thin-local" => Some(CollectorLto::ThinLocal),
         "thin" => Some(CollectorLto::Thin),
         "fat" => Some(CollectorLto::Fat),
         _ => None,
