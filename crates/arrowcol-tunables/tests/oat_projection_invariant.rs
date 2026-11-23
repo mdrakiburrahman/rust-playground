@@ -298,14 +298,20 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "collector.upload.buffer_capacity_bytes" || path == "collector.upload.request_concurrency" {
         input["collector"] = json!({"upload": {"mode": "buffered_multipart"}});
     }
-    if matches!(path, "collector.layout.sort_options" | "collector.layout.sort_execution") {
+    if matches!(
+        path,
+        "collector.layout.sort_options" | "collector.layout.sort_execution"
+    ) {
         input["collector"] = json!({"layout":{"enabled":true,"sort_columns":["customer_id"]}});
     }
     if path == "maintenance.layout_sort_options" {
         input["maintenance"]["layout_enabled"] = json!(true);
         input["maintenance"]["layout_sort_columns"] = json!(["customer_id"]);
     }
-    if matches!(path, "maintenance.optimize_upload_buffer_bytes" | "maintenance.optimize_upload_concurrency") {
+    if matches!(
+        path,
+        "maintenance.optimize_upload_buffer_bytes" | "maintenance.optimize_upload_concurrency"
+    ) {
         input["maintenance"]["optimize_upload_mode"] = json!("buffered_multipart");
     }
     if path.ends_with(".compression_level") {
@@ -885,7 +891,13 @@ fn partition_grouping_only_accepts_explicit_enum_strings() -> Result<()> {
         json!("TypedRuns"),
         json!("auto"),
     ] {
-        assert!(Tunables::parse_oat_json(json!({"collector":{"runtime":{"partition_grouping":invalid}}})).is_err());
+        let error = Tunables::parse_oat_json(json!({"collector":{"runtime":{"partition_grouping":invalid}}}))
+            .err()
+            .context("invalid partition_grouping unexpectedly parsed")?;
+        assert!(
+            format!("{error:#}").contains("collector.runtime.partition_grouping"),
+            "{error:#}"
+        );
     }
     for mode in ["scalar_map", "typed_runs"] {
         let tunables = Tunables::parse_oat_json(json!({"collector":{"runtime":{"partition_grouping":mode}}}))?;

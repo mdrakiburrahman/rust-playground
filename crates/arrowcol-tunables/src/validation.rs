@@ -1579,7 +1579,8 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
         mode.validate(
             layout.enabled != Some(false),
             layout.sort_columns.as_ref().is_none_or(|keys| !keys.is_empty()),
-        )?;
+        )
+        .context("collector.layout.sort_execution")?;
     }
     if let Some(options) = &layout.sort_options {
         let columns = layout
@@ -2879,12 +2880,26 @@ mod tests {
             serde_json::json!("verify"),
             serde_json::json!([]),
         ] {
-            assert!(Tunables::parse_oat_json(config(bad, empty.clone())).is_err());
+            let error = Tunables::parse_oat_json(config(bad, empty.clone()))
+                .err()
+                .context("invalid sort_execution unexpectedly parsed")?;
+            assert!(
+                format!("{error:#}").contains("collector.layout.sort_execution"),
+                "{error:#}"
+            );
         }
-        assert!(Tunables::parse_oat_json(config(serde_json::json!("verify_order"), empty.clone())).is_err());
-        assert!(
-            Tunables::parse_oat_json(config(serde_json::json!("stream_unordered"), serde_json::json!(["id"]))).is_err()
-        );
+        for (mode, keys) in [
+            (serde_json::json!("verify_order"), empty.clone()),
+            (serde_json::json!("stream_unordered"), serde_json::json!(["id"])),
+        ] {
+            let error = Tunables::parse_oat_json(config(mode, keys))
+                .err()
+                .context("incompatible sort mode unexpectedly parsed")?;
+            assert!(
+                format!("{error:#}").contains("collector.layout.sort_execution"),
+                "{error:#}"
+            );
+        }
         let tunables = Tunables::parse_oat_json(config(serde_json::json!("stream_unordered"), empty))?;
         let name = "ARROWCOL_COLLECTOR_LAYOUT_SORT_EXECUTION";
         assert_eq!(

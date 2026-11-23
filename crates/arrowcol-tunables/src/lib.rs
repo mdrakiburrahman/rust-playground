@@ -433,7 +433,9 @@ where
 fn deserialize_present_partition_grouping<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<PartitionGrouping>, D::Error> {
-    PartitionGrouping::deserialize(deserializer).map(Some)
+    PartitionGrouping::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("collector.runtime.partition_grouping: {error}")))
 }
 
 fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(
@@ -458,7 +460,9 @@ fn deserialize_binding<'de, D: serde::Deserializer<'de>>(
 fn deserialize_present_sort_execution<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<arrow_deltalake::layout::SortExecution>, D::Error> {
-    arrow_deltalake::layout::SortExecution::deserialize(deserializer).map(Some)
+    arrow_deltalake::layout::SortExecution::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("collector.layout.sort_execution: {error}")))
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
