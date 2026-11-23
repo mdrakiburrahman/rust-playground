@@ -584,6 +584,18 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_THP_DISABLED" => "/process/thp_disabled".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
+            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE" => {
+                "/engine/channel_capacity/control_node".to_owned()
+            }
+            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE" => {
+                "/engine/channel_capacity/control_pipeline".to_owned()
+            }
+            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION" => {
+                "/engine/channel_capacity/control_completion".to_owned()
+            }
+            "ARROWCOL_COLLECTOR_CHANNEL_PDATA" => {
+                "/engine/channel_capacity/pdata".to_owned()
+            }
             "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
                 "/engine/shutdown_drain_timeout_seconds".to_owned()
             }
@@ -2338,6 +2350,8 @@ mod consumer_startup_projection_tests {
         };
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector": {
+                "channel_capacity":{"control_node":11,"control_pipeline":12,
+                    "control_completion":13,"pdata":14},
                 "batching":{"coalesce_publications":true,"age_flush_policy":"drain_ready","pipeline_depth":2,
                     "global_capacity":{"bytes":1073741824,"rows":5000000,"batches":2048},
                     "per_table_capacity":{"bytes":268435456,"rows":1000000,"batches":512},
@@ -2373,6 +2387,13 @@ groups:
   isolated:
     pipelines:
       ingest:
+        policies:
+          channel_capacity:
+            control:
+              node: ${{env:ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE:-64}}
+              pipeline: ${{env:ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE:-64}}
+              completion: ${{env:ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION:-512}}
+            pdata: ${{env:ARROWCOL_COLLECTOR_CHANNEL_PDATA:-32}}
         nodes:
           flight:
             type: receiver:arrow_flight
@@ -2454,6 +2475,9 @@ groups:
             assert!(observed["socket_buffer_effective"]["recv_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
             assert!(observed["socket_buffer_effective"]["send_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
         }
+        assert_eq!(observed["engine"]["channel_capacity"], json!({
+            "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
+        }));
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
             "component": "collector", "instance_id": "collector-1", "log_complete": true,
@@ -2464,12 +2488,16 @@ groups:
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
         let verified = covered["consumer_verified"].as_array().context("consumer_verified array")?;
-        assert_eq!(verified.len(), if cfg!(target_os = "linux") { 39 } else { 37 });
+        assert_eq!(verified.len(), if cfg!(target_os = "linux") { 43 } else { 41 });
         for path in [
             "collector.socket.tcp_nodelay",
             "collector.runtime.file_mapping_cache",
             "collector.runtime.partition_grouping",
             "collector.runtime.generated_partition_binding",
+            "collector.channel_capacity.control_node",
+            "collector.channel_capacity.control_pipeline",
+            "collector.channel_capacity.control_completion",
+            "collector.channel_capacity.pdata",
         ] {
             assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
         }

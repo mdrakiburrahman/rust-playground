@@ -331,6 +331,22 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        let channel = match path {
+            "collector.channel_capacity.control_node" => Some(("control_node", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE")),
+            "collector.channel_capacity.control_pipeline" => Some(("control_pipeline", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE")),
+            "collector.channel_capacity.control_completion" => Some(("control_completion", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION")),
+            "collector.channel_capacity.pdata" => Some(("pdata", "ARROWCOL_COLLECTOR_CHANNEL_PDATA")),
+            _ => None,
+        };
+        if let Some((field, variable)) = channel {
+            if environment.contains_key(variable)
+                && collectors.iter().all(|process| process["effective_config"]["engine"]["channel_capacity"].get(field).is_some())
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         let runtime = match path {
             "collector.runtime.timestamp_kernel" => Some(("timestamp_kernel", "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL")),
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
@@ -1391,6 +1407,124 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn collector_channel_capacity_invalid_types_report_field_without_value() -> Result<()> {
+        let mut source = serde_json::to_value(config()?)?;
+        for field in ["control_node", "control_pipeline", "control_completion", "pdata"] {
+            source["tunables"] = json!({"collector":{"channel_capacity":{field:"private-marker"}}});
+            let error = match serde_json::from_value::<OatConfig>(source.clone()) {
+                Ok(_) => bail!("invalid channel capacity accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(&format!("collector.channel_capacity.{field}")), "{error}");
+            assert!(!error.contains("private-marker"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collector_channel_capacity_omission_preserves_profile_defaults() -> Result<()> {
+        const CHILD: &str = "OAT_CHANNEL_DEFAULTS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use otel_arrow_dfe_config::{engine::OtelDataflowSpec, env_substitution::substitute_env_vars};
+            for template in [
+                include_str!("../../arrowcol-dataflow-rust/config.yaml"),
+                include_str!("../../arrowcol-dataflow-rust/config.quiver.yaml"),
+            ] {
+                let parsed = OtelDataflowSpec::from_yaml(&substitute_env_vars(template)?)?;
+                let (_, pipelines, _) = parsed.resolve().into_parts();
+                let [pipeline] = pipelines.as_slice() else { bail!("expected one pipeline"); };
+                let capacity = &pipeline.policies.channel_capacity;
+                assert_eq!((capacity.control.node, capacity.control.pipeline, capacity.control.completion, capacity.pdata),
+                    (64, 64, 512, 32));
+            }
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .env_clear().env(CHILD, "1")
+            .args(["collector_channel_capacity_omission_preserves_profile_defaults", "--nocapture"])
+            .output()?;
+        anyhow::ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "channel defaults subprocess failed: {}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        Ok(())
+    }
+
+    #[test]
+    fn collector_channel_capacity_reaches_profiles_and_readback() -> Result<()> {
+        const CHILD: &str = "OAT_CHANNEL_CAPACITY_CHILD";
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"channel_capacity":{
+                "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
+            }}
+        }))?;
+        config.validate()?;
+        let environment = role_environment(&config, ComponentRole::Collector)?;
+        if std::env::var_os(CHILD).is_some() {
+            use otel_arrow_dfe_config::{engine::OtelDataflowSpec, env_substitution::substitute_env_vars};
+            for template in [
+                include_str!("../../arrowcol-dataflow-rust/config.yaml"),
+                include_str!("../../arrowcol-dataflow-rust/config.quiver.yaml"),
+            ] {
+                let parsed = OtelDataflowSpec::from_yaml(&substitute_env_vars(template)?)?;
+                let (_, pipelines, _) = parsed.resolve().into_parts();
+                let [pipeline] = pipelines.as_slice() else { bail!("expected one pipeline"); };
+                let capacity = &pipeline.policies.channel_capacity;
+                let observed = json!({"engine":{"channel_capacity":{
+                    "control_node":capacity.control.node,"control_pipeline":capacity.control.pipeline,
+                    "control_completion":capacity.control.completion,"pdata":capacity.pdata
+                }}});
+                assert_eq!(observed["engine"]["channel_capacity"], json!({
+                    "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
+                }));
+                verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+                let process = json!({
+                    "component":"collector","instance_id":"one","log_complete":true,
+                    "startup_tunables_verified":true,"effective_config_source":"consumer_startup_readback",
+                    "effective_config":observed
+                });
+                let mut evidence = tunable_leaf_evidence(&config)?;
+                promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
+                assert_eq!(evidence["consumer_verified"].as_array().context("missing verified")?.len(), 4);
+                for field in ["control_node", "control_pipeline", "control_completion", "pdata"] {
+                    for missing in [false, true] {
+                        let mut wrong = process.clone();
+                        if missing {
+                            wrong["effective_config"]["engine"]["channel_capacity"]
+                                .as_object_mut().context("missing capacity")?.remove(field);
+                        } else {
+                            wrong["effective_config"]["engine"]["channel_capacity"][field] = json!(1);
+                        }
+                        let mut evidence = tunable_leaf_evidence(&config)?;
+                        promote_collector_readback(&config, &mut evidence, Some(&json!([wrong])), 1)?;
+                        assert_eq!(evidence["consumer_verified"].as_array().context("missing verified")?.len(), 0);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let compose = compose_tunables(&config)?;
+        for (key, value) in &environment {
+            assert_eq!(compose["services"]["dataflow-1"]["environment"][key], *value);
+        }
+        let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
+        inject_deployment_environment(&mut deployment, "dataflow", &environment)?;
+        let entries = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array().context("missing deployment environment")?;
+        for (key, value) in &environment {
+            assert!(entries.iter().any(|entry| entry["name"] == *key && entry["value"] == *value));
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .env(CHILD, "1").envs(environment)
+            .args(["collector_channel_capacity_reaches_profiles_and_readback", "--nocapture"])
+            .output()?;
+        anyhow::ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "channel capacity subprocess failed: {}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
         Ok(())
     }
 
