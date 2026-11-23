@@ -948,8 +948,8 @@ impl OatConfig {
         {
             bail!("platform.local.collector_memory_limit_bytes must be integer bytes in 8388608..=1099511627776");
         }
-        if let Some(images) = &self.platform.local.expected_image_ids {
-            if !self.platform.local.stable_image_build
+        if let Some(images) = &self.platform.local.expected_image_ids
+            && (!self.platform.local.stable_image_build
                 || images.len() != 6
                 || !["catalog", "client", "collector", "maintenance", "router", "sqlserver"]
                     .iter()
@@ -962,10 +962,9 @@ impl OatConfig {
                                         .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
                             })
                         })
-                    })
-            {
-                bail!("expected local image IDs require six immutable role IDs and a stable image build");
-            }
+                    }))
+        {
+            bail!("expected local image IDs require six immutable role IDs and a stable image build");
         }
         if let Some(image) = &self.platform.local.collector_image_override {
             let valid_hash = |value: &str, len: usize| {
@@ -984,17 +983,16 @@ impl OatConfig {
                 bail!("collector image override requires a stable build, immutable image ID and full source revision");
             }
         }
-        if let Some(cpus) = &self.platform.local.collector_cpus {
-            if !self.platform.local.stable_image_build
+        if let Some(cpus) = &self.platform.local.collector_cpus
+            && (!self.platform.local.stable_image_build
                 || cpus.is_empty()
                 || cpus.iter().any(|cpu| *cpu > 4095)
                 || cpus.windows(2).any(|pair| pair[0] >= pair[1])
-                || self.replica_counts.as_slice() != [1]
-            {
-                bail!(
-                    "collector CPU allocation requires one collector, a stable local build, and an ordered unique CPU list"
-                );
-            }
+                || self.replica_counts.as_slice() != [1])
+        {
+            bail!(
+                "collector CPU allocation requires one collector, a stable local build, and an ordered unique CPU list"
+            );
         }
         if !self.overload_guard.cap_fraction.is_finite()
             || self.overload_guard.cap_fraction <= 0.0

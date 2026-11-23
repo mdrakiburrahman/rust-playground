@@ -1028,7 +1028,7 @@ mod commit_evidence_tests {
         let table = canonical_dmv_table_name(&config.tables[0])?;
         let stopped = stopped_collector_commit_output(&config, &full)?;
         assert_eq!(stopped["source"], "complete_stopped_collector_logs");
-        assert_eq!(stopped["tables"][&table]["commits_by_version"].as_array().unwrap().len(), 2);
+        assert_eq!(stopped["tables"][&table]["commits_by_version"].as_array().context("missing stopped commit receipts")?.len(), 2);
         full.complete = false;
         let incomplete = stopped_collector_commit_output(&config, &full)?;
         assert_eq!(incomplete["source"], "incomplete_stopped_collector_logs");
@@ -1123,7 +1123,7 @@ mod commit_evidence_tests {
         let cumulative = &evidence[&config.tables[0]]["run_cumulative_output"];
         let receipts = cumulative["commits_by_version"].as_array().context("missing cumulative commit receipts")?;
         assert_eq!(receipts.len(), 4);
-        assert_eq!(receipts.iter().map(|receipt| receipt["finished_at_unix_ms"].as_i64().unwrap()).collect::<Vec<_>>(),
+        assert_eq!(receipts.iter().map(|receipt| receipt["finished_at_unix_ms"].as_i64().context("missing finish timestamp")).collect::<Result<Vec<_>>>()?,
             vec![1_000, 31_000, 61_000, 66_000]);
         assert_eq!(cumulative["rows"], 40);
         let mut missing = log(&[]);
