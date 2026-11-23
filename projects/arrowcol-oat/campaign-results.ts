@@ -308,6 +308,10 @@ const proofReasonPaths: Readonly<Record<string, readonly string[]>> = {
     'client.string_length_distribution', 'client.entropy', 'client.cardinality', 'client.seed', 'client.skew',
   ],
   committed_table_metadata_readback: ['collector.commit.delta_stats_columns'],
+  consumer_linux_thp_flag_readback: ['collector.thp_disabled'],
+  consumer_linux_listener_buffer_readback: ['collector.socket.recv_buffer_bytes', 'collector.socket.send_buffer_bytes'],
+  consumer_accepted_socket_readback: ['collector.socket.tcp_nodelay'],
+  consumer_cpu_pool_readback: ['collector.runtime.cpu_thread_stack_size'],
 };
 
 function factorCoverage(row: CampaignMeasurement): FactorCoverage {
@@ -333,7 +337,7 @@ function factorCoverage(row: CampaignMeasurement): FactorCoverage {
         ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled', 'duration_based_run', 'connection_retries_disabled', 'stream_retries_disabled', 'http2_keepalive_disabled', 'adaptive_http2_window', 'tcp_keepalive_disabled', 'rate_limit_disabled', 'no_nullable_generated_columns', 'no_eligible_generated_rows', 'all_values_skewed', 'one_byte_maximum_width']],
         ['projection_only', projected, ['consumer_startup_proof_unverified']],
         ['runner_controls', undefined, ['maintenance_runner_control', 'router_log_filter_inheritance']],
-        ['consumer_verified', undefined, ['consumer_startup_readback', 'consumer_table_writer_readback', 'consumer_table_adaptive_readback', 'consumer_startup_and_prepared_corpus', 'committed_table_metadata_readback']],
+        ['consumer_verified', undefined, ['consumer_startup_readback', 'consumer_table_writer_readback', 'consumer_table_adaptive_readback', 'consumer_startup_and_prepared_corpus', 'committed_table_metadata_readback', 'consumer_linux_thp_flag_readback', 'consumer_linux_listener_buffer_readback', 'consumer_accepted_socket_readback', 'consumer_cpu_pool_readback']],
       ] as const) {
         const entries = evidence[field];
         if (!Array.isArray(entries)) { incomplete = true; continue; }
