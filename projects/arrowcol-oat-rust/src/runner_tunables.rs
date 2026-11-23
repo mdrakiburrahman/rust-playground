@@ -401,6 +401,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.guid_uniqueness") => ("guid_uniqueness", "ARROWCOL_CLIENT_GUID_UNIQUENESS"),
             Some("client.value_variation") => ("value_variation", "ARROWCOL_CLIENT_VALUE_VARIATION"),
             Some("client.string_width") => ("string_width", "ARROWCOL_CLIENT_STRING_WIDTH"),
+            Some("client.string_length_distribution") => ("string_length_distribution", "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -455,15 +456,16 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }
             return true;
         }
-        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width") {
+        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution") {
             let counts = reports.iter().map(|report| {
                 let name = report["table"].as_str()?;
                 let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
                 if tables.len() != 1 || !tables[0]["table"].as_str()?.eq_ignore_ascii_case(name) {
                     return None;
                 }
-                let columns = tables[0].get(field)?.get("eligible_columns")?.as_u64()?;
-                let rows = tables[0].get(field)?.get("eligible_rows")?.as_u64()?;
+                let evidence_field = if field == "string_length_distribution" { "string_width" } else { field };
+                let columns = tables[0].get(evidence_field)?.get("eligible_columns")?.as_u64()?;
+                let rows = tables[0].get(evidence_field)?.get("eligible_rows")?.as_u64()?;
                 Some((columns, rows))
             }).collect::<Option<Vec<_>>>();
             let Some(counts) = counts else { return true; };
@@ -488,13 +490,25 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
                     return true;
                 }
             }
+            if field == "string_length_distribution" {
+                let widths = reports.iter().map(|report| report["consumer_effective_config"]["string_width"].as_u64())
+                    .collect::<Option<Vec<_>>>();
+                let Some(widths) = widths else { return true; };
+                if widths.iter().all(|&width| width == 1) {
+                    inert.push(json!({"path": entry["path"], "reason": "one_byte_maximum_width"}));
+                    return false;
+                }
+                if widths.contains(&1) {
+                    return true;
+                }
+            }
         }
         if !environment.contains_key(variable)
             || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
         {
             return true;
         }
-        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width") {
+        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution") {
             "consumer_startup_and_prepared_corpus"
         } else { "consumer_startup_readback" }}));
         false
