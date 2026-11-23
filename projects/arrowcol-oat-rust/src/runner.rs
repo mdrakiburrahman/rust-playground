@@ -47,6 +47,7 @@ include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
+include!("runner_router_readiness.rs");
 include!("runner_overload.rs");
 include!("runner_admission_diagnostics.rs");
 include!("runner_fixture.rs");
@@ -8320,6 +8321,13 @@ async fn local_compose_endpoint(
             .context("Docker daemon endpoint not resolved")?,
         path,
     )?;
+    if service == "router" && container_port == "50050" {
+        wait_for_local_router(&endpoint, Duration::from_secs(120), || {
+            local_router_state(config, platform)
+        })
+        .await?;
+        return Ok(endpoint);
+    }
     let url = Url::parse(&endpoint)?;
     let host = url
         .host_str()
