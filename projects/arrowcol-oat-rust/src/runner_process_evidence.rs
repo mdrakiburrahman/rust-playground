@@ -760,9 +760,10 @@ fn collector_adaptive_records(config: &OatConfig, text: &str) -> Result<Vec<Valu
     let mut records = Vec::new();
     for line in text.lines().filter_map(|line| line.strip_prefix("arrowcol_adaptive_config ")) {
         let value: Value = serde_json::from_str(line).context("invalid adaptive policy readback")?;
-        let Some(table) = value["table_name"].as_str().filter(|table| tables.contains(*table)) else {
+        let table = value["table_name"].as_str().context("adaptive policy readback omitted table identity")?;
+        if !tables.contains(table) {
             continue;
-        };
+        }
         if value["scope"] != "installed_estimator_not_full_run_history" {
             bail!("invalid adaptive policy readback scope");
         }
@@ -1543,6 +1544,8 @@ mod startup_readback_tests {
         let mut bad = json!({"table_name":canonical_dmv_table_name(&config.tables[0])?,
             "scope":"installed_estimator_not_full_run_history", "config":policy});
         bad["config"]["ewma_weight"] = json!("0.25");
+        assert!(collector_adaptive_records(&config, &format!("arrowcol_adaptive_config {bad}\n")).is_err());
+        bad.as_object_mut().context("event object")?.remove("table_name");
         assert!(collector_adaptive_records(&config, &format!("arrowcol_adaptive_config {bad}\n")).is_err());
         Ok(())
     }
