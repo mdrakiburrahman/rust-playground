@@ -2020,6 +2020,11 @@ export async function main(
   const viewerOnly = args.includes('--viewer-only');
   const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  const prelaunchOnly = args.includes('--diagnostic-prelaunch-only');
+  const diagnosticParity = process.env.OAT_DARWIN_PARITY_PRECHECK === '1';
+  if (prelaunchOnly && (!diagnosticParity || requestedMode === 'aks' || viewerOnly || preflightOnly || cleanupRunId !== undefined)) {
+    throw new OatCliError('Diagnostic prelaunch requires local diagnostic parity and cannot be combined with viewer, preflight, or cleanup options');
+  }
   if (deadlineSeconds !== undefined && (requestedMode === 'aks' || viewerOnly || !noViewer)) {
     throw new OatCliError('--deadline-seconds requires a local benchmark run with --no-viewer');
   }
@@ -2090,13 +2095,19 @@ export async function main(
     config.subscriptionId = subscriptionId;
   }
   const transitionRoot = await diagnosticTransitionReceiptRoot();
-  const prelaunchOnly = args.includes('--diagnostic-prelaunch-only');
-  if (prelaunchOnly && !transitionRoot) throw new OatCliError('Diagnostic prelaunch requires the versioned transition runtime');
   if (transitionRoot) receiptRoot = transitionRoot;
-  await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
-    transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !transitionRoot);
+  if (diagnosticParity && mode === 'local' && !transitionRoot) {
+    const names = await readdir(receiptRoot).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+      throw error;
+    });
+    if (names.length !== 0) throw new Error('Fresh diagnostic requires an empty launcher receipt ledger');
+  } else {
+    await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
+      transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !transitionRoot);
+  }
   if (prelaunchOnly) {
-    console.log('Diagnostic transition ledger prelaunch gate passed; no workload started.');
+    console.log('Diagnostic ledger prelaunch gate passed; no workload started.');
     return;
   }
   const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
