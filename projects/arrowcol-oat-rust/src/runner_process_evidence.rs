@@ -2350,6 +2350,8 @@ mod consumer_startup_projection_tests {
         };
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector": {
+                "shutdown_drain_timeout_seconds":17,
+                "exporter":{"authority_timeout":"4s"},
                 "channel_capacity":{"control_node":11,"control_pipeline":12,
                     "control_completion":13,"pdata":14},
                 "limits":{"batch_channel_capacity":9,"put_result_channel_capacity":19},
@@ -2379,6 +2381,8 @@ mod consumer_startup_projection_tests {
             let admin_port = admin.local_addr()?.port();
             let yaml = format!(r#"
 version: otel_dataflow/v1
+engine:
+  shutdown_drain_timeout_seconds: ${{env:ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS:-60}}
 policies:
   resources:
     core_allocation:
@@ -2480,6 +2484,8 @@ groups:
             "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
         }));
         assert_eq!(observed["limits"]["batch_channel_capacity"], json!(9));
+        assert_eq!(observed["engine"]["shutdown_drain_timeout_seconds"], json!(17));
+        assert_eq!(observed["authority_timeout"], json!("4s"));
         assert_eq!(observed["limits"]["put_result_channel_capacity"], json!(19));
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         let process = json!({
@@ -2511,6 +2517,7 @@ groups:
                 assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
             }
         }
+        assert_eq!(covered["inert_fields"], json!([{"path":"collector.shutdown_drain_timeout_seconds","reason":"collector_shutdown_after_measurement"}]));
         assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
         for field in ["batch_channel_capacity", "put_result_channel_capacity"] {
             for missing in [false, true] {
@@ -2526,6 +2533,13 @@ groups:
             }
         }
         let mut wrong_process = process.clone();
+        for pointer in ["/engine/shutdown_drain_timeout_seconds", "/authority_timeout"] {
+            let mut wrong = process.clone();
+            *wrong["effective_config"].pointer_mut(pointer).context("missing timeout")? = json!("wrong");
+            let mut uncovered = initial.clone();
+            promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong])), 1)?;
+            assert_eq!(uncovered, initial);
+        }
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
         let mut missing_process = process.clone();
         missing_process["effective_config"]["pressure"].as_object_mut().context("pressure object")?.remove("buffered_rows_limit");

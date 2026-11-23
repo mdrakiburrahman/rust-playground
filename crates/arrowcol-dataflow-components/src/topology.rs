@@ -20,12 +20,13 @@ pub fn observe_validated_topology(spec: &OtelDataflowSpec) -> Result<(), &'stati
     STARTUP_TOPOLOGY
         .set(direct_collector(spec))
         .map_err(|_| "collector topology was already observed")?;
+    let mut engine = serde_json::json!({
+        "shutdown_drain_timeout_seconds": spec.engine.shutdown_drain_timeout_seconds.get()
+    });
     if let Some(capacity) = resolved_channel_capacity(spec) {
-        eprintln!(
-            "df_engine_effective_config {}",
-            serde_json::json!({"engine":{"channel_capacity":capacity}})
-        );
+        engine["channel_capacity"] = capacity;
     }
+    eprintln!("df_engine_effective_config {}", serde_json::json!({"engine":engine}));
     Ok(())
 }
 

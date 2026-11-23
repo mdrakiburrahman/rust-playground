@@ -85,7 +85,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "installed_estimator_not_full_run_history"
         });
-    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG", "ARROWCOL_COLLECTOR_LIMITS_CONFIG",
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG", "ARROWCOL_COLLECTOR_LIMITS_CONFIG", "ARROWCOL_COLLECTOR_EXPORTER_CONFIG",
         "ARROWCOL_COLLECTOR_BATCHING_CONFIG"]
         .into_iter()
         .filter_map(|name| environment.get(name).map(|value| (name, value)))
@@ -331,6 +331,18 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if path == "collector.exporter.authority_timeout"
+            && projected.get("ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
+                .and_then(|value| value.get("authority_timeout"))
+                .is_some_and(|value| !value.is_null())
+            && collectors.iter().all(|process| {
+                process["effective_config"]["authority_timeout"].is_string()
+            })
+        {
+            promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+            return false;
+        }
+
         let channel = match path {
             "collector.channel_capacity.control_node" => Some(("control_node", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE")),
             "collector.channel_capacity.control_pipeline" => Some(("control_pipeline", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE")),

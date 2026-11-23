@@ -637,6 +637,8 @@ impl Tunables {
                 (inert, "maintenance_disabled")
             } else if name == "client.max_rows" {
                 (inert, "duration_based_run")
+            } else if name == "collector.shutdown_drain_timeout_seconds" {
+                (inert, "collector_shutdown_after_measurement")
             } else if capability.gate == Some(ApplicabilityGate::ConnectionRetries)
                 && context.connection_retries_disabled
             {

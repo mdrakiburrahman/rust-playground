@@ -314,6 +314,16 @@ fn fixture(path: &str, value: Value) -> Value {
     ) {
         input["maintenance"]["optimize_upload_mode"] = json!("buffered_multipart");
     }
+    if path == "collector.layout.sort_options" {
+        set(
+            &mut input,
+            &["collector", "layout", "sort_columns"],
+            json!(["customer_id"]),
+        );
+    }
+    if path == "maintenance.layout_sort_options" {
+        input["maintenance"]["layout_sort_columns"] = json!(["customer_id"]);
+    }
     if path.ends_with(".compression_level") {
         let mut parent = parts[..parts.len() - 1].to_vec();
         parent.push("compression");
@@ -341,6 +351,12 @@ fn candidates(path: &str) -> Vec<Value> {
     }
     if path == "arrow_ipc.alignment" {
         return vec![json!(8)];
+    }
+    if path == "collector.layout.sort_options" || path == "maintenance.layout_sort_options" {
+        return vec![json!([{"column":"customer_id","direction":"descending","nulls":"first"}])];
+    }
+    if path == "collector.pressure.rss_limit_bytes" {
+        return vec![json!(4_294_967_296_u64)];
     }
     if path.ends_with("sorting_columns") {
         return vec![json!([{ "path": "customer_id", "descending": false, "nulls_first": false }])];
@@ -466,6 +482,11 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
             ),
             None,
         ),
+        "collector" if parts[1] == "channel_capacity" => (
+            ComponentRole::Collector,
+            format!("ARROWCOL_COLLECTOR_CHANNEL_{}", parts[2].to_ascii_uppercase()),
+            None,
+        ),
         "collector" if parts[1] == "runtime" => (
             ComponentRole::Collector,
             format!(
@@ -522,7 +543,9 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
         }
         _ => panic!("unknown typed section {path}"),
     };
-    let expected = if path == "logging.router" {
+    let expected = if path == "collector.layout.sort_options" || path == "maintenance.layout_sort_options" {
+        "customer_id:descending:first".to_owned()
+    } else if path == "logging.router" {
         format!("{},tiberius=error", scalar(value))
     } else if matches!(
         path,
@@ -606,6 +629,22 @@ fn generated_partition_binding_requires_a_named_string_mode() -> Result<()> {
             .context("invalid binding unexpectedly accepted")?;
         assert!(format!("{error:#}").contains("collector.runtime.generated_partition_binding"));
     }
+    Ok(())
+}
+
+#[test]
+fn shutdown_timeout_is_inert_for_the_captured_measurement() -> Result<()> {
+    let tunables = Tunables::parse_oat_json(json!({
+        "collector":{"shutdown_drain_timeout_seconds":17}
+    }))?;
+    let evidence = tunables.classify_oat_leaves()?;
+    assert_eq!(
+        evidence["inert_fields"],
+        json!([{
+            "path": "collector.shutdown_drain_timeout_seconds",
+            "reason": "collector_shutdown_after_measurement"
+        }])
+    );
     Ok(())
 }
 
