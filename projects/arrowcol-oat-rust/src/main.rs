@@ -42,8 +42,16 @@ struct ApiError {
     error: String,
 }
 
-#[tokio::main(worker_stack_size = 8_388_608)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .context("build ArrowCol OAT Tokio runtime")?;
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     if let Some(path) = args.fixture_setup {
         let result = arrowcol_oat_rust::runner::run_fixture_setup(&path, args.fixture_bridge_stdio).await;
