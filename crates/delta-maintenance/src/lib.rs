@@ -93,6 +93,7 @@ pub struct OperationLimits {
     pub purge_max_plan_bytes: usize,
     pub optimize_upload_mode: OptimizeUploadMode,
     pub optimize_upload_buffer_bytes: Option<usize>,
+    pub optimize_upload_concurrency: Option<usize>,
     pub vacuum_delete_chunk: usize,
     pub vacuum_max_plan_bytes: usize,
     pub replay_max_log_files: usize,
@@ -110,6 +111,7 @@ impl Default for OperationLimits {
             purge_max_plan_bytes: 4 * 1024 * 1024,
             optimize_upload_mode: OptimizeUploadMode::PutCreate,
             optimize_upload_buffer_bytes: None,
+            optimize_upload_concurrency: None,
             vacuum_delete_chunk: 256,
             vacuum_max_plan_bytes: 8 * 1024 * 1024,
             replay_max_log_files: 100_000,
@@ -203,6 +205,24 @@ impl Settings {
         if limits.optimize_upload_mode == OptimizeUploadMode::PutCreate && limits.optimize_upload_buffer_bytes.is_some()
         {
             bail!("OPTIMIZE upload buffer applies only to buffered_multipart mode");
+        }
+        if let Some(concurrency) = limits.optimize_upload_concurrency {
+            if limits.optimize_upload_mode != OptimizeUploadMode::BufferedMultipart {
+                bail!("optimize_upload_concurrency requires buffered_multipart mode");
+            }
+            if !(1..=arrow_deltalake::maintenance::MAX_OPTIMIZE_UPLOAD_CONCURRENCY).contains(&concurrency) {
+                bail!("optimize_upload_concurrency must be within 1..=16");
+            }
+            let bytes = limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES);
+            let budget = bytes
+                .checked_mul(concurrency + 1)
+                .and_then(|v| v.checked_mul(self.max_concurrent_tables))
+                .context("optimize_upload_concurrency buffer budget overflow")?;
+            if budget > 536_870_912 {
+                bail!("optimize_upload_concurrency buffer budget exceeds 512 MiB");
+            }
         }
         if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
             let buffer_bytes = limits
@@ -1018,6 +1038,7 @@ fn configuration_evidence(
             "mode": startup.operation_limits.optimize_upload_mode,
             "buffer_bytes_requested": startup.operation_limits.optimize_upload_buffer_bytes,
             "buffer_bytes_effective": optimize_upload_buffer_bytes_effective,
+            "concurrency_effective": if startup.operation_limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart { Some(startup.operation_limits.optimize_upload_concurrency.unwrap_or(1)) } else { None },
         },
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
@@ -1930,6 +1951,7 @@ fn run_operation(
             let config = OptimizeConfig {
                 automatic_layout,
                 automatic_layout_sort_columns_explicit,
+                upload_concurrency: settings.operation_limits.optimize_upload_concurrency.unwrap_or(1),
                 granularity: settings.granularity,
                 now_ms: Some(anchor),
                 min_files_per_bin: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,

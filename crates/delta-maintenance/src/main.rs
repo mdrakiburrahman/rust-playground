@@ -157,6 +157,8 @@ struct Cli {
     /// Buffered upload size for buffered_multipart only (4..=64 MiB).
     #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES")]
     optimize_upload_buffer_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_CONCURRENCY")]
+    optimize_upload_concurrency: Option<usize>,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     max_active_files: usize,
     #[arg(long, env = "ARROWCOL_MAINT_LATEST_PARTITIONS")]
@@ -297,6 +299,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             purge_max_plan_bytes: cli.purge_max_plan_bytes,
             optimize_upload_mode: cli.optimize_upload_mode.parse::<OptimizeUploadMode>()?,
             optimize_upload_buffer_bytes: cli.optimize_upload_buffer_bytes,
+            optimize_upload_concurrency: cli.optimize_upload_concurrency,
             vacuum_delete_chunk: cli.vacuum_delete_chunk,
             vacuum_max_plan_bytes: cli.vacuum_max_plan_bytes,
             replay_max_log_files: cli.replay_max_log_files,

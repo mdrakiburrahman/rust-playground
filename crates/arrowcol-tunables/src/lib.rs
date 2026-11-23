@@ -531,6 +531,7 @@ pub struct MaintenanceTunables {
     pub parquet_writer: Option<ParquetWriterConfig>,
     pub optimize_upload_mode: Option<MaintenanceUploadMode>,
     pub optimize_upload_buffer_bytes: Option<usize>,
+    pub optimize_upload_concurrency: Option<usize>,
     pub interval_secs: Option<u64>,
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,

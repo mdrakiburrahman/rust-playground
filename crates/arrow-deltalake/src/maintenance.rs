@@ -2233,6 +2233,7 @@ mod optimize_upload_tests {
             local.path().to_path_buf(),
             bytes.len() as u64,
             Some(32 * 1024),
+            2,
         )
         .await?;
 
@@ -2252,11 +2253,12 @@ mod optimize_upload_tests {
         let replacement = vec![4_u8, 5, 6];
         fs::write(local.path(), &replacement)?;
 
-        let error =
-            match upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None).await {
-                Err(error) => error,
-                Ok(()) => anyhow::bail!("create-only upload replaced an existing object"),
-            };
+        let error = match upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None, 1)
+            .await
+        {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("create-only upload replaced an existing object"),
+        };
         assert!(matches!(
             error.downcast_ref::<object_store::Error>(),
             Some(object_store::Error::AlreadyExists { .. })
@@ -2338,6 +2340,7 @@ mod optimize_upload_tests {
 pub const MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_OPTIMIZE_UPLOAD_CONCURRENCY: usize = 16;
 
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
@@ -2372,6 +2375,7 @@ pub struct OptimizeConfig {
     pub batch_rows: usize,
     /// Input buffering strategy; spool uses temporary local disk.
     pub input_read_strategy: InputReadStrategy,
+    pub upload_concurrency: usize,
     pub max_output_file_bytes: u64,
     pub max_active_files: usize,
     /// Whole-output sort using the shared layout helper.
@@ -2405,6 +2409,7 @@ impl Default for OptimizeConfig {
             max_batch_bytes: 64 * 1024 * 1024,
             batch_rows: 8192,
             input_read_strategy: InputReadStrategy::Memory,
+            upload_concurrency: 1,
             max_output_file_bytes: 1023 * 1024 * 1024,
             max_active_files: 1_000_000,
             layout: None,
@@ -2450,6 +2455,9 @@ impl OptimizeConfig {
         }
         if self.output_row_group_rows == 0 {
             return invalid("output row-group rows must be positive");
+        }
+        if !(1..=MAX_OPTIMIZE_UPLOAD_CONCURRENCY).contains(&self.upload_concurrency) {
+            return invalid("upload_concurrency must be within 1..=16");
         }
         Ok(())
     }
@@ -3646,8 +3654,11 @@ impl BinWriter<'_> {
         };
         self.outputs.push(staged);
         let index = self.outputs.len() - 1;
-        self.table
-            .upload_output(&mut self.outputs[index], self.upload_buffer_bytes)?;
+        self.table.upload_output(
+            &mut self.outputs[index],
+            self.upload_buffer_bytes,
+            self.config.upload_concurrency,
+        )?;
         Ok(())
     }
 
@@ -3679,7 +3690,7 @@ impl BinWriter<'_> {
 
 impl DeltaTable {
     /// Upload a staged cloud output to its UUID-named path; local outputs are already in place.
-    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: Option<usize>) -> Result<()> {
+    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: Option<usize>, concurrency: usize) -> Result<()> {
         if self.url.scheme() == "file" {
             return Ok(());
         }
@@ -3691,6 +3702,7 @@ impl DeltaTable {
             output.local.clone(),
             output.bytes,
             buffer_bytes,
+            concurrency,
         ))?;
         output.uploaded = true;
         match fs::remove_file(&output.local) {
@@ -3707,9 +3719,10 @@ async fn upload_staged_output(
     local: PathBuf,
     expected_bytes: u64,
     buffer_bytes: Option<usize>,
+    concurrency: usize,
 ) -> Result<()> {
     match buffer_bytes {
-        Some(buffer_bytes) => stream_staged_output(store, path, local, expected_bytes, buffer_bytes).await,
+        Some(buffer_bytes) => stream_staged_output(store, path, local, expected_bytes, buffer_bytes, concurrency).await,
         None => {
             let bytes = tokio::fs::read(local).await?;
             if bytes.len() as u64 != expected_bytes {
@@ -3730,6 +3743,7 @@ async fn stream_staged_output(
     local: PathBuf,
     expected_bytes: u64,
     buffer_bytes: usize,
+    concurrency: usize,
 ) -> Result<()> {
     let mut reader = tokio::fs::File::from_std(File::open(local)?);
     if reader.metadata().await?.len() != expected_bytes {
@@ -3739,7 +3753,7 @@ async fn stream_staged_output(
         ));
     }
     let mut writer =
-        object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes).with_max_concurrency(1);
+        object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes).with_max_concurrency(concurrency);
     let copied = match tokio::io::copy(&mut reader, &mut writer).await {
         Ok(copied) => copied,
         Err(error) => {

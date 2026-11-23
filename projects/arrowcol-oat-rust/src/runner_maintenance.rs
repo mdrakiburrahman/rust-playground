@@ -352,6 +352,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "PURGE_MAX_PLAN_BYTES"
         | "OPTIMIZE_UPLOAD_MODE"
         | "OPTIMIZE_UPLOAD_BUFFER_BYTES"
+        | "OPTIMIZE_UPLOAD_CONCURRENCY"
         | "VACUUM_DELETE_CHUNK"
         | "VACUUM_MAX_PLAN_BYTES"
         | "REPLAY_MAX_LOG_FILES"
@@ -1331,11 +1332,11 @@ mod maintenance_topology_tests {
         ))?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "maintenance": {"enabled": true, "operations": ["optimize"],
-                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3}
         }))?;
         let mut observed = json!({"startup": {
             "apply": false, "operations": ["optimize"], "interval_secs": 60,
-            "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+            "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3}
         }});
         verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
         observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"] = Value::Null;

@@ -409,6 +409,7 @@ const CAPABILITIES: &[Capability] = &[
         "maintenance.optimize_upload_buffer_bytes",
         "8388608; buffered_multipart only"
     ),
+    capability!("maintenance.optimize_upload_concurrency", "1; buffered_multipart only"),
     capability!("maintenance.interval_secs", "OAT: 60s; standalone CLI: one-shot"),
     capability!(
         "maintenance.max_idle_backoff_secs",
@@ -1851,9 +1852,29 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     }
     let has_operation = |operation| !enabled || operations.contains(&operation);
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
-    if maintenance.optimize_upload_mode.is_some() || maintenance.optimize_upload_buffer_bytes.is_some() {
+    if maintenance.optimize_upload_mode.is_some()
+        || maintenance.optimize_upload_buffer_bytes.is_some()
+        || maintenance.optimize_upload_concurrency.is_some()
+    {
         if !has_optimize {
             bail!("maintenance optimize upload settings require optimize");
+        }
+        if let Some(concurrency) = maintenance.optimize_upload_concurrency {
+            if maintenance.optimize_upload_mode != Some(MaintenanceUploadMode::BufferedMultipart) {
+                bail!("maintenance.optimize_upload_concurrency requires buffered_multipart mode");
+            }
+            if !(1..=16).contains(&concurrency) {
+                bail!("maintenance.optimize_upload_concurrency must be within 1..=16");
+            }
+            let bytes = maintenance.optimize_upload_buffer_bytes.unwrap_or(8_388_608);
+            let tables = maintenance.max_concurrent_tables.unwrap_or(1);
+            let budget = bytes
+                .checked_mul(concurrency + 1)
+                .and_then(|v| v.checked_mul(tables))
+                .context("maintenance.optimize_upload_concurrency buffer budget overflow")?;
+            if budget > 536_870_912 {
+                bail!("maintenance.optimize_upload_concurrency buffer budget exceeds 512 MiB");
+            }
         }
         if let Some(bytes) = maintenance.optimize_upload_buffer_bytes {
             if maintenance.optimize_upload_mode != Some(MaintenanceUploadMode::BufferedMultipart) {
@@ -2851,6 +2872,37 @@ mod tests {
             .context("maintenance fixture must be an object")?
             .remove("optimize_upload_buffer_bytes");
         assert!(Tunables::parse_oat_json(create).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_upload_concurrency_rejects_invalid_values_and_budget() -> Result<()> {
+        let value = serde_json::json!({"maintenance": {
+            "enabled": true, "operations": ["optimize"], "optimize_upload_mode": "buffered_multipart",
+            "optimize_upload_concurrency": 3
+        }});
+        let env = Tunables::parse_oat_json(value.clone())?.environment_for(ComponentRole::Maintenance)?;
+        assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_CONCURRENCY"], "3");
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(17),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut input = value.clone();
+            input["maintenance"]["optimize_upload_concurrency"] = invalid;
+            assert!(Tunables::parse_oat_json(input).is_err());
+        }
+        let mut no_multipart = value.clone();
+        no_multipart["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
+        assert!(
+            format!("{:#}", Tunables::parse_oat_json(no_multipart).unwrap_err())
+                .contains("optimize_upload_concurrency")
+        );
+        let mut over = value;
+        over["maintenance"]["optimize_upload_buffer_bytes"] = serde_json::json!(67_108_864);
+        over["maintenance"]["max_concurrent_tables"] = serde_json::json!(3);
+        assert!(format!("{:#}", Tunables::parse_oat_json(over).unwrap_err()).contains("optimize_upload_concurrency"));
         Ok(())
     }
 

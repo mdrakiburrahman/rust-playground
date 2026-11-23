@@ -298,7 +298,10 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "collector.upload.buffer_capacity_bytes" || path == "collector.upload.request_concurrency" {
         input["collector"] = json!({"upload": {"mode": "buffered_multipart"}});
     }
-    if path == "maintenance.optimize_upload_buffer_bytes" {
+    if matches!(
+        path,
+        "maintenance.optimize_upload_buffer_bytes" | "maintenance.optimize_upload_concurrency"
+    ) {
         input["maintenance"]["optimize_upload_mode"] = json!("buffered_multipart");
     }
     if path.ends_with(".compression_level") {
