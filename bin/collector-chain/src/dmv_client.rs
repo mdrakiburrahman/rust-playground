@@ -5207,6 +5207,251 @@ mod tests {
         Ok(())
     }
 
+    struct QuiesceFlightState {
+        requests: AtomicU64,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for QuiesceFlightState {
+        fn default() -> Self {
+            Self {
+                requests: AtomicU64::new(0),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    struct QuiesceAdmission(Arc<QuiesceFlightState>);
+    struct QuiesceStream(Arc<QuiesceFlightState>);
+
+    #[async_trait::async_trait]
+    impl BatchAdmission for QuiesceAdmission {
+        async fn begin(
+            &self,
+            _: StreamContext,
+            _: Arc<dyn PutResultEmitter>,
+        ) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+            self.0.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(QuiesceStream(Arc::clone(&self.0))))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamLifecycle for QuiesceStream {
+        async fn push_batch(&mut self, _: RecordBatch) -> RuntimeResult<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, _: StreamSummary) -> RuntimeResult<StreamCompletion> {
+            self.0.entered.add_permits(1);
+            self.0
+                .release
+                .acquire()
+                .await
+                .map_err(|_| RuntimeError::internal())?
+                .forget();
+            Ok(StreamCompletion::best_effort())
+        }
+        async fn abort(self: Box<Self>, _: StreamAbortReason) {}
+    }
+
+    async fn gated_quiesce_client() -> Result<(
+        Arc<PreparedClient>,
+        Arc<QuiesceFlightState>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    )> {
+        use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
+        use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
+        use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
+        let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
+        let principal = AuthenticatedPrincipal::new(
+            PrincipalId::new("quiesce")?,
+            PrincipalIssuer::new("quiesce")?,
+            Default::default(),
+        )?;
+        let auth = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(1)?, None)?;
+        let state = Arc::new(QuiesceFlightState::default());
+        let service = ArrowColFlightService::new(
+            ImplementationPool::Dataflow,
+            Arc::clone(&store),
+            Arc::new(AllowAllAuthenticator::new(auth)),
+            Arc::new(QuiesceAdmission(Arc::clone(&state))),
+            RuntimeLimits::default(),
+        )?
+        .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
+        .into_tonic_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let mut options = options()?;
+        options.workers = 1;
+        options.corpus_rows = 8;
+        options.batch_rows = 8;
+        options.streams_per_worker = 1;
+        options.request_timeout_ms = 3000;
+        options.quiesce_timeout_ms = Some(3000);
+        let client = PreparedClient::prepare(
+            &endpoint,
+            "quiesce-test",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            options,
+        )
+        .await?;
+        Ok((client, state, shutdown, server))
+    }
+
+    async fn wait_for_gated_send(state: &QuiesceFlightState) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), state.entered.acquire())
+            .await??
+            .forget();
+        Ok(())
+    }
+
+    async fn wait_for_client_stop(client: &PreparedClient) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !client
+                .measurement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|measurement| measurement.stopped())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_end_quiesces_and_drains_an_in_flight_send() -> Result<()> {
+        let (client, state, shutdown, server) = gated_quiesce_client().await?;
+        let start = unix_ms()? + 100;
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            runner
+                .run_continuous_with_termination(start, start, start + 800, std::future::pending())
+                .await
+        });
+        wait_for_gated_send(&state).await?;
+        wait_for_client_stop(&client).await?;
+        assert!(
+            !run.is_finished(),
+            "the in-flight acknowledgement must drain after window end"
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        state.release.add_permits(1);
+        let report = tokio::time::timeout(Duration::from_secs(3), run).await???;
+        assert_eq!(
+            report.completed_rows, 0,
+            "post-window completion is not measured throughput"
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1, "no new send after window end");
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::SeqCst), 8);
+        let receipt = client.completed_terminal_metrics()?;
+        let window = &receipt["measurement_window"]["windows"][0];
+        assert_eq!(window["completed_sends"], 1);
+        assert_eq!(window["timed_out_sends"], 0);
+        assert_eq!(window["ambiguous_sends"], 0);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sigterm_quiesces_and_emits_the_drained_send_outcome() -> Result<()> {
+        let (client, state, shutdown, server) = gated_quiesce_client().await?;
+        let start = unix_ms()? + 100;
+        let (signal, received) = tokio::sync::oneshot::channel();
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            runner
+                .run_continuous_with_termination(start, start, start + 10_000, async {
+                    received.await.context("test SIGTERM sender dropped")?;
+                    Ok(())
+                })
+                .await
+        });
+        wait_for_gated_send(&state).await?;
+        signal
+            .send(())
+            .map_err(|()| anyhow::anyhow!("SIGTERM listener dropped"))?;
+        wait_for_client_stop(&client).await?;
+        assert!(
+            !run.is_finished(),
+            "SIGTERM must wait for the in-flight acknowledgement"
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        state.release.add_permits(1);
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await??
+            .err()
+            .context("SIGTERM must produce a failed terminal result")?;
+        assert!(error.to_string().contains("SIGTERM"));
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1, "no new send after SIGTERM");
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::SeqCst), 8);
+        let receipt = client.failed_terminal_metrics()?;
+        assert_eq!(receipt["phase"], "failed");
+        let window = &receipt["measurement_window"]["windows"][0];
+        assert_eq!(window["completed_sends"], 1);
+        assert_eq!(window["timed_out_sends"], 0);
+        assert_eq!(window["ambiguous_sends"], 0);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_deadline_aborts_a_stalled_send_as_timed_out_and_ambiguous() -> Result<()> {
+        let (mut client, state, shutdown, server) = gated_quiesce_client().await?;
+        // Fault injection: a stalled worker outlives the validated request timeout contract.
+        Arc::get_mut(&mut client)
+            .context("client unexpectedly shared")?
+            .options
+            .quiesce_timeout_ms = Some(100);
+        let start = unix_ms()? + 100;
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            runner
+                .run_continuous_with_termination(start, start, start + 800, std::future::pending())
+                .await
+        });
+        wait_for_gated_send(&state).await?;
+        wait_for_client_stop(&client).await?;
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await??
+            .err()
+            .context("expected quiesce deadline")?;
+        assert!(error.to_string().contains("quiesce deadline exceeded"));
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        let receipt = client.failed_terminal_metrics()?;
+        let window = &receipt["measurement_window"]["windows"][0];
+        assert_eq!(window["completed_sends"], 0);
+        assert_eq!(window["timed_out_sends"], 1);
+        assert_eq!(window["ambiguous_sends"], 1);
+        state.release.add_permits(1);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_flight_smoke_keeps_fast_worker_busy_and_drains_late_acknowledgement() -> Result<()> {
         use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
