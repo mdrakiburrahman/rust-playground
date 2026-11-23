@@ -107,3 +107,5 @@ reverses just the manifest's exact treatment and compares the resulting digest w
 the bound baseline. Missing readback or a second setting change rejects the arm.
 Existing memory, saturation and durability gates still apply; a terminal read after
 client failure records inspect evidence even when the exited cgroup cannot be read.
+
+See [Pressure timeout evidence](PRESSURE_TIMEOUT_OBSERVER.md) for sampler semantics and the proposed bounded diagnostic.
