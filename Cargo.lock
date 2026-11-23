@@ -875,6 +875,7 @@ dependencies = [
  "mimalloc",
  "otel-arrow-dfe",
  "otel-arrow-dfe-telemetry",
+ "rustix",
  "serde_json",
  "tracing-subscriber",
 ]

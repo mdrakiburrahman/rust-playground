@@ -304,6 +304,7 @@ const CAPABILITIES: &[Capability] = &[
         "2147483648 in OAT YAML; 536870912 component default"
     ),
     capability!("collector.socket.tcp_nodelay", "OS default"),
+    capability!("collector.thp_disabled", "inherited process flag"),
     capability!("collector.pressure.buffered_rows_limit", "10000000"),
     capability!("collector.pressure.buffered_batches_limit", "4096"),
     capability!("collector.pressure.pressure_interval", "2s"),
@@ -703,6 +704,11 @@ impl Tunables {
             {
                 bail!("maintenance.{field} must be an integer within 1..={maximum}");
             }
+        }
+        if let Some(disabled) = value.pointer("/collector/thp_disabled")
+            && !disabled.is_boolean()
+        {
+            bail!("collector.thp_disabled must be a boolean");
         }
         if let Some(socket) = value.pointer("/collector/socket")
             && !socket.is_object()
@@ -1130,6 +1136,9 @@ impl Tunables {
                 }
                 if let Some(value) = &collector.socket {
                     insert_json_config("ARROWCOL_COLLECTOR_SOCKET_CONFIG", value, &mut output)?;
+                }
+                if let Some(value) = collector.thp_disabled {
+                    output.insert("ARROWCOL_COLLECTOR_THP_DISABLED".to_owned(), value.to_string());
                 }
                 if let Some(value) = &collector.pressure {
                     let mut value = value.clone();
@@ -2622,6 +2631,22 @@ mod tests {
             let error = error_text(Tunables::parse_oat_json(serde_json::json!({"collector":settings})));
             assert!(error.contains("collector."), "{error}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn thp_flag_rejects_non_boolean() -> Result<()> {
+        for value in [serde_json::json!(1), serde_json::json!("true"), serde_json::json!(null)] {
+            let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"thp_disabled":value}
+            })));
+            assert!(error.contains("collector.thp_disabled"), "{error}");
+        }
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"thp_disabled":true}}))?;
+        assert_eq!(
+            valid.environment_for(ComponentRole::Collector)?["ARROWCOL_COLLECTOR_THP_DISABLED"],
+            "true"
+        );
         Ok(())
     }
 

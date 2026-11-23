@@ -23,5 +23,8 @@ serde_json = "1"
 arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
 otel-arrow-dfe = { path = "../../submodules/otel-arrow/rust/otap-dataflow", default-features = false, features = ["durable-buffer", "crypto-ring"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["thread"] }
+
 [lints]
 workspace = true

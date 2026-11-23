@@ -288,6 +288,17 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if path == "collector.thp_disabled" {
+            if environment.contains_key("ARROWCOL_COLLECTOR_THP_DISABLED")
+                && collectors.iter().all(|process| {
+                    process["effective_config"]["process"]["scope"] == "linux_thp_disable_flag"
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_linux_thp_flag_readback"}));
+                return false;
+            }
+            return true;
+        }
         if path == "collector.socket.tcp_nodelay" {
             if environment.contains_key("ARROWCOL_COLLECTOR_SOCKET_CONFIG")
                 && collectors.iter().all(|process| {
@@ -1182,6 +1193,37 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         Ok(serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn thp_flag_reaches_actual_collector() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arrowcol-dataflow-rust");
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"thp_disabled":true}
+        }))?;
+        let output = std::process::Command::new(binary)
+            .arg("--help")
+            .env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?)
+            .output()?;
+        anyhow::ensure!(output.status.success(), "collector failed: {}", String::from_utf8_lossy(&output.stderr));
+        let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+        assert_eq!(observed["process"]["thp_disabled"], true);
+        assert_eq!(observed["process"]["scope"], "linux_thp_disable_flag");
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":observed
+        });
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+        assert!(evidence["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "collector.thp_disabled"));
+        Ok(())
     }
 
     #[test]

@@ -74,6 +74,7 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.runtime.thread_keep_alive_ms` | Integer milliseconds `1..=86400000`; unset uses Tokio default 10000. Startup only. Controls idle Delta I/O blocking worker lifetime and thread churn. |
 | `collector.runtime.cpu_thread_stack_size` | Integer bytes `65536..=67108864`; unset uses platform default. Startup only. Configures dedicated Delta CPU worker stacks; the OS may round the allocation. Readback is the builder value, not an OS stack measurement, and consumer evidence requires the lazy CPU pool on every collector. |
 | `collector.socket.tcp_nodelay` | Boolean; unset leaves the OS default unchanged. Startup only. Sets `TCP_NODELAY` on every accepted Flight connection, changing server-side Nagle buffering. Consumer evidence requires an accepted socket on every collector. |
+| `collector.thp_disabled` | Boolean; unset preserves the inherited Linux process flag. Startup only. `true` disables transparent huge pages for the process; `false` clears that flag but does not override system THP policy. Readback is the kernel flag, not proof of actual huge-page use. Non-Linux collectors reject the setting. |
 | `dfe_worker_concurrency` | OAT axis of distinct integers `1..=256`, projected as `--num-cores` at collector startup. The receiver reports `dfe_worker_concurrency` from its DFE pipeline context; higher values increase per-core pipeline parallelism and resource use. Fleet `sizing.collector.dfe_workers` sets this axis. |
 | `logging.maintenance` | Inert when maintenance is disabled because no maintenance process is running; listed in the cell's `tunables_json.inert_fields` and `evidence_json.inert_fields`, and Darwin receipt `inert_fields`. A null receipt field means evidence was unavailable, not that no fields were inert. |
 | `maintenance.*` | Except for the `enabled` runner control, fields are inert when maintenance is disabled. Values remain range- and cross-field-validated; enabling the role also requires the corresponding operations. |
@@ -90,7 +91,7 @@ selection and effect claims.
 | DFE scheduler builder options | The DFE engine constructs its current-thread Tokio runtime internally without a collector-side builder hook. Delta I/O settings do not change it. |
 | Receiver socket buffers and other TCP options | The DFE listener is bound and listening before the collector receives it; the current listener API offers no pre-bind socket-option hook or effective buffer readback. `collector.socket.tcp_nodelay` is applied to accepted sockets separately. |
 | Allocator environment tuning | `MALLOC_*` and `MIMALLOC_*` are not typed OAT fields here. The effective allocator build readback does not establish that an environment option was consumed. Even with mimalloc for the Rust heap, C libraries can still use glibc allocation. |
-| Transparent huge pages / `madvise` | No verified collector allocation or process-level control/readback is available; kernel policy alone does not establish actual huge-page use. |
+| Per-allocation `madvise` | No collector allocation-specific control/readback is available. The process THP-disable flag does not establish actual huge-page use. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal

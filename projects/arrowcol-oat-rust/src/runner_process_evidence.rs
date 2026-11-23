@@ -581,6 +581,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
             "ARROWCOL_COLLECTOR_SOCKET_CONFIG" => "/socket".to_owned(),
+            "ARROWCOL_COLLECTOR_THP_DISABLED" => "/process/thp_disabled".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
             "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
