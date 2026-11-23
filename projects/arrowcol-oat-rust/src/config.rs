@@ -2338,7 +2338,7 @@ mod tests {
                 "layout_sort_options":[{"column":"customer_id","direction":"descending","nulls":"first"}],
                 "parquet_writer":{"sorting_columns":[{"path":"customer_id","descending":true,"nulls_first":true}]}}
         }))?;
-        maintenance.validate()?;
+        maintenance.validate_selected_parquet_schemas()?;
         maintenance
             .tunables
             .maintenance
@@ -2352,8 +2352,13 @@ mod tests {
             .context("sorting columns")?[0]
             .descending = false;
         assert!(
-            format!("{:#}", maintenance.validate().expect_err("wrong metadata accepted"))
-                .contains("sorting metadata must match")
+            format!(
+                "{:#}",
+                maintenance
+                    .validate_selected_parquet_schemas()
+                    .expect_err("wrong metadata accepted")
+            )
+            .contains("sorting metadata must match")
         );
         Ok(())
     }
