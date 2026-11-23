@@ -466,11 +466,13 @@ fn create_receiver(
     metrics
         .configure_cpu_pressure(config.cpu_pressure)
         .map_err(config_error)?;
+    let mut effective_config = config.effective_config_json();
+    effective_config["dfe_worker_concurrency"] = serde_json::json!(pipeline.num_cores());
     eprintln!(
         "arrowcol_effective_config {}",
         serde_json::json!({
             "component": "receiver",
-            "config": config.effective_config_json()
+            "config": effective_config
         })
     );
     tracing::info!(
