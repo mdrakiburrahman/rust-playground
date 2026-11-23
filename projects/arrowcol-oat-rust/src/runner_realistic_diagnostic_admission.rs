@@ -796,6 +796,37 @@ mod realistic_diagnostic_admission_tests {
         assert_eq!(schedule_calls.get(), 0, "a one-byte mismatch must not enter the schedule callback");
 
         proof["reference"] = exact_reference.clone();
+        assert!(
+            schedule_after_diagnostic_admission(None, Some(&proof), run, || {
+                schedule_calls.set(schedule_calls.get() + 1)
+            })
+            .is_err(),
+            "a missing reference must not schedule clients"
+        );
+        assert_eq!(schedule_calls.get(), 0);
+
+        let mut wrong_roster = exact_reference.clone();
+        wrong_roster["clients"] = json!([]);
+        proof["reference"] = wrong_roster.clone();
+        assert!(
+            schedule_after_diagnostic_admission(
+                Some(&wrong_roster.to_string()),
+                Some(&proof),
+                run,
+                || schedule_calls.set(schedule_calls.get() + 1),
+            )
+            .is_err(),
+            "an incomplete client roster must not schedule clients"
+        );
+        assert_eq!(schedule_calls.get(), 0);
+
+        let normal_schedule_calls = Cell::new(0);
+        schedule_after_diagnostic_admission(None, None, run, || {
+            normal_schedule_calls.set(normal_schedule_calls.get() + 1)
+        })?;
+        assert_eq!(normal_schedule_calls.get(), 1, "non-diagnostic scheduling remains unchanged");
+
+        proof["reference"] = exact_reference.clone();
         schedule_after_diagnostic_admission(
             Some(&exact_reference.to_string()),
             Some(&proof),

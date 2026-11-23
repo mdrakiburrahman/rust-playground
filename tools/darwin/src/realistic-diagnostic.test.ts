@@ -148,6 +148,11 @@ test("freezes a non-circular first-arm profile and binds its per-client reservat
   assert.deepEqual(validateFrozenComparisonProfile(profileBytes, profileSha256, expected), profile);
   assert.deepEqual(verifyComparisonProfileReference(profileBytes, profileSha256, receiptBytes, expected), profile);
 
+  const staleReceipt = { ...firstArmReceipt(expected), footer_sha256: "6".repeat(64) };
+  const staleReceiptBytes = Buffer.from(JSON.stringify(staleReceipt));
+  assert.throws(() => freezeDiagnosticComparisonProfile(
+    staleReceiptBytes, createHash("sha256").update(staleReceiptBytes).digest("hex"), expected,
+  ));
   const changedReservation = {
     ...profile,
     clients: [{ logical_client_id: "sqlserver_availability_replica_states:1", corpus_memory_reservation_bytes: 101 }],

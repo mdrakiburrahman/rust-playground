@@ -132,6 +132,7 @@ export function freezeDiagnosticComparisonProfile(
     || receipt.collector_source_revision !== expected.collectorSource || receipt.startup_revision !== expected.startup
     || receipt.diagnostic_gate_sha256 !== expected.gate || receipt.controller_sha256 !== expected.controller
     || receipt.seed_sha256 !== expected.seed || receipt.corpus_sha256 !== expected.corpus
+    || receipt.footer_sha256 !== expected.footer
     || !isDeepStrictEqual(receipt.images, expected.images)
     || !isDeepStrictEqual(receipt.diagnostic_profile, DIAGNOSTIC_WORKLOAD_PROFILE)
     || !isDeepStrictEqual(initial.reference, { mode: "first" })
