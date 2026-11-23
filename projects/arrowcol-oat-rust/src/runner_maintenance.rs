@@ -806,14 +806,14 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             let columns = policy.pointer("/table_policy/arrowcol.layout.sortColumns")
                 .and_then(Value::as_array).context("maintenance effective sort columns missing")?;
             let options = actual.as_array().context("maintenance effective sort options missing")?;
-            if options.len() != columns.len() || options.iter().zip(columns)
-                .any(|(option, column)| option.get("column") != Some(column))
+            if !options.is_empty() && (options.len() != columns.len() || options.iter().zip(columns)
+                .any(|(option, column)| option.get("column") != Some(column)))
             {
                 bail!("maintenance effective sort options do not match sort columns");
             }
             match source {
                 "process" if actual == requested => {},
-                "table" if !options.is_empty() => {},
+                "table" => {},
                 _ => bail!("maintenance effective sort options do not match their source"),
             }
         }
@@ -1095,6 +1095,8 @@ mod maintenance_topology_tests {
         assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
         assert!(maintenance_table_evidence(&config, &event(&observed)).is_err());
         observed["layout_sources"]["arrowcol.layout.sortOptions"] = json!("table");
+        maintenance_table_evidence(&config, &event(&observed))?;
+        observed["table_policy"]["arrowcol.layout.sortOptions"] = json!([]);
         maintenance_table_evidence(&config, &event(&observed))?;
         observed["table_policy"].as_object_mut().context("policy")?.remove("arrowcol.layout.sortOptions");
         assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());

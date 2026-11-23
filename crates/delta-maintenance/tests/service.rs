@@ -317,6 +317,28 @@ fn oat_projected_maintenance_sort_options_drive_real_optimize() -> Result<()> {
         .args(["--operation", "optimize", "--sealed-final", "--apply"])
         .output()?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    for prefix in [
+        "arrowcol_maintenance_effective_config ",
+        "arrowcol_maintenance_table_config ",
+    ] {
+        let value: serde_json::Value = serde_json::from_str(
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .context("missing maintenance readback")?,
+        )?;
+        let config = if prefix.contains("table") {
+            &value["config"]
+        } else {
+            &value
+        };
+        assert_eq!(
+            config["table_policy"]["arrowcol.layout.sortOptions"],
+            serde_json::json!([{"column":"id","direction":"descending","nulls":"first"}])
+        );
+        assert_eq!(config["layout_sources"]["arrowcol.layout.sortOptions"], "process");
+    }
     let reports = lines(&output.stdout)?;
     let outputs = reports[0]["report"]["outputs"].as_array().context("missing outputs")?;
     assert_eq!(outputs.len(), 4);

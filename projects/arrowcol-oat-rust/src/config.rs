@@ -2257,6 +2257,16 @@ mod tests {
             invalid_layout.validate(),
             Err(error) if format!("{error:#}").contains("unknown sort column not_a_dmv_column")
         ));
+        let mut invalid_maintenance_layout = valid();
+        invalid_maintenance_layout.tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "maintenance":{"enabled":true,"operations":["optimize"],
+                "layout_sort_columns":["not_a_dmv_column"],
+                "layout_sort_options":[{"column":"not_a_dmv_column","direction":"descending","nulls":"first"}]}
+        }))?;
+        assert!(matches!(
+            invalid_maintenance_layout.validate(),
+            Err(error) if format!("{error:#}").contains("maintenance layout is invalid for selected DMV table")
+        ));
         let mut sorted = valid();
         sorted.tables = vec![table.identity().table().as_str().to_owned()];
         sorted.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
