@@ -1529,6 +1529,12 @@ mod startup_readback_tests {
             assert!(result["projection_only"].as_array().context("missing projection fields")?
                 .iter().any(|entry| entry["path"] == path));
         }
+        let mut overridden = process.clone();
+        overridden["adaptive_table_policies"][1]["config"]["target_parquet_bytes"] = json!(2000);
+        let mut result = initial.clone();
+        promote_collector_readback(&config, &mut result, Some(&json!([overridden])), 1)?;
+        assert!(result["projection_only"].as_array().context("missing projection fields")?
+            .iter().any(|entry| entry["path"] == "collector.batching.adaptive_file.target_parquet_bytes"));
         let mut missing = process.clone();
         missing["adaptive_table_policies"].as_array_mut().context("missing policies")?.pop();
         let mut result = initial.clone();
