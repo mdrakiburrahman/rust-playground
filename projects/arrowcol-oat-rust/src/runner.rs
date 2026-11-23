@@ -1894,6 +1894,23 @@ impl Platform for LocalPlatform {
     }
 
     async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str, _replicas: u32) -> Result<()> {
+        let containerized = Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+        let host_network = if containerized {
+            let hostname =
+                fs::read_to_string("/proc/sys/kernel/hostname").context("read harness container hostname")?;
+            let mut inspect = Command::new("docker");
+            inspect.args(["inspect", "--format", "{{.HostConfig.NetworkMode}}", hostname.trim()]);
+            let output = run_command(inspect, "inspect harness container network mode").await?;
+            String::from_utf8(output.stdout)?.trim() == "host"
+        } else {
+            false
+        };
+        crate::local::validate_container_endpoints(
+            containerized,
+            host_network,
+            config.platform.local.bind_host,
+            config.platform.local.endpoint_host.as_deref(),
+        )?;
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.refresh_endpoints(config).await
@@ -8352,8 +8369,8 @@ async fn local_compose_endpoint(
         tokio::net::TcpStream::connect((host, url.port_or_known_default().context("local endpoint has no port")?)),
     )
     .await
-    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host, not a loopback fallback"))?
-    .with_context(|| format!("connect local {service} endpoint {endpoint}"))?;
+    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"))?
+    .with_context(|| format!("connect local {service} endpoint {endpoint}; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"))?;
     Ok(endpoint)
 }
 

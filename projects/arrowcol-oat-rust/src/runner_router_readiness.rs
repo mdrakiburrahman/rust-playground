@@ -102,7 +102,7 @@ where
     let until = tokio::time::Instant::now() + deadline;
     let mut backoff = Duration::from_millis(100);
     let explanation = format!(
-        "local router endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host, not a loopback fallback"
+        "local router endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"
     );
     loop {
         match tokio::time::timeout_at(until, inspect()).await {
