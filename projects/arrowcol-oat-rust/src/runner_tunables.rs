@@ -37,6 +37,12 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
     {
         return Ok(());
     }
+    let environment = role_environment(config, ComponentRole::Collector)?;
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
+        .into_iter()
+        .filter_map(|name| environment.get(name).map(|value| (name, value)))
+        .map(|(name, value)| Ok((name, serde_json::from_str::<Value>(value)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
     let projection = evidence["projection_only"]
         .as_array_mut()
         .context("projection_only must be an array")?;
@@ -55,6 +61,14 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             _ => return true,
         };
         let field = path.rsplit('.').next().unwrap_or_default();
+        let variable = if section == "commit" {
+            "ARROWCOL_COLLECTOR_COMMIT_CONFIG"
+        } else {
+            "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"
+        };
+        if projected.get(variable).and_then(|value| value.get(field)).is_none() {
+            return true;
+        }
         if collectors.iter().any(|process| process["effective_config"][section].get(field).is_none()) {
             return true;
         }
