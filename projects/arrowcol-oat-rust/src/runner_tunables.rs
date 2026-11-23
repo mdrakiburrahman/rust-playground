@@ -822,8 +822,9 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             services.insert(service.to_owned(), json!({ "environment": environment }));
         }
     }
-    if config.platform.kind == crate::config::OatMode::Local {
-        if let Some(profile_hash) = config.client_build_profile_hash() {
+    if config.platform.kind == crate::config::OatMode::Local
+        && let Some(profile_hash) = config.client_build_profile_hash()
+    {
             let profile = config.tunables.client.as_ref()
                 .and_then(|client| client.build_profile.as_ref())
                 .context("client profile hash requires client build-profile tunables")?
@@ -841,7 +842,6 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             });
             let pin_init = services.entry("oat-pin-init".to_owned()).or_insert_with(|| json!({}));
             pin_init["image"] = json!(image);
-        }
     }
     compose_maintenance(config, &mut services)?;
     Ok(json!({ "services": services }))
