@@ -2219,6 +2219,156 @@ mod optimize_upload_tests {
     use super::*;
     use object_store::memory::InMemory;
 
+    #[derive(Debug)]
+    struct ProbeStore {
+        inner: Arc<dyn ObjectStore>,
+        barrier: Arc<tokio::sync::Barrier>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::fmt::Display for ProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "probe store")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProbeUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        barrier: Arc<tokio::sync::Barrier>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for ProbeUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            let part = self.inner.put_part(data);
+            let barrier = Arc::clone(&self.barrier);
+            let entered = Arc::clone(&self.entered);
+            let active = Arc::clone(&self.active);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                if entered.fetch_add(1, Ordering::SeqCst) < 2 {
+                    barrier.wait().await;
+                }
+                let result = part.await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                result
+            })
+        }
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            self.inner.complete().await
+        }
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn put_opts(
+            &self,
+            p: &object_store::path::Path,
+            v: object_store::PutPayload,
+            o: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(p, v, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &object_store::path::Path,
+            o: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Ok(Box::new(ProbeUpload {
+                inner: self.inner.put_multipart_opts(p, o).await?,
+                barrier: Arc::clone(&self.barrier),
+                entered: Arc::clone(&self.entered),
+                active: Arc::clone(&self.active),
+                peak: Arc::clone(&self.peak),
+            }))
+        }
+        async fn get_opts(
+            &self,
+            p: &object_store::path::Path,
+            o: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            p: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(p)
+        }
+        fn list(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(
+            &self,
+            a: &object_store::path::Path,
+            b: &object_store::path::Path,
+            o: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(a, b, o).await
+        }
+        async fn rename_opts(
+            &self,
+            a: &object_store::path::Path,
+            b: &object_store::path::Path,
+            o: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(a, b, o).await
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_consumer_respects_configured_concurrency() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let peak = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(ProbeStore {
+            inner: Arc::new(InMemory::new()),
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            entered: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+        let file = tempfile::NamedTempFile::new()?;
+        let bytes = vec![0x5a; 512 * 1024];
+        fs::write(file.path(), &bytes)?;
+        let path = object_store::path::Path::from("concurrent.parquet");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            upload_staged_output(
+                Arc::clone(&store),
+                path.clone(),
+                file.path().to_path_buf(),
+                bytes.len() as u64,
+                Some(32 * 1024),
+                2,
+            ),
+        )
+        .await??;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(store.get(&path).await?.bytes().await?.as_ref(), bytes);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn staged_file_is_complete_when_streaming_upload_returns() -> Result<()> {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2995,6 +3145,12 @@ impl DeltaTable {
         writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
+        if upload_buffer_bytes.is_none() && config.upload_concurrency != 1 {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "upload_concurrency requires buffered multipart upload",
+            ));
+        }
         let state = self.validated_active_state(prepared, config.max_active_files)?;
         let writer_config = match writer_config {
             Some(config) => config,
