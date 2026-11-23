@@ -34,10 +34,12 @@ async fn capture_local_cpu_quota(
     let mut containers = Vec::new();
     for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
         let mut inspect = Command::new("docker");
+        inspect.envs(environment);
         inspect.args(["inspect", "--format", "{{json .HostConfig.NanoCpus}}", id]);
         let nano_cpus: u64 = String::from_utf8(run_command(inspect, "read collector NanoCpus").await?.stdout)?
             .trim().parse()?;
         let mut read = Command::new("docker");
+        read.envs(environment);
         read.args(["exec", id, "sh", "-ec",
             "cat /sys/fs/cgroup/cpu.max; cat /sys/fs/cgroup/cpu.stat"]);
         let counters = String::from_utf8(run_command(read, "read collector cgroup CPU counters").await?.stdout)?;

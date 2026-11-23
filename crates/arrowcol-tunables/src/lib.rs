@@ -28,13 +28,14 @@ pub enum UnlimitedCpuQuota {
 }
 
 impl CollectorCpuQuota {
+    /// # Errors
+    /// Rejects nonpositive, nonfinite, oversized or sub-nanocore quotas.
     pub fn nano_cpus(self) -> Result<u64, &'static str> {
         match self {
             Self::Unlimited(_) => Ok(0),
             Self::Cores(cores)
                 if cores.is_finite()
-                    && cores >= 0.000_000_001
-                    && cores <= 4096.0
+                    && (0.000_000_001..=4096.0).contains(&cores)
                     && (cores * 1_000_000_000.0).fract() == 0.0 =>
             {
                 Ok((cores * 1_000_000_000.0) as u64)
