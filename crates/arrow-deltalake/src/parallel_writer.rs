@@ -8,6 +8,7 @@ use parquet::arrow::arrow_writer::{
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use std::io::Write;
+use std::sync::Arc;
 
 pub(crate) struct ParallelArrowWriter<W: Write + Send + 'static> {
     file_writer: Option<SerializedFileWriter<W>>,
