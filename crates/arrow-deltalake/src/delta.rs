@@ -2549,6 +2549,17 @@ impl LayoutReadback {
             "table_property_overrides": self.table_property_overrides,
             "config": config,
             "parquet_columns": (!columns_unavailable).then_some(parquet_columns),
+            "parquet_properties": {
+                "writer_version": match properties.writer_version() {
+                    parquet::file::properties::WriterVersion::PARQUET_1_0 => "v1",
+                    parquet::file::properties::WriterVersion::PARQUET_2_0 => "v2",
+                },
+                "max_row_group_bytes": properties.max_row_group_bytes(),
+                "write_batch_size": properties.write_batch_size(),
+                "offset_index_enabled": !properties.offset_index_disabled(),
+                "column_index_truncate_length": properties.column_index_truncate_length(),
+                "statistics_truncate_length": properties.statistics_truncate_length(),
+            },
         }))
     }
 }
@@ -5542,6 +5553,12 @@ mod layout_readback_tests {
         let parquet: crate::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
             "max_row_group_rows": 3,
             "data_page_row_count_limit": 1,
+            "writer_version": "v2",
+            "max_row_group_bytes": 2048,
+            "write_batch_size": 5,
+            "offset_index_enabled": true,
+            "column_index_truncate_length": 32,
+            "statistics_truncate_length": 64,
             "columns": {"customer_id": {"bloom_filter_enabled": true}}
         }))?;
         let url = Url::parse("file:///safe/catalog/schema/events/")?;
@@ -5557,6 +5574,13 @@ mod layout_readback_tests {
         assert_eq!(event["config"]["bloom_columns"], serde_json::json!(["customer_id"]));
         assert_eq!(event["config"]["row_group_rows"], 3);
         assert_eq!(event["config"]["page_rows"], 1);
+        assert_eq!(
+            event["parquet_properties"],
+            serde_json::json!({
+                "writer_version":"v2", "max_row_group_bytes":2048, "write_batch_size":5,
+                "offset_index_enabled":true, "column_index_truncate_length":32, "statistics_truncate_length":64
+            })
+        );
         assert_eq!(
             event["precedence"],
             serde_json::json!(["table_properties", "process_policy", "registry_defaults"])

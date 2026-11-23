@@ -70,6 +70,20 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
+        if let Some(field) = path.strip_prefix("parquet_writer.")
+            && matches!(field, "writer_version" | "max_row_group_bytes" | "write_batch_size"
+                | "offset_index_enabled" | "column_index_truncate_length" | "statistics_truncate_length")
+        {
+            let requested = parquet_policy.as_ref().and_then(|policy| policy.get(field))
+                .filter(|value| !value.is_null());
+            if tables_covered && requested.is_some()
+                && table_policies.iter().all(|record| record["parquet_properties"].get(field) == requested)
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
+                return false;
+            }
+            return true;
+        }
         let codec = if path == "parquet_writer.defaults.compression" {
             Some((None, "compression"))
         } else if path == "parquet_writer.defaults.compression_level" {

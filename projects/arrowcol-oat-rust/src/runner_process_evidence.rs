@@ -779,8 +779,20 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             }
             policy.insert(field.to_owned(), actual.clone());
         }
+        let properties = &value["parquet_properties"];
+        let valid_properties = properties.as_object().is_some_and(|object| {
+            object.len() == 6
+                && matches!(properties["writer_version"].as_str(), Some("v1" | "v2"))
+                && properties["write_batch_size"].as_u64().is_some_and(|value| value > 0)
+                && properties["offset_index_enabled"].is_boolean()
+                && ["max_row_group_bytes", "column_index_truncate_length", "statistics_truncate_length"]
+                    .iter().all(|field| object.get(*field).is_some_and(|value| {
+                        value.is_null() || value.as_u64().is_some_and(|number| number > 0)
+                    }))
+        });
         let record = json!({"table_id":id,"table_name":table,"config":policy,
             "parquet_columns":parquet_column_readback(&value["parquet_columns"]),
+            "parquet_properties":valid_properties.then_some(properties),
             "scope":"table_effective_at_file_construction_not_full_run_history"});
         if !records.contains(&record) {
             if records.len() >= 256 {
@@ -2350,7 +2362,10 @@ groups:
                         "parquet_columns":{
                             "value":{"compression":"zstd","compression_level":3},
                             "customer_id":{"compression":"gzip","compression_level":5}
-                        }
+                        },
+                        "parquet_properties":{"writer_version":"v2", "max_row_group_bytes":1048576,
+                            "write_batch_size":512, "offset_index_enabled":true,
+                            "column_index_truncate_length":64, "statistics_truncate_length":64}
                     })
                 ))).collect::<Result<String>>()?;
                 let tables = collector_layout_records(&config, &events)?;
@@ -2364,14 +2379,28 @@ groups:
                 let mut covered = initial.clone();
                 promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
                 for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit",
+                    "parquet_writer.writer_version", "parquet_writer.max_row_group_bytes",
+                    "parquet_writer.write_batch_size", "parquet_writer.offset_index_enabled",
+                    "parquet_writer.column_index_truncate_length", "parquet_writer.statistics_truncate_length",
                     "parquet_writer.defaults.compression", "parquet_writer.defaults.compression_level",
                     "parquet_writer.columns.customer_id.compression", "parquet_writer.columns.customer_id.compression_level"] {
                     assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
-                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"));
+                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"),
+                        "missing writer readback for {path}: {covered}");
                 }
                 let projected = |evidence: &Value, path: &str| {
                     evidence["projection_only"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
                 };
+                let mut missing_properties = process.clone();
+                missing_properties["layout_table_policies"][0]["parquet_properties"] = Value::Null;
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([missing_properties])), 1)?;
+                assert!(projected(&result, "parquet_writer.write_batch_size"));
+                let mut conflicting_properties = process.clone();
+                conflicting_properties["layout_table_policies"][1]["parquet_properties"]["write_batch_size"] = json!(1);
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([conflicting_properties])), 1)?;
+                assert!(projected(&result, "parquet_writer.write_batch_size"));
                 assert!(parquet_column_readback(&json!({"value":{"compression":"zstd","compression_level":"3"}})).is_none());
                 for columns in [
                     Value::Null,
