@@ -2100,7 +2100,7 @@ impl Platform for LocalPlatform {
         let missing_logs = self
             .stopped_collector_logs
             .lock()
-            .expect("collector logs mutex poisoned")
+            .map_err(|_| anyhow::anyhow!("collector logs mutex poisoned"))?
             .is_none();
         if result.is_err()
             && missing_logs
@@ -2109,7 +2109,7 @@ impl Platform for LocalPlatform {
             *self
                 .stopped_collector_logs
                 .lock()
-                .expect("collector logs mutex poisoned") = Some(logs);
+                .map_err(|_| anyhow::anyhow!("collector logs mutex poisoned"))? = Some(logs);
         }
         match result {
             Ok(evidence) => {
@@ -2130,7 +2130,7 @@ impl Platform for LocalPlatform {
     fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
         self.stopped_collector_logs
             .lock()
-            .expect("collector logs mutex poisoned")
+            .ok()?
             .clone()
             .map(|logs| (logs, self.maintenance_cell_baseline.clone()))
     }
@@ -9557,7 +9557,7 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     *platform
         .stopped_collector_logs
         .lock()
-        .expect("collector logs mutex poisoned") = Some(collector_logs.clone());
+        .map_err(|_| anyhow::anyhow!("collector logs mutex poisoned"))? = Some(collector_logs.clone());
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let after: Vec<Value> = serde_json::from_slice(

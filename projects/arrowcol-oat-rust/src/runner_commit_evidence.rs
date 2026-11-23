@@ -1368,7 +1368,7 @@ mod commit_evidence_tests {
         assert_eq!(
             evidence["durable_commits"]["run_cumulative_output"]["commits_by_version"]
                 .as_array()
-                .unwrap()
+                .context("missing cumulative commit versions")?
                 .len(),
             2
         );

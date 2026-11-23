@@ -394,7 +394,7 @@ mod official_cell_measurement_tests {
         assert_eq!(evidence["durable_commits"]["complete_30_second_commit_windows"][0]["teardown_outcome"], "succeeded");
         assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
         let mut pending = outcome.rows.clone();
-        let mut changed: Value = serde_json::from_str(pending[0].evidence_json.as_deref().unwrap())?;
+        let mut changed: Value = serde_json::from_str(pending[0].evidence_json.as_deref().context("missing pending evidence")?)?;
         changed["teardown_outcome"] = json!("pending");
         pending[0].evidence_json = Some(changed.to_string());
         assert!(official_measurement_bytes(&inventory, &config, &pending, None).is_err());
@@ -3041,7 +3041,7 @@ mod downstream_runner_tests {
         assert_eq!(reports[0]["phase_counters"]["measurement_window"]["windows"][0]["completed_sends"], 3);
         assert_eq!(reports[0]["phase_counters"]["measurement_window"]["windows"][0]["ambiguous_sends"], 2);
         assert_eq!(reports[1]["phase_counters"]["unavailable_reason"], "terminal_client_window_unavailable");
-        assert_eq!(platform.cancellations.lock().unwrap().len(), 2);
+        assert_eq!(platform.cancellations.lock().map_err(|_| anyhow::anyhow!("cancellation log mutex poisoned"))?.len(), 2);
         Ok(())
     }
 
