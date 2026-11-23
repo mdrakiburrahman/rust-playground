@@ -26,6 +26,7 @@ These controls are rebuild-only. The canonical profile key is `allocator=<value>
 | BOLT | Unsupported | N/A | Not configurable | Requires post-link instrumentation, profile collection and binary rewrite tooling that are not present in the image pipeline. |
 
 Every profile hash, requested field, image identity, and compiled startup value is recorded separately. A startup-profile mismatch is a failed arm, never a throughput result.
+
 ## Client data profile and identity
 
 Generator settings below apply at **process startup**.

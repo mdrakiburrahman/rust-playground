@@ -42,6 +42,7 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 | `arrowcol.optimize.batchRows` | Integer | `8192` | `Positive` | Table | 0.1 | Rows read per input batch. |
 | `arrowcol.layout.enabled` | Bool | `false` | `Any` | Table | 0.1 | Enable bounded sorted-file layout. |
 | `arrowcol.layout.sortColumns` | StringList | `customer_id` | `Any` | Table | 0.1 | Comma-separated sort columns; empty disables sorting and names must exist in the table schema. |
+| `arrowcol.layout.sortOptions` | StringList | `` | `SortOptions` | Table | 0.1 | Ordered column, direction, and null placement entries; must match sortColumns. |
 | `arrowcol.layout.bloomColumns` | StringList | `customer_id` | `Any` | Table | 0.1 | Comma-separated Bloom-filter columns; empty disables Bloom filters. |
 | `arrowcol.layout.maxRows` | Integer | `262144` | `Range(1.0, 4294967295.0)` | Table | 0.1 | Maximum rows buffered per sorted file. |
 | `arrowcol.layout.maxInputSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Maximum Arrow input retained per sorted file. |

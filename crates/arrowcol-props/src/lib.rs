@@ -304,7 +304,7 @@ pub static REGISTRY: &[PropKey] = &[
         StringList,
         "",
         Validator::SortOptions,
-        "Ordered column:ascending|descending:first|last entries; must match sortColumns."
+        "Ordered column, direction, and null placement entries; must match sortColumns."
     ),
     key!(
         "arrowcol.layout.bloomColumns",

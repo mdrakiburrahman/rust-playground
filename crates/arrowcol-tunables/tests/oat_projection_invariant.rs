@@ -259,6 +259,11 @@ enum LeafClass {
 
 fn classify(path: &str) -> LeafClass {
     match path {
+        "collector.allocator"
+        | "collector.lto"
+        | "collector.codegen_units"
+        | "collector.opt_level"
+        | "collector.target_cpu" => LeafClass::RunnerControl,
         // The OAT runner uses these to decide whether to start maintenance and its arguments.
         "maintenance.enabled" | "maintenance.operations" | "maintenance.apply" => LeafClass::RunnerControl,
         // Maintenance logging is inert when the role is disabled.
@@ -342,6 +347,14 @@ fn fixture(path: &str, value: Value) -> Value {
 }
 
 fn candidates(path: &str) -> Vec<Value> {
+    match path {
+        "collector.allocator" => return vec![json!("system")],
+        "collector.lto" => return vec![json!("off")],
+        "collector.codegen_units" => return vec![json!(16)],
+        "collector.opt_level" => return vec![json!(3)],
+        "collector.target_cpu" => return vec![json!("generic")],
+        _ => {}
+    }
     if path == "collector.commit.delta_stats_columns" {
         return vec![json!(["customer_id", "timestamp"])];
     }
