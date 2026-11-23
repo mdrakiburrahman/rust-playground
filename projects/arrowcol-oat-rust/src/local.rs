@@ -24,11 +24,11 @@ pub(crate) fn endpoint_host(host: &str) -> Result<String> {
     match &parsed {
         url::Host::Ipv4(address) => ensure!(
             !address.is_unspecified() && !address.is_multicast(),
-            "invalid endpoint address"
+            "platform.local.endpoint_host must be unicast; use the Docker bridge gateway IP, not a wildcard"
         ),
         url::Host::Ipv6(address) => ensure!(
             !address.is_unspecified() && !address.is_multicast(),
-            "invalid endpoint address"
+            "platform.local.endpoint_host must be unicast; use the Docker bridge gateway IP, not a wildcard"
         ),
         url::Host::Domain(_) => {}
     }
@@ -41,9 +41,16 @@ pub(crate) fn validate_container_endpoints(
     bind_host: Option<IpAddr>,
     endpoint: Option<&str>,
 ) -> Result<()> {
+    if let Some(endpoint) = endpoint {
+        endpoint_host(endpoint)?;
+    }
     if !containerized || host_network {
         return Ok(());
     }
+    ensure!(
+        !bind_host.is_some_and(|address| address.is_unspecified()) || endpoint.is_some(),
+        "containerized wildcard bind requires a concrete platform.local.endpoint_host; set platform.local.bind_host and platform.local.endpoint_host to the Docker bridge gateway IP"
+    );
     let bind_is_loopback = bind_host
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         .is_loopback();
@@ -564,11 +571,17 @@ mod tests {
     fn container_loopback_is_rejected_but_host_native_and_gateway_work() -> Result<()> {
         let gateway = "172.17.0.1".parse()?;
         let loopback = "127.0.0.1".parse()?;
+        let wildcard_v4 = "0.0.0.0".parse::<IpAddr>()?;
+        let wildcard_v6 = "::".parse::<IpAddr>()?;
         for (bind, endpoint) in [
             (None, None),
             (Some(loopback), Some("172.17.0.1")),
             (Some(gateway), Some("localhost")),
             (Some(gateway), Some("[::1]")),
+            (Some(wildcard_v4), None),
+            (Some(wildcard_v6), None),
+            (Some(gateway), Some("0.0.0.0")),
+            (Some(gateway), Some("::")),
         ] {
             let error = validate_container_endpoints(true, false, bind, endpoint)
                 .err()
@@ -578,8 +591,28 @@ mod tests {
             assert!(error.contains("gateway"));
         }
         validate_container_endpoints(false, false, None, None)?;
+        validate_container_endpoints(false, false, Some(wildcard_v4), Some("172.17.0.1"))?;
         validate_container_endpoints(true, true, None, None)?;
+        validate_container_endpoints(true, true, Some(wildcard_v4), None)?;
+        assert!(validate_container_endpoints(true, true, Some(wildcard_v4), Some("0.0.0.0")).is_err());
         validate_container_endpoints(true, false, Some(gateway), Some("172.17.0.1"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_wildcard_bind_uses_concrete_advertised_gateway() -> Result<()> {
+        let gateway = "172.17.0.1";
+        for bind in ["0.0.0.0", "::"] {
+            validate_container_endpoints(true, false, Some(bind.parse()?), Some(gateway))?;
+        }
+        assert_eq!(
+            published_endpoint("0.0.0.0:1234", Some(gateway), "unix:///var/run/docker.sock", "/readyz")?,
+            "http://172.17.0.1:1234/readyz"
+        );
+        for endpoint in ["0.0.0.0", "::"] {
+            assert!(endpoint_host(endpoint).is_err());
+            assert!(validate_container_endpoints(true, false, Some(gateway.parse()?), Some(endpoint)).is_err());
+        }
         Ok(())
     }
 

@@ -37,6 +37,7 @@ test("extracts commit-window rather than admission throughput", () => {
   assert.equal(result.cpuMillicoresMean, 200);
   assert.equal(result.resourceSampleCount, 2);
   assert.equal(result.rssBytesMaxObserved, null);
+  assert.ok(result.rssUnavailableReason);
   assert.match(result.rssUnavailableReason, /do not expose/);
   assert.equal(result.commitLatencySeconds.samples, 5);
   assert.equal(result.downstreamRowsPerSecond, null);

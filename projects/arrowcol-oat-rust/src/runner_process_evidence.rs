@@ -714,6 +714,46 @@ fn parquet_column_readback(value: &Value) -> Option<Value> {
     Some(value.clone())
 }
 
+fn parquet_column_options_readback(value: &Value) -> Option<Value> {
+    let columns = value.as_object()?;
+    if columns.is_empty() || columns.len() > 256 {
+        return None;
+    }
+    for (name, settings) in columns {
+        if name.is_empty() || name.len() > 128
+            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        {
+            return None;
+        }
+        let fields = settings.as_object()?;
+        if fields.len() != 10
+            || !matches!(fields.get("encoding")?, Value::Null)
+                && !matches!(fields.get("encoding")?.as_str(), Some("plain" | "rle" | "delta_binary_packed"
+                    | "delta_length_byte_array" | "delta_byte_array" | "byte_stream_split"))
+            || !matches!(fields.get("statistics")?.as_str(), Some("none" | "chunk" | "page"))
+            || ["dictionary_enabled", "write_page_header_statistics", "bloom_filter_enabled"]
+                .iter().any(|name| fields.get(*name).is_none_or(|value| !value.is_boolean()))
+            || ["dictionary_page_size_limit", "data_page_size_limit"]
+                .iter().any(|name| fields.get(*name).and_then(Value::as_u64).is_none_or(|value| value == 0))
+            || fields.get("data_page_v2_compression_ratio_threshold")?.as_f64().is_none_or(|value| !value.is_finite() || value <= 0.0)
+        {
+            return None;
+        }
+        let fpp = fields.get("bloom_filter_fpp")?;
+        let ndv = fields.get("bloom_filter_ndv")?;
+        if fields["bloom_filter_enabled"] == true {
+            if fpp.as_f64().is_none_or(|value| !value.is_finite() || !(0.0..1.0).contains(&value) || value == 0.0)
+                || ndv.as_u64().is_none_or(|value| value == 0)
+            {
+                return None;
+            }
+        } else if !fpp.is_null() || !ndv.is_null() {
+            return None;
+        }
+    }
+    Some(value.clone())
+}
+
 fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
     let tables = config
         .tables
@@ -779,8 +819,21 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             }
             policy.insert(field.to_owned(), actual.clone());
         }
+        let properties = &value["parquet_properties"];
+        let valid_properties = properties.as_object().is_some_and(|object| {
+            object.len() == 6
+                && matches!(properties["writer_version"].as_str(), Some("v1" | "v2"))
+                && properties["write_batch_size"].as_u64().is_some_and(|value| value > 0)
+                && properties["offset_index_enabled"].is_boolean()
+                && ["max_row_group_bytes", "column_index_truncate_length", "statistics_truncate_length"]
+                    .iter().all(|field| object.get(*field).is_some_and(|value| {
+                        value.is_null() || value.as_u64().is_some_and(|number| number > 0)
+                    }))
+        });
         let record = json!({"table_id":id,"table_name":table,"config":policy,
             "parquet_columns":parquet_column_readback(&value["parquet_columns"]),
+            "parquet_column_options":parquet_column_options_readback(&value["parquet_column_options"]),
+            "parquet_properties":valid_properties.then_some(properties),
             "scope":"table_effective_at_file_construction_not_full_run_history"});
         if !records.contains(&record) {
             if records.len() >= 256 {
@@ -2350,7 +2403,20 @@ groups:
                         "parquet_columns":{
                             "value":{"compression":"zstd","compression_level":3},
                             "customer_id":{"compression":"gzip","compression_level":5}
-                        }
+                        },
+                        "parquet_column_options":{
+                            "value":{"encoding":"plain","dictionary_enabled":true,"dictionary_page_size_limit":2048,
+                                "data_page_size_limit":4096,"statistics":"chunk","write_page_header_statistics":true,
+                                "bloom_filter_enabled":true,"bloom_filter_fpp":0.05,"bloom_filter_ndv":1024,
+                                "data_page_v2_compression_ratio_threshold":1.5},
+                            "customer_id":{"encoding":"delta_byte_array","dictionary_enabled":true,"dictionary_page_size_limit":1024,
+                                "data_page_size_limit":2048,"statistics":"page","write_page_header_statistics":false,
+                                "bloom_filter_enabled":true,"bloom_filter_fpp":0.1,"bloom_filter_ndv":512,
+                                "data_page_v2_compression_ratio_threshold":1.2}
+                        },
+                        "parquet_properties":{"writer_version":"v2", "max_row_group_bytes":1048576,
+                            "write_batch_size":512, "offset_index_enabled":true,
+                            "column_index_truncate_length":64, "statistics_truncate_length":64}
                     })
                 ))).collect::<Result<String>>()?;
                 let tables = collector_layout_records(&config, &events)?;
@@ -2364,14 +2430,60 @@ groups:
                 let mut covered = initial.clone();
                 promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
                 for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit",
+                    "parquet_writer.writer_version", "parquet_writer.max_row_group_bytes",
+                    "parquet_writer.write_batch_size", "parquet_writer.offset_index_enabled",
+                    "parquet_writer.column_index_truncate_length", "parquet_writer.statistics_truncate_length",
                     "parquet_writer.defaults.compression", "parquet_writer.defaults.compression_level",
-                    "parquet_writer.columns.customer_id.compression", "parquet_writer.columns.customer_id.compression_level"] {
+                    "parquet_writer.columns.customer_id.compression", "parquet_writer.columns.customer_id.compression_level",
+                    "parquet_writer.defaults.encoding", "parquet_writer.defaults.dictionary_enabled",
+                    "parquet_writer.defaults.dictionary_page_size_limit", "parquet_writer.defaults.data_page_size_limit",
+                    "parquet_writer.defaults.statistics",
+                    "parquet_writer.defaults.bloom_filter_enabled", "parquet_writer.defaults.bloom_filter_fpp",
+                    "parquet_writer.defaults.bloom_filter_ndv", "parquet_writer.defaults.data_page_v2_compression_ratio_threshold",
+                    "parquet_writer.columns.customer_id.encoding", "parquet_writer.columns.customer_id.dictionary_enabled",
+                    "parquet_writer.columns.customer_id.dictionary_page_size_limit", "parquet_writer.columns.customer_id.data_page_size_limit",
+                    "parquet_writer.columns.customer_id.statistics", "parquet_writer.columns.customer_id.write_page_header_statistics",
+                    "parquet_writer.columns.customer_id.bloom_filter_enabled", "parquet_writer.columns.customer_id.bloom_filter_fpp",
+                    "parquet_writer.columns.customer_id.bloom_filter_ndv", "parquet_writer.columns.customer_id.data_page_v2_compression_ratio_threshold"] {
                     assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
-                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"));
+                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"),
+                        "missing writer readback for {path}: {covered}");
                 }
                 let projected = |evidence: &Value, path: &str| {
                     evidence["projection_only"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
                 };
+                assert!(projected(&covered, "parquet_writer.defaults.write_page_header_statistics"));
+                let mut malformed_options = process["layout_table_policies"][0]["parquet_column_options"].clone();
+                malformed_options["value"]["dictionary_enabled"] = json!("true");
+                assert!(parquet_column_options_readback(&malformed_options).is_none());
+                let mut no_statistics = process.clone();
+                for column in ["value", "customer_id"] {
+                    no_statistics["layout_table_policies"][0]["parquet_column_options"][column]["statistics"] = json!("none");
+                }
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([no_statistics])), 1)?;
+                assert!(projected(&result, "parquet_writer.column_index_truncate_length"));
+                assert!(projected(&result, "parquet_writer.statistics_truncate_length"));
+                let mut missing_properties = process.clone();
+                missing_properties["layout_table_policies"][0]["parquet_properties"] = Value::Null;
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([missing_properties])), 1)?;
+                assert!(projected(&result, "parquet_writer.write_batch_size"));
+                let mut disabled_column = process.clone();
+                disabled_column["layout_table_policies"][0]["parquet_column_options"]["customer_id"]["dictionary_enabled"] = json!(false);
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([disabled_column])), 1)?;
+                assert!(projected(&result, "parquet_writer.columns.customer_id.dictionary_page_size_limit"));
+                let mut wrong_column = process.clone();
+                wrong_column["layout_table_policies"][1]["parquet_column_options"]["value"]["encoding"] = json!("rle");
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([wrong_column])), 1)?;
+                assert!(projected(&result, "parquet_writer.defaults.encoding"));
+                let mut conflicting_properties = process.clone();
+                conflicting_properties["layout_table_policies"][1]["parquet_properties"]["write_batch_size"] = json!(1);
+                let mut result = initial.clone();
+                promote_collector_readback(&config, &mut result, Some(&json!([conflicting_properties])), 1)?;
+                assert!(projected(&result, "parquet_writer.write_batch_size"));
                 assert!(parquet_column_readback(&json!({"value":{"compression":"zstd","compression_level":"3"}})).is_none());
                 for columns in [
                     Value::Null,

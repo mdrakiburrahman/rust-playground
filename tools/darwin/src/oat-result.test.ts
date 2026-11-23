@@ -160,7 +160,7 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       commits_by_version: [receipt, receipt, later] };
     const clients = [3, 2].map((completed_rows, index) => ({
       ...reportFor("realistic"),
-      execution_image: { source: "docker_container_inspect", image_id: `sha256:${"e".repeat(64)}` },
+      execution_image: { source: "docker_container_inspect", image_id: `sha256:${"e".repeat(64)}`, source_revision: "c".repeat(40) },
       consumer_effective_config: { workers: 14, streams_per_worker: 2 },
       phase_counters: { ...reportFor("realistic").phase_counters,
         payload_manifest: { ...reportFor("realistic").phase_counters.payload_manifest,
@@ -178,6 +178,10 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
             first_send_unix_ns: 123456789, last_outcome_unix_ms: start + 1000 }] },
         process_cumulative: { completed_rows, ambiguous_rows: 0 } },
     }));
+    const startupWriterDefaults: { compression: string | null; compression_level: number | null } = {
+      compression: null, compression_level: null,
+    };
+    const admissionWriterDefaults: { compression: string | null } = { compression: null };
     const evidence = {
       version: 1,
       inert_fields: [{ path: "logging.maintenance", reason: "maintenance_disabled" }],
@@ -190,13 +194,13 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
       processes: [{ component: "collector", source_revision: revision, log_complete: true,
         image_id: `sha256:${"b".repeat(64)}`, effective_config_source: "consumer_startup_readback",
         effective_config: { commit_telemetry: { schema_version: 1, scope: "new_ingestion_addfiles_after_sync", clock: "system_unix_ms" } },
-        writer_policy_overrides: { defaults: { compression: null, compression_level: null },
+        writer_policy_overrides: { defaults: startupWriterDefaults,
           columns: {}, max_row_group_rows: null } }],
       client_phase_reports: clients,
       client_schedule: { effective: { run_start_unix_ms: start - 50 } },
       parity_admission_readback: { status: "verified_before_schedule", observed_at_unix_ms: start - 75,
         collector_image_id: `sha256:${"b".repeat(64)}`,
-        collector: { parquet_writer: { defaults: { compression: null }, columns: {} } } },
+        collector: { parquet_writer: { defaults: admissionWriterDefaults, columns: {} } } },
       preload_delta: { table: `telemetry.sqlserver.${table}`, latest_version: 0, observed_at_unix_ms: start - 100,
         partition_columns: ["__arrowcol_ingestion"], granularity: "hour",
         logs: [{ version: 0, sha256: sha(files["_delta_log/00000000000000000000.json"]!) }] },
@@ -218,6 +222,36 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
           window_seconds: 30, rows: i === 0 ? 3 : 0, parquet_bytes: i === 0 ? first.length : 0,
         })),
       },
+      backlog: { samples: [{
+        request_start_unix_ms: start + 500, request_end_unix_ms: start + 600,
+        pipeline_stage_metrics: { temporality: "cumulative_process_lifetime_snapshot", stage_duration_seconds: { encode: { count: 2 } }, submission_wait_seconds: { count: 3 } },
+        pipeline_stage_metrics_unavailable_reason: null,
+      }], samples_dropped: 0 },
+      overload_guard: {
+        admission_diagnostics: { pressure_http_timings: [
+          { started_at_ms: start - 10, elapsed_ms: 5, status: "ok" },
+          { started_at_ms: start + 100, elapsed_ms: 50, status: "ok" },
+          { started_at_ms: start + 200, elapsed_ms: 1600, status: "timeout" },
+          { started_at_ms: end - 1000, elapsed_ms: 1001, status: "ok" },
+          { started_at_ms: end + 10, elapsed_ms: 5, status: "ok" },
+        ], pressure_http_timing_dropped: 0 },
+        complete_windows: [
+          { index: 0, start_ms: start, end_ms: start + 30000, ingestion_commits: 0, covered: true, outstanding: true },
+          { index: 1, start_ms: start + 30000, end_ms: start + 60000, ingestion_commits: 1, covered: true, outstanding: true },
+          { index: 2, start_ms: start - 30000, end_ms: start, ingestion_commits: 0, covered: true, outstanding: true },
+          { index: 3, start_ms: end - 1000, end_ms: end + 1, ingestion_commits: 0, covered: true, outstanding: true },
+          { index: 4, start_ms: end, end_ms: end + 30000, ingestion_commits: 0, covered: true, outstanding: true },
+        ],
+        collector_rss_samples_scope: "guard_lifetime",
+        collector_rss_samples: [
+          { sampled_at_unix_ms: start - 50, acquisition_start_unix_ms: start - 60, acquisition_end_unix_ms: start - 50, rss_bytes: 900, cap_bytes: 1000 },
+          { sampled_at_unix_ms: start + 60, acquisition_start_unix_ms: start + 50, acquisition_end_unix_ms: start + 60, rss_bytes: 100, cap_bytes: 1000 },
+          { sampled_at_unix_ms: start + 1, acquisition_start_unix_ms: start - 1, acquisition_end_unix_ms: start + 1, rss_bytes: 800, cap_bytes: 1000 },
+          { sampled_at_unix_ms: end - 1, acquisition_start_unix_ms: end - 2, acquisition_end_unix_ms: end, rss_bytes: 700, cap_bytes: 1000 },
+          { sampled_at_unix_ms: end + 10, acquisition_start_unix_ms: end + 5, acquisition_end_unix_ms: end + 10, rss_bytes: 600, cap_bytes: 1000 },
+        ],
+        collector_rss_samples_dropped: 0,
+      },
       resources: { samples: [] }, downstream_status: "unavailable", downstream_comment: "not measured",
     };
     await writeSnapshot();
@@ -232,12 +266,12 @@ test("diagnostic Realistic reconciles whole-snapshot identities and deduplicated
     const originalNumber = '"first_send_unix_ns":123456789';
     const exactNumber = '"first_send_unix_ns":1795385557123456789';
     const fragments = clients.map(client => JSON.stringify(client.phase_counters.payload_manifest).replace(originalNumber, exactNumber));
-    const evidenceBytes = () => JSON.stringify(evidence).replaceAll(originalNumber, exactNumber);
+    const evidenceBytes = (value: object = evidence) => JSON.stringify(value).replaceAll(originalNumber, exactNumber);
     const resultPath = join(root, "results.parquet");
-    const writeResult = async () => {
+    const writeResult = async (value: object = evidence) => {
       const row = tableFromArrays({
         schema_version: [3], mode: ["local"], table: [table], status: ["succeeded"], git_sha: [revision],
-        pinning_ok: [true], replicas: [1], run_id: [run], evidence_json: [evidenceBytes()],
+        pinning_ok: [true], replicas: [1], run_id: [run], evidence_json: [evidenceBytes(value)],
       });
       await writeFile(resultPath, writeParquet(WasmTable.fromIPCStream(tableToIPC(row, "stream"))));
     };
@@ -294,6 +328,8 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
         parity, { tools, outputDir }, option);
     };
     const result = await read();
+    assert.deepEqual(decoded.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
+    decoded.length = 0;
     assert.equal(DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION, 1);
     assert.equal(DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION, 1);
     assert.equal(result.kind, "diagnostic-only");
@@ -329,7 +365,6 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(result.measurement.rows, 3);
     assert.equal(result.activeRows, 5);
     assert.equal(result.measurement.durableRowsPerSecond, 3 / 150);
-    assert.deepEqual(decoded.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
     evidence.consumer_verified.push({ path: "client.workers", reason: "consumer_startup_readback" });
     await writeResult();
     await assert.rejects(read(), /invalid consumer_verified/);
@@ -339,6 +374,50 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     await assert.rejects(read(), /duplicate tunable coverage path/);
     evidence.runner_controls.pop();
     await writeResult();
+    assert.deepEqual(result.measurement.completeBucketRows.map(bucket => bucket.rows), [3, 0, 0, 0, 0]);
+    assert.equal(result.diagnosticTelemetry.pressure_http_timings.scope, "guard_lifetime");
+    assert.equal(result.diagnosticTelemetry.pressure_http_timings.count, 5);
+    assert.equal(result.diagnosticTelemetry.measurement_pressure_http_timings.scope, "measurement_window");
+    assert.equal(result.diagnosticTelemetry.measurement_pressure_http_timings.count, 2);
+    assert.equal(result.diagnosticTelemetry.measurement_pressure_http_timings.p50_ms, 50);
+    assert.equal(result.diagnosticTelemetry.measurement_pressure_http_timings.p95_ms, 1600);
+    assert.equal(result.diagnosticTelemetry.measurement_pressure_http_timings.slow_or_timed_out_samples?.length, 1);
+    assert.equal(result.diagnosticTelemetry.complete_windows_scope, "guard_evidence");
+    assert.equal(result.diagnosticTelemetry.measurement_complete_windows?.length, 2);
+    assert.equal(result.diagnosticTelemetry.zero_progress_window_count, 1);
+    assert.equal(result.diagnosticTelemetry.zero_progress_window_count_scope, "measurement_window");
+    assert.equal(result.diagnosticTelemetry.collector_rss_samples_scope, "guard_lifetime");
+    assert.equal(result.diagnosticTelemetry.collector_rss_samples?.length, 5);
+    assert.equal(result.diagnosticTelemetry.collector_rss_measurement_samples?.length, 1);
+    assert.equal(result.diagnosticTelemetry.collector_rss_measurement_samples?.[0]!.rss_bytes, 100);
+    assert.equal(result.measurement.rssBytesMaxObserved, 100);
+    assert.equal(result.measurement.rssUnavailableReason, null);
+    assert.equal(result.clientImageSourceRevision, "c".repeat(40));
+    assert.equal(result.clientImageSourceRevisionUnavailableReason, null);
+    assert.equal(result.diagnosticTelemetry.pipeline_metric_samples?.length, 1);
+    assert.equal(result.diagnosticTelemetry.pipeline_metric_samples_temporality, "cumulative_process_lifetime_snapshot");
+    const { overload_guard: omittedGuard, ...withoutGuardEvidence } = evidence;
+    assert.ok(omittedGuard);
+    await writeResult(withoutGuardEvidence);
+    const withoutGuard = await read();
+    assert.equal(withoutGuard.diagnosticTelemetry.pipeline_metric_samples?.length, 1);
+    assert.equal(withoutGuard.diagnosticTelemetry.pressure_http_timings.count, null);
+    assert.equal(withoutGuard.diagnosticTelemetry.pipeline_metrics_unavailable_reason, null);
+    assert.equal(withoutGuard.measurement.rssBytesMaxObserved, null);
+    assert.match(withoutGuard.measurement.rssUnavailableReason ?? "", /guard evidence is missing/);
+    const withoutWindowRssEvidence = {
+      ...evidence,
+      overload_guard: {
+        ...evidence.overload_guard,
+        collector_rss_samples: evidence.overload_guard.collector_rss_samples.filter(sample => sample.rss_bytes !== 100),
+      },
+    };
+    await writeResult(withoutWindowRssEvidence);
+    const withoutWindowRss = await read();
+    assert.equal(withoutWindowRss.measurement.rssBytesMaxObserved, null);
+    assert.match(withoutWindowRss.measurement.rssUnavailableReason ?? "", /no collector RSS acquisition lies wholly inside/);
+    await writeResult();
+    assert.equal(result.diagnosticTelemetry.client_send_stalls, null);
     await assert.rejects(readReconciledOatResult(resultPath, join(root, "snapshots"), table, revision,
       { codec: "zstd", level: 3 }, "realistic", undefined, { tools, outputDir: root }, diagnostic),
     /requires the unchanged default writer/);
@@ -360,15 +439,15 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     await assert.rejects(read({ ...diagnostic, decodeFile: async () => 99 }), /decoded rows differ from footer/);
     await assert.rejects(read({ ...diagnostic, expectedClientConfig: { workers: 8, streams_per_worker: 2 } }), /readback differs/);
     const startupWriter = evidence.processes[0]!.writer_policy_overrides;
-    (startupWriter.defaults as Record<string, unknown>).compression = "zstd";
+    startupWriter.defaults.compression = "zstd";
     await writeResult();
     await assert.rejects(read(), /collector writer readback contains an override/);
-    (startupWriter.defaults as Record<string, unknown>).compression = null;
+    startupWriter.defaults.compression = null;
     const admissionWriter = evidence.parity_admission_readback.collector.parquet_writer;
-    (admissionWriter.defaults as Record<string, unknown>).compression = "zstd";
+    admissionWriter.defaults.compression = "zstd";
     await writeResult();
     await assert.rejects(read(), /pre-admission writer readback contains an override/);
-    (admissionWriter.defaults as Record<string, unknown>).compression = null;
+    admissionWriter.defaults.compression = null;
     evidence.parity_admission_readback.collector_image_id = `sha256:${"c".repeat(64)}`;
     await writeResult();
     await assert.rejects(read(), /pre-admission collector identity or timing/);
@@ -498,7 +577,7 @@ test("rejects profile, hash contract, unavailable, and truncated evidence", () =
 
 test("extends the frozen window with complete stopped collector receipts", () => {
   const measurement: OatMeasurement = {
-    startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: 60, files: 1, commits: 1, completeBuckets: 5,
+    startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: 60, files: 1, commits: 1, completeBuckets: 5, completeBucketRows: [],
     durableRowsPerSecond: 3 / 150, parquetBytesPerRow: 20,
     commitLatencySeconds: { p50: 0.1, p99: 0.1, samples: 1 },
     cpuMillicoresMean: null, memoryBytesMaxObserved: null, rssBytesMaxObserved: null,

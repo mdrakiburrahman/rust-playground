@@ -188,7 +188,9 @@ impl GuardEngine {
     fn new(settings: crate::config::OverloadGuardConfig) -> Self {
         Self {
             proof: json!({"status":"monitoring","settings":settings,"sample_count":0,"peak_cap_fraction":0.0,
-                "max_sampling_gap_ms":0,"complete_windows":[],"disk":{"status":"not_applicable","reason":"memory_only"}}),
+                "max_sampling_gap_ms":0,"complete_windows":[],"collector_rss_samples_scope":"guard_lifetime",
+                "collector_rss_samples":[],"collector_rss_samples_dropped":0,"collector_rss_unavailable_reason":null,
+                "disk":{"status":"not_applicable","reason":"memory_only"}}),
             settings,
             start: None,
             end: None,
@@ -257,6 +259,32 @@ impl GuardEngine {
         self.proof["coverage_end_ms"] = json!(reading.request_start_ms);
         if self.proof["coverage_start_ms"].is_null() {
             self.proof["coverage_start_ms"] = json!(reading.request_start_ms);
+        }
+        let rss = reading.caps.iter().find(|cap| cap.metric == "collector_rss_bytes");
+        if let Some(rss) = rss {
+            let samples = self.proof["collector_rss_samples"]
+                .as_array_mut()
+                .context("collector RSS sample evidence missing")?;
+            let dropped = samples.len() == 4096;
+            if dropped {
+                samples.remove(0);
+            }
+            samples.push(json!({
+                "sampled_at_unix_ms": reading.timestamp_ms,
+                "acquisition_start_unix_ms": reading.request_start_ms,
+                "acquisition_end_unix_ms": reading.timestamp_ms,
+                "rss_bytes": rss.observed_value,
+                "cap_bytes": rss.cap,
+            }));
+            self.proof["collector_rss_unavailable_reason"] = Value::Null;
+            if dropped {
+                let count = self.proof["collector_rss_samples_dropped"]
+                    .as_u64()
+                    .context("collector RSS dropped counter missing")?;
+                self.proof["collector_rss_samples_dropped"] = json!(count + 1);
+            }
+        } else {
+            self.proof["collector_rss_unavailable_reason"] = json!("process_rss_not_in_selected_guard_caps");
         }
         for cap in &reading.caps {
             let fraction = cap.observed_value as f64 / cap.cap as f64;
@@ -1227,6 +1255,14 @@ enum GuardSignal {
 #[cfg(test)]
 mod overload_guard_tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn serve_readiness(listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        }
+    }
 
     #[test]
     fn guard_http_log_filter_handles_chunk_boundaries_and_partial_records() -> Result<()> {
@@ -1702,6 +1738,8 @@ mod overload_guard_tests {
             let after = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let old = before.local_addr()?.port();
             let new = after.local_addr()?.port();
+            let before_ready = tokio::spawn(serve_readiness(before));
+            let after_ready = tokio::spawn(serve_readiness(after));
             let mut state = json!({"scaled":false,"before":{"router":old,"dataflow-1":old,"kusto":old},
                 "after":{"router":new,"dataflow-1":new,"kusto":new}});
             fs::write(root.join("state.json"), state.to_string())?;
@@ -1810,6 +1848,8 @@ mod overload_guard_tests {
             assert!(platform.qap_url.is_none());
             let commands = fs::read_to_string(root.join("commands"))?;
             assert!(!commands.contains("oat-client"));
+            before_ready.abort();
+            after_ready.abort();
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -2299,6 +2339,8 @@ mod overload_guard_tests {
                 logical_bytes: Some(rows * 10),
                 oldest_age_seconds: Some(0.0),
                 status: "available".to_owned(),
+                pipeline_stage_metrics: None,
+                pipeline_stage_metrics_unavailable_reason: Some("not_scraped_in_test_fixture".to_owned()),
             },
             time,
             time,
@@ -2681,6 +2723,11 @@ mod overload_guard_tests {
         let public = evidence.for_table("table", None);
         assert_eq!(public["overload_stop"], stop);
         assert_eq!(public["overload_guard"]["status"], "triggered");
+        assert_eq!(public["overload_guard"]["collector_rss_samples_scope"], "guard_lifetime");
+        assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["rss_bytes"], 10);
+        assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["sampled_at_unix_ms"], 0);
+        assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["acquisition_start_unix_ms"], 0);
+        assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["acquisition_end_unix_ms"], 0);
         assert_eq!(evidence.resource_samples.len(), 1);
         let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"

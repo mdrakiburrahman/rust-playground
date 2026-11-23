@@ -2486,6 +2486,7 @@ impl LayoutReadback {
         )?;
         let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
         let mut parquet_columns = serde_json::Map::new();
+        let mut parquet_column_options = serde_json::Map::new();
         let mut columns_unavailable = descriptor.columns().len() > 256;
         for column in descriptor.columns().iter().take(256) {
             use parquet::basic::Compression;
@@ -2508,6 +2509,36 @@ impl LayoutReadback {
             {
                 columns_unavailable = true;
             }
+            use parquet::basic::Encoding;
+            use parquet::file::properties::EnabledStatistics;
+            let path = column.path();
+            let encoding = match properties.encoding(path) {
+                Some(Encoding::PLAIN) => Some("plain"),
+                Some(Encoding::RLE) => Some("rle"),
+                Some(Encoding::DELTA_BINARY_PACKED) => Some("delta_binary_packed"),
+                Some(Encoding::DELTA_LENGTH_BYTE_ARRAY) => Some("delta_length_byte_array"),
+                Some(Encoding::DELTA_BYTE_ARRAY) => Some("delta_byte_array"),
+                Some(Encoding::BYTE_STREAM_SPLIT) => Some("byte_stream_split"),
+                _ => None,
+            };
+            let statistics = match properties.statistics_enabled(path) {
+                EnabledStatistics::None => "none",
+                EnabledStatistics::Chunk => "chunk",
+                EnabledStatistics::Page => "page",
+            };
+            let bloom = properties.bloom_filter_properties(path);
+            parquet_column_options.insert(path.string(), serde_json::json!({
+                "encoding":encoding,
+                "dictionary_enabled":properties.dictionary_enabled(path),
+                "dictionary_page_size_limit":properties.column_dictionary_page_size_limit(path),
+                "data_page_size_limit":properties.column_data_page_size_limit(path),
+                "statistics":statistics,
+                "write_page_header_statistics":properties.write_page_header_statistics(path),
+                "bloom_filter_enabled":bloom.is_some(),
+                "bloom_filter_fpp":bloom.map(|value| value.fpp),
+                "bloom_filter_ndv":bloom.map(|value| value.ndv),
+                "data_page_v2_compression_ratio_threshold":properties.column_data_page_v2_compression_ratio_threshold(path),
+            }));
         }
         if self.enabled {
             let bloom_columns = descriptor
@@ -2549,6 +2580,18 @@ impl LayoutReadback {
             "table_property_overrides": self.table_property_overrides,
             "config": config,
             "parquet_columns": (!columns_unavailable).then_some(parquet_columns),
+            "parquet_column_options": (!columns_unavailable).then_some(parquet_column_options),
+            "parquet_properties": {
+                "writer_version": match properties.writer_version() {
+                    parquet::file::properties::WriterVersion::PARQUET_1_0 => "v1",
+                    parquet::file::properties::WriterVersion::PARQUET_2_0 => "v2",
+                },
+                "max_row_group_bytes": properties.max_row_group_bytes(),
+                "write_batch_size": properties.write_batch_size(),
+                "offset_index_enabled": !properties.offset_index_disabled(),
+                "column_index_truncate_length": properties.column_index_truncate_length(),
+                "statistics_truncate_length": properties.statistics_truncate_length(),
+            },
         }))
     }
 }
@@ -5542,7 +5585,18 @@ mod layout_readback_tests {
         let parquet: crate::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
             "max_row_group_rows": 3,
             "data_page_row_count_limit": 1,
-            "columns": {"customer_id": {"bloom_filter_enabled": true}}
+            "writer_version": "v2",
+            "max_row_group_bytes": 2048,
+            "write_batch_size": 5,
+            "offset_index_enabled": true,
+            "column_index_truncate_length": 32,
+            "statistics_truncate_length": 64,
+            "columns": {"customer_id": {
+                "encoding":"delta_byte_array", "dictionary_enabled":true, "dictionary_page_size_limit":1024,
+                "data_page_size_limit":2048, "statistics":"chunk", "write_page_header_statistics":false,
+                "bloom_filter_enabled":true, "bloom_filter_fpp":0.1, "bloom_filter_ndv":512,
+                "data_page_v2_compression_ratio_threshold":1.2
+            }}
         }))?;
         let url = Url::parse("file:///safe/catalog/schema/events/")?;
         let event = readback.event(&url, &parquet)?;
@@ -5557,6 +5611,23 @@ mod layout_readback_tests {
         assert_eq!(event["config"]["bloom_columns"], serde_json::json!(["customer_id"]));
         assert_eq!(event["config"]["row_group_rows"], 3);
         assert_eq!(event["config"]["page_rows"], 1);
+        assert_eq!(
+            event["parquet_column_options"]["customer_id"],
+            serde_json::json!({
+                "encoding":"delta_byte_array", "dictionary_enabled":true, "dictionary_page_size_limit":1024,
+                "data_page_size_limit":2048, "statistics":"chunk", "write_page_header_statistics":false,
+                "bloom_filter_enabled":true, "bloom_filter_fpp":0.1, "bloom_filter_ndv":512,
+                "data_page_v2_compression_ratio_threshold":1.2
+            })
+        );
+        assert_eq!(event["parquet_column_options"]["value"]["bloom_filter_enabled"], false);
+        assert_eq!(
+            event["parquet_properties"],
+            serde_json::json!({
+                "writer_version":"v2", "max_row_group_bytes":2048, "write_batch_size":5,
+                "offset_index_enabled":true, "column_index_truncate_length":32, "statistics_truncate_length":64
+            })
+        );
         assert_eq!(
             event["precedence"],
             serde_json::json!(["table_properties", "process_policy", "registry_defaults"])

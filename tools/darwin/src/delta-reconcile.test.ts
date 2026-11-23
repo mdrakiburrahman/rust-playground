@@ -50,7 +50,7 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       finished_at: "2026-01-01T00:00:00Z", oom_killed: false,
     }] }));
     const measurement: OatMeasurement = {
-      startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: one.length, files: 1, commits: 1, completeBuckets: 5,
+      startUnixMs: 1000, endUnixMs: 151000, rows: 3, parquetBytes: one.length, files: 1, commits: 1, completeBuckets: 5, completeBucketRows: [],
       durableRowsPerSecond: 3 / 150, parquetBytesPerRow: one.length / 3,
       commitLatencySeconds: { p50: 0.1, p99: 0.1, samples: 1 },
       cpuMillicoresMean: null, memoryBytesMaxObserved: null, rssBytesMaxObserved: null,
