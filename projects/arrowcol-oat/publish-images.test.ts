@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -277,6 +278,20 @@ test('publishes the static viewer to the stamped root website through the federa
   }
   assert.ok(!m.calls.some(command => command[0] === 'docker'));
   assert.equal(fs.existsSync(m.cache()), false);
+});
+
+test('builds the collector image at its canonical profile-hash tag', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry);
+  const profile = { allocator: 'mimalloc', lto: 'thin', codegen_units: 8, opt_level: 2, target_cpu: 'x86-64-v3' } as const;
+  const hash = createHash('sha256').update('allocator=mimalloc;lto=thin;codegen_units=8;opt_level=2;target_cpu=x86-64-v3').digest('hex');
+  await buildLocalImages({ revision, profile }, m.runner);
+  const collector = m.calls.find(command => command[0] === 'docker' && command[1] === 'buildx' && command.includes('projects/arrowcol-dataflow-rust/Dockerfile'));
+  assert.ok(collector);
+  assert.equal(collector[collector.indexOf('--tag') + 1], 'arrowcol-oat/dataflow:profile-' + hash);
+  for (const argument of ['PROFILE_HASH=' + hash, 'BUILD_ALLOCATOR=mimalloc', 'BUILD_LTO=thin',
+    'BUILD_CODEGEN_UNITS=8', 'BUILD_OPT_LEVEL=2', 'BUILD_TARGET_CPU=x86-64-v3',
+    'org.opencontainers.image.profile=' + hash]) assert.ok(collector.includes(argument), argument);
 });
 
 test('opt-in maintenance verifies a sixth immutable revision, while legacy setup still uses five', async t => {
