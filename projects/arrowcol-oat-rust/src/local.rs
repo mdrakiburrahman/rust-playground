@@ -571,7 +571,8 @@ mod tests {
             (Some(gateway), Some("[::1]")),
         ] {
             let error = validate_container_endpoints(true, false, bind, endpoint)
-                .unwrap_err()
+                .err()
+                .context("container loopback was accepted")?
                 .to_string();
             assert!(error.contains("platform.local.bind_host") && error.contains("platform.local.endpoint_host"));
             assert!(error.contains("gateway"));
