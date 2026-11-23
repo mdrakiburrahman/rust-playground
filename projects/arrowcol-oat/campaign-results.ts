@@ -598,7 +598,8 @@ export function publicationBacklogIssue(value: unknown, start: number, end: numb
   return undefined;
 }
 
-const guardCapMetrics = ['container_memory_bytes', 'collector_rss_bytes', 'collector_buffered_bytes'];
+const guardCapMetrics = ['container_memory_bytes', 'collector_rss_bytes',
+  'collector_cgroup_memory_bytes', 'collector_buffered_bytes'];
 
 function overloadStopIssue(evidence: RecordValue): string | undefined {
   const stop = evidence.overload_stop;
@@ -622,6 +623,10 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
   const enabled = requested.enabled === undefined ? true : requested.enabled;
   const fraction = requested.cap_fraction === undefined ? 0.9 : requested.cap_fraction;
   const zeroWindows = requested.zero_progress_windows === undefined ? 2 : requested.zero_progress_windows;
+  const memorySignal = requested.memory_signal === undefined ? 'process_rss' : requested.memory_signal;
+  if (memorySignal !== 'process_rss' && memorySignal !== 'cgroup_memory') return invalid;
+  const metrics = ['container_memory_bytes', memorySignal === 'cgroup_memory' ?
+    'collector_cgroup_memory_bytes' : 'collector_rss_bytes', 'collector_buffered_bytes'];
   const warmup = nonNegativeInteger(config.warmup_seconds);
   if (enabled !== true || typeof fraction !== 'number' || !Number.isFinite(fraction) || fraction <= 0 || fraction > 0.9 ||
       nonNegativeInteger(zeroWindows) === undefined || Number(zeroWindows) < 1 || Number(zeroWindows) > 2 ||
@@ -632,6 +637,12 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
   const platform = isRecord(config.platform) ? config.platform : undefined;
   const local = platform && isRecord(platform.local) ? platform.local : undefined;
   const requestedCap = local?.collector_memory_limit_bytes;
+  const tunables = isRecord(config.tunables) ? config.tunables : undefined;
+  const collector = tunables && isRecord(tunables.collector) ? tunables.collector : undefined;
+  const pressure = collector && isRecord(collector.pressure) ? collector.pressure : undefined;
+  const requestedRssCap = pressure?.rss_limit_bytes;
+  if (memorySignal === 'cgroup_memory' &&
+      (nonNegativeInteger(requestedRssCap) === undefined || Number(requestedRssCap) === 0)) return invalid;
   if (requestedCap !== undefined && requestedCap !== null &&
       (nonNegativeInteger(requestedCap) === undefined || Number(requestedCap) < 8388608 || Number(requestedCap) > 1099511627776)) return invalid;
   if (guard.requested_container_memory_limit_bytes !== (requestedCap ?? null)) return invalid;
@@ -640,15 +651,18 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
       guard.run_start_ms !== expectedStart || guard.measurement_end_ms !== end ||
       !isRecord(guard.settings) || guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
       guard.settings.zero_progress_windows !== zeroWindows ||
+      (guard.settings.memory_signal ?? 'process_rss') !== memorySignal ||
       nonNegativeInteger(guard.coverage_start_ms) === undefined || Number(guard.coverage_start_ms) > expectedStart ||
       nonNegativeInteger(guard.coverage_end_ms) === undefined || Number(guard.coverage_end_ms) < end ||
       nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > 5000 ||
       nonNegativeInteger(guard.sample_count) === undefined || Number(guard.sample_count) < Math.ceil((end - expectedStart) / 5000) + 1 ||
       typeof guard.peak_cap_fraction !== 'number' || !Number.isFinite(guard.peak_cap_fraction) ||
       guard.peak_cap_fraction < 0 || guard.peak_cap_fraction >= fraction ||
-      !Array.isArray(caps) || caps.length !== guardCapMetrics.length ||
+      !Array.isArray(caps) || caps.length !== metrics.length ||
       requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === 'container_memory_bytes' && cap.cap === requestedCap) ||
-      !guardCapMetrics.every(metric =>
+      memorySignal === 'cgroup_memory' && !caps.some(cap => isRecord(cap) && cap.metric === 'collector_cgroup_memory_bytes' &&
+        cap.cap === requestedRssCap && typeof cap.observed_value === 'number' && cap.observed_value > 0) ||
+      !metrics.every(metric =>
         caps.filter(cap => isRecord(cap) && cap.metric === metric && cap.confirmed === true &&
           nonNegativeInteger(cap.observed_value) !== undefined && nonNegativeInteger(cap.cap) !== undefined &&
           Number(cap.cap) > 0 && Number(cap.observed_value) / Number(cap.cap) < fraction).length === 1) ||
