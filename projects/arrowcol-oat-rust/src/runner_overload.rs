@@ -1788,6 +1788,17 @@ mod overload_guard_tests {
             );
             assert!(platform.collector_metrics_url.is_some());
 
+            state["fail"] = Value::Null;
+            state["routerExited"] = json!(true);
+            fs::write(root.join("state.json"), state.to_string())?;
+            let error = local_compose_endpoint(&config, &platform, "router", "50050", "/metrics")
+                .await
+                .err()
+                .context("exited router unexpectedly admitted")?;
+            assert!(error.to_string().contains("state=exited exit_code=17"));
+            assert!(error.to_string().contains("fixture router failed"));
+            state["routerExited"] = json!(false);
+
             state["fail"] = json!("router");
             fs::write(root.join("state.json"), state.to_string())?;
             assert!(
