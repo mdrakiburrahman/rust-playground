@@ -2599,7 +2599,7 @@ fn prefetch_inputs<T>(
         }
         while !pending.is_empty() {
             control.check()?;
-            let (key, task) = pending.pop_front().expect("pending input exists");
+            let Some((key, task)) = pending.pop_front() else { break };
             let bytes = executor.block_on(async move { task.await.context("input prefetch task failed")? })?;
             control.check()?;
             consume(&key, bytes)?;
