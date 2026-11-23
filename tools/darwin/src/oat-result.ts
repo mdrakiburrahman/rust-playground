@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
@@ -30,6 +30,34 @@ export function assertParityProcessRevision(
 }
 
 export type ClientDataProfile = "diagnostic" | "realistic";
+
+export const DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION = 1;
+export const DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION = 1;
+
+function assertDiagnosticDefaultWriter(evidence: JsonObject, collector: JsonObject): void {
+  const hasOverride = (value: unknown): boolean => {
+    if (value == null) return false;
+    if (Array.isArray(value)) return value.length !== 0;
+    if (typeof value === "object") return Object.values(value).some(hasOverride);
+    return true;
+  };
+  const check = (value: unknown, label: string) => {
+    const writer = object(value, label);
+    object(writer.defaults, `${label} defaults`);
+    object(writer.columns, `${label} columns`);
+    if (hasOverride(writer)) throw new Error(`${label} contains an override`);
+  };
+  check(collector.writer_policy_overrides, "collector writer readback");
+  const admission = object(evidence.parity_admission_readback, "pre-admission readback");
+  const schedule = object(object(evidence.client_schedule, "client schedule").effective, "effective client schedule");
+  if (admission.status !== "verified_before_schedule" || !Number.isSafeInteger(admission.observed_at_unix_ms)
+    || !Number.isSafeInteger(schedule.run_start_unix_ms)
+    || Number(admission.observed_at_unix_ms) >= Number(schedule.run_start_unix_ms)
+    || typeof admission.collector_image_id !== "string" || admission.collector_image_id !== collector.image_id) {
+    throw new Error("pre-admission collector identity or timing is unavailable");
+  }
+  check(object(admission.collector, "pre-admission collector").parquet_writer, "pre-admission writer readback");
+}
 
 export function wasmCompression(spec: CompressionSpec): Compression {
   switch (spec.codec) {
@@ -180,27 +208,46 @@ export async function readReconciledOatResult(
     allowWriterOverrides?: boolean;
   },
   identity?: { tools: IdentityTools; outputDir: string; collectorRevision?: string },
+  diagnostic?: {
+    diagnosticOnlyRealistic: true; decodeFile: (path: string, active: boolean) => Promise<number>;
+    expectedClientConfig: { workers: number; streams_per_worker: number }; collectorRevision?: string;
+  },
 ): Promise<{
-  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; clientEvidences: ClientEvidence[]; activeRows: number; snapshotVersion: number;
+  measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; clientEvidences: ClientEvidence[];
+  clientEffectiveConfigs: JsonObject[]; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   parityTelemetry: JsonObject | null;
   deliveryIdentity: JsonObject | null;
+  diagnosticOnlyRealistic: boolean; diagnosticRealisticReconciliationVersion: number | null;
+  kind?: "diagnostic-only";
   cellRunId: string; snapshotReconciled: true;
 }> {
+  if (diagnostic && (diagnostic.diagnosticOnlyRealistic !== true || requestedProfile !== "realistic"
+    || typeof diagnostic.decodeFile !== "function" || parity || !identity?.tools
+    || typeof identity.outputDir !== "string" || identity.outputDir.length === 0)) {
+    throw new Error("diagnostic-only Realistic reconciliation requires a physical decoder and identity tools, without parity qualification");
+  }
+  if (diagnostic && (!Number.isSafeInteger(diagnostic.expectedClientConfig?.workers)
+    || diagnostic.expectedClientConfig.workers < 1 || diagnostic.expectedClientConfig.workers > 1024
+    || !Number.isSafeInteger(diagnostic.expectedClientConfig.streams_per_worker)
+    || diagnostic.expectedClientConfig.streams_per_worker < 1)) {
+    throw new Error("invalid diagnostic client worker/stream binding");
+  }
   const typedCompression = compressionLevel !== null && typeof compressionLevel === "object";
   const compression = compressionLevel === null ? null : parseCompressionSpec(
     typeof compressionLevel === "number" ? { codec: "zstd", level: compressionLevel } : compressionLevel,
   );
-  if (typedCompression && (requestedProfile !== "realistic" || !parity?.allowWriterOverrides
-    || typeof parity.decodeFile !== "function" || !identity)) {
+  if (diagnostic && compression !== null) throw new Error("diagnostic Realistic requires the unchanged default writer");
+  if (typedCompression && (requestedProfile !== "realistic" || (!diagnostic && (!parity?.allowWriterOverrides
+    || typeof parity.decodeFile !== "function" || !identity)))) {
     throw new Error("typed compression requires qualified preflight and delivery identity");
   }
   if (requestedProfile === "diagnostic") {
     if (compression !== null || !parity || typeof parity.decodeFile !== "function") {
       throw new Error("diagnostic parity requires a physical footer inspector and no codec override");
     }
-  } else if (compression === null || (parity && (!parity.allowWriterOverrides || typeof parity.decodeFile !== "function"))) {
+  } else if ((!diagnostic && compression === null) || (parity && (!parity.allowWriterOverrides || typeof parity.decodeFile !== "function"))) {
     throw new Error("realistic compression requires its Zstd level and an explicitly qualified parity gate");
   }
   if (requestedProfile === "realistic" && !identity) {
@@ -239,7 +286,9 @@ export async function readReconciledOatResult(
   if (parity) {
     assertParityEvidence(parity.config, evidence, parity.allowWriterOverrides === true);
   }
-  if (requestedProfile === "realistic") {
+  if (diagnostic) {
+    assertDiagnosticDefaultWriter(evidence, collector);
+  } else if (requestedProfile === "realistic") {
     const policy = object(object(collector.writer_policy_overrides, "writer policy").defaults, "writer defaults");
     if (!compression || policy.compression !== compression.codec || (policy.compression_level ?? null) !== compression.level) {
       throw new Error("collector configured compression does not match the run");
@@ -247,12 +296,17 @@ export async function readReconciledOatResult(
   }
   const images = processes.map(process => {
     if (typeof process.component !== "string" || process.log_complete !== true) throw new Error("incomplete OAT process evidence");
-    if (parity || identity?.collectorRevision) {
-      assertParityProcessRevision(process, sourceRevision, parity?.collectorRevision ?? identity?.collectorRevision);
+    if (parity || identity?.collectorRevision || diagnostic) {
+      assertParityProcessRevision(process, sourceRevision, parity?.collectorRevision ?? identity?.collectorRevision ?? diagnostic?.collectorRevision);
     }
     return `${process.component}:${imageId(process.image_id)}`;
   });
   const clients = extractClientReports(evidence.client_phase_reports, requestedProfile);
+  if (diagnostic && clients.reports.some(report =>
+    report.config.workers !== diagnostic.expectedClientConfig.workers
+      || report.config.streams_per_worker !== diagnostic.expectedClientConfig.streams_per_worker)) {
+    throw new Error("diagnostic client worker/stream readback differs from requested binding");
+  }
   const client = clients.reports[0]!.image;
   const clientEvidence = clients.clientEvidence;
   images.push(`client:${clients.image}`);
@@ -281,28 +335,39 @@ export async function readReconciledOatResult(
   }
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
   const identityResult: { value: JsonObject | null } = { value: null };
+  const identityOutputDir = identity ? (diagnostic ? join(identity.outputDir, "diagnostic-only") : identity.outputDir) : undefined;
+  const verifyActive = identity ? async (paths: string[]) => {
+    if (diagnostic) await mkdir(identityOutputDir!);
+    identityResult.value = await verifyReconciledDelivery(identity.tools, identityOutputDir!, resultsPath,
+      createHash("sha256").update(bytes).digest("hex"), evidenceJson, table, paths);
+    if (diagnostic) {
+      identityResult.value.kind = "diagnostic-only";
+      identityResult.value.diagnosticRealisticReconciliationVersion = DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION;
+      identityResult.value.diagnosticRealisticDefaultWriterVersion = DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION;
+    }
+    const root = join(snapshotRoot, cellRunId);
+    const snapshotHashes: Record<string, string> = {};
+    for (const path of ["complete.json", "stopped.json", `${table}/manifest.json`]) {
+      snapshotHashes[path] = createHash("sha256").update(await readFile(join(root, path))).digest("hex");
+    }
+    identityResult.value.snapshotHashes = snapshotHashes;
+  } : undefined;
   const proof = await reconcileStoppedSnapshot(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
-    compression === null ? Compression.UNCOMPRESSED : wasmCompression(compression), preload, parity?.decodeFile,
-    identity ? async paths => {
-      identityResult.value = await verifyReconciledDelivery(identity.tools, identity.outputDir, resultsPath,
-        createHash("sha256").update(bytes).digest("hex"), evidenceJson, table, paths);
-      const root = join(snapshotRoot, cellRunId);
-      const snapshotHashes: Record<string, string> = {};
-      for (const path of ["complete.json", "stopped.json", `${table}/manifest.json`]) {
-        snapshotHashes[path] = createHash("sha256").update(await readFile(join(root, path))).digest("hex");
-      }
-      identityResult.value.snapshotHashes = snapshotHashes;
-    } : undefined,
+    compression === null ? Compression.UNCOMPRESSED : wasmCompression(compression), preload,
+    parity?.decodeFile ?? diagnostic?.decodeFile, verifyActive, diagnostic !== undefined,
   );
   if (identity && (!identityResult.value || identityResult.value.activeFileRows !== proof.activeRows)) {
     throw new Error("identity verdict does not match reconciled active rows");
   }
-  if (identity) await writeFile(join(identity.outputDir, "identity-result.json"),
+  if (identity) await writeFile(join(identityOutputDir!, "identity-result.json"),
     `${JSON.stringify(identityResult.value)}\n`, { flag: "wx", mode: 0o400 });
   return {
-    measurement, images, clientEvidence, clientEvidences: clients.reports.map(report => report.evidence), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
+    measurement, images, clientEvidence, clientEvidences: clients.reports.map(report => report.evidence),
+    clientEffectiveConfigs: clients.reports.map(report => report.config), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
     activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
+    ...(diagnostic ? { kind: "diagnostic-only" as const } : {}), diagnosticOnlyRealistic: diagnostic !== undefined,
+    diagnosticRealisticReconciliationVersion: diagnostic ? DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION : null,
     parityTelemetry: parity ? {
       backlog: evidence.backlog ?? null,
       backlog_budgets: object(object(object(parity.config, "parity config").tunables, "tunables").collector, "collector").batching,
