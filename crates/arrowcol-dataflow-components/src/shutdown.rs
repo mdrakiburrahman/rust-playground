@@ -295,12 +295,12 @@ impl RoutingShutdown {
             .map_err(|_| anyhow::anyhow!("routing shutdown registry poisoned"))?
             .clone();
         let (pending_total, counts) = {
-            let pending = self
+            let mut pending = self
                 .pending
                 .lock()
                 .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
             let mut counts = PendingCounts::default();
-            for publication in pending.values() {
+            pending.retain(|_, publication| {
                 match publication.state {
                     PublicationState::NeverStaged
                         if publication.cancelled
@@ -308,13 +308,15 @@ impl RoutingShutdown {
                             && publication.active_admissions == 0 =>
                     {
                         counts.cancelled_ambiguous += 1;
+                        return false;
                     }
                     PublicationState::NeverStaged => counts.never_staged += 1,
                     PublicationState::Staged => counts.staged += 1,
                     PublicationState::Nacked => counts.nacked += 1,
                 }
-            }
-            (pending.len() - counts.cancelled_ambiguous, counts)
+                true
+            });
+            (pending.len(), counts)
         };
         let retired = self
             .workers
@@ -577,6 +579,13 @@ mod tests {
         assert_eq!(receiver.try_recv()?, 1);
         assert!(receiver.try_recv().is_err());
         shutdown.finish(true).await?;
+        assert!(
+            !shutdown
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .contains_key(&publication)
+        );
 
         shutdown.publication_staged(publication)?;
         assert!(shutdown.finish(true).await.is_err());
