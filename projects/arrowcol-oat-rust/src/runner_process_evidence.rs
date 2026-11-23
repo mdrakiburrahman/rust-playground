@@ -2142,6 +2142,37 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn client_quiesce_readback_survives_into_completed_and_cancelled_table_evidence() -> Result<()> {
+        for (tunables, effective_timeout) in [
+            (json!({"transport":{"request_timeout_ms":1234}}), 1234_u64),
+            (json!({"transport":{"request_timeout_ms":1234},"client":{"quiesce_timeout_ms":2345}}), 2345_u64),
+        ] {
+            let mut config: OatConfig = serde_json::from_str(include_str!(
+                "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+            ))?;
+            config.tunables = serde_json::from_value(tunables)?;
+            let output = format!("OAT_CLIENT_EFFECTIVE_CONFIG {}\n", json!({
+                "request_timeout_ms":1234, "quiesce_timeout_ms":effective_timeout
+            }));
+            let mut evidence = CellEvidence::default();
+            evidence.record_client(&config, "table-a", "client-a", &output)?;
+            evidence.record_client(&config, "table-b", "client-b", &output)?;
+            evidence.record_cancelled_client("table-b", "client-c", Some(&output));
+            for (table, count) in [("table-a", 1), ("table-b", 2)] {
+                let serialized = serde_json::to_string(&evidence.for_table(table, None))?;
+                let row: Value = serde_json::from_str(&serialized)?;
+                let reports = row["client_phase_reports"].as_array().context("missing client phase reports")?;
+                assert_eq!(reports.len(), count);
+                for report in reports {
+                    assert_eq!(report["consumer_effective_config"]["quiesce_timeout_ms"], effective_timeout);
+                    assert_eq!(report["consumer_effective_config"]["request_timeout_ms"], 1234);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn requested_nondefault_is_not_effective_without_matching_consumer_readback() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
