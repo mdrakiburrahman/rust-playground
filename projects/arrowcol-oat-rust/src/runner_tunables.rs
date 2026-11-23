@@ -121,6 +121,15 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         let (field, variable) = match entry["path"].as_str() {
             Some("transport.max_message_bytes") => ("max_message_bytes", "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES"),
             Some("transport.max_flight_data_bytes") => ("max_flight_data_bytes", "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES"),
+            Some("transport.max_frame_bytes") => ("max_frame_bytes", "ARROWCOL_CLIENT_MAX_FRAME_BYTES"),
+            Some("transport.header_table_bytes") => ("header_table_bytes", "ARROWCOL_CLIENT_HEADER_TABLE_BYTES"),
+            Some("transport.max_header_list_bytes") => ("max_header_list_bytes", "ARROWCOL_CLIENT_MAX_HEADER_LIST_BYTES"),
+            Some("transport.adaptive_window") => ("adaptive_window", "ARROWCOL_CLIENT_ADAPTIVE_WINDOW"),
+            Some("transport.connect_timeout_ms") => ("connect_timeout_ms", "ARROWCOL_CLIENT_CONNECT_TIMEOUT_MS"),
+            Some("transport.request_timeout_ms") => ("request_timeout_ms", "ARROWCOL_CLIENT_REQUEST_TIMEOUT_MS"),
+            Some("transport.tcp_nodelay") => ("tcp_nodelay", "ARROWCOL_CLIENT_TCP_NODELAY"),
+            Some("transport.endpoint_concurrency_limit") => ("endpoint_concurrency_limit", "ARROWCOL_CLIENT_ENDPOINT_CONCURRENCY_LIMIT"),
+            Some("transport.endpoint_buffer_size") => ("endpoint_buffer_size", "ARROWCOL_CLIENT_ENDPOINT_BUFFER_SIZE"),
             _ => return true,
         };
         if !environment.contains_key(variable)
