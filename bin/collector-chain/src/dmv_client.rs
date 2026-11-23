@@ -3447,6 +3447,23 @@ mod tests {
             .resolve(100, 1)
     }
 
+    #[test]
+    fn tcp_tunables_reach_tonic_endpoint() -> Result<()> {
+        let mut options = options()?;
+        options.tcp_nodelay = false;
+        options.tcp_keepalive_ms = 1_500;
+        options.tcp_keepalive_interval_ms = 700;
+        options.tcp_keepalive_retries = 3;
+        options.connect_timeout_ms = 1_200;
+        let endpoint = options.endpoint("http://127.0.0.1:1234")?;
+        assert!(!endpoint.get_tcp_nodelay());
+        assert_eq!(endpoint.get_tcp_keepalive(), Some(Duration::from_millis(1_500)));
+        assert_eq!(endpoint.get_tcp_keepalive_interval(), Some(Duration::from_millis(700)));
+        assert_eq!(endpoint.get_tcp_keepalive_retries(), Some(3));
+        assert_eq!(endpoint.get_connect_timeout(), Some(Duration::from_millis(1_200)));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn direct_identity_matches_formatted_rows_and_encoded_frames() -> Result<()> {
         use prost::Message;
