@@ -2,6 +2,7 @@
 
 pub use crate::delta_io::spawn_shared_io;
 use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executor};
+use crate::layout::{PublicationSorter, SortExecution};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
@@ -154,8 +155,12 @@ fn layout_startup_config(process: &BTreeMap<String, String>) -> Result<serde_jso
         .contains_key("arrowcol.layout.enabled")
         .then(|| properties.boolean("arrowcol.layout.enabled"))
         .transpose()?;
+    let mode = collector_sort_execution()?;
+    mode.validate(enabled != Some(false), !policy.sort_columns.is_empty())?;
+    let mut config = policy.config_json(enabled);
+    config["sort_execution"] = serde_json::json!(mode);
     Ok(serde_json::json!({
-        "process_policy": policy.config_json(enabled),
+        "process_policy": config,
         "table_properties_override": true,
     }))
 }
@@ -193,6 +198,27 @@ fn resolve_adaptive_file_config(
     ]);
     let props = arrowcol_props::resolve(table, &process)?;
     crate::sizing::AdaptiveFileSizeConfig::from_properties(&props)
+}
+
+fn collector_sort_execution() -> Result<SortExecution> {
+    match std::env::var("ARROWCOL_COLLECTOR_LAYOUT_SORT_EXECUTION") {
+        Ok(raw) => raw.parse(),
+        Err(std::env::VarError::NotPresent) => Ok(SortExecution::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn collector_publication_layout(
+    schema: &SchemaRef,
+    properties: &arrowcol_props::ResolvedProps,
+    mode: SortExecution,
+) -> Result<Option<crate::layout::LayoutPolicy>> {
+    let layout = publication_layout(schema, properties)?;
+    mode.validate(
+        layout.is_some(),
+        layout.as_ref().is_some_and(|policy| !policy.sort_columns.is_empty()),
+    )?;
+    Ok(layout)
 }
 
 fn publication_layout(
@@ -1328,6 +1354,73 @@ mod io_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn publication_execution_preserves_physical_rows_counts_and_sort_claims() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        for (mode, values, ordered) in [
+            (SortExecution::Concatenate, [2, 4, 1, 3], true),
+            (SortExecution::VerifyOrder, [1, 2, 3, 4], true),
+            (SortExecution::StreamUnordered, [2, 4, 1, 3], false),
+        ] {
+            let policy = crate::layout::LayoutPolicy {
+                sort_columns: if ordered { vec!["id".into()] } else { vec![] },
+                bloom_columns: vec![],
+                max_rows: 4,
+                row_group_rows: 2,
+                ..Default::default()
+            };
+            let open = || {
+                table.new_file_with_publication_policy(
+                    Arc::clone(&schema),
+                    "test".into(),
+                    0,
+                    0,
+                    Some(policy.clone()),
+                    mode,
+                    false,
+                    "day",
+                )
+            };
+            let mut writer = open()?;
+            let mut bytes = 0;
+            for chunk in values.chunks(2) {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(arrow::array::Int32Array::from(chunk.to_vec()))],
+                )?;
+                writer.write(&batch).await?;
+                bytes += record_batch_logical_bytes(&batch)?;
+            }
+            let staged = writer.stage().await?;
+            assert_eq!((staged.file.rows, staged.file.input_bytes), (4, bytes));
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged.file.path)?)?;
+            for group in reader.metadata().row_groups() {
+                assert_eq!(group.sorting_columns().is_some(), ordered);
+            }
+            let rows = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+            let output = arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
+            let expected = if ordered { vec![1, 2, 3, 4] } else { values.to_vec() };
+            assert_eq!(output.column(0).as_ref(), &arrow::array::Int32Array::from(expected));
+            let mut rejected = open()?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]))],
+            )?;
+            rejected.write(&batch).await?;
+            let next = if mode == SortExecution::VerifyOrder {
+                batch.slice(0, 1)
+            } else {
+                batch
+            };
+            assert!(rejected.write(&next).await.is_err());
+            assert!(rejected.stage().await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn publication_refreshes_delta_writer_properties() -> Result<()> {
         struct Fixture(PathBuf);
         impl Drop for Fixture {
@@ -1833,7 +1926,11 @@ mod io_tests {
             supplied.schema(),
             BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some("1970-01-01".to_owned()))]),
         )?;
-        let error = direct.write(&supplied).await.err().context("accepted a mixed partition")?;
+        let error = direct
+            .write(&supplied)
+            .await
+            .err()
+            .context("accepted a mixed partition")?;
         assert!(error.to_string().contains("differs from bound write context"));
         drop(direct);
         let error = match table
@@ -2571,6 +2668,7 @@ pub struct DeltaTable {
 
 #[derive(PartialEq, Eq)]
 struct LayoutReadback {
+    mode: SortExecution,
     schema: SchemaRef,
     enabled: bool,
     policy: crate::layout::LayoutPolicy,
@@ -2583,8 +2681,10 @@ impl LayoutReadback {
         properties: &arrowcol_props::ResolvedProps,
         table: &BTreeMap<String, String>,
         enabled: bool,
+        mode: SortExecution,
     ) -> Result<Self> {
         Ok(Self {
+            mode,
             schema,
             enabled,
             policy: crate::layout::LayoutPolicy::from_properties(properties)?,
@@ -2598,6 +2698,7 @@ impl LayoutReadback {
 
     fn event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
         let mut config = self.policy.config_json(Some(self.enabled));
+        config["sort_execution"] = serde_json::json!(self.enabled.then_some(self.mode));
         let base = if self.enabled {
             Some(self.policy.writer_properties(&self.schema)?)
         } else {
@@ -2701,7 +2802,7 @@ impl LayoutReadback {
             "table_name": telemetry_table_name(url),
             "applied": self.enabled,
             "inactive_controls": if self.enabled { Vec::<&str>::new() } else {
-                vec!["sort_columns", "sort_options", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
+                vec!["sort_execution", "sort_columns", "sort_options", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
             },
             "precedence": ["table_properties", "process_policy", "registry_defaults"],
             "encoding_precedence": ["parquet_config", "resolved_layout", "parquet_defaults"],
@@ -3543,8 +3644,9 @@ impl DeltaTable {
         properties: &arrowcol_props::ResolvedProps,
         table: &BTreeMap<String, String>,
         enabled: bool,
+        mode: SortExecution,
     ) -> Result<()> {
-        let next = LayoutReadback::new(physical, properties, table, enabled)?;
+        let next = LayoutReadback::new(physical, properties, table, enabled, mode)?;
         let mut previous = self
             .layout_readback
             .lock()
@@ -3842,12 +3944,21 @@ impl DeltaTable {
                 .collect()
         });
         let properties = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized)?)?;
-        let layout = publication_layout(&normalized, &properties)?;
+        let mode = collector_sort_execution()?;
+        let layout = collector_publication_layout(&normalized, &properties, mode)?;
         let enabled = layout.is_some();
         let partitioned = self.partition_columns == [INGESTION_PARTITION];
         let granularity = properties.text("arrowcol.partition.granularity")?;
-        let writer =
-            self.new_file_with_publication_policy(input, app_id, version, stamp, layout, partitioned, granularity)?;
+        let writer = self.new_file_with_publication_policy(
+            input,
+            app_id,
+            version,
+            stamp,
+            layout,
+            mode,
+            partitioned,
+            granularity,
+        )?;
         if writer.table_properties != table_properties {
             writer.discard_empty()?;
             bail!("table properties changed while preparing publication; retry with refreshed policy");
@@ -3857,6 +3968,7 @@ impl DeltaTable {
             &properties,
             &table_properties,
             enabled,
+            mode,
         )?;
         Ok(writer)
     }
@@ -3893,6 +4005,7 @@ impl DeltaTable {
             version,
             stamp,
             layout,
+            SortExecution::Concatenate,
             partitioned,
             properties.text("arrowcol.partition.granularity")?,
         )?;
@@ -3911,6 +4024,7 @@ impl DeltaTable {
         version: i64,
         stamp: i64,
         layout: Option<crate::layout::LayoutPolicy>,
+        mode: SortExecution,
         partitioned: bool,
         granularity: &str,
     ) -> Result<DeltaFileWriter> {
@@ -3941,7 +4055,7 @@ impl DeltaTable {
         let mut writer = self.new_file_partitioned_inner(input, values, properties)?;
         if let Some(policy) = layout {
             let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-            writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy)?);
+            writer.sorter = Some(PublicationSorter::new(physical, policy, mode)?);
         }
         writer.with_transaction(app_id, version)?.with_ingestion_time(stamp)
     }
@@ -3992,7 +4106,8 @@ impl DeltaTable {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized.schema())?)?;
-        let layout = publication_layout(&normalized.schema(), &resolved)?;
+        let mode = collector_sort_execution()?;
+        let layout = collector_publication_layout(&normalized.schema(), &resolved, mode)?;
         if let Some(policy) = &layout {
             for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
                 if partitions.contains(name) {
@@ -4022,7 +4137,7 @@ impl DeltaTable {
                 }
                 if let Some(policy) = layout.clone() {
                     let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                    match crate::layout::FileSortBuffer::new(physical, policy) {
+                    match PublicationSorter::new(physical, policy, mode) {
                         Ok(sorter) => writer.sorter = Some(sorter),
                         Err(error) => {
                             writer.discard_empty()?;
@@ -4050,6 +4165,7 @@ impl DeltaTable {
                 &resolved,
                 &table_properties,
                 layout.is_some(),
+                mode,
             )?;
         }
         Ok(files)
@@ -4087,7 +4203,8 @@ impl DeltaTable {
         });
         let first = normalize::batch_with_kernel(first_batch, runtime_config()?.timestamp_kernel)?;
         let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&first.schema())?)?;
-        let layout = publication_layout(&first.schema(), &resolved)?;
+        let mode = collector_sort_execution()?;
+        let layout = collector_publication_layout(&first.schema(), &resolved, mode)?;
         if let Some(policy) = &layout {
             for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
                 if partitions.contains(name) {
@@ -4360,7 +4477,7 @@ impl DeltaTable {
                     }
                     if let Some(policy) = &layout {
                         let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                        writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
+                        writer.sorter = Some(PublicationSorter::new(physical, policy.clone(), mode)?);
                     }
                     if staged.is_empty() {
                         self.record_layout_readback(
@@ -4368,6 +4485,7 @@ impl DeltaTable {
                             &resolved,
                             &table_properties,
                             layout.is_some(),
+                            mode,
                         )?;
                     }
                     for (batch, proof) in &batches {
@@ -5021,7 +5139,7 @@ pub struct DeltaFileWriter {
     publication: Option<(String, i64)>,
     ingested_at_ms: Option<i64>,
     partition_values: BTreeMap<String, Option<String>>,
-    sorter: Option<crate::layout::FileSortBuffer>,
+    sorter: Option<PublicationSorter>,
     accepted_rows: usize,
     accepted_input_bytes: u64,
     /// Batches are already canonical: validate instead of normalizing again.
@@ -5440,16 +5558,16 @@ impl DeltaFileWriter {
             .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
         self.stage_timings.build += build_started.elapsed();
-        if let Some(sorter) = &mut self.sorter {
+        let encode = if let Some(sorter) = &mut self.sorter {
             let sort_started = Instant::now();
             let physical = owned_for_sort(physical, runtime_config()?.layout_detach_ratio)?;
+            let encode = sorter.admit(&physical)?;
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
-            if !sorter.try_push(&physical)? {
-                bail!(
-                    "publication exceeds sorted-file budget; split upstream into independently identified publications"
-                );
-            }
+            encode.then_some(physical)
         } else {
+            Some(physical)
+        };
+        if let Some(physical) = encode {
             let encode_started = Instant::now();
             let result = self
                 .parquet
@@ -5471,7 +5589,7 @@ impl DeltaFileWriter {
         if self.failed {
             bail!("Delta file previously failed; refusing to commit its partial data");
         }
-        if let Some(sorter) = self.sorter.take() {
+        if let Some(sorter) = self.sorter.take().and_then(PublicationSorter::into_buffer) {
             let sort_started = Instant::now();
             let sorted = sorter.finish();
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
@@ -5704,6 +5822,7 @@ mod layout_readback_tests {
         assert_eq!(layout, layout_startup_config(&resolve(&collector)?)?);
         assert_eq!(layout["table_properties_override"], true);
         let config = &layout["process_policy"];
+        assert_eq!(config["sort_execution"], "concatenate");
         assert_eq!(config["enabled"], false);
         assert_eq!(config["sort_columns"], serde_json::json!(["customer_id", "value"]));
         assert_eq!(
@@ -5776,6 +5895,7 @@ mod layout_readback_tests {
         ]));
         let process = BTreeMap::from([
             ("arrowcol.layout.enabled".into(), "true".into()),
+            ("arrowcol.layout.sortColumns".into(), String::new()),
             ("arrowcol.layout.maxRows".into(), "128".into()),
             ("arrowcol.layout.rowGroupRows".into(), "64".into()),
         ]);
@@ -5786,9 +5906,24 @@ mod layout_readback_tests {
             ("arrowcol.layout.sortColumns".into(), "value".into()),
             ("arrowcol.layout.bloomColumns".into(), String::new()),
         ]);
+        assert!(
+            collector_publication_layout(
+                &schema,
+                &arrowcol_props::resolve(&BTreeMap::new(), &process)?,
+                SortExecution::StreamUnordered
+            )?
+            .is_some()
+        );
         let resolved = arrowcol_props::resolve(&table, &process)?;
         let enabled = publication_layout(&schema, &resolved)?.is_some();
-        let readback = LayoutReadback::new(Arc::clone(&schema), &resolved, &table, enabled)?;
+        assert!(collector_publication_layout(&schema, &resolved, SortExecution::StreamUnordered).is_err());
+        let readback = LayoutReadback::new(
+            Arc::clone(&schema),
+            &resolved,
+            &table,
+            enabled,
+            SortExecution::VerifyOrder,
+        )?;
         let parquet: crate::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
             "max_row_group_rows": 3,
             "data_page_row_count_limit": 1,
@@ -5812,6 +5947,7 @@ mod layout_readback_tests {
             event["table_id"],
             format!("{:x}", sha2::Sha256::digest(url.as_str().as_bytes()))
         );
+        assert_eq!(event["config"]["sort_execution"], "verify_order");
         assert_eq!(event["applied"], true);
         assert_eq!(event["config"]["max_rows"], 7);
         assert_eq!(event["config"]["sort_columns"], serde_json::json!(["value"]));
@@ -5874,7 +6010,8 @@ mod layout_readback_tests {
         table.insert("arrowcol.layout.enabled".into(), "false".into());
         let resolved = arrowcol_props::resolve(&table, &process)?;
         assert!(publication_layout(&schema, &resolved)?.is_none());
-        let disabled = LayoutReadback::new(schema, &resolved, &table, false)?;
+        assert!(collector_publication_layout(&schema, &resolved, SortExecution::VerifyOrder).is_err());
+        let disabled = LayoutReadback::new(schema, &resolved, &table, false, SortExecution::Concatenate)?;
         let event = disabled.event(&url, &parquet)?;
         assert_eq!(event["applied"], false);
         assert_eq!(event["config"]["enabled"], false);

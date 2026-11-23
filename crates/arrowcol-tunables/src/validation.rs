@@ -261,6 +261,7 @@ const CAPABILITIES: &[Capability] = &[
         "collector.layout.sort_columns",
         "customer_id (comma-separated, ordered)"
     ),
+    capability!("collector.layout.sort_execution", "concatenate"),
     capability!("collector.layout.sort_options", "ascending, nulls last per sort column"),
     capability!(
         "collector.layout.bloom_columns",
@@ -1086,6 +1087,9 @@ impl Tunables {
                     if let Some(columns) = &layout.sort_columns {
                         output.insert("ARROWCOL_COLLECTOR_SORT_COLUMNS".to_owned(), columns.join(","));
                     }
+                    if let Some(mode) = layout.sort_execution {
+                        output.insert("ARROWCOL_COLLECTOR_LAYOUT_SORT_EXECUTION".into(), mode.as_str().into());
+                    }
                     if let Some(options) = &layout.sort_options {
                         output.insert(
                             "ARROWCOL_COLLECTOR_SORT_OPTIONS".to_owned(),
@@ -1525,7 +1529,8 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
             "collector.layout.detach_ratio requires enabled layout"
         );
     }
-    let has_overrides = layout.sort_columns.is_some()
+    let has_overrides = layout.sort_execution.is_some()
+        || layout.sort_columns.is_some()
         || layout.sort_options.is_some()
         || layout.bloom_columns.is_some()
         || layout.max_rows.is_some()
@@ -1534,6 +1539,12 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
         || layout.page_rows.is_some();
     if layout.enabled == Some(false) && has_overrides {
         bail!("collector.layout settings require enabled=true; disabled layout would ignore them");
+    }
+    if let Some(mode) = layout.sort_execution {
+        mode.validate(
+            layout.enabled != Some(false),
+            layout.sort_columns.as_ref().is_none_or(|keys| !keys.is_empty()),
+        )?;
     }
     if let Some(options) = &layout.sort_options {
         let columns = layout
@@ -2716,6 +2727,35 @@ mod tests {
                 assert!(Tunables::parse_oat_json(value).is_err());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sort_execution_is_a_collector_only_closed_string() -> Result<()> {
+        let config =
+            |mode, keys| serde_json::json!({"collector":{"layout":{"sort_execution":mode,"sort_columns":keys}}});
+        let empty = serde_json::json!([]);
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(1),
+            serde_json::json!({"concatenate":null}),
+            serde_json::json!("verify"),
+            serde_json::json!([]),
+        ] {
+            assert!(Tunables::parse_oat_json(config(bad, empty.clone())).is_err());
+        }
+        assert!(Tunables::parse_oat_json(config(serde_json::json!("verify_order"), empty.clone())).is_err());
+        assert!(
+            Tunables::parse_oat_json(config(serde_json::json!("stream_unordered"), serde_json::json!(["id"]))).is_err()
+        );
+        let tunables = Tunables::parse_oat_json(config(serde_json::json!("stream_unordered"), empty))?;
+        let name = "ARROWCOL_COLLECTOR_LAYOUT_SORT_EXECUTION";
+        assert_eq!(
+            tunables.environment_for(ComponentRole::Collector)?[name],
+            "stream_unordered"
+        );
+        assert!(!tunables.environment_for(ComponentRole::Maintenance)?.contains_key(name));
         Ok(())
     }
 
