@@ -1789,7 +1789,27 @@ mod startup_readback_tests {
         anyhow::ensure!(output.status.success(), "router validation failed: {}", String::from_utf8_lossy(&output.stderr));
         let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
         let observed = process_configurations(&text)?;
-        verify_process_configuration(&config, ComponentRole::Router, &observed)
+        verify_process_configuration(&config, ComponentRole::Router, &observed)?;
+        let process = json!({
+            "component": "router", "instance_id": "router-1", "log_complete": true,
+            "startup_tunables_verified": true, "effective_config_source": "consumer_startup_readback",
+            "effective_config": observed,
+        });
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut covered = initial.clone();
+        promote_router_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
+        assert_eq!(covered["consumer_verified"], json!([{
+            "path": "router.excluded_admission_gauges", "reason": "consumer_startup_readback"
+        }]));
+        let mut wrong = process.clone();
+        wrong["effective_config"]["routing"]["excluded_admission_gauges"] = json!([]);
+        for processes in [json!([]), json!([wrong]), json!([process.clone(), process])] {
+            let mut uncovered = initial.clone();
+            let replicas = if processes.as_array().context("process array")?.len() == 2 { 2 } else { 1 };
+            promote_router_readback(&config, &mut uncovered, Some(&processes), replicas)?;
+            assert_eq!(uncovered, initial);
+        }
+        Ok(())
     }
 
     #[test]

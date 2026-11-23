@@ -5,38 +5,40 @@ fn tunable_leaf_evidence(config: &OatConfig) -> Result<Value> {
     config.tunables.classify_oat_leaves()
 }
 
-fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
-    let Some(processes) = processes.and_then(Value::as_array) else {
-        return Ok(());
-    };
-    let collectors = processes
-        .iter()
-        .filter(|process| process["component"] == "collector")
+fn verified_processes<'a>(
+    config: &OatConfig, processes: Option<&'a Value>, role: ComponentRole, replicas: u32,
+) -> Option<Vec<&'a Value>> {
+    let processes = processes?.as_array()?.iter()
+        .filter(|process| process["component"] == role_name(role))
         .collect::<Vec<_>>();
-    let identities = collectors
-        .iter()
+    let identities = processes.iter()
         .filter_map(|process| process["instance_id"].as_str().filter(|id| !id.is_empty()))
         .collect::<std::collections::BTreeSet<_>>();
-    if replicas == 0
-        || collectors.len() != replicas as usize
-        || identities.len() != collectors.len()
-        || collectors.iter().any(|process| {
+    if replicas == 0 || processes.len() != replicas as usize || identities.len() != processes.len()
+        || processes.iter().any(|process| {
             process["log_complete"] != true
                 || process["startup_tunables_verified"] != true
                 || process["effective_config_source"] != "consumer_startup_readback"
                 || {
                     let mut observed = process["effective_config"].clone();
-                    if let Some(fields) = observed.as_object_mut()
+                    if matches!(role, ComponentRole::Collector)
+                        && let Some(fields) = observed.as_object_mut()
                         && !process["writer_policy_overrides"].is_null()
                     {
                         fields.insert("parquet_writer".to_owned(), process["writer_policy_overrides"].clone());
                     }
-                    verify_process_configuration(config, ComponentRole::Collector, &observed).is_err()
+                    verify_process_configuration(config, role, &observed).is_err()
                 }
-        })
-    {
-        return Ok(());
+        }) {
+        return None;
     }
+    Some(processes)
+}
+
+fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
+    let Some(collectors) = verified_processes(config, processes, ComponentRole::Collector, replicas) else {
+        return Ok(());
+    };
     let environment = role_environment(config, ComponentRole::Collector)?;
     let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"]
         .into_iter()
@@ -81,6 +83,29 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         .as_array_mut()
         .context("consumer_verified must be an array")?
         .extend(promoted);
+    Ok(())
+}
+
+fn promote_router_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
+    let Some(routers) = verified_processes(config, processes, ComponentRole::Router, replicas) else {
+        return Ok(());
+    };
+    if !role_environment(config, ComponentRole::Router)?.contains_key("ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")
+        || routers.iter().any(|process| process.pointer("/effective_config/routing/excluded_admission_gauges").is_none())
+    {
+        return Ok(());
+    }
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
+    let mut promoted = Vec::new();
+    projection.retain(|entry| {
+        if entry["path"] == "router.excluded_admission_gauges" {
+            promoted.push(json!({"path": entry["path"], "reason": "consumer_startup_readback"}));
+            false
+        } else {
+            true
+        }
+    });
+    evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
     Ok(())
 }
 

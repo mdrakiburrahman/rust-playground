@@ -4528,6 +4528,17 @@ fn result_rows(
         client_run.evidence.processes.as_ref(),
         replicas,
     )?;
+    let router_replicas = if config.platform.kind == crate::config::OatMode::Local {
+        1
+    } else {
+        replicas
+    };
+    promote_router_readback(
+        config,
+        &mut leaf_evidence,
+        client_run.evidence.processes.as_ref(),
+        router_replicas,
+    )?;
     let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
