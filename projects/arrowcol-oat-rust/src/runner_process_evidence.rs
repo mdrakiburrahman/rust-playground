@@ -2046,6 +2046,123 @@ mod startup_readback_tests {
 mod consumer_startup_projection_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn commit_and_pressure_reach_actual_collector_startup() -> Result<()> {
+        struct TempRoot(PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("oat-collector-readback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let root = TempRoot(root);
+        let flight = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let admin = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let flight_port = flight.local_addr()?.port();
+        let admin_port = admin.local_addr()?.port();
+        let yaml = format!(r#"
+version: otel_dataflow/v1
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  isolated:
+    pipelines:
+      ingest:
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "127.0.0.1:{flight_port}"
+              admin_listening_addr: "127.0.0.1:{admin_port}"
+              catalog:
+                type: memory
+              routing:
+                type: memory
+              registration:
+                instance_key: isolated-startup-test
+                flight_endpoint: "127.0.0.1:{flight_port}"
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: "{}/data"
+              routing:
+                type: memory
+        connections:
+          - from: flight
+            to: delta
+"#, root.0.display());
+        let yaml_path = root.0.join("config.yaml");
+        let log_path = root.0.join("stderr.log");
+        std::fs::write(&yaml_path, yaml)?;
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector": {
+                "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13},
+                "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
+                    "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
+                    "buffered_batches_limit":123,"pressure_interval":"3s",
+                    "heartbeat_interval":"4s","registration_ttl":"30s"}
+            }
+        }))?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/arrowcol-dataflow-rust");
+        drop((flight, admin));
+        let mut child = Child(std::process::Command::new(binary)
+            .args(["--num-cores", "1", "--config"])
+            .arg(yaml_path)
+            .env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log_path)?)
+            .spawn()?);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let text = loop {
+            let text = std::fs::read_to_string(&log_path)?;
+            if text.contains(r#""component":"receiver""#) && text.contains(r#""component":"exporter""#) {
+                break text;
+            }
+            if let Some(status) = child.0.try_wait()? {
+                bail!("collector exited before both readbacks ({status}): {text}");
+            }
+            anyhow::ensure!(std::time::Instant::now() < deadline, "collector readback timed out: {text}");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        drop(child);
+        let observed = process_configurations(&text)?;
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        for (group, fields) in [
+            ("commit", &["batch_window", "max_files_per_commit", "max_pending_files"][..]),
+            ("pressure", &["max_concurrent_streams", "rss_limit_bytes", "buffered_bytes_limit",
+                "buffered_rows_limit", "buffered_batches_limit", "pressure_interval",
+                "heartbeat_interval", "registration_ttl"][..]),
+        ] {
+            for field in fields {
+                let mut missing = observed.clone();
+                missing[group].as_object_mut().context("missing readback group")?
+                    .remove(*field).context("consumer omitted requested field")?;
+                anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
+                    "verifier accepted missing {group}.{field}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires built arrowcol-dataflow-rust"]
     fn parquet_policy_reaches_actual_collector_startup() -> Result<()> {
