@@ -432,7 +432,8 @@ fn parse_pipeline_histogram(text: &str, name: &str, stage: Option<&str>) -> Opti
     let bucket_name = format!("{name}_bucket");
     let count_name = format!("{name}_count");
     let sum_name = format!("{name}_sum");
-    let mut buckets = BTreeMap::new();
+    let mut finite_buckets: Vec<(f64, String, u64)> = Vec::new();
+    let mut infinite_count = None;
     let mut count = None;
     let mut sum = None;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
@@ -456,10 +457,18 @@ fn parse_pipeline_histogram(text: &str, name: &str, stage: Option<&str>) -> Opti
             continue;
         }
         if metric == bucket_name {
-            let le = labels.split(",le=\"").nth(1)?.split('"').next()?;
+            let le = labels.split(",le=\"").nth(1)?.split('\"').next()?;
             let bucket = value.parse::<u64>().ok()?;
-            if buckets.insert(le.to_owned(), bucket).is_some() {
-                return None;
+            if le == "+Inf" {
+                if infinite_count.replace(bucket).is_some() {
+                    return None;
+                }
+            } else {
+                let bound = le.parse::<f64>().ok()?;
+                if !bound.is_finite() || bound < 0.0 || finite_buckets.iter().any(|(existing, _, _)| *existing == bound) {
+                    return None;
+                }
+                finite_buckets.push((bound, le.to_owned(), bucket));
             }
         } else if metric == count_name {
             if count.replace(value.parse::<u64>().ok()?).is_some() {
@@ -467,24 +476,28 @@ fn parse_pipeline_histogram(text: &str, name: &str, stage: Option<&str>) -> Opti
             }
         } else if metric == sum_name {
             let parsed = value.parse::<f64>().ok()?;
-            if !parsed.is_finite() || sum.replace(parsed).is_some() {
+            if !parsed.is_finite() || parsed < 0.0 || sum.replace(parsed).is_some() {
                 return None;
             }
         }
     }
     let count = count?;
     let sum = sum?;
-    if buckets.get("+Inf") != Some(&count)
-        || buckets.keys().any(|le| le != "+Inf" && !le.parse::<f64>().is_ok_and(|value| value.is_finite() && value >= 0.0))
-    {
+    if infinite_count? != count {
         return None;
     }
-    let mut buckets = buckets.into_iter().collect::<Vec<_>>();
-    buckets.sort_by(|(left, _), (right, _)| {
-        let order = |le: &str| if le == "+Inf" { f64::INFINITY } else { le.parse::<f64>().unwrap_or(f64::INFINITY) };
-        order(left).total_cmp(&order(right))
-    });
-    let buckets = buckets.into_iter().map(|(le, count)| json!({"le":le,"count":count})).collect::<Vec<_>>();
+    finite_buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut previous_count = 0;
+    for (_, _, bucket_count) in &finite_buckets {
+        if *bucket_count < previous_count || *bucket_count > count {
+            return None;
+        }
+        previous_count = *bucket_count;
+    }
+    let mut buckets = finite_buckets.into_iter()
+        .map(|(_, le, bucket_count)| json!({"le":le,"count":bucket_count}))
+        .collect::<Vec<_>>();
+    buckets.push(json!({"le":"+Inf","count":count}));
     Some(json!({"count":count,"sum_seconds":sum,"buckets":buckets}))
 }
 
@@ -494,7 +507,7 @@ fn parse_pipeline_stage_metrics(text: &str) -> Option<Value> {
         .map(|stage| Some((stage.to_owned(), parse_pipeline_histogram(text, "arrowcol_pipeline_stage_duration_seconds", Some(stage))?)))
         .collect::<Option<serde_json::Map<String, Value>>>()?;
     let submission_wait = parse_pipeline_histogram(text, "arrowcol_pipeline_submission_wait_seconds", None)?;
-    Some(json!({"stage_duration_seconds":stages,"submission_wait_seconds":submission_wait}))
+    Some(json!({"temporality":"cumulative_process_lifetime_snapshot","stage_duration_seconds":stages,"submission_wait_seconds":submission_wait}))
 }
 
 fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMetrics> {
@@ -1728,12 +1741,14 @@ mod measurement_evidence_tests {
         for stage in ["collect", "build", "sort", "encode", "upload", "commit"] {
             let labels = format!("run=\"r\",variant=\"v\",component=\"arrowcol-dataflow-rust\",stage=\"{stage}\"");
             output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"0.5\"}} 1\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"1.0\"}} 2\n"));
             output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"));
             output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_sum{{{labels}}} 0.125\n"));
             output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_count{{{labels}}} 2\n"));
         }
         let labels = "run=\"r\",variant=\"v\",component=\"arrowcol-dataflow-rust\"";
         output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"0.5\"}} 1\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"1.0\"}} 2\n"));
         output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"));
         output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_sum{{{labels}}} 0.25\n"));
         output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_count{{{labels}}} 2\n"));
@@ -1789,10 +1804,29 @@ mod measurement_evidence_tests {
             .context("pipeline histograms were not parsed")?;
         assert_eq!(metrics["stage_duration_seconds"]["encode"]["count"], 2);
         assert_eq!(metrics["stage_duration_seconds"]["upload"]["sum_seconds"], 0.125);
-        assert_eq!(metrics["stage_duration_seconds"]["commit"]["buckets"][1]["le"], "+Inf");
+        assert_eq!(metrics["stage_duration_seconds"]["commit"]["buckets"][2]["le"], "+Inf");
+        assert_eq!(metrics["temporality"], "cumulative_process_lifetime_snapshot");
         assert_eq!(metrics["submission_wait_seconds"]["count"], 2);
         assert_eq!(metrics["submission_wait_seconds"]["sum_seconds"], 0.25);
         Ok(())
+    }
+
+    #[test]
+    fn pipeline_histogram_rejects_malformed_bucket_distributions() {
+        let valid = pipeline_histogram_exposition();
+        let corrupt = |old: &str, new: &str| {
+            assert!(valid.contains(old), "fixture did not contain {old}");
+            valid.replacen(old, new, 1)
+        };
+        let negative_sum = corrupt("stage=\"collect\"} 0.125", "stage=\"collect\"} -0.125");
+        let decreasing = corrupt("stage=\"collect\",le=\"0.5\"} 1", "stage=\"collect\",le=\"0.5\"} 2")
+            .replacen("stage=\"collect\",le=\"1.0\"} 2", "stage=\"collect\",le=\"1.0\"} 1", 1);
+        let finite_exceeds_count = corrupt("stage=\"collect\",le=\"1.0\"} 2", "stage=\"collect\",le=\"1.0\"} 3");
+        let duplicate_numeric_bound = corrupt("stage=\"collect\",le=\"1.0\"", "stage=\"collect\",le=\"0.50\"");
+        let infinite_mismatch = corrupt("stage=\"collect\",le=\"+Inf\"} 2", "stage=\"collect\",le=\"+Inf\"} 3");
+        for malformed in [negative_sum, decreasing, finite_exceeds_count, duplicate_numeric_bound, infinite_mismatch] {
+            assert!(parse_pipeline_stage_metrics(&malformed).is_none());
+        }
     }
 
     #[test]

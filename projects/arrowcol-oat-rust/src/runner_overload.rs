@@ -188,8 +188,8 @@ impl GuardEngine {
     fn new(settings: crate::config::OverloadGuardConfig) -> Self {
         Self {
             proof: json!({"status":"monitoring","settings":settings,"sample_count":0,"peak_cap_fraction":0.0,
-                "max_sampling_gap_ms":0,"complete_windows":[],"collector_rss_samples":[],"collector_rss_samples_dropped":0,
-                "collector_rss_unavailable_reason":null,
+                "max_sampling_gap_ms":0,"complete_windows":[],"collector_rss_samples_scope":"guard_lifetime",
+                "collector_rss_samples":[],"collector_rss_samples_dropped":0,"collector_rss_unavailable_reason":null,
                 "disk":{"status":"not_applicable","reason":"memory_only"}}),
             settings,
             start: None,
@@ -270,7 +270,9 @@ impl GuardEngine {
                 samples.remove(0);
             }
             samples.push(json!({
-                "sampled_at_unix_ms": reading.request_start_ms,
+                "sampled_at_unix_ms": reading.timestamp_ms,
+                "acquisition_start_unix_ms": reading.request_start_ms,
+                "acquisition_end_unix_ms": reading.timestamp_ms,
                 "rss_bytes": rss.observed_value,
                 "cap_bytes": rss.cap,
             }));
@@ -2721,8 +2723,11 @@ mod overload_guard_tests {
         let public = evidence.for_table("table", None);
         assert_eq!(public["overload_stop"], stop);
         assert_eq!(public["overload_guard"]["status"], "triggered");
+        assert_eq!(public["overload_guard"]["collector_rss_samples_scope"], "guard_lifetime");
         assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["rss_bytes"], 10);
         assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["sampled_at_unix_ms"], 0);
+        assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["acquisition_start_unix_ms"], 0);
+        assert_eq!(public["overload_guard"]["collector_rss_samples"][0]["acquisition_end_unix_ms"], 0);
         assert_eq!(evidence.resource_samples.len(), 1);
         let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"

@@ -71,26 +71,40 @@ export function wasmCompression(spec: CompressionSpec): Compression {
   }
 }
 
+type PressureHttpSummary = {
+  scope: "guard_lifetime" | "measurement_window";
+  count: number | null;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
+  max_ms: number | null;
+  samples: JsonObject[] | null;
+  slow_or_timed_out_samples: JsonObject[] | null;
+  dropped: number | null;
+  quantile_method: "nearest_rank";
+  unavailable_reason: string | null;
+};
+
 type DiagnosticTelemetry = {
-  pressure_http_timings: {
-    count: number | null;
-    p50_ms: number | null;
-    p95_ms: number | null;
-    p99_ms: number | null;
-    max_ms: number | null;
-    samples: JsonObject[] | null;
-    slow_or_timed_out_samples: JsonObject[] | null;
-    dropped: number | null;
-    quantile_method: "nearest_rank";
-    unavailable_reason: string | null;
-  };
+  pressure_http_timings: PressureHttpSummary;
+  measurement_pressure_http_timings: PressureHttpSummary;
   zero_progress_window_count: number | null;
+  zero_progress_window_count_scope: "measurement_window";
   complete_windows: JsonObject[] | null;
+  complete_windows_scope: "guard_evidence" | null;
+  measurement_complete_windows: JsonObject[] | null;
+  measurement_complete_windows_scope: "measurement_window" | null;
   zero_progress_windows_unavailable_reason: string | null;
   collector_rss_samples: JsonObject[] | null;
+  collector_rss_samples_scope: "guard_lifetime" | null;
   collector_rss_samples_dropped: number | null;
   collector_rss_unavailable_reason: string | null;
+  collector_rss_measurement_samples: JsonObject[] | null;
+  collector_rss_measurement_samples_scope: "measurement_window" | null;
+  collector_rss_measurement_unavailable_reason: string | null;
   pipeline_metric_samples: JsonObject[] | null;
+  pipeline_metric_samples_scope: "measurement_window_observation" | null;
+  pipeline_metric_samples_temporality: "cumulative_process_lifetime_snapshot" | null;
   pipeline_metric_samples_unavailable_count: number | null;
   pipeline_metric_samples_dropped: number | null;
   pipeline_metrics_unavailable_reason: string | null;
@@ -105,96 +119,177 @@ function nonNegativeInteger(value: unknown, label: string): number {
   return value;
 }
 
+function pressureHttpSummary(
+  samples: JsonObject[] | null,
+  scope: PressureHttpSummary["scope"],
+  dropped: number | null,
+  unavailableReason: string | null,
+  completenessReason: string | null = null,
+): PressureHttpSummary {
+  if (samples === null) {
+    return { scope, count: null, p50_ms: null, p95_ms: null, p99_ms: null, max_ms: null,
+      samples: null, slow_or_timed_out_samples: null, dropped, quantile_method: "nearest_rank",
+      unavailable_reason: unavailableReason };
+  }
+  const elapsed = samples.map((sample, index) => nonNegativeInteger(sample.elapsed_ms, "pressure HTTP elapsed time " + index));
+  const sorted = [...elapsed].sort((a, b) => a - b);
+  const percentile = (fraction: number) => sorted.length ? sorted[Math.ceil(fraction * sorted.length) - 1]! : null;
+  return {
+    scope, count: samples.length, p50_ms: percentile(0.5), p95_ms: percentile(0.95), p99_ms: percentile(0.99),
+    max_ms: sorted.length ? sorted[sorted.length - 1]! : null, samples,
+    slow_or_timed_out_samples: samples.filter((sample, index) => elapsed[index]! >= 1500 || sample.status === "timeout"),
+    dropped, quantile_method: "nearest_rank",
+    unavailable_reason: samples.length === 0 ? unavailableReason ?? "no pressure HTTP timing samples were recorded" : completenessReason,
+  };
+}
+
 function extractDiagnosticTelemetry(evidence: JsonObject, measurement: OatMeasurement): DiagnosticTelemetry {
-  const unavailable = "overload guard evidence is missing";
+  const missingGuard = "overload guard evidence is missing";
   const result: DiagnosticTelemetry = {
-    pressure_http_timings: { count: null, p50_ms: null, p95_ms: null, p99_ms: null, max_ms: null,
-      samples: null, slow_or_timed_out_samples: null, dropped: null, quantile_method: "nearest_rank",
-      unavailable_reason: unavailable },
-    zero_progress_window_count: null, complete_windows: null,
-    zero_progress_windows_unavailable_reason: unavailable,
-    collector_rss_samples: null, collector_rss_samples_dropped: null,
-    collector_rss_unavailable_reason: unavailable,
-    pipeline_metric_samples: null, pipeline_metric_samples_unavailable_count: null, pipeline_metric_samples_dropped: null,
-    pipeline_metrics_unavailable_reason: unavailable,
+    pressure_http_timings: pressureHttpSummary(null, "guard_lifetime", null, missingGuard),
+    measurement_pressure_http_timings: pressureHttpSummary(null, "measurement_window", null, missingGuard),
+    zero_progress_window_count: null, zero_progress_window_count_scope: "measurement_window",
+    complete_windows: null, complete_windows_scope: null,
+    measurement_complete_windows: null, measurement_complete_windows_scope: null,
+    zero_progress_windows_unavailable_reason: missingGuard,
+    collector_rss_samples: null, collector_rss_samples_scope: null, collector_rss_samples_dropped: null,
+    collector_rss_unavailable_reason: missingGuard,
+    collector_rss_measurement_samples: null, collector_rss_measurement_samples_scope: "measurement_window",
+    collector_rss_measurement_unavailable_reason: missingGuard,
+    pipeline_metric_samples: null, pipeline_metric_samples_scope: null, pipeline_metric_samples_temporality: null,
+    pipeline_metric_samples_unavailable_count: null, pipeline_metric_samples_dropped: null,
+    pipeline_metrics_unavailable_reason: "publication backlog evidence is missing",
     client_send_stalls: null, client_send_stalls_unavailable_reason: "OAT client evidence does not expose send-stall measurements; these are owned by the load generator.",
   };
-  if (evidence.overload_guard == null) return result;
-  const guard = object(evidence.overload_guard, "overload guard evidence");
-  const admission = guard.admission_diagnostics == null
-    ? null : object(guard.admission_diagnostics, "guard admission diagnostics");
-  const rawTimings = admission?.pressure_http_timings;
-  if (admission && Array.isArray(rawTimings)) {
-    const samples = rawTimings.map((sample, index) => object(sample, "pressure HTTP timing sample " + index));
-    const elapsed = samples.map((sample, index) => nonNegativeInteger(sample.elapsed_ms, "pressure HTTP elapsed time " + index));
-    const sorted = [...elapsed].sort((a, b) => a - b);
-    const percentile = (fraction: number) => sorted.length ? sorted[Math.ceil(fraction * sorted.length) - 1]! : null;
-    const dropped = admission.pressure_http_timing_dropped;
-    result.pressure_http_timings = {
-      count: samples.length, p50_ms: percentile(0.5), p95_ms: percentile(0.95), p99_ms: percentile(0.99),
-      max_ms: sorted.length ? sorted[sorted.length - 1]! : null, samples,
-      slow_or_timed_out_samples: samples.filter((sample, index) => elapsed[index]! >= 1500 || sample.status === "timeout"),
-      dropped: typeof dropped === "number" ? nonNegativeInteger(dropped, "dropped pressure HTTP timing count") : null,
-      quantile_method: "nearest_rank",
-      unavailable_reason: samples.length === 0 ? "no pressure HTTP timing samples were recorded" : null,
-    };
-  } else {
-    result.pressure_http_timings.unavailable_reason = "pressure HTTP timings are missing from guard admission diagnostics";
+  if (evidence.overload_guard != null) {
+    const guard = object(evidence.overload_guard, "overload guard evidence");
+    const admission = guard.admission_diagnostics == null
+      ? null : object(guard.admission_diagnostics, "guard admission diagnostics");
+    const rawTimings = admission?.pressure_http_timings;
+    if (admission && Array.isArray(rawTimings)) {
+      const samples = rawTimings.map((sample, index) => object(sample, "pressure HTTP timing sample " + index));
+      const dropped = typeof admission.pressure_http_timing_dropped === "number"
+        ? nonNegativeInteger(admission.pressure_http_timing_dropped, "dropped pressure HTTP timing count") : null;
+      result.pressure_http_timings = pressureHttpSummary(samples, "guard_lifetime", dropped, null);
+      const measurementSamples = samples.filter((sample, index) => {
+        const started = nonNegativeInteger(sample.started_at_ms, "pressure HTTP start " + index);
+        const elapsed = nonNegativeInteger(sample.elapsed_ms, "pressure HTTP elapsed time " + index);
+        const completed = started + elapsed;
+        if (!Number.isSafeInteger(completed)) throw new Error("pressure HTTP completion timestamp exceeds the safe integer range");
+        return started >= measurement.startUnixMs && started < measurement.endUnixMs && completed < measurement.endUnixMs;
+      });
+      result.measurement_pressure_http_timings = pressureHttpSummary(measurementSamples, "measurement_window", null,
+        "no complete pressure HTTP timing samples lie inside the measurement window",
+        dropped ? "guard-lifetime timing retention dropped " + dropped + " samples; the measurement distribution may be incomplete" : null);
+    } else {
+      const reason = "pressure HTTP timings are missing from guard admission diagnostics";
+      result.pressure_http_timings = pressureHttpSummary(null, "guard_lifetime", null, reason);
+      result.measurement_pressure_http_timings = pressureHttpSummary(null, "measurement_window", null, reason);
+    }
+
+    if (Array.isArray(guard.complete_windows)) {
+      const windows = guard.complete_windows.map((window, index) => object(window, "guard complete window " + index));
+      result.complete_windows = windows;
+      result.complete_windows_scope = "guard_evidence";
+      const measurementWindows = windows.filter((window, index) => {
+        const started = nonNegativeInteger(window.start_ms, "guard window start " + index);
+        const ended = nonNegativeInteger(window.end_ms, "guard window end " + index);
+        if (ended <= started) throw new Error("guard window interval is invalid");
+        return started >= measurement.startUnixMs && ended <= measurement.endUnixMs;
+      });
+      result.measurement_complete_windows = measurementWindows;
+      result.measurement_complete_windows_scope = "measurement_window";
+      result.zero_progress_window_count = measurementWindows.length
+        ? measurementWindows.filter((window, index) => {
+          const commits = nonNegativeInteger(window.ingestion_commits, "measurement window ingestion commits " + index);
+          return window.covered === true && window.outstanding === true && commits === 0;
+        }).length : null;
+      result.zero_progress_windows_unavailable_reason = measurementWindows.length
+        ? null : "no complete guard windows lie wholly inside the measurement window";
+    } else {
+      result.zero_progress_windows_unavailable_reason = "complete progress windows are missing from guard evidence";
+    }
+
+    if (Array.isArray(guard.collector_rss_samples)) {
+      const rawSamples = guard.collector_rss_samples.map((sample, index) => {
+        const parsed = object(sample, "collector RSS sample " + index);
+        const acquisitionStart = parsed.acquisition_start_unix_ms == null
+          ? null : nonNegativeInteger(parsed.acquisition_start_unix_ms, "collector RSS acquisition start " + index);
+        const acquisitionEnd = parsed.acquisition_end_unix_ms == null
+          ? null : nonNegativeInteger(parsed.acquisition_end_unix_ms, "collector RSS acquisition end " + index);
+        return {
+          sampled_at_unix_ms: nonNegativeInteger(parsed.sampled_at_unix_ms, "collector RSS sample timestamp " + index),
+          acquisition_start_unix_ms: acquisitionStart,
+          acquisition_end_unix_ms: acquisitionEnd,
+          rss_bytes: nonNegativeInteger(parsed.rss_bytes, "collector RSS bytes " + index),
+          cap_bytes: nonNegativeInteger(parsed.cap_bytes, "collector RSS cap bytes " + index),
+        };
+      });
+      result.collector_rss_samples = rawSamples;
+      const hasLifetimeScope = guard.collector_rss_samples_scope === "guard_lifetime";
+      result.collector_rss_samples_scope = hasLifetimeScope ? "guard_lifetime" : null;
+      const dropped = typeof guard.collector_rss_samples_dropped === "number"
+        ? nonNegativeInteger(guard.collector_rss_samples_dropped, "dropped collector RSS sample count") : null;
+      result.collector_rss_samples_dropped = dropped;
+      result.collector_rss_unavailable_reason = rawSamples.length
+        ? (hasLifetimeScope ? null : "collector RSS samples do not declare guard-lifetime scope")
+        : typeof guard.collector_rss_unavailable_reason === "string"
+          ? guard.collector_rss_unavailable_reason : "no collector RSS samples were recorded";
+      const measurementSamples = hasLifetimeScope ? rawSamples.filter(sample =>
+        sample.acquisition_start_unix_ms !== null && sample.acquisition_end_unix_ms !== null
+        && sample.acquisition_start_unix_ms <= sample.sampled_at_unix_ms
+        && sample.sampled_at_unix_ms <= sample.acquisition_end_unix_ms
+        && sample.acquisition_start_unix_ms >= measurement.startUnixMs
+        && sample.acquisition_end_unix_ms < measurement.endUnixMs
+        && sample.sampled_at_unix_ms >= measurement.startUnixMs
+        && sample.sampled_at_unix_ms < measurement.endUnixMs) : [];
+      result.collector_rss_measurement_samples = measurementSamples.length ? measurementSamples : null;
+      result.collector_rss_measurement_unavailable_reason = measurementSamples.length ? null
+        : !hasLifetimeScope ? "collector RSS samples do not declare guard-lifetime scope"
+          : rawSamples.length === 0 ? result.collector_rss_unavailable_reason
+            : "no collector RSS acquisition lies wholly inside the measurement window";
+    } else {
+      result.collector_rss_unavailable_reason = "collector RSS samples are missing from guard evidence";
+      result.collector_rss_measurement_unavailable_reason = result.collector_rss_unavailable_reason;
+    }
   }
-  if (Array.isArray(guard.complete_windows)) {
-    const windows = guard.complete_windows.map((window, index) => object(window, "guard complete window " + index));
-    result.complete_windows = windows;
-    result.zero_progress_window_count = windows.filter((window, index) => {
-      const commits = nonNegativeInteger(window.ingestion_commits, "window ingestion commits " + index);
-      return window.covered === true && window.outstanding === true && commits === 0;
-    }).length;
-    result.zero_progress_windows_unavailable_reason = windows.length ? null : "guard recorded no complete progress windows";
-  } else {
-    result.zero_progress_windows_unavailable_reason = "complete progress windows are missing from guard evidence";
-  }
-  if (Array.isArray(guard.collector_rss_samples)) {
-    result.collector_rss_samples = guard.collector_rss_samples.map((sample, index) => {
-      const parsed = object(sample, "collector RSS sample " + index);
-      return { sampled_at_unix_ms: nonNegativeInteger(parsed.sampled_at_unix_ms, "collector RSS sample timestamp"),
-        rss_bytes: nonNegativeInteger(parsed.rss_bytes, "collector RSS bytes"),
-        cap_bytes: nonNegativeInteger(parsed.cap_bytes, "collector RSS cap bytes") };
-    });
-    const dropped = guard.collector_rss_samples_dropped;
-    result.collector_rss_samples_dropped = typeof dropped === "number"
-      ? nonNegativeInteger(dropped, "dropped collector RSS sample count") : null;
-    result.collector_rss_unavailable_reason = result.collector_rss_samples.length
-      ? null : typeof guard.collector_rss_unavailable_reason === "string"
-        ? guard.collector_rss_unavailable_reason : "no collector RSS samples were recorded";
-  } else {
-    result.collector_rss_unavailable_reason = "collector RSS samples are missing from guard evidence";
-  }
+
   const backlog = evidence.backlog == null ? null : object(evidence.backlog, "publication backlog evidence");
   if (Array.isArray(backlog?.samples)) {
     const matching = backlog.samples.map((sample, index) => object(sample, "backlog sample " + index)).filter(sample => {
       const started = nonNegativeInteger(sample.request_start_unix_ms, "backlog sample start");
-      return started >= measurement.startUnixMs && started < measurement.endUnixMs;
+      const ended = nonNegativeInteger(sample.request_end_unix_ms, "backlog sample end");
+      return ended >= started && started >= measurement.startUnixMs && ended < measurement.endUnixMs;
     });
     const pipelineSamples: JsonObject[] = [];
     const unavailableReasons: string[] = [];
     for (const sample of matching) {
       if (sample.pipeline_stage_metrics != null) {
-        pipelineSamples.push({
-          request_start_unix_ms: sample.request_start_unix_ms,
-          request_end_unix_ms: sample.request_end_unix_ms,
-          metrics: object(sample.pipeline_stage_metrics, "pipeline stage metrics"),
-        });
+        const metrics = object(sample.pipeline_stage_metrics, "pipeline stage metrics");
+        if (metrics.temporality === "cumulative_process_lifetime_snapshot") {
+          pipelineSamples.push({
+            request_start_unix_ms: sample.request_start_unix_ms,
+            request_end_unix_ms: sample.request_end_unix_ms,
+            metrics,
+          });
+        } else {
+          unavailableReasons.push("pipeline histogram temporality is missing or unsupported");
+        }
       } else if (typeof sample.pipeline_stage_metrics_unavailable_reason === "string") {
         unavailableReasons.push(sample.pipeline_stage_metrics_unavailable_reason);
       }
     }
     result.pipeline_metric_samples = pipelineSamples.length ? pipelineSamples : null;
+    result.pipeline_metric_samples_scope = pipelineSamples.length ? "measurement_window_observation" : null;
+    result.pipeline_metric_samples_temporality = pipelineSamples.length ? "cumulative_process_lifetime_snapshot" : null;
     result.pipeline_metric_samples_unavailable_count = matching.length - pipelineSamples.length;
     result.pipeline_metric_samples_dropped = typeof backlog.samples_dropped === "number"
       ? nonNegativeInteger(backlog.samples_dropped, "dropped backlog sample count") : null;
     result.pipeline_metrics_unavailable_reason = pipelineSamples.length
       ? null : unavailableReasons[0] ?? "no exporter stage histogram samples in the measurement window";
   } else {
-    result.pipeline_metrics_unavailable_reason = "publication backlog samples are missing";
+    result.pipeline_metrics_unavailable_reason = backlog === null
+      ? "publication backlog evidence is missing" : "publication backlog samples are missing";
   }
   return result;
 }
@@ -444,13 +539,14 @@ export async function readReconciledOatResult(
   images.sort();
   const measurement = adaptOatEvidence(evidence);
   const diagnosticTelemetry = extractDiagnosticTelemetry(evidence, measurement);
-  if (diagnosticTelemetry.collector_rss_samples?.length) {
-    measurement.rssBytesMaxObserved = diagnosticTelemetry.collector_rss_samples
+  if (diagnosticTelemetry.collector_rss_measurement_samples?.length) {
+    measurement.rssBytesMaxObserved = diagnosticTelemetry.collector_rss_measurement_samples
       .map(sample => nonNegativeInteger(sample.rss_bytes, "collector RSS bytes"))
       .reduce((maximum, value) => Math.max(maximum, value), 0);
     measurement.rssUnavailableReason = null;
   } else {
-    measurement.rssUnavailableReason = diagnosticTelemetry.collector_rss_unavailable_reason;
+    measurement.rssBytesMaxObserved = null;
+    measurement.rssUnavailableReason = diagnosticTelemetry.collector_rss_measurement_unavailable_reason;
   }
   const canonicalTable = `telemetry.sqlserver.${table}`;
   const stoppedPath = join(snapshotRoot, row.run_id, "stopped.json");
