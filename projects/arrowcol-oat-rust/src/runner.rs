@@ -4998,7 +4998,7 @@ async fn run_clients_inner(
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients).await?;
+    diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;
 
     let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
     if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
@@ -5093,6 +5093,7 @@ async fn run_clients_inner(
             };
         }
     };
+    diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;
     diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
     let schedule_created_at_unix_ms = unix_time_ms_u64()?;

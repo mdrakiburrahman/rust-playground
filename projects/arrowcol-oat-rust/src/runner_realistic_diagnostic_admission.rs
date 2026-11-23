@@ -208,6 +208,23 @@ async fn diagnostic_cpu_readback(config: &OatConfig, handle: &ClientHandle, run_
         ids.len() == 1 && ids[0].len() == 64 && ids[0].bytes().all(|b| b.is_ascii_hexdigit()),
         "diagnostic collector identity is missing or ambiguous"
     );
+    let mut clients = Command::new("docker");
+    clients.args([
+        "ps",
+        "--no-trunc",
+        "--filter",
+        &format!("label=com.docker.compose.project={project}"),
+        "--filter",
+        "label=com.docker.compose.service=oat-client",
+        "--format",
+        "{{.ID}}",
+    ]);
+    let client_ids = diagnostic_command(clients, "locate diagnostic clients").await?;
+    let client_ids = client_ids.lines().collect::<Vec<_>>();
+    ensure!(
+        client_ids.len() == 1 && client_ids[0] == container_id,
+        "diagnostic run-owned client roster differs from its single handle"
+    );
     let collector_proof = diagnostic_container_cpu_readback(ids[0], &collector).await?;
     let client_proof = diagnostic_container_cpu_readback(container_id, &client).await?;
     let cpus = collector.union(&client).copied().collect::<Vec<_>>();
@@ -244,6 +261,69 @@ fn diagnostic_expected_pin(
     }
     ensure!(diagnostic, "diagnostic corpus pin requires a diagnostic-scoped project");
     Ok(Some(value.context("diagnostic corpus pin is missing or invalid")?))
+}
+
+fn require_diagnostic_parity_precheck(value: std::result::Result<String, std::env::VarError>) -> Result<()> {
+    ensure!(
+        matches!(value.as_deref(), Ok("1")),
+        "diagnostic requires the non-qualification parity readback"
+    );
+    Ok(())
+}
+
+struct DiagnosticJson(Value);
+
+impl<'de> serde::Deserialize<'de> for DiagnosticJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct UniqueValue;
+        impl<'de> serde::de::Visitor<'de> for UniqueValue {
+            type Value = DiagnosticJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(DiagnosticJson(json!(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(DiagnosticJson(json!(value)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(DiagnosticJson(json!(value)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+                let number = serde_json::Number::from_f64(value).ok_or_else(|| E::custom("invalid number"))?;
+                Ok(DiagnosticJson(Value::Number(number)))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(DiagnosticJson(Value::String(value.to_owned())))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> std::result::Result<Self::Value, E> {
+                Ok(DiagnosticJson(Value::String(value)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(DiagnosticJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<DiagnosticJson>()? {
+                    values.push(value.0);
+                }
+                Ok(DiagnosticJson(Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate diagnostic JSON key"));
+                    }
+                    values.insert(key, map.next_value::<DiagnosticJson>()?.0);
+                }
+                Ok(DiagnosticJson(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(UniqueValue)
+    }
 }
 
 fn validate_diagnostic_prepared_metrics(
@@ -285,7 +365,9 @@ fn validate_diagnostic_prepared_metrics(
         ids.len() == 1 && !expected_client_id.is_empty() && ids[0] == expected_client_id,
         "client readiness does not match the expected client identity"
     );
-    let metrics: Value = serde_json::from_str(lines[0].1).context("parse prepared client metrics")?;
+    let metrics = serde_json::from_str::<DiagnosticJson>(lines[0].1)
+        .context("parse prepared client metrics")?
+        .0;
     let p = metrics.get("preparation").context("missing client preparation")?;
     let live_batch = p["live_identity_batch_bytes"]
         .as_u64()
@@ -294,7 +376,7 @@ fn validate_diagnostic_prepared_metrics(
     ensure!(
         metrics["version"] == 1
             && metrics["phase"] == "prepared"
-            && metrics["measurement_window"].is_null()
+            && metrics.get("measurement_window") == Some(&Value::Null)
             && p["data_profile"] == "realistic"
             && p["payload_corpus_hash_version"] == 2
             && p["payload_corpus_hash_scope"] == "arrow-logical-v2-excluding-endpoint_url"
@@ -363,11 +445,45 @@ fn validate_diagnostic_prepared_metrics(
     }))
 }
 
+fn validate_diagnostic_live_fleet(
+    config: &OatConfig,
+    handles: &[ClientHandle],
+    clients: &[ClientProgress],
+    run_id: &str,
+    expected: &str,
+) -> Result<Value> {
+    ensure!(
+        config.platform.kind == crate::config::OatMode::Local
+            && config.tables.len() == 1
+            && config.tables[0] == "sqlserver_availability_replica_states"
+            && config.clients_per_table == 1
+            && handles.len() == 1
+            && clients.len() == 1,
+        "diagnostic requires one local table and client"
+    );
+    let client = &clients[0];
+    ensure!(
+        client.ready && !client.completed && !client.schedule_received && client.failure.is_none(),
+        "diagnostic client is not exclusively waiting for its schedule"
+    );
+    ensure!(
+        uuid::Uuid::parse_str(run_id)?.to_string() == run_id
+            && handles[0].client_id == format!("{run_id}:{}:1", config.tables[0])
+            && handles[0].table == config.tables[0]
+            && matches!(&handles[0].process, ClientProcess::Local { .. }),
+        "diagnostic client handle differs from the active run and table"
+    );
+    let expected_client_id = format!("oat-{run_id}-{}-c1", config.tables[0]);
+    validate_diagnostic_prepared_metrics(&client.output, expected, &expected_client_id)
+}
+
 async fn diagnostic_admission_or_cancel(
     config: &OatConfig,
     platform: &mut dyn Platform,
     handles: &[ClientHandle],
     clients: &[ClientProgress],
+    run_id: &str,
+    pre_schedule: bool,
 ) -> Result<()> {
     let result = (|| {
         let Some(expected) = diagnostic_expected_pin(
@@ -377,28 +493,8 @@ async fn diagnostic_admission_or_cancel(
         else {
             return Ok(None);
         };
-        ensure!(
-            config.platform.kind == crate::config::OatMode::Local
-                && config.tables.len() == 1
-                && config.tables[0] == "sqlserver_availability_replica_states"
-                && config.clients_per_table == 1
-                && handles.len() == 1
-                && clients.len() == 1,
-            "diagnostic requires one local table and client"
-        );
-        let client = &clients[0];
-        ensure!(
-            client.ready && !client.completed && !client.schedule_received && client.failure.is_none(),
-            "diagnostic client is not exclusively waiting for its schedule"
-        );
-        let suffix = format!(":{}:1", config.tables[0]);
-        let run_id = handles[0]
-            .client_id
-            .strip_suffix(&suffix)
-            .filter(|value| !value.is_empty())
-            .context("diagnostic client handle has an invalid identity")?;
-        let expected_client_id = format!("oat-{run_id}-{}-c1", config.tables[0]);
-        validate_diagnostic_prepared_metrics(&client.output, &expected, &expected_client_id)
+        require_diagnostic_parity_precheck(std::env::var("OAT_DARWIN_PARITY_PRECHECK"))?;
+        validate_diagnostic_live_fleet(config, handles, clients, run_id, &expected)
             .map(|proof| Some((proof, run_id.to_owned())))
     })();
     let result = match result {
@@ -411,7 +507,12 @@ async fn diagnostic_admission_or_cancel(
     };
     match result {
         Ok(Some(proof)) => {
-            println!("[oat] diagnostic admission: {proof}");
+            let label = if pre_schedule {
+                "diagnostic pre-schedule admission"
+            } else {
+                "diagnostic admission"
+            };
+            println!("[oat] {label}: {proof}");
             Ok(())
         }
         Ok(None) => Ok(()),
@@ -424,6 +525,36 @@ async fn diagnostic_admission_or_cancel(
                 ))),
             }
         }
+    }
+}
+
+async fn diagnostic_recheck_or_cancel(
+    config: &OatConfig,
+    platform: &mut dyn Platform,
+    handles: &[ClientHandle],
+    run_id: &str,
+) -> Result<()> {
+    let enabled = diagnostic_expected_pin(
+        config.platform.compose_project.as_deref(),
+        std::env::var(DIAGNOSTIC_CORPUS_ENV),
+    );
+    match enabled {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => match poll_clients(platform, config, handles).await {
+            Ok(clients) => diagnostic_admission_or_cancel(config, platform, handles, &clients, run_id, true).await,
+            Err(error) => match cancel_clients(platform, config, handles).await {
+                Ok(()) => Err(error).context("refresh diagnostic clients before scheduling"),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "cancelling clients after diagnostic refresh failure also failed: {cleanup_error:#}"
+                ))),
+            },
+        },
+        Err(error) => match cancel_clients(platform, config, handles).await {
+            Ok(()) => Err(error).context("verify diagnostic configuration before scheduling"),
+            Err(cleanup_error) => Err(error.context(format!(
+                "cancelling clients after diagnostic configuration failure also failed: {cleanup_error:#}"
+            ))),
+        },
     }
 }
 
@@ -516,6 +647,70 @@ mod realistic_diagnostic_admission_tests {
     }
 
     #[test]
+    fn diagnostic_requires_non_qualification_parity_readback() {
+        assert!(require_diagnostic_parity_precheck(Ok("1".into())).is_ok());
+        for value in ["qualified", "0", ""] {
+            assert!(require_diagnostic_parity_precheck(Ok(value.into())).is_err());
+        }
+        assert!(require_diagnostic_parity_precheck(Err(std::env::VarError::NotPresent)).is_err());
+    }
+
+    #[test]
+    fn live_fleet_requires_exact_run_owned_waiting_client() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let table = "sqlserver_availability_replica_states";
+        config.tables = vec![table.into()];
+        config.clients_per_table = 1;
+        let run = "00000000-0000-4000-8000-000000000001";
+        let process_id = format!("oat-{run}-{table}-c1");
+        let handle = ClientHandle {
+            client_id: format!("{run}:{table}:1"),
+            table: table.into(),
+            process: ClientProcess::Local {
+                container_id: "one".into(),
+            },
+        };
+        let client = ClientProgress {
+            ready: true,
+            output: output(&prepared()).replace("client_id=test", &format!("client_id={process_id}")),
+            ..Default::default()
+        };
+        let pin = "a".repeat(64);
+        assert!(validate_diagnostic_live_fleet(&config, &[handle.clone()], &[client.clone()], run, &pin).is_ok());
+        assert!(validate_diagnostic_live_fleet(&config, &[], &[client.clone()], run, &pin).is_err());
+        assert!(
+            validate_diagnostic_live_fleet(&config, &[handle.clone(), handle.clone()], &[client.clone()], run, &pin)
+                .is_err()
+        );
+        assert!(
+            validate_diagnostic_live_fleet(&config, &[handle.clone()], &[client.clone(), client.clone()], run, &pin)
+                .is_err()
+        );
+        assert!(
+            validate_diagnostic_live_fleet(
+                &config,
+                &[handle.clone()],
+                &[client.clone()],
+                "00000000-0000-4000-8000-000000000002",
+                &pin
+            )
+            .is_err()
+        );
+        let mut wrong = client.clone();
+        wrong.schedule_received = true;
+        assert!(validate_diagnostic_live_fleet(&config, &[handle.clone()], &[wrong], run, &pin).is_err());
+        let mut wrong = client.clone();
+        wrong.failure = Some("failed".into());
+        assert!(validate_diagnostic_live_fleet(&config, &[handle.clone()], &[wrong], run, &pin).is_err());
+        let mut wrong = client.clone();
+        wrong.output.clear();
+        assert!(validate_diagnostic_live_fleet(&config, &[handle], &[wrong], run, &pin).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn checks_pinned_corpus_and_complete_pre_schedule_reservation() -> Result<()> {
         let value = prepared();
         let pin = "a".repeat(64);
@@ -532,6 +727,15 @@ mod realistic_diagnostic_admission_tests {
         let mut wrong = value.clone();
         wrong["phase"] = json!("measurement");
         assert!(validate_diagnostic_prepared_metrics(&output(&wrong), &pin, "test").is_err());
+        wrong = value.clone();
+        wrong.as_object_mut().unwrap().remove("measurement_window");
+        assert!(validate_diagnostic_prepared_metrics(&output(&wrong), &pin, "test").is_err());
+        let duplicate = output(&value).replacen(
+            "\"admitted_live_slots\":28",
+            "\"admitted_live_slots\":27,\"admitted_live_slots\":28",
+            1,
+        );
+        assert!(validate_diagnostic_prepared_metrics(&duplicate, &pin, "test").is_err());
         wrong = value.clone();
         wrong["preparation"]["admitted_live_slots"] = json!(27);
         assert!(validate_diagnostic_prepared_metrics(&output(&wrong), &pin, "test").is_err());

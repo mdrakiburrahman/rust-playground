@@ -71,7 +71,8 @@ function diagnosticClientMapping(proof: JsonObject): { clientId: string; logical
 
 export function verifyDiagnosticHook(source: string): void {
   const include = 'include!("runner_realistic_diagnostic_admission.rs");';
-  const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients).await?;";
+  const hook = "diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;";
+  const recheckHook = "diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;";
   const memoryHook = "diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;";
   const lines = source.split(/\r?\n/).map(line => line.trim());
   const nonempty = lines.filter(Boolean);
@@ -80,7 +81,8 @@ export function verifyDiagnosticHook(source: string): void {
   const ready = source.indexOf("let ready_clients = loop {");
   const precheck = source.indexOf('let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");');
   if (lines.filter(line => line === include).length !== 1 || lines.filter(line => line === hook).length !== 1
-    || lines.filter(line => line === memoryHook).length !== 1 || precheckLine < 0 || schedule < 1 || nonempty[schedule - 1] !== memoryHook || ready < 0
+    || lines.filter(line => line === recheckHook).length !== 1 || lines.filter(line => line === memoryHook).length !== 1
+    || precheckLine < 0 || schedule < 2 || nonempty[schedule - 1] !== memoryHook || nonempty[schedule - 2] !== recheckHook || ready < 0
     || precheck < 0 || source.indexOf(hook) <= ready || source.indexOf(hook) >= precheck) {
     throw new Error("diagnostic admission hook is not wired immediately after client readiness");
   }
@@ -145,8 +147,8 @@ async function runDiagnosticOat(runtime: string, configPath: string, home: strin
   } finally { await log.close(); }
 }
 
-export function validateDiagnosticProof(log: string, corpus: string, schedule: unknown): JsonObject {
-  const prefix = "[oat] diagnostic admission: ";
+export function validateDiagnosticProof(log: string, corpus: string, schedule: unknown, preSchedule = false): JsonObject {
+  const prefix = preSchedule ? "[oat] diagnostic pre-schedule admission: " : "[oat] diagnostic admission: ";
   const lines = log.split("\n").filter(line => line.startsWith(prefix));
   if (lines.length !== 1) throw new Error("diagnostic admission proof missing or repeated");
   const proof = object(JSON.parse(lines[0]!.slice(prefix.length)), "diagnostic admission proof");
@@ -169,6 +171,16 @@ export function validateDiagnosticProof(log: string, corpus: string, schedule: u
     throw new Error("diagnostic startup accounting differs from admission proof");
   }
   return proof;
+}
+
+export function validateDiagnosticRecheck(initial: JsonObject, recheck: JsonObject, host: JsonObject): void {
+  if (!isDeepStrictEqual(initial.startup_accounting, recheck.startup_accounting)
+    || !isDeepStrictEqual(initial.client_mapping, recheck.client_mapping)
+    || !isDeepStrictEqual(initial.cpu_isolation, recheck.cpu_isolation)
+    || Number(recheck.observed_at_unix_ms) < Number(initial.observed_at_unix_ms)
+    || Number(host.observed_at_unix_ms) < Number(recheck.observed_at_unix_ms)) {
+    throw new Error("diagnostic pre-schedule client or CPU readback changed or is out of order");
+  }
 }
 
 function linuxCpuSet(value: unknown): number[] {
@@ -400,8 +412,11 @@ export async function runRealisticDiagnostic(options: {
       || Number(row.replicas) !== 1 || typeof row.evidence_json !== "string") throw new Error("diagnostic result identity differs");
     const evidence = object(JSON.parse(row.evidence_json), "evidence");
     const admission = validateDiagnosticProof(log, expected.corpus, evidence.client_schedule);
+    const preScheduleAdmission = validateDiagnosticProof(log, expected.corpus, evidence.client_schedule, true);
     const hostAdmission = validateHostAdmission(log, evidence.client_schedule);
     validateDiagnosticCpuProof(admission, cpus, clientCpus);
+    validateDiagnosticCpuProof(preScheduleAdmission, cpus, clientCpus);
+    validateDiagnosticRecheck(admission, preScheduleAdmission, hostAdmission);
     if (!Array.isArray(evidence.client_phase_reports) || evidence.client_phase_reports.length !== 1) throw new Error("client evidence missing");
     const report = object(evidence.client_phase_reports[0], "client report");
     const executionImage = object(report.execution_image, "client execution image");
@@ -472,7 +487,7 @@ export async function runRealisticDiagnostic(options: {
       images: expected.images, startup_revision: expected.startup, diagnostic_gate_sha256: expected.gate,
       harness_revision: expected.harness, collector_source_revision: expected.collectorSource,
       config_sha256: configHash, diagnostic_admission: admission, collector_cpu_allocation: allocation,
-      pre_schedule_host_admission: hostAdmission,
+      pre_schedule_admission: preScheduleAdmission, pre_schedule_host_admission: hostAdmission,
       footer_sha256: expected.footer,
       durable_rows_per_second: reconciled.measurement.durableRowsPerSecond,
       committed_original_bytes_per_second: originalBytes.bytesPerSecond,
