@@ -538,6 +538,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.string_width") => ("string_width", "ARROWCOL_CLIENT_STRING_WIDTH"),
             Some("client.string_length_distribution") => ("string_length_distribution", "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION"),
             Some("client.entropy") => ("entropy", "ARROWCOL_CLIENT_ENTROPY"),
+            Some("client.cardinality") => ("cardinality", "ARROWCOL_CLIENT_CARDINALITY"),
             Some("client.max_memory_bytes") => ("max_memory_bytes", "ARROWCOL_CLIENT_MAX_MEMORY_BYTES"),
             Some("client.stream_retry_max_attempts") => ("stream_retry_max_attempts", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"),
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
@@ -592,21 +593,25 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             }
             return true;
         }
-        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy") {
+        if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality") {
             let counts = reports.iter().map(|report| {
                 let name = report["table"].as_str()?;
                 let tables = report.pointer("/phase_counters/preparation/generator_applicability/tables")?.as_array()?;
                 if tables.len() != 1 || !tables[0]["table"].as_str()?.eq_ignore_ascii_case(name) {
                     return None;
                 }
-                let evidence_field = if field == "string_length_distribution" { "string_width" } else { field };
+                let evidence_field = match field {
+                    "string_length_distribution" => "string_width",
+                    "cardinality" => "value_variation",
+                    _ => field,
+                };
                 let columns = tables[0].get(evidence_field)?.get("eligible_columns")?.as_u64()?;
                 let rows = tables[0].get(evidence_field)?.get("eligible_rows")?.as_u64()?;
                 Some((columns, rows))
             }).collect::<Option<Vec<_>>>();
             let Some(counts) = counts else { return true; };
             if counts.iter().all(|&(columns, rows)| columns == 0 && rows == 0) {
-                if field == "entropy" {
+                if matches!(field, "entropy" | "cardinality") {
                     return true;
                 }
                 inert.push(json!({"path": entry["path"], "reason": "no_eligible_generated_rows"}));
@@ -617,7 +622,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             {
                 return true;
             }
-            if field == "value_variation" {
+            if matches!(field, "value_variation" | "cardinality") {
                 let skews = reports.iter().map(|report| report["consumer_effective_config"]["skew"].as_f64())
                     .collect::<Option<Vec<_>>>();
                 let Some(skews) = skews else { return true; };
@@ -625,7 +630,10 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
                     inert.push(json!({"path": entry["path"], "reason": "all_values_skewed"}));
                     return false;
                 }
-                if skews.iter().any(|&skew| skew != 0.0) {
+                if skews.iter().any(|&skew| skew != 0.0)
+                    || (field == "cardinality"
+                        && reports.iter().any(|report| report["consumer_effective_config"]["value_variation"] != "cardinality"))
+                {
                     return true;
                 }
             }
@@ -647,7 +655,7 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         {
             return true;
         }
-        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy") {
+        promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality") {
             "consumer_startup_and_prepared_corpus"
         } else { "consumer_startup_readback" }}));
         false
