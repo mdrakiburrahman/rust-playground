@@ -473,7 +473,7 @@ mod io_tests {
             let mut high = rows.min(batch.num_rows().saturating_sub(start));
             while low < high {
                 let mid = low + (high - low).div_ceil(2);
-                if owned_for_sort(batch.slice(start, mid))?.get_array_memory_size() <= bytes {
+                if owned_for_sort(batch.slice(start, mid), 2)?.get_array_memory_size() <= bytes {
                     low = mid;
                 } else {
                     high = mid - 1;
@@ -482,7 +482,7 @@ mod io_tests {
             if low == 0 {
                 Ok(None)
             } else {
-                Ok(Some(owned_for_sort(batch.slice(start, low))?))
+                Ok(Some(owned_for_sort(batch.slice(start, low), 2)?))
             }
         }
 
@@ -490,10 +490,22 @@ mod io_tests {
         let strings = Arc::new(StringArray::from_iter(
             (0..2048).map(|i| (i % 7 != 0).then(|| format!("{i:04}-{}", "x".repeat(128)))),
         )) as ArrayRef;
+        let compact = RecordBatch::try_from_iter(vec![("id", Arc::clone(&ids))])?.slice(0, 1024);
+        let retained = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 8)?.context("retain slice")?;
+        let detached = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 1)?.context("detach slice")?;
+        assert_eq!(retained, detached);
+        assert_eq!(
+            retained.column(0).to_data().buffers()[0].as_ptr(),
+            compact.column(0).to_data().buffers()[0].as_ptr()
+        );
+        assert_ne!(
+            retained.column(0).to_data().buffers()[0].as_ptr(),
+            detached.column(0).to_data().buffers()[0].as_ptr()
+        );
         let batch = RecordBatch::try_from_iter(vec![("id", ids), ("text", strings)])?.slice(1000, 128);
         let (logical, bound) = flat_take_prefix_bound(&batch).context("flat bound")?;
         assert!(batch.get_array_memory_size() > logical * 2);
-        let full = fitting_sort_chunk(&batch, 0, 128, bound)?.context("full chunk")?;
+        let full = fitting_sort_chunk(&batch, 0, 128, bound, 2)?.context("full chunk")?;
         assert_eq!(full, batch);
         assert!(full.get_array_memory_size() < batch.get_array_memory_size());
         assert_ne!(
@@ -502,10 +514,10 @@ mod io_tests {
         );
         for rows in 1..=128 {
             let (_, upper) = flat_take_prefix_bound(&batch.slice(0, rows)).context("prefix bound")?;
-            assert!(owned_for_sort(batch.slice(0, rows))?.get_array_memory_size() <= upper);
+            assert!(owned_for_sort(batch.slice(0, rows), 2)?.get_array_memory_size() <= upper);
         }
-        let one_row = owned_for_sort(batch.slice(0, 1))?.get_array_memory_size();
-        let almost_full = owned_for_sort(batch.slice(0, 127))?.get_array_memory_size();
+        let one_row = owned_for_sort(batch.slice(0, 1), 2)?.get_array_memory_size();
+        let almost_full = owned_for_sort(batch.slice(0, 127), 2)?.get_array_memory_size();
         for budget in [
             0,
             one_row - 1,
@@ -518,7 +530,7 @@ mod io_tests {
             usize::MAX,
         ] {
             for rows in [1, 63, 128] {
-                let actual = fitting_sort_chunk(&batch, 0, rows, budget)?;
+                let actual = fitting_sort_chunk(&batch, 0, rows, budget, 2)?;
                 let expected = original(&batch, 0, rows, budget)?;
                 assert_eq!(actual, expected);
                 if let Some(actual) = actual {
@@ -535,7 +547,7 @@ mod io_tests {
         assert!(flat_take_prefix_bound(&nested).is_none());
         for budget in [0, 512, usize::MAX] {
             assert_eq!(
-                fitting_sort_chunk(&nested, 0, 128, budget)?,
+                fitting_sort_chunk(&nested, 0, 128, budget, 2)?,
                 original(&nested, 0, 128, budget)?
             );
         }
@@ -2425,6 +2437,7 @@ fn fitting_sort_chunk(
     start: usize,
     max_rows: usize,
     max_bytes: usize,
+    detach_ratio: usize,
 ) -> Result<Option<RecordBatch>> {
     let remaining = batch.num_rows().saturating_sub(start);
     let mut low = 0;
@@ -2435,8 +2448,8 @@ fn fitting_sort_chunk(
             let charged = full.get_array_memory_size();
             // A prefix either keeps the original buffers or is copied. If the
             // full slice is copied, all shorter flat prefixes are copied too.
-            if copy_bound <= max_bytes && (charged <= max_bytes || charged > logical.saturating_mul(2)) {
-                let candidate = owned_for_sort(full)?;
+            if copy_bound <= max_bytes && (charged <= max_bytes || charged > logical.saturating_mul(detach_ratio)) {
+                let candidate = owned_for_sort(full, detach_ratio)?;
                 if candidate.get_array_memory_size() <= max_bytes {
                     return Ok(Some(candidate));
                 }
@@ -2445,7 +2458,7 @@ fn fitting_sort_chunk(
     }
     while low < high {
         let rows = low + (high - low).div_ceil(2);
-        let candidate = owned_for_sort(batch.slice(start, rows))?;
+        let candidate = owned_for_sort(batch.slice(start, rows), detach_ratio)?;
         if candidate.get_array_memory_size() <= max_bytes {
             low = rows;
         } else {
@@ -2455,7 +2468,7 @@ fn fitting_sort_chunk(
     if low == 0 {
         return Ok(None);
     }
-    Ok(Some(owned_for_sort(batch.slice(start, low))?))
+    Ok(Some(owned_for_sort(batch.slice(start, low), detach_ratio)?))
 }
 
 /// Local table ownership and Kernel engine. Hold one instance per table.
@@ -2577,6 +2590,7 @@ impl LayoutReadback {
                 .filter(|column| properties.bloom_filter_properties(column.path()).is_some())
                 .map(|column| column.path().string())
                 .collect::<Vec<_>>();
+            config["detach_ratio"] = serde_json::json!(runtime_config()?.layout_detach_ratio);
             config["bloom_columns"] = serde_json::json!(bloom_columns);
             config["row_group_rows"] = serde_json::json!(
                 properties
@@ -3997,7 +4011,8 @@ impl DeltaTable {
         }
         let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
         let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
-        let generated_partition_fast_path = runtime_config()?.generated_partition_fast_path;
+        let runtime = runtime_config()?;
+        let generated_partition_fast_path = runtime.generated_partition_fast_path;
         let mut identities = Vec::with_capacity(entries.len());
         let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
@@ -4174,7 +4189,8 @@ impl DeltaTable {
                     let row_capacity = policy.max_rows.saturating_sub(partition.file_rows[file]);
                     let byte_capacity = policy.max_input_bytes.saturating_sub(partition.file_bytes[file]);
                     let sort_started = Instant::now();
-                    let chunk = fitting_sort_chunk(&batch, start, row_capacity, byte_capacity);
+                    let chunk =
+                        fitting_sort_chunk(&batch, start, row_capacity, byte_capacity, runtime.layout_detach_ratio);
                     preparation_sort += sort_started.elapsed();
                     let chunk = chunk?;
                     let Some(chunk) = chunk else {
@@ -4989,14 +5005,14 @@ impl StagedAppend {
 /// Return a batch whose Arrow memory charge is the memory the sort buffer actually retains.
 ///
 /// IPC-decoded and sliced columns share a parent allocation, so `get_array_memory_size`
-/// charges that allocation once per column. When the charge exceeds twice the logical
+/// charges that allocation once per column. When the charge exceeds the configured multiple of logical
 /// slice bytes, copy rows into fresh buffers: the parent is released instead of retained
 /// and the unchanged sort-budget guard then measures real memory. Batches built with
 /// their own buffers are retained without a copy.
-fn owned_for_sort(batch: RecordBatch) -> Result<RecordBatch> {
+fn owned_for_sort(batch: RecordBatch, detach_ratio: usize) -> Result<RecordBatch> {
     let charged = u64::try_from(batch.get_array_memory_size()).context("Arrow memory charge exceeds u64")?;
     let logical = crate::record_batch_logical_bytes(&batch)?;
-    if charged <= logical.saturating_mul(2) {
+    if charged <= logical.saturating_mul(u64::try_from(detach_ratio)?) {
         return Ok(batch);
     }
     let rows = u32::try_from(batch.num_rows()).context("sorted batch row count exceeds u32")?;
@@ -5285,7 +5301,7 @@ impl DeltaFileWriter {
         self.stage_timings.build += build_started.elapsed();
         if let Some(sorter) = &mut self.sorter {
             let sort_started = Instant::now();
-            let physical = owned_for_sort(physical)?;
+            let physical = owned_for_sort(physical, runtime_config()?.layout_detach_ratio)?;
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
             if !sorter.try_push(&physical)? {
                 bail!(

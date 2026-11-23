@@ -116,7 +116,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         }
         if let Some(field) = path.strip_prefix("collector.layout.")
             && matches!(field, "enabled" | "sort_columns" | "bloom_columns" | "max_rows"
-                | "max_input_bytes" | "row_group_rows" | "page_rows")
+                | "max_input_bytes" | "row_group_rows" | "page_rows" | "detach_ratio")
         {
             let requested = layout_policy.as_ref().and_then(|policy| policy.get(field))
                 .filter(|value| !value.is_null());
@@ -1105,6 +1105,23 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let mut wrong = observed;
         wrong["runtime"]["upload_request_concurrency"] = json!(2);
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn detach_ratio_reaches_actual_collector_startup() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arrowcol-dataflow-rust");
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"layout":{"detach_ratio":5}}
+        }))?;
+        let output = std::process::Command::new(binary).arg("--help").env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?).output()?;
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+        let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        assert_eq!(observed["runtime"]["layout_detach_ratio"], 5);
         Ok(())
     }
 

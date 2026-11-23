@@ -49,6 +49,9 @@ pub struct DeltaRuntimeConfig {
     /// Blocking workers reserved for filesystem handoffs: default 1.
     #[serde(default = "default_blocking_fs_reserve")]
     pub blocking_fs_reserve: usize,
+    /// Detach sorted input from its parent allocation above this charged/logical size ratio.
+    #[serde(default = "default_detach_ratio")]
+    pub layout_detach_ratio: usize,
     /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
     /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
@@ -74,6 +77,10 @@ pub struct DeltaRuntimeConfig {
     pub generated_partition_fast_path: bool,
 }
 
+const fn default_detach_ratio() -> usize {
+    2
+}
+
 fn default_blocking_fs_reserve() -> usize {
     1
 }
@@ -90,6 +97,7 @@ impl DeltaRuntimeConfig {
             runtime_workers: (cores / 4).clamp(2, 16),
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
             blocking_fs_reserve: 1,
+            layout_detach_ratio: default_detach_ratio(),
             upload_limit: 32,
             upload_mode: UploadMode::PutCreate,
             upload_buffer_capacity_bytes: DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES,
@@ -123,6 +131,7 @@ impl DeltaRuntimeConfig {
             ("RUNTIME_WORKERS", &mut config.runtime_workers),
             ("BLOCKING_WORKERS", &mut config.blocking_workers),
             ("BLOCKING_FS_RESERVE", &mut config.blocking_fs_reserve),
+            ("LAYOUT_DETACH_RATIO", &mut config.layout_detach_ratio),
             ("UPLOAD_LIMIT", &mut config.upload_limit),
             ("UPLOAD_BUFFER_CAPACITY_BYTES", &mut config.upload_buffer_capacity_bytes),
             ("UPLOAD_REQUEST_CONCURRENCY", &mut config.upload_request_concurrency),
@@ -189,6 +198,7 @@ impl DeltaRuntimeConfig {
         for (name, value, min, max) in [
             ("RUNTIME_WORKERS", self.runtime_workers, 1, 64),
             ("BLOCKING_WORKERS", self.blocking_workers, 2, 256),
+            ("LAYOUT_DETACH_RATIO", self.layout_detach_ratio, 1, 8),
             ("UPLOAD_LIMIT", self.upload_limit, 1, 256),
             ("TASK_LIMIT", self.task_limit, 2, 1024),
             ("READ_AHEAD", self.read_ahead, 1, 128),
