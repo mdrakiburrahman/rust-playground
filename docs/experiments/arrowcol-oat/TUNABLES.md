@@ -65,7 +65,7 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.runtime.cpu_queue_jobs` | Integer `1..=128`, default resolved `cpu_workers`. Bounds queued CPU jobs independently of worker count. |
 | `logging.maintenance` | Inert when maintenance is disabled because no maintenance process is running; listed in the cell's `tunables_json.inert_fields` and `evidence_json.inert_fields`, and Darwin receipt `inert_fields`. A null receipt field means evidence was unavailable, not that no fields were inert. |
 | `maintenance.*` | Except for the `enabled` runner control, fields are inert when maintenance is disabled. Values remain range- and cross-field-validated; enabling the role also requires the corresponding operations. |
-| `parquet_writer.columns.<column>.dictionary_page_size_limit` | Inert if the same column explicitly disables dictionary encoding. Inert factors are not ranked or attributed effects. |
+| `parquet_writer` dictionary page limits | A column limit is inert when its column disables dictionary encoding, including when it inherits a disabled default. A default limit is inert when dictionaries are disabled by default and no column explicitly enables them. Inert factors are not ranked or attributed effects. |
 
 Coverage evidence distinguishes runner controls, inert fields, and projected fields
 whose consumer startup verification is unproven. Missing coverage remains unknown;
