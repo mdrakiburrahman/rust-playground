@@ -820,6 +820,25 @@ mod realistic_diagnostic_admission_tests {
         );
         assert_eq!(schedule_calls.get(), 0);
 
+        let mut wrong_id = exact_reference.clone();
+        wrong_id["clients"][0]["logical_client_id"] = json!("sqlserver_availability_replica_states:2");
+        let mut wrong_count = exact_reference.clone();
+        wrong_count["clients"].as_array_mut().expect("client roster").push(json!({
+            "logical_client_id": "sqlserver_availability_replica_states:2",
+            "corpus_memory_reservation_bytes": 100,
+        }));
+        for reference in [wrong_id, wrong_count] {
+            proof["reference"] = reference.clone();
+            assert!(
+                schedule_after_diagnostic_admission(Some(&reference.to_string()), Some(&proof), run, || {
+                    schedule_calls.set(schedule_calls.get() + 1)
+                })
+                .is_err(),
+                "a wrong client ID or count must not schedule clients"
+            );
+            assert_eq!(schedule_calls.get(), 0);
+        }
+
         let normal_schedule_calls = Cell::new(0);
         schedule_after_diagnostic_admission(None, None, run, || {
             normal_schedule_calls.set(normal_schedule_calls.get() + 1)
