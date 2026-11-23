@@ -452,6 +452,10 @@ const X86_64_FEATURES: &[CollectorCpuFeatureRequirement] = &[
     },
 ];
 
+/// Verifies host CPU flags against a supported collector target ISA.
+///
+/// # Errors
+/// Returns an error when the target is unsupported or required CPU flags are missing.
 pub fn verify_collector_target_cpu_flags(target_cpu: &str, cpu_info: &str, field: &str) -> Result<(), String> {
     let target_level = match target_cpu {
         "generic" => return Ok(()),
