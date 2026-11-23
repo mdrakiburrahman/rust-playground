@@ -1170,6 +1170,31 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     }
 
     #[test]
+    fn socket_evidence_requires_an_accepted_socket() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"socket":{"tcp_nodelay":true}}
+        }))?;
+        let mut process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"socket":{"tcp_nodelay":true}}
+        });
+        for observed in [None, Some(false), Some(true)] {
+            if let Some(value) = observed {
+                process["effective_config"]["socket_effective"] =
+                    json!({"tcp_nodelay":value,"scope":"accepted_flight_socket"});
+            }
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.socket.tcp_nodelay"),
+                observed == Some(true));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn collector_shutdown_drain_timeout_reaches_dfe_profiles_and_readback() -> Result<()> {
         const CHILD: &str = "OAT_DFE_DRAIN_CHILD";
         const ENV: &str = "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS";

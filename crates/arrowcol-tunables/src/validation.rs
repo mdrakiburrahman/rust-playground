@@ -668,6 +668,11 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
+        if let Some(socket) = value.pointer("/collector/socket")
+            && !socket.is_object()
+        {
+            bail!("collector.socket must be an object");
+        }
         if let Some(value) = value.pointer("/collector/socket/tcp_nodelay")
             && !value.is_boolean()
         {
@@ -2428,6 +2433,8 @@ mod tests {
 
     #[test]
     fn receiver_socket_rejects_non_boolean() -> Result<()> {
+        let error = error_text(Tunables::parse_oat_json(serde_json::json!({"collector":{"socket":1}})));
+        assert!(error.contains("collector.socket"), "{error}");
         for value in [serde_json::json!(1), serde_json::json!("true"), serde_json::json!(null)] {
             let error = error_text(Tunables::parse_oat_json(serde_json::json!({
                 "collector":{"socket":{"tcp_nodelay":value}}
