@@ -283,6 +283,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.limits.max_stream_duration", "300s"),
     capability!("collector.limits.admission_timeout", "30s"),
     capability!("collector.limits.max_ddl_bytes", "65536"),
+    capability!("collector.socket.recv_buffer_bytes", "OS default"),
+    capability!("collector.socket.send_buffer_bytes", "OS default"),
     capability!("collector.socket.tcp_nodelay", "OS default"),
     capability!("collector.thp_disabled", "inherited process flag"),
     capability!("collector.pressure.max_concurrent_streams", "128"),
@@ -683,6 +685,14 @@ impl Tunables {
             && !value.is_boolean()
         {
             bail!("collector.socket.tcp_nodelay must be a boolean");
+        }
+        for name in ["recv_buffer_bytes", "send_buffer_bytes"] {
+            if let Some(value) = value.pointer(&format!("/collector/socket/{name}")) {
+                anyhow::ensure!(
+                    value.as_u64().and_then(|value| usize::try_from(value).ok()).is_some(),
+                    "collector.socket.{name} must be an unsigned integer"
+                );
+            }
         }
         if let Some(runtime) = value.pointer("/collector/runtime").and_then(Value::as_object) {
             for name in [
@@ -1590,6 +1600,9 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
 }
 
 fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
+    if let Some(socket) = &collector.socket {
+        socket.validate().map_err(anyhow::Error::msg)?;
+    }
     if collector
         .shutdown_drain_timeout_seconds
         .is_some_and(|seconds| !(1..=MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS).contains(&seconds))
@@ -2472,6 +2485,24 @@ mod tests {
             r#"{"tcp_nodelay":true}"#
         );
         Ok(())
+    }
+
+    #[test]
+    fn receiver_socket_buffers_reject_invalid_values() {
+        for field in ["recv_buffer_bytes", "send_buffer_bytes"] {
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(1_073_741_824_u64),
+                serde_json::json!(-1),
+                serde_json::json!(null),
+                serde_json::json!("4096"),
+            ] {
+                let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"socket":{field:value}}
+                })));
+                assert!(error.contains(&format!("collector.socket.{field}")), "{error}");
+            }
+        }
     }
 
     #[test]

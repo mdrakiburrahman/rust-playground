@@ -259,9 +259,39 @@ pub struct CollectorUploadTunables {
 pub struct CollectorSocketTunables {
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub recv_buffer_bytes: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub send_buffer_bytes: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_bool"
     )]
     pub tcp_nodelay: Option<bool>,
+}
+
+impl CollectorSocketTunables {
+    /// Validates listener buffer requests before they reach the OS.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid buffer size.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("collector.socket.recv_buffer_bytes", self.recv_buffer_bytes),
+            ("collector.socket.send_buffer_bytes", self.send_buffer_bytes),
+        ] {
+            if let Some(value) = value {
+                if !(1..=1_073_741_823).contains(&value) {
+                    return Err(format!("{name} must be in 1..=1073741823"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn deserialize_present_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>

@@ -849,7 +849,7 @@ pub struct FlightReceiverConfig {
     /// Flight resource limits.
     #[serde(default)]
     pub limits: RuntimeLimitsConfig,
-    /// Flight accepted-socket settings.
+    /// Flight listener and accepted-socket settings.
     #[serde(default)]
     pub socket: arrowcol_tunables::CollectorSocketTunables,
     /// Enables durable admission through native Quiver persistence.
@@ -930,6 +930,12 @@ impl FlightReceiverConfig {
         self.routing.validate()?;
         self.registration.validate()?;
         self.limits.build().map_err(|error| error.to_string())?;
+        self.socket.validate()?;
+        if !cfg!(target_os = "linux")
+            && (self.socket.recv_buffer_bytes.is_some() || self.socket.send_buffer_bytes.is_some())
+        {
+            return Err("collector.socket buffer settings are only supported on Linux".to_owned());
+        }
         Ok(())
     }
 }

@@ -38,6 +38,7 @@ otel-arrow-dfe-pdata = { path = "../../submodules/otel-arrow/rust/otap-dataflow/
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+socket2 = "0.6"
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }

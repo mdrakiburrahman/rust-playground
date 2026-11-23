@@ -586,6 +586,14 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Connect, error))?;
 
         let flight_listener = effect_handler.tcp_listener(self.config.listening_addr)?;
+        if let Some(actual) = configure_flight_listener(&flight_listener, &self.config.socket)
+            .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error))?
+        {
+            eprintln!(
+                "arrowcol_effective_config {}",
+                serde_json::json!({"socket_listener_effective":actual})
+            );
+        }
         let admin_listener = effect_handler.tcp_listener(self.config.admin_listening_addr)?;
         let shutdown = CancellationToken::new();
         let registration_shutdown = shutdown.child_token();
@@ -700,6 +708,46 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             }
         }
     }
+}
+
+fn configure_flight_listener(
+    listener: &tokio::net::TcpListener,
+    config: &arrowcol_tunables::CollectorSocketTunables,
+) -> Result<Option<serde_json::Value>, String> {
+    if config.recv_buffer_bytes.is_none() && config.send_buffer_bytes.is_none() {
+        return Ok(None);
+    }
+    if !cfg!(target_os = "linux") {
+        return Err("collector.socket buffer settings are only supported on Linux".to_owned());
+    }
+    config.validate()?;
+    let socket = socket2::SockRef::from(listener);
+    let mut actual = serde_json::json!({"scope":"linux_flight_listener"});
+    for (name, requested) in [
+        ("recv_buffer_bytes", config.recv_buffer_bytes),
+        ("send_buffer_bytes", config.send_buffer_bytes),
+    ] {
+        let Some(requested) = requested else { continue };
+        let field = format!("collector.socket.{name}");
+        let observed = if name == "recv_buffer_bytes" {
+            socket
+                .set_recv_buffer_size(requested)
+                .map_err(|error| format!("{field}: {error}"))?;
+            socket.recv_buffer_size().map_err(|error| format!("{field}: {error}"))?
+        } else {
+            socket
+                .set_send_buffer_size(requested)
+                .map_err(|error| format!("{field}: {error}"))?;
+            socket.send_buffer_size().map_err(|error| format!("{field}: {error}"))?
+        };
+        if observed < requested * 2 {
+            return Err(format!(
+                "{field}: OS clamped request {requested}; reported buffer is {observed} bytes"
+            ));
+        }
+        actual[name] = serde_json::json!(observed);
+    }
+    Ok(Some(actual))
 }
 
 fn configure_flight_socket(
@@ -1196,6 +1244,30 @@ pub(crate) mod tests {
         let (stream, observed) = configure_flight_socket(stream, Some(false))?;
         assert_eq!(observed, Some(false));
         assert!(!stream.nodelay()?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn flight_listener_buffers_reach_accepted_socket() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = arrowcol_tunables::CollectorSocketTunables {
+            recv_buffer_bytes: Some(32_768),
+            send_buffer_bytes: Some(32_768),
+            ..Default::default()
+        };
+        let actual = configure_flight_listener(&listener, &config)?.ok_or("missing listener readback")?;
+        let _client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (stream, _) = listener.accept().await?;
+        let socket = socket2::SockRef::from(&stream);
+        assert_eq!(
+            socket.recv_buffer_size()?,
+            actual["recv_buffer_bytes"].as_u64().ok_or("missing receive readback")? as usize
+        );
+        assert_eq!(
+            socket.send_buffer_size()?,
+            actual["send_buffer_bytes"].as_u64().ok_or("missing send readback")? as usize
+        );
         Ok(())
     }
 
