@@ -545,6 +545,8 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
         null_rows: u64,
         guid_columns: std::collections::BTreeSet<String>,
         guid_rows: u64,
+        variation_columns: std::collections::BTreeSet<String>,
+        variation_rows: u64,
     }
     let mut tables = std::collections::BTreeMap::<String, Counts>::new();
     for batches in corpus {
@@ -558,6 +560,23 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
                 .checked_add(batch.rows)
                 .context("corpus table row count overflow")?;
             for (field, array) in batch.template.schema().fields().iter().zip(batch.template.columns()) {
+                if matches!(
+                    field.data_type(),
+                    DataType::Boolean
+                        | DataType::UInt8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float64
+                        | DataType::Timestamp(TimeUnit::Microsecond, _)
+                ) && array.len() > array.null_count()
+                {
+                    counts.variation_columns.insert(field.name().to_owned());
+                    counts.variation_rows = counts
+                        .variation_rows
+                        .checked_add(u64::try_from(array.len() - array.null_count())?)
+                        .context("corpus variation row count overflow")?;
+                }
                 if field.data_type() == &DataType::Utf8
                     && is_guid_field(field.name())
                     && array.len() > array.null_count()
@@ -604,6 +623,10 @@ fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Option
             "guid_uniqueness": {
                 "eligible_columns": counts.guid_columns.len(),
                 "eligible_rows": counts.guid_rows,
+            },
+            "value_variation": {
+                "eligible_columns": counts.variation_columns.len(),
+                "eligible_rows": counts.variation_rows,
             },
         })).collect::<Vec<_>>(),
     }))
@@ -4569,6 +4592,13 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .context("value array")?;
         assert!(values.iter().all(|value| value == Some(0)));
+        options.skew = 0.0;
+        options.cardinality = 1;
+        options.value_variation = Some(ValueVariation::Cardinality);
+        let cardinal = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        options.value_variation = Some(ValueVariation::PerRow);
+        let per_row = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(cardinal.column_by_name("value"), per_row.column_by_name("value"));
         Ok(())
     }
 
@@ -4947,6 +4977,13 @@ mod tests {
         assert!(applicability["pod_ordinal"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
         assert!(applicability["pod_ordinal"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
         assert_eq!(applicability["guid_uniqueness"], applicability["pod_ordinal"]);
+        assert!(
+            applicability["value_variation"]["eligible_columns"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(applicability["value_variation"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()
