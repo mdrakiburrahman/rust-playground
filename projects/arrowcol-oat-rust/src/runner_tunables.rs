@@ -321,6 +321,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 && (field != "cpu_thread_stack_size" || collectors.iter().all(|process| {
                     process["effective_config"]["cpu_pool"]["thread_stack_size"]
                         == process["effective_config"]["runtime"][field]
+                        && process["effective_config"]["cpu_pool"]["scope"] == "lazy_pool_initialization"
                 }))
             {
                 let reason = if field == "cpu_thread_stack_size" {
@@ -1201,7 +1202,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         });
         for observed in [None, Some(2097152), Some(4194304)] {
             if let Some(size) = observed {
-                process["effective_config"]["cpu_pool"] = json!({"thread_stack_size":size});
+                process["effective_config"]["cpu_pool"] =
+                    json!({"thread_stack_size":size,"scope":"lazy_pool_initialization"});
             }
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;

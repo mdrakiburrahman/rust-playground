@@ -442,7 +442,7 @@ fn cpu_pool() -> Result<&'static CpuPool> {
         if let Some(size) = config.cpu_thread_stack_size {
             eprintln!(
                 "arrowcol_effective_config {}",
-                serde_json::json!({"cpu_pool":{"thread_stack_size":size}})
+                serde_json::json!({"cpu_pool":{"thread_stack_size":size,"scope":"lazy_pool_initialization"}})
             );
         }
         Ok(pool)
@@ -1018,6 +1018,7 @@ mod tests {
             .context("CPU pool readback missing")?;
         let readback: serde_json::Value = serde_json::from_str(readback)?;
         assert_eq!(readback["cpu_pool"]["thread_stack_size"], 4194304);
+        assert_eq!(readback["cpu_pool"]["scope"], "lazy_pool_initialization");
         Ok(())
     }
 
