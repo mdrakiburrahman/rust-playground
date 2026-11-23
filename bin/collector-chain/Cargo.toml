@@ -35,6 +35,9 @@ tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time", 
 tonic = { version = "0.14", features = ["gzip", "zstd"] }
 uuid = { version = "1", features = ["v4"] }
 
+[build-dependencies]
+arrowcol-tunables = { path = "../../crates/arrowcol-tunables" }
+
 [dev-dependencies]
 async-trait = "0.1"
 

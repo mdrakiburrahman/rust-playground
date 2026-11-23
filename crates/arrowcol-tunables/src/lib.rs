@@ -121,6 +121,8 @@ pub struct ClientTunables {
     pub runtime_threads: Option<usize>,
     pub data_mode: Option<DataMode>,
     pub data_profile: Option<ClientDataProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_profile: Option<ClientBuildProfileTunables>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_iter: Option<ClientSendIter>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,6 +409,45 @@ impl CollectorTargetCpu {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClientBuildProfile {
+    pub lto: CollectorLto,
+    pub codegen_units: u16,
+    pub opt_level: CollectorOptLevel,
+    pub target_cpu: CollectorTargetCpu,
+}
+impl ClientBuildProfile {
+    pub fn canonical_key(self) -> String {
+        format!(
+            "lto={};codegen_units={};opt_level={};target_cpu={}",
+            self.lto.as_str(), self.codegen_units, self.opt_level.as_u8(), self.target_cpu.as_str()
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientBuildProfileTunables {
+    #[serde(default, deserialize_with = "deserialize_client_build_lto")]
+    pub lto: Option<CollectorLto>,
+    #[serde(default, deserialize_with = "deserialize_client_build_codegen_units")]
+    pub codegen_units: Option<u16>,
+    #[serde(default, deserialize_with = "deserialize_client_build_opt_level")]
+    pub opt_level: Option<CollectorOptLevel>,
+    #[serde(default, deserialize_with = "deserialize_client_build_target_cpu")]
+    pub target_cpu: Option<CollectorTargetCpu>,
+}
+impl ClientBuildProfileTunables {
+    pub fn build_profile(&self) -> ClientBuildProfile {
+        ClientBuildProfile {
+            lto: self.lto.unwrap_or_default(),
+            codegen_units: self.codegen_units.unwrap_or(16),
+            opt_level: self.opt_level.unwrap_or_default(),
+            target_cpu: self.target_cpu.unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CollectorCpuFeatureRequirement {
     isa_feature: &'static str,
@@ -567,6 +608,22 @@ pub fn verify_collector_target_cpu_flags(target_cpu: &str, cpu_info: &str, field
     Ok(())
 }
 
+pub fn required_rust_target_features(target_cpu: &str) -> Result<&'static [&'static str], String> {
+    const V2: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2"];
+    const V3: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2",
+        "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"];
+    const V4: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2",
+        "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave",
+        "avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
+    match target_cpu {
+        "generic" => Ok(&[]),
+        "x86-64-v2" => Ok(V2),
+        "x86-64-v3" => Ok(V3),
+        "x86-64-v4" => Ok(V4),
+        _ => Err(format!("unsupported target CPU {target_cpu}")),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectorBuildProfile {
     pub allocator: CollectorAllocator,
@@ -690,6 +747,54 @@ where
             _ => None,
         },
     )
+}
+
+fn deserialize_client_build_lto<'de, D>(d: D) -> Result<Option<CollectorLto>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(d, "client.build_profile.lto", "off, thin-local, thin or fat", |value| match value {
+        "off" => Some(CollectorLto::Off),
+        "thin-local" => Some(CollectorLto::ThinLocal),
+        "thin" => Some(CollectorLto::Thin),
+        "fat" => Some(CollectorLto::Fat),
+        _ => None,
+    })
+}
+fn deserialize_client_build_codegen_units<'de, D>(d: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u16>::deserialize(d)
+        .map_err(|_| D::Error::custom("client.build_profile.codegen_units must be an integer in 1..=256"))?;
+    value.map_or(Ok(None), |value| match value {
+        1..=256 => Ok(Some(value)),
+        _ => Err(D::Error::custom("client.build_profile.codegen_units must be an integer in 1..=256")),
+    })
+}
+fn deserialize_client_build_opt_level<'de, D>(d: D) -> Result<Option<CollectorOptLevel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u8>::deserialize(d)
+        .map_err(|_| D::Error::custom("client.build_profile.opt_level must be integer 2 or 3"))?;
+    value.map_or(Ok(None), |value| match value {
+        2 => Ok(Some(CollectorOptLevel::O2)),
+        3 => Ok(Some(CollectorOptLevel::O3)),
+        _ => Err(D::Error::custom("client.build_profile.opt_level must be integer 2 or 3")),
+    })
+}
+fn deserialize_client_build_target_cpu<'de, D>(d: D) -> Result<Option<CollectorTargetCpu>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(d, "client.build_profile.target_cpu", "generic, x86-64-v2, x86-64-v3 or x86-64-v4", |value| match value {
+        "generic" => Some(CollectorTargetCpu::Generic),
+        "x86-64-v2" => Some(CollectorTargetCpu::X86_64V2),
+        "x86-64-v3" => Some(CollectorTargetCpu::X86_64V3),
+        "x86-64-v4" => Some(CollectorTargetCpu::X86_64V4),
+        _ => None,
+    })
 }
 
 fn deserialize_channel_capacity_object<'de, D>(deserializer: D) -> Result<Option<ChannelCapacityTunables>, D::Error>

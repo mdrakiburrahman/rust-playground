@@ -864,7 +864,9 @@ fn accepted_typed_leaves_have_one_evidence_classification() -> Result<()> {
 #[test]
 fn evidence_classification_uses_only_requested_non_null_leaves() -> Result<()> {
     let input = json!({
-        "client": {"interval_us": 10, "max_rows": null},
+        "client": {"interval_us": 10, "max_rows": null, "build_profile": {
+            "lto": "thin-local", "codegen_units": 16, "opt_level": 3, "target_cpu": "generic"
+        }},
         "collector": {"upload": {"mode": "buffered_multipart", "request_concurrency": 2}},
         "logging": {"maintenance": "warn", "router": "inherit"},
         "maintenance": {"enabled": false},
@@ -892,6 +894,11 @@ fn evidence_classification_uses_only_requested_non_null_leaves() -> Result<()> {
             "reason":"consumer_startup_proof_unverified"})
     }));
     assert!(!evidence.to_string().contains("client.max_rows"));
+    let controls = evidence["runner_controls"].as_array().context("runner_controls missing")?;
+    for field in ["lto", "codegen_units", "opt_level", "target_cpu"] {
+        assert!(controls.iter().any(|entry| entry["path"] == format!("client.build_profile.{field}")
+            && entry["reason"] == "rebuild_only_oat_client_profile"));
+    }
     assert_eq!(
         Tunables::parse_oat_json(json!({}))?.classify_oat_leaves()?,
         json!({

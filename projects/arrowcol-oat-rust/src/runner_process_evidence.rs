@@ -1019,16 +1019,20 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
     Ok(records)
 }
 
-pub(crate) fn verify_oat_client_build_profile_readback(observed: &Value) -> Result<()> {
+pub(crate) fn verify_oat_client_build_profile_readback(config: &OatConfig, observed: &Value) -> Result<()> {
     let profile = observed.get("build_profile").context("OAT client omitted startup build-profile readback")?;
+    let expected_profile = config.tunables.client.as_ref()
+        .and_then(|client| client.build_profile.as_ref())
+        .map(|profile| profile.build_profile())
+        .unwrap_or_default();
     let expected = json!({
-        "lto": "off",
-        "codegen_units": 16,
-        "opt_level": 3,
-        "target_cpu": "generic",
+        "lto": expected_profile.lto.as_str(),
+        "codegen_units": expected_profile.codegen_units,
+        "opt_level": expected_profile.opt_level.as_u8(),
+        "target_cpu": expected_profile.target_cpu.as_str(),
     });
     if profile != &expected {
-        bail!("OAT client startup build-profile readback does not match the requested release profile");
+        bail!("OAT client startup build-profile readback does not match tunables.client.build_profile");
     }
     Ok(())
 }
@@ -2185,14 +2189,25 @@ mod startup_readback_tests {
             "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"off\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}\n",
             "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":257,\"workers\":4}\n",
         ))?;
-        verify_oat_client_build_profile_readback(&readback)?;
+        verify_oat_client_build_profile_readback(&config, &readback)?;
         verify_process_configuration(&config, ComponentRole::Client, &readback)?;
         assert_eq!(readback["workers"], 4);
         let wrong_profile = process_configurations(
             "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"thin-local\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}\n",
         )?;
-        assert!(verify_oat_client_build_profile_readback(&wrong_profile).is_err());
-        assert!(verify_oat_client_build_profile_readback(&json!({})).is_err());
+        assert!(verify_oat_client_build_profile_readback(&config, &wrong_profile).is_err());
+        assert!(verify_oat_client_build_profile_readback(&config, &json!({})).is_err());
+        config.tunables = serde_json::from_value(json!({"client":{"build_profile":{
+            "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
+        }}}))?;
+        let requested_profile = json!({"build_profile":{
+            "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
+        }});
+        verify_oat_client_build_profile_readback(&config, &requested_profile)?;
+        let wrong_requested_profile = json!({"build_profile":{
+            "lto":"thin-local","codegen_units":8,"opt_level":3,"target_cpu":"x86-64-v3"
+        }});
+        assert!(verify_oat_client_build_profile_readback(&config, &wrong_requested_profile).is_err());
         Ok(())
     }
 

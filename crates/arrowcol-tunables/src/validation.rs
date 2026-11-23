@@ -85,6 +85,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.runtime_threads", "0 (automatic)"),
     capability!("client.data_mode", "shared"),
     capability!("client.data_profile", "diagnostic"),
+    capability!("client.build_profile.lto", "off", RebuildOnly),
+    capability!("client.build_profile.codegen_units", "16", RebuildOnly),
+    capability!("client.build_profile.opt_level", "3", RebuildOnly),
+    capability!("client.build_profile.target_cpu", "generic", RebuildOnly),
     capability!("client.send_iter", "clone_vec"),
     capability!("client.identity_builder", "formatted_rows"),
     capability!(
@@ -679,6 +683,14 @@ impl Tunables {
                     | "collector.target_cpu"
             ) {
                 (controls, "rebuild_only_collector_profile")
+            } else if matches!(
+                name.as_str(),
+                "client.build_profile.lto"
+                    | "client.build_profile.codegen_units"
+                    | "client.build_profile.opt_level"
+                    | "client.build_profile.target_cpu"
+            ) {
+                (controls, "rebuild_only_oat_client_profile")
             } else if matches!(
                 name.as_str(),
                 "maintenance.enabled" | "maintenance.operations" | "maintenance.apply"
@@ -4556,6 +4568,31 @@ mod tests {
             let error = format!("{error:#}");
             assert!(error.contains(&format!("collector.{field}")), "{field}: {error}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn oat_client_build_profile_fields_are_strict_and_target_features_are_checked() -> Result<()> {
+        let tunables = Tunables::parse_oat_json(serde_json::json!({"client":{"build_profile":{
+            "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
+        }}}))?;
+        let profile = tunables.client.as_ref().context("client tunables")?
+            .build_profile.as_ref().context("client build profile")?.build_profile();
+        assert_eq!(profile.canonical_key(), "lto=thin-local;codegen_units=8;opt_level=2;target_cpu=x86-64-v3");
+        for (field, value) in [
+            ("lto", serde_json::json!("none")),
+            ("codegen_units", serde_json::json!(0)),
+            ("codegen_units", serde_json::json!(257)),
+            ("opt_level", serde_json::json!(1)),
+            ("target_cpu", serde_json::json!("native")),
+        ] {
+            let error = Tunables::parse_oat_json(serde_json::json!({"client":{"build_profile":{(field):value}}}))
+                .err().context("invalid client build profile was accepted")?;
+            assert!(format!("{error:#}").contains(&format!("client.build_profile.{field}")), "{error:#}");
+        }
+        assert!(required_rust_target_features("generic")?.is_empty());
+        assert!(required_rust_target_features("x86-64-v3")?.contains(&"f16c"));
+        assert!(required_rust_target_features("x86-64-v4")?.contains(&"avx512f"));
         Ok(())
     }
 

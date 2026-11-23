@@ -808,7 +808,7 @@ impl CellEvidence {
 
     fn record_client(&mut self, config: &OatConfig, table: &str, client_id: &str, output: &str) -> Result<()> {
         let effective = process_configurations(output)?;
-        crate::runner::verify_oat_client_build_profile_readback(&effective)?;
+        crate::runner::verify_oat_client_build_profile_readback(config, &effective)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
         let data_profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
         let counters = client_phase_evidence(output, data_profile)?;

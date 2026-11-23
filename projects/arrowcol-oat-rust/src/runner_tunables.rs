@@ -822,6 +822,27 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             services.insert(service.to_owned(), json!({ "environment": environment }));
         }
     }
+    if config.platform.kind == crate::config::OatMode::Local {
+        if let Some(profile_hash) = config.client_build_profile_hash() {
+            let profile = config.tunables.client.as_ref()
+                .and_then(|client| client.build_profile.as_ref())
+                .context("client profile hash requires client build-profile tunables")?
+                .build_profile();
+            let image = super::local_client_profile_tag(&profile_hash);
+            let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
+            client["image"] = json!(image);
+            client["build"]["args"] = json!({
+                "VCS_REF": "${GIT_SHA:-local}",
+                "OAT_CLIENT_BUILD_PROFILE_HASH": profile_hash,
+                "OAT_CLIENT_BUILD_LTO": profile.lto.as_str(),
+                "OAT_CLIENT_BUILD_CODEGEN_UNITS": profile.codegen_units.to_string(),
+                "OAT_CLIENT_BUILD_OPT_LEVEL": profile.opt_level.as_u8().to_string(),
+                "OAT_CLIENT_BUILD_TARGET_CPU": profile.target_cpu.as_str(),
+            });
+            let pin_init = services.entry("oat-pin-init".to_owned()).or_insert_with(|| json!({}));
+            pin_init["image"] = json!(image);
+        }
+    }
     compose_maintenance(config, &mut services)?;
     Ok(json!({ "services": services }))
 }

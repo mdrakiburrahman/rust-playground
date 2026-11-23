@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use arrowcol_tunables::{
-    ClientDataProfile, ClientTunables, CollectorBuildProfile, CollectorTargetCpu,
+    ClientBuildProfile, ClientDataProfile, ClientTunables, CollectorBuildProfile, CollectorTargetCpu,
     DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, DataMode, Tunables,
 };
 use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
@@ -672,6 +672,11 @@ pub fn collector_build_profile_hash(profile: CollectorBuildProfile) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub fn client_build_profile_hash(profile: ClientBuildProfile) -> String {
+    let digest = Sha256::digest(profile.canonical_key().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 impl OatConfig {
     pub(crate) fn cgroup_guard_requested_limits(&self) -> Result<(u64, u64)> {
         let pressure = self
@@ -699,29 +704,39 @@ impl OatConfig {
             .map(|collector| collector_build_profile_hash(collector.build_profile()))
     }
 
+    pub(crate) fn client_build_profile_hash(&self) -> Option<String> {
+        self.tunables
+            .client
+            .as_ref()
+            .and_then(|client| client.build_profile.as_ref())
+            .map(|profile| client_build_profile_hash(profile.build_profile()))
+    }
+
     fn verify_local_cpu_profile(&self) -> Result<()> {
         if self.platform.kind != OatMode::Local {
             return Ok(());
         }
-        let Some(target_cpu) = self
-            .tunables
-            .collector
-            .as_ref()
-            .and_then(|collector| collector.target_cpu)
-        else {
-            return Ok(());
-        };
-        if target_cpu == CollectorTargetCpu::Generic {
+        let mut requested = Vec::new();
+        if let Some(target_cpu) = self.tunables.collector.as_ref().and_then(|collector| collector.target_cpu) {
+            requested.push(("collector.target_cpu preflight", target_cpu));
+        }
+        if let Some(target_cpu) = self.tunables.client.as_ref()
+            .and_then(|client| client.build_profile.as_ref())
+            .map(|profile| profile.build_profile().target_cpu)
+        {
+            requested.push(("client.build_profile.target_cpu preflight", target_cpu));
+        }
+        let requested = requested.into_iter().filter(|(_, cpu)| *cpu != CollectorTargetCpu::Generic)
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
             return Ok(());
         }
         let cpu_info = std::fs::read_to_string("/proc/cpuinfo")
-            .context("collector.target_cpu preflight cannot read host CPU flags")?;
-        arrowcol_tunables::verify_collector_target_cpu_flags(
-            target_cpu.as_str(),
-            &cpu_info,
-            "collector.target_cpu preflight",
-        )
-        .map_err(anyhow::Error::msg)?;
+            .context("target_cpu preflight cannot read host CPU flags")?;
+        for (field, target_cpu) in requested {
+            arrowcol_tunables::verify_collector_target_cpu_flags(target_cpu.as_str(), &cpu_info, field)
+                .map_err(anyhow::Error::msg)?;
+        }
         Ok(())
     }
 

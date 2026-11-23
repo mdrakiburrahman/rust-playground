@@ -97,7 +97,16 @@ Every profile hash, requested field, image identity, and compiled startup value 
 
 ## OAT client release build
 
-The local `arrowcol-oat-client` image uses an explicit release profile: `opt-level=3`, `lto=off` (no LTO), `codegen-units=16`, and `target_cpu=generic` (no `-C target-cpu` flag). `arrowcol-dmv` emits these compiled values in `OAT_CLIENT_BUILD_PROFILE`; the runner verifies the readback before recording client throughput.
+The OAT client release profile is rebuild-only and defaults to `lto=off`, `codegen_units=16`, `opt_level=3`, and `target_cpu=generic`.
+
+| Setting | Type and range | Default | Apply boundary | Influence and interactions |
+| --- | --- | --- | --- | --- |
+| `client.build_profile.lto` | `off`, `thin-local`, `thin`, or `fat` | `off` | OAT client image rebuild | `off` disables LTO; `thin-local` preserves Cargo/rustc's prior local-LTO default; `thin` and `fat` select their corresponding modes. |
+| `client.build_profile.codegen_units` | Integer `1..=256` | `16` | OAT client image rebuild | Parallel code generation and optimization scope; interacts with LTO. |
+| `client.build_profile.opt_level` | Integer `2` or `3` | `3` | OAT client image rebuild | Must match Cargo's effective `OPT_LEVEL`; a mismatch fails the image build. |
+| `client.build_profile.target_cpu` | `generic`, `x86-64-v2`, `x86-64-v3`, or `x86-64-v4`; `native` is forbidden | `generic` | OAT client image rebuild and CPU preflight | Local preflight checks host flags; image build checks rustc target features, including F16C for v3/v4. |
+
+The local image tag includes the profile SHA-256, preventing profiles from reusing an image. `arrowcol-dmv` emits the compiled values in `OAT_CLIENT_BUILD_PROFILE`; the runner derives the expected values from this config and rejects mismatches before recording throughput.
 
 ## Client data profile and identity
 

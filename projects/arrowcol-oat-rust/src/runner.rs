@@ -8603,6 +8603,10 @@ fn local_collector_profile_tag(profile_hash: &str) -> String {
     format!("arrowcol-oat/dataflow:profile-{profile_hash}")
 }
 
+fn local_client_profile_tag(profile_hash: &str) -> String {
+    format!("arrowcol-oat-client:profile-{profile_hash}")
+}
+
 fn local_build_source_revision() -> Result<String> {
     let revision = std::env::var("GIT_SHA")
         .ok()
@@ -8619,6 +8623,9 @@ fn local_prebuild_image_sources(
     source_revision: &str,
 ) -> Vec<(String, String, Option<String>, Option<String>)> {
     let profile_hash = config.collector_build_profile_hash();
+    let client_profile_hash = config.client_build_profile_hash();
+    let client = client_profile_hash.as_deref().map(local_client_profile_tag)
+        .unwrap_or_else(|| "arrowcol-oat-client:local".to_owned());
     let collector = profile_hash
         .as_deref()
         .map(local_collector_profile_tag)
@@ -8635,7 +8642,12 @@ fn local_prebuild_image_sources(
             Some(source_revision.to_owned()),
             None,
         ),
-        ("client".to_owned(), "arrowcol-oat-client:local".to_owned(), None, None),
+        (
+            "client".to_owned(),
+            client,
+            client_profile_hash.as_ref().map(|_| source_revision.to_owned()),
+            client_profile_hash,
+        ),
         (
             collector_role.to_owned(),
             collector,
@@ -8713,8 +8725,8 @@ fn local_prebuild_image_identity(
     let revision = (fields[1] != "-").then(|| fields[1].to_owned());
     let profile_hash = (fields[2] != "-").then(|| fields[2].to_owned());
     if let Some(expected_profile) = expected_profile_hash {
-        let expected_revision = expected_revision.context("collector profile image requires a source revision")?;
-        verify_collector_profile_image(observed, expected_revision, expected_profile)?;
+        let expected_revision = expected_revision.context("profile image requires a source revision")?;
+        verify_profile_image(role, observed, expected_revision, expected_profile)?;
     } else if let Some(expected) = expected_revision {
         if role == "collector" && image.starts_with("sha256:") {
             verify_collector_image(&format!("{} {}", fields[0], fields[1]), image, expected)?;
@@ -8824,19 +8836,28 @@ fn verify_collector_profile_image(
     expected_source_revision: &str,
     profile_hash: &str,
 ) -> Result<String> {
+    verify_profile_image("collector", observed, expected_source_revision, profile_hash)
+}
+
+fn verify_profile_image(
+    role: &str,
+    observed: &str,
+    expected_source_revision: &str,
+    profile_hash: &str,
+) -> Result<String> {
     let fields = observed.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 3 {
-        bail!("local collector profile image metadata must contain image ID, source revision, and profile hash");
+        bail!("local {role} profile image metadata must contain image ID, source revision, and profile hash");
     }
     let image_digest = fields[0].strip_prefix("sha256:").unwrap_or_default();
     if !is_lower_hex_string(image_digest, 64) {
-        bail!("local collector profile image ID must be a full sha256 digest");
+        bail!("local {role} profile image ID must be a full sha256 digest");
     }
     if !is_lower_hex_string(expected_source_revision, 40) || fields[1] != expected_source_revision {
-        bail!("local collector profile image source revision does not match the checked-out source");
+        bail!("local {role} profile image source revision does not match the checked-out source");
     }
     if !is_lower_hex_string(profile_hash, 64) || fields[2] != profile_hash {
-        bail!("local collector image profile hash does not match the requested build profile");
+        bail!("local {role} image profile hash does not match the requested build profile");
     }
     Ok(fields[0].to_owned())
 }
@@ -8876,37 +8897,33 @@ async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -
     let mut images = BTreeMap::new();
     for (role, default_source) in sources {
         let source = if role == "collector" {
-            config
-                .collector_build_profile_hash()
-                .as_deref()
+            config.collector_build_profile_hash().as_deref()
                 .map(local_collector_profile_tag)
+                .unwrap_or_else(|| default_source.to_owned())
+        } else if role == "client" {
+            config.client_build_profile_hash().as_deref()
+                .map(local_client_profile_tag)
                 .unwrap_or_else(|| default_source.to_owned())
         } else {
             default_source.to_owned()
         };
-        let image = if role == "collector" {
-            if let Some(profile_hash) = config.collector_build_profile_hash() {
-                let mut inspect = Command::new("docker");
-                inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
-                let output = run_command(inspect, "resolve profile-specific local collector image")
-                    .await
-                    .with_context(|| {
-                        format!("required immutable collector profile image {source} is unavailable; rebuild with platform.local.stable_image_build=true")
-                    })?;
-                let observed = String::from_utf8(output.stdout)?;
-                let mut revision = Command::new("git");
-                revision.args(["rev-parse", "HEAD"]);
-                revision.current_dir(std::env::current_dir()?);
-                let output = run_command(revision, "resolve checked-out source revision").await?;
-                let expected_revision = String::from_utf8(output.stdout)?;
-                verify_collector_profile_image(&observed, expected_revision.trim(), &profile_hash)?
-            } else {
-                let mut inspect = Command::new("docker");
-                inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);
-                let output = run_command(inspect, "resolve stable local image").await?;
-                let observed = String::from_utf8(output.stdout)?;
-                local_client_image_id(&observed)?.to_owned()
-            }
+        let profile_hash = match role {
+            "collector" => config.collector_build_profile_hash(),
+            "client" => config.client_build_profile_hash(),
+            _ => None,
+        };
+        let image = if let Some(profile_hash) = profile_hash {
+            let mut inspect = Command::new("docker");
+            inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
+            let output = run_command(inspect, &format!("resolve profile-specific local {role} image"))
+                .await.with_context(|| format!("required immutable {role} profile image {source} is unavailable"))?;
+            let observed = String::from_utf8(output.stdout)?;
+            let mut revision = Command::new("git");
+            revision.args(["rev-parse", "HEAD"]);
+            revision.current_dir(std::env::current_dir()?);
+            let output = run_command(revision, "resolve checked-out source revision").await?;
+            let expected_revision = String::from_utf8(output.stdout)?;
+            verify_profile_image(role, &observed, expected_revision.trim(), &profile_hash)?
         } else {
             let mut inspect = Command::new("docker");
             inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);

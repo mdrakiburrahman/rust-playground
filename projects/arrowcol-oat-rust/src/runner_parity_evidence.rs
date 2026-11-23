@@ -117,8 +117,8 @@ fn parity_admission_readback(
         bail!("parity client was not ready before admission");
     }
     let client_config = process_configurations(&client.output)?;
-    crate::runner::verify_oat_client_build_profile_readback(&client_config)?;
     let resolved_config = resolved_fleet_client_config(config, 0)?;
+    crate::runner::verify_oat_client_build_profile_readback(&resolved_config, &client_config)?;
     verify_process_configuration(&resolved_config, ComponentRole::Client, &client_config)?;
     Ok(json!({
         "status": "verified_before_schedule",
