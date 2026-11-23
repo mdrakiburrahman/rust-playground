@@ -339,6 +339,156 @@ impl CollectorTargetCpu {
         }
     }
 }
+#[derive(Clone, Copy)]
+struct CollectorCpuFeatureRequirement {
+    isa_feature: &'static str,
+    cpuinfo_tokens: &'static [&'static str],
+    minimum_level: u8,
+}
+
+const X86_64_FEATURES: &[CollectorCpuFeatureRequirement] = &[
+    CollectorCpuFeatureRequirement {
+        isa_feature: "CX16",
+        cpuinfo_tokens: &["cx16"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "LAHF/SAHF",
+        cpuinfo_tokens: &["lahf_lm"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "POPCNT",
+        cpuinfo_tokens: &["popcnt"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSE3",
+        cpuinfo_tokens: &["pni", "sse3"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSSE3",
+        cpuinfo_tokens: &["ssse3"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSE4.1",
+        cpuinfo_tokens: &["sse4_1"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSE4.2",
+        cpuinfo_tokens: &["sse4_2"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX",
+        cpuinfo_tokens: &["avx"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX2",
+        cpuinfo_tokens: &["avx2"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "BMI1",
+        cpuinfo_tokens: &["bmi1"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "BMI2",
+        cpuinfo_tokens: &["bmi2"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "FMA",
+        cpuinfo_tokens: &["fma"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "LZCNT",
+        cpuinfo_tokens: &["abm"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "MOVBE",
+        cpuinfo_tokens: &["movbe"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "XSAVE",
+        cpuinfo_tokens: &["xsave"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512F",
+        cpuinfo_tokens: &["avx512f"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512BW",
+        cpuinfo_tokens: &["avx512bw"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512CD",
+        cpuinfo_tokens: &["avx512cd"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512DQ",
+        cpuinfo_tokens: &["avx512dq"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512VL",
+        cpuinfo_tokens: &["avx512vl"],
+        minimum_level: 4,
+    },
+];
+
+pub fn verify_collector_target_cpu_flags(target_cpu: &str, cpu_info: &str, field: &str) -> Result<(), String> {
+    let target_level = match target_cpu {
+        "generic" => return Ok(()),
+        "x86-64-v2" => 2,
+        "x86-64-v3" => 3,
+        "x86-64-v4" => 4,
+        _ => return Err(format!("{field} uses unsupported collector target CPU {target_cpu}")),
+    };
+    let flags = cpu_info
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim() == "flags").then_some(value)
+        })
+        .ok_or_else(|| format!("{field} cannot find host CPU flags"))?;
+    let flags = flags.split_whitespace().collect::<std::collections::HashSet<_>>();
+    if flags.is_empty() {
+        return Err(format!("{field} found empty host CPU flags"));
+    }
+    let missing = X86_64_FEATURES
+        .iter()
+        .filter(|feature| {
+            feature.minimum_level <= target_level && !feature.cpuinfo_tokens.iter().any(|token| flags.contains(*token))
+        })
+        .map(|feature| {
+            format!(
+                "{} (cpuinfo token: {})",
+                feature.isa_feature,
+                feature.cpuinfo_tokens.join(" or ")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{field} {target_cpu} requires unavailable ISA features: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectorBuildProfile {

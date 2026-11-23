@@ -119,39 +119,19 @@ fn propagate(
 
 fn ensure_target_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let target_cpu = option_env!("COLLECTOR_BUILD_TARGET_CPU").unwrap_or("generic");
-    let required: &[&str] = match target_cpu {
-        "generic" => &[],
-        "x86-64-v2" => &["cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2"],
-        "x86-64-v3" => &[
-            "cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "bmi1", "bmi2", "fma",
-            "abm", "movbe", "xsave",
-        ],
-        "x86-64-v4" => &[
-            "cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "bmi1", "bmi2", "fma",
-            "abm", "movbe", "xsave", "avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl",
-        ],
-        _ => return Err(format!("unsupported compiled target CPU {target_cpu}").into()),
-    };
-    if required.is_empty() {
+    if target_cpu == "generic" {
         return Ok(());
     }
+    if !matches!(target_cpu, "x86-64-v2" | "x86-64-v3" | "x86-64-v4") {
+        return Err(format!("unsupported compiled target CPU {target_cpu}").into());
+    }
     let cpu_info = std::fs::read_to_string("/proc/cpuinfo")?;
-    let flags = cpu_info
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("flags:")
-                .or_else(|| line.strip_prefix("Features:"))
-                .map(str::split_whitespace)
-        })
-        .map(|values| values.collect::<std::collections::HashSet<_>>())
-        .ok_or_else(|| format!("cannot determine CPU flags required by collector target-cpu {target_cpu}"))?;
-    let missing: Vec<_> = required.iter().copied().filter(|flag| !flags.contains(flag)).collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "collector target-cpu {target_cpu} requires unavailable CPU flags: {}",
-            missing.join(", ")
-        )
-        .into());
+    if let Err(error) = arrowcol_tunables::verify_collector_target_cpu_flags(
+        target_cpu,
+        &cpu_info,
+        "collector.target_cpu startup guard",
+    ) {
+        return Err(error.into());
     }
     Ok(())
 }

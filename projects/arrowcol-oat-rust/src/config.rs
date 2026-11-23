@@ -618,36 +618,17 @@ impl OatConfig {
         else {
             return Ok(());
         };
-        let required = match target_cpu {
-            CollectorTargetCpu::Generic => &[][..],
-            CollectorTargetCpu::X86_64V2 => &["cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2"][..],
-            CollectorTargetCpu::X86_64V3 => &[
-                "cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "bmi1", "bmi2", "fma",
-                "abm", "movbe", "xsave",
-            ][..],
-            CollectorTargetCpu::X86_64V4 => &[
-                "cx16", "lahf_lm", "popcnt", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "bmi1", "bmi2", "fma",
-                "abm", "movbe", "xsave", "avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl",
-            ][..],
-        };
-        if required.is_empty() {
+        if target_cpu == CollectorTargetCpu::Generic {
             return Ok(());
         }
         let cpu_info = std::fs::read_to_string("/proc/cpuinfo")
             .context("collector.target_cpu preflight cannot read host CPU flags")?;
-        let flags = cpu_info
-            .lines()
-            .find_map(|line| line.strip_prefix("flags:").map(str::split_whitespace))
-            .map(|values| values.collect::<HashSet<_>>())
-            .context("collector.target_cpu preflight cannot find host CPU flags")?;
-        let missing: Vec<_> = required.iter().copied().filter(|flag| !flags.contains(flag)).collect();
-        if !missing.is_empty() {
-            bail!(
-                "collector.target_cpu {} requires unavailable host CPU flags: {}",
-                target_cpu.as_str(),
-                missing.join(", ")
-            );
-        }
+        arrowcol_tunables::verify_collector_target_cpu_flags(
+            target_cpu.as_str(),
+            &cpu_info,
+            "collector.target_cpu preflight",
+        )
+        .map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
@@ -1659,6 +1640,49 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_cpu_preflight_parses_linux_flags_and_sse3_alias() {
+        let flags = "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 fma abm movbe xsave avx512f avx512bw avx512cd avx512dq avx512vl\n";
+        for target in ["x86-64-v2", "x86-64-v3", "x86-64-v4"] {
+            arrowcol_tunables::verify_collector_target_cpu_flags(target, flags, "collector.target_cpu preflight")
+                .unwrap();
+        }
+        let spaced = "flags : cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2\n";
+        arrowcol_tunables::verify_collector_target_cpu_flags("x86-64-v2", spaced, "collector.target_cpu preflight")
+            .unwrap();
+        assert!(
+            arrowcol_tunables::verify_collector_target_cpu_flags("generic", "", "collector.target_cpu preflight")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn collector_cpu_preflight_reports_absent_empty_and_missing_flags() {
+        let absent = arrowcol_tunables::verify_collector_target_cpu_flags(
+            "x86-64-v2",
+            "processor\t: 0\n",
+            "collector.target_cpu preflight",
+        )
+        .unwrap_err();
+        assert!(absent.contains("collector.target_cpu preflight cannot find host CPU flags"));
+
+        let empty = arrowcol_tunables::verify_collector_target_cpu_flags(
+            "x86-64-v2",
+            "flags\t\t:   \n",
+            "collector.target_cpu preflight",
+        )
+        .unwrap_err();
+        assert!(empty.contains("collector.target_cpu preflight found empty host CPU flags"));
+
+        let insufficient = arrowcol_tunables::verify_collector_target_cpu_flags(
+            "x86-64-v3",
+            "flags\t\t: cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx bmi1 bmi2 fma abm movbe xsave\n",
+            "collector.target_cpu preflight",
+        )
+        .unwrap_err();
+        assert!(insufficient.contains("AVX2 (cpuinfo token: avx2)"));
+    }
 
     #[test]
     fn collector_override_requires_a_local_stable_build_and_exact_identity() -> Result<()> {

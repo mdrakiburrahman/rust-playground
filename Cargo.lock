@@ -872,6 +872,7 @@ dependencies = [
  "arrow-deltalake",
  "arrowcol-buffer",
  "arrowcol-dataflow-components",
+ "arrowcol-tunables",
  "delta_kernel",
  "mimalloc",
  "otel-arrow-dfe",
