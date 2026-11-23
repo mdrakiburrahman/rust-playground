@@ -591,7 +591,7 @@ export async function runRealisticDiagnostic(options: {
   const files = object(manifest.files, "manifest files");
   if (object(files["experiments/darwin/historical-parity.oat.json"], "seed manifest").sha256 !== expected.seed
     || await sha256(seedPath) !== expected.seed) throw new Error("seed pin differs from trusted snapshot");
-  const config = realisticDiagnosticConfig(JSON.parse(await readFile(seedPath, "utf8")));
+  const config = realisticDiagnosticConfig(JSON.parse(await readFile(seedPath, "utf8")), cpus);
   const lock = join(options.home, "data", "evaluating");
   await mkdir(dirname(lock), { recursive: true });
   await mkdir(lock);
@@ -644,7 +644,6 @@ export async function runRealisticDiagnostic(options: {
     platform.compose_override_file = clientOverridePath;
     platform.local = localReplayOptions(platform.local, options.bindHost, options.endpointHost, paths.snapshot);
     const local = object(platform.local, "local");
-    local.collector_cpus = cpus;
     local.expected_image_ids = expected.images;
     local.collector_image_override = { image_id: expected.images.collector, source_revision: expected.collectorSource };
     config.result_url = pathToFileURL(join(paths.output, "diagnostic-results.parquet")).href;
@@ -718,6 +717,12 @@ export async function runRealisticDiagnostic(options: {
     const client = extractClientEvidence(evidence.client_phase_reports[0], "realistic");
     if (client.payloadCorpusSha256 !== expected.corpus) throw new Error("corpus differs from pin");
     assertParityEvidence(config, evidence);
+    const engineCores = object(preScheduleAdmission.cpu_isolation, "CPU isolation").engine_num_cores;
+    const parityCollector = object(object(evidence.parity_admission_readback, "pre-arm parity").collector, "collector startup");
+    const cpuWorkers = object(parityCollector.runtime, "collector runtime").cpu_workers;
+    if (engineCores !== cpus.length || cpuWorkers !== cpus.length || Number(row.dfe_worker_concurrency) !== cpus.length) {
+      throw new Error("collector worker/core readback differs from diagnostic CPU stratum");
+    }
     const decodeFile = async (path: string, active: boolean): Promise<number> => {
       if (await sha256(footer.path) !== expected.footer) throw new Error("footer inspector changed");
       const output = execFileSync(footer.path, [active ? "--active" : "--decode", path], {
@@ -787,6 +792,7 @@ export async function runRealisticDiagnostic(options: {
       original_byte_scope: "collector_reported_input_bytes_from_reconciled_commit_receipts",
       whole_snapshot_identity: wholeRunIdentity,
       measurement_window: { start_unix_ms: reconciled.measurement.startUnixMs, end_unix_ms: reconciled.measurement.endUnixMs },
+      collector_treatment: { kind: "cpuset_and_engine_workers", cpus, engine_num_cores: engineCores, runtime_cpu_workers: cpuWorkers },
       project_cpu_window: cpuWindow,
       collector_cpu_evidence: cpuWindow.collector_cpu_evidence,
       client_resource_observation: {

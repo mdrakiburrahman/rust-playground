@@ -2155,6 +2155,17 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
             },
         ),
     ]);
+    if config
+        .platform
+        .compose_project
+        .as_deref()
+        .is_some_and(|name| name.starts_with("diagnostic-"))
+    {
+        environment.insert(
+            "LOADTEST_CPUS".to_owned(),
+            configured_diagnostic_workers(config)?.to_string(),
+        );
+    }
     environment.extend(local_control_mount_environment(state_dir));
     for (variable, name) in secret_paths {
         let path = state_dir.join("secrets").join(name);

@@ -25,7 +25,7 @@ export function diagnosticPaths(root: string, snapshot: string, output: string) 
   return { root, snapshot, output, home: join(root, "home"), state: join(root, "state") };
 }
 
-export function realisticDiagnosticConfig(seed: unknown): JsonObject {
+export function realisticDiagnosticConfig(seed: unknown, cpus: readonly number[]): JsonObject {
   const config = parityLadderConfig(seed, 8, "historical-parity-diagnostic");
   const tunables = object(config.tunables, "tunables");
   const client = object(tunables.client, "client");
@@ -41,12 +41,18 @@ export function realisticDiagnosticConfig(seed: unknown): JsonObject {
   if (!isDeepStrictEqual(batching.global_capacity, { bytes: 4_290_000_000, rows: 25_000_000, batches: 16_384 })
     || pressure.buffered_bytes_limit !== 4_290_000_000 || pressure.buffered_rows_limit !== 25_000_000
     || pressure.buffered_batches_limit !== 16_384 || commit.batch_window !== "2s"
+    || !isDeepStrictEqual(config.dfe_worker_concurrency, [32])
     || commit.max_files_per_commit !== 128 || commit.max_pending_files !== 512 || runtime.cpu_workers !== 32
     || local.collector_memory_limit_bytes !== COLLECTOR_MEMORY || pressure.rss_limit_bytes !== COLLECTOR_MEMORY
     || guard.enabled !== true || guard.cap_fraction !== 0.9 || guard.zero_progress_windows !== 2
     || config.warmup_seconds !== 60 || config.measure_seconds !== 150 || client.streams_per_worker !== 2) {
     throw new Error("frozen parity pressure, guard, timing or topology changed");
   }
+  if (![8, 16, 24].includes(cpus.length) || cpus.some((cpu, i) => !Number.isSafeInteger(cpu) || cpu < 0 || cpu >= 24
+    || (i > 0 && cpu <= cpus[i - 1]!))) throw new Error("invalid diagnostic collector CPU stratum");
+  local.collector_cpus = [...cpus];
+  config.dfe_worker_concurrency = [cpus.length];
+  runtime.cpu_workers = cpus.length;
   client.data_profile = "realistic";
   client.string_width = DIAGNOSTIC_STRING_WIDTH;
   client.seed = 20260923;

@@ -314,6 +314,7 @@ async fn diagnostic_cpu_readback(config: &OatConfig, handle: &ClientHandle, run_
         "diagnostic run-owned client roster differs from its single handle"
     );
     let collector_proof = diagnostic_container_cpu_readback(ids[0], &collector).await?;
+    let engine_num_cores = diagnostic_engine_readback(ids[0], config).await?;
     let client_proof = diagnostic_container_cpu_readback(container_id, &client).await?;
     let cpus = collector.union(&client).copied().collect::<Vec<_>>();
     let mut topology = Command::new("docker");
@@ -341,7 +342,7 @@ async fn diagnostic_cpu_readback(config: &OatConfig, handle: &ClientHandle, run_
     let mut inspect = diagnostic_cpu_tool();
     inspect.arg("inspect").arg(&project).arg(masks);
     let roster: Value = serde_json::from_str(&diagnostic_command(inspect, "verify complete diagnostic project CPU assignments").await?)?;
-    Ok(json!({"collector": collector_proof, "client": client_proof, "thread_siblings": topology, "project_readback": roster}))
+    Ok(json!({"collector": collector_proof, "client": client_proof, "thread_siblings": topology, "project_readback": roster, "engine_num_cores": engine_num_cores}))
 }
 
 fn diagnostic_expected_pin(

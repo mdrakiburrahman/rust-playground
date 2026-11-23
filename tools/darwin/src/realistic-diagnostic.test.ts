@@ -220,7 +220,8 @@ async function seed() {
 test("derives realistic diagnostic from an unchanged historical seed", async () => {
   const original = await seed();
   const copy = structuredClone(original);
-  const config = realisticDiagnosticConfig(original) as any;
+  const cpus = Array.from({ length: 8 }, (_, i) => i);
+  const config = realisticDiagnosticConfig(original, cpus) as any;
   assert.deepEqual(original, copy);
   assert.equal(config.tunables.client.data_profile, "realistic");
   assert.equal(config.tunables.client.string_width, 63);
@@ -231,10 +232,19 @@ test("derives realistic diagnostic from an unchanged historical seed", async () 
   assert.equal(config.tunables.client.stream_retry_max_attempts, 1);
   assert.equal(config.tunables.transport.connect_retries, 0);
   assert.equal(config.platform.local.collector_memory_limit_bytes, COLLECTOR_MEMORY);
-  const second = realisticDiagnosticConfig(await seed());
+  const second = realisticDiagnosticConfig(await seed(), cpus);
   assert.deepEqual(config.platform, second.platform);
   assert.equal(config.platform.compose_project, "diagnostic-stable");
-  assert.deepEqual(config.tunables.collector, original.tunables.collector);
+  for (const n of [8, 16, 24]) {
+    const mask = Array.from({ length: n }, (_, i) => i);
+    const arm = realisticDiagnosticConfig(original, mask) as any;
+    assert.deepEqual(arm.platform.local.collector_cpus, mask);
+    assert.deepEqual(arm.dfe_worker_concurrency, [n]);
+    const expectedCollector = structuredClone(original.tunables.collector);
+    expectedCollector.runtime.cpu_workers = n;
+    assert.deepEqual(arm.tunables.collector, expectedCollector);
+  }
+  assert.throws(() => realisticDiagnosticConfig(original, [...cpus, 8]));
   assert.deepEqual(config.overload_guard, original.overload_guard);
   assert.deepEqual(config.tables, ["sqlserver_availability_replica_states"]);
   assert.deepEqual(config.replica_counts, [1]);
@@ -245,12 +255,13 @@ test("refuses drift in pressure, guard and collector runtime", async () => {
     (s: any) => { s.tunables.collector.pressure.buffered_rows_limit--; },
     (s: any) => { s.tunables.collector.commit.max_pending_files--; },
     (s: any) => { s.tunables.collector.runtime.cpu_workers--; },
+    (s: any) => { s.dfe_worker_concurrency = [8]; },
     (s: any) => { s.overload_guard.zero_progress_windows = 3; },
     (s: any) => { s.platform.local.collector_memory_limit_bytes--; },
   ]) {
     const changed = await seed();
     mutate(changed);
-    assert.throws(() => realisticDiagnosticConfig(changed));
+    assert.throws(() => realisticDiagnosticConfig(changed, [0,1,2,3,4,5,6,7]));
   }
 });
 

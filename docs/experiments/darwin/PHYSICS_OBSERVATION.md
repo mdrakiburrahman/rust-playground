@@ -44,6 +44,8 @@ Decoder children are stopped and reaped on early failure or interruption.
 
 ### Project CPU admission and measurement
 
+The treatment changes **both the collector cpuset and engine worker count**, not affinity alone. The historical seed must still specify 32; the derived config sets `dfe_worker_concurrency` and `collector.runtime.cpu_workers` to the mask size (8, 16, or 24). OAT supplies that count on first startup as well as scale-up. Before scheduling, the live collector argv (`--num-cores`), startup runtime readback, and effective cpuset must agree with the config. The receipt records the mask and both counts in `collector_treatment`.
+
 The launch arguments are unchanged. Pass the ordered collector CPU list for the arm and client list `24,25,26,27,28,29`. Support is fixed at `30,31`; support services share those CPUs. The runner resolves services from its benchmark, OAT and maintenance Compose profiles with the generated run overlay. Only `dataflow-1` and `oat-client` are exceptions to the support default. The three role sets must be online and physically disjoint; this is **not host isolation**.
 
 | Receipt field | Meaning |

@@ -102,3 +102,82 @@ fn resolved_unknown_service_is_pinned_to_shared_support_not_collector() -> Resul
     assert!(diagnostic_cpu_masks(names, &[1, 31], "24-29").is_err());
     Ok(())
 }
+
+fn diagnostic_worker_count(cpus: &[u32], concurrency: &[u32], workers: Option<usize>) -> Result<usize> {
+    let n = cpus.len();
+    ensure!(
+        matches!(n, 8 | 16 | 24)
+            && cpus.windows(2).all(|p| p[0] < p[1])
+            && cpus.iter().all(|&cpu| cpu < 24)
+            && concurrency == [n as u32]
+            && workers == Some(n),
+        "diagnostic engine workers/concurrency must equal collector CPU allocation"
+    );
+    Ok(n)
+}
+
+fn configured_diagnostic_workers(config: &OatConfig) -> Result<usize> {
+    diagnostic_worker_count(
+        config.platform.local.collector_cpus.as_deref().unwrap_or_default(),
+        &config.dfe_worker_concurrency,
+        config
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|c| c.runtime.as_ref())
+            .and_then(|r| r.cpu_workers),
+    )
+}
+
+fn verify_diagnostic_engine_argv(raw: &str, expected: usize) -> Result<usize> {
+    let args: Vec<_> = raw
+        .strip_suffix('\0')
+        .context("missing live collector argv")?
+        .split('\0')
+        .collect();
+    let exe = "/usr/local/bin/arrowcol-dataflow-rust";
+    ensure!(
+        args.first() == Some(&exe) && args.iter().filter(|&&a| a == exe).count() == 1,
+        "ambiguous collector process"
+    );
+    let flags: Vec<_> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| **a == "--num-cores" || a.starts_with("--num-cores="))
+        .collect();
+    ensure!(
+        flags.len() == 1
+            && *flags[0].1 == "--num-cores"
+            && args.get(flags[0].0 + 1).copied() == Some(expected.to_string().as_str()),
+        "running collector --num-cores differs from diagnostic CPU allocation"
+    );
+    Ok(expected)
+}
+
+async fn diagnostic_engine_readback(id: &str, config: &OatConfig) -> Result<usize> {
+    let expected = configured_diagnostic_workers(config)?;
+    let mut cmd = Command::new("docker");
+    cmd.args(["exec", id, "/bin/sh", "-ec", r#"for f in /proc/[0-9]*/cmdline; do
+        if [ "$(tr '\000' '\n' < "$f" 2>/dev/null | head -n 1)" = /usr/local/bin/arrowcol-dataflow-rust ]; then cat "$f"; fi
+    done"#]);
+    verify_diagnostic_engine_argv(
+        &diagnostic_command(cmd, "read running collector engine arguments").await?,
+        expected,
+    )
+}
+
+#[test]
+fn diagnostic_worker_strata_reject_mismatched_config_and_live_engine() -> Result<()> {
+    for n in [8, 16, 24] {
+        let cpus: Vec<_> = (0..n).collect();
+        let expected = diagnostic_worker_count(&cpus, &[n], Some(n as usize))?;
+        let argv =
+            format!("/usr/local/bin/arrowcol-dataflow-rust\0--num-cores\0{n}\0--config\0/etc/oat/dataflow.yaml\0");
+        assert_eq!(verify_diagnostic_engine_argv(&argv, expected)?, cpus.len());
+        assert!(diagnostic_worker_count(&cpus, &[32], Some(n as usize)).is_err());
+        assert!(diagnostic_worker_count(&cpus, &[n], Some(32)).is_err());
+        assert!(verify_diagnostic_engine_argv(&argv, 32).is_err());
+        assert!(verify_diagnostic_engine_argv(&format!("{argv}{argv}"), expected).is_err());
+    }
+    Ok(())
+}
