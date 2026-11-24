@@ -10,6 +10,76 @@ use std::collections::HashSet;
 use std::path::Path;
 use url::Url;
 
+#[cfg(test)]
+fn initial_delta_properties_from_tunables(
+    value: &serde_json::Value,
+) -> Result<arrow_deltalake::delta::InitialDeltaProperties> {
+    let mut config: OatConfig = serde_json::from_str(include_str!(
+        "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+    ))?;
+    config.tunables = serde_json::from_value(value.clone())?;
+    config.initial_delta_properties()
+}
+
+#[cfg(test)]
+mod initial_delta_lifecycle_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn typed_delta_contract_is_optional_strict_and_positive() -> Result<()> {
+        for unset in [json!({}), json!({"delta": {}})] {
+            assert!(initial_delta_properties_from_tunables(&unset)?.properties()?.is_empty());
+        }
+        let properties = initial_delta_properties_from_tunables(
+            &json!({"delta":{"target_file_size_bytes":67108864,"checkpoint_interval":17}}),
+        )?;
+        assert_eq!(
+            properties.properties()?.get("delta.targetFileSize").map(String::as_str),
+            Some("67108864")
+        );
+        for invalid in [
+            json!({"delta":null}),
+            json!({"delta":{"checkpoint_interval":null}}),
+            json!({"delta":{"checkpoint_interval":0}}),
+            json!({"delta":{"target_file_size_bytes":0}}),
+            json!({"delta":{"checkpoint_interval":1.5}}),
+            json!({"delta":{"checkpoint_interval":"17"}}),
+            json!({"delta":{"optimize_target_file_size_bytes":100}}),
+        ] {
+            assert!(initial_delta_properties_from_tunables(&invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_properties_fail_closed_without_a_fresh_single_table_lifecycle() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let properties = initial_delta_properties_from_tunables(&json!({"delta":{"checkpoint_interval":17}}))?;
+        config.platform.kind = OatMode::Local;
+        config.platform.local.partitioned_table_bootstrap = false;
+        config.campaign_profile = None;
+        config.tunables.maintenance = None;
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        assert!(config.validate_initial_delta_lifecycle(&properties).is_err());
+        assert!(config.validate_initial_delta_lifecycle(&Default::default()).is_ok());
+        config.campaign_profile = Some(CampaignProfile::SingleHotTable);
+        config.validate_initial_delta_lifecycle(&properties)?;
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate_initial_delta_lifecycle(&properties).is_err());
+        config.tables.truncate(1);
+        config.platform.kind = OatMode::Aks;
+        assert!(config.validate_initial_delta_lifecycle(&properties).is_err());
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.validate_initial_delta_lifecycle(&properties)?;
+        config.tables[0] = "sqlserver_wait_stats".to_owned();
+        assert!(config.validate_initial_delta_lifecycle(&properties).is_err());
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
@@ -735,6 +805,47 @@ pub fn client_build_profile_hash(profile: ClientBuildProfile) -> String {
 }
 
 impl OatConfig {
+    pub(crate) fn initial_delta_properties(&self) -> Result<arrow_deltalake::delta::InitialDeltaProperties> {
+        let properties = self.tunables.delta.as_ref().map_or_else(
+            arrow_deltalake::delta::InitialDeltaProperties::default,
+            |settings| arrow_deltalake::delta::InitialDeltaProperties {
+                target_file_size_bytes: settings.target_file_size_bytes,
+                checkpoint_interval: settings.checkpoint_interval,
+            },
+        );
+        properties.properties()?;
+        Ok(properties)
+    }
+
+    fn validate_initial_delta_lifecycle(
+        &self,
+        properties: &arrow_deltalake::delta::InitialDeltaProperties,
+    ) -> Result<()> {
+        if properties.properties()?.is_empty() {
+            return Ok(());
+        }
+        let fresh_local = self.platform.kind == OatMode::Local
+            && self.campaign_profile != Some(CampaignProfile::ScaleOutSingleTable)
+            && (self.campaign_profile == Some(CampaignProfile::SingleHotTable)
+                || self.platform.local.partitioned_table_bootstrap
+                || (self.campaign_profile.is_none()
+                    && self
+                        .tunables
+                        .maintenance
+                        .as_ref()
+                        .is_some_and(|settings| settings.enabled == Some(true))))
+            && self.tables.len() == 1;
+        let fresh_aks = self.platform.kind == OatMode::Aks
+            && self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable)
+            && self.tables.as_slice() == ["sqlserver_availability_replica_states"];
+        if !fresh_local && !fresh_aks {
+            bail!(
+                "tunables.delta requires a supported fresh single-table local initializer or AKS scale_out_single_table lifecycle; existing tables are never altered"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn effective_dmv_concurrency(&self) -> usize {
         self.dmv_concurrency.unwrap_or(4)
     }
@@ -1258,6 +1369,7 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        self.validate_initial_delta_lifecycle(&self.initial_delta_properties()?)?;
         let computed_profile_hash = self.collector_build_profile_hash();
         let computed_client_profile_hash = self.client_build_profile_hash();
         if computed_client_profile_hash.is_some() && self.platform.kind != OatMode::Local {
