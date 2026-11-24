@@ -402,7 +402,7 @@ test('default restoration is a true no-op at supported safe capacity and capacit
   assert.equal(await f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), 'complete');
   assert.equal(await f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), 'complete');
   assert.deepEqual(f.mutations, []);
-  await assert.rejects(f.providers.verifySafeIdle(f.store.state, 'verify'), /positively completed exact removals/);
+  await assert.rejects(f.providers.verifySafeIdle(f.store.state, 'verify'), /release and handoff withheld/);
 });
 
 test('default restoration changes only one dimension at a time and reconciles exact ARM targets before continuing', async t => {
@@ -427,9 +427,9 @@ test('default restoration changes only one dimension at a time and reconciles ex
     measurements: { qapNotHealthyReasons: 0, qapPendingBacklog: 0, previousQapPendingBacklog: 0,
       deltaRowsBefore: 42, deltaRowsAfter: 42, kustoRowsBefore: 42, kustoRowsAfter: 42 },
   }) });
-  assert.equal(await full.verifySafeIdle(f.store.state, 'verify'), 'complete');
+  await assert.rejects(full.verifySafeIdle(f.store.state, 'verify'), /release and handoff withheld/);
   properties(f.resources.get(f.c.cluster_id)!).optimizedAutoscale = { isEnabled: false, minimum: 2, maximum: 4 };
-  assert.equal(await full.verifySafeIdle(f.store.state, 'verify'), 'pending');
+  await assert.rejects(full.verifySafeIdle(f.store.state, 'verify'), /release and handoff withheld/);
 });
 
 for (const fault of ['before', 'after'] as const) test(`unknown ARM ${fault}-apply outcome is reconciled without replay`, async t => {

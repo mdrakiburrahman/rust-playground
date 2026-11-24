@@ -259,7 +259,8 @@ test('terminal collector exit classification requires the exact container drain 
     if (!marker) f.setLogText('secret=must-not-be-persisted\n');
     const deadline = Date.now() + 150;
     f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
-    assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), 'pending');
+    assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), exitCode === 143 && marker ? 'complete' : 'pending');
+    now = Math.max(now, deadline + 1);
     const current = await f.controller(deadline);
     assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
     const evidence = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))

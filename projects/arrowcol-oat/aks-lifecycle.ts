@@ -114,7 +114,7 @@ function validatePods(value: unknown): asserts value is PodProof[] {
     }
   }
 }
-function parseStop(value: unknown, inventory: RunInventory, field: LifecycleField, resource: RunInventoryResource): StopRecord {
+export function parseStop(value: unknown, inventory: RunInventory, field: LifecycleField, resource: RunInventoryResource): StopRecord {
   const record = object(value);
   if (Object.keys(record).sort().join() !== ['schema_version', 'origin', 'field', 'resource', 'phase', 'deadline_unix_ms',
     'initial_desired', 'initial_pods', 'terminal_pods', 'response', 'observed_at_unix_ms', 'logs', 'expected_resource_version'].sort().join() ||
@@ -354,14 +354,22 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       if (observation.pods.some(pod => !active.initial_pods.some(initial => initial.uid === pod.uid)))
         throw new Error('The original workload recreated or replaced a pod after its stop intent.');
       const stopped: boolean = physicallyStopped(observation);
+      const logs: LogProof[] = [...record.logs, ...await captureLogs(observation.plan.server, inventory, newlyTerminal, 'terminal', evidence)];
       const cleanDrain: boolean = field !== 'bounded_drain' || active.initial_pods.length === 0 && active.initial_desired === 0 ||
         active.initial_pods.length > 0 && active.initial_pods.every(pod => {
           const ended = terminal.get(pod.uid);
-          return ended && ended.containers.length === pod.containers.length &&
-            ended.containers.every(container => container.exit_code === 0 && !container.oom_killed);
+          return ended && ended.name === pod.name && ended.containers.length === pod.containers.length &&
+            pod.containers.every(initial => {
+              const container = ended.containers.find(value => value.name === initial.name);
+              if (!container || container.oom_killed) return false;
+              if (container.exit_code === 0) return true;
+              return container.exit_code === 143 && initial.restart_count !== undefined && container.restart_count === initial.restart_count &&
+                logs.some(log => log.phase === 'terminal' && log.pod_uid === pod.uid && log.pod_name === pod.name &&
+                  log.container === initial.name && log.drain_complete_marker === true);
+            });
         });
       record = { ...record, terminal_pods: [...terminal.values()], observed_at_unix_ms: Date.now(),
-        logs: [...record.logs, ...await captureLogs(observation.plan.server, inventory, newlyTerminal, 'terminal', evidence)],
+        logs,
         phase: stopped && cleanDrain && Date.now() < active.deadline_unix_ms ? 'complete' : 'responded' };
       saved = { value: record, etag: await write(blob, record, evidence, saved!.etag) };
       if (record.phase === 'complete') return 'complete';
