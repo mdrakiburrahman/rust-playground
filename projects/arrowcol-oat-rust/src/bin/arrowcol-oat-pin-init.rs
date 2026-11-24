@@ -33,24 +33,27 @@ struct RegisteredRunTableReceipt<'a, P: Serialize> {
 }
 
 #[derive(Debug, Parser)]
+#[command(group(clap::ArgGroup::new("registration").args(["register_only_config", "register_maintenance_only_config"])))]
 struct Cli {
     #[arg(
         long,
-        required_unless_present = "register_only_config",
-        conflicts_with = "register_only_config"
+        required_unless_present = "registration",
+        conflicts_with = "registration"
     )]
     config: Option<PathBuf>,
     #[arg(
         long,
-        required_unless_present = "register_only_config",
-        conflicts_with = "register_only_config"
+        required_unless_present = "registration",
+        conflicts_with = "registration"
     )]
     migrator_password_file: Option<PathBuf>,
     #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
     register_only_config: Option<PathBuf>,
-    #[arg(long, requires = "register_only_config")]
+    #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
+    register_maintenance_only_config: Option<PathBuf>,
+    #[arg(long, requires = "registration")]
     edge_secret_file: Option<PathBuf>,
-    #[arg(long, requires = "register_only_config")]
+    #[arg(long, requires = "registration")]
     internal_secret_file: Option<PathBuf>,
 }
 
@@ -108,13 +111,15 @@ struct SqlServerConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(path) = cli.register_only_config {
+    let maintenance_registration = cli.register_maintenance_only_config.is_some();
+    if let Some(path) = cli.register_only_config.or(cli.register_maintenance_only_config) {
         let config: RegisterOnlyConfig = serde_json::from_slice(
             &std::fs::read(&path).with_context(|| format!("read catalog registration config {}", path.display()))?,
         )
         .context("parse catalog registration config")?;
         let receipt = register_run_table(
             &config,
+            maintenance_registration,
             &cli.edge_secret_file
                 .context("catalog registration requires the client edge signing key")?,
             &cli.internal_secret_file
@@ -176,19 +181,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn validate_register_only_config(config: &RegisterOnlyConfig) -> Result<Url> {
+fn validate_register_only_config(config: &RegisterOnlyConfig, maintenance_registration: bool) -> Result<Url> {
     let run_id = Uuid::parse_str(&config.run_id).context("registration requires a UUID run_id")?;
     let root = Url::parse(&config.delta_root).context("parse registration Delta root")?;
     if config.schema_version != 1
         || run_id.to_string() != config.run_id
-        || config.table != HOT_RUN_TABLE
+        || (!maintenance_registration && config.table != HOT_RUN_TABLE)
         || !matches!(root.scheme(), "abfss" | "file")
         || root.password().is_some()
         || root.query().is_some()
         || root.fragment().is_some()
         || !root.path().ends_with(&format!("/runs/{run_id}/dataflow"))
     {
-        bail!("catalog registration requires the exact canonical hot table and run-scoped Dataflow root");
+        bail!("catalog registration requires the selected canonical table contract and run-scoped Dataflow root");
     }
     for endpoint in [&config.endpoint, &config.catalog_endpoint] {
         let endpoint = Url::parse(endpoint).context("parse registration service endpoint")?;
@@ -208,10 +213,11 @@ fn validate_register_only_config(config: &RegisterOnlyConfig) -> Result<Url> {
 
 async fn register_run_table(
     config: &RegisterOnlyConfig,
+    maintenance_registration: bool,
     edge_secret_file: &std::path::Path,
     internal_secret_file: &std::path::Path,
 ) -> Result<serde_json::Value> {
-    let expected_location = validate_register_only_config(config)?;
+    let expected_location = validate_register_only_config(config, maintenance_registration)?;
     let completion =
         collector_chain::dmv::register_table_authenticated(&config.endpoint, &config.table, edge_secret_file)
             .await
@@ -463,6 +469,25 @@ mod tests {
     }
 
     #[test]
+    fn readme_maintenance_registration_has_a_separate_authenticated_mode() -> Result<()> {
+        let args = [
+            "pin-init",
+            "--register-maintenance-only-config",
+            "register.json",
+            "--edge-secret-file",
+            "edge",
+            "--internal-secret-file",
+            "internal",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
+        assert!(Cli::try_parse_from(&args[..5]).is_err());
+        let mut conflicting = args.to_vec();
+        conflicting.extend(["--register-only-config", "hot-table.json"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn register_only_mode_is_run_bound_and_does_not_require_migrator_credentials() -> Result<()> {
         let run_id = "00000000-0000-0000-0000-000000000001";
         let mut config = RegisterOnlyConfig {
@@ -473,15 +498,29 @@ mod tests {
             endpoint: "http://router:50050".to_owned(),
             catalog_endpoint: "http://catalog:8817".to_owned(),
         };
-        validate_register_only_config(&config)?;
+        validate_register_only_config(&config, false)?;
         config.endpoint = "http://user:password@router:50050".to_owned();
-        assert!(validate_register_only_config(&config).is_err());
+        assert!(validate_register_only_config(&config, false).is_err());
         config.endpoint = "http://router:50050".to_owned();
         config.run_id = "00000000-0000-0000-0000-000000000002".to_owned();
-        assert!(validate_register_only_config(&config).is_err());
+        assert!(validate_register_only_config(&config, false).is_err());
         config.run_id = run_id.to_owned();
         config.table = "telemetry.sqlserver.sqlserver_wait_stats".to_owned();
-        assert!(validate_register_only_config(&config).is_err());
+        assert!(validate_register_only_config(&config, false).is_err());
+        validate_register_only_config(&config, true)?;
+        config.table = "telemetry.sqlserver.sqlserver_active_sessions".to_owned();
+        let location = validate_register_only_config(&config, true)?;
+        assert!(location.path().trim_end_matches('/').ends_with("/telemetry/sqlserver/sqlserver_active_sessions"));
+        for table in ["sqlserver_active_sessions", "telemetry.sqlserver.unknown_table"] {
+            config.table = table.to_owned();
+            assert!(validate_register_only_config(&config, true).is_err());
+        }
+        config.table = "telemetry.sqlserver.sqlserver_active_sessions".to_owned();
+        config.delta_root = "file:///tmp/shared/dataflow".to_owned();
+        assert!(validate_register_only_config(&config, true).is_err());
+        config.delta_root = format!("file:///tmp/oat/runs/{run_id}/dataflow");
+        config.catalog_endpoint = "http://user:password@catalog:8817".to_owned();
+        assert!(validate_register_only_config(&config, true).is_err());
         let args = [
             "pin-init",
             "--register-only-config",

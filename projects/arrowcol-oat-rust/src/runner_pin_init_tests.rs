@@ -576,6 +576,44 @@ mod pin_init_tests {
             return Ok(());
         };
         match std::env::var("PIN_INIT_PROBE_MODE")?.as_str() {
+            "maintenance-admission" => {
+                let (_, platform, _) = fixture(&root)?;
+                let config: OatConfig = serde_json::from_slice(&fs::read(
+                    std::env::var("MAINTENANCE_PROBE_CONFIG")?
+                )?)?;
+                ensure!(config.campaign_profile.is_none() && maintenance_enabled(&config));
+                ensure!(config.tables.as_slice() == ["sqlserver_active_sessions"]);
+                let result = verify_maintenance_stop_budget_before_admission(&config, &platform).await;
+                if std::env::var("MAINTENANCE_EXPECT_MISSING")?.as_str() == "true" {
+                    let error = result.err().context("absent original table evidence was admitted")?;
+                    ensure!(error.to_string() ==
+                        "maintenance omitted effective per-table operationTimeout before load admission");
+                    println!("ORIGINAL_README_ADMISSION_FAILURE={error}");
+                } else {
+                    result?;
+                    let text = fs::read_to_string(std::env::var("MAINTENANCE_PRODUCER_LOG")?)?;
+                    let actual = maintenance_table_evidence(&config, &text)?;
+                    let table = canonical_dmv_table_name(&config.tables[0])?;
+                    println!("ACTUAL_MAINTENANCE_OPERATION_TIMEOUT={}",
+                        actual["tables"][&table]["table_policy"]["arrowcol.maintenance.operationTimeout"]);
+                    for invalid in [Value::Null, json!(0), json!("900000"), json!(true), json!(1_200_000)] {
+                        let mut changed = String::new();
+                        for line in text.lines() {
+                            if let Some(raw) = line.strip_prefix("arrowcol_maintenance_table_config ") {
+                                let mut event: Value = serde_json::from_str(raw)?;
+                                event["config"]["table_policy"]["arrowcol.maintenance.operationTimeout"] = invalid.clone();
+                                changed.push_str(&format!("arrowcol_maintenance_table_config {event}\n"));
+                            } else {
+                                changed.push_str(&format!("{line}\n"));
+                            }
+                        }
+                        ensure!(maintenance_table_evidence(&config, &changed).is_err(),
+                            "invalid or unsafe actual timeout evidence was admitted: {invalid}");
+                    }
+                    ensure!(maintenance_table_evidence(&config, "").is_err());
+                    println!("MISSING_MALFORMED_AND_UNSAFE_READBACK_REJECTIONS=6");
+                }
+            }
             "emit" => {
                 let (config, mut platform, _) = fixture(&root)?;
                 let result = run_aks_pin_setup_job(

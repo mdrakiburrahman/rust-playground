@@ -47,6 +47,7 @@ function fake(options: {
   output?: string;
   clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
   missingImages?: boolean; olderTags?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
+  maintenance?: boolean;
   alreadyHardened?: boolean; unsupportedDisableFlag?: boolean; nullExecEnv?: boolean;
 } = {}) {
   const calls: string[][] = [];
@@ -84,6 +85,7 @@ function fake(options: {
     else if (text.startsWith('az acr show')) stdout = 'arrowcollector89152.azurecr.io';
     else if (text.startsWith('az acr repository list')) stdout = JSON.stringify([
       'arrowcol-sqlserver', 'arrowcol-catalog-rust', 'arrowcol-router-rust', 'arrowcol-dataflow-rust', 'arrowcol-oat-client',
+      ...(options.maintenance ? ['delta-maintenance'] : []),
     ]);
     else if (text.startsWith('az acr repository show-tags')) {
       const repository = command[command.indexOf('--repository') + 1]!;
@@ -149,6 +151,21 @@ function fake(options: {
   };
   return { runner, calls };
 }
+
+test('README maintenance setup preserves its ordinary profile and effective stop budget inputs', async t => {
+  const options = await fixture(t);
+  await setup({ ...options, maintenance: true }, fake({ output: options.output, maintenance: true }).runner);
+  const config = JSON.parse(await readFile(resolve(options.output, 'oat-config.aks.json'), 'utf8'));
+  const runtime = JSON.parse(await readFile(resolve(options.output, 'runtime.json'), 'utf8'));
+  assert.equal(config.campaign_profile, undefined);
+  assert.deepEqual(config.tables, ['sqlserver_active_sessions']);
+  assert.deepEqual(config.tunables, {
+    maintenance: { enabled: true, apply: false, operations: ['optimize'] },
+  });
+  assert.equal(config.tunables.maintenance.operation_timeout_secs, undefined);
+  assert.equal(runtime.images.maintenance, config.maintenance_image);
+  assert.ok(config.maintenance_image.includes('@sha256:'));
+});
 
 test('discovers exactly one live stamp instead of trusting stale YAML', async t => {
   const options = await fixture(t);

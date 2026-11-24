@@ -1,4 +1,16 @@
-fn build_aks_catalog_registration_job(spec: AksClientJobSpec<'_>, config_map_name: &str) -> Result<Value> {
+fn aks_catalog_registration_flag(config: &OatConfig) -> Option<&'static str> {
+    match config.campaign_profile {
+        Some(crate::config::CampaignProfile::ScaleOutSingleTable) => Some("--register-only-config"),
+        None if maintenance_enabled(config) => Some("--register-maintenance-only-config"),
+        _ => None,
+    }
+}
+
+fn build_aks_catalog_registration_job(
+    spec: AksClientJobSpec<'_>,
+    config_map_name: &str,
+    registration_flag: &str,
+) -> Result<Value> {
     let mut job = build_aks_client_job(spec);
     job["metadata"]["labels"]["arrowcol-oat-role"] = json!("catalog-registration");
     let pod = job
@@ -45,7 +57,7 @@ fn build_aks_catalog_registration_job(spec: AksClientJobSpec<'_>, config_map_nam
     container["name"] = json!("catalog-registration");
     container["command"] = json!(["/usr/local/bin/arrowcol-oat-pin-init"]);
     container["args"] = json!([
-        "--register-only-config",
+        registration_flag,
         "/run/arrowcol-oat/register.json",
         "--edge-secret-file",
         "/run/secrets/edge-hmac",
@@ -305,7 +317,7 @@ async fn delete_catalog_registration_job_with_uid(
 }
 
 async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut AksPlatform, run_id: &str) -> Result<()> {
-    if config.campaign_profile != Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+    if aks_catalog_registration_flag(config).is_none() {
         return Ok(());
     }
     let deadline = CatalogRegistrationDeadline(
@@ -323,7 +335,7 @@ async fn run_aks_catalog_registration_stage(
     deadline: CatalogRegistrationDeadline,
 ) -> Result<()> {
     let [table] = config.tables.as_slice() else {
-        bail!("catalog registration requires exactly one scale-out hot table");
+        bail!("pre-admission catalog registration requires exactly one table");
     };
     let table = canonical_dmv_table_name(table)?;
     let delta_root = platform
@@ -351,6 +363,7 @@ async fn run_aks_catalog_registration_stage(
             stop_grace_seconds: config.client_stop_grace_seconds(),
         },
         &config_map_name,
+        aks_catalog_registration_flag(config).context("catalog registration mode is missing")?,
     )?;
     let mut manifest = json!({
         "apiVersion":"v1","kind":"List","items":[{
@@ -528,6 +541,39 @@ async fn run_aks_catalog_registration_stage(
 #[cfg(test)]
 mod catalog_registration_tests {
     use super::*;
+
+    #[test]
+    fn readme_maintenance_registers_before_readback_without_changing_campaign_contracts() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.aks.quick.json"
+        ))?;
+        assert!(aks_catalog_registration_flag(&config).is_none());
+        config.tunables = serde_json::from_value(json!({
+            "maintenance": {"enabled":true,"apply":false,"operations":["optimize"]}
+        }))?;
+        let flag = aks_catalog_registration_flag(&config).context("README maintenance would start without a table")?;
+        let job = build_aks_catalog_registration_job(
+            AksClientJobSpec {
+                namespace: "cell", client_image: "client:test", router_auth_secret_name: "auth",
+                schedule_configmap_name: "unused", run_id: "run", run_label: "register",
+                job_name: "register", args: &[], run_seconds: 180, stop_grace_seconds: 30,
+            },
+            "register-config",
+            flag,
+        )?;
+        assert_eq!(job.pointer("/spec/template/spec/containers/0/args/0"), Some(&json!("--register-maintenance-only-config")));
+        assert_eq!(config.campaign_profile, None);
+        assert_eq!(config.tables, ["sqlserver_active_sessions"]);
+        assert_eq!(config.tunables.maintenance.as_ref().context("maintenance")?.operation_timeout_secs, None);
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        assert_eq!(aks_catalog_registration_flag(&config), Some("--register-only-config"));
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        assert!(aks_catalog_registration_flag(&config).is_none());
+        config.campaign_profile = None;
+        config.tunables.maintenance.as_mut().context("maintenance")?.enabled = Some(false);
+        assert!(aks_catalog_registration_flag(&config).is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn registration_deadline_cancels_stalled_work_without_resetting_between_calls() -> Result<()> {
@@ -771,6 +817,7 @@ mod catalog_registration_tests {
                 stop_grace_seconds: 30,
             },
             "register-config",
+            "--register-only-config",
         )?;
         let pod = &job["spec"]["template"]["spec"];
         assert_eq!(

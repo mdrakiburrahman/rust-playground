@@ -190,6 +190,7 @@ npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config
 - It refuses if a live or partial stamp or stale generated state exists: [destroy](#aks-destroy) first.
 - Flags: `--what-if` read-only preview; `--network cilium` enforces NetworkPolicy (the default Azure dataplane prints `network: NOT ENFORCED`); `--stamp NNNNN` pins the stamp.
 - The run repeats preflight and refuses to start unless READY; `--preflight-only` runs just that read-only check. Setup's host assertion lasts one hour: re-run `aks setup --stamp-config "$STAMP_CONFIG"` if the run starts later.
+- Ordinary single-table runs with `aks setup --maintenance` register the canonical DMV table through authenticated Flight SQL before starting maintenance. No load rows are sent by registration; load admission still requires the worker's effective per-table timeout readback to fit the persisted stop budget. Campaign profiles retain their separate initialization contracts.
 - Pass: `DATA FLOW: PASS` and no run-scoped namespaces or federated credentials left.
 
 ### AKS run
