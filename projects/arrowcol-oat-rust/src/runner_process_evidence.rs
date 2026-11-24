@@ -851,6 +851,10 @@ fn verify_process_configuration_recording(
                 "/runtime/{}",
                 variable.trim_start_matches("ARROWCOL_COLLECTOR_").to_ascii_lowercase()
             ),
+            "ARROWCOL_CLIENT_BUILD_PROFILE_LTO" => "/build_profile/lto".to_owned(),
+            "ARROWCOL_CLIENT_BUILD_PROFILE_CODEGEN_UNITS" => "/build_profile/codegen_units".to_owned(),
+            "ARROWCOL_CLIENT_BUILD_PROFILE_OPT_LEVEL" => "/build_profile/opt_level".to_owned(),
+            "ARROWCOL_CLIENT_BUILD_PROFILE_TARGET_CPU" => "/build_profile/target_cpu".to_owned(),
             variable if variable.starts_with("ARROWCOL_CLIENT_") => format!(
                 "/{}",
                 variable.trim_start_matches("ARROWCOL_CLIENT_").to_ascii_lowercase()
@@ -2436,7 +2440,10 @@ mod startup_readback_tests {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
-        config.tunables = serde_json::from_value(json!({"client":{"batch_rows":257}}))?;
+        config.tunables = serde_json::from_value(json!({"client":{
+            "batch_rows":257,
+            "build_profile":{"lto":"off","codegen_units":16,"opt_level":3,"target_cpu":"generic"}
+        }}))?;
         assert!(verify_process_configuration(&config, ComponentRole::Client, &json!({})).is_err());
         assert!(verify_process_configuration(&config, ComponentRole::Client, &json!({"batch_rows":256})).is_err());
         let readback = process_configurations(concat!(
@@ -2447,22 +2454,28 @@ mod startup_readback_tests {
         verify_oat_client_build_profile_readback(&config, &readback)?;
         verify_process_configuration(&config, ComponentRole::Client, &readback)?;
         assert_eq!(readback["workers"], 4);
-        let wrong_profile = process_configurations(
-            "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"thin-local\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}\n",
-        )?;
+        let wrong_profile = process_configurations(concat!(
+            "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"off\",\"codegen_units\":8,\"opt_level\":3,\"target_cpu\":\"generic\"}\n",
+            "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":257}\n",
+        ))?;
         assert!(verify_oat_client_build_profile_readback(&config, &wrong_profile).is_err());
-        assert!(verify_oat_client_build_profile_readback(&config, &json!({})).is_err());
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &wrong_profile).is_err());
+        let absent_profile = process_configurations("OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":257}\n")?;
+        assert!(verify_oat_client_build_profile_readback(&config, &absent_profile).is_err());
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &absent_profile).is_err());
         config.tunables = serde_json::from_value(json!({"client":{"build_profile":{
             "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
         }}}))?;
-        let requested_profile = json!({"build_profile":{
-            "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
-        }});
+        let requested_profile = process_configurations(
+            "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"thin-local\",\"codegen_units\":8,\"opt_level\":2,\"target_cpu\":\"x86-64-v3\"}\n",
+        )?;
         verify_oat_client_build_profile_readback(&config, &requested_profile)?;
-        let wrong_requested_profile = json!({"build_profile":{
-            "lto":"thin-local","codegen_units":8,"opt_level":3,"target_cpu":"x86-64-v3"
-        }});
+        verify_process_configuration(&config, ComponentRole::Client, &requested_profile)?;
+        let wrong_requested_profile = process_configurations(
+            "OAT_CLIENT_BUILD_PROFILE {\"lto\":\"thin-local\",\"codegen_units\":8,\"opt_level\":3,\"target_cpu\":\"x86-64-v3\"}\n",
+        )?;
         assert!(verify_oat_client_build_profile_readback(&config, &wrong_requested_profile).is_err());
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &wrong_requested_profile).is_err());
         Ok(())
     }
 
