@@ -280,6 +280,8 @@ impl KustoClient {
         let body = self.response_body(response).await.map_err(|error| {
             if self.response_byte_limit.is_some() && matches!(status.as_u16(), 502..=504) {
                 error.context(QapUnavailable).context(format!("Kusto HTTP {status}"))
+            } else if self.response_byte_limit.is_some() && !status.is_success() {
+                anyhow::anyhow!("Kusto HTTP {status}: invalid or unreadable response body")
             } else {
                 error
             }
@@ -2529,6 +2531,7 @@ mod tests {
                 (200, b"CANARYSIG".to_vec(), 0, "not valid JSON", true),
                 (200, b"{".to_vec(), 12, "response body failed", false),
                 (503, b"CANARYSIG".to_vec(), 0, "not valid JSON", true),
+                (400, b"CANARYSIG".to_vec(), 0, "Kusto HTTP 400", false),
                 (
                     200,
                     br#"{"error":"query rejected"}"#.to_vec(),

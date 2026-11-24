@@ -3887,6 +3887,24 @@ async fn run_isolated_cell(
         result,
         cleanup,
     );
+    if let Err(error) = attach_collector_teardown_failures(
+        &mut outcome.rows,
+        stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()),
+        cleanup_succeeded,
+    ) {
+        for row in &mut outcome.rows {
+            row.status = "failed".to_owned();
+            let message = format!("capture collector teardown failure evidence: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("capture collector teardown failure evidence: {error:#}")),
+            None => error,
+        });
+    }
     if let Some(evidence) = shutdown_drain_evidence
         && let Err(error) = attach_shutdown_drain_evidence(&mut outcome, evidence)
     {
@@ -5207,7 +5225,7 @@ fn result_rows(
                     "limit_cpu": requested.client.limits.cpu,
                     "limit_millicores": client_limit_millicores,
                     "concurrency_per_cpu_core": config.dmv_concurrency
-                        .filter(|_| !config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).is_some_and(|streams| streams > 0))
+                        .filter(|_| config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).is_none_or(|streams| streams == 0))
                         .map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
                 },
                 "throttling": throttling,
@@ -19425,7 +19443,10 @@ mod tests {
         let mut matched = evidence.clone();
         matched.durable_commits.get_mut(&table).context("commit evidence")?["delta_log_reconciliation"] =
             json!({"status": "matched"});
-        for (failure, violation) in [(Some("client infrastructure unavailable"), None), (None, Some("ownership changed"))] {
+        for (failure, violation) in [
+            (Some("client infrastructure unavailable"), None),
+            (None, Some("ownership changed")),
+        ] {
             let rows = rows_for(matched.clone(), failure, violation)?;
             let row = &rows[0];
             let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;

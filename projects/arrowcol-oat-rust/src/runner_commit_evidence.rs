@@ -1438,6 +1438,7 @@ mod commit_evidence_tests {
             clients: 1, tables: 1, table_owner: None, pinning_ok: true, pinning_error: None,
             failure: None, status: "succeeded".into(), git_sha: "test".into(), tunables_json: "{}".into(),
             evidence_json: Some(json!({"backlog":{"measurement_window":{"start_unix_ms":100,"end_unix_ms":60_100}},
+                "reconciliation":{"status":"unsettled","reason":"delta_commit_drain_timeout","exact_match_required":true,"exact_match":false},
                 "durable_commits":{"output_throughput":{"rows":10,"rows_per_second":1.0},
                     "run_cumulative_output":{"rows":10,"settle_seconds":1.0}},
                 "client_phase_reports":[{"phase_counters":{"process_cumulative":{"completed_rows":20,"ambiguous_rows":0}}}],
@@ -1445,6 +1446,28 @@ mod commit_evidence_tests {
             replicas: 1, dfe_worker_concurrency: 1, table: table.clone(), rows: Some(20), duration_ms: Some(60_000),
             rows_per_second: Some(1.0), cpu_millicores: None, memory_bytes: None, qap: QapMetrics::default(),
         };
+        let mut typed = stopped.clone();
+        typed.text.push_str(&format!("arrowcol_teardown_failure {}\n", json!({
+            "kind": arrowcol_protocol::DATAFLOW_DRAIN_INCOMPLETE,
+            "triggers": ["unpublished_identities"]
+        })));
+        typed.text = filter_process_evidence_text(&typed.text)?;
+        let mut typed_row = row.clone();
+        attach_collector_teardown_failures(std::slice::from_mut(&mut typed_row), Some(std::slice::from_ref(&typed)), false)?;
+        let typed_evidence: Value = serde_json::from_str(typed_row.evidence_json.as_deref().context("missing typed evidence")?)?;
+        assert_eq!(typed_row.status, "failed");
+        assert_eq!(typed_evidence["teardown_failures"], json!([{
+            "kind": "dataflow_drain_incomplete", "triggers": ["unpublished_identities"], "collector_instance_id": "collector-test"
+        }]));
+        let mut missing = row.clone();
+        attach_collector_teardown_failures(std::slice::from_mut(&mut missing), Some(std::slice::from_ref(&stopped)), false)?;
+        assert!(serde_json::from_str::<Value>(missing.evidence_json.as_deref().context("missing evidence")?)?["teardown_failures"].is_null());
+        let mut invalid = typed.clone();
+        invalid.text.push_str("arrowcol_teardown_failure {\"kind\":\"dataflow_drain_incomplete\",\"triggers\":[]}\n");
+        assert!(attach_collector_teardown_failures(std::slice::from_mut(&mut row.clone()), Some(&[invalid]), false).is_err());
+        let mut incomplete_typed = typed.clone();
+        incomplete_typed.complete = false;
+        assert!(attach_collector_teardown_failures(std::slice::from_mut(&mut row.clone()), Some(&[incomplete_typed]), false).is_err());
         let mut warned = stopped.clone();
         warned.text.push_str("WARN cancelled admissions had no observed publication outcome; delivery remains ambiguous cancelled_ambiguous=2\n");
         let mut incomplete_admissions = stopped.clone();
@@ -1530,6 +1553,10 @@ mod commit_evidence_tests {
             2
         );
         assert_eq!(evidence["reconciliation"]["status"], "within_bound");
+        assert_eq!(evidence["pre_teardown_reconciliation"], json!({
+            "status":"unsettled", "reason":"delta_commit_drain_timeout",
+            "exact_match_required":true, "exact_match":false
+        }));
         assert_eq!(
             evidence["durable_commits"]["complete_30_second_commit_windows"][0]["rows"],
             10

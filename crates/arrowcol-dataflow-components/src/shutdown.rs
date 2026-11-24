@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use arrowcol_protocol::{CollectorInstanceId, PublicationId, UnixMillis};
+use arrowcol_protocol::{CollectorInstanceId, DATAFLOW_DRAIN_INCOMPLETE, PublicationId, UnixMillis};
 use arrowcol_routing::{CollectorState, RoutingErrorKind, RoutingStore};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -75,6 +75,20 @@ impl Drop for AdmissionGuard<'_> {
             }
         }
     }
+}
+
+fn drain_failure_record(pending_total: usize, retired: usize, ingress_failed: bool) -> serde_json::Value {
+    let mut triggers = Vec::new();
+    if pending_total != 0 {
+        triggers.push("unpublished_identities");
+    }
+    if retired != 0 {
+        triggers.push("retired_workers");
+    }
+    if ingress_failed {
+        triggers.push("ingress_failure");
+    }
+    serde_json::json!({"kind": DATAFLOW_DRAIN_INCOMPLETE, "triggers": triggers})
 }
 
 impl RoutingShutdown {
@@ -336,6 +350,10 @@ impl RoutingShutdown {
             );
         }
         if failed {
+            eprintln!(
+                "arrowcol_teardown_failure {}",
+                drain_failure_record(pending_total, retired, self.failed.load(Ordering::Acquire))
+            );
             tracing::error!(
                 never_staged = counts.never_staged,
                 staged_unpublished = counts.staged,
@@ -522,6 +540,21 @@ mod tests {
             .to_string();
         assert!(error.contains("never_staged=1"), "{error}");
         Ok(())
+    }
+
+    #[test]
+    fn drain_failure_record_names_every_cause() {
+        assert_eq!(
+            drain_failure_record(3, 1, true),
+            serde_json::json!({
+                "kind": DATAFLOW_DRAIN_INCOMPLETE,
+                "triggers": ["unpublished_identities", "retired_workers", "ingress_failure"]
+            })
+        );
+        assert_eq!(
+            drain_failure_record(0, 0, true)["triggers"],
+            serde_json::json!(["ingress_failure"])
+        );
     }
 
     #[tokio::test]

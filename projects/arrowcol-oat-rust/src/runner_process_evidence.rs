@@ -40,6 +40,50 @@ fn has_startup_envelope(text: &str, prefix: &str, required_component: Option<&st
     })
 }
 
+fn attach_collector_teardown_failures(
+    rows: &mut [OatResult],
+    logs: Option<&[ProcessLog]>,
+    cleanup_succeeded: bool,
+) -> Result<()> {
+    if cleanup_succeeded {
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for log in logs.unwrap_or_default().iter().filter(|log| log.role == ComponentRole::Collector) {
+        for line in log.text.lines().filter(|line| line.starts_with("arrowcol_teardown_failure ")) {
+            if !log.complete || log.instance_id.is_empty() {
+                bail!("collector teardown failure record has incomplete provenance");
+            }
+            let value: Value = serde_json::from_str(&line["arrowcol_teardown_failure ".len()..])
+                .context("invalid collector teardown failure record")?;
+            let object = value.as_object().context("invalid collector teardown failure object")?;
+            let triggers = value["triggers"].as_array().context("missing teardown failure triggers")?;
+            if object.len() != 2 || value["kind"].as_str() != Some(arrowcol_protocol::DATAFLOW_DRAIN_INCOMPLETE)
+                || triggers.is_empty() || triggers.iter().any(|trigger| !matches!(trigger.as_str(),
+                    Some("unpublished_identities" | "retired_workers" | "ingress_failure")))
+                || triggers.iter().filter_map(Value::as_str).collect::<BTreeSet<_>>().len() != triggers.len()
+            {
+                bail!("invalid collector teardown failure kind or triggers");
+            }
+            failures.push(json!({"kind": arrowcol_protocol::DATAFLOW_DRAIN_INCOMPLETE,
+                "triggers": triggers, "collector_instance_id": log.instance_id}));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for row in rows {
+        let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+        if !evidence.is_object() {
+            bail!("invalid cell evidence");
+        }
+        evidence["teardown_failures"] = json!(failures);
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+        row.status = "failed".to_owned();
+    }
+    Ok(())
+}
+
 fn process_log_complete(role: &ComponentRole, text: &str) -> bool {
     match role {
         ComponentRole::Client => true,
@@ -57,6 +101,7 @@ fn is_process_evidence_line(line: &str) -> bool {
         "arrowcol_wal_effective_config ",
         "arrowcol_layout_",
         "arrowcol_data_commit ",
+        "arrowcol_teardown_failure ",
         "cancelled admissions had no observed publication outcome",
         "arrowcol_maintenance_",
         "delta-maintenance ",

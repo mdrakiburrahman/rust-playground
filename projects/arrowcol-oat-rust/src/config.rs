@@ -2717,7 +2717,8 @@ mod tests {
         assert!(
             config
                 .validate()
-                .unwrap_err()
+                .err()
+                .context("settle timeout above stop grace accepted")?
                 .to_string()
                 .contains("reconciliation_settle_timeout_seconds")
         );
