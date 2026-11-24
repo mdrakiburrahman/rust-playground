@@ -594,6 +594,8 @@ fn fixture_platform(input: &FixtureSetupInput) -> AksPlatform {
         }),
         maintenance_cell_baseline: Vec::new(),
         stopped_collector_logs: None,
+        custody_followers: Vec::new(),
+        shutdown_membership: None,
     }
 }
 
