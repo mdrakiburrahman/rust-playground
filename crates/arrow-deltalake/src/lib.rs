@@ -105,6 +105,28 @@ impl<'de> serde::Deserialize<'de> for SnapshotCacheMode {
     }
 }
 
+/// How coalesced preparation resolves the prior Delta transactions of its entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightLookupMode {
+    /// One Kernel transaction lookup per entry.
+    #[default]
+    PerEntry,
+    /// One `txn_lookup_mode` lookup per group; custom-partitioned tables stay per entry.
+    Grouped,
+}
+
+impl<'de> serde::Deserialize<'de> for PreflightLookupMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.preflight_lookup_mode must be per_entry or grouped";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_entry") => Ok(Self::PerEntry),
+            Ok("grouped") => Ok(Self::Grouped),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
 /// Who writes Delta checkpoints for a collector-owned table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
