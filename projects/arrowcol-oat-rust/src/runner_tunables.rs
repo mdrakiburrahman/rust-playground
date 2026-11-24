@@ -1615,7 +1615,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     fn cpu_modes_need_pool_readback_and_stage_concurrency_needs_batching_readback() -> Result<()> {
         let mut config = config()?;
         let runtime = json!({"cpu_dispatch":"bounded_shards", "cpu_placement":"compact_allowed"});
-        let batching = json!({"stage_file_concurrency":8});
+        let batching = json!({"coalesce_publications":true,"stage_file_concurrency":8});
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector":{"runtime":runtime,"batching":batching}
         }))?;

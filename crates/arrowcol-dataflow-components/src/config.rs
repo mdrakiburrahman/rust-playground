@@ -134,9 +134,18 @@ mod override_tests {
     fn stage_file_concurrency_validates_the_merged_batch_policy() {
         let config = FileBatchConfig::default();
         assert_eq!(config.stage_file_concurrency, 1);
+        let enabled = FileBatchConfig {
+            coalesce_publications: true,
+            ..config.clone()
+        };
+        assert!(
+            merge_config(&enabled, r#"{"stage_file_concurrency":16}"#, None)
+                .and_then(|merged| merged.validate())
+                .is_ok()
+        );
         for (raw, valid) in [
             ("1", true),
-            ("16", true),
+            ("16", false),
             ("0", false),
             ("17", false),
             ("-1", false),
@@ -1175,6 +1184,9 @@ impl FileBatchConfig {
         let table = self.per_table_capacity;
         if !(1..=16).contains(&self.stage_file_concurrency) {
             return Err("stage_file_concurrency must be in 1..=16".to_owned());
+        }
+        if self.stage_file_concurrency > 1 && !self.coalesce_publications {
+            return Err("stage_file_concurrency > 1 requires coalesce_publications=true".to_owned());
         }
         if [global.rows, global.batches, table.rows, table.batches].contains(&0)
             || global.bytes == 0

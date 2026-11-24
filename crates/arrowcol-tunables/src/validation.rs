@@ -1839,6 +1839,9 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
     if !(1..=16).contains(&batching.stage_file_concurrency.unwrap_or(1)) {
         bail!("collector.batching.stage_file_concurrency must be an integer in 1..=16");
     }
+    if batching.stage_file_concurrency.unwrap_or(1) > 1 && batching.coalesce_publications != Some(true) {
+        bail!("collector.batching.stage_file_concurrency > 1 requires coalesce_publications=true");
+    }
     if !(1..=64).contains(&depth) {
         bail!("collector.batching.pipeline_depth must be in 1..=64");
     }
