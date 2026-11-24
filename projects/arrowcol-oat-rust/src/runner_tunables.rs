@@ -408,6 +408,15 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if path == "collector.upload.staging_mode" {
+            if let Some(mode) = environment.get("ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE")
+                && collectors.iter().all(|p| p["effective_config"]["runtime"]["staging_mode"].as_str() == Some(mode.as_str()))
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         let runtime = match path {
             "collector.runtime.timestamp_kernel" => Some(("timestamp_kernel", "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL")),
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
@@ -1455,6 +1464,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             (json!({"collector":{"runtime":{"timestamp_kernel":"fused_checked"}}}), json!({"timestamp_kernel":"fused_checked"})),
             (json!({"collector":{"runtime":{"upload_limit":1},"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":16}}}),
              json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1})),
+            (json!({"collector":{"upload":{"mode":"buffered_multipart","staging_mode":"streaming"}}}), json!({"staging_mode":"streaming"})),
             (json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
              json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256})),
             (json!({"collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":2}}}),

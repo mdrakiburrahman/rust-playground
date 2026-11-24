@@ -1,5 +1,6 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
+pub(crate) mod streaming_sink;
 pub use crate::delta_io::spawn_shared_io;
 use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executor};
 use crate::layout::{PublicationSorter, SortExecution};
@@ -36,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
+pub use streaming_sink::StreamingUploadError;
 use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
@@ -748,13 +750,8 @@ mod io_tests {
         }
     }
 
-    /// Scenario: a registered publisher stages through an injected cloud-shaped data store.
-    /// Guarantees: authority checks work off the caller runtime without synchronous I/O-worker re-entry.
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_backed_cloud_stage_uses_async_authority_checks() -> Result<()> {
-        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
-        use crate::publisher::{MetadataSnapshot, PublisherSession, SessionMode};
-        use futures::TryStreamExt;
+    async fn ready_stage_session() -> Result<(Arc<StageControl>, Arc<PublisherSession>)> {
+        use crate::publisher::{MetadataSnapshot, SessionMode};
         const SANDBOX: &str = "0123456789ab";
         const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
         let control = Arc::new(StageControl(std::sync::Mutex::new(MetadataSnapshot {
@@ -779,6 +776,114 @@ mod io_tests {
             Some(GENERATION),
         )
         .await?;
+        Ok((control, session))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_publication_commits_without_a_local_file_and_fences_replay() -> Result<()> {
+        const CHILD: &str = "ARROWCOL_TEST_STREAMING_STAGE";
+        if std::env::var_os(CHILD).is_none() {
+            let run = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "delta::io_tests::streaming_publication_commits_without_a_local_file_and_fences_replay",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE", "streaming")
+                .env("ARROWCOL_COLLECTOR_UPLOAD_MODE", "buffered_multipart")
+                .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", "1")
+                .output()?;
+            anyhow::ensure!(
+                run.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            return Ok(());
+        }
+        let (control, session) = ready_stage_session().await?;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            vec![],
+            None,
+            Some(Arc::clone(&session)),
+            Some(Arc::<object_store::memory::InMemory>::clone(&store)),
+        )?;
+        let input = input_batch()?;
+        for (index, identity) in ["stream-a", "stream-a", "stream-b"].iter().enumerate() {
+            let mut writer = table
+                .new_file(input.schema())?
+                .with_transaction(identity.to_string(), 1)?;
+            writer.write(&input).await?;
+            let staged = writer.stage().await?;
+            assert!(!staged.file.path.try_exists()?);
+            let relative = staged
+                .file
+                .path
+                .strip_prefix(&table.root)?
+                .to_str()
+                .context("fixture path")?;
+            let bytes = store.get(&table.object_path(relative)?).await?.bytes().await?;
+            assert_eq!(bytes.len() as u64, staged.file.bytes);
+            let mut read = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+            assert_eq!(read.next().context("missing Parquet rows")??, input);
+            if index == 2 {
+                control
+                    .0
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .metadata
+                    .insert("resetstate".into(), "fenced-v1".into());
+                assert!(table.commit_files(&[staged]).is_err());
+            } else {
+                assert_eq!(table.commit_files(&[staged])?, 1);
+            }
+        }
+        assert_eq!(table.version()?, 1);
+        assert_eq!(table.lookup_txn("stream-a")?, Some(1));
+        assert_eq!(table.lookup_txn("stream-b")?, None);
+        session.close_after_drain_async().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_upload_aborts_instead_of_publishing_a_truncated_writer() -> Result<()> {
+        let store = Arc::new(PausedStagePut {
+            fail_part_at: Some(usize::MAX),
+            ..Default::default()
+        });
+        let path = object_store::path::Path::from("incomplete.parquet");
+        let (sender, expected) = tokio::sync::oneshot::channel::<u64>();
+        drop(sender);
+        let error = upload_multipart(
+            Arc::<PausedStagePut>::clone(&store),
+            path.clone(),
+            &b"no-footer"[..],
+            async { expected.await.context("Parquet stream ended without a finished footer") },
+            3,
+            2,
+        )
+        .await
+        .err()
+        .context("truncated input published")?;
+        assert!(error.to_string().contains("without a finished footer"));
+        assert_eq!(store.abort_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            store.inner.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    /// Scenario: a registered publisher stages through an injected cloud-shaped data store.
+    /// Guarantees: authority checks work off the caller runtime without synchronous I/O-worker re-entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_backed_cloud_stage_uses_async_authority_checks() -> Result<()> {
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        use futures::TryStreamExt;
+        let (_, session) = ready_stage_session().await?;
         let directory = tempfile::tempdir()?;
         let table = DeltaTable::open(directory.path())?;
         let input = input_batch()?;
@@ -5235,10 +5340,25 @@ impl DeltaTable {
                 crate::partition::component(value)
             ));
         }
-        fs::create_dir_all(&directory)?;
         let path = directory.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));
         let physical = Arc::new(context.physical_data_schema().as_ref().try_into_arrow()?);
-        let parquet = ParquetFileWriter::create_with_codec_evidence(path, physical, properties)?;
+        let parquet = if self.url.scheme() != "file" && runtime_config()?.staging_mode == crate::StagingMode::Streaming
+        {
+            let relative = path
+                .strip_prefix(&self.root)?
+                .to_str()
+                .context("invalid data file path")?;
+            let destination = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
+            ParquetFileWriter::streaming(
+                path,
+                physical,
+                properties,
+                streaming_sink::StreamingSink::new(Arc::clone(self), destination),
+            )?
+        } else {
+            fs::create_dir_all(&directory)?;
+            ParquetFileWriter::create_with_codec_evidence(path, physical, properties)?
+        };
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(DeltaFileWriter {
             mapping,
@@ -5693,12 +5813,15 @@ impl DeltaTable {
                     .to_str()
                     .context("invalid data file path")?;
                 let url = self.staged_url(relative)?;
-                let modified = i64::try_from(
-                    fs::metadata(&append.file.path)?
-                        .modified()?
-                        .duration_since(UNIX_EPOCH)?
-                        .as_millis(),
-                )?;
+                let modified = match append.remote_modified {
+                    Some(modified) => modified,
+                    None => i64::try_from(
+                        fs::metadata(&append.file.path)?
+                            .modified()?
+                            .duration_since(UNIX_EPOCH)?
+                            .as_millis(),
+                    )?,
+                };
                 let metadata =
                     DataFileMetadata::new(FileMeta::new(url, modified, append.file.bytes), append.stats.clone());
                 transaction.add_files(build_add_file_metadata(metadata, &append.context)?);
@@ -5986,6 +6109,7 @@ pub struct StagedAppend {
     pub(crate) schema: SchemaRef,
     context: BoundWriteContext,
     pub(crate) file: CompletedFile,
+    remote_modified: Option<i64>,
     pub(crate) stats: StructArray,
     pub(crate) publication: Option<(String, i64)>,
     pub(crate) ingested_at_ms: Option<i64>,
@@ -6096,88 +6220,107 @@ async fn upload_staged_output(
             upload_started.elapsed()
         }
         UploadMode::BufferedMultipart => {
-            let upload_started = Instant::now();
-            use futures::StreamExt as _;
-            use tokio::io::AsyncReadExt as _;
-
-            anyhow::ensure!(buffer_capacity > 0, "multipart buffer capacity must be positive");
-            anyhow::ensure!(
-                request_concurrency > 0,
-                "multipart request concurrency must be positive"
-            );
-
-            let mut source = tokio::fs::File::open(&source_path)
+            let source = tokio::fs::File::open(&source_path)
                 .await
                 .context("open completed Parquet output for upload")?;
-            let mut upload = store
-                .put_multipart_opts(&destination, object_store::PutMultipartOptions::default())
-                .await
-                .context("start completed Parquet multipart upload")?;
-            let mut pending = futures::stream::FuturesUnordered::new();
-            let mut copied = 0_u64;
-            let mut eof = false;
-            let mut upload_error = None;
-
-            while !eof && upload_error.is_none() {
-                while pending.len() < request_concurrency && !eof && upload_error.is_none() {
-                    let mut buffer = vec![0; buffer_capacity];
-                    let mut filled = 0;
-                    while filled < buffer.len() {
-                        match source.read(&mut buffer[filled..]).await {
-                            Ok(0) => {
-                                eof = true;
-                                break;
-                            }
-                            Ok(bytes_read) => filled += bytes_read,
-                            Err(error) => {
-                                upload_error = Some(
-                                    anyhow::Error::new(error)
-                                        .context("read completed Parquet output for multipart upload"),
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    if filled == 0 {
-                        break;
-                    }
-                    copied = match copied.checked_add(filled as u64) {
-                        Some(bytes) => bytes,
-                        None => {
-                            upload_error = Some(anyhow::anyhow!("multipart source length overflow"));
-                            break;
-                        }
-                    };
-                    buffer.truncate(filled);
-                    pending.push(upload.put_part(buffer.into()));
-                }
-                if let Some(Err(error)) = pending.next().await {
-                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                }
-            }
-            while let Some(result) = pending.next().await {
-                if upload_error.is_none()
-                    && let Err(error) = result
-                {
-                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                }
-            }
-            if let Some(error) = upload_error {
-                return Err(abort_multipart_after_failure(&mut upload, error).await);
-            }
-            if copied != expected_bytes {
-                let error =
-                    anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
-                return Err(abort_multipart_after_failure(&mut upload, error).await);
-            }
-            if let Err(error) = upload.complete().await {
-                let error = anyhow::Error::new(error).context("complete completed Parquet multipart upload");
-                return Err(abort_multipart_after_failure(&mut upload, error).await);
-            }
-            upload_started.elapsed()
+            upload_multipart(
+                store,
+                destination,
+                source,
+                async { Ok(expected_bytes) },
+                buffer_capacity,
+                request_concurrency,
+            )
+            .await?
         }
     };
     Ok(upload_duration)
+}
+
+async fn upload_multipart(
+    store: Arc<dyn ObjectStore>,
+    destination: object_store::path::Path,
+    mut source: impl tokio::io::AsyncRead + Unpin,
+    expected: impl std::future::Future<Output = Result<u64>>,
+    buffer_capacity: usize,
+    request_concurrency: usize,
+) -> Result<Duration> {
+    use futures::StreamExt as _;
+    use tokio::io::AsyncReadExt as _;
+    anyhow::ensure!(
+        buffer_capacity > 0 && request_concurrency > 0,
+        "multipart capacity and request concurrency must be positive"
+    );
+    let upload_started = Instant::now();
+    let mut upload = store
+        .put_multipart_opts(&destination, object_store::PutMultipartOptions::default())
+        .await
+        .context("start completed Parquet multipart upload")?;
+    let mut pending = futures::stream::FuturesUnordered::new();
+    let mut copied = 0_u64;
+    let mut eof = false;
+    let mut upload_error = None;
+
+    while !eof && upload_error.is_none() {
+        while pending.len() < request_concurrency && !eof && upload_error.is_none() {
+            let mut buffer = vec![0; buffer_capacity];
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match source.read(&mut buffer[filled..]).await {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(bytes_read) => filled += bytes_read,
+                    Err(error) => {
+                        upload_error = Some(
+                            anyhow::Error::new(error).context("read completed Parquet output for multipart upload"),
+                        );
+                        break;
+                    }
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            copied = match copied.checked_add(filled as u64) {
+                Some(bytes) => bytes,
+                None => {
+                    upload_error = Some(anyhow::anyhow!("multipart source length overflow"));
+                    break;
+                }
+            };
+            buffer.truncate(filled);
+            pending.push(upload.put_part(buffer.into()));
+        }
+        if let Some(Err(error)) = pending.next().await {
+            upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
+        }
+    }
+    while let Some(result) = pending.next().await {
+        if upload_error.is_none()
+            && let Err(error) = result
+        {
+            upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
+        }
+    }
+    if let Some(error) = upload_error {
+        return Err(abort_multipart_after_failure(&mut upload, error).await);
+    }
+    let expected_bytes = match expected.await {
+        Ok(size) => size,
+        Err(error) => return Err(abort_multipart_after_failure(&mut upload, error).await),
+    };
+    if copied != expected_bytes {
+        let error = anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
+        return Err(abort_multipart_after_failure(&mut upload, error).await);
+    }
+    if let Err(error) = upload.complete().await {
+        let error = anyhow::Error::new(error).context("complete completed Parquet multipart upload");
+        return Err(abort_multipart_after_failure(&mut upload, error).await);
+    }
+
+    Ok(upload_started.elapsed())
 }
 
 async fn abort_multipart_after_failure(
@@ -6198,6 +6341,9 @@ impl DeltaFileWriter {
     pub fn discard_empty(self) -> Result<()> {
         if self.accepted_rows != 0 {
             bail!("cannot discard a writer that accepted rows");
+        }
+        if self.parquet.durable_handle.is_none() {
+            return Ok(());
         }
         let path = self.parquet.path.clone();
         drop(self);
@@ -6416,61 +6562,74 @@ impl DeltaFileWriter {
             result?;
         }
         let encode_started = Instant::now();
-        let file_result = self.parquet.finish().await;
+        let file_result = self.parquet.finish_with_upload().await;
         self.stage_timings.encode += encode_started.elapsed();
-        let file = file_result?;
+        let (file, streaming_upload) = file_result?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
-        let executor = shared_executor()?;
         self.table.check_publication_async().await?;
-        let upload_slot = if self.table.url.scheme() == "file" {
-            None
+        let (file, remote_modified) = if let Some(duration) = streaming_upload {
+            self.stage_timings.encode = self.stage_timings.encode.saturating_sub(duration);
+            self.stage_timings.upload = Some(duration);
+            (
+                file,
+                Some(i64::try_from(
+                    std::time::SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                )?),
+            )
         } else {
-            Some(executor.upload_slot().await?)
-        };
-        let table = Arc::clone(&self.table);
-        let (file, prepared, upload_slot) = executor
-            .spawn_blocking(move || {
-                let prepared = table.prepare_upload(&file);
-                (file, prepared, upload_slot)
-            })
-            .await
-            .context("stage upload preparation worker failed")?;
-        if let Some(path) = prepared? {
-            self.table.check_publication_async().await?;
-            let config = runtime_config()?;
-            let upload_mode = config.upload_mode;
-            let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
-            let upload_request_concurrency = config.upload_request_concurrency;
+            let executor = shared_executor()?;
+            let upload_slot = if self.table.url.scheme() == "file" {
+                None
+            } else {
+                Some(executor.upload_slot().await?)
+            };
             let table = Arc::clone(&self.table);
-            let store = Arc::clone(&table.store);
-            let source_path = file.path.clone();
-            let expected_bytes = file.bytes;
-            let upload_duration = spawn_shared_io(async move {
-                let _table = table;
-                let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
-                upload_staged_output(
-                    store,
-                    path,
-                    source_path,
-                    expected_bytes,
-                    upload_mode,
-                    upload_buffer_capacity,
-                    upload_request_concurrency,
-                )
+            let (file, prepared, upload_slot) = executor
+                .spawn_blocking(move || {
+                    let prepared = table.prepare_upload(&file);
+                    (file, prepared, upload_slot)
+                })
                 .await
-            })
-            .context("start stage upload task")?
-            .await
-            .context("stage upload task failed")?
-            .context("stage upload failed")?;
-            self.stage_timings.upload = Some(upload_duration);
-        }
+                .context("stage upload preparation worker failed")?;
+            if let Some(path) = prepared? {
+                self.table.check_publication_async().await?;
+                let config = runtime_config()?;
+                let upload_mode = config.upload_mode;
+                let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
+                let upload_request_concurrency = config.upload_request_concurrency;
+                let table = Arc::clone(&self.table);
+                let store = Arc::clone(&table.store);
+                let source_path = file.path.clone();
+                let expected_bytes = file.bytes;
+                let upload_duration = spawn_shared_io(async move {
+                    let _table = table;
+                    let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
+                    upload_staged_output(
+                        store,
+                        path,
+                        source_path,
+                        expected_bytes,
+                        upload_mode,
+                        upload_buffer_capacity,
+                        upload_request_concurrency,
+                    )
+                    .await
+                })
+                .context("start stage upload task")?
+                .await
+                .context("stage upload task failed")?
+                .context("stage upload failed")?;
+                self.stage_timings.upload = Some(upload_duration);
+            }
+            (file, None)
+        };
         self.table.check_publication_async().await?;
         Ok(StagedAppend {
             table: self.table,
             schema: self.schema,
             context: self.context,
             file,
+            remote_modified,
             stats,
             publication: self.publication,
             ingested_at_ms: self.ingested_at_ms,
