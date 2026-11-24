@@ -28,7 +28,10 @@ the boundary timestamps; inspect them when comparing short windows.
 
 AKS already configures `platform.resources.collector.limits.cpu` independently
 of worker concurrency (including the existing explicit uncapped mode); it does
-not consume this local-only field.
+not consume this local-only field. Each collector replica's actual cAdvisor
+quota and period must match the request before load and at measurement
+boundaries; missing or inconsistent evidence fails the cell. Throttling deltas
+are recorded per container with pod and container identity.
 
 ## Container memory guard metric
 
