@@ -39,9 +39,9 @@ mod parallel_writer;
 #[cfg(feature = "delta")]
 mod partition;
 #[cfg(feature = "delta")]
-mod publication_lookup;
-#[cfg(feature = "delta")]
 mod publication_evidence;
+#[cfg(feature = "delta")]
+mod publication_lookup;
 #[cfg(feature = "delta")]
 pub use publication_evidence::{PublicationEvidence, PublicationOutcome, PublicationReason};
 #[cfg(feature = "delta")]
