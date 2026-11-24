@@ -9,6 +9,7 @@ import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, 
 import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
 import { captureStampKustoBaseline, observeDataPreservation, validateStampKustoBaseline, type DataPreservationReceipt } from './aks-data-safety.js';
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
+import { requireFinalizedCollectorStop } from './aks-shutdown-finalization.js';
 import { createCellCleanupProviders, type CellStepProviders } from './aks-cell-cleanup.js';
 import { createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
 import { withCleanupDeadline } from './aks-cleanup-budget.js';
@@ -240,6 +241,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
   });
   const owned = async (authority: CleanupMutationAuthority) => {
     const inventory = await assertRunCleanupActor(store, authority);
+    await requireFinalizedCollectorStop(store, azure, inventory, authority);
     return createOwnedRunCleanupActions(store, azure, inventory.qap?.reference ?? null, options.workDirectory,
       inventory.fic?.plan ?? undefined);
   };
@@ -279,6 +281,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       await authority.assertCurrent();
       const state = (await store.read())?.state;
       if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Final cell data inventory changed.');
+      await requireFinalizedCollectorStop(store, azure, inventory, authority);
       const result = await observeDataPreservation(store, azure, state, authority);
       if (result.status !== 'preserved') throw new Error('Final cell data preservation is ' + result.status + ': ' + result.reason);
       return 'complete';
@@ -340,6 +343,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       const authority = authorityFor(state);
       await assertCleaningActor(store, authority);
       await authority.assertCurrent();
+      if (state.runInventory) await requireFinalizedCollectorStop(store, azure, state.runInventory, authority);
       const capacity = await observe_custody_idle_capacity(azure), health = await readHealth(azure, state, authority, options.runCommand);
       if (capacity.status !== 'capacity_idle') return 'pending';
       const data = await readDataSafety(state, authority);
