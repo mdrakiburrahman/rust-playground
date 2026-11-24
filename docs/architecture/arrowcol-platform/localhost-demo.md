@@ -1,16 +1,20 @@
 # Localhost catalogue and ingestion demo
 
-| Component | Local address | Purpose |
+| Component | Purpose | Prerequisite |
 | --- | --- | --- |
-| Catalogue UI | <http://localhost:4173/lakehouse> | Explore contracts and download independent models/SDK packages |
-| Local / hosted simulation | `18817` / `18818` | Two independent, persistent catalogue authorities |
-| Regional Arrowcol | `18830` | Admit SDK batches and commit Delta/Parquet |
-| Optional on-node Arrowcol | `18832` | Admit and forward to regional using the same catalogue authority |
-| Optional Kusto emulator | `18090` | Query the committed Delta table, without copying rows |
+| [Localhost UI](#localhost-ui) | Browse tables, create contracts, build and download packages; UI on `4173`, owned registries on `18817` / `18818` | Repository devcontainer |
+| [Sample App](#sample-app) | Editable Rust/C++/C# application using the SDK and models packages | Successful contract release; Localhost Arrowcol to send events |
+| [Localhost Arrowcol](#localhost-arrowcol) | Regional collector on `18830`, optional node on `18832`, and Delta/Parquet output | Prepared contract run and its running catalogue |
+| [Localhost Kusto](#localhost-kusto) | Query Delta through the emulator on `18090`, optionally with Kusto Explorer | Prepared contract run and its Delta warehouse; committed events for nonempty results |
 
 For coding agents setting up this demo for someone else, follow the
 [agent execution checklist](#agent-execution-checklist) and return the actual
 reachable URLs and connection details, not just commands.
+
+Set up the components you need. Localhost UI includes contract/package builds.
+The Sample App can be compiled without collectors. To exercise the complete path,
+build the Sample App, start Localhost Arrowcol, run the app, then query its
+committed data with Localhost Kusto.
 
 Use the repository devcontainer for the complete demo. Rust, Node/Nx, protoc and
 Docker must be available there. C++ additionally requires CMake and protobuf C++
@@ -30,7 +34,11 @@ local contracts, history, releases and data. Do not run broad clean/reset target
 against a demo you need to keep. These services are unauthenticated local
 development services; never expose their ports to the public internet.
 
-## 1. Start the catalogue
+## Localhost UI
+
+Starts the browser UI and two persistent catalogue services. It supports table
+creation and package builds without running the Sample App, Arrowcol collectors
+or Kusto.
 
 In the devcontainer terminal:
 
@@ -38,18 +46,20 @@ In the devcontainer terminal:
 npx --no-install nx run arrowcol-sdk-gen:catalog-ui
 ```
 
-Keep it running and forward port `4173` in your editor. `/`, `/fabric` and
-`/lakehouse` remain separate frontends. Select a registry, browse its tables, or
+Keep it running and forward port `4173` in your editor. Open `/lakehouse` for
+the table explorer, `/fabric` for the catalogue grid, or `/` for the basic explorer.
+Select a registry, browse its tables, or
 use **Create and build**. Click a workflow run for its pipeline, logs, pinned
 version and downloadable archives. Expand **Individual contract and SDK packages**
 for the neutral contract and each language's models/SDK. Every package has a
-digest and host-visible path. The complete developer bundle remains available.
+digest and host-visible path. **Download SDK + contract** contains the complete
+developer bundle.
 
 The default hosted choice is a second local service, not a cloud deployment.
 For actual local Unity/Hive metadata services, follow
 [native catalogue setup](catalog.md#optional-local-unity-catalog-and-hive-services).
 After enabling builds and restarting the idle UI, select those authorities from
-the same dropdown. Their initial contract scope is flat, unpartitioned v1 tables
+the same dropdown. They support creating flat, unpartitioned v1 tables
 and exact rebuilds; this does not adopt arbitrary foreign tables.
 
 The screenshots below are real local captures using **Hosted simulation**, the
@@ -58,7 +68,13 @@ They use an isolated qualification namespace; the commands below use `demo.publi
 
 ![Local lakehouse explorer showing the committed three-column events schema](images/localhost-catalogue.png)
 
-## 2. Build the editable sample's contract packages
+## Sample App
+
+Build an editable Rust, C++ or C# emitter against a successful contract release.
+Compiling the app does not send events. Running it requires
+[Localhost Arrowcol](#localhost-arrowcol).
+
+### Build the contract
 
 In a second devcontainer terminal:
 
@@ -68,12 +84,12 @@ npx --no-install nx run arrowcol-protoc:build-contract --registry=local --defini
 
 This creates `demo.public.events`: required `event_id`, required `observed_at`
 (UTC microseconds), and nullable `payload`. Copy the successful run's `id`.
-The workflow checks canonical artifacts, Rust models and legacy Rust/TypeScript
-builders before registration. C++/C# compilation and full ingestion are verified
-by the demo, not claimed by the workflow's build-only success.
-It does not silently overwrite an existing table.
+The workflow checks canonical artifacts, Rust models and Rust/TypeScript Arrow
+builders before registration. Build the C++/C# sample applications to check those
+toolchains, and run the emitters to verify ingestion. CREATE fails if the table
+already exists.
 
-For an existing, intentionally reused sample contract, rebuild instead:
+If the sample table already exists with the expected schema, rebuild its pinned version:
 
 ```bash
 npx --no-install nx run arrowcol-protoc:build-contract --registry=local --table=demo.public.events --schema-version=1
@@ -83,8 +99,8 @@ Do not use the fixture generator as a substitute for this committed build.
 Changing values in the sample app needs no schema rebuild. Changing the schema
 does: use a new contract rather than assuming this CREATE-only demo performs ALTER.
 
-Open the successful run to inspect its stages and download packages. This capture
-shows a pinned-version rebuild: registration is correctly skipped, not replayed.
+Open the successful run to inspect its stages and download packages. A
+pinned-version rebuild skips registration:
 
 ![Successful pinned-contract rebuild showing independent package digests](images/localhost-workflow.png)
 
@@ -93,31 +109,24 @@ dependency for your language:
 
 ![Seven independent contract, models and SDK downloads with hashes and host paths](images/localhost-packages.png)
 
-## 3. Prepare and start collectors
+### Prepare and build
 
 Replace `RUN_UUID` with the successful run ID:
 
 ```bash
 export RUN=RUN_UUID
 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=prepare --run-id="$RUN"
-npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=serve --run-id="$RUN" --node
+npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=build --run-id="$RUN" --language=rust
 ```
 
-Leave `serve` running. Omit `--node` for regional-only ingestion. Both collectors
-resolve the selected authority themselves; SDK clients never receive a registry
-endpoint. Configurations, logs, separately extracted SDK/models packages and sample projects are under
+Use `--language=cpp` or `--language=csharp` to build either of those applications.
+The extracted SDK/models packages and sample projects are under
 `.temp/contract-builder/demos/RUN_UUID/`.
 
-The on-node exporter uses explicit `registration: shared_catalog`: it does not
-replay CREATE/ALTER into the regional collector. Existing independent-catalogue
-forwarding retains its default DDL-replay behavior. This minimal topology is
-best-effort admission; it does not enable Quiver crash-durable buffering or claim
-exactly-once delivery. SDK batching is enabled; the node forwards admitted batches
-without promising an additional timed aggregation stage.
+### Run the app
 
-## 4. Emit data for five minutes
-
-In another terminal:
+Start [Localhost Arrowcol](#localhost-arrowcol) with the same run ID, then run
+the app in another terminal. It emits for five minutes by default:
 
 ```bash
 export RUN=RUN_UUID
@@ -141,17 +150,24 @@ Use `--action=build --language=cpp` (or `rust`/`csharp`) to compile without send
 Samples use deterministic synthetic timestamps and values for exact comparison;
 edit the event construction to use your own values or current timestamps.
 
-When running a compiled sample directly, pass `--endpoint` / `ARROWCOL_ENDPOINT`
-and `--contract` / `ARROWCOL_CONTRACT`. The contract path is the corresponding
-`sdk/models/<language>/contract` directory under the prepared demo. There is no
-hardcoded IP fallback. The wrapper supplies both values from the active run,
-overriding the environment. See
-[connection configuration and DNS](sdk-developer-guide.md#configure-the-collector-connection)
-and the complete Cargo, CMake and .NET project-reference examples in that guide.
-Ordinary protobuf types stay `Events`. The new API is `ArrowcolStream<Events>`
-bound to a loaded `ArrowcolContract`; no event-specific SDK/native build is needed.
-Applications reference the language SDK and models package independently.
-Legacy generated adapters remain in the complete developer archive only.
+The wrapper supplies both configuration values as command-line arguments; you
+do not need to set environment variables for `--action=emit`. When running a
+compiled sample directly, supply them yourself:
+
+| Argument (takes precedence) | Environment alternative | Value |
+| --- | --- | --- |
+| `--endpoint` | `ARROWCOL_ENDPOINT` | Collector Flight/gRPC URI, such as `http://127.0.0.1:18830`; not the UI URL or registry endpoint |
+| `--contract` | `ARROWCOL_CONTRACT` | Local directory `.temp/contract-builder/demos/RUN_UUID/sdk/models/<language>/contract/`, containing the manifest, Arrow schema and protobuf descriptors; not an archive or `.proto` filename |
+
+These environment-variable names belong to the sample apps, not the SDK.
+The apps load an `ArrowcolContract` from the directory and pass that object
+plus the endpoint to `ArrowcolStream<Events>.connect` (or its C++/C# equivalent).
+Stream creation opens its own transport connection; no separate connection
+object is required. There is no hardcoded IP fallback.
+The wrapper overrides environment configuration with the active local run.
+For a collector on another VM, run the app directly using the
+[same-VM and remote-VM configuration examples](sdk-developer-guide.md#configure-the-collector-connection).
+That guide also contains complete Cargo, CMake and .NET project references.
 
 Run the app directly if you need its own Ctrl+C handler to flush before exit;
 the wrapper is primarily a bounded-duration runner. Killing a process does not
@@ -160,28 +176,61 @@ See the [SDK developer guide](sdk-developer-guide.md) for the minimal APIs.
 
 ### Windows Command Prompt
 
-These are **CMD**, not PowerShell, commands. They invoke the existing Linux
-devcontainer through WSL; they do not claim a native Windows collector build.
-Replace the distribution/container names if yours differ. Run `serve` in a
-separate CMD window, and keep the catalogue terminal open:
+Run these commands in **Windows CMD**. They execute the Linux demo inside
+the repository devcontainer through WSL.
+Replace the distribution/container names if yours differ. Prepare and compile:
 
 ```bat
 set RUN=RUN_UUID
 wsl -d Ubuntu-24.04 -u root -- docker exec -u vscode -w /workspaces/rust-playground rust-playground_devcontainer-workspace-1 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=prepare --run-id=%RUN%
-wsl -d Ubuntu-24.04 -u root -- docker exec -u vscode -w /workspaces/rust-playground rust-playground_devcontainer-workspace-1 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=serve --run-id=%RUN% --node
+wsl -d Ubuntu-24.04 -u root -- docker exec -u vscode -w /workspaces/rust-playground rust-playground_devcontainer-workspace-1 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=build --run-id=%RUN% --language=rust
 ```
 
-In another CMD window:
+After starting [Localhost Arrowcol](#localhost-arrowcol), emit from another CMD window:
 
 ```bat
 set RUN=RUN_UUID
-wsl -d Ubuntu-24.04 -u root -- docker exec -u vscode -w /workspaces/rust-playground rust-playground_devcontainer-workspace-1 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=emit --run-id=%RUN% --language=rust --node
+wsl -d Ubuntu-24.04 -u root -- docker exec -u vscode -w /workspaces/rust-playground rust-playground_devcontainer-workspace-1 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=emit --run-id=%RUN% --language=rust
 ```
 
 The same wrapper accepts `--language=cpp` or `--language=csharp`. Source edits in
 the Windows checkout are visible through its devcontainer bind mount.
 
-## 5. Inspect committed Delta and optional Kusto
+## Localhost Arrowcol
+
+Requires a successful contract run that has completed
+[prepare](#prepare-and-build), with its selected catalogue still running.
+The regional collector admits SDK batches and writes Delta/Parquet. Starting
+collectors does not start the Sample App or Kusto.
+
+### Start collectors
+
+In the devcontainer terminal:
+
+```bash
+export RUN=RUN_UUID
+npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=serve --run-id="$RUN"
+```
+
+Add `--node` to start the optional node-to-regional hop. Leave `serve` running
+and keep the catalogue service available. Both collectors resolve the selected
+authority themselves; SDK clients receive a collector endpoint.
+Configurations, logs and `endpoints.json` are under
+`.temp/contract-builder/demos/RUN_UUID/`.
+
+In **Windows CMD**, start the same supervisor in a separate window:
+
+```bat
+set RUN=RUN_UUID
+wsl -d Ubuntu-24.04 -u root -- docker exec -u vscode -w /workspaces/rust-playground rust-playground_devcontainer-workspace-1 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=serve --run-id=%RUN%
+```
+
+The on-node exporter uses `registration: shared_catalog`: both collectors use
+the same authority, without forwarding CREATE/ALTER. The SDK batches events and
+the node forwards admitted batches. This demo uses best-effort admission without
+Quiver crash-durable buffering or exactly-once delivery.
+
+### Inspect committed Delta
 
 After an emitter completes, allow the regional Delta export to commit:
 
@@ -194,11 +243,20 @@ file in the directory. It records `committed-files.json` and `committed-rows.jso
 Inspecting immediately after admission may show fewer rows; admission is not a
 sink-visibility barrier. Repeated emit runs append data and can repeat sample IDs.
 
+## Localhost Kusto
+
+Requires a prepared contract run and its Delta warehouse. Kusto reads committed
+data without requiring the Sample App or collectors to stay running. Use the
+same run ID that produced the data you want to query.
+
+### Start and query the emulator
+
 **`kusto-up` starts a local 6 GiB emulator with `ACCEPT_EULA=Y`; run it only if you
 accept the emulator license.** It mounts the selected warehouse read-only and
 retains a named Kusto data volume:
 
 ```bash
+export RUN=RUN_UUID
 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=kusto-up --run-id="$RUN"
 npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=kusto-query --run-id="$RUN"
 ```
@@ -253,7 +311,9 @@ If Docker runs inside WSL, verify the host-published address from Windows before
 handing it to the user. Configure a loopback-only forward if needed; a URL that
 works only inside a container is not a verified host URL.
 
-The optional Kusto Explorer is not required for ingestion. Follow the
+### Browser workbench
+
+For the optional Kusto Explorer, follow the
 [Kusto Explorer README](../../../projects/kusto-explorer/README.md#standalone-container);
 attach it to the emulator's Docker network and configure the printed internal
 endpoint, with default database `NetDefaultDB`.
@@ -270,72 +330,91 @@ These are instructions for an agent asked to run the localhost demo, not
 permission to deploy anything remotely. Reuse the repository tooling and the
 steps above; do not invent a separate collector, SDK generator or query proxy.
 
-Use the same source revision as this guide, not an older default-branch checkout.
-Preserve an existing dirty checkout and ask before switching it. Select the
-requested mode first; if it is unclear, ask before starting extra components:
+Use the source revision containing this guide. Inspect the checkout, devcontainer,
+active ports and existing run state. Preserve user edits, `.temp/contract-builder`,
+releases, registry identity and Docker volumes. Ask before switching a dirty
+checkout. Reuse healthy services; never kill an unrelated process to free a port.
+Do not commit, push or mutate a real hosted service without permission.
 
-| Requested mode | Scope and checklist steps |
-| --- | --- |
-| **UI only** | Steps 1-2, then 8-9: catalogue UI and its owned catalogue services. Browse existing metadata; do not create a sample table, generate an SDK, emit events or start collectors/Kusto. |
-| **UI + SDK** | Steps 1-4, then 8-9: also build the sample SDK and selected language's application. Do not start collectors or emit data. |
-| **Ingestion demo** | Steps 1-5, then 8-9: also run regional Arrowcol and the emitter, and inspect Delta. Add node only if requested; no Kusto. |
-| **Full demo** | Steps 1-9: UI, SDK, regional Arrowcol, emitter, Delta, local Kusto and Kusto Explorer. Confirm emulator EULA acceptance before starting Kusto; node remains optional. |
+Confirm which of the four components the user wants. Reuse their prerequisites;
+ask before starting additional services if the scope is unclear. Installing
+C++/.NET tooling is necessary only for the selected sample language.
+For an end-to-end demo, prepare the Sample App, start Localhost Arrowcol, emit
+events, then verify the committed data with Localhost Kusto.
 
-Run only the steps for that mode. Installing C++/.NET tooling is necessary only
-when the selected sample language needs it. Return the actual reachable UI URL
-even in UI-only mode; do not report an unstarted component as ready.
+### Localhost UI setup
 
-1. Inspect the checkout, devcontainer, active ports and existing run state.
-   Preserve user edits, `.temp/contract-builder`, releases, registry identity and
-   Docker data volumes. Reuse healthy services; never kill another process merely
-   because it owns a port. Use another supported port or ask when ownership is
-   unclear. Do not commit, push or mutate a real hosted service without permission.
-2. Check prerequisites inside the environment that will execute the commands.
-   Start or reuse `arrowcol-sdk-gen:catalog-ui` from step 1. Forward port `4173`
+1. Check prerequisites in the execution environment.
+   Start or reuse `arrowcol-sdk-gen:catalog-ui`. Forward port `4173`
    to the user's host using loopback-only access and verify `/lakehouse` from the
    host browser. Keep the process alive using the environment's persistent
    background/terminal facility; retain its process handle and logs.
-3. Use an owned local registry (the hosted simulator is also an owned local
-   service). Inspect for `demo.public.events` before CREATE. Build the sample
-   contract if absent; otherwise rebuild the exact existing version only after
-   confirming its three-column schema matches. Record the successful run ID,
-   registry, table ID, schema version, fingerprint and artifact path. Require a
-   new modular release with separate `models-*` and `sdk-*` packages; rebuild an
-   older pinned release rather than editing its immutable archive.
-4. Run `stream-demo --action=prepare --run-id=...`. Build the selected language
+2. Verify that Local catalogue and Hosted simulation are available. Table
+   creation and package builds are UI features; do not automatically create a
+   sample contract when only Localhost UI was requested.
+3. Return the verified host UI URL, even if the catalogue is empty.
+
+### Sample App setup
+
+1. Use a successful release from an owned local registry, including the hosted
+   simulator. If a contract build is needed, keep that registry running and
+   inspect for `demo.public.events` before CREATE. Build it if absent; otherwise
+   rebuild the pinned version after confirming its three-column schema matches.
+   Record the successful run ID,
+   registry, table ID, schema version, fingerprint and artifact path. Check for
+   separate `models-*` and `sdk-*` packages. If they are absent, rebuild the pinned
+   contract; never edit an immutable release archive.
+2. Run `stream-demo --action=prepare --run-id=...`. Build the selected language
    with `--action=build`; fix missing toolchains rather than changing the schema.
    The projects generated under `.temp` are not checked in. For a user's own
    application, follow the project references in the SDK developer guide.
-5. Start `stream-demo --action=serve --run-id=...`, adding `--node` only when that
-   hop is requested. Keep the supervisor alive and read its actual `endpoints.json`.
-   Run a short emitter smoke check, then the default five-minute loop unless the
-   user requested a shorter run. Record admitted counts and query committed Delta
-   rows using `--action=inspect`; do not equate admission with sink visibility.
-6. For full-demo mode or an explicit Kusto request, confirm emulator EULA
+3. If execution was requested, verify Localhost Arrowcol is ready for the same
+   contract run. Run a short smoke check, then the default five-minute loop
+   unless the user requested a shorter run. Record admitted counts and inspect
+   committed Delta rows; do not equate admission with sink visibility.
+   Building the Sample App alone does not authorize emitting events.
+
+### Localhost Arrowcol setup
+
+1. Verify the selected catalogue is running and the contract run is prepared.
+   Starting collectors does not require compiling or running an emitter.
+2. Start `stream-demo --action=serve --run-id=...`, adding `--node` only when that
+   hop is requested. Keep the supervisor alive and read its `endpoints.json`.
+   Return the regional/node endpoints and the host/container where they are reachable.
+3. Use `--action=inspect` to report committed Delta rows after an authorized
+   emitter run. Retain all data; do not send extra events merely to populate a view.
+
+### Localhost Kusto setup
+
+1. Verify the prepared run and its Delta warehouse. Confirm emulator EULA
    acceptance if not already given.
    Run `--action=kusto-up` and `--action=kusto-query`. Record both the internal URI
    and host URI from `kusto.json`; verify the host URI with a real query from the
    user's host. Check `NetDefaultDB` and `external_table("ArrowcolEvents")` contain
    the expected synthetic data, accounting for prior runs and repeated event IDs.
-7. For full-demo mode or an explicit browser-workbench request, start/reuse the repository's
+2. If a browser workbench was requested, start/reuse the repository's
    Kusto Explorer on the same Docker network as the emulator. Set
    `KUSTO_EXPLORER_CONNECTIONS=Arrowcol demo=<internal URI>` and
    `KUSTO_EXPLORER_DEFAULT_DATABASE=NetDefaultDB`; publish only to host loopback.
    Verify its health and run the external-table query in the UI before returning
    its browser URL. A raw Kusto cluster URI is not a browser workbench URL.
-8. Capture screenshots only from components in the selected mode, not an
-   authenticated Fabric/cloud workspace. UI-only may show an empty catalogue;
-   do not create data just for a screenshot. For broader modes, show the selected
-   schema, successful workflow/artifact and, if running, Kusto query results.
-   Never include credentials or fabricate successful results. Report blocked
-   components or unavailable screenshots plainly.
-9. Leave the user-requested UI, collectors and Kusto available after the handoff,
-   with their logs and exact stop instructions. Stop only temporary verification
-   helpers you own. If the environment cannot keep services running or cannot
-   forward a host port, state that limitation instead of claiming a working URL.
+3. Querying committed data does not require restarting collectors or emitters.
+   Report an empty result honestly if no events have been committed.
 
-The final handoff **must include** these fields for the selected mode. Mark
-out-of-scope components as **not started (outside requested mode)**:
+### Verification and handoff
+
+Capture screenshots from the requested local components: selected schema,
+workflow/packages and Kusto results where applicable. Do not create data solely
+for a screenshot, expose credentials, or capture an authenticated cloud workspace.
+Report blocked components or unavailable screenshots plainly.
+
+Leave user-requested services available after the handoff, with logs and exact
+stop instructions. Stop only temporary verification helpers you own. If the
+environment cannot keep a service running or forward its port, state that
+limitation instead of claiming a working URL.
+
+The final handoff **must include** the relevant fields below. Identify which
+components were started and which were not requested:
 
 | Return to the user | Required evidence/details |
 | --- | --- |
@@ -364,7 +443,7 @@ external_table("ArrowcolEvents")
 | Stop Kusto | `npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=kusto-stop --run-id="$RUN"` |
 | Port conflict | Use `serve --port-base=18930`; Kusto uses independent `--kusto-port=18091` |
 | Table already exists | Rebuild its pinned version; do not replay CREATE or delete the warehouse |
-| Missing generated stream adapter | Rebuild with the new generator; initial protobuf stream support is flat scalars |
+| Missing models or SDK packages | Confirm the schema uses flat scalar fields, then rebuild its pinned version |
 | Native compiler/toolchain missing | Install the missing CMake/protobuf C++ or .NET 8 SDK in the devcontainer |
 | `outcome_unknown` | Retain source records and reconcile committed data; do not blindly retry |
 | Stale `serve.lock` after a crash | Inspect its PID and logs before removing that exact lock; never kill unrelated processes |

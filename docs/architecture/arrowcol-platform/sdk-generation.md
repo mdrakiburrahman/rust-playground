@@ -29,11 +29,15 @@ restart, are never reused, and skip the protobuf-reserved range 19000-19999.
 | Flight descriptor, fingerprint and routing helpers | Configure transport and send through Dataflow |
 | `sdk-manifest.json` | Hashes of artifacts and generated files; package/version identity |
 
-For the new flat-scalar stream API, applications reference a language SDK and a
+For the flat-scalar stream API, applications reference a language SDK and a
 separate language models package. The neutral contract is independently available
-to non-Arrowcol consumers. C++/C# share one native library across schemas; legacy
-generated adapters remain only for compatibility. See the
+to non-Arrowcol consumers. C++/C# share one native library across schemas. See the
 [developer guide](sdk-developer-guide.md) for exact project references and limits.
+
+The complete developer bundle also contains table-specific helpers such as
+`ArrowcolEventsContract` and `ArrowcolEventsStream` in its `rust/`, `cpp/`,
+`csharp/` and `native/` trees. `sdk-manifest.json` identifies the package roots
+and capabilities.
 
 Generation cross-checks source, descriptor, Arrow schema and normalized manifest.
 Unsupported/lossy types, identifier collisions, stale output, symlinks and unsafe
@@ -56,7 +60,7 @@ cargo run --locked -p arrowcol-sdk-gen -- generate \
 statement. The command connects to the running catalog, executes Flight SQL,
 then validates the catalog's committed history and artifacts. `--version 1`
 selects a historical contract without changing it to the current head.
-`--artifacts` remains available for offline generation from validated exports.
+Use `--artifacts` for offline generation from validated exports.
 
 | Command | Expected result |
 | --- | --- |
@@ -83,13 +87,11 @@ artifact-based export, packaging and safety details.
 
 ## Registration-last contract workflow
 
-`arrowcol-sdk-gen:catalog-ui` is a local developer tool, not a hosted admin
-service. It uses an original catalogue tree/detail/run layout; the reference
-Databricks workspace required sign-in and was not inspected beyond its login page.
-The separate `/fabric` frontend shares only the workflow/API and form logic;
-the original `/` frontend remains available with its direct-generator default.
-`/fabric` defaults to the Arrowcol protoc builder and allows a compiler entry
-filename. Both use the same persistent authorities, runs and immutable releases.
+`arrowcol-sdk-gen:catalog-ui` is a local developer tool.
+Its `/`, `/fabric` and `/lakehouse` frontends share the workflow API, persistent
+authorities, runs and immutable releases. `/` defaults to direct generation;
+`/fabric` and `/lakehouse` default to the protoc builder and allow a compiler
+entry filename.
 The primary form accepts catalogue/schema/table names, ordered columns, supported
 types, nullability and table properties, then displays the generated DDL.
 It serializes input only; the Rust parser and central property registry validate it.
@@ -99,10 +101,10 @@ It serializes input only; the Rust parser and central property registry validate
 | Validate | Exactly one managed CREATE; reject ALTER, LOCATION, IF NOT EXISTS and invalid typed properties |
 | Prepare | Read-only `PrepareTable` freezes table/field IDs, v1, complete schema, exact properties, comment, partitions and the selected authority's managed location |
 | Export / validate protobuf (protoc only) | Export the compiler entry and options, then run descriptor-only `protoc` to resolve imports and validate protobuf; the plugin separately validates semantic IR/API binding |
-| Generate | Direct backend uses the existing Rust renderer; the opt-in protoc backend invokes `protoc-gen-arrowcol-sdk` and reuses that same renderer |
-| Verify | Canonical byte-exact check, Rust models compilation/tests and legacy Rust/TypeScript builder checks; C++/C# and ingestion qualification happen separately |
+| Generate | Direct backend and `protoc-gen-arrowcol-sdk` use the same Rust renderer |
+| Verify | Canonical byte-exact check, Rust models compilation/tests and Rust/TypeScript Arrow builder checks; C++/C# and ingestion qualification happen separately |
 | Stage | Neutral contract, independent language models/SDK source archives and complete developer bundle; individual digests in `packages.json`; not exposed before registration |
-| Promote | `PromoteTable` validates the entire candidate under the catalogue DDL lock and commits through the existing Delta optimistic transaction/reconciliation path |
+| Promote | `PromoteTable` validates the entire candidate under the catalogue DDL lock and commits through Delta optimistic transactions and reconciliation |
 | Publish | Read-back equality of the complete committed v1 contract; create-only content-addressed archives, independent downloads and host paths |
 
 Preparation is not a reservation and publishes no table/event. Conflicting
@@ -110,9 +112,8 @@ concurrent creation fails promotion; schema fingerprint equality alone is never
 enough. The full candidate includes IDs and backend properties even though the
 Arrow schema fingerprint deliberately does not hash mutable policy or DDL text.
 Exact-candidate promotion is idempotent, including after a lost response/restart.
-The service's existing deterministic identity rules are retained, not replaced
-with IDs invented by a temporary catalogue. Preparation refuses a managed location
-with pre-existing Delta history.
+The catalogue assigns deterministic identities during preparation.
+Preparation refuses a managed location with pre-existing Delta history.
 
 Rebuilding uses an explicit committed table/version and never submits CREATE,
 prepares a new candidate or promotes one. It generates and verifies against the
@@ -142,8 +143,8 @@ Stop the UI before editing configuration. An external endpoint must implement
 the candidate RPCs for new tables; no fallback to registration-first is allowed.
 Configure its actual stable authority identity, not an arbitrary new identity on
 every restart. Endpoint configuration is not cloud deployment. An external Arrowcol service can
-use a mounted `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE`; credential forwarding
-and real cloud mutation are outside this MVP.
+use a mounted `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE`. Configure credentials
+on the execution host; the UI does not forward credentials or provision services.
 The workflow refuses a registry change between queueing and execution/promotion.
 
 The UI binds to `127.0.0.1:4173` by default. `CONTRACT_UI_PORT` changes the port;
@@ -161,14 +162,11 @@ promotion remains valid after decode/re-encode, while modified values fail
 authentication. Read-only rebuilds call `GetTable` directly, never the DDL
 hydration path.
 
-### Separate Fabric-style prototype
+### Fabric-style frontends
 
-The authenticated OneLake reference was inspected read-only: suite bar, navigation
-rail, Explore tabs, workspace filtering, item grid and overview drawer. An
-accessible workspace/lakehouse/schema and a selected table were found; the
-lakehouse's table view returned "Unable to load table view". No query, data
-change, tenant data, account image or proprietary asset was copied into the demo.
-This is original prototype code, not a pixel-perfect or Microsoft-hosted product.
+`/fabric` provides a catalogue grid and table detail drawer. `/lakehouse` provides
+a nested catalogue/schema/table tree with an inline table pane. Both display
+local metadata; they are independent of Microsoft Fabric services.
 
 | Surface | Local behavior |
 | --- | --- |
@@ -181,11 +179,8 @@ This is original prototype code, not a pixel-perfect or Microsoft-hosted product
 | Favorites | Browser-local, scoped by catalogue connection |
 | Govern, Secure, Copilot | Explicitly disabled; no implied connection or enforcement |
 
-`/lakehouse` is a separate Explorer-focused version; `/fabric` and `/` remain
-available. It follows the reference's nested Lakehouse/Tables/schema/table tree
-and inline table pane rather than replacing the catalogue grid with a drawer.
 Schema, Properties and SDK contract tabs display committed local metadata.
-New table, Build packages and Workflow runs share the existing backend and compiler
+New table, Build packages and Workflow runs share the backend and compiler
 workflow. Catalogue selection includes Unity/Hive build authorities after
 [`enable-build`](catalog.md#optional-local-unity-catalog-and-hive-services);
 unconfigured native entries remain inspection-only. Native builds support new
@@ -196,26 +191,26 @@ are visual-only; OneLake catalog links to the working `/fabric` surface.
 The table overview links back into Explorer using explicit registry/table query
 parameters, which preserve the selected table on reload.
 
-`arrowcol-sdk-gen:catalog-ui-e2e:lakehouse` covers the new layout, metadata tabs,
+`arrowcol-sdk-gen:catalog-ui-e2e:lakehouse` covers metadata tabs,
 tree search/collapse, non-interactive surrounding navigation, responsive layout
 and the real protoc build/rebuild/download journey.
 
 `arrowcol-sdk-gen:catalog-ui-e2e:fabric` exercises actual form submission,
 protoc execution, registry isolation, reload/favorites, rebuild identity,
-download bytes and descriptor properties. The original
-`arrowcol-sdk-gen:catalog-ui-e2e` exercises the unchanged direct-default journey.
+download bytes and descriptor properties.
+`arrowcol-sdk-gen:catalog-ui-e2e` exercises the direct-default journey.
 
 ### Failure and recovery
 
 Runs persist queued/running/succeeded/failed state, phase, registration outcome,
 timestamps, logs and release references across page reloads and server restarts.
-Click a run title/card in either frontend to open its top-down live pipeline.
-New runs retain per-step start/end timestamps and failed/resumed attempts.
+Click a run title/card in any frontend to open its top-down live pipeline.
+Run traces record per-step start/end timestamps and failed/resumed attempts.
 The panel follows the active step, or lets you select a stage and inspect the
 submitted DDL, row/options/compiler proto, manifests, provenance or live log tail.
 The selected run survives reload through `#run=RUN_UUID`. Direct builds explicitly
-skip protoc-only stages; rebuilds skip registration. Older runs without a trace
-say **not recorded** rather than inventing stage completion or timings.
+skip protoc-only stages; rebuilds skip registration. Missing trace data is
+displayed as **not recorded**.
 Document inspection is read-only and allowlisted, rejects symlinks, and returns
 at most 128 KiB per document; it cannot read arbitrary workspace files or keys.
 Pre-promotion validation/generation/test failures leave the authoritative
@@ -237,8 +232,8 @@ with a corrected new request because they have not registered the table.
 
 The release records authority, endpoint, table ID, schema version/fingerprint,
 backend policy metadata and generator/workflow/dependency-lock digests.
-`backendPolicy` is descriptive: no retention scheduler, collector policy engine,
-header forwarding or schema evolution editor is added.
+`backendPolicy` records descriptive metadata. Runtime policy enforcement is the
+responsibility of the consuming service.
 
 ### Portable options and native defaults
 
@@ -286,26 +281,23 @@ protoc/Buf and compare descriptor bytes, including native defaults and overrides
 
 ## Optional protoc backend
 
-The website and `arrowcol-sdk-gen:build-contract` default to direct generation.
+The `/` frontend and `arrowcol-sdk-gen:build-contract` default to direct generation.
 `arrowcol-protoc:build-contract` explicitly selects `codegen=protoc`; it builds
 the exporter, plugin and normal catalogue bridge without restarting services.
 Both backends share validation, SDK tests, staging, promotion and publication.
 Use `--schema-version` for historical builds through Nx, whose own `--version`
-flag is not forwarded. Direct invocation of the TypeScript CLI also accepts the
-legacy `--version` spelling.
+flag is not forwarded.
 
 | Compiler input | Contract |
 | --- | --- |
 | `--proto-entry=telemetry.proto` | Configurable basename, default `schema.proto`; traversal and reserved import names are rejected |
 | `payload/compiler/` | Separate import root, bundled with the release; canonical `payload/contract/` is unchanged |
-| `options.proto` | Existing native defaults, selected values and portable table properties |
+| `options.proto` | Native defaults, selected values and portable table properties |
 | `arrowcol_codegen.proto` | Versioned compiler envelope and typed Arrowcol API binding |
-| `compiler.catalog_manifest_json` | Existing canonical `artifact_manifest_version=1` catalogue IR, embedded as bytes in a protobuf option |
+| `compiler.catalog_manifest_json` | Canonical `artifact_manifest_version=1` catalogue IR, embedded as bytes in a protobuf option |
 | `compiler.api` | Arrow Flight DoPut operation/path, descriptor path and resolved routing metadata |
 
-The initial adapter deliberately reuses the public versioned JSON catalogue IR
-rather than duplicating the full Arrow type model in a second protobuf schema.
-That IR is **inside the compiler descriptor**, not an ambient sidecar path.
+The compiler descriptor embeds the versioned JSON catalogue IR.
 It preserves nullability, IDs, physical types, decimals, timezones and collection
 details that cannot be recovered from protobuf row primitives alone. A consumer
 only needs the exported compiler sources/imports and compatible plugin binaries.
@@ -314,20 +306,20 @@ The plugin reconstructs the validated `ArtifactBundle` and compares its canonica
 row, property and dependency descriptors with the request, ignoring only source
 locations and the extra compiler envelope. Changes to rows, option defaults, IR
 or unsupported API mappings fail closed. Unknown plugin parameters, duplicate
-files and multiple selected table files are rejected in this first version.
-Custom-option bytes are retained rather than lost through `prost_types`.
-The existing renderer is reused; there is no second SDK implementation.
+files and multiple selected table files are rejected.
+Descriptor decoding preserves custom-option bytes. Both backends use the same
+SDK renderer.
 
 `CodeGeneratorResponse` returns UTF-8 sources. Nx copies the original binary
 `schema.arrow` and `descriptor.pb` into the SDK, then checks the entire SDK against
 direct generation byte-for-byte. The release includes the compiler sources and
 exporter/plugin/driver hashes plus the protoc version. Toolchain changes during
-generation fail before promotion. Old releases are not rewritten; the optional
-compiler inputs and provenance intentionally produce a different archive digest.
+generation fail before promotion. Compiler inputs and provenance are part of
+the release digest.
 
 ### Supported APIs and extension ownership
 
-| API | Existing surface |
+| API | Surface |
 | --- | --- |
 | Construct Arrow batches | Rust `record_batch`; TypeScript `recordBatch` |
 | Build routing metadata | Rust `routing_metadata`; TypeScript `routingMetadata` |
@@ -336,12 +328,11 @@ compiler inputs and provenance intentionally produce a different archive digest.
 | Catalogue control plane | `GetTable`, `GetSnapshot`, events/Watch, `PrepareTable` and `PromoteTable`; not data-plane write methods |
 
 The supported write binding is `/arrow.flight.protocol.FlightService/DoPut`.
-Its existing metadata keys are `x-arrowcol-protocol-version`,
+Its metadata keys are `x-arrowcol-protocol-version`,
 `x-arrowcol-implementation-pool`, `x-arrowcol-catalog`, `x-arrowcol-schema`,
 `x-arrowcol-table`, and `x-arrowcol-schema-fingerprint`. The implementation pool
-currently supports `dataflow`. The plugin rejects alternate bindings rather than
-generating an API that the current SDK does not implement. Gateway policy and
-tier headers remain proposals; portable ingest-tier metadata is not forwarded.
+supports `dataflow`. The plugin rejects unsupported bindings.
+Portable ingest-tier metadata is not forwarded as a transport header.
 
 Run a second trusted plugin against the same descriptors to generate wrappers
 around the SDK. It does not need to implement Arrowcol request construction.
@@ -366,31 +357,28 @@ file-set check. The live `arrowcol-protoc:e2e` target typechecks and executes th
 wrapper separately from the immutable base release.
 
 Plugin binaries are executable build tools, not untrusted UI parameters.
-This prototype uses fixed repository-owned paths. Configuring arbitrary external
-option-definition files or additional production plugins is not yet supported;
-definitions remain compiled and digest-pinned as in the direct backend.
+Nx uses fixed repository-owned plugin paths and compiled, digest-pinned option
+definitions. It does not accept arbitrary plugin executables or option files.
 
 ## Design: schema authoring to a protoc-built SDK
 
-This design separates authoring, build-time contract validation, registration
-and runtime ingestion. The current implementation is a local demonstration,
-not a deployed Fabric feature. The original catalogue frontend stays available;
-the separate Fabric-style frontend submits the same structured requests without
-owning schema semantics or executing arbitrary commands.
+The workflow separates authoring, build-time contract validation, registration
+and runtime ingestion. UI frontends submit structured requests; the catalogue
+and compiler own schema validation.
 
 ### End-to-end compilation
 
 ```mermaid
 flowchart TD
     author["📝 UI / CLI<br/>Columns, nullability, properties<br/>Validate inputs and preview DDL"]
-    subgraph schemaRepo["Schema repository / contract build boundary"]
+    subgraph schemaRepo["Contract build"]
         ddl["📄 Spark SQL DDL<br/>CREATE TABLE + TBLPROPERTIES"]
         nx["⚙️ Nx build-contract<br/>Selected registry + protoc backend"]
         prepare["🔒 Rust validation + PrepareTable<br/>Freeze exact candidate; no registration"]
         contract["📦 Canonical contract<br/>Manifest + Arrow schema + proto descriptors"]
         proto["📜 Compiler entry .proto<br/>Row schema + options.proto + compiler IR/API options"]
         compiler["🛠️ protoc<br/>CodeGeneratorRequest → protoc-gen-arrowcol-sdk"]
-        sdk["🧩 Rust + TypeScript SDK<br/>Arrow builders + Flight DoPut helpers"]
+        sdk["🧩 Models + language SDK sources<br/>Rust/C++/C# streams and Rust/TS Arrow builders"]
         verify["✅ Compile, test and compare<br/>Stage deterministic SDK archive"]
         promote["📚 Promote exact candidate<br/>Commit and read back registered schema"]
         release["🔗 Publish immutable release<br/>Download + host path + SHA-256"]
@@ -399,11 +387,9 @@ flowchart TD
     author --> ddl
 ```
 
-The boundary is the intended schema-repository ownership model. Today the UI
-persists DDL as `runs/<run-id>/definition.sql` in the local build store; it does
-**not** create a version-controlled schema file or commit to a separate schema
-repository. CLI callers can supply an existing `.sql` file. Introducing a
-reviewed schema-repository submission flow is a separate integration.
+The UI persists authored DDL as `runs/<run-id>/definition.sql` in the local build
+store. CLI callers supply a `.sql` file. Version-control those definitions through
+your repository workflow; contract builds do not commit source files.
 
 | Step | Input and implementation | Output and invariant |
 | --- | --- | --- |
@@ -411,12 +397,12 @@ reviewed schema-repository submission flow is a separate integration.
 | Admit build | Local backend enqueues a structured request; `contract.ts` executes the Nx workflow | Durable run ID, selected authority and explicit backend; no arbitrary-shell endpoint |
 | Validate | `arrowcol-sdk-gen catalog validate` invokes Rust parsing/property validation | Exactly one supported managed CREATE; invalid or stale definitions fail before preparation |
 | Freeze | Catalogue `PrepareTable` returns a candidate; no table, event or Delta log is created | Table UUID, v1, stable field/protobuf IDs, Arrow types/nullability, location and complete properties |
-| Export canonical artifacts | Existing catalogue artifact code derives manifest, Arrow IPC schema, row proto and descriptors | Lossless canonical model and complete imports; schema fingerprint excludes mutable policy and DDL spelling |
+| Export canonical artifacts | Catalogue artifact code derives manifest, Arrow IPC schema, row proto and descriptors | Lossless canonical model and complete imports; schema fingerprint excludes mutable policy and DDL spelling |
 | Export compiler input | `arrowcol-protoc --artifacts … --out … --entry telemetry.proto` | Separate compiler sources containing native property options plus the versioned compiler envelope |
 | Invoke compiler | `protoc --arrowcol-sdk_out=…` resolves the explicitly pinned `protoc-gen-arrowcol-sdk` executable | Standard protobuf compiler request on stdin and response on stdout; no catalogue/network lookup inside the plugin |
 | Interpret contract | Plugin reads extension-preserving descriptors, restores `ArtifactBundle` and compares row/options/dependencies/API binding | Changed or unsupported inputs fail; no silent inference of Arrow semantics from protobuf primitives |
-| Render SDK | Plugin calls shared `render_sdk_files` | Rust/TS sources identical to the direct renderer; binary Arrow/descriptor files are copied separately by Nx |
-| Verify and stage | Existing canonical checker, TypeScript checks/tests, generated Rust tests and deterministic packager | Archive digest and pinned toolchain provenance; SDK failure leaves the registry unchanged |
+| Render SDK | Plugin calls shared `render_sdk_files` | Models and SDK sources identical to the direct renderer; binary Arrow/descriptor files are copied separately by Nx |
+| Verify and stage | Canonical checker, TypeScript checks/tests, Rust models/builder tests and deterministic packager | Independent package digests and pinned toolchain provenance; SDK failure leaves the registry unchanged |
 | Register and publish | `PromoteTable` checks the exact candidate, commits and verifies read-back; Nx publishes create-only | Immutable release tied to authority, table ID, schema version/fingerprint and release SHA-256 |
 
 ### What the compiler options actually mean
@@ -429,18 +415,17 @@ Its `CompilerContract` contains:
 | Field | Role |
 | --- | --- |
 | `format_version` | Version of the compiler-envelope protocol |
-| `catalog_manifest_json` | Existing canonical, lossless versioned IR embedded inside the protobuf descriptor |
+| `catalog_manifest_json` | Canonical, lossless versioned IR embedded inside the protobuf descriptor |
 | `option_definitions_sha256` | Pins the complete compiled property vocabulary |
 | `api.operation` / `api.grpc_path` | Supported operation and `/arrow.flight.protocol.FlightService/DoPut` |
 | `api.descriptor_path` | Catalog, schema, table and `v<version>` |
-| `api.metadata` | Resolved existing protocol, implementation-pool, namespace and fingerprint headers |
+| `api.metadata` | Resolved protocol, implementation-pool, namespace and fingerprint headers |
 
-Embedding JSON IR is a deliberate prototype compatibility choice, not a fully
-protobuf-native Arrow IR. Row `.proto` primitives alone cannot faithfully encode
+The embedded IR preserves details that row `.proto` primitives cannot encode:
 Arrow nullability, decimal representation, timezones and stable identity.
 The plugin checks the binding against the supported SDK implementation rather
 than treating arbitrary strings as instructions to call arbitrary services.
-Properties such as ingest tier remain metadata unless an implemented runtime
+Properties such as ingest tier are metadata unless a runtime
 binding consumes them; gateway-policy/tier enforcement is not implied.
 
 ### Extension and runtime boundaries
@@ -488,10 +473,9 @@ admission. Callers do not pass a catalogue service/connection as an SDK argument
 or per-ingestion request setting. The logical catalogue name in the table identity
 and routing metadata is a namespace, not a registry URL or connection configuration.
 
-The current local and hosted-simulation choices are two independent Rust
-catalogues. Supporting native Unity Catalog REST and Hive Metastore Thrift
-requires workflow adapters rather than passing their URLs to an Arrowcol
-`SchemaCatalog` client. For new tables the authored schema is a proposal until
+Local and hosted simulation are two independent Rust catalogues. Native Unity
+Catalog and Hive use workflow adapters for REST and Thrift, respectively, and
+a CES bridge for Arrowcol schema lookup. For new tables the authored schema is a proposal until
 registration; adapters must preserve read-only preparation, retained canonical
 contract history and exact-candidate registration checks. External native identity
 belongs in a post-registration receipt, not a rewrite of the verified SDK. See the
@@ -507,20 +491,17 @@ optional namespaced documentation and downstream options, just as DDL
 them prerequisites for representing an ordinary table.
 
 Protobuf field numbers are stable message-field identifiers, not column-order
-instructions. Under the existing strict nullable-tail-append policy, the compiler
+instructions. Under the strict nullable-tail-append policy, the compiler
 can derive them deterministically from the original sibling ordinal, skipping
 protobuf's reserved range. Once published, the previous descriptor is the
 compatibility baseline: numbers cannot be reused or reassigned. Native reorder,
 drop, rename or type changes must fail compatibility checks, rather than silently
 generating a different mapping.
 
-SDK package SemVer belongs to the release. A compatible nullable-tail addition
-can produce a minor release, while its normalized Arrow schema gets a new
+SDK package versions are declared in their language project manifests.
+Models packages use `<schema-version>.0.0`; their contract records the schema
 fingerprint. DDL spelling is not identity. Immutable schema/descriptor snapshots
-and native registration receipts belong with retained release artifacts; the
-catalogue need not carry a user-managed version counter or mandatory pointer.
-Automatic SDK SemVer assignment is a design direction, not implemented behavior:
-generated packages currently retain their existing package version.
+and native registration receipts are stored with release artifacts.
 
 The current collector also uses internal schema versions in Flight descriptor
 paths (`vN`). An adapter must resolve those published contracts or change runtime
@@ -550,10 +531,9 @@ history after restart. A runtime extension of that demonstration additionally
 requires sending known rows through the selected collector topology and reading
 them from the configured sink, with admission distinguished from durable delivery.
 
-### Current collector integration
+### Collector integration
 
-Upstream `main` through `3630d3e4` was merged locally, including the matching
-`otel-arrow` submodule revision. The current collector supports a remote
+The collector supports a remote
 catalogue/cache, standalone or SQL routing, Arrow Flight admission, Delta export
 and optional Quiver durable admission. Production ingestion-layout metadata
 remains separate from the SDK's logical schema.
@@ -567,15 +547,14 @@ The SDK sender receives only the Arrowcol endpoint, not a catalogue argument.
 The proof keeps its rows/evidence and refuses a nonempty or external table.
 It shuts down only its own collector and does not replay CREATE.
 
-That original three-row proof qualifies **SDK -> endpoint Arrowcol -> Delta**;
-it does not by itself establish the two-hop chain or Kusto visibility.
-The [localhost demo](localhost-demo.md) adds an optional on-node forwarder using
-explicit `registration: shared_catalog`, plus a local native Delta external
-table in Kusto. The exporter never sends DDL in shared-authority mode; the legacy
-DDL-replay mode remains the default for independent catalogues.
+The three-row test covers **SDK -> regional Arrowcol -> Delta**.
+The [localhost demo](localhost-demo.md) uses `registration: shared_catalog` for
+optional node-to-regional forwarding and queries committed Delta data through
+a Kusto external table. Its end-to-end test checks Rust/C++/C# applications on
+both direct and node paths. The exporter does not send DDL in shared-authority mode.
 
 Unity/Hive builds and runtime lookups use the enabled native CES bridge, which
 validates native identity and metadata. Their REST/Thrift endpoints still cannot
 be substituted directly for an Arrowcol `SchemaCatalog` RPC endpoint.
-The [developer guide](sdk-developer-guide.md) describes the protobuf models,
-generated contract adapters and shared stream runtime used by the new samples.
+The [developer guide](sdk-developer-guide.md) covers protobuf models, language
+SDK dependencies and the stream API.

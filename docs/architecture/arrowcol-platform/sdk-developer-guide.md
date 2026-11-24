@@ -12,28 +12,23 @@ contract, runs editable Rust/C++/C# emitters, and inspects actual Delta/Kusto ou
 | Standalone neutral contract | `.proto`, option definitions/imports, descriptors, Arrow schema and manifest | Same contract release; usable without Arrowcol |
 
 An application references **its language SDK and its language models package**.
-The neutral bundle is also independently downloadable; it is not a third required
-dependency for Arrowcol applications. Models depend on protobuf, not the Arrowcol
-SDK, so non-Arrowcol applications can reuse them. Rust models include protobuf
-reflection metadata. C++ and C# use one schema-independent native Rust library;
-adding a schema does not require recompiling or releasing that SDK library.
+The models package embeds the neutral contract and depends only on protobuf,
+so it also works in applications that do not use Arrowcol. Rust models include
+protobuf reflection metadata. C++ and C# share a schema-independent native Rust
+library. The neutral bundle is available as a separate download for other tools.
 
-The current distributions are immutable **source archives with Cargo, .NET and
-CMake project manifests**, not packages uploaded to public feeds or universal
-precompiled binaries. Use local project/path references below. Build native SDK
+Distributions are immutable **source archives with Cargo, .NET and CMake project
+manifests**. Use the local project/path references below and build native SDK
 binaries for the application's OS/architecture. Identical SDK source produces
 identical SDK package digests across contracts; contract/model digests change
 independently. `packages.json` records the standalone neutral bundle digest.
 
-Protobuf is the application model/schema contract. The wire is Arrow Flight;
-the shared runtime builds exact Arrow batches internally. Applications do not implement
-interfaces on their events or manually map fields to Arrow arrays.
+Applications construct protobuf events; the SDK validates them, builds Arrow
+batches and sends them over Arrow Flight.
 
-Ordinary protobuf classes stay `Events` or `Demo`. The new APIs use
-`ArrowcolContract` and `ArrowcolStream<Events>` / `ArrowcolStream<Demo>`, not a new
-Arrowcol helper class for every event. One stream binds one model and one pinned
-contract; it does not accept arbitrary unrelated objects. Existing immutable
-archives and the legacy generated helpers remain available for compatibility.
+Use `ArrowcolContract` with `ArrowcolStream<Events>` or `ArrowcolStream<Demo>`.
+`Events` and `Demo` are ordinary protobuf classes. Each stream accepts one model
+type and binds to one pinned contract.
 
 ## Build and consume contract packages
 
@@ -58,24 +53,64 @@ extract the complete developer archive, retaining its `sdk/` tree:
 | `runtime/arrowcol-sdk-ffi/` | Shared native SDK, independent of event types |
 | `STREAMS.md`, `sdk-manifest.json` | Complete developer bundle's integration/capability metadata |
 
-The original Rust Arrow row/builders and TypeScript APIs remain available.
-The new protobuf-backed stream API initially supports **flat scalar fields**.
-Nested/collection schemas still generate their previous APIs and a neutral bundle, with an explicit
-stream capability note; no lossy repeated-field/null-container mapping is hidden.
+The protobuf-backed stream API supports **flat scalar fields**.
+For nested or collection schemas, use the generated Rust or TypeScript Arrow
+builders. Those schemas include a neutral bundle and a stream capability note.
 
 ## Minimal application APIs
 
+### Stream, connection and contract
+
+| Input or object | Meaning |
+| --- | --- |
+| `ArrowcolContract` | The pinned table identity, schema version, fingerprint and schema artifacts used to validate and route events |
+| Contract path passed to `load` / `Load` | A local **directory** from the extracted models package, such as `sdk/models/rust/contract/`; not a registry URL, archive or single `.proto` file |
+| Endpoint passed to `connect` / `ConnectAsync` / `Connect` | The collector's **Arrow Flight/gRPC service URI**, such as `http://127.0.0.1:18830`; not the catalogue UI or a website |
+| `ArrowcolStream<Events>` | A producer for one model type and pinned contract, with buffering and an internally owned transport connection |
+
+A connection and a stream are different concepts: the connection reaches a
+collector, while the stream identifies what table/schema its events belong to.
+**The current SDK combines their creation in `ArrowcolStream.connect(...)`.**
+It checks the compiled model against the contract and opens an internal gRPC
+channel. There is no separate public `ArrowcolConnection` to create first or
+share between streams. Create another stream for another contract or independent
+producer. `push`/`PushAsync` accepts events of that stream's model; it does not
+take a new contract or endpoint on each call.
+
+The contract directory must contain these files together:
+
+| File | Runtime use |
+| --- | --- |
+| `manifest.json` | Table identity, pinned schema version, fingerprint and field mappings |
+| `schema.arrow` | Serialized Arrow schema |
+| `descriptor.pb` | Compiled protobuf descriptors and contract annotations |
+
+The bundle also includes `.proto` sources for tooling, but a `.proto` alone is
+not the runtime contract. Deploy the matching `contract/` directory alongside
+the application or mount it read-only. Loading it does not fetch anything from
+the registry. Use an absolute path where possible: relative paths resolve from
+the application's **working directory**, not its executable or models assembly.
+Inside a container, use the path visible inside that container.
+
+The SDK takes the endpoint string and loaded contract object as arguments.
+`ARROWCOL_ENDPOINT` and `ARROWCOL_CONTRACT` are configuration names chosen by
+these examples, not SDK-defined globals or automatically populated settings.
+The application reads them, then passes their values to the SDK. You can instead
+read your own configuration file or deployment settings.
+
+### Application layout
+
 In each language below, keep the extracted `sdk/` tree beside your `app/`
 directory. A source-level `use`, `using` or `#include` does not replace the
-Cargo, .NET or CMake dependency declaration. These examples read
-`ARROWCOL_ENDPOINT` from application configuration; see
+Cargo, .NET or CMake dependency declaration. Set both
+`ARROWCOL_ENDPOINT` and `ARROWCOL_CONTRACT` before running these examples; see
 [endpoint configuration](#configure-the-collector-connection) before running.
 
 ### Rust
 
 Create `app/Cargo.toml` with the following content. Replace
 `GENERATED_MODELS_PACKAGE` with `name` from `sdk/models/rust/package.json`;
-do not guess a version/fingerprint. `models` is the application's local import name:
+`models` is the application's local import name:
 
 ```toml
 [package]
@@ -122,8 +157,7 @@ From the directory containing `app/` and `sdk/`, run
 `cargo run --manifest-path app/Cargo.toml`.
 `push_batch(&events)` queues several protobuf events at once. The sample app's
 complete `main` and error handling are in `examples/arrowcol-stream/rust/main.rs`.
-You can copy that loop into `app/src/main.rs` instead. Its generic parameter is the
-ordinary protobuf event, not an Arrowcol-generated adapter.
+You can copy that loop into `app/src/main.rs` instead.
 
 ### C# (.NET)
 
@@ -137,8 +171,8 @@ demo/
     Program.cs
 ```
 
-Add this project reference in `app/Emitter.csproj` (or add the `ProjectReference`
-to your existing project, adjusting its relative path):
+Add these project references in `app/Emitter.csproj`, adjusting their relative
+paths if your directory layout differs:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -154,11 +188,9 @@ to your existing project, adjusting its relative path):
 </Project>
 ```
 
-These reference two assemblies: ordinary `Events` models and the reusable SDK.
+These reference two assemblies: `Events` models and the Arrowcol SDK.
 Building the application invokes Grpc.Tools to generate and compile the protobuf
-classes in the models project; no
-manual copy of `Events.cs` or precompiled managed DLL is needed. A C# `using`
-directive alone does **not** add an assembly reference.
+classes in the models project.
 
 From `demo/`, build the native library first:
 
@@ -209,8 +241,7 @@ containing `global using Events = global::Arrowcol.Demo.Public.Events;` under
 `.temp/contract-builder/demos/<run-id>/apps/csharp/`. Those project files are
 local, Git-ignored outputs, not checked-in examples. When copying the loop into
 your own project, add `using Arrowcol.Demo.Public;` to `Program.cs` as above, or
-put the event alias in `Schema.cs`. Aliases only shorten names; they do not
-generate a new event class.
+put the event alias in `Schema.cs`.
 
 ### C++
 
@@ -236,13 +267,9 @@ endif()
 ```
 
 The contract-specific CMake target supplies protobuf models; `arrowcol_sdk` supplies the
-generic header and native SDK. CMake invokes ordinary protoc for the model;
-`#include` directives alone are not enough to compile/link an application.
-For C++ reserved package components such as SQL schema `public`, the bundled
-`models/cpp/model/contract_<table-id>.proto` escapes the language namespace to `public_`. Field
-numbers, types and encoded event bytes are unchanged; canonical descriptors and
-the registry identity remain untouched. This avoids protoc 3.x generating an
-invalid C++ namespace.
+generic header and native SDK. CMake invokes protoc to compile the model.
+Reserved C++ namespace components are escaped: SQL schema `public` becomes
+`public_`. Use the fully qualified model name from `models/cpp/package.json`.
 
 Use this `app/main.cpp`, or copy the editable loop from
 `examples/arrowcol-stream/cpp/main.cpp`:
@@ -279,7 +306,7 @@ int main() {
 }
 ```
 
-`Events` is an alias for the ordinary protoc class, not an Arrowcol-prefixed type.
+`Events` is an alias for the protobuf class.
 The loop sample uses a `Schema.hpp` alias generated by `stream-demo prepare`;
 when copying that loop, provide this alias or use the fully qualified model name.
 From the directory containing `app/` and `sdk/`, build and run on Linux:
@@ -302,46 +329,110 @@ Keep deployment addresses out of event definitions and generated code. Pass a
 configured Flight URI into `connect`/`ConnectAsync`/`Connect`; the shared runtime
 does not read environment variables or discover a collector on your behalf.
 
-| Running the application | Endpoint configuration |
-| --- | --- |
-| Same host/network namespace as local regional | `ARROWCOL_ENDPOINT=http://localhost:18830` |
-| Same host/network namespace as local node | `ARROWCOL_ENDPOINT=http://localhost:18832` |
-| Nx localhost wrapper | Passes the active run's endpoint and exact extracted `--contract`; `--node` chooses the hop |
-| Containers on a shared network | Use a real Compose/service DNS name and its internal port, e.g. `http://arrowcol-regional:18830`, only if that service/listener is configured |
-| Hosted deployment | Use the operator-provided stable DNS endpoint, e.g. `https://ingest.example.com:443`; this example hostname is not a provisioned service |
+### Where configuration is defined
+
+| Setting | Who supplies it | Who reads it |
+| --- | --- | --- |
+| `ARROWCOL_ENDPOINT` | You, in the application's launch environment; value is the reachable collector URI | The application, before creating a stream |
+| `ARROWCOL_CONTRACT` | You, in the same environment; value is the matching extracted `contract/` directory path | The application, before calling `ArrowcolContract.load` / `Load` |
+| Nx demo arguments | `stream-demo --action=emit` supplies `--endpoint` from the run's `endpoints.json` and `--contract` from its extracted models package | The selected sample application; no environment-variable setup is needed for this wrapper |
 
 The three checked-in loop apps use **`--endpoint` first, then `ARROWCOL_ENDPOINT`**.
-They also require **`--contract` or `ARROWCOL_CONTRACT`**, pointing to the matching
-models package's `contract/` directory. Pin packages at build/restore time; do not
+Similarly, **`--contract` takes precedence over `ARROWCOL_CONTRACT`**. Their
+configuration readers are in
+[`rust/main.rs`](../../../examples/arrowcol-stream/rust/main.rs),
+[`csharp/Program.cs`](../../../examples/arrowcol-stream/csharp/Program.cs) and
+[`cpp/main.cpp`](../../../examples/arrowcol-stream/cpp/main.cpp).
+The minimal examples above read environment variables only.
+Pin packages at build/restore time; do not
 silently fetch a changing registry "latest" during stream creation.
 Missing or blank configuration fails explicitly; there is no fallback to another
 collector. In the Nx wrapper, its explicit active-demo endpoint deliberately
 overrides the environment, so a localhost demo cannot accidentally publish to a
-hosted destination.
+hosted destination. Run the application directly when configuring a remote collector.
 
-Set configuration in the shell that actually launches the application:
+### What an endpoint looks like
+
+Use **`http://HOST:PORT` or `https://HOST:PORT`**. `HOST` can be a DNS name or IP
+address reachable from the application. The port must serve Arrow Flight/gRPC
+over HTTP/2, not the collector's admin/health API. Although it looks like a website
+URL, this is a service address for the SDK, not a page to open in a browser.
+Do not append a table name, contract path, `/lakehouse` or REST ingestion path.
+
+| Collector location relative to the application | Example endpoint | Required setup |
+| --- | --- | --- |
+| Same VM and network namespace | `http://127.0.0.1:18830` | Collector listens on loopback port `18830`; `localhost` is also valid if it resolves to the listening address |
+| Same VM, optional forwarding collector in the demo | `http://127.0.0.1:18832` | Start the demo with `--node`; use `--node` on wrapper emission too |
+| Another container on a shared Docker network | `http://arrowcol-regional:18830` | Configure that service name and a listener reachable from the app container; the name is illustrative |
+| Remote VM behind private TLS ingress | `https://collector.example.com:443` | Operator supplies DNS, a trusted TLS certificate and HTTP/2 gRPC ingress forwarding to the collector; this hostname is illustrative, not a running service |
+
+Ports `18830` and `18832` are demo defaults, not protocol requirements. An IP
+address can replace DNS; for HTTPS, the certificate must also be valid for that
+IP. DNS does not configure a collector or add authentication.
+
+### Application and collector on the same VM
+
+Start the collector first. From the directory containing `app/` and `sdk/`,
+set configuration in the shell that actually launches the application:
 
 ```bash
-export ARROWCOL_ENDPOINT=http://localhost:18830
+export ARROWCOL_ENDPOINT=http://127.0.0.1:18830
 export ARROWCOL_CONTRACT="$PWD/sdk/models/rust/contract"
 cargo run --manifest-path app/Cargo.toml
 # For C# or C++, point ARROWCOL_CONTRACT at models/csharp/contract or models/cpp/contract.
 ```
 
-In Windows CMD, use `set ARROWCOL_ENDPOINT=http://localhost:18830` for an application
-built for Windows. A host environment variable is not automatically forwarded by
-`docker exec`: pass `-e ARROWCOL_ENDPOINT=...` when launching inside a container.
-`localhost` always means the application's own host/container. The documented
-collectors bind to loopback inside the devcontainer; publishing/forwarding a port
-or changing the listener requires an intentional network configuration, not
-substituting a container IP.
+For a Windows-native application and a collector reachable on Windows loopback,
+set both variables in **Windows CMD**:
 
-DNS keeps an address stable when service IPs change, but does not add authentication,
-retry safety or service discovery. Hosted ingress must support Arrow Flight/gRPC
-over HTTP/2. HTTPS uses native trusted roots and hostname verification. This SDK
-does not yet supply bearer-token/mTLS configuration, so do not claim support for
-a hosted endpoint that requires those credentials, disable TLS validation, or
-expose unauthenticated demo collectors publicly.
+```bat
+set "ARROWCOL_ENDPOINT=http://127.0.0.1:18830"
+set "ARROWCOL_CONTRACT=%CD%\sdk\models\rust\contract"
+cargo run --manifest-path app\Cargo.toml
+```
+
+`localhost`/`127.0.0.1` means the application's own network namespace, not
+necessarily every process on the VM. The walkthrough's collectors bind to
+loopback **inside the devcontainer**. Run the app there, or intentionally set up
+a host port forward before using a Windows-native app. For separate containers,
+configure a shared network and reachable listener; changing only the client's
+hostname does not expose a loopback-only collector. `docker exec` does not
+automatically forward host variables: pass both with `-e` if needed, using a
+container-visible contract path.
+
+### Application and collector on different VMs
+
+On the **collector VM**, the operator must configure its Arrow Flight receiver
+with a reachable listener (`config.listening_addr`, for example
+`10.20.0.15:18830` on a private interface), its catalogue and its storage or
+forwarding destination. Keep the admin listener private. For this HTTPS example,
+configure TLS ingress on port `443` forwarding gRPC/HTTP/2 to that receiver,
+with DNS and a trusted certificate for `collector.example.com`. Restrict access
+to the intended applications using private networking and firewall rules.
+The localhost demo wrapper does not provision this deployment.
+
+On the **application VM**, deploy the application and its matching models
+contract. Configure the reachable ingress address, not `localhost` and not the
+collector VM's contract filesystem path:
+
+```bash
+# Illustrative remote deployment; replace both values with your real configuration.
+export ARROWCOL_ENDPOINT=https://collector.example.com:443
+export ARROWCOL_CONTRACT=/opt/events-app/sdk/models/rust/contract
+```
+
+Launch the compiled app in that environment. Its stream-creation code is unchanged.
+The collector must resolve the contract's table in the intended catalogue
+authority; an unrelated registry with a same-named table is not interchangeable.
+To send through a same-VM forwarding collector instead, change the app's endpoint
+to that local listener. The forwarding collector's configuration, not the SDK,
+chooses the remote destination.
+
+HTTPS uses native trusted roots and hostname verification. This SDK does not
+support bearer-token or mTLS configuration. Use an endpoint compatible with its
+authentication capabilities, keep TLS validation enabled, and never expose
+unauthenticated demo collectors publicly. Plain HTTP is for trusted local
+development; DNS or private addressing alone does not encrypt traffic.
 
 ## Options, schema and delivery semantics
 
@@ -374,12 +465,3 @@ An SDK does not have to send newly added nullable columns: older supported
 contracts still emit their pinned subset, and collectors supply trailing nulls.
 `v1`, `v2`, etc. identify registered schema revisions, not a separate SDK SemVer
 minor-version negotiation protocol.
-
-## Legacy consumers
-
-The complete developer archive retains generated `rust/`, `typescript/`,
-`cpp/`, `csharp/` and `native/` trees. Existing `ArrowcolEventsContract`,
-`ArrowcolEventsStream`, `EventsContract` and `EventsStream` helpers belong to that
-compatibility path, not to the new independent models packages. Existing releases
-are immutable and remain usable with their bundled runtime. Rebuild a committed
-version to obtain the new layout; never modify a retained archive in place.
