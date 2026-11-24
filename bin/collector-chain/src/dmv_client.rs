@@ -1,11 +1,13 @@
 //! Bounded, startup-prepared DMV workload and persistent Flight senders.
 
 use super::*;
+use arrow_array::Array;
 use arrow_flight::encode::DictionaryHandling;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,6 +18,10 @@ use tokio::task::JoinSet;
 const MAX_LOGICAL_BATCH_RECORDS: usize = 1_000_000;
 const MAX_LOGICAL_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_OAT_CLIENT_METRICS_LINE_BYTES: usize = 1_048_576;
+const PAYLOAD_HASH_VERSION: u64 = 2;
+const PAYLOAD_HASH_DOMAIN: &[u8] = b"arrowcol.payload_corpus.logical.v2\0";
+const HASH_FIELD: u8 = 0x11;
+const HASH_ROW: u8 = 0x21;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +29,56 @@ pub enum DataMode {
     #[default]
     Shared,
     Independent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SendIter {
+    #[default]
+    #[value(name = "clone_vec")]
+    CloneVec,
+    #[value(name = "arc_cursor")]
+    ArcCursor,
+}
+
+enum SendFrames {
+    Owned(std::vec::IntoIter<FlightData>),
+    Shared { frames: Arc<Vec<FlightData>>, index: usize },
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityBuilder {
+    #[default]
+    #[value(name = "formatted_rows")]
+    FormattedRows,
+    #[value(name = "direct_utf8")]
+    DirectUtf8,
+}
+
+impl Iterator for SendFrames {
+    type Item = FlightData;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(frames) => frames.next(),
+            Self::Shared { frames, index } => {
+                let frame = frames.get(*index)?.clone();
+                *index += 1;
+                Some(frame)
+            }
+        }
+    }
+}
+
+fn send_frames(frames: &Arc<Vec<FlightData>>, mode: SendIter) -> SendFrames {
+    match mode {
+        SendIter::CloneVec => SendFrames::Owned(frames.as_ref().clone().into_iter()),
+        SendIter::ArcCursor => SendFrames::Shared {
+            frames: Arc::clone(frames),
+            index: 0,
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -89,6 +145,9 @@ pub enum GuidUniqueness {
 /// All settings are resolved and validated before allocation, registration, or connection.
 #[derive(Args, Clone, Debug, Serialize)]
 pub struct Options {
+    #[arg(long, env = "ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_customer_id: Option<String>,
     #[arg(long, env = "ARROWCOL_CLIENT_CORPUS_ROWS", default_value_t = 0)]
     pub corpus_rows: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_CORPUS_BYTES", default_value_t = 0)]
@@ -103,6 +162,10 @@ pub struct Options {
     pub data_mode: DataMode,
     #[arg(long, env = "ARROWCOL_CLIENT_DATA_PROFILE", value_enum, default_value_t = DataProfile::Diagnostic)]
     pub data_profile: DataProfile,
+    #[arg(long, env = "ARROWCOL_CLIENT_SEND_ITER", value_enum, default_value_t = SendIter::CloneVec)]
+    pub send_iter: SendIter,
+    #[arg(long, env = "ARROWCOL_CLIENT_IDENTITY_BUILDER", value_enum, default_value_t = IdentityBuilder::FormattedRows)]
+    pub identity_builder: IdentityBuilder,
     #[arg(long, env = "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", value_enum)]
     pub string_length_distribution: Option<StringLengthDistribution>,
     #[arg(long, env = "ARROWCOL_CLIENT_VALUE_VARIATION", value_enum)]
@@ -125,6 +188,8 @@ pub struct Options {
     pub max_memory_bytes: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_INTERVAL_US", default_value_t = 0)]
     pub interval_us: u64,
+    #[arg(long, env = "ARROWCOL_CLIENT_QUIESCE_TIMEOUT_MS")]
+    pub quiesce_timeout_ms: Option<u64>,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER", default_value_t = 1)]
     pub connections_per_worker: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_POD_ORDINAL", default_value_t = 0)]
@@ -143,6 +208,8 @@ pub struct Options {
     pub stream_retry_max_backoff_ms: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_IPC_COMPRESSION", value_enum, default_value_t = IpcCompression::None)]
     pub ipc_compression: IpcCompression,
+    #[arg(long, env = "ARROWCOL_CLIENT_IPC_ALIGNMENT", default_value_t = 64)]
+    pub ipc_alignment: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_DICTIONARY_HANDLING", value_enum, default_value_t = Dictionaries::Hydrate)]
     pub dictionary_handling: Dictionaries,
     #[arg(long, env = "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION", value_enum, default_value_t = GrpcCompression::None)]
@@ -153,6 +220,14 @@ pub struct Options {
     pub max_flight_data_bytes: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES", default_value_t = 16_777_216)]
     pub max_message_bytes: usize,
+    #[arg(long, env = "ARROWCOL_CLIENT_GRPC_MAX_ENCODE_BYTES")]
+    pub grpc_max_encode_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_CLIENT_GRPC_MAX_DECODE_BYTES")]
+    pub grpc_max_decode_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_CLIENT_SOCKET_SEND_BUFFER_BYTES")]
+    pub socket_send_buffer_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_CLIENT_SOCKET_RECV_BUFFER_BYTES")]
+    pub socket_recv_buffer_bytes: Option<usize>,
     #[arg(long, env = "ARROWCOL_CLIENT_STREAM_WINDOW_BYTES", default_value_t = 1_048_576)]
     pub stream_window_bytes: u32,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTION_WINDOW_BYTES", default_value_t = 16_777_216)]
@@ -191,12 +266,151 @@ pub struct Options {
     pub connect_retries: u32,
     #[arg(long, env = "ARROWCOL_CLIENT_RETRY_BACKOFF_MS", default_value_t = 100)]
     pub retry_backoff_ms: u64,
-    /// Zero disables the per-connection token-bucket request limit.
+    /// Zero disables the per-connection request limit; otherwise this is the number per period.
     #[arg(long, env = "ARROWCOL_CLIENT_RATE_LIMIT_RPS", default_value_t = 0)]
     pub rate_limit_rps: u64,
+    #[arg(long, env = "ARROWCOL_CLIENT_RATE_LIMIT_PERIOD_MS", default_value_t = 1000)]
+    pub rate_limit_period_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SocketReadback {
+    generation: u64,
+    requested_send_buffer_bytes: Option<usize>,
+    requested_recv_buffer_bytes: Option<usize>,
+    send_buffer_bytes: usize,
+    recv_buffer_bytes: usize,
+    send_buffer_kernel_clamp_observed: Option<bool>,
+    recv_buffer_kernel_clamp_observed: Option<bool>,
+}
+
+#[derive(Default)]
+struct SocketState {
+    generation: u64,
+    current: Option<SocketReadback>,
+    socket: Option<socket2::Socket>,
+}
+
+type SocketObservation = Arc<Mutex<SocketState>>;
+
+struct ObservedSocket {
+    stream: tokio::net::TcpStream,
+    observation: SocketObservation,
+    generation: u64,
+}
+
+impl ObservedSocket {
+    fn invalidate(&self) {
+        if let Ok(mut state) = self.observation.lock()
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|readback| readback.generation == self.generation)
+        {
+            state.current = None;
+            state.socket = None;
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ObservedSocket {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let has_capacity = buf.remaining() > 0;
+        let result = std::pin::Pin::new(&mut self.stream).poll_read(cx, buf);
+        if matches!(&result, std::task::Poll::Ready(Err(_)))
+            || (has_capacity && matches!(&result, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before)
+        {
+            self.invalidate();
+        }
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedSocket {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
+        if matches!(&result, std::task::Poll::Ready(Err(_)))
+            || (!buf.is_empty() && matches!(result, std::task::Poll::Ready(Ok(0))))
+        {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        tokio::io::AsyncWrite::is_write_vectored(&self.stream)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_write_vectored(cx, bufs);
+        if matches!(&result, std::task::Poll::Ready(Err(_))) {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_flush(cx);
+        if matches!(&result, std::task::Poll::Ready(Err(_))) {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_shutdown(cx);
+        if result.is_ready() {
+            self.invalidate();
+        }
+        result
+    }
+}
+
+impl Drop for ObservedSocket {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
+#[derive(Serialize)]
+struct AppliedTransport {
+    max_frame_bytes: u32,
+    keepalive_interval_ms: u64,
+    keepalive_timeout_ms: u64,
+    grpc_max_encode_bytes: usize,
+    grpc_max_decode_bytes: usize,
 }
 
 impl Options {
+    fn applied_transport(&self) -> AppliedTransport {
+        AppliedTransport {
+            max_frame_bytes: self.max_frame_bytes,
+            keepalive_interval_ms: self.keepalive_interval_ms,
+            keepalive_timeout_ms: self.keepalive_timeout_ms,
+            grpc_max_encode_bytes: self.grpc_max_encode_bytes.unwrap_or(self.max_message_bytes),
+            grpc_max_decode_bytes: self.grpc_max_decode_bytes.unwrap_or(self.max_message_bytes),
+        }
+    }
+
     /// Resolve legacy aliases and reject invalid or unbounded resource requests.
     ///
     /// # Errors
@@ -212,6 +426,14 @@ impl Options {
     ///
     /// Returns the same validation failures as `resolve`, including unavailable CPU discovery.
     pub fn resolve_with_evidence(mut self, rows: usize, concurrency: usize) -> Result<(Self, serde_json::Value)> {
+        anyhow::ensure!(
+            self.identity_builder != IdentityBuilder::DirectUtf8 || self.data_profile == DataProfile::Realistic,
+            "identity-builder=direct_utf8 requires data-profile=realistic"
+        );
+        anyhow::ensure!(
+            matches!(self.ipc_alignment, 8 | 16 | 32 | 64),
+            "ipc-alignment must be 8, 16, 32, or 64"
+        );
         let requested = serde_json::json!({
             "workers": self.workers, "runtime_threads": self.runtime_threads,
             "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
@@ -224,6 +446,12 @@ impl Options {
             "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
             "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
         });
+        let quiesce_timeout_ms = self.quiesce_timeout_ms.unwrap_or(self.request_timeout_ms);
+        anyhow::ensure!(
+            (self.request_timeout_ms..=86_400_000).contains(&quiesce_timeout_ms) && self.request_timeout_ms > 0,
+            "quiesce-timeout-ms must be at least request-timeout-ms and at most 86400000"
+        );
+        self.quiesce_timeout_ms = Some(quiesce_timeout_ms);
         let corpus_rows_source = if self.corpus_bytes > 0 {
             "corpus_bytes_estimate_deferred_until_preparation"
         } else if self.corpus_rows == 0 {
@@ -253,9 +481,12 @@ impl Options {
         if self.runtime_threads == 0 {
             self.runtime_threads = available_parallelism;
         }
-        if self.streams_per_worker == 0 {
+        let streams_per_worker_source = if self.streams_per_worker == 0 {
             self.streams_per_worker = concurrency;
-        }
+            "legacy_concurrency"
+        } else {
+            "explicit_streams_per_worker"
+        };
         self.string_length_distribution.get_or_insert(match self.data_profile {
             DataProfile::Diagnostic => StringLengthDistribution::Fixed,
             DataProfile::Realistic => StringLengthDistribution::Uniform,
@@ -283,6 +514,12 @@ impl Options {
                 && self.workers.saturating_mul(self.streams_per_worker) <= 65536,
             "connections-per-worker must be 1..=256, streams-per-worker 1..=1024; totals <=4096 connections and <=65536 streams"
         );
+        anyhow::ensure!(
+            self.payload_customer_id
+                .as_deref()
+                .is_none_or(arrowcol_tunables::valid_payload_customer_id),
+            "payload-customer-id must be 1..=128 ASCII letters, digits, '.', '_' or '-'"
+        );
         anyhow::ensure!(self.string_width <= 65536, "string-width must be 0..=65536");
         anyhow::ensure!(self.cardinality > 0, "cardinality must be positive");
         for (name, value) in [
@@ -308,6 +545,26 @@ impl Options {
                 && self.max_flight_data_bytes <= self.max_message_bytes
                 && self.max_message_bytes <= i32::MAX as usize,
             "require 1024 <= max-flight-data-bytes <= max-message-bytes <= 2147483647"
+        );
+        anyhow::ensure!(
+            (self.max_flight_data_bytes..=i32::MAX as usize)
+                .contains(&self.grpc_max_encode_bytes.unwrap_or(self.max_message_bytes))
+                && (1..=i32::MAX as usize).contains(&self.grpc_max_decode_bytes.unwrap_or(self.max_message_bytes)),
+            "gRPC encode limit must fit max-flight-data-bytes; decode limit must be positive; both must be <= 2147483647"
+        );
+        for value in [self.socket_send_buffer_bytes, self.socket_recv_buffer_bytes]
+            .into_iter()
+            .flatten()
+        {
+            anyhow::ensure!(
+                (1..=1_073_741_823).contains(&value),
+                "socket buffer bytes must be in 1..=1073741823"
+            );
+        }
+        anyhow::ensure!(
+            cfg!(target_os = "linux")
+                || (self.socket_send_buffer_bytes.is_none() && self.socket_recv_buffer_bytes.is_none()),
+            "client socket buffer settings are supported only on Linux"
         );
         anyhow::ensure!(
             (1..=i32::MAX as u32).contains(&self.stream_window_bytes)
@@ -341,6 +598,10 @@ impl Options {
             self.interval_us <= 86_400_000_000,
             "interval-us must not exceed one day"
         );
+        anyhow::ensure!(
+            (1..=86_400_000).contains(&self.rate_limit_period_ms),
+            "rate-limit-period-ms must be between 1 and 86400000"
+        );
         for value in [
             self.connect_timeout_ms,
             self.request_timeout_ms,
@@ -368,21 +629,23 @@ impl Options {
                 "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
             },
             "corpus_rows_source": corpus_rows_source,
+            "streams_per_worker_source": streams_per_worker_source,
         });
         Ok((self, evidence))
     }
 
     fn endpoint(&self, address: &str) -> Result<Endpoint> {
+        let applied = self.applied_transport();
         let mut endpoint = Endpoint::from_shared(address.to_owned())?
             .connect_timeout(Duration::from_millis(self.connect_timeout_ms))
             .timeout(Duration::from_millis(self.request_timeout_ms))
             .initial_stream_window_size(self.stream_window_bytes)
             .initial_connection_window_size(self.connection_window_bytes)
-            .max_frame_size(self.max_frame_bytes)
+            .max_frame_size(applied.max_frame_bytes)
             .http2_header_table_size(self.header_table_bytes)
             .http2_max_header_list_size(self.max_header_list_bytes)
             .http2_adaptive_window(self.adaptive_window)
-            .keep_alive_timeout(Duration::from_millis(self.keepalive_timeout_ms))
+            .keep_alive_timeout(Duration::from_millis(applied.keepalive_timeout_ms))
             .keep_alive_while_idle(self.keepalive_while_idle)
             .tcp_nodelay(self.tcp_nodelay)
             .tcp_keepalive((self.tcp_keepalive_ms > 0).then(|| Duration::from_millis(self.tcp_keepalive_ms)))
@@ -392,20 +655,93 @@ impl Options {
             .tcp_keepalive_retries((self.tcp_keepalive_retries > 0).then_some(self.tcp_keepalive_retries))
             .concurrency_limit(self.endpoint_concurrency_limit)
             .buffer_size(self.endpoint_buffer_size);
-        if self.keepalive_interval_ms > 0 {
-            endpoint = endpoint.http2_keep_alive_interval(Duration::from_millis(self.keepalive_interval_ms));
+        if applied.keepalive_interval_ms > 0 {
+            endpoint = endpoint.http2_keep_alive_interval(Duration::from_millis(applied.keepalive_interval_ms));
         }
         if self.rate_limit_rps > 0 {
-            endpoint = endpoint.rate_limit(self.rate_limit_rps, Duration::from_secs(1));
+            endpoint = endpoint.rate_limit(self.rate_limit_rps, Duration::from_millis(self.rate_limit_period_ms));
         }
         Ok(endpoint)
     }
 
-    async fn connect(&self, address: &str) -> Result<Channel> {
+    async fn connect(&self, address: &str) -> Result<(Channel, Option<SocketObservation>)> {
         let endpoint = self.endpoint(address)?;
+        let observation = (self.socket_send_buffer_bytes.is_some() || self.socket_recv_buffer_bytes.is_some())
+            .then(|| Arc::new(Mutex::new(SocketState::default())));
         for attempt in 0..=self.connect_retries {
-            match endpoint.connect().await {
-                Ok(channel) => return Ok(channel),
+            let result = if let Some(observation) = &observation {
+                let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+                connector.enforce_http(false);
+                connector.set_nodelay(self.tcp_nodelay);
+                connector
+                    .set_keepalive((self.tcp_keepalive_ms > 0).then(|| Duration::from_millis(self.tcp_keepalive_ms)));
+                connector.set_keepalive_interval(
+                    (self.tcp_keepalive_interval_ms > 0).then(|| Duration::from_millis(self.tcp_keepalive_interval_ms)),
+                );
+                connector.set_keepalive_retries((self.tcp_keepalive_retries > 0).then_some(self.tcp_keepalive_retries));
+                connector.set_connect_timeout(Some(Duration::from_millis(self.connect_timeout_ms)));
+                connector.set_send_buffer_size(self.socket_send_buffer_bytes);
+                connector.set_recv_buffer_size(self.socket_recv_buffer_bytes);
+                let send = self.socket_send_buffer_bytes;
+                let recv = self.socket_recv_buffer_bytes;
+                let observation = Arc::clone(observation);
+                let connector = tower::service_fn(move |uri: http::Uri| {
+                    use tower::ServiceExt;
+                    let connector = connector.clone();
+                    let observation = Arc::clone(&observation);
+                    async move {
+                        {
+                            let mut state = observation
+                                .lock()
+                                .map_err(|_| std::io::Error::other("socket observation lock poisoned"))?;
+                            state.current = None;
+                            state.socket = None;
+                        }
+                        let stream = connector.oneshot(uri).await.map_err(std::io::Error::other)?;
+                        let socket = socket2::SockRef::from(stream.inner());
+                        if let Some(size) = send {
+                            socket.set_send_buffer_size(size)?;
+                        }
+                        if let Some(size) = recv {
+                            socket.set_recv_buffer_size(size)?;
+                        }
+                        let send_buffer_bytes = socket.send_buffer_size()?;
+                        let recv_buffer_bytes = socket.recv_buffer_size()?;
+                        let readback_socket = socket.try_clone()?;
+                        let mut state = observation
+                            .lock()
+                            .map_err(|_| std::io::Error::other("socket observation lock poisoned"))?;
+                        let generation = state
+                            .generation
+                            .checked_add(1)
+                            .ok_or_else(|| std::io::Error::other("socket generation overflow"))?;
+                        state.generation = generation;
+                        state.socket = Some(readback_socket);
+                        state.current = Some(SocketReadback {
+                            generation,
+                            requested_send_buffer_bytes: send,
+                            requested_recv_buffer_bytes: recv,
+                            send_buffer_bytes,
+                            recv_buffer_bytes,
+                            // Linux reports twice the accepted request, subject to kernel minimums.
+                            send_buffer_kernel_clamp_observed: send.map(|requested| send_buffer_bytes / 2 < requested),
+                            recv_buffer_kernel_clamp_observed: recv.map(|requested| recv_buffer_bytes / 2 < requested),
+                        });
+                        drop(state);
+                        let stream = ObservedSocket {
+                            stream: stream.into_inner(),
+                            observation,
+                            generation,
+                        };
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                });
+                endpoint.connect_with_connector(connector).await
+            } else {
+                endpoint.connect().await
+            };
+            match result {
+                Ok(channel) => return Ok((channel, observation)),
                 Err(error) if attempt == self.connect_retries => return Err(error).context("connect Flight endpoint"),
                 Err(error) => {
                     eprintln!("Flight connection attempt {} failed: {error}", attempt + 1);
@@ -417,9 +753,10 @@ impl Options {
     }
 
     fn client(&self, channel: Channel) -> FlightServiceClient<Channel> {
+        let applied = self.applied_transport();
         let mut client = FlightServiceClient::new(channel)
-            .max_encoding_message_size(self.max_message_bytes)
-            .max_decoding_message_size(self.max_message_bytes);
+            .max_encoding_message_size(applied.grpc_max_encode_bytes)
+            .max_decoding_message_size(applied.grpc_max_decode_bytes);
         for (send, compression) in [
             (true, self.grpc_send_compression),
             (false, self.grpc_accept_compression),
@@ -448,6 +785,153 @@ struct EncodedBatch {
     rows: u64,
     raw_arrow_bytes: u64,
     encoded_bytes: u64,
+}
+
+fn generator_corpus_evidence(corpus: &[Arc<Vec<EncodedBatch>>], options: &Options) -> Result<serde_json::Value> {
+    #[derive(Default)]
+    struct Counts {
+        rows: u64,
+        fields: usize,
+        eligible: std::collections::BTreeSet<String>,
+        eligible_rows: u64,
+        null_rows: u64,
+        guid_columns: std::collections::BTreeSet<String>,
+        guid_rows: u64,
+        variation_columns: std::collections::BTreeSet<String>,
+        variation_rows: u64,
+        width_columns: std::collections::BTreeSet<String>,
+        width_rows: u64,
+        entropy_columns: std::collections::BTreeSet<String>,
+        entropy_rows: u64,
+    }
+    let mut tables = std::collections::BTreeMap::<String, Counts>::new();
+    for batches in corpus {
+        for batch in batches.iter() {
+            let counts = tables
+                .entry(batch.table.identity.table().as_str().to_owned())
+                .or_default();
+            counts.fields = batch.template.num_columns();
+            counts.rows = counts
+                .rows
+                .checked_add(batch.rows)
+                .context("corpus table row count overflow")?;
+            for (field, array) in batch.template.schema().fields().iter().zip(batch.template.columns()) {
+                if field.data_type() == &DataType::Utf8
+                    && field.name() != "customer_id"
+                    && !(options.data_profile == DataProfile::Realistic
+                        && (field.name() == "endpoint_url" || realistic_category_values(field.name()).is_some()))
+                    && !(is_guid_field(field.name()) && options.guid_uniqueness == Some(GuidUniqueness::PerRow))
+                    && array.len() > array.null_count()
+                {
+                    counts.width_columns.insert(field.name().to_owned());
+                    counts.width_rows = counts
+                        .width_rows
+                        .checked_add(u64::try_from(array.len() - array.null_count())?)
+                        .context("corpus width row count overflow")?;
+                    let fallback = options.string_width == 0
+                        && options.data_profile == DataProfile::Diagnostic
+                        && options.string_length_distribution == Some(StringLengthDistribution::Fixed);
+                    let width = if options.string_width == 0 {
+                        field.name().len() + 32
+                    } else {
+                        options.string_width
+                    };
+                    let min_width = if options.string_length_distribution == Some(StringLengthDistribution::Uniform) {
+                        width.div_ceil(2)
+                    } else {
+                        width
+                    };
+                    let (prefix, suffix) = if options.data_profile == DataProfile::Realistic {
+                        realistic_name_parts(field.name(), u64::MAX).unwrap_or_default()
+                    } else {
+                        (String::new(), "")
+                    };
+                    if !fallback && min_width > prefix.len() + suffix.len() {
+                        counts.entropy_columns.insert(field.name().to_owned());
+                        counts.entropy_rows = counts
+                            .entropy_rows
+                            .checked_add(u64::try_from(array.len() - array.null_count())?)
+                            .context("corpus entropy row count overflow")?;
+                    }
+                }
+                if matches!(
+                    field.data_type(),
+                    DataType::Boolean
+                        | DataType::UInt8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float64
+                        | DataType::Timestamp(TimeUnit::Microsecond, _)
+                ) && array.len() > array.null_count()
+                {
+                    counts.variation_columns.insert(field.name().to_owned());
+                    counts.variation_rows = counts
+                        .variation_rows
+                        .checked_add(u64::try_from(array.len() - array.null_count())?)
+                        .context("corpus variation row count overflow")?;
+                }
+                if field.data_type() == &DataType::Utf8
+                    && is_guid_field(field.name())
+                    && array.len() > array.null_count()
+                {
+                    counts.guid_columns.insert(field.name().to_owned());
+                    counts.guid_rows = counts
+                        .guid_rows
+                        .checked_add(u64::try_from(array.len() - array.null_count())?)
+                        .context("corpus GUID row count overflow")?;
+                }
+                if !field.is_nullable()
+                    || field.name() == "customer_id"
+                    || (options.data_profile == DataProfile::Realistic && field.name() == "endpoint_url")
+                {
+                    continue;
+                }
+                counts.eligible.insert(field.name().to_owned());
+                counts.eligible_rows = counts
+                    .eligible_rows
+                    .checked_add(u64::try_from(array.len())?)
+                    .context("corpus eligible row count overflow")?;
+                counts.null_rows = counts
+                    .null_rows
+                    .checked_add(u64::try_from(array.null_count())?)
+                    .context("corpus null count overflow")?;
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "version": 1,
+        "tables": tables.into_iter().map(|(table, counts)| serde_json::json!({
+            "table": table,
+            "schema_fields": counts.fields,
+            "rows": counts.rows,
+            "null_fraction": {
+                "eligible_columns": counts.eligible.len(),
+                "eligible_rows": counts.eligible_rows,
+                "null_rows": counts.null_rows,
+            },
+            "pod_ordinal": {
+                "eligible_columns": if options.guid_uniqueness == Some(GuidUniqueness::PerRow) { counts.guid_columns.len() } else { 0 },
+                "eligible_rows": if options.guid_uniqueness == Some(GuidUniqueness::PerRow) { counts.guid_rows } else { 0 },
+            },
+            "guid_uniqueness": {
+                "eligible_columns": counts.guid_columns.len(),
+                "eligible_rows": counts.guid_rows,
+            },
+            "value_variation": {
+                "eligible_columns": counts.variation_columns.len(),
+                "eligible_rows": counts.variation_rows,
+            },
+            "string_width": {
+                "eligible_columns": counts.width_columns.len(),
+                "eligible_rows": counts.width_rows,
+            },
+            "entropy": {
+                "eligible_columns": counts.entropy_columns.len(),
+                "eligible_rows": counts.entropy_rows,
+            },
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -610,6 +1094,8 @@ struct Attempt<'a> {
     send_started: bool,
     started: Instant,
     finished: bool,
+    measurement: Option<&'a Measurement>,
+    send_unix_ns: u64,
 }
 
 struct Measurement {
@@ -623,6 +1109,11 @@ struct Measurement {
     raw_window_bytes: Vec<AtomicU64>,
     wire_window_bytes: Vec<AtomicU64>,
     window_latency: Vec<Mutex<[u64; 64]>>,
+    window_completed_sends: Vec<AtomicU64>,
+    window_timed_out_sends: Vec<AtomicU64>,
+    window_ambiguous_sends: Vec<AtomicU64>,
+    stop: tokio::sync::watch::Sender<bool>,
+    deadline_expired: AtomicBool,
     resource_start: Mutex<Option<ResourceSample>>,
     resource_end: Mutex<Option<ResourceSample>>,
     rejected_streams: AtomicU64,
@@ -675,6 +1166,17 @@ impl Measurement {
             window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| Mutex::new([0; 64]))
                 .collect(),
+            window_completed_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            window_timed_out_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            window_ambiguous_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            stop: tokio::sync::watch::channel(false).0,
+            deadline_expired: AtomicBool::new(false),
             resource_start: Mutex::new(None),
             resource_end: Mutex::new(None),
             rejected_streams: AtomicU64::new(0),
@@ -686,6 +1188,35 @@ impl Measurement {
             ambiguous_streams: AtomicU64::new(0),
             ambiguous_rows: AtomicU64::new(0),
         })
+    }
+
+    fn stopped(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    async fn wait_stopped(&self) {
+        let mut stop = self.stop.subscribe();
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    fn record_send_outcome(&self, send_unix_ns: u64, completed: bool, timed_out: bool, ambiguous: bool) {
+        let ms = send_unix_ns / 1_000_000;
+        if ms >= self.start_unix_ms && ms < self.end_unix_ms {
+            let index = ((ms - self.start_unix_ms) / 30_000) as usize;
+            if completed {
+                self.window_completed_sends[index].fetch_add(1, Ordering::Relaxed);
+            }
+            if timed_out {
+                self.window_timed_out_sends[index].fetch_add(1, Ordering::Relaxed);
+            }
+            if ambiguous {
+                self.window_ambiguous_sends[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn record_completion(
@@ -770,6 +1301,10 @@ impl Measurement {
                     "completed_flight_data_bytes_configured_ipc_compression": self.wire_window_bytes[index].load(Ordering::Relaxed),
                     "completed_raw_arrow_bytes": self.raw_window_bytes[index].load(Ordering::Relaxed),
                     "completed_wire_bytes": self.wire_window_bytes[index].load(Ordering::Relaxed),
+                    "completed_sends": self.window_completed_sends[index].load(Ordering::Relaxed),
+                    "timed_out_sends": self.window_timed_out_sends[index].load(Ordering::Relaxed),
+                    "ambiguous_sends": self.window_ambiguous_sends[index].load(Ordering::Relaxed),
+                    "send_outcome_scope": "attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous",
                     "send_latency_us": latency_percentiles(&latency),
                     "send_latency_scope": "attempts_grouped_by_fresh_send_timestamp_in_half_open_window"
                 })
@@ -827,15 +1362,30 @@ impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         if !self.finished {
             if self.send_started
-                && let Some((client, index)) = self.manifest
+                && let Some(measurement) = self.measurement
             {
+                measurement.record_send_outcome(
+                    self.send_unix_ns,
+                    false,
+                    measurement.deadline_expired.load(Ordering::Relaxed),
+                    true,
+                );
+            }
+            if let Some((client, index)) = self.manifest {
                 let mut records = client
                     .logical_batches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(record) = records.get_mut(index) {
-                    record.outcome = ManifestOutcome::Ambiguous;
+                    if self.send_started {
+                        record.outcome = ManifestOutcome::Ambiguous;
+                    } else if record.outcome == ManifestOutcome::Pending {
+                        record.outcome = ManifestOutcome::NotAdmitted;
+                    }
                 }
+            }
+            if !self.send_started {
+                return;
             }
             self.counters
                 .cancelled_rows
@@ -852,6 +1402,7 @@ pub struct PreparedClient {
     pub options: Options,
     corpus: Vec<Arc<Vec<EncodedBatch>>>,
     channels: Vec<Vec<Channel>>,
+    socket_observations: Vec<SocketObservation>,
     live_batch_slots: Arc<tokio::sync::Semaphore>,
     signer: Option<EdgeRequestSigner>,
     counters: Vec<Counters>,
@@ -919,7 +1470,7 @@ impl PreparedClient {
             for field in table.schema.fields() {
                 if field.data_type() == &DataType::Utf8 {
                     let width = if field.name() == "customer_id" {
-                        client_id.len()
+                        options.payload_customer_id.as_deref().unwrap_or(client_id).len()
                     } else if options.string_width == 0 {
                         field.name().len() + 32
                     } else {
@@ -935,7 +1486,8 @@ impl PreparedClient {
             }
         }
         let signer = edge_secret_file.map(edge_signer_from_file).transpose()?;
-        let mut registration = options.client(options.connect(endpoint).await?);
+        let (registration_channel, _) = options.connect(endpoint).await?;
+        let mut registration = options.client(registration_channel);
         let mut versions = Vec::new();
         for table in &tables {
             versions.push(
@@ -956,6 +1508,7 @@ impl PreparedClient {
         let mut encoding_seconds = 0.0;
         let mut generation_cpu_seconds = cpu_started.map(|_| 0.0);
         let mut encoding_cpu_seconds = cpu_started.map(|_| 0.0);
+        let mut payload_hasher = new_payload_hasher(options.data_profile, copies, table_count)?;
         for copy in 0..copies {
             let mut batches = Vec::new();
             for (table, version) in tables.iter().zip(&versions) {
@@ -964,6 +1517,15 @@ impl PreparedClient {
                     let generation_start = Instant::now();
                     let cpu_start = thread_cpu_seconds()?;
                     let batch = synthetic_batch(table, client_id, length, offset, copy, &options)?;
+                    hash_payload_batch(
+                        &mut payload_hasher,
+                        table,
+                        &batch,
+                        copy,
+                        offset,
+                        rows,
+                        options.data_profile,
+                    )?;
                     generation_seconds += generation_start.elapsed().as_secs_f64();
                     if let Some((total, (end, start))) = generation_cpu_seconds
                         .as_mut()
@@ -1004,15 +1566,25 @@ impl PreparedClient {
             }
             corpus.push(Arc::new(batches));
         }
+        let generator_applicability = generator_corpus_evidence(&corpus, &options)?;
         let mut channels = Vec::new();
+        let mut socket_observations = Vec::new();
         for _ in 0..options.workers {
             let mut worker = Vec::new();
             for _ in 0..options.connections_per_worker {
-                worker.push(options.connect(endpoint).await?);
+                let (channel, observation) = options.connect(endpoint).await?;
+                worker.push(channel);
+                if let Some(observation) = observation {
+                    socket_observations.push(observation);
+                }
             }
             channels.push(worker);
         }
-        let preparation = serde_json::json!({
+        let mut preparation = serde_json::json!({
+            "data_profile": options.data_profile,
+            "generator_applicability": generator_applicability,
+            "payload_corpus_hash_version": PAYLOAD_HASH_VERSION,
+            "payload_corpus_hash_scope": payload_hash_scope(options.data_profile),
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
             "corpus_uncompressed_flight_data_bytes": raw_arrow_bytes_total,
             "corpus_configured_ipc_compression_flight_data_bytes": encoded_bytes,
@@ -1036,6 +1608,7 @@ impl PreparedClient {
             "generator_rows_per_second": rows as f64 * table_count as f64 * copies as f64 / generation_seconds.max(f64::MIN_POSITIVE),
             "steady_state_generation": options.data_profile == DataProfile::Realistic,
         });
+        preparation["payload_corpus_sha256"] = serde_json::json!(finish_payload_hasher(payload_hasher));
         Ok(Arc::new(Self {
             counters: (0..options.workers).map(|_| Counters::default()).collect(),
             worker_next: (0..options.workers).map(|_| AtomicU64::new(0)).collect(),
@@ -1043,6 +1616,7 @@ impl PreparedClient {
             options,
             corpus,
             channels,
+            socket_observations,
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(memory.admitted_live_slots)),
             signer,
             next: AtomicU64::new(0),
@@ -1057,6 +1631,47 @@ impl PreparedClient {
             preparation,
             started: Instant::now(),
         }))
+    }
+
+    /// Settings supplied to the connected HTTP/2 endpoint and Flight client.
+    ///
+    /// # Errors
+    /// Returns an error if socket readback is unavailable or serialization fails.
+    pub fn applied_transport_json(&self) -> Result<String> {
+        let mut applied = serde_json::to_value(self.options.applied_transport())?;
+        let sockets = self
+            .socket_observations
+            .iter()
+            .map(|observation| {
+                let state = observation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("socket observation lock poisoned"))?;
+                let mut readback = state
+                    .current
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing connected socket readback"))?;
+                let socket = state
+                    .socket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing live socket"))?;
+                readback.send_buffer_bytes = socket.send_buffer_size()?;
+                readback.recv_buffer_bytes = socket.recv_buffer_size()?;
+                readback.send_buffer_kernel_clamp_observed = readback
+                    .requested_send_buffer_bytes
+                    .map(|requested| readback.send_buffer_bytes / 2 < requested);
+                readback.recv_buffer_kernel_clamp_observed = readback
+                    .requested_recv_buffer_bytes
+                    .map(|requested| readback.recv_buffer_bytes / 2 < requested);
+                Ok(readback)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        applied["socket_buffer_accounting"] = serde_json::json!(if cfg!(target_os = "linux") {
+            "linux_doubled"
+        } else {
+            "unsupported"
+        });
+        applied["socket_connections"] = serde_json::to_value(sockets)?;
+        Ok(serde_json::to_string(&applied)?)
     }
 
     fn next_batch(&self, worker: usize) -> &EncodedBatch {
@@ -1255,6 +1870,7 @@ impl PreparedClient {
         let mut manifest = if self.options.data_profile == DataProfile::Diagnostic {
             serde_json::json!({
                 "schema": "arrowcol.logical_batch_manifest.v1",
+                "data_profile": self.options.data_profile,
                 "identity_status": "diagnostic_only",
                 "eligible_for_identity_reconciliation": false,
                 "complete": false,
@@ -1266,6 +1882,7 @@ impl PreparedClient {
         } else {
             serde_json::json!({
                 "schema": "arrowcol.logical_batch_manifest.v1",
+                "data_profile": self.options.data_profile,
                 "version": 1,
                 "identity_status": "identity_bearing",
                 "eligible_for_identity_reconciliation": true,
@@ -1294,6 +1911,11 @@ impl PreparedClient {
                 "ranges": ranges,
             })
         };
+        if let Some(hash) = self.preparation.get("payload_corpus_sha256") {
+            manifest["payload_corpus_sha256"] = hash.clone();
+            manifest["payload_corpus_hash_version"] = serde_json::json!(PAYLOAD_HASH_VERSION);
+            manifest["payload_corpus_hash_scope"] = serde_json::json!(payload_hash_scope(self.options.data_profile));
+        }
         if self.manifest_capacity_reached.load(Ordering::Relaxed) {
             let reason = self.remember_first_terminal_failure("record_capacity_reached")?;
             manifest["terminal_failure"] = serde_json::json!(reason);
@@ -1432,8 +2054,14 @@ impl PreparedClient {
         }
         let live_batch_permit = live_batch_permit.context("realistic logical batch requires a memory reservation")?;
         let sequence = self.next_logical_batch_sequence(worker)?;
-        let batch =
-            batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
+        let batch = batch_with_logical_identity(
+            &template.template,
+            self.run_id,
+            self.incarnation_id,
+            worker,
+            sequence,
+            self.options.identity_builder,
+        )?;
         let (data, raw_arrow_bytes, encoded_bytes) =
             encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
         anyhow::ensure!(
@@ -1472,6 +2100,25 @@ impl PreparedClient {
         measurement_start_unix_ms: u64,
         measurement_end_unix_ms: u64,
     ) -> Result<ContinuousReport> {
+        self.run_continuous_with_termination(
+            scheduled_start_unix_ms,
+            measurement_start_unix_ms,
+            measurement_end_unix_ms,
+            termination_signal(),
+        )
+        .await
+    }
+
+    async fn run_continuous_with_termination<F>(
+        self: &Arc<Self>,
+        scheduled_start_unix_ms: u64,
+        measurement_start_unix_ms: u64,
+        measurement_end_unix_ms: u64,
+        termination: F,
+    ) -> Result<ContinuousReport>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
         let measurement = Arc::new(Measurement::new(
             measurement_start_unix_ms,
             measurement_end_unix_ms,
@@ -1481,11 +2128,12 @@ impl PreparedClient {
             .measurement
             .lock()
             .map_err(|_| anyhow::anyhow!("measurement state poisoned"))? = Some(Arc::clone(&measurement));
+        tokio::pin!(termination);
         while unix_ms()? < scheduled_start_unix_ms {
-            tokio::time::sleep(Duration::from_millis(
-                scheduled_start_unix_ms.saturating_sub(unix_ms()?).min(10),
-            ))
-            .await;
+            tokio::select! {
+                result = &mut termination => { result?; anyhow::bail!("client received SIGTERM before scheduled start"); },
+                () = tokio::time::sleep(Duration::from_millis(scheduled_start_unix_ms.saturating_sub(unix_ms()?).min(10))) => {},
+            }
         }
         let scheduled_start_observed_unix_ms = unix_ms()?;
         anyhow::ensure!(
@@ -1499,11 +2147,17 @@ impl PreparedClient {
                 let measurement = Arc::clone(&measurement);
                 tasks.spawn(async move {
                     let channel = this.channels[worker][slot % this.channels[worker].len()].clone();
-                    replenish_until(measurement.end_unix_ms, this.options.interval_us, || async {
-                        this.send_continuous_one(worker, channel.clone(), this.next_batch(worker), &measurement)
-                            .await
-                    })
-                    .await
+                    while !measurement.stopped() && unix_ms()? < measurement.end_unix_ms {
+                        if !this.send_continuous_one(worker, channel.clone(), this.next_batch(worker), &measurement).await? { break; }
+                        if this.options.interval_us > 0 {
+                            let remaining = measurement.end_unix_ms.saturating_sub(unix_ms()?);
+                            tokio::select! {
+                                () = tokio::time::sleep(Duration::from_micros(this.options.interval_us.min(remaining.saturating_mul(1000)))) => {},
+                                () = measurement.wait_stopped() => break,
+                            }
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
                 });
             }
         }
@@ -1536,9 +2190,29 @@ impl PreparedClient {
         };
         tokio::pin!(resource_end);
         let mut resource_end_recorded = false;
+        let mut quiescing = false;
+        let mut terminated = false;
+        let quiesce_timeout = Duration::from_millis(
+            self.options
+                .quiesce_timeout_ms
+                .unwrap_or(self.options.request_timeout_ms),
+        );
+        let deadline = tokio::time::sleep(Duration::from_secs(86_400));
+        tokio::pin!(deadline);
         loop {
+            if quiescing && tasks.is_empty() {
+                break;
+            }
             tokio::select! {
-                result = &mut phase, if measurement_started.is_none() => {
+                biased;
+                result = &mut termination, if !quiescing => {
+                    result?;
+                    terminated = true;
+                    quiescing = true;
+                    measurement.stop.send_replace(true);
+                    deadline.as_mut().reset(tokio::time::Instant::now() + quiesce_timeout);
+                }
+                result = &mut phase, if measurement_started.is_none() && !quiescing => {
                     match result {
                         Ok(started) => measurement_started = Some(started),
                         Err(error) => {
@@ -1548,15 +2222,27 @@ impl PreparedClient {
                         }
                     }
                 }
-                result = &mut resource_end, if !resource_end_recorded => {
+                result = &mut resource_end, if !resource_end_recorded && !quiescing => {
                     match result {
-                        Ok(()) => resource_end_recorded = true,
+                        Ok(()) => {
+                            resource_end_recorded = true;
+                            quiescing = true;
+                            measurement.stop.send_replace(true);
+                            let elapsed_since_end = Duration::from_millis(unix_ms()?.saturating_sub(measurement_end_unix_ms));
+                            deadline.as_mut().reset(tokio::time::Instant::now() + quiesce_timeout.saturating_sub(elapsed_since_end));
+                        },
                         Err(error) => {
                             tasks.abort_all();
                             while tasks.join_next().await.is_some() {}
                             return Err(error);
                         }
                     }
+                }
+                () = &mut deadline, if quiescing && !tasks.is_empty() => {
+                    measurement.deadline_expired.store(true, Ordering::Relaxed);
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    anyhow::bail!("client quiesce deadline exceeded; in-flight sends are ambiguous");
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     match result {
@@ -1575,6 +2261,9 @@ impl PreparedClient {
                 }
                 else => break,
             }
+        }
+        if terminated {
+            anyhow::bail!("client received SIGTERM; in-flight sends drained");
         }
         Ok(ContinuousReport {
             completed_rows: measurement.rows.load(Ordering::Relaxed),
@@ -1706,12 +2395,16 @@ impl PreparedClient {
         logical: &LogicalBatch,
         measurement: Option<&Measurement>,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
+        if let Some(measurement) = measurement
+            && (measurement.stopped() || unix_ms()? >= measurement.end_unix_ms)
+        {
+            if let Some(index) = logical.manifest_index {
+                self.record_manifest_outcome(index, ManifestOutcome::NotAdmitted, Some(unix_ms()?))?;
+            }
+            return Ok(None);
+        }
         let batch = &logical.batch;
         let counters = &self.counters[worker];
-        counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
-        counters
-            .attempted_bytes
-            .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
         let mut attempt = Attempt {
             counters,
             batch,
@@ -1719,22 +2412,47 @@ impl PreparedClient {
             send_started: false,
             started: Instant::now(),
             finished: false,
+            measurement,
+            send_unix_ns: 0,
         };
         let observation = SendObservation::fresh()?;
-        let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
+        let mut request = Request::new(stream::iter(send_frames(&batch.data, self.options.send_iter)));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
             request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
             request.set_timeout(timeout);
+            if let Some(measurement) = measurement
+                && (measurement.stopped() || unix_ms()? >= measurement.end_unix_ms)
+            {
+                return Ok(None);
+            }
             if let Some(index) = logical.manifest_index {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
-                attempt.send_started = true;
             }
-            completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
+            counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
+            counters
+                .attempted_bytes
+                .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
+            attempt.send_started = true;
+            attempt.send_unix_ns = observation.send_unix_ns;
+            completed_admission(self.options.client(channel).do_put(request).await?.into_inner())
+                .await
+                .map(Some)
         })
-        .await
-        .context("DMV upload timeout")
-        .and_then(std::convert::identity);
+        .await;
+        let timed_out = result.is_err();
+        let result = result.context("DMV upload timeout").and_then(std::convert::identity);
+        let result = match result {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => {
+                if let Some(index) = logical.manifest_index {
+                    self.record_manifest_outcome(index, ManifestOutcome::NotAdmitted, Some(unix_ms()?))?;
+                }
+                attempt.finished = true;
+                return Ok(None);
+            }
+            Err(error) => Err(error),
+        };
         if let Some(index) = logical.manifest_index {
             let outcome = match &result {
                 Ok(_) => ManifestOutcome::Acknowledged,
@@ -1749,6 +2467,23 @@ impl PreparedClient {
         } else {
             None
         };
+        if attempt.send_started
+            && let Some(measurement) = measurement
+        {
+            let timeout_status = result.as_ref().err().is_some_and(|error| {
+                error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<tonic::Status>()
+                        .is_some_and(|status| status.code() == tonic::Code::DeadlineExceeded)
+                })
+            });
+            measurement.record_send_outcome(
+                observation.send_unix_ns,
+                result.is_ok(),
+                timed_out || timeout_status,
+                result.as_ref().err().is_some_and(is_ambiguous_continuous_error),
+            );
+        }
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Some(measurement) = measurement {
@@ -1814,7 +2549,10 @@ impl PreparedClient {
                 .context("acquire realistic live-batch memory reservation")
         };
         let window_end = async move {
-            tokio::time::sleep_until(deadline).await;
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {},
+                () = measurement.wait_stopped() => {},
+            }
             Ok::<(), anyhow::Error>(())
         };
         self.send_continuous_one_with_admission(
@@ -1825,7 +2563,7 @@ impl PreparedClient {
             ContinuousAdmission {
                 acquire_permit,
                 window_end,
-                window_open: || Ok::<bool, anyhow::Error>(unix_ms()? < end_unix_ms),
+                window_open: || Ok::<bool, anyhow::Error>(!measurement.stopped() && unix_ms()? < end_unix_ms),
             },
         )
         .await
@@ -1848,6 +2586,12 @@ impl PreparedClient {
             return Ok(false);
         };
         for attempt in 1..=self.options.stream_retry_max_attempts {
+            if measurement.stopped() || unix_ms()? >= measurement.end_unix_ms {
+                if let Some(index) = logical.manifest_index {
+                    self.record_manifest_outcome(index, ManifestOutcome::NotAdmitted, Some(unix_ms()?))?;
+                }
+                return Ok(false);
+            }
             match self
                 .send_encoded_one(worker, channel.clone(), &logical, Some(measurement))
                 .await
@@ -1866,12 +2610,14 @@ impl PreparedClient {
                     counters.retried_streams.fetch_add(1, Ordering::Relaxed);
                     counters.retried_rows.fetch_add(batch.rows, Ordering::Relaxed);
                     measurement.record_retry(batch.rows, unix_ms()?);
-                    tokio::time::sleep(stream_retry_backoff(
-                        self.options.stream_retry_base_backoff_ms,
-                        self.options.stream_retry_max_backoff_ms,
-                        attempt,
-                    ))
-                    .await;
+                    tokio::select! {
+                        () = tokio::time::sleep(stream_retry_backoff(
+                            self.options.stream_retry_base_backoff_ms,
+                            self.options.stream_retry_max_backoff_ms,
+                            attempt,
+                        )) => {},
+                        () = measurement.wait_stopped() => return Ok(false),
+                    }
                 }
                 Err(error) if is_ambiguous_continuous_error(&error) => {
                     let counters = &self.counters[worker];
@@ -2025,6 +2771,20 @@ fn unix_ms() -> Result<u64> {
     )?)
 }
 
+async fn termination_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        signal.recv().await.context("SIGTERM listener closed")?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<Result<()>>().await
+    }
+}
+
+#[cfg(test)]
 async fn replenish_until<F, Fut>(end_unix_ms: u64, interval_us: u64, mut send: F) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -2068,7 +2828,9 @@ fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> 
         .fields()
         .iter()
         .map(|field| match field.data_type() {
-            DataType::Utf8 if field.name() == "customer_id" => client_id.len() as u64 + 5,
+            DataType::Utf8 if field.name() == "customer_id" => {
+                options.payload_customer_id.as_deref().unwrap_or(client_id).len() as u64 + 5
+            }
             DataType::Utf8 => {
                 let category_width = if options.data_profile == DataProfile::Realistic {
                     realistic_category_max_width(field.name())
@@ -2137,24 +2899,36 @@ fn memory_budget(
             .context("realistic profile has no tables for live-batch budgeting")?;
         let rows_per_batch = rows.min(options.batch_rows);
         budget.per_live_batch_bytes = memory_estimate(tables, rows_per_batch, identity_row_bytes, 1, options)?;
-        let available = options
-            .max_memory_bytes
-            .checked_sub(corpus_bytes)
-            .context("corpus reservation exceeds max-memory-bytes")?;
-        anyhow::ensure!(
-            available >= budget.per_live_batch_bytes,
-            "one realistic live batch needs {} reserved bytes beyond the {}-byte corpus reservation, exceeding max-memory-bytes={}",
-            budget.per_live_batch_bytes,
-            corpus_bytes,
-            options.max_memory_bytes
-        );
-        budget.admitted_live_slots =
-            usize::try_from((available / budget.per_live_batch_bytes).min(configured_live_slots as u64))
-                .context("admitted live-batch slot count exceeds address space")?;
-        anyhow::ensure!(
-            budget.admitted_live_slots > 0,
-            "no realistic live-batch slot fits max-memory-bytes"
-        );
+        let available = options.max_memory_bytes.saturating_sub(corpus_bytes);
+        let configured_slots =
+            u64::try_from(configured_live_slots).context("configured live stream count exceeds u64")?;
+        let required_reservation =
+            u128::from(corpus_bytes) + u128::from(budget.per_live_batch_bytes) * u128::from(configured_slots);
+        budget.admitted_live_slots = usize::try_from((available / budget.per_live_batch_bytes).min(configured_slots))
+            .context("admitted live-batch slot count exceeds address space")?;
+        if budget.admitted_live_slots != configured_live_slots {
+            let evidence = serde_json::json!({
+                "version": 1,
+                "status": "client_under_admission",
+                "configured_slots": configured_live_slots,
+                "admitted_slots": budget.admitted_live_slots,
+                "required_reservation_bytes": u64::try_from(required_reservation).ok(),
+                "required_reservation_bytes_exact": required_reservation.to_string(),
+                "max_memory_bytes": options.max_memory_bytes,
+                "corpus_reservation_bytes": corpus_bytes,
+                "per_live_batch_reservation_bytes": budget.per_live_batch_bytes,
+            });
+            eprintln!("OAT_CLIENT_ADMISSION_REJECTED {evidence}");
+            anyhow::bail!(
+                "client_under_admission configured_slots={} admitted_slots={} required_reservation_bytes={} max_memory_bytes={} corpus_reservation_bytes={} per_live_batch_reservation_bytes={}",
+                configured_live_slots,
+                budget.admitted_live_slots,
+                required_reservation,
+                options.max_memory_bytes,
+                corpus_bytes,
+                budget.per_live_batch_bytes
+            );
+        }
         budget.live_batch_bytes = budget
             .per_live_batch_bytes
             .checked_mul(budget.admitted_live_slots as u64)
@@ -2185,7 +2959,7 @@ fn estimated_identity_row_bytes(table: &DmvTable, client_id: &str, options: &Opt
         "logical identity endpoint_url column must be a nonnullable string"
     );
     let previous_width = match endpoint.name().as_str() {
-        "customer_id" => client_id.len(),
+        "customer_id" => options.payload_customer_id.as_deref().unwrap_or(client_id).len(),
         name => realistic_category_max_width(name).unwrap_or_else(|| {
             if options.string_width == 0 {
                 name.len() + 32
@@ -2299,6 +3073,190 @@ fn synthetic_guid(seed: u64, pod_ordinal: u32, worker: usize, column: usize, row
     uuid::Uuid::from_u128(value).to_string()
 }
 
+fn payload_hash_scope(profile: DataProfile) -> &'static str {
+    match profile {
+        DataProfile::Diagnostic => "arrow-logical-v2-all-columns",
+        DataProfile::Realistic => "arrow-logical-v2-excluding-endpoint_url",
+    }
+}
+
+fn payload_profile_name(profile: DataProfile) -> &'static str {
+    match profile {
+        DataProfile::Diagnostic => "diagnostic",
+        DataProfile::Realistic => "realistic",
+    }
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {
+    hasher.update(u64::try_from(bytes.len())?.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_u64(hasher: &mut Sha256, value: usize) -> Result<()> {
+    hasher.update(u64::try_from(value)?.to_le_bytes());
+    Ok(())
+}
+
+fn new_payload_hasher(profile: DataProfile, copies: usize, tables: usize) -> Result<Sha256> {
+    let mut hasher = Sha256::new();
+    hasher.update(PAYLOAD_HASH_DOMAIN);
+    hasher.update(PAYLOAD_HASH_VERSION.to_le_bytes());
+    hash_bytes(&mut hasher, payload_profile_name(profile).as_bytes())?;
+    hash_u64(&mut hasher, copies)?;
+    hash_u64(&mut hasher, tables)?;
+    Ok(hasher)
+}
+
+fn hash_data_type(hasher: &mut Sha256, data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Utf8 => hash_bytes(hasher, b"utf8")?,
+        DataType::Boolean => hash_bytes(hasher, b"bool")?,
+        DataType::UInt8 => hash_bytes(hasher, b"u8")?,
+        DataType::Int16 => hash_bytes(hasher, b"i16")?,
+        DataType::Int32 => hash_bytes(hasher, b"i32")?,
+        DataType::Int64 => hash_bytes(hasher, b"i64")?,
+        DataType::Float64 => hash_bytes(hasher, b"f64")?,
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            hash_bytes(hasher, b"timestamp_us")?;
+            if let Some(timezone) = timezone {
+                hasher.update([1]);
+                hash_bytes(hasher, timezone.as_bytes())?;
+            } else {
+                hasher.update([0]);
+            }
+        }
+        other => bail!("unsupported synthetic payload hash type {other}"),
+    }
+    Ok(())
+}
+
+fn hash_array_value(hasher: &mut Sha256, array: &dyn Array, data_type: &DataType, row: usize) -> Result<()> {
+    if array.is_null(row) {
+        hasher.update([0]);
+        return Ok(());
+    }
+    hasher.update([1]);
+    match data_type {
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("payload string column type mismatch")?;
+            hash_bytes(hasher, values.value(row).as_bytes())?;
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("payload boolean column type mismatch")?;
+            hasher.update([u8::from(values.value(row))]);
+        }
+        DataType::UInt8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .context("payload u8 column type mismatch")?;
+            hasher.update([values.value(row)]);
+        }
+        DataType::Int16 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .context("payload i16 column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        DataType::Int32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context("payload i32 column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("payload i64 column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .context("payload f64 column type mismatch")?;
+            hasher.update(values.value(row).to_bits().to_le_bytes());
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("payload timestamp column type mismatch")?;
+            hasher.update(values.value(row).to_le_bytes());
+        }
+        other => bail!("unsupported synthetic payload hash type {other}"),
+    }
+    Ok(())
+}
+
+fn hash_payload_batch(
+    hasher: &mut Sha256,
+    table: &DmvTable,
+    batch: &RecordBatch,
+    copy: usize,
+    offset: usize,
+    total_rows: usize,
+    profile: DataProfile,
+) -> Result<()> {
+    anyhow::ensure!(
+        batch.schema().as_ref() == table.schema.as_ref(),
+        "payload batch schema changed"
+    );
+    anyhow::ensure!(
+        offset
+            .checked_add(batch.num_rows())
+            .is_some_and(|end| end <= total_rows),
+        "payload batch exceeds table row count"
+    );
+    let schema = batch.schema();
+    let fields = schema.fields();
+    let include_field =
+        |field: &arrow_schema::Field| profile != DataProfile::Realistic || field.name() != "endpoint_url";
+    let field_count = fields.iter().filter(|field| include_field(field)).count();
+    if offset == 0 {
+        hasher.update([0x10]);
+        hash_u64(hasher, copy)?;
+        hash_bytes(hasher, table.identity.catalog().to_string().as_bytes())?;
+        hash_bytes(hasher, table.identity.schema().to_string().as_bytes())?;
+        hash_bytes(hasher, table.identity.table().to_string().as_bytes())?;
+        hash_u64(hasher, total_rows)?;
+        hash_u64(hasher, field_count)?;
+        for (index, field) in fields.iter().enumerate().filter(|(_, field)| include_field(field)) {
+            hasher.update([HASH_FIELD]);
+            hash_u64(hasher, index)?;
+            hash_bytes(hasher, field.name().as_bytes())?;
+            hash_data_type(hasher, field.data_type())?;
+            hasher.update([u8::from(field.is_nullable())]);
+        }
+    }
+    for row in 0..batch.num_rows() {
+        hasher.update([HASH_ROW]);
+        hash_u64(hasher, offset + row)?;
+        for (index, field) in fields.iter().enumerate().filter(|(_, field)| include_field(field)) {
+            hash_array_value(hasher, batch.column(index).as_ref(), field.data_type(), row)?;
+        }
+    }
+    if offset + batch.num_rows() == total_rows {
+        hasher.update([0x12]);
+    }
+    Ok(())
+}
+
+fn finish_payload_hasher(mut hasher: Sha256) -> String {
+    hasher.update([0xff]);
+    format!("{:x}", hasher.finalize())
+}
+
 fn synthetic_batch(
     table: &DmvTable,
     client_id: &str,
@@ -2347,9 +3305,9 @@ fn synthetic_batch(
                 };
             }
             Ok(match field.data_type() {
-                DataType::Utf8 if field.name() == "customer_id" => {
-                    Arc::new(StringArray::from_iter_values(std::iter::repeat_n(client_id, rows)))
-                }
+                DataType::Utf8 if field.name() == "customer_id" => Arc::new(StringArray::from_iter_values(
+                    std::iter::repeat_n(options.payload_customer_id.as_deref().unwrap_or(client_id), rows),
+                )),
                 DataType::Utf8 => Arc::new(StringArray::from_iter((0..rows).map(|row| {
                     valid(row).then(|| {
                         if is_guid_field(field.name())
@@ -2468,6 +3426,7 @@ fn batch_with_logical_identity(
     incarnation_id: uuid::Uuid,
     worker: usize,
     sequence: u64,
+    builder: IdentityBuilder,
 ) -> Result<RecordBatch> {
     let identity_column = batch
         .schema()
@@ -2477,10 +3436,46 @@ fn batch_with_logical_identity(
         batch.schema().field(identity_column).data_type() == &DataType::Utf8,
         "logical identity endpoint_url column must be a nonnullable string"
     );
-    let values = (0..batch.num_rows())
-        .map(|row| logical_identity_url(run_id, incarnation_id, worker, sequence, row))
-        .collect::<Result<Vec<_>>>()?;
-    let identity: ArrayRef = Arc::new(StringArray::from_iter_values(values.iter().map(String::as_str)));
+    let identity: ArrayRef = match builder {
+        IdentityBuilder::FormattedRows => {
+            let values = (0..batch.num_rows())
+                .map(|row| logical_identity_url(run_id, incarnation_id, worker, sequence, row))
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StringArray::from_iter_values(values.iter().map(String::as_str)))
+        }
+        IdentityBuilder::DirectUtf8 => {
+            use std::fmt::Write as _;
+            anyhow::ensure!(worker < 1_024, "logical identity worker id exceeds 1023");
+            let last_row = batch.num_rows().saturating_sub(1);
+            u32::try_from(last_row).context("logical identity row ordinal exceeds u32")?;
+            let prefix = format!(
+                "https://x.invalid/v1/{}/{}/{}/{}/",
+                run_id.simple(),
+                incarnation_id.simple(),
+                worker,
+                base36(sequence)
+            );
+            let width = prefix
+                .len()
+                .checked_add(last_row.to_string().len())
+                .context("identity width overflow")?;
+            let capacity = width
+                .checked_mul(batch.num_rows())
+                .context("identity values capacity overflow")?;
+            anyhow::ensure!(
+                capacity <= i32::MAX as usize,
+                "identity values exceed Arrow Utf8 capacity"
+            );
+            let mut array = arrow_array::builder::StringBuilder::with_capacity(batch.num_rows(), capacity);
+            let mut value = String::with_capacity(width);
+            for row in 0..batch.num_rows() {
+                value.clear();
+                write!(&mut value, "{prefix}{row}")?;
+                array.append_value(&value);
+            }
+            Arc::new(array.finish())
+        }
+    };
     let columns = batch
         .columns()
         .iter()
@@ -2515,7 +3510,10 @@ async fn encode(table: &DmvTable, version: &str, batch: RecordBatch, options: &O
     let data = FlightDataEncoderBuilder::new()
         .with_schema(Arc::clone(&table.schema))
         .with_flight_descriptor(Some(descriptor))
-        .with_options(IpcWriteOptions::default().try_with_compression(compression)?)
+        .with_options(
+            IpcWriteOptions::try_new(options.ipc_alignment, false, arrow_ipc::MetadataVersion::V5)?
+                .try_with_compression(compression)?,
+        )
         .with_dictionary_handling(match options.dictionary_handling {
             Dictionaries::Hydrate => DictionaryHandling::Hydrate,
             Dictionaries::Resend => DictionaryHandling::Resend,
@@ -2960,6 +3958,276 @@ mod tests {
             .resolve(100, 1)
     }
 
+    #[tokio::test]
+    async fn http2_frame_and_keepalive_reach_the_wire() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut preface = [0; 24];
+            socket.read_exact(&mut preface).await?;
+            anyhow::ensure!(&preface == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "bad HTTP/2 preface");
+            socket.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+            let mut max_frame = None;
+            loop {
+                let mut header = [0; 9];
+                socket.read_exact(&mut header).await?;
+                let len = (usize::from(header[0]) << 16) | (usize::from(header[1]) << 8) | usize::from(header[2]);
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await?;
+                if header[3] == 4 && header[4] == 0 {
+                    for entry in body.chunks_exact(6) {
+                        if entry[0..2] == [0, 5] {
+                            max_frame = Some(u32::from_be_bytes(entry[2..6].try_into()?));
+                        }
+                    }
+                }
+                if header[3] == 6 && header[4] == 0 {
+                    break;
+                }
+            }
+            let ping_at = Instant::now();
+            let mut byte = [0];
+            let end = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut byte)).await??;
+            anyhow::ensure!(end == 0, "client did not close after an unanswered ping");
+            Ok::<_, anyhow::Error>((max_frame, ping_at.elapsed()))
+        });
+        let mut options = options()?;
+        options.max_frame_bytes = 32_768;
+        options.keepalive_interval_ms = 25;
+        options.keepalive_timeout_ms = 150;
+        let (channel, _) = options.connect(&address).await?;
+        let (frame, elapsed) = tokio::time::timeout(Duration::from_secs(5), server).await???;
+        assert_eq!(frame, Some(32_768));
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "keepalive timed out prematurely: {elapsed:?}"
+        );
+        drop(channel);
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_tunables_reach_tonic_endpoint() -> Result<()> {
+        let mut options = options()?;
+        options.tcp_nodelay = false;
+        options.tcp_keepalive_ms = 1_500;
+        options.tcp_keepalive_interval_ms = 700;
+        options.tcp_keepalive_retries = 3;
+        options.connect_timeout_ms = 1_200;
+        let endpoint = options.endpoint("http://127.0.0.1:1234")?;
+        assert!(!endpoint.get_tcp_nodelay());
+        assert_eq!(endpoint.get_tcp_keepalive(), Some(Duration::from_millis(1_500)));
+        assert_eq!(endpoint.get_tcp_keepalive_interval(), Some(Duration::from_millis(700)));
+        assert_eq!(endpoint.get_tcp_keepalive_retries(), Some(3));
+        assert_eq!(endpoint.get_connect_timeout(), Some(Duration::from_millis(1_200)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_identity_matches_formatted_rows_and_encoded_frames() -> Result<()> {
+        use prost::Message;
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let batch = synthetic_batch(&table, "identity-test", 37, 0, 0, &options)?;
+        for (worker, sequence) in [(0, 0), (1023, u64::MAX)] {
+            let args = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+            let formatted =
+                batch_with_logical_identity(&batch, args.0, args.1, worker, sequence, IdentityBuilder::FormattedRows)?;
+            let direct =
+                batch_with_logical_identity(&batch, args.0, args.1, worker, sequence, IdentityBuilder::DirectUtf8)?;
+            assert_eq!(formatted, direct);
+            let frames = encode(&table, "v1", formatted, &options).await?;
+            let direct_frames = encode(&table, "v1", direct, &options).await?;
+            assert_eq!(
+                frames.iter().map(Message::encode_to_vec).collect::<Vec<_>>(),
+                direct_frames.iter().map(Message::encode_to_vec).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_cursor_replays_identical_frames_without_eager_cloning() -> Result<()> {
+        use prost::Message;
+        let frames = Arc::new(vec![
+            FlightData {
+                data_header: vec![1, 2].into(),
+                ..Default::default()
+            },
+            FlightData {
+                data_body: vec![3, 4, 5].into(),
+                ..Default::default()
+            },
+        ]);
+        let expected = send_frames(&frames, SendIter::CloneVec)
+            .map(|frame| frame.encode_to_vec())
+            .collect::<Vec<_>>();
+        let mut cursor = send_frames(&frames, SendIter::ArcCursor);
+        assert_eq!(Arc::strong_count(&frames), 2);
+        assert_eq!(
+            cursor.next().context("missing first frame")?.encode_to_vec(),
+            expected[0]
+        );
+        assert_eq!(
+            cursor.next().context("missing second frame")?.encode_to_vec(),
+            expected[1]
+        );
+        assert!(cursor.next().is_none());
+        let retry = send_frames(&frames, SendIter::ArcCursor)
+            .map(|frame| frame.encode_to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(retry, expected);
+        Ok(())
+    }
+
+    fn hash_test_batches(
+        table: &DmvTable,
+        profile: DataProfile,
+        copy: usize,
+        batches: &[RecordBatch],
+    ) -> Result<String> {
+        let total_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let mut hasher = new_payload_hasher(profile, copy + 1, 1)?;
+        let mut offset = 0;
+        for batch in batches {
+            hash_payload_batch(&mut hasher, table, batch, copy, offset, total_rows, profile)?;
+            offset += batch.num_rows();
+        }
+        Ok(finish_payload_hasher(hasher))
+    }
+
+    #[test]
+    fn independently_generated_corpus_hash_ignores_send_batch_size() -> Result<()> {
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let total_rows = 65_537;
+        for profile in [DataProfile::Diagnostic, DataProfile::Realistic] {
+            let hash_for = |batch_rows: usize| -> Result<String> {
+                let mut options = options()?;
+                options.data_profile = profile;
+                options.batch_rows = batch_rows;
+                options.null_fraction = 0.2;
+                let mut hasher = new_payload_hasher(profile, 1, 1)?;
+                for offset in (0..total_rows).step_by(batch_rows) {
+                    let rows = batch_rows.min(total_rows - offset);
+                    let batch = synthetic_batch(&table, "logical-hash", rows, offset, 0, &options)?;
+                    hash_payload_batch(&mut hasher, &table, &batch, 0, offset, total_rows, profile)?;
+                }
+                Ok(finish_payload_hasher(hasher))
+            };
+            assert_eq!(hash_for(4096)?, hash_for(65_536)?, "{profile:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn logical_corpus_hash_ignores_batch_splits_and_detects_order_or_value_changes() -> Result<()> {
+        let options = options()?;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let batch = synthetic_batch(&table, "logical-hash", 7, 0, 0, &options)?;
+        let whole = hash_test_batches(&table, DataProfile::Diagnostic, 0, std::slice::from_ref(&batch))?;
+        let ragged = [batch.slice(0, 2), batch.slice(2, 1), batch.slice(3, 4)];
+        assert_eq!(whole, hash_test_batches(&table, DataProfile::Diagnostic, 0, &ragged)?);
+        let reordered = [batch.slice(3, 4), batch.slice(0, 3)];
+        assert_ne!(
+            whole,
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &reordered)?
+        );
+        let column = table.schema.index_of("replica_server_name")?;
+        let values = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("replica_server_name is not a string")?;
+        let changed_values = StringArray::from_iter((0..batch.num_rows()).map(|row| {
+            if row == 3 {
+                Some("changed-middle-value")
+            } else if values.is_null(row) {
+                None
+            } else {
+                Some(values.value(row))
+            }
+        }));
+        let mut columns = batch.columns().to_vec();
+        columns[column] = Arc::new(changed_values);
+        let changed = RecordBatch::try_new(batch.schema(), columns)?;
+        assert_ne!(
+            whole,
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[changed])?
+        );
+        assert_ne!(whole, hash_test_batches(&table, DataProfile::Diagnostic, 1, &[batch])?);
+        Ok(())
+    }
+
+    #[test]
+    fn logical_corpus_hash_covers_all_public_generator_schemas() -> Result<()> {
+        let options = options()?;
+        for table in tables()? {
+            let batch = synthetic_batch(&table, "all-public-schemas", 3, 0, 0, &options)?;
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[batch])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_business_payload_retains_distinct_delivery_identities() -> Result<()> {
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        options.payload_customer_id = Some("direct-e64-confirmwide".to_owned());
+        let table = table_named("sqlserver_availability_replica_states")?;
+        options.data_profile = DataProfile::Diagnostic;
+        assert_eq!(
+            synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?,
+            synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?
+        );
+        options.data_profile = DataProfile::Realistic;
+        let first = synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?;
+        let second = synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?;
+        assert_eq!(first, second);
+        let customer = first
+            .column_by_name("customer_id")
+            .context("customer_id missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("customer_id is not a string")?;
+        assert!(customer.iter().all(|value| value == Some("direct-e64-confirmwide")));
+        let a = batch_with_logical_identity(
+            &first,
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            0,
+            0,
+            IdentityBuilder::FormattedRows,
+        )?;
+        let b = batch_with_logical_identity(
+            &second,
+            uuid::Uuid::from_u128(3),
+            uuid::Uuid::from_u128(4),
+            0,
+            0,
+            IdentityBuilder::FormattedRows,
+        )?;
+        assert_ne!(a.column_by_name("endpoint_url"), b.column_by_name("endpoint_url"));
+        assert_eq!(
+            hash_test_batches(&table, DataProfile::Realistic, 0, std::slice::from_ref(&a))?,
+            hash_test_batches(&table, DataProfile::Realistic, 0, std::slice::from_ref(&b))?
+        );
+        assert_ne!(
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[a])?,
+            hash_test_batches(&table, DataProfile::Diagnostic, 0, &[b])?
+        );
+        options.payload_customer_id = None;
+        assert_ne!(
+            synthetic_batch(&table, "delivery-run-one", 8, 0, 0, &options)?,
+            synthetic_batch(&table, "delivery-run-two", 8, 0, 0, &options)?,
+        );
+        options.payload_customer_id = Some("bad identity!".to_owned());
+        assert!(options.resolve(100, 1).is_err());
+        Ok(())
+    }
+
     fn manifest_test_client() -> Result<PreparedClient> {
         let mut options = options()?;
         options.data_profile = DataProfile::Realistic;
@@ -2967,6 +4235,7 @@ mod tests {
         Ok(PreparedClient {
             corpus: Vec::new(),
             channels: Vec::new(),
+            socket_observations: Vec::new(),
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             signer: None,
             counters: (0..workers).map(|_| Counters::default()).collect(),
@@ -3250,6 +4519,8 @@ mod tests {
             vec!["--stream-window-bytes", "2147483648"],
             vec!["--dictionary-handling", "resend"],
             vec!["--stream-retry-max-attempts", "0"],
+            vec!["--rate-limit-period-ms", "0"],
+            vec!["--rate-limit-period-ms", "86400001"],
             vec![
                 "--stream-retry-base-backoff-ms",
                 "100",
@@ -3300,7 +4571,14 @@ mod tests {
         let base_ipc_data = encode(&table, "v1", batch.clone(), &options).await?;
         let base_ipc_bytes_per_row =
             base_ipc_data.iter().map(|message| message.encoded_len()).sum::<usize>() / batch.num_rows();
-        let identity_batch = batch_with_logical_identity(&batch, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0, 0)?;
+        let identity_batch = batch_with_logical_identity(
+            &batch,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            0,
+            0,
+            IdentityBuilder::FormattedRows,
+        )?;
         let identity_ipc_data = encode(&table, "v1", identity_batch.clone(), &options).await?;
         let identity_ipc_bytes_per_row = identity_ipc_data
             .iter()
@@ -3446,7 +4724,20 @@ mod tests {
         assert_eq!(evidence["resolved"]["batch_rows"], 123);
         assert_eq!(evidence["resolved"]["corpus_rows"], 123);
         assert_eq!(evidence["resolved"]["streams_per_worker"], 7);
+        assert_eq!(evidence["streams_per_worker_source"], "legacy_concurrency");
         assert_eq!(evidence["corpus_rows_source"], "legacy_rows");
+        for mode in [DataMode::Shared, DataMode::Independent] {
+            for profile in [DataProfile::Diagnostic, DataProfile::Realistic] {
+                let mut options = options()?;
+                options.data_mode = mode;
+                options.data_profile = profile;
+                options.workers = 14;
+                options.streams_per_worker = 0;
+                let (resolved, proof) = options.resolve_with_evidence(123, 2)?;
+                assert_eq!(resolved.workers * resolved.streams_per_worker, 28);
+                assert_eq!(proof["streams_per_worker_source"], "legacy_concurrency");
+            }
+        }
 
         let mut options = options()?;
         options.corpus_rows = 0;
@@ -3474,11 +4765,46 @@ mod tests {
         for codec in [IpcCompression::None, IpcCompression::Lz4Frame, IpcCompression::Zstd] {
             options.ipc_compression = codec;
             let encoded = encode(&table, "v1", batch.clone(), &options).await?;
+            let mut observed_codecs = Vec::new();
+            for data in &encoded {
+                let message = arrow_ipc::root_as_message(&data.data_header)
+                    .map_err(|error| anyhow::anyhow!("invalid IPC header: {error:?}"))?;
+                if let Some(record_batch) = message.header_as_record_batch() {
+                    observed_codecs.push(record_batch.compression().map(|compression| compression.codec()));
+                }
+            }
+            let expected = match codec {
+                IpcCompression::None => None,
+                IpcCompression::Lz4Frame => Some(arrow_ipc::CompressionType::LZ4_FRAME),
+                IpcCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
+            };
+            assert!(!observed_codecs.is_empty());
+            assert!(observed_codecs.iter().all(|observed| *observed == expected));
             let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(encoded.into_iter().map(Ok)))
                 .try_collect::<Vec<_>>()
                 .await?;
             assert_eq!(decoded, vec![batch.clone()]);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_alignment_changes_padding_without_changing_rows() -> Result<()> {
+        use arrow_flight::decode::FlightRecordBatchStream;
+        let table = table_named("sqlserver_wait_stats")?;
+        let mut options = options()?;
+        let batch = synthetic_batch(&table, "client", 3, 0, 0, &options)?;
+        let mut sizes = Vec::new();
+        for alignment in [8, 64] {
+            options.ipc_alignment = alignment;
+            let encoded = encode(&table, "v1", batch.clone(), &options).await?;
+            sizes.push(encoded.iter().map(|message| message.data_body.len()).sum::<usize>());
+            let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(encoded.into_iter().map(Ok)))
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(decoded, vec![batch.clone()]);
+        }
+        assert!(sizes[0] < sizes[1]);
         Ok(())
     }
 
@@ -3496,41 +4822,152 @@ mod tests {
     }
 
     #[test]
-    fn realistic_memory_budget_admits_only_live_batches_that_fit() -> Result<()> {
-        let table = table_named("sqlserver_availability_replica_states")?;
-        let tables = vec![table];
+    fn realistic_memory_budget_requires_every_configured_slot() -> Result<()> {
+        let tables = vec![table_named("sqlserver_availability_replica_states")?];
         let mut options = options()?;
         options.data_profile = DataProfile::Realistic;
-        options.workers = 32;
-        options.streams_per_worker = 32;
-        options.batch_rows = 32_768;
-        options.corpus_rows = 32_768;
+        options.workers = 4;
+        options.streams_per_worker = 3;
+        options.batch_rows = 128;
+        options.corpus_rows = 256;
         options.string_width = 96;
-        options.max_memory_bytes = 512 * 1_024 * 1_024;
+        options.max_memory_bytes = u64::MAX;
         let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
         let budget = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
-        assert_eq!(budget.configured_live_slots, 1_024);
-        assert!(budget.admitted_live_slots > 0);
-        assert!(budget.admitted_live_slots < budget.configured_live_slots);
+        assert_eq!(budget.configured_live_slots, 12);
+        assert_eq!(budget.admitted_live_slots, 12);
+        assert_eq!(budget.live_batch_bytes, budget.per_live_batch_bytes * 12);
         assert_eq!(budget.total_bytes, budget.corpus_bytes + budget.live_batch_bytes);
-        assert!(budget.total_bytes <= options.max_memory_bytes);
-        eprintln!(
-            "W2_MEMORY_BUDGET cap_bytes={} corpus_bytes={} per_live_batch_bytes={} configured_slots={} admitted_slots={} live_reserved_bytes={} total_reserved_bytes={}",
-            options.max_memory_bytes,
-            budget.corpus_bytes,
-            budget.per_live_batch_bytes,
-            budget.configured_live_slots,
-            budget.admitted_live_slots,
-            budget.live_batch_bytes,
-            budget.total_bytes
-        );
 
-        options.max_memory_bytes = budget.corpus_bytes + budget.per_live_batch_bytes - 1;
-        assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_err());
-        eprintln!(
-            "W2_MEMORY_SINGLE_BATCH_REJECT cap_bytes={} corpus_bytes={} required_one_live_batch_bytes={}",
-            options.max_memory_bytes, budget.corpus_bytes, budget.per_live_batch_bytes
-        );
+        options.max_memory_bytes = budget.total_bytes;
+        let exact = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
+        assert_eq!(exact.total_bytes, options.max_memory_bytes);
+        assert_eq!(exact.admitted_live_slots, 12);
+        for (cap, admitted) in [
+            (budget.total_bytes - 1, 11),
+            (budget.corpus_bytes + budget.per_live_batch_bytes, 1),
+            (budget.corpus_bytes + budget.per_live_batch_bytes - 1, 0),
+            (budget.corpus_bytes - 1, 0),
+        ] {
+            options.max_memory_bytes = cap;
+            let error = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)
+                .err()
+                .context("under-admitted client was accepted")?
+                .to_string();
+            assert!(error.contains("client_under_admission"), "{error}");
+            assert!(error.contains("configured_slots=12"), "{error}");
+            assert!(error.contains(&format!("admitted_slots={admitted}")), "{error}");
+            assert!(
+                error.contains(&format!("required_reservation_bytes={}", budget.total_bytes)),
+                "{error}"
+            );
+            assert!(error.contains(&format!("max_memory_bytes={cap}")), "{error}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realistic_under_admission_fails_before_connection() -> Result<()> {
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        options.workers = 2;
+        options.streams_per_worker = 2;
+        options.corpus_rows = 32;
+        options.batch_rows = 16;
+        options.max_memory_bytes = 1;
+        let error = PreparedClient::prepare(
+            "not-an-endpoint",
+            "client",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            options,
+        )
+        .await
+        .err()
+        .context("under-admitted client was accepted")?
+        .to_string();
+        assert!(error.contains("client_under_admission"), "{error}");
+        assert!(error.contains("configured_slots=4"), "{error}");
+        assert!(error.contains("admitted_slots=0"), "{error}");
+        assert!(error.contains("required_reservation_bytes="), "{error}");
+        assert!(error.contains("max_memory_bytes=1"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn under_admission_emits_machine_readable_event() -> Result<()> {
+        const CHILD: &str = "OAT_TEST_UNDER_ADMISSION_EVENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let tables = vec![table_named("sqlserver_availability_replica_states")?];
+            let mut options = options()?;
+            options.data_profile = DataProfile::Realistic;
+            options.workers = 2;
+            options.streams_per_worker = 2;
+            options.corpus_rows = 32;
+            options.batch_rows = 16;
+            options.max_memory_bytes = 1;
+            let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
+            assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_err());
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "dmv::client::tests::under_admission_emits_machine_readable_event",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        anyhow::ensure!(output.status.success(), "under-admission fixture process failed");
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        let mut lines = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("OAT_CLIENT_ADMISSION_REJECTED "));
+        let evidence: serde_json::Value =
+            serde_json::from_str(lines.next().context("missing admission rejection event")?)?;
+        assert!(lines.next().is_none());
+        assert_eq!(evidence["version"], 1);
+        assert_eq!(evidence["status"], "client_under_admission");
+        assert_eq!(evidence["configured_slots"], 4);
+        assert_eq!(evidence["admitted_slots"], 0);
+        assert_eq!(evidence["max_memory_bytes"], 1);
+        let corpus = evidence["corpus_reservation_bytes"]
+            .as_u64()
+            .context("missing corpus reservation")?;
+        let per_batch = evidence["per_live_batch_reservation_bytes"]
+            .as_u64()
+            .context("missing live batch reservation")?;
+        let required = corpus + per_batch * 4;
+        assert_eq!(evidence["required_reservation_bytes"], required);
+        assert_eq!(evidence["required_reservation_bytes_exact"], required.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_budget_does_not_reserve_live_batches() -> Result<()> {
+        let tables = vec![table_named("sqlserver_availability_replica_states")?];
+        let mut options = options()?;
+        options.data_profile = DataProfile::Diagnostic;
+        options.workers = 4;
+        options.streams_per_worker = 3;
+        options.batch_rows = 128;
+        options.corpus_rows = 256;
+        options.max_memory_bytes = u64::MAX;
+        let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
+        let budget = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
+        assert_eq!(budget.configured_live_slots, 12);
+        assert_eq!(budget.admitted_live_slots, 0);
+        assert_eq!(budget.live_batch_bytes, 0);
+        assert_eq!(budget.total_bytes, budget.corpus_bytes);
+        options.max_memory_bytes = budget.total_bytes;
+        assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_ok());
+        options.max_memory_bytes -= 1;
+        let error = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)
+            .err()
+            .context("oversized diagnostic corpus was accepted")?
+            .to_string();
+        assert!(error.contains("conservative workload reservation"), "{error}");
+        assert!(!error.contains("client_under_admission"), "{error}");
         Ok(())
     }
 
@@ -3631,11 +5068,10 @@ mod tests {
     #[tokio::test]
     async fn queued_realistic_work_stops_at_window_end_without_identity_or_send() -> Result<()> {
         let mut prepared = manifest_test_client()?;
-        let workers = 64;
-        let streams_per_worker = 16;
-        let admitted_slots = 3;
+        let workers = 3;
+        let streams_per_worker = 1;
         let configured_slots = workers * streams_per_worker;
-        assert_eq!(configured_slots, 1_024);
+        let admitted_slots = configured_slots;
         prepared.options.workers = workers;
         prepared.options.streams_per_worker = streams_per_worker;
         prepared.live_batch_slots = Arc::new(tokio::sync::Semaphore::new(admitted_slots));
@@ -3652,7 +5088,7 @@ mod tests {
             Arc::clone(&client.live_batch_slots).acquire_owned().await?,
             Arc::clone(&client.live_batch_slots).acquire_owned().await?,
         ];
-        let waiter_count = configured_slots - admitted_slots;
+        let waiter_count = configured_slots;
         let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
         let (end_tx, end_rx) = tokio::sync::watch::channel(false);
         let open = Arc::new(AtomicBool::new(true));
@@ -3843,6 +5279,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_batch_at_quiescence_is_definitively_unsent() -> Result<()> {
+        let client = manifest_test_client()?;
+        let template = realistic_test_batch(&client).await?;
+        let logical = client.prepare_logical_batch(0, &template).await?;
+        let now = unix_ms()?;
+        let measurement = Measurement::new(now, now + 60_000, 2)?;
+        measurement.stop.send_replace(true);
+        let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        assert!(
+            client
+                .send_encoded_one(0, channel, &logical, Some(&measurement))
+                .await?
+                .is_none()
+        );
+        client.ensure_terminal_manifest_complete()?;
+        let records = client
+            .logical_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(records[0].attempts, 0);
+        assert_eq!(records[0].outcome, ManifestOutcome::NotAdmitted);
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancellation_releases_a_prepared_realistic_batch_permit() -> Result<()> {
         let client = Arc::new(manifest_test_client()?);
         let template = realistic_test_batch(&client).await?;
@@ -3902,12 +5364,72 @@ mod tests {
             .downcast_ref::<StringArray>()
             .context("string array")?;
         assert!(strings.iter().all(|value| value == Some("aaaaaaaaaaaaaaaaaaaaaaa")));
+        options.string_width = 7;
+        let narrower = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        let strings = narrower
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("string array")?;
+        assert!(strings.iter().all(|value| value == Some("aaaaaaa")));
+        options.string_width = 23;
+        options.string_length_distribution = Some(StringLengthDistribution::Uniform);
+        let variable = synthetic_batch(&table, "client", 100, 0, 0, &options)?;
+        let strings = variable
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("string array")?;
+        assert!(strings.iter().flatten().any(|value| value.len() < 23));
+        options.string_length_distribution = Some(StringLengthDistribution::Fixed);
+        options.entropy = 1.0;
+        let varied = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(repeated.column_by_name("text"), varied.column_by_name("text"));
+        options.entropy = 0.0;
         let values = repeated
             .column(2)
             .as_any()
             .downcast_ref::<Int64Array>()
             .context("value array")?;
         assert!(values.iter().all(|value| value == Some(0)));
+        options.skew = 0.0;
+        options.cardinality = 1;
+        options.value_variation = Some(ValueVariation::Cardinality);
+        let cardinal = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        options.cardinality = 3;
+        let more_cardinal = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(cardinal.column_by_name("value"), more_cardinal.column_by_name("value"));
+        options.cardinality = 1;
+        options.value_variation = Some(ValueVariation::PerRow);
+        let per_row = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(cardinal.column_by_name("value"), per_row.column_by_name("value"));
+        assert_ne!(repeated.column_by_name("value"), per_row.column_by_name("value"));
+        options.seed = options.seed.wrapping_add(1);
+        let other_seed = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_ne!(per_row.column_by_name("value"), other_seed.column_by_name("value"));
+        Ok(())
+    }
+
+    #[test]
+    fn pod_ordinal_changes_only_per_row_guid_generation() -> Result<()> {
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let mut options = options()?;
+        options.guid_uniqueness = Some(GuidUniqueness::PerRow);
+        let first = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        options.pod_ordinal = 3;
+        let second = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        assert_ne!(
+            first.column_by_name("availability_group_id"),
+            second.column_by_name("availability_group_id")
+        );
+        options.guid_uniqueness = Some(GuidUniqueness::Cardinality);
+        let third = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        assert_ne!(
+            second.column_by_name("availability_group_id"),
+            third.column_by_name("availability_group_id")
+        );
+        options.pod_ordinal = 4;
+        assert_eq!(third, synthetic_batch(&table, "client", 8, 0, 0, &options)?);
         Ok(())
     }
 
@@ -3935,6 +5457,7 @@ mod tests {
                 encoded_bytes,
             }])],
             channels: vec![vec![channel]],
+            socket_observations: Vec::new(),
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             signer: None,
             counters: vec![Counters::default()],
@@ -4083,6 +5606,9 @@ mod tests {
         measurement.record_send_latency(200, 40_000_000_000)?;
         measurement.record_send_latency(300, 69_999_000_000)?;
         measurement.record_send_latency(400, 70_000_000_000)?;
+        measurement.record_send_outcome(10_000_000_000, true, false, false);
+        measurement.record_send_outcome(39_999_000_000, false, true, true);
+        measurement.record_send_outcome(40_000_000_000, false, false, true);
         measurement.record_completion(0, 100, 900, 1000, 9_999);
         measurement.record_completion(0, 200, 1800, 2000, 10_000);
         measurement.record_completion(0, 300, 2700, 3000, 69_999);
@@ -4101,6 +5627,10 @@ mod tests {
             snapshot["windows"][0]["completed_flight_data_bytes_configured_ipc_compression"],
             2000
         );
+        assert_eq!(snapshot["windows"][0]["completed_sends"], 1);
+        assert_eq!(snapshot["windows"][0]["timed_out_sends"], 1);
+        assert_eq!(snapshot["windows"][0]["ambiguous_sends"], 1);
+        assert_eq!(snapshot["windows"][1]["ambiguous_sends"], 1);
         assert_eq!(snapshot["windows"][0]["send_latency_us"]["samples"], 2);
         assert_eq!(snapshot["windows"][1]["send_latency_us"]["samples"], 2);
         Ok(())
@@ -4129,6 +5659,7 @@ mod tests {
         let client = PreparedClient {
             corpus: vec![corpus(), corpus()],
             channels: vec![],
+            socket_observations: Vec::new(),
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             signer: None,
             counters: vec![],
@@ -4154,6 +5685,455 @@ mod tests {
             }
         }
         assert_eq!(observed, [vec![1, 2, 3, 4], vec![1, 2, 3, 4]]);
+        Ok(())
+    }
+
+    struct QuiesceFlightState {
+        requests: AtomicU64,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for QuiesceFlightState {
+        fn default() -> Self {
+            Self {
+                requests: AtomicU64::new(0),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    struct QuiesceAdmission(Arc<QuiesceFlightState>);
+    struct QuiesceStream(Arc<QuiesceFlightState>);
+
+    #[async_trait::async_trait]
+    impl BatchAdmission for QuiesceAdmission {
+        async fn begin(
+            &self,
+            _: StreamContext,
+            _: Arc<dyn PutResultEmitter>,
+        ) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+            self.0.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(QuiesceStream(Arc::clone(&self.0))))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamLifecycle for QuiesceStream {
+        async fn push_batch(&mut self, _: RecordBatch) -> RuntimeResult<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, _: StreamSummary) -> RuntimeResult<StreamCompletion> {
+            self.0.entered.add_permits(1);
+            self.0
+                .release
+                .acquire()
+                .await
+                .map_err(|_| RuntimeError::internal())?
+                .forget();
+            Ok(StreamCompletion::best_effort())
+        }
+        async fn abort(self: Box<Self>, _: StreamAbortReason) {}
+    }
+
+    async fn gated_quiesce_client() -> Result<(
+        Arc<PreparedClient>,
+        Arc<QuiesceFlightState>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    )> {
+        gated_quiesce_client_with_buffers(None, None).await
+    }
+
+    async fn gated_quiesce_client_with_buffers(
+        send: Option<usize>,
+        recv: Option<usize>,
+    ) -> Result<(
+        Arc<PreparedClient>,
+        Arc<QuiesceFlightState>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    )> {
+        use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
+        use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
+        use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
+        let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
+        let principal = AuthenticatedPrincipal::new(
+            PrincipalId::new("quiesce")?,
+            PrincipalIssuer::new("quiesce")?,
+            Default::default(),
+        )?;
+        let auth = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(1)?, None)?;
+        let state = Arc::new(QuiesceFlightState::default());
+        let service = ArrowColFlightService::new(
+            ImplementationPool::Dataflow,
+            Arc::clone(&store),
+            Arc::new(AllowAllAuthenticator::new(auth)),
+            Arc::new(QuiesceAdmission(Arc::clone(&state))),
+            RuntimeLimits::default(),
+        )?
+        .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
+        .into_tonic_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let mut options = options()?;
+        options.workers = 1;
+        options.corpus_rows = 8;
+        options.batch_rows = 8;
+        options.streams_per_worker = 1;
+        options.request_timeout_ms = 3000;
+        options.quiesce_timeout_ms = Some(3000);
+        options.socket_send_buffer_bytes = send;
+        options.socket_recv_buffer_bytes = recv;
+        let client = PreparedClient::prepare(
+            &endpoint,
+            "quiesce-test",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            options,
+        )
+        .await?;
+        Ok((client, state, shutdown, server))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_buffer_readback_is_from_connected_kernel_socket() -> Result<()> {
+        let (client, _, shutdown, server) = gated_quiesce_client_with_buffers(Some(4096), Some(4096)).await?;
+        let applied: serde_json::Value = serde_json::from_str(&client.applied_transport_json()?)?;
+        let sockets = applied["socket_connections"].as_array().context("missing sockets")?;
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0]["requested_send_buffer_bytes"], 4096);
+        assert_eq!(sockets[0]["requested_recv_buffer_bytes"], 4096);
+        assert_eq!(sockets[0]["generation"], 1);
+        assert_eq!(sockets[0]["send_buffer_kernel_clamp_observed"], false);
+        assert_eq!(sockets[0]["recv_buffer_kernel_clamp_observed"], false);
+        for field in ["send_buffer_bytes", "recv_buffer_bytes"] {
+            let effective = sockets[0][field].as_u64().context("missing buffer readback")?;
+            assert!(
+                effective >= 8192,
+                "kernel readback must reflect Linux buffer accounting: {effective}"
+            );
+            assert_ne!(effective, 4096);
+        }
+        let kernel_now = {
+            let state = client.socket_observations[0]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let socket = state.socket.as_ref().context("missing socket")?;
+            socket.set_send_buffer_size(8192)?;
+            socket.send_buffer_size()?
+        };
+        let updated: serde_json::Value = serde_json::from_str(&client.applied_transport_json()?)?;
+        assert_eq!(updated["socket_connections"][0]["send_buffer_bytes"], kernel_now);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_changes_live_socket_generation() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let (close_first, close_rx) = tokio::sync::oneshot::channel();
+        let (close_second, close_second_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            for close in [close_rx, close_second_rx] {
+                let (mut socket, _) = listener.accept().await?;
+                let mut preface = [0; 24];
+                socket.read_exact(&mut preface).await?;
+                socket.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+                let _ = close.await;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let mut options = options()?;
+        options.socket_send_buffer_bytes = Some(4096);
+        let (channel, observation) = options.connect(&address).await?;
+        let observation = observation.context("missing socket observation")?;
+        assert_eq!(
+            observation.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.generation,
+            1
+        );
+        close_first
+            .send(())
+            .map_err(|_| anyhow::anyhow!("first server stopped"))?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if observation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .current
+                    .is_none()
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        let mut client = options.client(channel.clone());
+        let request = tokio::spawn(async move {
+            loop {
+                let _ = client.get_flight_info(FlightDescriptor::default()).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if observation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .current
+                    .as_ref()
+                    .is_some_and(|readback| readback.generation == 2)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        request.abort();
+        let _ = close_second.send(());
+        drop(channel);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_socket_drop_cannot_invalidate_reconnected_socket() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let first = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (_peer1, _) = listener.accept().await?;
+        let second = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (_peer2, _) = listener.accept().await?;
+        let readback = SocketReadback {
+            generation: 2,
+            requested_send_buffer_bytes: Some(4096),
+            requested_recv_buffer_bytes: None,
+            send_buffer_bytes: 8192,
+            recv_buffer_bytes: 8192,
+            send_buffer_kernel_clamp_observed: Some(false),
+            recv_buffer_kernel_clamp_observed: None,
+        };
+        let state = Arc::new(Mutex::new(SocketState {
+            generation: 2,
+            current: Some(readback),
+            socket: None,
+        }));
+        let old = ObservedSocket {
+            stream: first,
+            observation: Arc::clone(&state),
+            generation: 1,
+        };
+        let new = ObservedSocket {
+            stream: second,
+            observation: Arc::clone(&state),
+            generation: 2,
+        };
+        drop(old);
+        assert_eq!(
+            state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .current
+                .as_ref()
+                .map(|value| value.generation),
+            Some(2)
+        );
+        drop(new);
+        assert!(state.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.current.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grpc_encode_and_decode_limits_are_independent() -> Result<()> {
+        let (prepared, state, shutdown, server) = gated_quiesce_client().await?;
+        let applied: serde_json::Value = serde_json::from_str(&prepared.applied_transport_json()?)?;
+        assert_eq!(applied["socket_connections"], serde_json::json!([]));
+        assert_eq!(applied["grpc_max_encode_bytes"], prepared.options.max_message_bytes);
+        assert_eq!(applied["grpc_max_decode_bytes"], prepared.options.max_message_bytes);
+        let channel = prepared.channels[0][0].clone();
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let mut options = prepared.options.clone();
+        options.grpc_max_encode_bytes = Some(1);
+        assert!(
+            register(&mut options.client(channel.clone()), &table, None)
+                .await
+                .is_err()
+        );
+        options.grpc_max_encode_bytes = None;
+        register(&mut options.client(channel.clone()), &table, None).await?;
+        options.grpc_max_decode_bytes = Some(1);
+        let batch = &prepared.corpus[0][0];
+        let mut request = Request::new(stream::iter(send_frames(&batch.data, options.send_iter)));
+        request_metadata(&mut request, &batch.table, None, None)?;
+        let mut response = options.client(channel).do_put(request).await?.into_inner();
+        state.release.add_permits(1);
+        let Err(error) = response.message().await else {
+            anyhow::bail!("expected a decode limit error");
+        };
+        assert!(
+            format!("{error:#}").contains("decoded message length too large"),
+            "{error:#}"
+        );
+        drop(prepared);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    async fn wait_for_gated_send(state: &QuiesceFlightState) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), state.entered.acquire())
+            .await??
+            .forget();
+        Ok(())
+    }
+
+    async fn wait_for_client_stop(client: &PreparedClient) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !client
+                .measurement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|measurement| measurement.stopped())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_end_quiesces_and_drains_an_in_flight_send() -> Result<()> {
+        let (client, state, shutdown, server) = gated_quiesce_client().await?;
+        let start = unix_ms()? + 100;
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            runner
+                .run_continuous_with_termination(start, start, start + 800, std::future::pending())
+                .await
+        });
+        wait_for_gated_send(&state).await?;
+        wait_for_client_stop(&client).await?;
+        assert!(
+            !run.is_finished(),
+            "the in-flight acknowledgement must drain after window end"
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        state.release.add_permits(1);
+        let report = tokio::time::timeout(Duration::from_secs(3), run).await???;
+        assert_eq!(
+            report.completed_rows, 0,
+            "post-window completion is not measured throughput"
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1, "no new send after window end");
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::SeqCst), 8);
+        let receipt = client.completed_terminal_metrics()?;
+        let window = &receipt["measurement_window"]["windows"][0];
+        assert_eq!(window["completed_sends"], 1);
+        assert_eq!(window["timed_out_sends"], 0);
+        assert_eq!(window["ambiguous_sends"], 0);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sigterm_quiesces_and_emits_the_drained_send_outcome() -> Result<()> {
+        let (client, state, shutdown, server) = gated_quiesce_client().await?;
+        let start = unix_ms()? + 100;
+        let (signal, received) = tokio::sync::oneshot::channel();
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            runner
+                .run_continuous_with_termination(start, start, start + 10_000, async {
+                    received.await.context("test SIGTERM sender dropped")?;
+                    Ok(())
+                })
+                .await
+        });
+        wait_for_gated_send(&state).await?;
+        signal
+            .send(())
+            .map_err(|()| anyhow::anyhow!("SIGTERM listener dropped"))?;
+        wait_for_client_stop(&client).await?;
+        assert!(
+            !run.is_finished(),
+            "SIGTERM must wait for the in-flight acknowledgement"
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        state.release.add_permits(1);
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await??
+            .err()
+            .context("SIGTERM must produce a failed terminal result")?;
+        assert!(error.to_string().contains("SIGTERM"));
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1, "no new send after SIGTERM");
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::SeqCst), 8);
+        let receipt = client.failed_terminal_metrics()?;
+        assert_eq!(receipt["phase"], "failed");
+        let window = &receipt["measurement_window"]["windows"][0];
+        assert_eq!(window["completed_sends"], 1);
+        assert_eq!(window["timed_out_sends"], 0);
+        assert_eq!(window["ambiguous_sends"], 0);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_deadline_aborts_a_stalled_send_as_timed_out_and_ambiguous() -> Result<()> {
+        let (mut client, state, shutdown, server) = gated_quiesce_client().await?;
+        // Fault injection: a stalled worker outlives the validated request timeout contract.
+        Arc::get_mut(&mut client)
+            .context("client unexpectedly shared")?
+            .options
+            .quiesce_timeout_ms = Some(100);
+        let start = unix_ms()? + 100;
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            runner
+                .run_continuous_with_termination(start, start, start + 800, std::future::pending())
+                .await
+        });
+        wait_for_gated_send(&state).await?;
+        wait_for_client_stop(&client).await?;
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await??
+            .err()
+            .context("expected quiesce deadline")?;
+        assert!(error.to_string().contains("quiesce deadline exceeded"));
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        let receipt = client.failed_terminal_metrics()?;
+        let window = &receipt["measurement_window"]["windows"][0];
+        assert_eq!(window["completed_sends"], 0);
+        assert_eq!(window["timed_out_sends"], 1);
+        assert_eq!(window["ambiguous_sends"], 1);
+        state.release.add_permits(1);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
         Ok(())
     }
 
@@ -4206,6 +6186,10 @@ mod tests {
         options.grpc_send_compression = GrpcCompression::Gzip;
         options.grpc_accept_compression = GrpcCompression::Gzip;
         options.data_profile = DataProfile::Realistic;
+        options.null_fraction = 1.0;
+        options.guid_uniqueness = Some(GuidUniqueness::PerRow);
+        options.send_iter = SendIter::ArcCursor;
+        options.identity_builder = IdentityBuilder::DirectUtf8;
         let client = PreparedClient::prepare(
             &endpoint,
             "smoke",
@@ -4247,6 +6231,29 @@ mod tests {
         );
         assert!(report.completed_rows > 8, "fast worker did not replenish its slot");
         let metrics = client.metrics("completed")?;
+        let applicability = &metrics["preparation"]["generator_applicability"]["tables"][0];
+        assert_eq!(applicability["table"], "sqlserver_availability_replica_states");
+        assert_eq!(applicability["rows"], 8);
+        let eligible_columns = applicability["null_fraction"]["eligible_columns"]
+            .as_u64()
+            .context("eligible columns")?;
+        assert_eq!(eligible_columns, 0);
+        assert_eq!(applicability["null_fraction"]["eligible_rows"], eligible_columns * 8);
+        assert_eq!(applicability["null_fraction"]["null_rows"], eligible_columns * 8);
+        assert!(applicability["pod_ordinal"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
+        assert!(applicability["pod_ordinal"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
+        assert_eq!(applicability["guid_uniqueness"], applicability["pod_ordinal"]);
+        assert!(
+            applicability["value_variation"]["eligible_columns"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(applicability["value_variation"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
+        assert!(applicability["string_width"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
+        assert!(applicability["string_width"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
+        assert!(applicability["entropy"]["eligible_columns"].as_u64().unwrap_or(0) > 0);
+        assert!(applicability["entropy"]["eligible_rows"].as_u64().unwrap_or(0) >= 8);
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()
@@ -4316,7 +6323,125 @@ mod tests {
             total >= report.completed_rows + 16,
             "late slow acknowledgement must be drained but excluded from measurement"
         );
+        state.slow_next.store(true, Ordering::SeqCst);
+        let signal_start = unix_ms()? + 100;
+        let (terminate, terminated) = tokio::sync::oneshot::channel();
+        let signal_client = Arc::clone(&client);
+        let signal_run = tokio::spawn(async move {
+            signal_client
+                .run_continuous_with_termination(signal_start, signal_start + 25, signal_start + 2_000, async {
+                    terminated.await.context("test termination sender dropped")?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.slow_next.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let termination_started = Instant::now();
+        terminate
+            .send(())
+            .map_err(|()| anyhow::anyhow!("termination listener dropped"))?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stopped = client
+                    .measurement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|m| m.stopped());
+                if stopped {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let attempted_at_stop: u64 = client
+            .counters
+            .iter()
+            .map(|c| c.attempted_rows.load(Ordering::SeqCst))
+            .sum();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            client
+                .counters
+                .iter()
+                .map(|c| c.attempted_rows.load(Ordering::SeqCst))
+                .sum::<u64>(),
+            attempted_at_stop
+        );
+        assert!(
+            signal_run
+                .await?
+                .err()
+                .context("expected SIGTERM termination")?
+                .to_string()
+                .contains("SIGTERM")
+        );
+        assert!(termination_started.elapsed() >= Duration::from_millis(150));
+        assert!(!state.slow_next.load(Ordering::SeqCst));
+        let mut timeout_options = client.options.clone();
+        timeout_options.workers = 1;
+        timeout_options.streams_per_worker = 1;
+        timeout_options.request_timeout_ms = 100;
+        timeout_options.quiesce_timeout_ms = Some(100);
+        let timeout_client = PreparedClient::prepare(
+            &endpoint,
+            "timeout",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            timeout_options,
+        )
+        .await?;
+        state.slow_next.store(true, Ordering::SeqCst);
+        let start = unix_ms()? + 100;
+        timeout_client
+            .run_continuous_with_termination(start, start, start + 50, std::future::pending())
+            .await?;
+        let timeout_metrics = timeout_client.metrics("completed")?;
+        assert_eq!(
+            timeout_metrics["measurement_window"]["windows"][0]["timed_out_sends"],
+            1
+        );
+        assert_eq!(
+            timeout_metrics["measurement_window"]["windows"][0]["ambiguous_sends"],
+            1
+        );
+        drop(timeout_client);
         drop(client);
+        let mut limited_options = Cli::try_parse_from(["test", "--workers", "1"])?
+            .options
+            .resolve(100, 1)?;
+        limited_options.workers = 1;
+        limited_options.corpus_rows = 16;
+        limited_options.batch_rows = 8;
+        limited_options.streams_per_worker = 1;
+        limited_options.max_rows = 16;
+        limited_options.rate_limit_rps = 1;
+        limited_options.rate_limit_period_ms = 3000;
+        let limited = PreparedClient::prepare(
+            &endpoint,
+            "rate-limited",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            limited_options,
+        )
+        .await?;
+        let rows_before_limit = state.rows.load(Ordering::Relaxed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), limited.send_once())
+                .await
+                .is_err(),
+            "two requests completed before the configured rate-limit period"
+        );
+        assert_eq!(state.rows.load(Ordering::Relaxed) - rows_before_limit, 8);
+        drop(limited);
         shutdown
             .send(())
             .map_err(|()| anyhow::anyhow!("smoke server stopped early"))?;

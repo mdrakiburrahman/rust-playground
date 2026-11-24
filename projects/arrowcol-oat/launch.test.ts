@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { ChildProcess, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { createServer, request as createHttpRequest } from 'node:http';
 import { connect as createTcpConnection } from 'node:net';
@@ -15,6 +15,7 @@ import { run_tree } from '../../infra/azure/bootstrap.js';
 import { tableFromArrays, tableToIPC } from 'apache-arrow';
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import { collectDataFlow } from './dataflow-verdict.js';
+import { localDispositionSuffix } from './local-failed-disposition.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
@@ -171,6 +172,82 @@ async function passingMainFixture(options: Parameters<typeof ownedBuildFixture>[
   }));
   return { ...fixture, stateRoot, receiptRoot, configPath };
 }
+
+test('launcher marker in state is recovered without moving it', { skip: process.platform !== 'linux', timeout: 30_000 }, async () => {
+  const fixture = await passingMainFixture({ initialState: 'failed' });
+  const previousExitCode = process.exitCode;
+  const previousPath = process.env.PATH;
+  try {
+    const config = JSON.parse(await readFile(fixture.configPath, 'utf8'));
+    config.platform.compose_project = 'arrowcol-oat-historical-parity';
+    await writeFile(fixture.configPath, JSON.stringify(config));
+    await writeFile(path.join(fixture.directory, 'package.json'), '{"type":"commonjs"}');
+    const build = await fixture.runner(['cargo'], 0, process.cwd());
+    const launcher = pathToFileURL(fileURLToPath(new URL('./launch.ts', import.meta.url))).href;
+    const script = `
+      import { main } from ${JSON.stringify(launcher)};
+      const runner = async (command) => command[0] === 'git'
+        ? { returncode: 0, stdout: command[1] === 'rev-parse' ? ${JSON.stringify(fixture.sha)} : '', stderr: '' }
+        : { returncode: 0, stdout: ${JSON.stringify(build.stdout)}, stderr: '' };
+      await main(['--deadline-seconds', '10', '--no-viewer', '--config', ${JSON.stringify(fixture.configPath)}], runner, undefined, ${JSON.stringify(fixture.receiptRoot)});
+    `;
+    const outputPath = path.join(fixture.directory, 'launcher-output.log');
+    const output = openSync(outputPath, 'w');
+    let launch: ReturnType<typeof spawnSync>;
+    try {
+      launch = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], { stdio: ['ignore', output, output], timeout: 20_000 });
+    } finally {
+      closeSync(output);
+    }
+    const diagnostics = await readFile(outputPath, 'utf8');
+    assert.ifError(launch.error);
+    assert.equal(launch.signal, null, diagnostics);
+    assert.equal(launch.status, 1, diagnostics);
+    const [receiptName] = await readdir(fixture.receiptRoot);
+    assert.ok(receiptName);
+    const receiptPath = path.join(fixture.receiptRoot, receiptName);
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+    assert.equal(receipt.run_state, 'failed', diagnostics + JSON.stringify(receipt));
+    assert.equal(receipt.cleanup_state, 'unsettled');
+    const [markerName] = await readdir(fixture.stateRoot);
+    assert.ok(markerName?.startsWith('.arrowcol-oat-owner-'));
+    const markerPath = path.join(fixture.stateRoot, markerName);
+    const marker = JSON.parse(await readFile(markerPath, 'utf8'));
+    assert.equal(await processStartTicks(marker.ownerPid), undefined);
+    assert.equal(await processStartTicks(marker.serverPid), marker.serverStartTicks);
+    await fixture.stop();
+    assert.equal(await processStartTicks(marker.serverPid), undefined);
+
+    const cell = '22222222-2222-4222-8222-222222222222';
+    const table = tableFromArrays({
+      run_id: [cell], mode: ['local'], status: ['failed'], table: ['sqlserver_active_sessions'],
+      evidence_json: [JSON.stringify({ overload_guard: { run_id: cell }, rows: { delta_committed: null } })],
+    });
+    await writeFile(path.join(fixture.directory, 'results.parquet'), writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream'))));
+    const project = `arrowcol-oat-hi-${cell.replace(/-/g, '')}`;
+    await writeFile(path.join(fixture.directory, 'run.log'), `${receipt.run_id} ${project} synthetic cleanup failure`);
+    const tools = path.join(fixture.directory, 'tools');
+    await mkdir(tools);
+    for (const command of ['docker', 'ss']) await writeFile(path.join(tools, command), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    process.env.PATH = `${tools}:${previousPath ?? ''}`;
+    process.exitCode = undefined;
+    const otherMarker = path.join(fixture.stateRoot, '.arrowcol-oat-owner-999999.json');
+    await writeFile(otherMarker, '{}');
+    await assert.rejects(main(['--recover-failed-local', receipt.invocation_id, markerPath], undefined, undefined, fixture.receiptRoot), /unresolved cell or owner/);
+    await unlink(otherMarker);
+    await main(['--recover-failed-local', receipt.invocation_id, markerPath], undefined, undefined, fixture.receiptRoot);
+    const disposition = JSON.parse(await readFile(receiptPath + localDispositionSuffix, 'utf8'));
+    assert.equal(disposition.marker_path, markerPath);
+    assert.deepEqual(await readdir(fixture.stateRoot), [markerName]);
+    assert.deepEqual(JSON.parse(await readFile(markerPath, 'utf8')), marker);
+  } finally {
+    process.exitCode = previousExitCode;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test('owned server starts the exact successful Cargo artifact, not a stale prebuilt path', async () => {
   const fixture = await ownedBuildFixture();
@@ -1381,6 +1458,29 @@ test('owned main rechecks supplementary eligibility after cancellation during ma
   }
 });
 
+test('unsettled owned server is unreferenced but retained for recovery', { skip: process.platform !== 'linux' }, async (t) => {
+  const fixture = await passingMainFixture({ configHash: '0'.repeat(64) });
+  const previousExitCode = process.exitCode;
+  const original = ChildProcess.prototype.unref;
+  let unrefs = 0;
+  t.mock.method(ChildProcess.prototype, 'unref', function (this: ChildProcess) {
+    unrefs++;
+    return original.call(this);
+  });
+  try {
+    process.exitCode = undefined;
+    await main(['--deadline-seconds', '10', '--no-viewer', '--config', fixture.configPath],
+      fixture.runner, undefined, fixture.receiptRoot);
+    assert.equal(process.exitCode, 1);
+    assert.equal(unrefs, 1);
+    assert.equal((await readdir(fixture.stateRoot)).length, 1);
+  } finally {
+    process.exitCode = previousExitCode;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test('owned main does not emit supplementary identity for rejected, unknown or unattested runs', { skip: process.platform !== 'linux' }, async (t) => {
   for (const options of [{ rejectRun: true }, { invalidRunId: true }, { configHash: null }, { configHash: '0'.repeat(64) }]) {
     await t.test(JSON.stringify(options), async () => {
@@ -1961,6 +2061,30 @@ test('local recovery and cleanup resolve relative state beside the owned server,
     await assert.rejects(stat(markerPath), { code: 'ENOENT' });
   } finally {
     process.chdir(cwd);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('local status polling retries transient timeouts without resubmitting the run', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-poll-timeout-'));
+  const configPath = path.join(directory, 'config.json');
+  await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
+  const calls: string[] = [];
+  let polls = 0;
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push((init?.method ?? 'GET') + ' ' + url.pathname);
+    if (init?.method === 'POST') return Response.json(status('running'), { status: 202 });
+    if (++polls <= 2) throw new DOMException('synthetic timeout', 'TimeoutError');
+    return Response.json(status('succeeded'));
+  };
+  t.mock.method(console, 'error', () => {});
+  try {
+    const result = await launchOat(configPath, undefined, 1, fetcher, () => {}, 'local', () => '127.0.0.1');
+    assert.equal(result.state, 'succeeded');
+    assert.equal(calls.filter(call => call === 'POST /runs').length, 1);
+    assert.equal(polls, 3);
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

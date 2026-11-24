@@ -93,6 +93,7 @@ pub struct OperationLimits {
     pub purge_max_plan_bytes: usize,
     pub optimize_upload_mode: OptimizeUploadMode,
     pub optimize_upload_buffer_bytes: Option<usize>,
+    pub optimize_upload_concurrency: Option<usize>,
     pub vacuum_delete_chunk: usize,
     pub vacuum_max_plan_bytes: usize,
     pub replay_max_log_files: usize,
@@ -110,6 +111,7 @@ impl Default for OperationLimits {
             purge_max_plan_bytes: 4 * 1024 * 1024,
             optimize_upload_mode: OptimizeUploadMode::PutCreate,
             optimize_upload_buffer_bytes: None,
+            optimize_upload_concurrency: None,
             vacuum_delete_chunk: 256,
             vacuum_max_plan_bytes: 8 * 1024 * 1024,
             replay_max_log_files: 100_000,
@@ -204,6 +206,39 @@ impl Settings {
         {
             bail!("OPTIMIZE upload buffer applies only to buffered_multipart mode");
         }
+        if let Some(concurrency) = limits.optimize_upload_concurrency {
+            if limits.optimize_upload_mode != OptimizeUploadMode::BufferedMultipart {
+                bail!("optimize_upload_concurrency requires buffered_multipart mode");
+            }
+            if !(1..=arrow_deltalake::maintenance::MAX_OPTIMIZE_UPLOAD_CONCURRENCY).contains(&concurrency) {
+                bail!("optimize_upload_concurrency must be within 1..=16");
+            }
+            let bytes = limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES);
+            let budget = bytes
+                .checked_mul(concurrency + 1)
+                .and_then(|v| v.checked_mul(self.max_concurrent_tables))
+                .and_then(|v| v.checked_mul(self.optimize.bin_concurrency))
+                .context("optimize_upload_concurrency buffer budget overflow")?;
+            if budget > 536_870_912 {
+                bail!("optimize_upload_concurrency buffer budget exceeds 512 MiB");
+            }
+        }
+        if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart && self.optimize.bin_concurrency > 1 {
+            let buffer = limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES);
+            let concurrency = limits.optimize_upload_concurrency.unwrap_or(1);
+            let budget = buffer
+                .checked_mul(concurrency + 1)
+                .and_then(|v| v.checked_mul(self.max_concurrent_tables))
+                .and_then(|v| v.checked_mul(self.optimize.bin_concurrency))
+                .context("bin_concurrency upload buffer budget overflow")?;
+            if budget > 536_870_912 {
+                bail!("bin_concurrency upload buffer budget exceeds 512 MiB");
+            }
+        }
         if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
             let buffer_bytes = limits
                 .optimize_upload_buffer_bytes
@@ -257,19 +292,41 @@ impl Settings {
         self.optimize.validate()?;
         self.catalog_options.validate()?;
         self.validate_decoded_budget(self.optimize.max_decoded_bytes_per_bin)?;
+        self.validate_prefetch_budget(self.optimize.small_file_bytes)?;
         MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
         resolve(&BTreeMap::new(), &process_defaults(self))?;
         Ok(())
     }
 
+    fn validate_prefetch_budget(&self, small_file_bytes: u64) -> Result<()> {
+        if self.optimize.input_prefetch_files > 1 {
+            let budget = small_file_bytes
+                .checked_mul(u64::from(self.optimize.input_prefetch_files))
+                .and_then(|v| v.checked_mul(self.optimize.bin_concurrency as u64))
+                .and_then(|v| v.checked_mul(self.max_concurrent_tables as u64))
+                .context("input_prefetch_files encoded input budget overflow")?;
+            if budget > arrow_deltalake::maintenance::MAX_OPTIMIZE_PREFETCH_BYTES {
+                bail!("input_prefetch_files encoded input budget exceeds 512 MiB");
+            }
+        }
+        Ok(())
+    }
+
     fn validate_decoded_budget(&self, per_bin: u64) -> Result<()> {
+        if self.optimize.bin_concurrency > 1 && self.max_concurrent_decoded_bytes.is_none() {
+            bail!("bin_concurrency above 1 requires max_concurrent_decoded_bytes");
+        }
         if let Some(budget) = self.max_concurrent_decoded_bytes {
-            let concurrency = u64::try_from(self.max_concurrent_tables)?;
+            let concurrency = u64::try_from(self.max_concurrent_tables)?
+                .checked_mul(u64::try_from(self.optimize.bin_concurrency)?)
+                .context("bin_concurrency decoded budget overflow")?;
             let total = per_bin
                 .checked_mul(concurrency)
                 .context("concurrent decode budget overflow")?;
             if budget == 0 || total > budget {
-                bail!("per-bin decoded limit times concurrent tables exceeds the aggregate decode budget");
+                bail!(
+                    "max_decoded_bytes_per_bin times bin_concurrency times max_concurrent_tables exceeds max_concurrent_decoded_bytes"
+                );
             }
         }
         Ok(())
@@ -832,6 +889,16 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
         ] {
             props.insert(key.into(), value);
         }
+        if let Some(options) = &layout.sort_options {
+            props.insert(
+                "arrowcol.layout.sortOptions".into(),
+                options
+                    .iter()
+                    .map(|option| option.to_property())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
     }
     props.extend(settings.process_properties.clone());
     props
@@ -892,6 +959,7 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     effective.optimize.max_plan_bytes = usize::try_from(props.unsigned("arrowcol.optimize.maxPlanSize")?)?;
     effective.optimize.max_decoded_bytes_per_bin = props.unsigned("arrowcol.optimize.maxDecodedSizePerBin")?;
     effective.validate_decoded_budget(effective.optimize.max_decoded_bytes_per_bin)?;
+    effective.validate_prefetch_budget(effective.optimize.small_file_bytes)?;
     effective.optimize.max_output_file_bytes = props.unsigned("arrowcol.optimize.maxOutputFileSize")?;
     effective.optimize.max_active_files = usize::try_from(props.unsigned("arrowcol.optimize.maxActiveFiles")?)?;
     effective.optimize.max_row_group_bytes = props.unsigned("arrowcol.optimize.maxRowGroupSize")?;
@@ -910,11 +978,39 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     {
         effective.optimize.use_default_layout = false;
     }
+    let physical = arrowcol_props::resolve(properties, &BTreeMap::new())?;
+    let log_floor = physical.unsigned("delta.logRetentionDuration")?;
+    // Sub-seven-day CLI requests retain operation-level unsafe-request reports
+    // and disposable-root checks; OAT rejects them before projection.
+    if effective.operations.contains(&Operation::PruneLog)
+        && !settings.unsafe_short_vacuum_for_tests
+        && let Some(retention) = settings.log_retention_ms
+        && retention >= arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+        && u64::try_from(retention)? < log_floor
+    {
+        bail!("maintenance.log_retention_secs is below physical table delta.logRetentionDuration");
+    }
+    let vacuum_retention = settings.vacuum_retention_ms.min(effective.vacuum_retention_ms);
+    if effective.operations.contains(&Operation::Vacuum)
+        && !effective.allow_short_vacuum_retention
+        && !settings.unsafe_short_vacuum_for_tests
+        && vacuum_retention >= arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+        && u64::try_from(vacuum_retention)? < physical.unsigned("delta.deletedFileRetentionDuration")?
+    {
+        bail!(
+            "maintenance.vacuum_retention_secs is below physical table delta.deletedFileRetentionDuration; requires maintenance.allow_short_vacuum_retention"
+        );
+    }
     effective.optimize.validate()?;
     Ok((effective, props))
 }
 
-fn configuration_evidence(startup: &Settings, settings: &Settings, props: &ResolvedProps) -> Result<serde_json::Value> {
+fn configuration_evidence(
+    startup: &Settings,
+    settings: &Settings,
+    props: &ResolvedProps,
+    table_properties: &BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
     let mut policy = serde_json::Map::new();
     for key in arrowcol_props::REGISTRY {
         let name = key.name;
@@ -942,6 +1038,13 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             PropValue::Unsigned(value) => serde_json::json!(value),
             PropValue::Float(value) => serde_json::json!(value),
             PropValue::Text(value) => serde_json::json!(value),
+            PropValue::StringList(value) if name == "arrowcol.layout.sortOptions" && !value.is_empty() => {
+                let options = value
+                    .iter()
+                    .map(|entry| arrow_deltalake::layout::SortKeyOptions::from_property(entry))
+                    .collect::<Result<Vec<_>>>()?;
+                serde_json::json!(options)
+            }
             PropValue::StringList(value) => serde_json::json!(value),
         };
         policy.insert(name.to_owned(), value);
@@ -968,17 +1071,26 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
         .get("arrowcol.optimize.sealedPartitionsOnly")
         .map(|value| value.parse::<bool>())
         .transpose()?;
-    Ok(serde_json::json!({
+    let physical = arrowcol_props::resolve(table_properties, &BTreeMap::new())?;
+    let mut evidence = serde_json::json!({
+        "physical_retention_floor": {
+            "source": "table_properties_over_registry_defaults_not_process_overrides",
+            "delta.logRetentionDuration": physical.unsigned("delta.logRetentionDuration")?,
+            "delta.deletedFileRetentionDuration": physical.unsigned("delta.deletedFileRetentionDuration")?,
+        },
         "startup": {
             "apply": startup.apply,
             "anchor_ms": startup.anchor_ms,
             "operations": startup.operations,
+            "checkpoint_every_commits": startup.checkpoint_every_commits,
+            "optimize_target_file_bytes": startup.optimize.target_file_bytes,
             "interval_secs": startup.interval.map(|value| value.as_secs()),
             "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
             "max_cycles": startup.max_cycles,
             "max_consecutive_stale_plans": startup.max_consecutive_stale_plans,
             "sealed_partitions_only": sealed_partitions_only_requested,
             "max_concurrent_tables": startup.max_concurrent_tables,
+            "bin_concurrency": startup.optimize.bin_concurrency,
             "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
             "commit_attempts": startup.commit_attempts,
             "commit_budget_secs": startup.commit_budget.as_secs(),
@@ -988,6 +1100,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "max_prune_files": startup.max_prune_files,
             "output_row_group_rows": startup.optimize.output_row_group_rows,
             "input_read_strategy": startup.optimize.input_read_strategy,
+            "input_prefetch_files": startup.optimize.input_prefetch_files,
             "operation_limits": startup.operation_limits,
         },
         "table_policy": policy,
@@ -996,10 +1109,15 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "mode": startup.operation_limits.optimize_upload_mode,
             "buffer_bytes_requested": startup.operation_limits.optimize_upload_buffer_bytes,
             "buffer_bytes_effective": optimize_upload_buffer_bytes_effective,
+            "concurrency_effective": if startup.operation_limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart { Some(startup.operation_limits.optimize_upload_concurrency.unwrap_or(1)) } else { None },
         },
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
             "max_consecutive_stale_plans": settings.max_consecutive_stale_plans,
+            "checkpoint_every_commits": settings.operations.contains(&Operation::Checkpoint)
+                .then_some(settings.checkpoint_every_commits),
+            "optimize_target_file_bytes": settings.operations.contains(&Operation::Optimize)
+                .then_some(settings.optimize.target_file_bytes),
             "sealed_partitions_only": !settings.optimize.sealed_final,
             "layout_mode": layout_mode,
             "vacuum_retention_ms": settings.vacuum_retention_ms,
@@ -1007,7 +1125,13 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "allow_short_vacuum_retention": settings.allow_short_vacuum_retention,
             "unsafe_short_vacuum_for_tests": settings.unsafe_short_vacuum_for_tests,
         })),
-    }))
+    });
+    if startup.process_properties.contains_key("arrowcol.layout.sortOptions")
+        || table_properties.contains_key("arrowcol.layout.sortOptions")
+    {
+        evidence["layout_sources"] = layout_policy_sources(startup, table_properties);
+    }
+    Ok(evidence)
 }
 
 /// Validated startup defaults, before any table-level overrides.
@@ -1017,7 +1141,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
 pub fn startup_configuration(settings: &Settings) -> Result<serde_json::Value> {
     settings.validate()?;
     let (effective, props) = effective_settings(settings, &BTreeMap::new())?;
-    configuration_evidence(settings, &effective, &props)
+    configuration_evidence(settings, &effective, &props, &BTreeMap::new())
 }
 
 fn policy_matches(settings: &Settings, actual: &BTreeMap<String, String>, expected: &ResolvedProps) -> Result<bool> {
@@ -1098,7 +1222,7 @@ fn layout_policy_sources(settings: &Settings, table_properties: &BTreeMap<String
         "arrowcol.layout.rowGroupRows",
         "arrowcol.layout.pageRows",
     ];
-    let sources: BTreeMap<&str, &str> = keys
+    let mut sources: BTreeMap<&str, &str> = keys
         .into_iter()
         .map(|key| {
             let source = if table_properties.contains_key(key) {
@@ -1111,6 +1235,12 @@ fn layout_policy_sources(settings: &Settings, table_properties: &BTreeMap<String
             (key, source)
         })
         .collect();
+    let key = "arrowcol.layout.sortOptions";
+    if table_properties.contains_key(key) {
+        sources.insert(key, "table");
+    } else if settings.process_properties.contains_key(key) {
+        sources.insert(key, "process");
+    }
     serde_json::json!(sources)
 }
 
@@ -1135,6 +1265,8 @@ impl OptimizeEvidence {
                 "max_files_per_bin": config.max_files_per_bin,
                 "min_files_per_bin": config.min_files_per_bin,
                 "max_bins_per_commit": config.max_bins_per_commit,
+                "bin_concurrency": config.bin_concurrency,
+                "input_prefetch_files": config.input_prefetch_files,
                 "max_actions_per_commit": config.max_actions_per_commit,
                 "max_plan_bytes": config.max_plan_bytes,
                 "max_decoded_bytes_per_bin": config.max_decoded_bytes_per_bin,
@@ -1150,14 +1282,20 @@ impl OptimizeEvidence {
                 "layout_fingerprint": plan.layout_fingerprint,
                 "output_policy_fingerprint": plan.output_policy_fingerprint,
                 "layout_sources": layout_sources,
-                "layout": plan.layout_fingerprint.as_ref().and_then(|_| resolved_layout.map(|layout| serde_json::json!({
-                    "sort_columns": layout.sort_columns,
-                    "max_rows": layout.max_rows,
-                    "max_input_bytes": layout.max_input_bytes,
-                    "row_group_rows": layout.row_group_rows,
-                    "page_rows": layout.page_rows,
-                    "bloom_columns": layout.bloom_columns,
-                }))),
+                "layout": plan.layout_fingerprint.as_ref().and_then(|_| resolved_layout.map(|layout| {
+                    let mut value = serde_json::json!({
+                        "sort_columns": layout.sort_columns,
+                        "max_rows": layout.max_rows,
+                        "max_input_bytes": layout.max_input_bytes,
+                        "row_group_rows": layout.row_group_rows,
+                        "page_rows": layout.page_rows,
+                        "bloom_columns": layout.bloom_columns,
+                    });
+                    if let Some(options) = &layout.sort_options {
+                        value["sort_options"] = serde_json::json!(options);
+                    }
+                    value
+                })),
             }),
             plan,
         }
@@ -1890,6 +2028,7 @@ fn run_operation(
             let config = OptimizeConfig {
                 automatic_layout,
                 automatic_layout_sort_columns_explicit,
+                upload_concurrency: settings.operation_limits.optimize_upload_concurrency.unwrap_or(1),
                 granularity: settings.granularity,
                 now_ms: Some(anchor),
                 min_files_per_bin: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
@@ -2457,7 +2596,7 @@ fn maintain_table(
             eprintln!("delta-maintenance target metadata refresh failed; identity unresolved table={name}");
         }
         discovered.log_token = Some(token);
-        let config = configuration_evidence(settings, &effective, &props)?;
+        let config = configuration_evidence(settings, &effective, &props, &discovered.properties)?;
         eprintln!(
             "arrowcol_maintenance_table_config {}",
             serde_json::json!({ "table": name, "config": config })

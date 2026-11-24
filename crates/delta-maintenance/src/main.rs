@@ -116,6 +116,8 @@ struct Cli {
     layout_enabled: Option<bool>,
     #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_SORT_COLUMNS")]
     layout_sort_columns: Option<String>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS")]
+    layout_sort_options: Option<String>,
     #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_BLOOM_COLUMNS")]
     layout_bloom_columns: Option<String>,
     #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_MAX_ROWS")]
@@ -130,6 +132,8 @@ struct Cli {
     max_files_per_bin: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_BINS_PER_COMMIT", default_value_t = 16)]
     max_bins_per_commit: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_BIN_CONCURRENCY", default_value_t = 1)]
+    bin_concurrency: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIONS_PER_COMMIT", default_value_t = 2048)]
     max_actions_per_commit: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_PLAN_BYTES", default_value_t = 1024 * 1024)]
@@ -145,6 +149,8 @@ struct Cli {
     /// Buffer in memory, spool to disk, or fetch ETag-fenced ranges.
     #[arg(long, env = "ARROWCOL_MAINT_INPUT_READ_STRATEGY",     value_parser = ["memory", "spool", "range"], default_value = "memory")]
     input_read_strategy: String,
+    #[arg(long, env = "ARROWCOL_MAINT_INPUT_PREFETCH_FILES", default_value_t = 1)]
+    input_prefetch_files: u8,
     #[arg(long, env = "ARROWCOL_MAINT_OUTPUT_ROW_GROUP_ROWS", default_value_t = 65_536)]
     output_row_group_rows: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
@@ -155,6 +161,8 @@ struct Cli {
     /// Buffered upload size for buffered_multipart only (4..=64 MiB).
     #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES")]
     optimize_upload_buffer_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_CONCURRENCY")]
+    optimize_upload_concurrency: Option<usize>,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     max_active_files: usize,
     #[arg(long, env = "ARROWCOL_MAINT_LATEST_PARTITIONS")]
@@ -232,6 +240,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         ),
         ("arrowcol.layout.enabled", cli.layout_enabled.map(|v| v.to_string())),
         ("arrowcol.layout.sortColumns", cli.layout_sort_columns.clone()),
+        ("arrowcol.layout.sortOptions", cli.layout_sort_options.clone()),
         ("arrowcol.layout.bloomColumns", cli.layout_bloom_columns.clone()),
         ("arrowcol.layout.maxRows", cli.layout_max_rows.map(|v| v.to_string())),
         (
@@ -294,6 +303,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             purge_max_plan_bytes: cli.purge_max_plan_bytes,
             optimize_upload_mode: cli.optimize_upload_mode.parse::<OptimizeUploadMode>()?,
             optimize_upload_buffer_bytes: cli.optimize_upload_buffer_bytes,
+            optimize_upload_concurrency: cli.optimize_upload_concurrency,
             vacuum_delete_chunk: cli.vacuum_delete_chunk,
             vacuum_max_plan_bytes: cli.vacuum_max_plan_bytes,
             replay_max_log_files: cli.replay_max_log_files,
@@ -309,6 +319,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             small_file_bytes: cli.small_file_bytes.unwrap_or_else(|| (target / 2).max(1)),
             max_files_per_bin: cli.max_files_per_bin,
             max_bins_per_commit: cli.max_bins_per_commit,
+            bin_concurrency: cli.bin_concurrency,
             max_actions_per_commit: cli.max_actions_per_commit,
             max_plan_bytes: cli.max_plan_bytes,
             max_decoded_bytes_per_bin: cli.max_decoded_bytes_per_bin,
@@ -321,6 +332,7 @@ fn settings(cli: Cli) -> Result<Settings> {
                 "range" => InputReadStrategy::Range,
                 value => return Err(anyhow!("invalid input read strategy: {value}")),
             },
+            input_prefetch_files: cli.input_prefetch_files,
             output_row_group_rows: cli.output_row_group_rows,
             max_output_file_bytes: cli.max_output_file_bytes,
             max_active_files: cli.max_active_files,

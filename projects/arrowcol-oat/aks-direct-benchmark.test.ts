@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { ROOT } from '../../infra/azure/bootstrap.js';
-import { assertRenderedManifest, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
+import { assertRenderedManifest, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry, verifyBenchmarkPlacement } from './aks-direct-benchmark.js';
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));
@@ -48,28 +48,47 @@ test('rendered benchmark manifest enforces ownership, stage, image, and timed-wi
     BENCHRUNHEX: runId.replaceAll('-', ''),
     BENCHOWNER: owner,
     BENCHCLIENTID: '11111111-2222-4333-8444-555555555555',
-    BENCHREGISTRY: 'arrowcollector68590.azurecr.io',
-    BENCHDELTA_ROOT: 'abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/' + runId + '/dataflow',
-    BENCHSTAMP: '68590',
+    BENCHREGISTRY: 'arrowcollector54321.azurecr.io',
+    BENCHDELTA_ROOT: 'abfss://arrowcol@arrowcollector54321.dfs.core.windows.net/direct-baseline-1/runs/' + runId + '/dataflow',
+    BENCHSTAMP: '54321',
     BENCHSUBSCRIPTION: '00000000-0000-4000-8000-000000000000',
-    BENCHRESOURCEGROUP: 'arrow-collector-rg',
-    BENCHSTORAGEACCOUNT: 'arrowcollector68590',
+    BENCHRESOURCEGROUP: 'fixture-rg',
+    BENCHSTORAGEACCOUNT: 'arrowcollector54321',
     BENCHCHECKPOINTS: 'checkpoints',
     BENCHDURATIONSECS: duration,
   });
   for (const duration of ['60', '600']) {
     const rendered = renderManifest(source, values(duration));
-    assertRenderedManifest(rendered, runId, owner, 'arrowcollector68590.azurecr.io');
-    assert.throws(() => assertRenderedManifest(rendered.replace('benchmark-stage: load', 'benchmark-stage: unknown'), runId, owner, 'arrowcollector68590.azurecr.io'), /stage label/);
-    assert.throws(() => assertRenderedManifest(rendered.replace('@sha256:', ':latest'), runId, owner, 'arrowcollector68590.azurecr.io'), /pinned SHA-256 digest/);
-    assert.throws(() => assertRenderedManifest(rendered.replace('arrowcol-oat/owner-token: ' + owner, 'arrowcol-oat/owner-token: ' + 'b'.repeat(48)), runId, owner, 'arrowcollector68590.azurecr.io'), /ownership markers/);
+    assertRenderedManifest(rendered, runId, owner, 'arrowcollector54321.azurecr.io');
+    assert.throws(() => assertRenderedManifest(rendered.replace('benchmark-stage: load', 'benchmark-stage: unknown'), runId, owner, 'arrowcollector54321.azurecr.io'), /stage label/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('@sha256:', ':latest'), runId, owner, 'arrowcollector54321.azurecr.io'), /pinned SHA-256 digest/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('arrowcol-oat/owner-token: ' + owner, 'arrowcol-oat/owner-token: ' + 'b'.repeat(48)), runId, owner, 'arrowcollector54321.azurecr.io'), /ownership markers/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('kubernetes.azure.com/agentpool: benche64', 'kubernetes.azure.com/agentpool: arrowe192'), runId, owner, 'arrowcollector54321.azurecr.io'), /must select agent pool benche64/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('        kubernetes.azure.com/agentpool: benche64\n', ''), runId, owner, 'arrowcollector54321.azurecr.io'), /must select agent pool benche64/);
   }
+});
+
+test('pre-load placement rejects an escaped collector stack or unknown node', () => {
+  const nodes = [
+    { metadata: { name: 'collector-node', labels: { 'kubernetes.azure.com/agentpool': 'benche64' } } },
+    { metadata: { name: 'client-node', labels: { 'kubernetes.azure.com/agentpool': 'benchd64' } } },
+    { metadata: { name: 'other-node', labels: { 'kubernetes.azure.com/agentpool': 'arrowe192' } } },
+  ];
+  const collector = { metadata: { name: 'collector' }, spec: { nodeName: 'collector-node' } };
+  const client = {
+    metadata: { name: 'client', labels: { 'batch.kubernetes.io/job-name': 'direct-load-confirmwide' } },
+    spec: { nodeName: 'client-node' },
+  };
+  assert.deepEqual(verifyBenchmarkPlacement([collector, client], nodes).map(pod => pod.pool), ['benche64', 'benchd64']);
+  assert.throws(() => verifyBenchmarkPlacement([{ ...collector, spec: { nodeName: 'other-node' } }, client], nodes), /on arrowe192, expected benche64/);
+  assert.throws(() => verifyBenchmarkPlacement([collector, { ...client, spec: { nodeName: 'collector-node' } }], nodes), /expected benchd64/);
+  assert.throws(() => verifyBenchmarkPlacement([collector], []), /on unknown/);
 });
 
 test('rendered Kubernetes env values remain strings for YAML 1.1 consumers', async () => {
   const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
   const manifest = await readFile(manifestPath, 'utf8');
-  const rendered = manifest.replaceAll('BENCHSTAMP', '68590');
+  const rendered = manifest.replaceAll('BENCHSTAMP', '54321');
   const documents = parseAllDocuments(rendered, { version: '1.1' });
   const nonStringValues: string[] = [];
   const eulaValues: unknown[] = [];

@@ -109,6 +109,7 @@ impl DeltaTable {
             inner: self.committer(),
             properties: properties.clone(),
             comment: comment.clone(),
+            merge_properties: false,
         });
         if let Some(current) = &current {
             if current.partition_columns != partition_columns {
@@ -176,10 +177,11 @@ fn commit_result<S>(result: CommitResult<S>) -> Result<()> {
     }
 }
 
-struct MetadataCommitter {
-    inner: Box<dyn Committer>,
-    properties: BTreeMap<String, String>,
-    comment: Option<String>,
+pub(crate) struct MetadataCommitter {
+    pub(crate) inner: Box<dyn Committer>,
+    pub(crate) properties: BTreeMap<String, String>,
+    pub(crate) comment: Option<String>,
+    pub(crate) merge_properties: bool,
 }
 
 impl Committer for MetadataCommitter {
@@ -190,6 +192,12 @@ impl Committer for MetadataCommitter {
         metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let original = metadata.effective_metadata()?;
+        let mut properties = if self.merge_properties {
+            original.configuration().clone()
+        } else {
+            Default::default()
+        };
+        properties.extend(self.properties.iter().map(|(key, value)| (key.clone(), value.clone())));
         let final_metadata = Metadata::from_parts(
             original.id().to_owned(),
             original.name().map(str::to_owned),
@@ -199,10 +207,7 @@ impl Committer for MetadataCommitter {
             original.schema_string().clone(),
             original.partition_columns().to_vec(),
             original.created_time(),
-            self.properties
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
+            properties,
         );
         let validated = TableConfiguration::try_new(
             final_metadata.clone(),

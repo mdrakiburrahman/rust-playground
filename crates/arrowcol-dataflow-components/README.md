@@ -43,6 +43,14 @@ client resubmission ID does not prove recovery of the original publication.
 An interrupted or failed DFE send with no proven publication remains incomplete;
 the send-error abstraction does not prove that no downstream delivery occurred.
 
+| Terminal evidence | Meaning |
+| --- | --- |
+| `arrowcol_terminal_evidence` schema 1 | Emitted after clean close and terminal routing writes when bounded process-lifetime accounting is available. |
+| Admission counts | Distinct receiver publication IDs offered downstream, including rejected sends; committed, failed, cancelled-ambiguous and pending partition these IDs. |
+| Commit tuples | Normalized table-URL SHA-256, exact version, rows, files and Parquet bytes for directly observed first-attempt commits; `committed_rows` sums these tuples. |
+| Completeness | Replay, retry, cancellation, admission race or uncertain attribution sets `incomplete=1`; overflow suppresses the summary. Missing or incomplete evidence cannot prove delivery. |
+| Reconciliation | The summary alone is not proof of client delivery or agreement with Delta. |
+
 `arrowcol-dataflow-components` links three external OTAP Dataflow Engine (DFE)
 nodes:
 
@@ -203,6 +211,19 @@ utilizations. `dfe_state`, `dfe_pressure_bps`, and `oldest_buffer_age_ms`
 keep describing in-memory DFE work only. Batches evicted by a Quiver
 `drop_oldest` or `max_age` policy are not subtracted, so durable deployments
 should use `size_cap_policy: backpressure` without `max_age`.
+
+Exporter Prometheus observations are process-wide:
+
+| Metric | Meaning |
+| --- | --- |
+| `arrowcol_exporter_capacity_reserved` | Logical reserved `bytes`, `rows`, or `batches`; not RSS. `scope=table` sums all table pools. |
+| `arrowcol_exporter_capacity_waiters` | In-progress acquisitions, including immediately satisfied attempts between scrapes. |
+| `arrowcol_exporter_capacity_acquire_{attempts,seconds}_total` | Completed or cancelled acquisition attempts and total elapsed seconds, including uncontended attempts. |
+| `arrowcol_exporter_group_occupancy` | Groups in overlapping `pipeline`, `flush_wait`, `flush_slot`, `preparing`, or `commit_wait` states. Pipeline slots include completed tasks awaiting collection; commit wait includes submission and durable receipt. |
+| `arrowcol_exporter_group_occupancy_seconds_total` | Elapsed state time added on state exit or cancellation; in-progress time is not included. |
+
+Gauges are point-in-time samples and may miss short events. Per-resource and
+per-state values are independently sampled, not an atomic snapshot.
 
 ## Collector chaining
 

@@ -117,6 +117,7 @@ fn effective_configuration_is_reported_with_protected_partition_debt() -> Result
     let table = event("arrowcol_maintenance_table_config ")?;
     assert_eq!(startup["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(startup["startup"]["input_read_strategy"], "spool");
+    assert_eq!(startup["startup"]["input_prefetch_files"], 1);
     assert_eq!(table["table"], "events");
     assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
@@ -141,6 +142,33 @@ fn effective_configuration_is_reported_with_protected_partition_debt() -> Result
         .args(["--operation", "optimize", "--input-read-strategy", "invalid"])
         .output()?;
     assert!(!invalid.status.success());
+    Ok(())
+}
+
+#[test]
+fn oat_prefetch_reaches_optimize_without_overriding_input_strategy() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    table(&root.path().join("events"))?;
+    let maintenance_env = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+        "maintenance": {"enabled": true, "operations": ["optimize"], "input_prefetch_files": 2}
+    }))?
+    .environment_for(arrowcol_tunables::ComponentRole::Maintenance)?;
+    for strategy in ["spool", "range"] {
+        let rejected = service(root.path())?
+            .envs(&maintenance_env)
+            .args(["--operation", "optimize", "--input-read-strategy", strategy])
+            .output()?;
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires memory input_read_strategy"));
+    }
+    let applied = service(root.path())?
+        .envs(&maintenance_env)
+        .args(["--operation", "optimize", "--apply"])
+        .output()?;
+    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+    let result = &lines(&applied.stdout)?[0];
+    assert_eq!(result["optimize"]["config"]["input_prefetch_files"], 2);
+    assert!(result["report"]["files_added"].as_u64().context("files added")? > 0);
     Ok(())
 }
 
@@ -295,6 +323,83 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
         }
         all_ids.sort_unstable();
         assert_eq!(all_ids, [0, 1, 10, 11, 20, 21, 30, 31]);
+    }
+    Ok(())
+}
+
+#[test]
+fn oat_projected_maintenance_sort_options_drive_real_optimize() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+        "maintenance": {
+            "enabled": true, "operations": ["optimize"],
+            "layout_enabled": true, "layout_sort_columns": ["id"], "layout_bloom_columns": [],
+            "layout_sort_options": [{"column":"id","direction":"descending","nulls":"first"}]
+        }
+    }))?;
+    let env = tunables.environment_for(arrowcol_tunables::ComponentRole::Maintenance)?;
+    let output = service(root.path())?
+        .envs(&env)
+        .args(["--operation", "optimize", "--sealed-final", "--apply"])
+        .output()?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    for prefix in [
+        "arrowcol_maintenance_effective_config ",
+        "arrowcol_maintenance_table_config ",
+    ] {
+        let value: serde_json::Value = serde_json::from_str(
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .context("missing maintenance readback")?,
+        )?;
+        let config = if prefix.contains("table") {
+            &value["config"]
+        } else {
+            &value
+        };
+        assert_eq!(
+            config["table_policy"]["arrowcol.layout.sortOptions"],
+            serde_json::json!([{"column":"id","direction":"descending","nulls":"first"}])
+        );
+        assert_eq!(config["layout_sources"]["arrowcol.layout.sortOptions"], "process");
+    }
+    let reports = lines(&output.stdout)?;
+    let outputs = reports[0]["report"]["outputs"].as_array().context("missing outputs")?;
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(
+        reports[0]["optimize"]["config"]["layout_sources"]["arrowcol.layout.sortOptions"],
+        "process"
+    );
+    for output in outputs {
+        let relative = output.as_str().context("output path")?;
+        let url = Url::from_directory_path(&path)
+            .map_err(|()| anyhow!("table URL"))?
+            .join(relative)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(
+            url.to_file_path().map_err(|()| anyhow!("output file path"))?,
+        )?)?;
+        for group in reader.metadata().row_groups() {
+            let sorting = group.sorting_columns().context("missing sorting metadata")?;
+            assert_eq!(sorting.len(), 1);
+            assert_eq!(sorting[0].column_idx, 0);
+            assert!(sorting[0].descending && sorting[0].nulls_first);
+        }
+        let mut ids = Vec::new();
+        for batch in reader.build()? {
+            let batch = batch?;
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("id array")?;
+            ids.extend(values.values().iter().copied());
+        }
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1] + 1);
     }
     Ok(())
 }

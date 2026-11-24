@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Azure } from '../../infra/azure/bootstrap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
-import { WATCHDOG_INTERVAL_MS } from './aks-cleanup-budget.js';
+import { CleanupDeadlineExpiredError, WATCHDOG_INTERVAL_MS } from './aks-cleanup-budget.js';
 import { DEFAULT_EFFECTIVE_STOP_BUDGETS, parseEffectiveStopBudgets, type EffectiveStopBudgets } from './stop-budgets.js';
 export { WATCHDOG_INTERVAL_MS };
 
@@ -78,7 +78,8 @@ export async function runWatchdog(signal: AbortSignal, evaluate: () => Promise<R
     } catch (error) {
       consecutiveFailures++;
       console.error(JSON.stringify({ event: 'campaign_custody_watchdog_failure', observedAtMs: Date.now(),
-        consecutiveFailures, error: error instanceof Error ? error.message : 'Unexpected watchdog failure' }));
+        consecutiveFailures, error: error instanceof Error ? error.message : 'Unexpected watchdog failure',
+        ...(error instanceof CleanupDeadlineExpiredError ? { code: 'write_outcome_unknown', reason_code: error.code } : {}) }));
     }
     try {
       await delay(Math.max(0, WATCHDOG_INTERVAL_MS - (Date.now() - started)), undefined, { signal });
@@ -106,6 +107,8 @@ async function main(args: string[]): Promise<void> {
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : 'Campaign watchdog failed'); process.exitCode = 1;
+    console.error(error instanceof CleanupDeadlineExpiredError ? JSON.stringify({ event: 'campaign_custody_watchdog_failure',
+      code: 'write_outcome_unknown', reason_code: error.code, error: error.message }) :
+      error instanceof Error ? error.message : 'Campaign watchdog failed'); process.exitCode = 1;
   });
 }

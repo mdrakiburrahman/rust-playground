@@ -29,7 +29,6 @@
   "dfe_pod_selector": "app=arrowcol",
   "arrowcol_endpoint": "http://router:50050",
   "router_metrics_endpoint": "http://127.0.0.1:15050/metrics",
-  "dmv_client_binary": "target/debug/arrowcol-dmv",
   "edge_secret_file": "/run/secrets/edge-hmac",
   "tables": [
     "sqlserver_active_sessions"

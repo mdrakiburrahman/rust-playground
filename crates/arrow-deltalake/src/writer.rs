@@ -318,7 +318,9 @@ impl ParquetWriterConfig {
         verified_sort: &[SortColumn],
     ) -> Result<WriterProperties> {
         self.validate()?;
-        let descriptor = ArrowSchemaConverter::new().convert(schema)?;
+        let descriptor = ArrowSchemaConverter::new()
+            .with_coerce_types(base.as_ref().is_some_and(WriterProperties::coerce_types))
+            .convert(schema)?;
         let leaves = descriptor.columns();
         let leaf_index = |path: &str| -> Result<usize> {
             let mut matching = leaves
@@ -350,7 +352,16 @@ impl ParquetWriterConfig {
                     .with_context(|| format!("Parquet column {path}"))?;
             }
         }
+        let has_base = base.is_some();
         let mut builder = self.defaults.apply(base.unwrap_or_default().into(), None)?;
+        // A base can already contain leaf-specific settings (notably layout Bloom filters).
+        // Global setters alone cannot override those. Seed configured leaves as well so
+        // a partial per-leaf Bloom request inherits the requested default fpp and ndv.
+        for leaf in leaves {
+            if has_base || self.columns.contains_key(&leaf.path().string()) {
+                builder = self.defaults.apply(builder, Some(leaf.path()))?;
+            }
+        }
         for (path, options) in &self.columns {
             builder = options.apply(builder, Some(leaves[leaf_index(path)?].path()))?;
         }
@@ -448,7 +459,115 @@ impl ParquetWriterConfig {
                     .all(|leaf| properties.statistics_enabled(leaf.path()) != EnabledStatistics::Page),
             "offset_index_enabled=false requires statistics=none or chunk for every column; page statistics force offset indexes"
         );
+        self.verify_effective(&descriptor, &properties)?;
         Ok(properties)
+    }
+
+    fn verify_effective(
+        &self,
+        descriptor: &parquet::schema::types::SchemaDescriptor,
+        props: &WriterProperties,
+    ) -> Result<()> {
+        macro_rules! check {
+            ($field:ident, $actual:expr) => {
+                if let Some(expected) = self.$field {
+                    ensure!(
+                        Some(expected) == $actual,
+                        "requested Parquet {} differs from writer properties",
+                        stringify!($field)
+                    );
+                }
+            };
+        }
+        check!(
+            writer_version,
+            Some(match props.writer_version() {
+                WriterVersion::PARQUET_1_0 => Version::V1,
+                WriterVersion::PARQUET_2_0 => Version::V2,
+            })
+        );
+        check!(max_row_group_rows, props.max_row_group_row_count());
+        check!(max_row_group_bytes, props.max_row_group_bytes());
+        check!(data_page_row_count_limit, Some(props.data_page_row_count_limit()));
+        check!(write_batch_size, Some(props.write_batch_size()));
+        check!(offset_index_enabled, Some(!props.offset_index_disabled()));
+        check!(column_index_truncate_length, props.column_index_truncate_length());
+        check!(statistics_truncate_length, props.statistics_truncate_length());
+        let empty = ColumnOptions::default();
+        if self.columns.is_empty() && self.defaults == empty {
+            return Ok(());
+        }
+        for leaf in descriptor.columns() {
+            let path = leaf.path();
+            let column = self.columns.get(&path.string()).unwrap_or(&empty);
+            macro_rules! requested {
+                ($field:ident) => {
+                    column.$field.or(self.defaults.$field)
+                };
+            }
+            macro_rules! verify {
+                ($field:ident, $expected:expr, $actual:expr) => {
+                    if let Some(expected) = $expected {
+                        let actual = $actual;
+                        ensure!(Some(expected) == actual, "requested Parquet {} for {path} differs from writer properties: expected {expected:?}, found {actual:?}", stringify!($field));
+                    }
+                };
+            }
+            let codec = if column.compression.is_some() {
+                column
+            } else {
+                &self.defaults
+            };
+            verify!(compression, codec.compression()?, Some(props.compression(path)));
+            verify!(
+                encoding,
+                requested!(encoding).map(ValueEncoding::parquet),
+                props.encoding(path)
+            );
+            verify!(
+                dictionary_enabled,
+                requested!(dictionary_enabled),
+                Some(props.dictionary_enabled(path))
+            );
+            verify!(
+                statistics,
+                requested!(statistics).map(Statistics::parquet),
+                Some(props.statistics_enabled(path))
+            );
+            verify!(
+                write_page_header_statistics,
+                requested!(write_page_header_statistics),
+                Some(props.write_page_header_statistics(path))
+            );
+            verify!(
+                data_page_size_limit,
+                requested!(data_page_size_limit),
+                Some(props.column_data_page_size_limit(path))
+            );
+            verify!(
+                dictionary_page_size_limit,
+                requested!(dictionary_page_size_limit),
+                Some(props.column_dictionary_page_size_limit(path))
+            );
+            verify!(
+                data_page_v2_compression_ratio_threshold,
+                requested!(data_page_v2_compression_ratio_threshold),
+                Some(props.column_data_page_v2_compression_ratio_threshold(path))
+            );
+            let bloom = props.bloom_filter_properties(path);
+            let enabled = |options: &ColumnOptions| {
+                options.bloom_filter_enabled.or_else(|| {
+                    (options.bloom_filter_fpp.is_some() || options.bloom_filter_ndv.is_some()).then_some(true)
+                })
+            };
+            let expected = enabled(column).or_else(|| enabled(&self.defaults));
+            verify!(bloom_filter_enabled, expected, Some(bloom.is_some()));
+            if expected != Some(false) {
+                verify!(bloom_filter_fpp, requested!(bloom_filter_fpp), bloom.map(|b| b.fpp));
+                verify!(bloom_filter_ndv, requested!(bloom_filter_ndv), bloom.map(|b| b.ndv));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -534,6 +653,26 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("value", DataType::Utf8, false),
         ]))
+    }
+
+    #[test]
+    fn writer_gate_rejects_wrong_level_even_when_codec_matches() -> Result<()> {
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"defaults":{"compression":"zstd","compression_level":7},"columns":{"id":{"compression":"snappy"}}}"#,
+        )?;
+        let schema = schema();
+        let descriptor = ArrowSchemaConverter::new().convert(&schema)?;
+        let good = config.writer_properties(&schema, None, &[])?;
+        let bad = WriterPropertiesBuilder::from(good)
+            .set_column_compression(ColumnPath::from("value"), Compression::ZSTD(ZstdLevel::try_new(1)?))
+            .build();
+        let error = config
+            .verify_effective(&descriptor, &bad)
+            .err()
+            .context("wrong compression level passed verification")?
+            .to_string();
+        assert!(error.contains("compression") && error.contains("value"), "{error}");
+        Ok(())
     }
 
     #[test]

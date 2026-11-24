@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::{
-    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
-    PublicationFenceError, object_store_for_url,
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, InitialDeltaProperties, PublicationFence,
+    PublicationFenceContext, PublicationFenceError, object_store_for_url,
 };
 use arrow_deltalake::publisher::{MutationRetries, PublisherSession};
 use arrowcol_protocol::{CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis};
@@ -9,7 +9,7 @@ use arrowcol_routing::{
     LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest,
 };
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,19 @@ use uuid::Uuid;
 
 const DATABASE: &str = "arrowcol";
 const MIGRATOR_USERNAME: &str = "arrowcol_migrator";
+
+#[derive(Serialize)]
+struct RegisteredRunTableReceipt<'a, P: Serialize> {
+    kind: &'static str,
+    run_id: &'a str,
+    table: String,
+    location: &'a str,
+    provider: &'a str,
+    schema_version: u64,
+    schema_fingerprint: String,
+    catalog_table_count: usize,
+    properties: &'a P,
+}
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -71,6 +84,8 @@ struct PinInitConfig {
 struct RunTableInitialization {
     delta_root: String,
     table: String,
+    #[serde(default)]
+    delta_properties: InitialDeltaProperties,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,16 +248,17 @@ async fn register_run_table(
     {
         bail!("catalog registration readback does not prove the exact canonical schema at the run-scoped location");
     }
-    Ok(serde_json::json!({
-        "kind": "oat_run_table_registered",
-        "run_id": config.run_id,
-        "table": head.identity().to_string(),
-        "location": table.location,
-        "provider": table.provider,
-        "schema_version": completion.schema_version().get(),
-        "schema_fingerprint": completion.schema_fingerprint().to_string(),
-        "catalog_table_count": snapshot.len(),
-    }))
+    Ok(serde_json::to_value(RegisteredRunTableReceipt {
+        kind: "oat_run_table_registered",
+        run_id: &config.run_id,
+        table: head.identity().to_string(),
+        location: &table.location,
+        provider: &table.provider,
+        schema_version: completion.schema_version().get(),
+        schema_fingerprint: completion.schema_fingerprint().to_string(),
+        catalog_table_count: snapshot.len(),
+        properties: &table.properties,
+    })?)
 }
 
 fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
@@ -318,6 +334,7 @@ fn validate_run_table_initialization(run_table: Option<&RunTableInitialization>,
     let Some(run_table) = run_table else {
         return Ok(());
     };
+    run_table.delta_properties.properties()?;
     let root = Url::parse(&run_table.delta_root).context("parse run-scoped table initialization root")?;
     let expected_suffix = format!("/runs/{run_id}/dataflow");
     if root.scheme() != "abfss"
@@ -368,8 +385,9 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
     });
     let init_url = url.clone();
     let init_session = Arc::clone(&session);
+    let properties = run_table.delta_properties.clone();
     let initialization = tokio::task::spawn_blocking(move || {
-        DeltaTable::initialize_fresh_url_with_session(
+        DeltaTable::initialize_fresh_url_with_session_and_properties(
             init_url,
             schema,
             vec![INGESTION_PARTITION.to_owned()],
@@ -379,6 +397,7 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
                 store,
                 mutation_retries: MutationRetries::Disabled,
             },
+            &properties,
         )
     })
     .await
@@ -417,6 +436,31 @@ fn unix_time_ms() -> Result<UnixMillis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_receipt_preserves_actual_snapshot_properties_including_unrequested_keys() -> Result<()> {
+        let mut actual = InitialDeltaProperties {
+            target_file_size_bytes: Some(67108864),
+            checkpoint_interval: Some(17),
+        }
+        .properties()?;
+        actual.insert("delta.dataSkippingStatsColumns".to_owned(), "sample".to_owned());
+        for properties in [actual, Default::default()] {
+            let receipt = serde_json::to_value(RegisteredRunTableReceipt {
+                kind: "oat_run_table_registered",
+                run_id: "00000000-0000-0000-0000-000000000001",
+                table: HOT_RUN_TABLE.to_owned(),
+                location: "file:///runs/00000000-0000-0000-0000-000000000001/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states",
+                provider: "delta",
+                schema_version: 1,
+                schema_fingerprint: "fixture".to_owned(),
+                catalog_table_count: 1,
+                properties: &properties,
+            })?;
+            assert_eq!(receipt["properties"], serde_json::to_value(properties)?);
+        }
+        Ok(())
+    }
 
     #[test]
     fn register_only_mode_is_run_bound_and_does_not_require_migrator_credentials() -> Result<()> {
@@ -498,6 +542,34 @@ mod tests {
     }
 
     #[test]
+    fn pin_init_literal_properties_are_optional_strict_and_validated_before_admission() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let base = serde_json::json!({
+            "delta_root": format!("abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"),
+            "table": HOT_RUN_TABLE
+        });
+        let default: RunTableInitialization = serde_json::from_value(base.clone())?;
+        assert!(default.delta_properties.properties()?.is_empty());
+        let mut configured = base.clone();
+        configured["delta_properties"] =
+            serde_json::json!({"target_file_size_bytes":67108864,"checkpoint_interval":17});
+        let parsed: RunTableInitialization = serde_json::from_value(configured.clone())?;
+        validate_run_table_initialization(Some(&parsed), run_id)?;
+        let properties = parsed.delta_properties.properties()?;
+        assert_eq!(properties["delta.targetFileSize"], "67108864");
+        assert_eq!(properties["delta.checkpointInterval"], "17");
+        for field in ["target_file_size_bytes", "checkpoint_interval"] {
+            let mut invalid = configured.clone();
+            invalid["delta_properties"][field] = serde_json::json!(0);
+            let parsed: RunTableInitialization = serde_json::from_value(invalid)?;
+            assert!(validate_run_table_initialization(Some(&parsed), run_id).is_err());
+        }
+        configured["delta_properties"]["unsupported"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RunTableInitialization>(configured).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn pin_init_config_requires_matching_digest_and_validated_table_identities() -> Result<()> {
         let valid = config()?;
         assert_eq!(validate_config(&valid)?.len(), 1);
@@ -507,6 +579,7 @@ mod tests {
                 "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"
             ),
             table: HOT_RUN_TABLE.to_owned(),
+            delta_properties: InitialDeltaProperties::default(),
         };
         validate_run_table_initialization(Some(&valid_run_table), run_id)?;
         let mut wrong_table = valid_run_table;

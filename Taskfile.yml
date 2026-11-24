@@ -1,0 +1,15 @@
+version: '3'
+
+tasks:
+  darwin:setup:
+    cmds:
+      - 'npx --no-install tsx tools/darwin/src/main.ts setup --home "${DARWIN_HOME:-.darwin/compression}" --producer "${DARWIN_PRODUCER:?Set DARWIN_PRODUCER to the full producer SHA}"'
+  darwin:prepare:
+    cmds:
+      - '"${DARWIN_HOME:-.darwin/compression}/trusted/bin/harness" prepare --controller-stack-bytes "${DARWIN_CONTROLLER_STACK_BYTES:-33554432}"'
+  darwin:preflight:
+    cmds:
+      - '"${DARWIN_HOME:-.darwin/compression}/trusted/bin/harness" preflight --experiment "${DARWIN_EXPERIMENT:-compression-config}"'
+  darwin:evaluate:
+    cmds:
+      - '"${DARWIN_HOME:-.darwin/compression}/trusted/bin/harness" evaluate --experiment "${DARWIN_EXPERIMENT:-compression-config}" --smoke --bind-host "${DARWIN_BIND_HOST:?Set DARWIN_BIND_HOST}" --endpoint-host "${DARWIN_ENDPOINT_HOST:?Set DARWIN_ENDPOINT_HOST}" --controller-stack-bytes "${DARWIN_CONTROLLER_STACK_BYTES:-33554432}"'

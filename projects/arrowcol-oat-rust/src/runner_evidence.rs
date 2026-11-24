@@ -75,6 +75,25 @@ fn official_measurement_bytes(
         bail!("official cell result does not match the original inventory and table");
     }
     let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("official result has no evidence")?)?;
+    let teardown = evidence["teardown_outcome"].as_str().context("official result has no final teardown outcome")?;
+    if !matches!(teardown, "succeeded" | "failed" | "not_started")
+        || evidence["durable_commits"]["run_cumulative_output"]["teardown_outcome"] != teardown
+        || evidence["commit_window_output_throughput"]["teardown_outcome"] != teardown
+        || !evidence["durable_commits"]["complete_30_second_commit_windows"].as_array()
+            .is_some_and(|windows| windows.iter().all(|window| window["teardown_outcome"] == teardown))
+    {
+        bail!("official result lacks consistent final teardown and commit-window evidence");
+    }
+    if row.status == "succeeded" && (teardown != "succeeded"
+        || evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"] != "matched"
+        || evidence["reconciliation"]["status"] != "within_bound"
+        || evidence["reconciliation"]["settled"] != true
+        || evidence["reconciliation"]["ambiguous_rows"] != 0
+        || evidence["durable_commits"]["collector_teardown_admissions"]["status"] != "clear"
+        || evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"] != 0)
+    {
+        bail!("successful official result lacks final settled unambiguous delivery evidence");
+    }
     let effective = json!({
         "typed_oat_config": config,
         "resolved_aks_resources": config.effective_aks_resources(),
@@ -176,7 +195,15 @@ async fn publish_campaign_official_measurement(
         let (current, _) = read_authoritative_campaign_inventory(
             platform, &identity, &cached.orchestration_run_id, publication_deadline.saturating_duration_since(tokio::time::Instant::now()),
         ).await?;
-        current.assert_custody_ready(platform.campaign_cli_paths()?).await?;
+        cached.validate_successor(&current)?;
+        if rows.iter().any(|row| row.status == "succeeded") {
+            for action in [CampaignCleanupAction::StopAdmission, CampaignCleanupAction::BoundedDrain,
+                CampaignCleanupAction::EvidenceCapture, CampaignCleanupAction::StopMaintenance,
+                CampaignCleanupAction::TerminalCapture, CampaignCleanupAction::RemoveNamespace,
+                CampaignCleanupAction::RemoveQap, CampaignCleanupAction::RemoveFic, CampaignCleanupAction::Handoff] {
+                campaign_cleanup_step_complete(&action, &current)?;
+            }
+        }
         let bytes = official_measurement_bytes(&current, config, rows, submitted)?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let destination = current.evidence_destination.as_ref().context("official measurement destination is missing")?;
@@ -224,6 +251,11 @@ mod official_cell_measurement_tests {
             CampaignCellBudget {
                 effective_stop_budgets: config.maintenance_stop_budget()?,
                 planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: config.platform.aks_drain_budget_ms,
+                    collector_grace_ms: config.collector_stop_grace_seconds * 1_000,
+                    pre_stop_capture_margin_ms: crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS,
+                },
             },
         )?;
         let mut rows = result_rows(&config, &inventory.orchestration_run_id, cell, 1, 1, CellMeasurements {
@@ -233,9 +265,13 @@ mod official_cell_measurement_tests {
             },
             started_at_ms: 1_000, qap: QapMetrics::default(), resources: None, resource_evidence: None,
         })?;
-        let output = commit_window_output(&BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None)?;
+        let mut output = commit_window_output(&BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None)?;
+        output["teardown_outcome"] = json!("failed");
         rows[0].evidence_json = Some(serde_json::to_string(&json!({
-            "version": 1, "commit_window_output_throughput": output,
+            "version": 1, "teardown_outcome": "failed",
+            "commit_window_output_throughput": output,
+            "durable_commits": {"run_cumulative_output": {"rows": null, "teardown_outcome": "failed"},
+                "complete_30_second_commit_windows": []},
         }))?);
         rows[0].git_sha = "a".repeat(40);
         Ok((config, inventory, rows))
@@ -340,6 +376,123 @@ mod official_cell_measurement_tests {
         Ok(())
     }
 
+    #[test]
+    fn final_official_result_requires_teardown_and_reconciled_delivery() -> Result<()> {
+        let (mut config, inventory, mut rows) = original_measurement()?;
+        config.clients_per_table = 1;
+        let row = &mut rows[0];
+        row.status = "succeeded".to_owned();
+        row.failure = None;
+        row.evidence_json = Some(json!({
+            "client_phase_reports": [{"phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}}],
+            "durable_commits": {
+                "collector_teardown_admissions": {"status": "clear", "cancelled_ambiguous": 0},
+                "run_cumulative_output": {"rows": 10, "settled": true, "commits_by_version": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]},
+                "output_throughput": {"rows": 10}, "complete_30_second_commit_windows": [{"rows": 10}]
+            }
+        }).to_string());
+        let delta = json!({"rows": 10, "versions": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]});
+        for status in ["unavailable", "ambiguous"] {
+            let mut candidate = row.clone();
+            let mut evidence: Value = serde_json::from_str(candidate.evidence_json.as_deref().context("missing fixture evidence")?)?;
+            evidence["durable_commits"]["collector_teardown_admissions"] = json!({"status": status, "cancelled_ambiguous": null});
+            candidate.evidence_json = Some(evidence.to_string());
+            apply_final_aks_delta_reconciliation(&config, &mut candidate, Some(&delta), true)?;
+            let evidence: Value = serde_json::from_str(candidate.evidence_json.as_deref().context("missing final evidence")?)?;
+            assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
+            assert_eq!(candidate.status, "failed");
+        }
+        apply_final_aks_delta_reconciliation(&config, row, Some(&delta), true)?;
+        let mut outcome = finish_matrix_cell(&config, &inventory.orchestration_run_id, &inventory.cell_run_id, 1, 1, Ok(rows), Ok(()));
+        attach_teardown_outcome(&mut outcome, "succeeded")?;
+        let payload: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &outcome.rows, None)?)?;
+        let evidence = &payload["official_result"]["evidence"];
+        assert_eq!(evidence["teardown_outcome"], "succeeded");
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["rows"], 10);
+        assert_eq!(evidence["durable_commits"]["complete_30_second_commit_windows"][0]["teardown_outcome"], "succeeded");
+        assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
+        let mut pending = outcome.rows.clone();
+        let mut changed: Value = serde_json::from_str(pending[0].evidence_json.as_deref().context("missing pending evidence")?)?;
+        changed["teardown_outcome"] = json!("pending");
+        pending[0].evidence_json = Some(changed.to_string());
+        assert!(official_measurement_bytes(&inventory, &config, &pending, None).is_err());
+        let mut failed = outcome.rows;
+        apply_final_aks_delta_reconciliation(&config, &mut failed[0], None, false)?;
+        let mut outcome = finish_matrix_cell(&config, &inventory.orchestration_run_id, &inventory.cell_run_id, 1, 1, Ok(failed), Err(anyhow::anyhow!("drain failed")));
+        attach_teardown_outcome(&mut outcome, "failed")?;
+        let payload: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &outcome.rows, None)?)?;
+        assert_eq!(payload["official_result"]["status"], "failed");
+        assert_eq!(payload["official_result"]["evidence"]["teardown_outcome"], "failed");
+        assert_eq!(payload["official_result"]["evidence"]["durable_commits"]["run_cumulative_output"]["rows"], 10);
+        assert_eq!(payload["official_result"]["evidence"]["commit_window_output_usage"], "diagnostic_only");
+        Ok(())
+    }
+
+    #[test]
+    fn local_final_reconciliation_reads_the_verified_stopped_snapshot() -> Result<()> {
+        let (mut config, _, mut rows) = original_measurement()?;
+        config.clients_per_table = 1;
+        rows[0].status = "succeeded".to_owned();
+        rows[0].failure = None;
+        rows[0].evidence_json = Some(json!({
+            "client_phase_reports": [{"phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}}],
+            "durable_commits": {
+                "collector_teardown_admissions": {"status": "clear", "cancelled_ambiguous": 0},
+                "run_cumulative_output": {"rows": 10, "settled": true, "commits_by_version": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]},
+                "output_throughput": {"rows": 10}, "complete_30_second_commit_windows": [{"rows": 10}]
+            }
+        }).to_string());
+        let run_id = "c0ffee00-0000-4000-8000-0000000000aa";
+        let table = rows[0].table.clone();
+        let root = std::env::temp_dir().join(format!("oat-final-local-{}", uuid::Uuid::new_v4()));
+        let write_snapshot = |rows_in_log: u64, digest_matches: bool| -> Result<()> {
+            let _ = fs::remove_dir_all(&root);
+            let log = root.join(run_id).join(&table).join("table").join("_delta_log");
+            fs::create_dir_all(&log)?;
+            fs::write(log.join(format!("{:020}.json", 0)), "{\"commitInfo\":{}}\n")?;
+            let add = json!({"add": {"path": "part-1.parquet", "size": 50, "dataChange": true,
+                "stats": json!({"numRecords": rows_in_log}).to_string()}});
+            fs::write(log.join(format!("{:020}.json", 1)), format!("{add}\n"))?;
+            let manifest = root.join(run_id).join(&table).join("manifest.json");
+            fs::write(&manifest, json!({"run_id": run_id, "table": table, "latestVersion": 1, "rowCount": rows_in_log}).to_string())?;
+            let (size, sha256) = crate::local::file_digest(&manifest)?;
+            let sha256 = if digest_matches { sha256 } else { "0".repeat(64) };
+            fs::write(root.join(run_id).join("complete.json"), json!({"run_id": run_id, "tables": [table],
+                "manifests": [{"path": format!("{table}/manifest.json"), "size": size, "sha256": sha256}]}).to_string())?;
+            Ok(())
+        };
+        let reconcile = |config: &OatConfig| -> Result<(OatResult, Value)> {
+            let mut candidate = rows.clone();
+            attach_final_local_delta_reconciliation(config, run_id, &mut candidate, true);
+            let evidence: Value = serde_json::from_str(candidate[0].evidence_json.as_deref().context("missing evidence")?)?;
+            Ok((candidate.remove(0), evidence))
+        };
+        let reason = "final_aks_delta_reconciliation_unavailable_or_mismatched";
+
+        let (row, evidence) = reconcile(&config)?;
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.failure.as_deref(), Some(reason));
+        assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["unavailable_reason"], "final_delta_log_unavailable");
+
+        config.platform.local.snapshot_root = Some(root.to_string_lossy().into_owned());
+        write_snapshot(10, true)?;
+        let (row, evidence) = reconcile(&config)?;
+        assert_eq!(row.status, "succeeded");
+        assert_eq!(row.failure, None);
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["post_teardown_verification"], "matched_final_delta_log");
+        assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
+
+        for (rows_in_log, digest_matches) in [(10, false), (9, true)] {
+            write_snapshot(rows_in_log, digest_matches)?;
+            let (row, evidence) = reconcile(&config)?;
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.failure.as_deref(), Some(reason));
+            assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["post_teardown_verification"], "unavailable_or_mismatched");
+        }
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn official_publication_is_create_only_and_never_adopts_different_bytes() -> Result<()> {
         let (config, inventory, rows) = original_measurement()?;
@@ -371,8 +524,10 @@ mod official_cell_measurement_tests {
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 struct CellEvidence {
+    cpu_quota: Option<Value>,
     overload_guard: Option<Value>,
     overload_stop: Option<Value>,
+    downstream_reason: Option<String>,
     downstream_comment: Option<String>,
     qap_observation: Option<Value>,
     native_telemetry: Option<Value>,
@@ -387,6 +542,8 @@ struct CellEvidence {
     processes: Option<Value>,
     measurement_window: Option<(u64, u64)>,
     client_schedule: Option<Value>,
+    preload_delta: Option<Value>,
+    parity_admission_readback: Option<Value>,
     durable_commits: HashMap<String, Value>,
     router_sql: Option<Value>,
     router_cpu_pressure: Option<Value>,
@@ -410,6 +567,8 @@ struct PublicationBacklogSample {
     oldest_age_seconds: Option<f64>,
     status: Option<String>,
     unavailable_reason: Option<String>,
+    pipeline_stage_metrics: Option<Value>,
+    pipeline_stage_metrics_unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -420,6 +579,90 @@ struct PublicationBacklogMetrics {
     logical_bytes: Option<u64>,
     oldest_age_seconds: Option<f64>,
     status: String,
+    pipeline_stage_metrics: Option<Value>,
+    pipeline_stage_metrics_unavailable_reason: Option<String>,
+}
+
+fn parse_pipeline_histogram(text: &str, name: &str, stage: Option<&str>) -> Option<Value> {
+    let bucket_name = format!("{name}_bucket");
+    let count_name = format!("{name}_count");
+    let sum_name = format!("{name}_sum");
+    let mut finite_buckets: Vec<(f64, String, u64)> = Vec::new();
+    let mut infinite_count = None;
+    let mut count = None;
+    let mut sum = None;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let mut fields = line.split_whitespace();
+        let Some(sample) = fields.next() else { continue };
+        let Some(value) = fields.next() else { continue };
+        if fields.next().is_some() {
+            continue;
+        }
+        let (metric, labels) = match sample.split_once('{') {
+            Some((metric, labels)) => (metric, labels.strip_suffix('}')?),
+            None => (sample, ""),
+        };
+        if metric != bucket_name && metric != count_name && metric != sum_name {
+            continue;
+        }
+        if !labels.contains("component=\"arrowcol-dataflow-rust\"")
+            || stage.is_some_and(|stage| !labels.contains(&format!("stage=\"{stage}\"")))
+            || stage.is_none() && labels.contains("stage=\"")
+        {
+            continue;
+        }
+        if metric == bucket_name {
+            let le = labels.split(",le=\"").nth(1)?.split('\"').next()?;
+            let bucket = value.parse::<u64>().ok()?;
+            if le == "+Inf" {
+                if infinite_count.replace(bucket).is_some() {
+                    return None;
+                }
+            } else {
+                let bound = le.parse::<f64>().ok()?;
+                if !bound.is_finite() || bound < 0.0 || finite_buckets.iter().any(|(existing, _, _)| *existing == bound) {
+                    return None;
+                }
+                finite_buckets.push((bound, le.to_owned(), bucket));
+            }
+        } else if metric == count_name {
+            if count.replace(value.parse::<u64>().ok()?).is_some() {
+                return None;
+            }
+        } else if metric == sum_name {
+            let parsed = value.parse::<f64>().ok()?;
+            if !parsed.is_finite() || parsed < 0.0 || sum.replace(parsed).is_some() {
+                return None;
+            }
+        }
+    }
+    let count = count?;
+    let sum = sum?;
+    if infinite_count? != count {
+        return None;
+    }
+    finite_buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut previous_count = 0;
+    for (_, _, bucket_count) in &finite_buckets {
+        if *bucket_count < previous_count || *bucket_count > count {
+            return None;
+        }
+        previous_count = *bucket_count;
+    }
+    let mut buckets = finite_buckets.into_iter()
+        .map(|(_, le, bucket_count)| json!({"le":le,"count":bucket_count}))
+        .collect::<Vec<_>>();
+    buckets.push(json!({"le":"+Inf","count":count}));
+    Some(json!({"count":count,"sum_seconds":sum,"buckets":buckets}))
+}
+
+fn parse_pipeline_stage_metrics(text: &str) -> Option<Value> {
+    let stages = ["collect", "build", "sort", "encode", "upload", "commit"]
+        .into_iter()
+        .map(|stage| Some((stage.to_owned(), parse_pipeline_histogram(text, "arrowcol_pipeline_stage_duration_seconds", Some(stage))?)))
+        .collect::<Option<serde_json::Map<String, Value>>>()?;
+    let submission_wait = parse_pipeline_histogram(text, "arrowcol_pipeline_submission_wait_seconds", None)?;
+    Some(json!({"temporality":"cumulative_process_lifetime_snapshot","stage_duration_seconds":stages,"submission_wait_seconds":submission_wait}))
 }
 
 fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMetrics> {
@@ -488,6 +731,9 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
     let raw_bytes = get("arrowcol_publication_backlog_bytes")?;
     let raw_age = get("arrowcol_publication_backlog_oldest_age_seconds")?;
     let status = status.context("publication backlog exposition omitted status")?.to_owned();
+    let pipeline_stage_metrics = parse_pipeline_stage_metrics(text);
+    let pipeline_stage_metrics_unavailable_reason = pipeline_stage_metrics.is_none()
+        .then(|| "exporter_stage_histograms_missing_or_malformed".to_owned());
 
     if available {
         if status != "available" {
@@ -507,6 +753,8 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
             logical_bytes: Some(logical_bytes),
             oldest_age_seconds: Some(oldest_age_seconds),
             status,
+            pipeline_stage_metrics,
+            pipeline_stage_metrics_unavailable_reason,
         })
     } else {
         if status == "available"
@@ -523,6 +771,8 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
             logical_bytes: None,
             oldest_age_seconds: None,
             status,
+            pipeline_stage_metrics,
+            pipeline_stage_metrics_unavailable_reason,
         })
     }
 }
@@ -544,6 +794,8 @@ fn failed_publication_backlog_sample(
         oldest_age_seconds: None,
         status: None,
         unavailable_reason: Some(reason.to_owned()),
+        pipeline_stage_metrics: None,
+        pipeline_stage_metrics_unavailable_reason: Some(reason.to_owned()),
     }
 }
 
@@ -564,6 +816,8 @@ fn publication_backlog_sample(
         oldest_age_seconds: metrics.oldest_age_seconds,
         unavailable_reason: (!metrics.available).then(|| metrics.status.clone()),
         status: Some(metrics.status),
+        pipeline_stage_metrics: metrics.pipeline_stage_metrics,
+        pipeline_stage_metrics_unavailable_reason: metrics.pipeline_stage_metrics_unavailable_reason,
     }
 }
 
@@ -595,13 +849,15 @@ fn classify_local_qap_error(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl CellEvidence {
-    fn downstream_unavailable(&mut self, reason: impl Into<String>) {
-        let reason = reason.into();
+    fn downstream_unavailable(&mut self, reason: &str, comment: impl Into<String>) {
+        let comment = comment.into();
         tracing::warn!(
             reason = %reason,
+            comment = %comment,
             "downstream observation unavailable; preserving local collector evidence"
         );
-        self.downstream_comment.get_or_insert(reason);
+        self.downstream_reason.get_or_insert_with(|| reason.to_owned());
+        self.downstream_comment.get_or_insert(comment);
     }
 
     fn resource_summary(&self) -> Option<ResourceMetrics> {
@@ -623,9 +879,11 @@ impl CellEvidence {
         })
     }
 
-    fn record_client(&mut self, config: &OatConfig, table: &str, output: &str) -> Result<()> {
+    fn record_client(&mut self, config: &OatConfig, table: &str, client_id: &str, output: &str) -> Result<()> {
         let effective = process_configurations(output)?;
+        crate::runner::verify_oat_client_build_profile_readback(config, &effective)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
+        let concurrency_readback = verify_dmv_concurrency_readback(config, &effective)?;
         let data_profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
         let counters = client_phase_evidence(output, data_profile)?;
         if let Some(window) = counters.get("measurement_window").filter(|value| !value.is_null()) {
@@ -636,12 +894,58 @@ impl CellEvidence {
                 bail!("client phase counters disagree with the armed window or measured-row report");
             }
         }
-        self.client_reports.entry(table.to_owned()).or_default().push(json!({
+        self.store_client_report(table, json!({
+            "client_id": client_id,
+            "table": table,
             "phase_counters": counters,
+            "admission_readback": client_admission_readback(output),
             "consumer_effective_config": effective,
+            "concurrency_readback": concurrency_readback,
             "execution_image": client_image_evidence(output)?,
         }));
         Ok(())
+    }
+
+    fn record_cancelled_client(&mut self, table: &str, client_id: &str, output: Option<&str>) {
+        let terminal = output.and_then(|output| cancelled_client_window(output, self.measurement_window));
+        let phase_counters = match terminal {
+            Some((phase, window)) => json!({"terminal_phase": phase, "measurement_window": window}),
+            None => json!({"measurement_window": null, "unavailable_reason": "terminal_client_window_unavailable"}),
+        };
+        let effective = output.and_then(|output| process_configurations(output).ok());
+        self.store_client_report(table, json!({
+            "client_id": client_id, "table": table, "status": "diagnostic_only",
+            "phase_counters": phase_counters, "consumer_effective_config": effective,
+            "admission_readback": output.map(client_admission_readback),
+        }));
+    }
+
+    fn store_client_report(&mut self, table: &str, mut report: Value) {
+        let reports = self.client_reports.entry(table.to_owned()).or_default();
+        if let Some(previous) = reports.iter_mut().find(|old| old["client_id"] == report["client_id"]) {
+            if report["consumer_effective_config"].is_null() {
+                report["consumer_effective_config"] = previous["consumer_effective_config"].clone();
+            }
+            if report["concurrency_readback"].is_null() {
+                report["concurrency_readback"] = previous["concurrency_readback"].clone();
+            }
+            for key in ["preparation", "rejection"] {
+                if report["admission_readback"][key].is_null() {
+                    report["admission_readback"][key] = previous["admission_readback"][key].clone();
+                }
+            }
+            if previous["admission_readback"]["status"] == "malformed"
+                || report["admission_readback"]["status"].is_null()
+                || report["admission_readback"]["status"] == "unavailable"
+            {
+                report["admission_readback"]["status"] = previous["admission_readback"]["status"].clone();
+                report["admission_readback"]["malformed_reasons"] =
+                    previous["admission_readback"]["malformed_reasons"].clone();
+            }
+            *previous = report;
+        } else {
+            reports.push(report);
+        }
     }
 
     fn client_snapshot_total(&self, table: &str, field: &str) -> Option<u64> {
@@ -721,7 +1025,11 @@ impl CellEvidence {
         };
         json!({
             "status": status,
-            "reason": (status == "unsettled").then_some("delta_commit_drain_timeout"),
+            "reason": if status == "unsettled" {
+                Some("delta_commit_drain_timeout")
+            } else {
+                (status == "outside_bound" && ambiguous_rows == 0).then_some("delta_exact_match_failed")
+            },
             "settle_seconds": settle,
             "settle_timeout_seconds": delta_evidence.and_then(|value| value.get("settle_timeout_seconds")),
             "settled": settled,
@@ -782,6 +1090,8 @@ impl CellEvidence {
         json!({
             "version": 1,
             "client_schedule": self.client_schedule,
+            "preload_delta": self.preload_delta,
+            "parity_admission_readback": self.parity_admission_readback,
             "overload_guard": self.overload_guard,
             "overload_stop": self.overload_stop,
             "processes": self.processes,
@@ -792,6 +1102,7 @@ impl CellEvidence {
             "commit_window_output_throughput": output,
             "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
+            "downstream_reason": self.downstream_reason,
             "downstream_comment": self.downstream_comment,
             "qap_observation": self.qap_observation,
             "native_telemetry": self.native_telemetry,
@@ -1214,12 +1525,21 @@ impl ResourceSampler {
                 let mut interval = tokio::time::interval(PUBLICATION_BACKLOG_SAMPLING_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut resource_tasks = tokio::task::JoinSet::<Result<ResourceSample>>::new();
+                let mut quota_start = None;
+                let mut quota_end = None;
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {}
                         _ = stop_receiver.changed() => break,
                     }
                     let now = unix_time_ms_u64()?;
+                    if let ResourceSamplerSource::Local { run_id, environment, .. } = &source {
+                        if now >= start && now < end && quota_start.is_none() {
+                            quota_start = Some(local_cpu_quota_observation(&config, run_id, environment).await);
+                        } else if now >= end && quota_end.is_none() {
+                            quota_end = Some(local_cpu_quota_observation(&config, run_id, environment).await);
+                        }
+                    }
                     while let Some(sample) = native_tasks.try_join_next() {
                         match sample {
                             Ok(Ok(sample)) if native_samples.len() < NATIVE_TELEMETRY_MAX_SAMPLES => native_samples.push(sample),
@@ -1287,6 +1607,8 @@ impl ResourceSampler {
                     let expected_identity = guard.as_ref()
                         .and_then(|(probe, _)| probe.expected_scale_out_identity.clone());
                     let guard_api = guard.as_ref().and_then(|(probe, _)| probe.api.clone());
+                    #[cfg(unix)]
+                    let local_memory = guard.as_ref().and_then(|(probe, _)| probe.local_memory.clone());
                     let deadline = request_anchor + Duration::from_millis(other_timeout_ms);
                     let guard_reading = async {
                         match (&mut guard, &backlog_scraper) {
@@ -1303,7 +1625,14 @@ impl ResourceSampler {
                             guard_reading,
                             bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
                                 request_anchor + Duration::from_millis(timeout_ms)),
-                            async { verify_guard_identity(&config, expected_identity.as_ref(), guard_api.as_deref()).await },
+                            async {
+                                verify_guard_identity(&config, expected_identity.as_ref(), guard_api.as_deref()).await?;
+                                #[cfg(unix)]
+                                if let Some(local) = &local_memory {
+                                    local.inspect(&local.get("/json").await?)?;
+                                }
+                                Ok(())
+                            },
                             deadline,
                         ),
                     );
@@ -1390,6 +1719,9 @@ impl ResourceSampler {
                         evidence.backlog_sampling_failures += 1;
                     }
                 }
+                if matches!(&source, ResourceSamplerSource::Local { .. }) {
+                    evidence.cpu_quota = Some(local_cpu_quota_window(&config, start, end, quota_start.as_ref(), quota_end.as_ref()));
+                }
                 evidence.resource_sampling_failures += resource_tasks.len() as u64;
                 if let Some(source) = native {
                     native_failures += native_tasks.len() as u64;
@@ -1453,6 +1785,7 @@ impl ResourceSampler {
                 evidence.overload_stop = sampled.overload_stop;
             }
             evidence.resource_samples = sampled.resource_samples;
+            evidence.cpu_quota = sampled.cpu_quota;
             if sampled.native_telemetry.is_some() {
                 evidence.native_telemetry = sampled.native_telemetry;
             }
@@ -1626,6 +1959,25 @@ mod measurement_evidence_tests {
         )
     }
 
+    fn pipeline_histogram_exposition() -> String {
+        let mut output = String::from("process_cpu_seconds_total 123.0\n");
+        for stage in ["collect", "build", "sort", "encode", "upload", "commit"] {
+            let labels = format!("run=\"r\",variant=\"v\",component=\"arrowcol-dataflow-rust\",stage=\"{stage}\"");
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"0.5\"}} 1\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"1.0\"}} 2\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_sum{{{labels}}} 0.125\n"));
+            output.push_str(&format!("arrowcol_pipeline_stage_duration_seconds_count{{{labels}}} 2\n"));
+        }
+        let labels = "run=\"r\",variant=\"v\",component=\"arrowcol-dataflow-rust\"";
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"0.5\"}} 1\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"1.0\"}} 2\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_bucket{{{labels},le=\"+Inf\"}} 2\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_sum{{{labels}}} 0.25\n"));
+        output.push_str(&format!("arrowcol_pipeline_submission_wait_seconds_count{{{labels}}} 2\n"));
+        output
+    }
+
     #[tokio::test]
     async fn backlog_scrape_honors_the_actual_remaining_window_deadline() -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1670,6 +2022,37 @@ mod measurement_evidence_tests {
     }
 
     #[test]
+    fn pipeline_histogram_snapshots_preserve_all_stages_and_submission_wait() -> Result<()> {
+        let metrics = parse_pipeline_stage_metrics(&pipeline_histogram_exposition())
+            .context("pipeline histograms were not parsed")?;
+        assert_eq!(metrics["stage_duration_seconds"]["encode"]["count"], 2);
+        assert_eq!(metrics["stage_duration_seconds"]["upload"]["sum_seconds"], 0.125);
+        assert_eq!(metrics["stage_duration_seconds"]["commit"]["buckets"][2]["le"], "+Inf");
+        assert_eq!(metrics["temporality"], "cumulative_process_lifetime_snapshot");
+        assert_eq!(metrics["submission_wait_seconds"]["count"], 2);
+        assert_eq!(metrics["submission_wait_seconds"]["sum_seconds"], 0.25);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_histogram_rejects_malformed_bucket_distributions() {
+        let valid = pipeline_histogram_exposition();
+        let corrupt = |old: &str, new: &str| {
+            assert!(valid.contains(old), "fixture did not contain {old}");
+            valid.replacen(old, new, 1)
+        };
+        let negative_sum = corrupt("stage=\"collect\"} 0.125", "stage=\"collect\"} -0.125");
+        let decreasing = corrupt("stage=\"collect\",le=\"0.5\"} 1", "stage=\"collect\",le=\"0.5\"} 2")
+            .replacen("stage=\"collect\",le=\"1.0\"} 2", "stage=\"collect\",le=\"1.0\"} 1", 1);
+        let finite_exceeds_count = corrupt("stage=\"collect\",le=\"1.0\"} 2", "stage=\"collect\",le=\"1.0\"} 3");
+        let duplicate_numeric_bound = corrupt("stage=\"collect\",le=\"1.0\"", "stage=\"collect\",le=\"0.50\"");
+        let infinite_mismatch = corrupt("stage=\"collect\",le=\"+Inf\"} 2", "stage=\"collect\",le=\"+Inf\"} 3");
+        for malformed in [negative_sum, decreasing, finite_exceeds_count, duplicate_numeric_bound, infinite_mismatch] {
+            assert!(parse_pipeline_stage_metrics(&malformed).is_none());
+        }
+    }
+
+    #[test]
     fn publication_backlog_parser_preserves_unavailable_and_rejects_bad_gauges() -> Result<()> {
         let exposition = format!(
             "unrelated_metric 123 1700000000\n{}",
@@ -1685,6 +2068,8 @@ mod measurement_evidence_tests {
                 logical_bytes: Some(256),
                 oldest_age_seconds: Some(1.25),
                 status: "available".to_owned(),
+                pipeline_stage_metrics: None,
+                pipeline_stage_metrics_unavailable_reason: Some("exporter_stage_histograms_missing_or_malformed".to_owned()),
             }
         );
         let unavailable = parse_publication_backlog_metrics(&publication_backlog_exposition(
@@ -1780,9 +2165,10 @@ mod measurement_evidence_tests {
         assert!(local_downstream_optional(crate::config::OatMode::Local));
         assert!(!local_downstream_optional(crate::config::OatMode::Aks));
         let mut evidence = CellEvidence::default();
-        evidence.downstream_unavailable("local_qap_initialization_unavailable");
+        evidence.downstream_unavailable("local_qap_initialization_unavailable", "Local QAP initialization unavailable.");
         let public = evidence.for_table("table", None);
         assert_eq!(public["downstream_status"], "unavailable");
+        assert_eq!(public["downstream_reason"], "local_qap_initialization_unavailable");
         assert!(public["rows"]["delta_committed"].is_null());
         assert_eq!(public["reconciliation"]["status"], "unavailable");
         assert_eq!(public["reconciliation"]["reason"], "cumulative_delta_rows_unavailable");
@@ -1845,6 +2231,7 @@ mod measurement_evidence_tests {
             "measurement_window": {
                 "start_unix_ms": 10, "end_unix_ms": 20, "completed_rows": 5,
                 "completed_bytes": 25, "worker_completed_rows": [5], "pilot_window_rows": [],
+                "windows": [{"completed_sends": 2, "timed_out_sends": 1, "ambiguous_sends": 1}],
                 "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
             },
         });
@@ -1856,8 +2243,25 @@ mod measurement_evidence_tests {
         assert_eq!(output["workers"][0]["rejected_rows"], 0);
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
+        assert_eq!(output["measurement_window"]["windows"][0]["completed_sends"], 2);
+        assert_eq!(output["measurement_window"]["windows"][0]["timed_out_sends"], 1);
+        assert_eq!(output["measurement_window"]["windows"][0]["ambiguous_sends"], 1);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
+        assert!(output["delivery_cumulative"]["retried_streams"].is_null());
+        snapshots[1].workers[0].retried_streams = Some(2);
+        snapshots[1].workers[0].retried_rows = Some(10);
+        snapshots[1].workers[0].ambiguous_streams = Some(0);
+        snapshots[1].workers[0].ambiguous_rows = Some(0);
+        let output = client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?;
+        assert_eq!(output["delivery_cumulative"]["retried_streams"], 2);
+        assert_eq!(output["delivery_cumulative"]["retried_rows"], 10);
+        assert_eq!(output["delivery_cumulative"]["ambiguous_rows"], 0);
+        let hash = "a".repeat(64);
         let prepared = json!({
+            "data_profile": "realistic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-excluding-endpoint_url",
             "corpus_rows": 65_536,
             "corpus_uncompressed_flight_data_bytes": 535_000,
             "corpus_configured_ipc_compression_flight_data_bytes": 500_000,
@@ -1881,17 +2285,83 @@ mod measurement_evidence_tests {
             "generator_rows_per_second": 655_360.0,
             "steady_state_generation": true,
         });
+        let realistic_manifest = json!({
+            "data_profile": "realistic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-excluding-endpoint_url",
+            "identity_status": "identity_bearing",
+            "eligible_for_identity_reconciliation": true,
+            "complete": true,
+            "truncated": false,
+            "run_uuid": "c784d07ceefe4191aaf92a269f272ecf",
+            "incarnation_uuid": "1ae94edfe4044f0894fa78d4467f568a",
+            "ranges": [{"table": "example", "worker": 0, "first_sequence": 1, "last_sequence": 2,
+                "batch_count": 2, "rows_per_batch": 5, "cohort": "measurement",
+                "attempts": 1, "outcome": "acknowledged"}],
+        });
         snapshots[1].preparation = Some(prepared.clone());
+        snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
         let realistic = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
         assert_eq!(realistic["preparation"]["steady_state_generation"], true);
         assert_eq!(realistic["preparation"]["corpus_rows"], 65_536);
+        for key in [
+            "configured_live_slots",
+            "admitted_live_slots",
+            "live_identity_batch_bytes",
+            "live_identity_batch_reservation_bytes",
+            "corpus_memory_reservation_bytes",
+            "memory_reservation_bytes",
+            "max_memory_bytes",
+        ] {
+            assert_eq!(realistic["preparation"][key], prepared[key], "{key}");
+            let mut invalid = prepared.clone();
+            invalid[key] = json!("not an unsigned number");
+            assert!(client_preparation(Some(&invalid), ClientDataProfile::Realistic).is_err());
+        }
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_err());
+        snapshots[1].measurement_window.as_mut().context("test measurement window")?.client_resources =
+            Some(json!({"cpu_core_equivalents": 2.5}));
+        let evidence = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
+        assert_eq!(evidence["payload_manifest"], realistic_manifest);
+        assert_eq!(evidence["measurement_window"]["client_resources"]["cpu_core_equivalents"], 2.5);
+        snapshots[1].logical_batch_manifest.as_mut().context("test manifest")?["payload_corpus_sha256"] = json!("b".repeat(64));
+        assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
+        snapshots[1].preparation = Some(prepared.clone());
+        snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
+
+        let diagnostic_preparation = json!({
+            "data_profile": "diagnostic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-all-columns",
+            "steady_state_generation": false,
+        });
+        let diagnostic_manifest = json!({
+            "data_profile": "diagnostic",
+            "payload_corpus_sha256": hash,
+            "payload_corpus_hash_version": 2,
+            "payload_corpus_hash_scope": "arrow-logical-v2-all-columns",
+            "identity_status": "diagnostic_only",
+            "eligible_for_identity_reconciliation": false,
+            "complete": false,
+            "truncated": false,
+        });
+        snapshots[1].preparation = Some(diagnostic_preparation.clone());
+        snapshots[1].logical_batch_manifest = Some(diagnostic_manifest);
+        let diagnostic = client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?;
+        assert_eq!(diagnostic["payload_manifest"]["identity_status"], "diagnostic_only");
+        assert_eq!(diagnostic["payload_manifest"]["complete"], false);
+        assert_eq!(diagnostic["payload_manifest"]["eligible_for_identity_reconciliation"], false);
 
         for (flag, valid_diagnostic) in [(json!(false), true), (json!("true"), false)] {
-            snapshots[1].preparation.as_mut().context("test preparation")?["steady_state_generation"] = flag;
+            let mut diagnostic_preparation = diagnostic_preparation.clone();
+            diagnostic_preparation["steady_state_generation"] = flag;
+            snapshots[1].preparation = Some(diagnostic_preparation);
             assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
             assert_eq!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_ok(), valid_diagnostic);
         }
+        snapshots[1].logical_batch_manifest = Some(realistic_manifest.clone());
         snapshots[1].preparation = Some(json!({"corpus_rows": 65_536}));
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
         snapshots[1].preparation = None;
@@ -1982,17 +2452,17 @@ struct WorkerCounterSnapshot {
     #[serde(default)]
     rejected_rows: u64,
     #[serde(default)]
-    retried_streams: u64,
+    retried_streams: Option<u64>,
     #[serde(default)]
-    retried_rows: u64,
+    retried_rows: Option<u64>,
     #[serde(default)]
     given_up_streams: u64,
     #[serde(default)]
     given_up_rows: u64,
     #[serde(default)]
-    ambiguous_streams: u64,
+    ambiguous_streams: Option<u64>,
     #[serde(default)]
-    ambiguous_rows: u64,
+    ambiguous_rows: Option<u64>,
     send_latency_us: Option<ClientLatency>,
 }
 
@@ -2005,6 +2475,36 @@ struct ClientLatency {
     precision: String,
 }
 
+fn cancelled_client_window(output: &str, expected: Option<(u64, u64)>) -> Option<(String, Value)> {
+    let (start, end) = expected?;
+    if start >= end { return None; }
+    let mut terminal = None;
+    for line in output.lines().filter_map(|line| line.strip_prefix("OAT_CLIENT_METRICS ")) {
+        let snapshot: Value = serde_json::from_str(line).ok()?;
+        if matches!(snapshot["phase"].as_str(), Some("failed" | "completed")) {
+            if terminal.is_some() { return None; }
+            terminal = Some(snapshot);
+        }
+    }
+    let snapshot = terminal?;
+    if snapshot["version"].as_u64() != Some(1) || snapshot["scope"].as_str() != Some("process_cumulative") { return None; }
+    let window = snapshot.get("measurement_window")?;
+    if window["start_unix_ms"].as_u64() != Some(start)
+        || window["end_unix_ms"].as_u64() != Some(end)
+        || window["scope"].as_str() != Some("per_stream_admission_completion_observed_in_half_open_shared_unix_window") { return None; }
+    let windows = window["windows"].as_array()?;
+    if u64::try_from(windows.len()).ok()? != (end - start).div_ceil(30_000) { return None; }
+    for (index, item) in windows.iter().enumerate() {
+        let bucket_start = start.checked_add(u64::try_from(index).ok()?.checked_mul(30_000)?)?;
+        if item["start_unix_ms"].as_u64() != Some(bucket_start)
+            || item["end_unix_ms"].as_u64() != Some(end.min(bucket_start.saturating_add(30_000)))
+            || item["send_outcome_scope"].as_str() != Some("attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous")
+            || ["completed_sends", "timed_out_sends", "ambiguous_sends"].iter().any(|key| item[*key].as_u64().is_none())
+            || item["timed_out_sends"].as_u64()? > item["ambiguous_sends"].as_u64()? { return None; }
+    }
+    Some((snapshot["phase"].as_str()?.to_owned(), window.clone()))
+}
+
 #[derive(serde::Deserialize)]
 struct ClientCounterSnapshot {
     version: u64,
@@ -2014,6 +2514,7 @@ struct ClientCounterSnapshot {
     workers: Vec<WorkerCounterSnapshot>,
     preparation: Option<Value>,
     measurement_window: Option<ClientMeasurementWindow>,
+    logical_batch_manifest: Option<Value>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -2040,7 +2541,292 @@ struct ClientMeasurementWindow {
     ambiguous_rows: u64,
     worker_completed_rows: Vec<u64>,
     pilot_window_rows: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows: Option<Vec<Value>>,
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_resources: Option<Value>,
+}
+
+fn client_profile_name(profile: ClientDataProfile) -> &'static str {
+    match profile {
+        ClientDataProfile::Diagnostic => "diagnostic",
+        ClientDataProfile::Realistic => "realistic",
+    }
+}
+
+fn client_payload_hash_scope(profile: ClientDataProfile) -> &'static str {
+    match profile {
+        ClientDataProfile::Diagnostic => "arrow-logical-v2-all-columns",
+        ClientDataProfile::Realistic => "arrow-logical-v2-excluding-endpoint_url",
+    }
+}
+
+fn client_admission_readback(output: &str) -> Value {
+    let mut preparation = None;
+    let mut rejection = None;
+    let mut malformed = Vec::new();
+    let mut tagged = false;
+    for line in output.lines() {
+        if let Some(raw) = line.strip_prefix("OAT_CLIENT_METRICS ") {
+            tagged = true;
+            match serde_json::from_str::<Value>(raw) {
+                Ok(snapshot) => {
+                    if snapshot["version"] != 1 || snapshot["scope"] != "process_cumulative" {
+                        malformed.push("client_metrics_malformed");
+                    }
+                    if let Some(value) = snapshot.get("preparation").filter(|value| !value.is_null()) {
+                        if !value.is_object() {
+                            malformed.push("preparation_not_object");
+                        } else {
+                            if preparation.as_ref().is_some_and(|previous| previous != value) {
+                                malformed.push("preparation_changed_between_snapshots");
+                            }
+                            preparation = Some(value.clone());
+                        }
+                    }
+                }
+                Err(_) => malformed.push("client_metrics_malformed"),
+            }
+        }
+        if let Some(raw) = line.strip_prefix("OAT_CLIENT_ADMISSION_REJECTED ") {
+            tagged = true;
+            match serde_json::from_str::<Value>(raw) {
+                Ok(value) => {
+                    let required = value["configured_slots"].as_u64()
+                        .zip(value["corpus_reservation_bytes"].as_u64())
+                        .zip(value["per_live_batch_reservation_bytes"].as_u64())
+                        .map(|((slots, corpus), per_batch)| u128::from(corpus) + u128::from(slots) * u128::from(per_batch));
+                    let required_valid = required.is_some_and(|required| {
+                        value["required_reservation_bytes_exact"].as_str() == Some(required.to_string().as_str())
+                            && match u64::try_from(required) {
+                                Ok(required) => value["required_reservation_bytes"].as_u64() == Some(required),
+                                Err(_) => value.get("required_reservation_bytes").is_some_and(Value::is_null),
+                            }
+                    });
+                    if rejection.is_some()
+                        || !required_valid
+                        || value["version"] != 1
+                        || value["status"] != "client_under_admission"
+                        || value["configured_slots"].as_u64().is_none()
+                        || value["admitted_slots"].as_u64().is_none()
+                        || value["corpus_reservation_bytes"].as_u64().is_none()
+                        || value["per_live_batch_reservation_bytes"].as_u64().is_none()
+                        || value["max_memory_bytes"].as_u64().is_none()
+                        || value["required_reservation_bytes_exact"].as_str().is_none()
+                    {
+                        malformed.push("admission_rejection_malformed");
+                    }
+                    rejection = Some(value);
+                }
+                Err(_) => malformed.push("admission_rejection_malformed"),
+            }
+        }
+    }
+    json!({"preparation": preparation, "rejection": rejection,
+        "status": if !malformed.is_empty() { "malformed" } else if tagged { "reported" } else { "unavailable" },
+        "malformed_reasons": malformed})
+}
+
+fn client_admission_for_table(config: &OatConfig, run_id: &str, table: &str, reports: Option<&Vec<Value>>) -> Value {
+    let mut clients = Vec::new();
+    let mut seen = HashSet::new();
+    let mut failure = None;
+    for report in reports.into_iter().flatten() {
+        let client_id = report["client_id"].as_str();
+        let slot = client_id
+            .and_then(|id| id.strip_prefix(&format!("{run_id}:{table}:")))
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|index| *index > 0 && *index <= config.clients_per_table);
+        let duplicate = slot.is_some_and(|index| !seen.insert(index));
+        let resolved = slot
+            .and_then(|index| resolved_fleet_client_config(config, index - 1).ok())
+            .or_else(|| config.platform.fleet.is_none().then(|| config.clone()));
+        let profile = resolved.as_ref().map(|config| {
+            config
+                .tunables
+                .client
+                .as_ref()
+                .and_then(|client| client.data_profile)
+                .unwrap_or_default()
+        });
+        let raw = &report["admission_readback"];
+        let preparation = raw.get("preparation").filter(|value| value.is_object()).or_else(|| {
+            report
+                .pointer("/phase_counters/preparation")
+                .filter(|value| value.is_object())
+        });
+        let rejection = raw.get("rejection").filter(|value| value.is_object());
+        let malformed_fields = preparation.is_some_and(|value| {
+            [
+                "configured_live_slots",
+                "admitted_live_slots",
+                "memory_reservation_bytes",
+                "corpus_memory_reservation_bytes",
+                "live_identity_batch_bytes",
+                "live_identity_batch_reservation_bytes",
+                "max_memory_bytes",
+            ]
+            .iter()
+            .any(|key| {
+                value
+                    .get(*key)
+                    .is_some_and(|field| !field.is_null() && field.as_u64().is_none())
+            })
+        });
+        let malformed = raw["status"] == "malformed" || malformed_fields;
+        let rejected =
+            rejection.is_some_and(|value| value["version"] == 1 && value["status"] == "client_under_admission");
+        let read = |key: &str| preparation.and_then(|value| value.get(key)).and_then(Value::as_u64);
+        let configured =
+            read("configured_live_slots").or_else(|| rejection.and_then(|value| value["configured_slots"].as_u64()));
+        let admitted =
+            read("admitted_live_slots").or_else(|| rejection.and_then(|value| value["admitted_slots"].as_u64()));
+        let total = read("memory_reservation_bytes");
+        let corpus = read("corpus_memory_reservation_bytes")
+            .or_else(|| rejection.and_then(|value| value["corpus_reservation_bytes"].as_u64()));
+        let per_live = read("live_identity_batch_bytes")
+            .or_else(|| rejection.and_then(|value| value["per_live_batch_reservation_bytes"].as_u64()));
+        let live = read("live_identity_batch_reservation_bytes");
+        let max = read("max_memory_bytes").or_else(|| rejection.and_then(|value| value["max_memory_bytes"].as_u64()));
+        let effective = &report["consumer_effective_config"];
+        let worker_input = effective["workers"].as_u64().or_else(|| {
+            resolved.as_ref().and_then(|config| {
+                config
+                    .tunables
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.workers)
+                    .filter(|workers| *workers > 0)
+                    .and_then(|workers| u64::try_from(workers).ok())
+            })
+        });
+        let streams_input = effective["streams_per_worker"].as_u64().or_else(|| {
+            resolved.as_ref().and_then(|config| {
+                let streams = config
+                    .tunables
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.streams_per_worker)
+                    .filter(|streams| *streams > 0)
+                    .unwrap_or(config.effective_dmv_concurrency());
+                u64::try_from(streams).ok()
+            })
+        });
+        let inputs = worker_input.zip(streams_input);
+        let expected_slots = inputs.and_then(|(workers, streams)| workers.checked_mul(streams));
+        let reason = if rejected
+            || profile == Some(ClientDataProfile::Realistic)
+                && configured
+                    .zip(admitted)
+                    .is_some_and(|(configured, admitted)| admitted < configured)
+        {
+            Some("client_under_admission")
+        } else if profile == Some(ClientDataProfile::Realistic) && (malformed || duplicate || slot.is_none()) {
+            Some("client_admission_evidence_malformed")
+        } else if profile == Some(ClientDataProfile::Realistic) {
+            match (configured, admitted, total, corpus, per_live, live, max) {
+                (
+                    Some(configured),
+                    Some(admitted),
+                    Some(total),
+                    Some(corpus),
+                    Some(per_live),
+                    Some(live),
+                    Some(max),
+                ) => {
+                    if configured == 0
+                        || admitted != configured
+                        || corpus == 0
+                        || per_live == 0
+                        || inputs.is_some() && expected_slots.is_none()
+                        || expected_slots.is_some_and(|expected| expected != configured)
+                        || preparation
+                            .and_then(|value| value["data_profile"].as_str())
+                            .is_some_and(|value| value != "realistic")
+                        || per_live.checked_mul(admitted) != Some(live)
+                        || corpus.checked_add(live) != Some(total)
+                        || total > max
+                    {
+                        Some("client_reservation_inconsistent")
+                    } else {
+                        None
+                    }
+                }
+                _ => Some("client_admission_evidence_unavailable"),
+            }
+        } else if profile.is_none() {
+            Some("client_admission_evidence_unavailable")
+        } else if admitted.is_some_and(|count| count != 0)
+            || matches!((total, corpus, live, max), (Some(total), Some(corpus), Some(live), Some(max))
+                if live != 0 || corpus.checked_add(live) != Some(total) || total > max)
+        {
+            Some("client_reservation_inconsistent")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            failure.get_or_insert(reason);
+        }
+        let (estimate, estimate_reason) = match resolved.as_ref() {
+            Some(config) => match crate::config::client_memory_preflight_estimate(
+                config.tunables.client.as_ref(),
+                config.effective_dmv_concurrency(),
+            ) {
+                Ok(Some(estimate)) => (Some(estimate), None),
+                Ok(None) => (None, Some("preflight_corpus_bytes_not_configured")),
+                Err(_) => (None, Some("preflight_estimate_calculation_failed")),
+            },
+            None => (None, Some("client_configuration_unavailable")),
+        };
+        let estimated_bytes = estimate.as_ref().map(|estimate| estimate.required_bytes);
+        clients.push(json!({
+            "client_id": client_id, "client_index": slot,
+            "data_profile": profile.map(client_profile_name),
+            "status": if reason.is_some() { "failed" } else if malformed || configured.is_none() || admitted.is_none() || total.is_none() { "unavailable" } else { "reported" },
+            "reason": reason.or_else(|| if malformed { Some("client_admission_evidence_malformed") } else { (configured.is_none() || admitted.is_none() || total.is_none()).then_some("client_admission_evidence_unavailable") }),
+            "malformed_reasons": raw["malformed_reasons"], "malformed_preparation_fields": malformed_fields,
+            "configured_live_slots": configured, "admitted_live_slots": admitted,
+            "expected_live_slots_from_known_client_inputs": expected_slots,
+            "memory_reservation_bytes": total, "corpus_memory_reservation_bytes": corpus,
+            "live_identity_batch_bytes": per_live, "live_identity_batch_reservation_bytes": live,
+            "max_memory_bytes": max, "rejection": rejection,
+            "preflight_comparison": {
+                "status": if estimated_bytes.zip(total).is_some() { "compared" } else { "unavailable" },
+                "estimate": estimate,
+                "unavailable_reason": estimate_reason.or_else(|| total.is_none().then_some("client_reservation_unavailable")),
+                "estimate_provenance": "recomputed_on_oat_host_at_result_time_not_captured_validation_inputs",
+                "guaranteed_upper_bound": false,
+                "actual_reservation_exceeds_estimate": estimated_bytes.zip(total).map(|(estimate, actual)| actual > estimate),
+                "actual_reservation_bytes": total,
+            }
+        }));
+    }
+    for index in 1..=config.clients_per_table {
+        if seen.contains(&index) {
+            continue;
+        }
+        let resolved = resolved_fleet_client_config(config, index - 1).ok();
+        let profile = resolved.as_ref().map(|config| {
+            config
+                .tunables
+                .client
+                .as_ref()
+                .and_then(|client| client.data_profile)
+                .unwrap_or_default()
+        });
+        if profile == Some(ClientDataProfile::Realistic) {
+            failure.get_or_insert("client_admission_evidence_unavailable");
+        }
+        clients.push(json!({"client_id": null, "client_index": index, "data_profile": profile.map(client_profile_name),
+            "status": "unavailable", "reason": "client_admission_evidence_unavailable", "configured_live_slots": null,
+            "admitted_live_slots": null, "memory_reservation_bytes": null, "corpus_memory_reservation_bytes": null,
+            "live_identity_batch_bytes": null, "live_identity_batch_reservation_bytes": null, "max_memory_bytes": null,
+            "preflight_comparison": {"status":"unavailable", "estimate":null, "unavailable_reason":"client_reservation_unavailable",
+                "estimate_provenance":"recomputed_on_oat_host_at_result_time_not_captured_validation_inputs", "guaranteed_upper_bound":false}}));
+    }
+    json!({"status": if failure.is_some() { "failed" } else if clients.iter().any(|client| client["status"] == "unavailable") { "unavailable" } else { "reported" },
+        "failure": failure, "clients": clients})
 }
 
 fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) -> Result<Value> {
@@ -2052,12 +2838,37 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
     };
     let object = value.as_object().context("client preparation must be an object")?;
     let mut result = serde_json::Map::new();
+    if let Some(hash) = object.get("payload_corpus_sha256") {
+        if hash.as_str().is_none_or(|value| {
+            value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            bail!("invalid client payload corpus hash");
+        }
+        if object.get("data_profile").and_then(Value::as_str) != Some(client_profile_name(data_profile))
+            || object.get("payload_corpus_hash_version").and_then(Value::as_u64) != Some(2)
+            || object.get("payload_corpus_hash_scope").and_then(Value::as_str) != Some(client_payload_hash_scope(data_profile))
+        {
+            bail!("client preparation profile or payload hash contract mismatch");
+        }
+        result.insert("payload_corpus_sha256".to_owned(), hash.clone());
+        for key in ["data_profile", "payload_corpus_hash_version", "payload_corpus_hash_scope"] {
+            result.insert(key.to_owned(), object[key].clone());
+        }
+    } else if data_profile == ClientDataProfile::Realistic {
+        bail!("missing realistic client payload corpus hash");
+    }
     for key in [
         "corpus_rows",
         "corpus_decoded_bytes",
         "corpus_encoded_bytes",
+        "corpus_memory_reservation_bytes",
         "retained_encoded_bytes",
         "memory_reservation_bytes",
+        "configured_live_slots",
+        "admitted_live_slots",
+        "live_identity_batch_bytes",
+        "live_identity_batch_reservation_bytes",
+        "max_memory_bytes",
     ] {
         if let Some(value) = object.get(key) {
             if value.as_u64().is_none() {
@@ -2066,6 +2877,55 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
             result.insert(key.to_owned(), value.clone());
         }
     }
+    if let Some(applicability) = object.get("generator_applicability") {
+        let tables = applicability.get("tables").and_then(Value::as_array)
+            .context("client generator_applicability tables must be an array")?;
+        if applicability["version"] != 1 || tables.is_empty() {
+            bail!("invalid client generator_applicability version or tables");
+        }
+        let mut names = HashSet::new();
+        let mut total_rows = 0_u64;
+        for table in tables {
+            let name = table["table"].as_str().filter(|name| !name.is_empty())
+                .context("client generator_applicability table is missing")?;
+            if !names.insert(name.to_ascii_lowercase()) {
+                bail!("duplicate client generator_applicability table");
+            }
+            let rows = table["rows"].as_u64().filter(|rows| *rows > 0)
+                .context("client generator_applicability rows must be positive")?;
+            let fields = table["schema_fields"].as_u64().filter(|fields| *fields > 0)
+                .context("client generator_applicability schema_fields must be positive")?;
+            let nulls = &table["null_fraction"];
+            let columns = nulls["eligible_columns"].as_u64()
+                .context("client generator_applicability eligible_columns must be unsigned")?;
+            let eligible_rows = nulls["eligible_rows"].as_u64()
+                .context("client generator_applicability eligible_rows must be unsigned")?;
+            let null_rows = nulls["null_rows"].as_u64()
+                .context("client generator_applicability null_rows must be unsigned")?;
+            if columns > fields || rows.checked_mul(columns) != Some(eligible_rows) || null_rows > eligible_rows {
+                bail!("inconsistent client generator_applicability null counts");
+            }
+            for name in ["pod_ordinal", "guid_uniqueness", "value_variation", "string_width", "entropy"] {
+              if let Some(guid) = table.get(name) {
+                let columns = guid["eligible_columns"].as_u64()
+                    .with_context(|| format!("client generator_applicability {name} eligible_columns must be unsigned"))?;
+                let eligible_rows = guid["eligible_rows"].as_u64()
+                    .with_context(|| format!("client generator_applicability {name} eligible_rows must be unsigned"))?;
+                if columns > fields || rows.checked_mul(columns).is_none_or(|maximum| eligible_rows > maximum)
+                    || (columns == 0) != (eligible_rows == 0)
+                {
+                    bail!("inconsistent client generator_applicability {name} counts");
+                }
+              }
+            }
+            total_rows = total_rows.checked_add(rows).context("client generator_applicability row overflow")?;
+        }
+        if object.get("corpus_rows").and_then(Value::as_u64) != Some(total_rows) {
+            bail!("client generator_applicability does not match prepared corpus rows");
+        }
+        result.insert("generator_applicability".to_owned(), applicability.clone());
+    }
+
     for key in [
         "generation_wall_seconds",
         "generation_cpu_seconds",
@@ -2121,13 +2981,236 @@ fn client_phase_evidence(output: &str, data_profile: ClientDataProfile) -> Resul
 mod downstream_runner_tests {
     use super::*;
 
+    #[test]
+    fn admission_readback_classifies_realistic_and_legacy_diagnostic_rows() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.truncate(1);
+        config.clients_per_table = 1;
+        config.tunables = serde_json::from_value(json!({"client": {
+            "data_profile": "realistic", "workers": 2, "streams_per_worker": 1,
+            "corpus_bytes": 100, "max_memory_bytes": 3_000_000_000_u64
+        }}))?;
+        let table = config.tables[0].clone();
+        let id = format!("run:{table}:1");
+        let preparation = json!({"configured_live_slots":2, "admitted_live_slots":2,
+            "memory_reservation_bytes":1000, "corpus_memory_reservation_bytes":700,
+            "live_identity_batch_bytes":150, "live_identity_batch_reservation_bytes":300, "max_memory_bytes":2000});
+        let report = |value: Value| {
+            json!({"client_id":id, "admission_readback":{"preparation":value},
+            "consumer_effective_config":{"workers":2,"streams_per_worker":1}})
+        };
+        let qualified = client_admission_for_table(&config, "run", &table, Some(&vec![report(preparation.clone())]));
+        assert_eq!(qualified["clients"][0]["status"], "reported");
+        assert!(qualified["failure"].is_null());
+        assert_eq!(
+            qualified["clients"][0]["preflight_comparison"]["estimate"]["required_bytes"],
+            1_593_742_225_u64
+        );
+        assert_eq!(
+            qualified["clients"][0]["preflight_comparison"]["guaranteed_upper_bound"],
+            false
+        );
+        assert_eq!(
+            qualified["clients"][0]["preflight_comparison"]["actual_reservation_exceeds_estimate"],
+            false
+        );
+        let mut larger = preparation.clone();
+        larger["corpus_memory_reservation_bytes"] = json!(2_000_000_000_u64);
+        larger["memory_reservation_bytes"] = json!(2_000_000_300_u64);
+        larger["max_memory_bytes"] = json!(3_000_000_000_u64);
+        let compared = client_admission_for_table(&config, "run", &table, Some(&vec![report(larger)]));
+        assert!(compared["failure"].is_null());
+        assert_eq!(
+            compared["clients"][0]["preflight_comparison"]["actual_reservation_exceeds_estimate"],
+            true
+        );
+        for (field, value, reason) in [
+            ("admitted_live_slots", json!(1), "client_under_admission"),
+            (
+                "memory_reservation_bytes",
+                json!(999),
+                "client_reservation_inconsistent",
+            ),
+            (
+                "configured_live_slots",
+                json!("invalid"),
+                "client_admission_evidence_malformed",
+            ),
+            (
+                "live_identity_batch_reservation_bytes",
+                Value::Null,
+                "client_admission_evidence_unavailable",
+            ),
+        ] {
+            let mut changed = preparation.clone();
+            changed[field] = value;
+            let admission = client_admission_for_table(&config, "run", &table, Some(&vec![report(changed)]));
+            assert_eq!(admission["failure"], reason);
+        }
+        let output = format!(
+            "OAT_CLIENT_METRICS {}\nOAT_CLIENT_METRICS invalid-json\n",
+            json!({
+                "version":1,"scope":"process_cumulative","preparation":preparation
+            })
+        );
+        let mut captured = CellEvidence::default();
+        captured.record_cancelled_client(&table, &id, Some(&output));
+        captured.record_cancelled_client(&table, &id, None);
+        let malformed = client_admission_for_table(&config, "run", &table, captured.client_reports.get(&table));
+        assert_eq!(malformed["failure"], "client_admission_evidence_malformed");
+        assert_eq!(malformed["clients"][0]["configured_live_slots"], 2);
+        assert_eq!(
+            malformed["clients"][0]["malformed_reasons"][0],
+            "client_metrics_malformed"
+        );
+        let mut overflow = config.clone();
+        overflow
+            .tunables
+            .client
+            .as_mut()
+            .context("missing fixture client")?
+            .corpus_bytes = Some(u64::MAX);
+        let evidence = client_admission_for_table(&overflow, "run", &table, Some(&vec![report(preparation.clone())]));
+        assert_eq!(
+            evidence["clients"][0]["preflight_comparison"]["unavailable_reason"],
+            "preflight_estimate_calculation_failed"
+        );
+        let missing = client_admission_for_table(&config, "run", &table, None);
+        assert_eq!(missing["failure"], "client_admission_evidence_unavailable");
+        assert!(missing["clients"][0]["client_id"].is_null());
+        assert!(missing["clients"][0]["admitted_live_slots"].is_null());
+        config.tunables = serde_json::from_value(json!({"client":{"data_profile":"diagnostic"}}))?;
+        let diagnostic = client_admission_for_table(
+            &config,
+            "run",
+            &table,
+            Some(&vec![report(json!({
+                "configured_live_slots":2,"admitted_live_slots":0,"memory_reservation_bytes":700
+            }))]),
+        );
+        assert!(diagnostic["failure"].is_null());
+        assert_eq!(diagnostic["clients"][0]["admitted_live_slots"], 0);
+        let mut diagnostic_capture = CellEvidence::default();
+        let output = format!(
+            "OAT_CLIENT_METRICS {}\nOAT_CLIENT_ADMISSION_REJECTED invalid-json\n",
+            json!({
+                "version":1,"scope":"process_cumulative","preparation":{"configured_live_slots":2,"admitted_live_slots":0,"memory_reservation_bytes":700}
+            })
+        );
+        diagnostic_capture.record_cancelled_client(&table, &id, Some(&output));
+        let malformed_diagnostic =
+            client_admission_for_table(&config, "run", &table, diagnostic_capture.client_reports.get(&table));
+        assert!(malformed_diagnostic["failure"].is_null());
+        assert_eq!(
+            malformed_diagnostic["clients"][0]["reason"],
+            "client_admission_evidence_malformed"
+        );
+        let legacy = client_admission_for_table(&config, "run", &table, None);
+        assert!(legacy["failure"].is_null());
+        assert_eq!(legacy["clients"][0]["status"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn admission_rejection_is_preserved_in_failed_result_row() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.truncate(1);
+        config.clients_per_table = 1;
+        config.tunables = serde_json::from_value(json!({"client":{"data_profile":"realistic"}}))?;
+        let table = config.tables[0].clone();
+        let id = format!("run:{table}:1");
+        let rejection = json!({"version":1,"status":"client_under_admission","configured_slots":4,"admitted_slots":1,
+            "required_reservation_bytes":1300,"required_reservation_bytes_exact":"1300","max_memory_bytes":1000,
+            "corpus_reservation_bytes":500,"per_live_batch_reservation_bytes":200});
+        let mut inconsistent = rejection.clone();
+        inconsistent["required_reservation_bytes_exact"] = json!("1299");
+        let malformed = client_admission_readback(&format!("OAT_CLIENT_ADMISSION_REJECTED {inconsistent}\n"));
+        assert_eq!(malformed["status"], "malformed");
+        assert_eq!(malformed["rejection"]["configured_slots"], 4);
+        let output = format!("OAT_CLIENT_ADMISSION_REJECTED {rejection}\n");
+        let mut evidence = CellEvidence::default();
+        evidence.record_cancelled_client(&table, &id, Some(&output));
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            "run",
+            1,
+            1,
+            CellMeasurements {
+                clients: ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: PinningReport::default(),
+                    qap_tables: Vec::new(),
+                    failure: Some("readiness failed".to_owned()),
+                    evidence,
+                },
+                started_at_ms: 1000,
+                qap: QapMetrics::default(),
+                resources: None,
+                resource_evidence: None,
+            },
+        )?;
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0]
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("client_under_admission"))
+        );
+        let evidence: Value =
+            serde_json::from_str(rows[0].evidence_json.as_deref().context("missing result evidence")?)?;
+        let client = &evidence["client_admission"]["clients"][0];
+        assert_eq!(client["configured_live_slots"], 4);
+        assert_eq!(client["admitted_live_slots"], 1);
+        assert!(client["memory_reservation_bytes"].is_null());
+        assert_eq!(client["rejection"]["required_reservation_bytes_exact"], "1300");
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_client_retains_window_outcomes_only_as_diagnostic_evidence() {
+        let bucket = |start, end, completed, timed_out, ambiguous| json!({
+            "start_unix_ms": start, "end_unix_ms": end,
+            "completed_sends": completed, "timed_out_sends": timed_out, "ambiguous_sends": ambiguous,
+            "send_outcome_scope": "attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous"
+        });
+        let terminal = json!({"version": 1, "phase": "failed", "scope": "process_cumulative",
+            "measurement_window": {"start_unix_ms": 1000, "end_unix_ms": 61000,
+                "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+                "windows": [bucket(1000, 31000, 2, 1, 1), bucket(31000, 61000, 3, 2, 4)]}});
+        let output = format!("OAT_CLIENT_METRICS {terminal}\n");
+        let mut evidence = CellEvidence { measurement_window: Some((1000, 61000)), ..Default::default() };
+        evidence.record_cancelled_client("table", "client-1", Some(&output));
+        let report = &evidence.client_reports["table"][0];
+        assert_eq!(report["status"], "diagnostic_only");
+        assert_eq!(report["phase_counters"]["terminal_phase"], "failed");
+        assert_eq!(report["phase_counters"]["measurement_window"]["windows"][0]["completed_sends"], 2);
+        assert_eq!(report["phase_counters"]["measurement_window"]["windows"][1]["timed_out_sends"], 2);
+        assert_eq!(report["phase_counters"]["measurement_window"]["windows"][1]["ambiguous_sends"], 4);
+        assert_eq!(evidence.client_snapshot_total("table", "client_completed_rows"), None);
+        assert_eq!(evidence.client_cumulative_total("table", "completed_rows"), None);
+        evidence.record_cancelled_client("table", "client-2", None);
+        assert_eq!(evidence.client_reports["table"][1]["phase_counters"]["unavailable_reason"], "terminal_client_window_unavailable");
+        assert!(cancelled_client_window(&output, Some((1000, 61001))).is_none());
+        assert!(cancelled_client_window(&format!("{output}{output}"), Some((1000, 61000))).is_none());
+        let mut malformed = terminal;
+        malformed["measurement_window"]["windows"][0]["ambiguous_sends"] = json!(0);
+        assert!(cancelled_client_window(&format!("OAT_CLIENT_METRICS {malformed}\n"), Some((1000, 61000))).is_none());
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Fault {
         InitUnavailable,
         InitRequired,
         InitTimeout,
         PinInitFailed,
+        GuardUnavailable,
         ObservationUnavailable,
+        ObservationInvalidJson,
         InitBindingRejected,
         ObservationBindingRejected,
         Collector,
@@ -2135,6 +3218,8 @@ mod downstream_runner_tests {
         ScheduleArmBlocked,
         ScheduleAckBlocked,
         ScheduleAckCancellationFailed,
+        CancellationCapture,
+        AdmissionRejected,
     }
 
     struct FaultPlatform {
@@ -2184,6 +3269,13 @@ mod downstream_runner_tests {
         fn qap_endpoint(&self, _: &OatConfig) -> String {
             self.endpoint.clone()
         }
+        fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+            matches!(self.fault, Fault::GuardUnavailable).then(|| ResourceSamplerSource::Local {
+                run_id: "stack-fixture".to_owned(),
+                environment: HashMap::new(),
+                collector_metrics_url: Some(format!("{}/metrics", self.endpoint)),
+            })
+        }
         async fn ensure_stack(&mut self, _: &OatConfig, _: &str, _: u32) -> Result<()> {
             Ok(())
         }
@@ -2226,7 +3318,7 @@ mod downstream_runner_tests {
                     outcome.map_err(classify_local_qap_error)?;
                     Ok(vec!["observed".to_owned()])
                 }
-                Fault::ObservationUnavailable | Fault::ObservationBindingRejected => Ok(vec!["observed".to_owned()]),
+                Fault::ObservationUnavailable | Fault::ObservationInvalidJson | Fault::ObservationBindingRejected => Ok(vec!["observed".to_owned()]),
                 _ => Err(anyhow::anyhow!(LocalDownstreamUnavailable)),
             }
         }
@@ -2240,9 +3332,9 @@ mod downstream_runner_tests {
         async fn start_client(
             &mut self,
             _: &OatConfig,
-            _: &str,
+            run_id: &str,
             table: &str,
-            _: usize,
+            client_index: usize,
             arguments: &[String],
         ) -> Result<ClientHandle> {
             self.clients_started += 1;
@@ -2251,7 +3343,10 @@ mod downstream_runner_tests {
                 .map(|pair| pair[1].parse())
                 .transpose()?;
             Ok(ClientHandle {
-                client_id: format!("client-{}", self.clients_started),
+                client_id: if matches!(self.fault, Fault::AdmissionRejected) {
+                    format!("{run_id}:{table}:{client_index}")
+                } else {
+                    format!("client-{}", self.clients_started)},
                 table: table.to_owned(),
                 process: ClientProcess::Local {
                     container_id: "fake".to_owned(),
@@ -2268,6 +3363,18 @@ mod downstream_runner_tests {
                     dropped_after_ms: &self.delivery_drop_ms,
                 };
                 return std::future::pending().await;
+            }
+            if matches!(self.fault, Fault::AdmissionRejected) {
+                let rejection = json!({"version":1,"status":"client_under_admission","configured_slots":4,"admitted_slots":1,
+                    "required_reservation_bytes":1300,"required_reservation_bytes_exact":"1300","max_memory_bytes":1000,
+                    "corpus_reservation_bytes":500,"per_live_batch_reservation_bytes":200});
+                return Ok(ClientProgress {
+                    ready: false,
+                    schedule_received: false,
+                    completed: true,
+                    failure: Some("client_under_admission".to_owned()),
+                    output: format!("OAT_CLIENT_ADMISSION_REJECTED {rejection}\n"),
+                });
             }
             Ok(ClientProgress {
                 ready: true,
@@ -2302,8 +3409,19 @@ mod downstream_runner_tests {
         async fn finish_client(&self, config: &OatConfig, _: ClientHandle) -> Result<String> {
             let start = self.start.load(std::sync::atomic::Ordering::SeqCst) + config.warmup_seconds * 1000;
             let end = start + config.measure_seconds * 1000;
+            let requested_streams = config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).unwrap_or(0);
+            let concurrency = config.effective_dmv_concurrency();
+            let (streams, source) = if requested_streams == 0 {
+                (concurrency, "legacy_concurrency")
+            } else {
+                (requested_streams, "explicit_streams_per_worker")
+            };
+            let effective = json!({"workers":1,"streams_per_worker":streams});
+            let resolution = json!({"version":1,"requested":{"streams_per_worker":requested_streams},
+                "legacy":{"concurrency":concurrency},"resolved":{"streams_per_worker":streams},
+                "streams_per_worker_source":source});
             Ok(format!(
-                "measured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
+                "OAT_CLIENT_EFFECTIVE_CONFIG {effective}\nOAT_CLIENT_RESOLUTION {resolution}\nOAT_CLIENT_BUILD_PROFILE {{\"lto\":\"off\",\"codegen_units\":16,\"opt_level\":3,\"target_cpu\":\"generic\"}}\nmeasured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
                 config.measure_seconds,
                 100.0 / config.measure_seconds as f64
             ))
@@ -2317,7 +3435,21 @@ mod downstream_runner_tests {
             }
             Ok(())
         }
+        async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+            self.cancel_client(config, handle).await?;
+            if !matches!(self.fault, Fault::CancellationCapture) { return Ok(None); }
+            if handle.client_id == "client-2" { bail!("fixture terminal logs unavailable"); }
+            let terminal = json!({"version":1,"phase":"failed","scope":"process_cumulative",
+                "measurement_window":{"start_unix_ms":1000,"end_unix_ms":31000,
+                    "scope":"per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+                    "windows":[{"start_unix_ms":1000,"end_unix_ms":31000,"completed_sends":3,
+                        "timed_out_sends":1,"ambiguous_sends":2,
+                        "send_outcome_scope":"attempts_started_in_window_including_post_window_outcomes_timeout_is_ambiguous"}]}});
+            Ok(Some(format!("OAT_CLIENT_METRICS {terminal}\n")))
+        }
         async fn process_logs(&self, _: &OatConfig) -> Result<Vec<ProcessLog>> {
+            let source_revision = std::env::var("GIT_SHA").unwrap_or_else(|_| "local".to_owned());
+            let collector_text = format!("arrowcol_effective_config {{\"source_revision\":\"{source_revision}\"}}\n");
             Ok(vec![ProcessLog {
                 role: ComponentRole::Router,
                 instance_id: "router-fault-test".to_owned(),
@@ -2330,7 +3462,34 @@ mod downstream_runner_tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 text: "arrowcol_router_effective_config {\"log_filter\":\"warn,tiberius=error\"}\n".to_owned(),
+            }, ProcessLog {
+                role: ComponentRole::Collector,
+                instance_id: "collector-fault-test".to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: true,
+                raw_log_bytes: collector_text.len() as u64,
+                raw_log_lines: 1,
+                stdout: collector_text.clone(),
+                stderr: String::new(),
+                text: collector_text,
             }])
+        }
+        async fn process_logs_for_role(&self, _: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+            if matches!(self.fault, Fault::GuardUnavailable) && role == ComponentRole::Collector {
+                let text = concat!(
+                    "arrowcol_effective_config ",
+                    "{\"commit_telemetry\":{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",",
+                    "\"clock\":\"system_unix_ms\"},\"pressure\":{\"rss_limit_bytes\":1000,\"buffered_bytes_limit\":1000}}\n"
+                ).to_owned();
+                return Ok(vec![ProcessLog {
+                    role, instance_id: "pod/collector".to_owned(), image: None, image_id: None,
+                    source_revision: None, complete: true, raw_log_bytes: text.len() as u64,
+                    raw_log_lines: 1, stdout: text.clone(), stderr: String::new(), text,
+                }]);
+            }
+            Ok(Vec::new())
         }
         async fn cleanup(&mut self, _: &OatConfig) -> Result<()> {
             Ok(())
@@ -2339,6 +3498,85 @@ mod downstream_runner_tests {
 
     async fn run_fault(fault: Fault, kind: crate::config::OatMode) -> Result<(Vec<OatResult>, FaultPlatform)> {
         run_fault_with_lead(fault, kind, None).await
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture for default Tokio worker stack"]
+    fn matrix_default_worker_stack_child() -> Result<()> {
+        anyhow::ensure!(std::env::var_os("OAT_STACK_FIXTURE_CHILD").is_some(), "run the parent stack fixture");
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let endpoint = format!("http://{}", listener.local_addr()?);
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, axum::Router::new().fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE })).await
+                });
+                let platform = FaultPlatform {
+                    kind: crate::config::OatMode::Aks, fault: Fault::GuardUnavailable, endpoint,
+                    start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+                    pin_init_calls: 0, qap_initialization_calls: 0, client_fleet_prepared: false,
+                    client_schedule_wait_seconds: None, arm_attempts: 0, arm_started: None,
+                    delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
+                    cancellations: std::sync::Mutex::new(Vec::new()), unresolved: false,
+                };
+                let mut config: OatConfig = serde_json::from_str(include_str!(
+                    "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+                ))?;
+                config.platform.kind = crate::config::OatMode::Aks;
+                config.platform.compose_file = None;
+                config.platform.compose_override_file = None;
+                config.platform.compose_project = None;
+                config.platform.compose_state_root = None;
+                std::fs::write("runtime.json", "")?;
+                std::fs::write("bootstrap.env", "")?;
+                config.platform.runtime_config_file = Some("runtime.json".to_owned());
+                config.platform.bootstrap_env_file = Some("bootstrap.env".to_owned());
+                config.stamp = Some("00000".to_owned());
+                config.edge_secret_name = "arrowcol-router-auth".to_owned();
+                config.dmv_client_image = "fixture.invalid/client:fixture".to_owned();
+                config.result_url = "abfss://experiments@fixture.dfs.core.windows.net/results.parquet".to_owned();
+                config.website_url = "abfss://$web@fixture.dfs.core.windows.net/results.parquet".to_owned();
+                config.overload_guard.enabled = true;
+                config.replica_counts = vec![1];
+                config.dfe_worker_concurrency = vec![1];
+                let state = Arc::new(AppState::default());
+                let (_cancel, cancellation) = watch::channel(false);
+                let outcome = STACK_TEST_PLATFORM.scope(
+                    std::sync::Mutex::new(Some(Box::new(platform))),
+                    run_matrix(&config, "stack-fixture", state, cancellation),
+                ).await;
+                server.abort();
+                let error = outcome.error.context("matrix unexpectedly admitted the unprotected fixture")?;
+                anyhow::ensure!(error.to_string().contains("overload_guard required protection unavailable before admission"), "unexpected matrix outcome: {error:#}");
+                anyhow::ensure!(outcome.aks_cleanup_confirmed, "fixture platform cleanup did not complete");
+                Ok::<_, anyhow::Error>(())
+            }).await?
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matrix_runs_on_default_tokio_worker_stack() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("oat-stack-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let kubectl = root.join("kubectl");
+        fs::write(&kubectl, "#!/bin/sh\nprintf x > \"$0.hit\"\nexit 23\n")?;
+        fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o700))?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "runner::downstream_runner_tests::matrix_default_worker_stack_child", "--ignored", "--nocapture"])
+            .env_remove("RUST_MIN_STACK")
+            .env("OAT_STACK_FIXTURE_CHILD", "1")
+            .env("PATH", &root)
+            .current_dir(&root)
+            .output()?;
+        let reached_guard = root.join("kubectl.hit").is_file();
+        fs::remove_dir_all(&root)?;
+        anyhow::ensure!(output.status.success(), "matrix worker subprocess failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        anyhow::ensure!(reached_guard, "guard did not reach its live readback commands");
+        Ok(())
     }
 
     async fn run_fault_with_lead(
@@ -2354,17 +3592,19 @@ mod downstream_runner_tests {
             "arrowcol_router_table_owners{pool=\"dataflow\",catalog=\"telemetry\",schema=\"sqlserver\",table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n"
         };
         let metric = format!("{metric}arrowcol_router_sql_connections_opened_total 0\n");
-        let downstream_status = if matches!(fault, Fault::InitBindingRejected | Fault::ObservationBindingRejected) {
-            axum::http::StatusCode::BAD_REQUEST
+        let (downstream_status, downstream_body) = if matches!(fault, Fault::ObservationInvalidJson) {
+            (axum::http::StatusCode::OK, "not-json")
+        } else if matches!(fault, Fault::InitBindingRejected | Fault::ObservationBindingRejected) {
+            (axum::http::StatusCode::BAD_REQUEST, "")
         } else {
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "")
         };
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 axum::Router::new()
                     .route("/metrics", axum::routing::get(move || async move { metric }))
-                    .fallback(move || async move { downstream_status }),
+                    .fallback(move || async move { (downstream_status, downstream_body) }),
             )
             .await
         });
@@ -2389,6 +3629,9 @@ mod downstream_runner_tests {
         ))?;
         config.platform.kind = kind;
         config.overload_guard.enabled = false;
+        if matches!(fault, Fault::AdmissionRejected) {
+            config.tunables = serde_json::from_value(json!({"client":{"data_profile":"realistic"}}))?;
+        }
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         if let Some(lead) = lead {
             config.schedule_lead_seconds = lead;
@@ -2417,6 +3660,52 @@ mod downstream_runner_tests {
             return Ok((Vec::new(), platform));
         }
         Ok((result?, platform))
+    }
+
+    #[tokio::test]
+    async fn admission_rejection_during_readiness_reaches_failed_result() -> Result<()> {
+        let (rows, platform) =
+            run_fault_with_lead(Fault::AdmissionRejected, crate::config::OatMode::Local, None).await?;
+        assert_eq!(platform.arm_attempts, 0);
+        assert_eq!(platform.qap_initialization_calls, 0);
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0]
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("client_under_admission"))
+        );
+        let evidence: Value =
+            serde_json::from_str(rows[0].evidence_json.as_deref().context("missing failure evidence")?)?;
+        assert_eq!(evidence["client_admission"]["clients"][0]["configured_live_slots"], 4);
+        assert_eq!(evidence["client_admission"]["clients"][0]["admitted_live_slots"], 1);
+        assert!(evidence["client_admission"]["clients"][0]["memory_reservation_bytes"].is_null());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_each_terminal_report_when_another_capture_fails() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        let platform = FaultPlatform {
+            kind: crate::config::OatMode::Local, fault: Fault::CancellationCapture,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+            pin_init_calls: 0, qap_initialization_calls: 0, client_fleet_prepared: false,
+            client_schedule_wait_seconds: None, unresolved: false, arm_attempts: 0, arm_started: None,
+            delivery_drop_ms: std::sync::atomic::AtomicU64::new(0), cancellations: std::sync::Mutex::new(Vec::new()),
+        };
+        let handles = (1..=2).map(|id| ClientHandle { client_id: format!("client-{id}"),
+            table: "table".to_owned(), process: ClientProcess::Local { container_id: format!("container-{id}") } }).collect::<Vec<_>>();
+        let mut evidence = CellEvidence { measurement_window: Some((1000, 31000)), ..Default::default() };
+        let result = cancel_active_clients_with_evidence(&platform, &config, &handles, &[true, true], &mut evidence).await;
+        assert!(result.is_err());
+        let reports = &evidence.client_reports["table"];
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0]["phase_counters"]["measurement_window"]["windows"][0]["completed_sends"], 3);
+        assert_eq!(reports[0]["phase_counters"]["measurement_window"]["windows"][0]["ambiguous_sends"], 2);
+        assert_eq!(reports[1]["phase_counters"]["unavailable_reason"], "terminal_client_window_unavailable");
+        assert_eq!(platform.cancellations.lock().map_err(|_| anyhow::anyhow!("cancellation log mutex poisoned"))?.len(), 2);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2529,6 +3818,11 @@ mod downstream_runner_tests {
             let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing failure evidence")?)?;
             assert!(evidence["client_schedule"].is_null());
             assert!(evidence["backlog"]["measurement_window"].is_null());
+            let owner_sample = evidence["ownership_samples"].as_array().context("ownership samples")?
+                .last().context("failure-time ownership sample")?;
+            assert_eq!(owner_sample["require_owner"], true);
+            assert!(owner_sample["owners_by_table"].is_object());
+            assert!(owner_sample["unavailable_reason"].is_null());
             eprintln!("delivery_fault={fault:?} dropped_after_ms={dropped_after_ms} arm_attempts={} cancelled={:?}; measurement/schedule receipt absent", platform.arm_attempts, *cancelled);
         }
         Ok(())
@@ -2540,13 +3834,22 @@ mod downstream_runner_tests {
             Fault::InitUnavailable,
             Fault::InitTimeout,
             Fault::ObservationUnavailable,
+            Fault::ObservationInvalidJson,
         ] {
             let (rows, platform) = run_fault(fault, crate::config::OatMode::Local).await?;
             assert_eq!(rows[0].status, "succeeded", "failure: {:?}", rows[0].failure);
             assert_eq!(rows[0].rows, Some(100));
             assert!(rows[0].qap.completion_percent.is_none());
+            assert!(rows[0].qap.pending_artifacts.is_none());
+            assert!(rows[0].qap.cached_bytes.is_none());
+            assert!(rows[0].qap.unhealthy_catalogs.is_none());
+            assert!(rows[0].qap.lag_seconds.is_none());
             let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
             assert_eq!(evidence["downstream_status"], "unavailable");
+            if matches!(fault, Fault::ObservationInvalidJson) {
+                assert_eq!(evidence["downstream_reason"], "local_qap_observation_unavailable");
+                assert!(evidence["downstream_comment"].as_str().is_some_and(|comment| comment.contains("not valid JSON")));
+            }
             if matches!(fault, Fault::InitTimeout) {
                 assert!(platform.unresolved);
             }
@@ -2658,12 +3961,12 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
             "durable_streams": difference(worker.durable_streams, before.durable_streams)?,
             "rejected_streams": difference(worker.rejected_streams, before.rejected_streams)?,
             "rejected_rows": difference(worker.rejected_rows, before.rejected_rows)?,
-            "retried_streams": difference(worker.retried_streams, before.retried_streams)?,
-            "retried_rows": difference(worker.retried_rows, before.retried_rows)?,
+            "retried_streams": difference(worker.retried_streams.unwrap_or(0), before.retried_streams.unwrap_or(0))?,
+            "retried_rows": difference(worker.retried_rows.unwrap_or(0), before.retried_rows.unwrap_or(0))?,
             "given_up_streams": difference(worker.given_up_streams, before.given_up_streams)?,
             "given_up_rows": difference(worker.given_up_rows, before.given_up_rows)?,
-            "ambiguous_streams": difference(worker.ambiguous_streams, before.ambiguous_streams)?,
-            "ambiguous_rows": difference(worker.ambiguous_rows, before.ambiguous_rows)?,
+            "ambiguous_streams": difference(worker.ambiguous_streams.unwrap_or(0), before.ambiguous_streams.unwrap_or(0))?,
+            "ambiguous_rows": difference(worker.ambiguous_rows.unwrap_or(0), before.ambiguous_rows.unwrap_or(0))?,
             "process_cumulative_send_latency_us": worker.send_latency_us,
         }));
     }
@@ -2673,20 +3976,51 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
             .try_fold(0_u64, |total, worker| total.checked_add(field(worker)))
             .context("client cumulative counter overflow")
     };
-    Ok(json!({
+    let cumulative_proven = |field: fn(&WorkerCounterSnapshot) -> Option<u64>| -> Option<u64> {
+        end.workers.iter().try_fold(0_u64, |total, worker| total.checked_add(field(worker)?))
+    };
+    let preparation = client_preparation(end.preparation.as_ref(), data_profile)?;
+    let mut result = json!({
         "scope": "measurement_start_to_completed_snapshot_delta_not_unique_delivery",
         "process_cumulative": {
             "completed_rows": cumulative_total(|worker| worker.completed_rows)?,
-            "ambiguous_rows": cumulative_total(|worker| worker.ambiguous_rows)?,
+            "ambiguous_rows": cumulative_total(|worker| worker.ambiguous_rows.unwrap_or(0))?,
+        },
+        "delivery_cumulative": {
+            "scope": "completed_process_lifetime_counters_not_unique_delivery",
+            "retried_streams": cumulative_proven(|worker| worker.retried_streams),
+            "retried_rows": cumulative_proven(|worker| worker.retried_rows),
+            "ambiguous_streams": cumulative_proven(|worker| worker.ambiguous_streams),
+            "ambiguous_rows": cumulative_proven(|worker| worker.ambiguous_rows),
         },
         "elapsed_seconds": end.elapsed_seconds - start.elapsed_seconds,
         "completion_semantics": "validated_admission_response_not_delta_commit",
         "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
         "latency_scope": "process_cumulative_includes_preflight_and_warmup_not_phase_percentiles",
         "workers": deltas,
-        "preparation": client_preparation(end.preparation.as_ref(), data_profile)?,
+        "preparation": preparation,
         "measurement_window": end.measurement_window,
-    }))
+    });
+    if let Some(hash) = preparation.get("payload_corpus_sha256") {
+        let manifest = end.logical_batch_manifest.as_ref().context("payload hash lacks a terminal manifest")?;
+        let (identity_status, identity_eligible, complete) = match data_profile {
+            ClientDataProfile::Diagnostic => ("diagnostic_only", false, false),
+            ClientDataProfile::Realistic => ("identity_bearing", true, true),
+        };
+        if manifest["payload_corpus_sha256"] != *hash
+            || manifest["data_profile"].as_str() != Some(client_profile_name(data_profile))
+            || manifest["payload_corpus_hash_version"].as_u64() != Some(2)
+            || manifest["payload_corpus_hash_scope"].as_str() != Some(client_payload_hash_scope(data_profile))
+            || manifest["identity_status"].as_str() != Some(identity_status)
+            || manifest["eligible_for_identity_reconciliation"].as_bool() != Some(identity_eligible)
+            || manifest["complete"].as_bool() != Some(complete)
+            || manifest["truncated"].as_bool() != Some(false)
+        {
+            bail!("client payload hash disagrees with terminal manifest");
+        }
+        result["payload_manifest"] = manifest.clone();
+    }
+    Ok(result)
 }
 
 #[test]

@@ -37,6 +37,34 @@ fn percentile(values: &[f64], percentile: usize) -> Option<f64> {
     values.get(index).copied()
 }
 
+fn commit_rate_resolution(mut commits: Vec<(u64, u64, u64)>, window_seconds: f64) -> Result<Value> {
+    commits.sort_unstable();
+    let max_rows = commits.iter().map(|(_, _, rows)| *rows).max();
+    let mut cumulative = 0_u64;
+    let origin = commits.first().map_or(0, |(time, _, _)| *time);
+    let mut points = Vec::with_capacity(commits.len());
+    for (time, _, rows) in &commits {
+        cumulative = cumulative.checked_add(*rows).context("commit resolution row overflow")?;
+        points.push(((*time - origin) as f64 / 1000.0, cumulative as f64));
+    }
+    let slope = if points.len() >= 3 {
+        let count = points.len() as f64;
+        let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / count;
+        let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / count;
+        let numerator = points.iter().map(|(x, y)| (x - mean_x) * (y - mean_y)).sum::<f64>();
+        let denominator = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum::<f64>();
+        (denominator > 0.0).then(|| numerator / denominator)
+    } else {
+        None
+    };
+    Ok(json!({
+        "window_commit_count": commits.len(),
+        "max_commit_rows": max_rows,
+        "rate_resolution_rows_per_second": max_rows.map(|rows| rows as f64 / window_seconds),
+        "slope_rows_per_second": slope,
+    }))
+}
+
 fn canonical_dmv_table_name(table: &str) -> Result<String> {
     let definitions = collector_chain::dmv::tables()?;
     let definition = definitions
@@ -70,6 +98,8 @@ fn commit_window_output(
         "measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": seconds,
         "clock": "collector_system_unix_ms_shared_schedule_clock_skew_not_measured",
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null, "rows_per_second": null,
+        "window_commit_count": null, "max_commit_rows": null,
+        "rate_resolution_rows_per_second": null, "slope_rows_per_second": null,
         "input_bytes_per_second": null, "parquet_bytes_per_second": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
         "unique_delivered_rows": null, "complete_delivery_established": false,
@@ -85,6 +115,7 @@ fn commit_window_output(
     let mut input_bytes = 0_u64;
     let mut parquet_bytes = 0_u64;
     let mut latencies = Vec::new();
+    let mut resolution_commits = Vec::new();
     for event in events
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
@@ -130,7 +161,10 @@ fn commit_window_output(
             .checked_add(event_bytes)
             .context("commit output byte overflow")?;
         latencies.push(elapsed);
+        resolution_commits.push((finished, event.delta_version.context("commit version unavailable")?, event_rows));
     }
+    result.as_object_mut().context("commit window is not an object")?
+        .extend(commit_rate_resolution(resolution_commits, seconds)?.as_object().context("invalid resolution")?.clone());
     latencies.sort_by(f64::total_cmp);
     result["rows"] = json!(rows);
     result["files"] = json!(files);
@@ -151,6 +185,68 @@ fn commit_window_output(
     Ok(result)
 }
 
+fn annotate_zero_durable_output(evidence: &mut Value) {
+    let full = evidence.pointer("/durable_commits/output_throughput").cloned().unwrap_or(Value::Null);
+    let full_interval = full["measurement_start_unix_ms"].as_u64().zip(full["measurement_end_unix_ms"].as_u64());
+    let guard_timestamp = evidence.get("overload_stop")
+        .filter(|stop| stop["classification"] == "above_ceiling")
+        .and_then(|stop| stop["timestamp_ms"].as_u64());
+    let teardown_failed = evidence["teardown_outcome"] == "failed";
+    let no_reported_attempts = full_interval.is_some_and(|(start, end)| {
+        start < end && evidence.pointer("/rows/attempted").and_then(Value::as_u64) == Some(0)
+            && evidence.pointer("/rows/attempted_scope").and_then(Value::as_str)
+                == Some("measurement_start_to_completed_process_snapshot_interval_not_exact_window")
+            && evidence["client_phase_reports"].as_array().is_some_and(|reports| {
+                !reports.is_empty() && reports.iter().all(|report| {
+                    let counters = &report["phase_counters"];
+                    counters["measurement_window"]["start_unix_ms"].as_u64() == Some(start)
+                        && counters["measurement_window"]["end_unix_ms"].as_u64() == Some(end)
+                        && counters["workers"].as_array().is_some_and(|workers| {
+                            !workers.is_empty() && workers.iter().all(|worker| worker["attempted_rows"].as_u64() == Some(0))
+                        })
+                })
+            })
+    });
+    let annotate = |window: &mut Value| {
+        if window["rows"].as_u64() != Some(0)
+            || window.get("unavailable_reason").is_some_and(|reason| !reason.is_null()) {
+            return;
+        }
+        let interval = window["measurement_start_unix_ms"].as_u64().zip(window["measurement_end_unix_ms"].as_u64());
+        let valid_interval = interval.filter(|(start, end)| start < end);
+        let (classification, basis) = if guard_timestamp.zip(valid_interval).is_some_and(|(trip, (_, end))| trip < end) {
+            ("overload_guard_trip_observed", "guard_trip_observed_before_window_end")
+        } else if teardown_failed {
+            ("teardown_failure_observed", "cell_teardown_failed_after_measurement")
+        } else if no_reported_attempts && valid_interval.zip(full_interval).is_some_and(|((start, end), (full_start, full_end))| {
+            start >= full_start && end <= full_end
+        }) {
+            ("client_inactivity_observed", "no_attempts_in_reported_snapshot_interval_not_exact_window")
+        } else {
+            ("cause_not_established", "insufficient_evidence_to_classify_observed_context")
+        };
+        window["zero_output_reason"] = json!({
+            "classification": classification,
+            "basis": basis,
+            "causality": "not_established",
+        });
+    };
+    if let Some(window) = evidence.pointer_mut("/durable_commits/output_throughput") { annotate(window); }
+    if let Some(windows) = evidence.pointer_mut("/durable_commits/complete_30_second_commit_windows").and_then(Value::as_array_mut) {
+        for window in windows { annotate(window); }
+    }
+    if let Some(window) = evidence.get_mut("commit_window_output_throughput") { annotate(window); }
+}
+
+fn unavailable_cumulative_output(reason: &str) -> Value {
+    json!({
+        "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+        "rows": null,
+        "commits_by_version": [],
+        "unavailable_reason": reason,
+    })
+}
+
 fn run_cumulative_output(
     events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
     table: &str,
@@ -158,12 +254,7 @@ fn run_cumulative_output(
     cell_start_unix_ms: Option<u64>,
 ) -> Result<Value> {
     if let Some(reason) = unavailable {
-        return Ok(json!({
-            "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-            "rows": null,
-            "commits_by_version": [],
-            "unavailable_reason": reason,
-        }));
+        return Ok(unavailable_cumulative_output(reason));
     }
     let mut rows = 0_u64;
     let mut commits = 0_u64;
@@ -172,50 +263,62 @@ fn run_cumulative_output(
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
     {
+        let (
+            Some(table_id),
+            Some(table_name),
+            Some(event_rows),
+            Some(event_files),
+            Some(event_input_bytes),
+            Some(event_parquet_bytes),
+            Some(min_ingested_at_ms),
+            Some(max_ingested_at_ms),
+            Some(elapsed_seconds),
+        ) = (
+            event.table_id.as_deref(),
+            event.table_name.as_deref(),
+            event.rows,
+            event.files,
+            event.input_bytes,
+            event.parquet_bytes,
+            event.min_ingested_at_ms,
+            event.max_ingested_at_ms,
+            event.elapsed_seconds,
+        ) else {
+            return Ok(unavailable_cumulative_output("cumulative_commit_metadata_unavailable"));
+        };
+        let Some(finished_at_unix_ms) = event.finished_at_unix_ms else {
+            return Ok(unavailable_cumulative_output("cumulative_commit_finish_time_unavailable"));
+        };
+        if max_ingested_at_ms < min_ingested_at_ms || finished_at_unix_ms < 0
+            || !elapsed_seconds.is_finite() || elapsed_seconds < 0.0
+        {
+            return Ok(unavailable_cumulative_output("cumulative_commit_metadata_invalid"));
+        }
         if let Some(cell_start) = cell_start_unix_ms {
-            let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
-                return Ok(json!({
-                    "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                    "rows": null,
-                    "commits_by_version": [],
-                    "unavailable_reason": "cumulative_commit_ingress_boundary_unavailable",
-                }));
-            };
-            if last < cell_start as i64 {
+            if max_ingested_at_ms < cell_start as i64 {
                 continue;
             }
-            if first < cell_start as i64 || last < first {
-                return Ok(json!({
-                    "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                    "rows": null,
-                    "commits_by_version": [],
-                    "unavailable_reason": "commit_crosses_cell_ingress_boundary",
-                }));
+            if min_ingested_at_ms < cell_start as i64 {
+                return Ok(unavailable_cumulative_output("commit_crosses_cell_ingress_boundary"));
             }
         }
-        let Some(event_rows) = event.rows else {
-            return Ok(json!({
-                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                "rows": null,
-                "commits_by_version": [],
-                "unavailable_reason": "cumulative_commit_rows_unavailable",
-            }));
-        };
         let Some(delta_version) = event.delta_version else {
-            return Ok(json!({
-                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
-                "rows": null,
-                "commits_by_version": [],
-                "unavailable_reason": "cumulative_commit_version_unavailable",
-            }));
+            return Ok(unavailable_cumulative_output("cumulative_commit_version_unavailable"));
         };
         rows = rows.checked_add(event_rows).context("cumulative commit row overflow")?;
         commits = commits.checked_add(1).context("cumulative commit count overflow")?;
         commits_by_version.push(json!({
+            "table_id": table_id,
+            "table_name": table_name,
             "delta_version": delta_version,
             "rows": event_rows,
-            "files": event.files,
-            "parquet_bytes": event.parquet_bytes,
+            "files": event_files,
+            "input_bytes": event_input_bytes,
+            "parquet_bytes": event_parquet_bytes,
+            "min_ingested_at_ms": min_ingested_at_ms,
+            "max_ingested_at_ms": max_ingested_at_ms,
+            "finished_at_unix_ms": finished_at_unix_ms,
+            "elapsed_seconds": elapsed_seconds,
         }));
     }
     Ok(json!({
@@ -419,16 +522,28 @@ fn durable_commit_evidence_for_cell(
                 reason = Some("commit_overlaps_preflight_warmup_or_measurement_boundary");
                 break;
             }
-            if event.finished_at_unix_ms.is_none_or(|finished| finished < last as i64)
-                || event
-                    .elapsed_seconds
-                    .is_none_or(|elapsed| !elapsed.is_finite() || elapsed < 0.0)
-                || event.rows.is_none_or(|rows| rows == 0)
-                || event.files.is_none_or(|files| files == 0)
-                || event.parquet_bytes.is_none_or(|bytes| bytes == 0)
+            if event.finished_at_unix_ms.is_none() {
+                reason = Some("commit_finish_time_unavailable");
+                break;
+            }
+            if event.finished_at_unix_ms.is_some_and(|finished| finished < last as i64) {
+                bail!("commit finish time predates its ingress boundary");
+            }
+            if event.elapsed_seconds.is_none()
+                || event.rows.is_none()
+                || event.files.is_none()
+                || event.parquet_bytes.is_none()
                 || event.input_bytes.is_none()
             {
-                bail!("committed event omitted valid file/row/byte/timing evidence");
+                reason = Some("committed_event_evidence_unavailable");
+                break;
+            }
+            if event.elapsed_seconds.is_some_and(|elapsed| !elapsed.is_finite() || elapsed < 0.0)
+                || event.rows.is_some_and(|rows| rows == 0)
+                || event.files.is_some_and(|files| files == 0)
+                || event.parquet_bytes.is_some_and(|bytes| bytes == 0)
+            {
+                bail!("invalid committed file/row/byte/timing evidence");
             }
             selected.push(event);
         }
@@ -648,6 +763,54 @@ async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> 
         parse_delta_log_adds(version, &contents, &mut adds)?;
     }
     validate_delta_log_version_history(&versions_seen, &checkpoint_tips)?;
+    summarize_delta_log_adds(adds)
+}
+
+/// Read a verified stopped local snapshot's `_delta_log` into the same shape as
+/// [`read_delta_log_commits`], so Local final reconciliation applies the AKS gates unchanged.
+fn read_local_delta_log_commits(delta_log: &Path) -> Result<Value> {
+    let mut adds = BTreeMap::new();
+    let mut log_files = 0_usize;
+    let mut versions_seen = BTreeSet::new();
+    let mut checkpoint_tips = BTreeSet::new();
+    for entry in fs::read_dir(delta_log).context("read stopped snapshot Delta log")? {
+        let entry = entry.context("read stopped snapshot Delta log entry")?;
+        let metadata = fs::symlink_metadata(entry.path()).context("inspect stopped snapshot Delta log entry")?;
+        if metadata.file_type().is_dir() {
+            continue;
+        }
+        ensure!(metadata.file_type().is_file(), "stopped snapshot Delta log entry is not a regular file");
+        let name = entry.file_name();
+        let filename = name.to_str().context("Delta log filename is not UTF-8")?;
+        if filename == "_last_checkpoint" {
+            ensure!(metadata.len() <= 64 * 1024, "Delta _last_checkpoint exceeds the 64 KiB evidence bound");
+            checkpoint_tips.insert(parse_last_checkpoint_version(&fs::read(entry.path())?)?);
+            continue;
+        }
+        if filename.contains(".checkpoint") {
+            let version = parse_delta_checkpoint_version(filename)?
+                .context("Delta checkpoint filename is malformed")?;
+            checkpoint_tips.insert(version);
+            continue;
+        }
+        let Some(version_text) = filename.strip_suffix(".json") else {
+            continue;
+        };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Delta log JSON filename is not a canonical version");
+        }
+        let version = version_text.parse::<u64>().context("Delta log version is invalid")?;
+        ensure!(versions_seen.insert(version), "duplicate Delta log version file");
+        ensure!(metadata.len() <= 16 * 1024 * 1024, "Delta log JSON exceeds the 16 MiB evidence bound");
+        log_files = log_files.checked_add(1).context("Delta log file count overflow")?;
+        ensure!(log_files <= 10_000, "Delta log exceeds the 10,000-file evidence bound");
+        parse_delta_log_adds(version, &fs::read(entry.path())?, &mut adds)?;
+    }
+    validate_delta_log_version_history(&versions_seen, &checkpoint_tips)?;
+    summarize_delta_log_adds(adds)
+}
+
+fn summarize_delta_log_adds(adds: BTreeMap<(u64, String), DeltaLogAdd>) -> Result<Value> {
     let mut versions: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
     for ((version, _), add) in adds {
         let totals = versions.entry(version).or_default();
@@ -667,6 +830,551 @@ async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> 
             "delta_version": version, "rows": rows, "files": files, "parquet_bytes": bytes,
         })).collect::<Vec<_>>(),
     }))
+}
+
+
+#[derive(Default)]
+struct LocalDeltaCommitMetadata {
+    operation: Option<String>,
+    operation_mode: Option<String>,
+    timestamp_unix_ms: Option<u64>,
+}
+
+type LocalDeltaAdds = BTreeMap<(u64, String), DeltaLogAdd>;
+
+fn parse_local_delta_commit(version: u64, contents: &[u8]) -> Result<(LocalDeltaCommitMetadata, LocalDeltaAdds)> {
+    let mut metadata = LocalDeltaCommitMetadata::default();
+    let mut adds = BTreeMap::new();
+    for (line_number, line) in contents.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() { continue; }
+        let action: Value = serde_json::from_slice(line)
+            .with_context(|| format!("invalid Delta log JSON at line {}", line_number + 1))?;
+        if let Some(info) = action.get("commitInfo") {
+            if let Some(operation) = info.get("operation").and_then(Value::as_str) {
+                metadata.operation = Some(operation.to_owned());
+            }
+            metadata.operation_mode = info.pointer("/operationParameters/mode")
+                .and_then(Value::as_str).map(str::to_owned);
+            metadata.timestamp_unix_ms = info.get("timestamp").and_then(Value::as_i64)
+                .and_then(|timestamp| u64::try_from(timestamp).ok());
+        }
+        let Some(add) = action.get("add") else { continue; };
+        match add.get("dataChange") {
+            None | Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => continue,
+            Some(_) => bail!("Delta add dataChange must be a boolean"),
+        }
+        let path = add.get("path").and_then(Value::as_str).filter(|path| !path.is_empty())
+            .context("Delta add action omitted its path")?;
+        let stats = match add.get("stats") {
+            Some(Value::String(stats)) => serde_json::from_str::<Value>(stats)
+                .context("Delta add action has invalid stats JSON")?,
+            Some(Value::Object(_)) => add["stats"].clone(),
+            _ => bail!("Delta add action omitted row statistics"),
+        };
+        let rows = stats.get("numRecords").and_then(Value::as_u64)
+            .context("Delta add statistics omitted numRecords")?;
+        let bytes = add.get("size").and_then(Value::as_u64)
+            .context("Delta add action omitted file size")?;
+        let identity = (version, path.to_owned());
+        let record = DeltaLogAdd { rows, bytes };
+        if let Some(previous) = adds.insert(identity, record) && previous != record {
+            bail!("conflicting duplicate Delta add action");
+        }
+    }
+    Ok((metadata, adds))
+}
+
+fn unavailable_local_delta_reconciliation(reason: impl Into<String>) -> Value {
+    let reason = reason.into();
+    json!({
+        "version": 1, "status": "unavailable", "reconciliation_state": "unavailable",
+        "unavailable_reason": reason, "csv_reason": format!("reconciliation unavailable: {reason}"),
+        "observed": {
+            "window_commit_count": null, "max_commit_rows": null,
+            "rate_resolution_rows_per_second": null, "slope_rows_per_second": null,
+        },
+        "csv": {
+            "started_utc": null, "ended_utc": null, "durable_rows_per_s": null,
+            "window_commit_count": null, "max_commit_rows": null,
+            "rate_resolution_rows_per_second": null, "slope_rows_per_second": null,
+            "durable_rows": null, "committed_add_actions": null, "bytes_per_row": null,
+            "compression_ratio": null, "latency_p50_ms": null, "latency_p99_ms": null,
+            "files_written": null, "commits_written": null,
+        },
+    })
+}
+
+#[derive(Clone, Copy)]
+struct LocalCommitReceipt {
+    version: u64, rows: u64, files: u64, input_bytes: u64, parquet_bytes: u64,
+    min_ingested_at_ms: u64, max_ingested_at_ms: u64, finished_at_unix_ms: u64,
+}
+
+fn local_commit_receipt(value: &Value) -> Result<LocalCommitReceipt> {
+    let number = |field: &str| value.get(field).and_then(Value::as_u64)
+        .with_context(|| format!("commit receipt omitted valid {field}"));
+    Ok(LocalCommitReceipt {
+        version: number("delta_version")?, rows: number("rows")?, files: number("files")?,
+        input_bytes: number("input_bytes")?, parquet_bytes: number("parquet_bytes")?,
+        min_ingested_at_ms: number("min_ingested_at_ms")?, max_ingested_at_ms: number("max_ingested_at_ms")?,
+        finished_at_unix_ms: number("finished_at_unix_ms")?,
+    })
+}
+
+fn reconcile_local_delta_log(delta_log: &Path, durable: &Value) -> Value {
+    match reconcile_local_delta_log_inner(delta_log, durable) {
+        Ok(value) => value,
+        Err(error) => unavailable_local_delta_reconciliation(format!("{error:#}")),
+    }
+}
+
+fn reconcile_local_delta_log_inner(delta_log: &Path, durable: &Value) -> Result<Value> {
+    let window = durable.get("output_throughput").context("output_throughput absent")?;
+    if let Some(reason) = window.get("unavailable_reason").and_then(Value::as_str) {
+        bail!("output_throughput unavailable: {reason}");
+    }
+    let start = window["measurement_start_unix_ms"].as_u64()
+        .context("measurement window start missing or invalid")?;
+    let end = window["measurement_end_unix_ms"].as_u64()
+        .context("measurement window end missing or invalid")?;
+    ensure!(end > start, "measurement window is empty or reversed");
+    let window_seconds = (end - start) as f64 / 1000.0;
+    let receipt_values = durable.pointer("/run_cumulative_output/commits_by_version")
+        .and_then(Value::as_array).context("commit receipts (commits_by_version) absent")?;
+    if let Some(reason) = durable.pointer("/run_cumulative_output/unavailable_reason").and_then(Value::as_str) {
+        bail!("run_cumulative_output unavailable: {reason}");
+    }
+    let mut receipts_by_version = BTreeMap::new();
+    let mut receipt_errors = Vec::new();
+    for value in receipt_values {
+        match local_commit_receipt(value) {
+            Ok(receipt) => {
+                if receipts_by_version.insert(receipt.version, receipt).is_some() {
+                    return Ok(local_delta_mismatch("duplicate receipts for the same Delta version",
+                        json!({"duplicate_receipt_version": receipt.version})));
+                }
+            }
+            Err(error) => receipt_errors.push(format!("{error:#}")),
+        }
+    }
+    if !receipt_errors.is_empty() { bail!("{}", receipt_errors.join("; ")); }
+    let selected = receipts_by_version.values()
+        .filter(|receipt| receipt.finished_at_unix_ms >= start && receipt.finished_at_unix_ms < end)
+        .copied().collect::<Vec<_>>();
+    let sum = |field: fn(&LocalCommitReceipt) -> u64| -> Result<u64> {
+        selected.iter().try_fold(0_u64, |total, receipt| {
+            total.checked_add(field(receipt)).context("in-window receipt totals overflow")
+        })
+    };
+    let receipt_totals = json!({
+        "rows": sum(|receipt| receipt.rows)?, "files": sum(|receipt| receipt.files)?,
+        "input_bytes": sum(|receipt| receipt.input_bytes)?, "parquet_bytes": sum(|receipt| receipt.parquet_bytes)?,
+    });
+    for field in ["rows", "files", "input_bytes", "parquet_bytes"] {
+        let expected = window[field].as_u64().with_context(|| format!("window {field} missing or invalid"))?;
+        if receipt_totals[field].as_u64() != Some(expected) {
+            return Ok(local_delta_mismatch(format!("window {field} differs from in-window receipt total"),
+                json!({"window_value": expected, "receipt_value": receipt_totals[field]})));
+        }
+    }
+
+    let mut present_versions = BTreeSet::new();
+    for entry in fs::read_dir(delta_log).context("Delta log directory unreadable")? {
+        let entry = entry.context("read Delta log directory entry")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(version_text) = name.strip_suffix(".json") else { continue; };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) { continue; }
+        let metadata = fs::symlink_metadata(entry.path()).context("inspect Delta log JSON file")?;
+        ensure!(metadata.file_type().is_file(), "Delta log JSON entry is not a regular file");
+        present_versions.insert(version_text.parse::<u64>().context("Delta log filename version invalid")?);
+        ensure!(present_versions.len() <= 10_000, "Delta log exceeds the 10,000-file evidence bound");
+    }
+
+    let mut observed_rows = 0_u64;
+    let mut observed_files = 0_u64;
+    let mut observed_bytes = 0_u64;
+    let mut operations = BTreeMap::<String, u64>::new();
+    let mut oldest_latency_ms = Vec::new();
+    let mut newest_latency_ms = Vec::new();
+    for receipt in &selected {
+        let path = delta_log.join(format!("{:020}.json", receipt.version));
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Delta version {} missing", receipt.version))?;
+        ensure!(metadata.file_type().is_file(), "receipted Delta version is not a regular file");
+        ensure!(metadata.len() <= 64 * 1024 * 1024, "Delta version JSON exceeds the 64 MiB evidence bound");
+        let contents = fs::read(&path).context("read receipted Delta version JSON")?;
+        let (commit, adds) = parse_local_delta_commit(receipt.version, &contents)
+            .with_context(|| format!("parse Delta version {}", receipt.version))?;
+        let (rows, files, bytes) = adds.values().try_fold((0_u64, 0_u64, 0_u64), |(rows, files, bytes), add| {
+            Some((rows.checked_add(add.rows)?, files.checked_add(1)?, bytes.checked_add(add.bytes)?))
+        }).context("Delta add totals overflow")?;
+        if (rows, files, bytes) != (receipt.rows, receipt.files, receipt.parquet_bytes) {
+            return Ok(local_delta_mismatch(format!("Delta version {} Adds differ from its commit receipt", receipt.version),
+                json!({"delta_version": receipt.version,
+                    "observed": {"rows": rows, "files": files, "parquet_bytes": bytes},
+                    "receipt": {"rows": receipt.rows, "files": receipt.files, "parquet_bytes": receipt.parquet_bytes}})));
+        }
+        observed_rows = observed_rows.checked_add(rows).context("Delta row total overflow")?;
+        observed_files = observed_files.checked_add(files).context("Delta file total overflow")?;
+        observed_bytes = observed_bytes.checked_add(bytes).context("Delta byte total overflow")?;
+        let operation = commit.operation.unwrap_or_else(|| "unknown".to_owned());
+        let operation_key = commit
+            .operation_mode
+            .map_or_else(|| operation.clone(), |mode| format!("{operation}/{mode}"));
+        *operations.entry(operation_key).or_default() += 1;
+        oldest_latency_ms.push(receipt.finished_at_unix_ms.saturating_sub(receipt.min_ingested_at_ms));
+        newest_latency_ms.push(receipt.finished_at_unix_ms.saturating_sub(receipt.max_ingested_at_ms));
+    }
+
+    let span = selected.first().zip(selected.last()).map(|(first, last)| (first.version, last.version));
+    let mut candidates = present_versions.clone();
+    if let Some((first, last)) = span {
+        ensure!(last - first <= 10_000, "receipt version span exceeds the 10,000-version evidence bound");
+        for version in first..=last {
+            let path = delta_log.join(format!("{version:020}.json"));
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("Delta JSON missing inside receipt version span at {version}"))?;
+            ensure!(metadata.file_type().is_file(), "Delta JSON inside receipt version span is not a regular file");
+            candidates.insert(version);
+        }
+    }
+    let maintenance_operations = ["DELETE", "UPDATE", "MERGE", "RESTORE", "REORG", "OPTIMIZE"];
+    let mut interleaved_maintenance = BTreeMap::<String, u64>::new();
+    let mut unreceipted_checked = 0_u64;
+    for version in candidates {
+        if receipts_by_version.contains_key(&version) { continue; }
+        let in_span = span.is_some_and(|(first, last)| version >= first && version <= last);
+        let path = delta_log.join(format!("{version:020}.json"));
+        let contents = match fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) if in_span => return Err(error).with_context(|| format!("unreceipted version {version} inside receipt span is missing")),
+            Err(_) => continue,
+        };
+        ensure!(contents.len() <= 64 * 1024 * 1024, "Delta version JSON exceeds the 64 MiB evidence bound");
+        let (commit, adds) = match parse_local_delta_commit(version, &contents) {
+            Ok(parsed) => parsed,
+            Err(_) if !in_span => continue,
+            Err(error) => return Err(error).with_context(|| format!("parse unreceipted Delta version {version}")),
+        };
+        let in_window = commit.timestamp_unix_ms.is_some_and(|timestamp| timestamp >= start && timestamp < end);
+        if !in_span && !in_window { continue; }
+        unreceipted_checked = unreceipted_checked.checked_add(1).context("unreceipted version count overflow")?;
+        let operation = commit.operation.unwrap_or_else(|| "unknown".to_owned());
+        if !adds.is_empty() && !maintenance_operations.contains(&operation.as_str()) {
+            return Ok(local_delta_mismatch(format!("unreceipted version {version} ({operation}) contains data-changing Adds"),
+                json!({"delta_version": version, "operation": operation, "data_change_adds": adds.len()})));
+        }
+        let key = if adds.is_empty() { operation } else { format!("{operation} (data-changing rewrite, excluded)") };
+        *interleaved_maintenance.entry(key).or_default() += 1;
+    }
+
+    let percentile = |values: &mut Vec<u64>, p: usize| -> Option<u64> {
+        if values.is_empty() { return None; }
+        values.sort_unstable();
+        Some(values[(values.len() * p).div_ceil(100).saturating_sub(1).min(values.len() - 1)])
+    };
+    let p50 = percentile(&mut oldest_latency_ms, 50);
+    let p99 = percentile(&mut oldest_latency_ms, 99);
+    let newest_p50 = percentile(&mut newest_latency_ms, 50);
+    let newest_p99 = percentile(&mut newest_latency_ms, 99);
+    let start_utc = i64::try_from(start).ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let end_utc = i64::try_from(end).ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let bytes_per_row = (observed_rows > 0).then_some(observed_bytes as f64 / observed_rows as f64);
+    let input_bytes = receipt_totals["input_bytes"].as_u64().unwrap_or_default();
+    let compression_ratio = (observed_bytes > 0).then_some(input_bytes as f64 / observed_bytes as f64);
+    let resolution = commit_rate_resolution(selected.iter()
+        .map(|receipt| (receipt.finished_at_unix_ms, receipt.version, receipt.rows)).collect(), window_seconds)?;
+    let csv = json!({
+        "started_utc": start_utc, "ended_utc": end_utc,
+        "durable_rows_per_s": observed_rows as f64 / window_seconds, "durable_rows": observed_rows,
+        "window_commit_count": resolution["window_commit_count"], "max_commit_rows": resolution["max_commit_rows"],
+        "rate_resolution_rows_per_second": resolution["rate_resolution_rows_per_second"],
+        "slope_rows_per_second": resolution["slope_rows_per_second"],
+        "committed_add_actions": observed_files, "bytes_per_row": bytes_per_row,
+        "compression_ratio": compression_ratio, "latency_p50_ms": p50, "latency_p99_ms": p99,
+        "files_written": observed_files, "commits_written": selected.len(),
+    });
+    Ok(json!({
+        "version": 1, "status": "matched", "reconciliation_state": "reconciled",
+        "scope": "local_stopped_delta_snapshot_receipts_selected_by_finished_at_in_half_open_window",
+        "window": {"measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": window_seconds},
+        "receipts": {"total": receipt_values.len(), "in_window": selected.len(),
+            "version_span": span.map(|(first, last)| json!([first, last]))},
+        "receipt_totals": receipt_totals,
+        "observed": {
+            "durable_rows": observed_rows, "committed_add_actions": observed_files, "parquet_bytes": observed_bytes,
+            "durable_rows_per_s": observed_rows as f64 / window_seconds, "bytes_per_row": bytes_per_row,
+            "window_commit_count": resolution["window_commit_count"], "max_commit_rows": resolution["max_commit_rows"],
+            "rate_resolution_rows_per_second": resolution["rate_resolution_rows_per_second"],
+            "slope_rows_per_second": resolution["slope_rows_per_second"],
+            "compression_ratio": compression_ratio,
+            "ingest_to_commit_oldest_row_ms": {"p50": p50, "p99": p99, "commits": selected.len()},
+            "ingest_to_commit_newest_row_ms": {"p50": newest_p50, "p99": newest_p99},
+        },
+        "collector_operations": operations, "interleaved_maintenance": interleaved_maintenance,
+        "unreceipted_versions_checked": unreceipted_checked, "csv": csv, "csv_reason": null,
+    }))
+}
+
+fn local_delta_mismatch(reason: impl Into<String>, details: Value) -> Value {
+    let reason = reason.into();
+    let mut result = unavailable_local_delta_reconciliation(format!("reconciliation mismatch: {reason}"));
+    result["status"] = json!("mismatch");
+    result["reconciliation_state"] = json!("mismatch");
+    result["unavailable_reason"] = Value::Null;
+    result["mismatch_reason"] = json!(reason);
+    result["details"] = details;
+    result["csv_reason"] = json!(format!("reconciliation mismatch: {reason}"));
+    result
+}
+
+
+#[cfg(test)]
+mod zero_durable_output_tests {
+    use super::*;
+
+    fn evidence() -> Value {
+        let window = |start, end, rows| json!({"measurement_start_unix_ms":start,"measurement_end_unix_ms":end,"rows":rows});
+        json!({"durable_commits":{"output_throughput":window(1000, 61000, json!(0)),
+            "complete_30_second_commit_windows":[window(1000, 31000, json!(0)), window(31000, 61000, json!(0)),
+                window(61000, 91000, json!(7)), window(91000, 121000, Value::Null)]},
+            "commit_window_output_throughput":window(1000, 61000, json!(0))})
+    }
+
+    #[test]
+    fn zero_output_context_respects_window_boundaries_and_never_changes_other_values() {
+        let mut value = evidence();
+        let nonzero = value["durable_commits"]["complete_30_second_commit_windows"][2].clone();
+        let unavailable = value["durable_commits"]["complete_30_second_commit_windows"][3].clone();
+        value["overload_stop"] = json!({"classification":"above_ceiling","timestamp_ms":40000});
+        annotate_zero_durable_output(&mut value);
+        let full = &value["durable_commits"]["output_throughput"]["zero_output_reason"];
+        assert_eq!(full["classification"], "overload_guard_trip_observed");
+        assert_eq!(full["causality"], "not_established");
+        assert_eq!(value["commit_window_output_throughput"]["zero_output_reason"], *full);
+        let windows = &value["durable_commits"]["complete_30_second_commit_windows"];
+        assert_eq!(windows[0]["zero_output_reason"]["classification"], "cause_not_established");
+        assert_eq!(windows[1]["zero_output_reason"]["classification"], "overload_guard_trip_observed");
+        assert_eq!(windows[2], nonzero);
+        assert_eq!(windows[3], unavailable);
+    }
+
+    #[test]
+    fn teardown_failure_is_context_not_proof_and_unavailable_windows_stay_unmodified() {
+        let mut value = evidence();
+        value["teardown_outcome"] = json!("failed");
+        value["durable_commits"]["complete_30_second_commit_windows"][0]["unavailable_reason"] = json!("logs_incomplete");
+        let unavailable = value["durable_commits"]["complete_30_second_commit_windows"][0].clone();
+        annotate_zero_durable_output(&mut value);
+        assert_eq!(value["durable_commits"]["complete_30_second_commit_windows"][0], unavailable);
+        assert_eq!(value["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        assert_eq!(value["durable_commits"]["output_throughput"]["zero_output_reason"]["causality"], "not_established");
+    }
+
+    #[test]
+    fn client_inactivity_requires_complete_reported_snapshot_counters() -> Result<()> {
+        let mut value = evidence();
+        value["rows"] = json!({"attempted":0,"attempted_scope":"measurement_start_to_completed_process_snapshot_interval_not_exact_window"});
+        value["client_phase_reports"] = json!([{ "phase_counters": { "workers": [{"attempted_rows":0}],
+            "measurement_window":{"start_unix_ms":1000,"end_unix_ms":61000} }}]);
+        let mut unknown = value.clone();
+        unknown["client_phase_reports"][0]["phase_counters"]["workers"][0]["attempted_rows"] = Value::Null;
+        annotate_zero_durable_output(&mut unknown);
+        assert_eq!(unknown["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "cause_not_established");
+        value["client_phase_reports"][0]["phase_counters"]["workers"].as_array_mut().context("missing workers array")?.push(json!({"attempted_rows":1}));
+        let mut active = value.clone();
+        active["rows"]["attempted"] = json!(1);
+        annotate_zero_durable_output(&mut active);
+        assert_eq!(active["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "cause_not_established");
+        value["client_phase_reports"][0]["phase_counters"]["workers"][1]["attempted_rows"] = json!(0);
+        annotate_zero_durable_output(&mut value);
+        assert_eq!(value["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "client_inactivity_observed");
+        assert_eq!(value["durable_commits"]["complete_30_second_commit_windows"][0]["zero_output_reason"]["basis"], "no_attempts_in_reported_snapshot_interval_not_exact_window");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod local_delta_reconciliation_tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("arrowcol-local-delta-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path { &self.0 }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    fn receipt(version: u64, rows: u64, files: u64, bytes: (u64, u64), ingress: (u64, u64), finish: u64) -> Value {
+        json!({
+            "delta_version": version, "rows": rows, "files": files,
+            "input_bytes": bytes.0, "parquet_bytes": bytes.1,
+            "min_ingested_at_ms": ingress.0, "max_ingested_at_ms": ingress.1,
+            "finished_at_unix_ms": finish, "elapsed_seconds": 0.1,
+        })
+    }
+
+    fn add(path: &str, rows: u64, bytes: u64, data_change: bool) -> Value {
+        json!({"add": {
+            "path": path, "size": bytes, "dataChange": data_change,
+            "stats": json!({"numRecords": rows}).to_string(),
+        }})
+    }
+
+    fn write_version(root: &Path, version: u64, operation: &str, timestamp: u64, actions: &[Value]) -> Result<()> {
+        let mut lines = vec![serde_json::to_string(&json!({"commitInfo": {
+            "timestamp": timestamp, "operation": operation,
+        }}))?];
+        lines.extend(actions.iter().map(serde_json::to_string).collect::<std::result::Result<Vec<_>, _>>()?);
+        fs::write(root.join(format!("{version:020}.json")), lines.join("\n") + "\n")?;
+        Ok(())
+    }
+
+    fn evidence() -> Value {
+        json!({
+            "output_throughput": {
+                "measurement_start_unix_ms": 1_000, "measurement_end_unix_ms": 109_000,
+                "rows": 15, "files": 2, "input_bytes": 900, "parquet_bytes": 400,
+            },
+            "run_cumulative_output": {"commits_by_version": [
+                receipt(0, 99, 1, (100, 50), (900, 950), 999),
+                receipt(1, 10, 1, (600, 300), (1_005, 1_008), 1_010),
+                receipt(3, 5, 1, (300, 100), (1_040, 1_045), 1_050),
+                receipt(4, 77, 1, (100, 50), (108_000, 108_500), 109_000),
+            ]},
+        })
+    }
+
+    fn complete_log(root: &Path, middle: Value) -> Result<()> {
+        write_version(root, 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
+        write_version(root, 2, "OPTIMIZE", 1_020, &[middle])?;
+        write_version(root, 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        Ok(())
+    }
+
+    #[test]
+    fn reconciles_half_open_receipts_and_emits_screen_v1_metrics() -> Result<()> {
+        let directory = TestDirectory::new()?;
+        complete_log(directory.path(), add("rewrite.parquet", 15, 390, false))?;
+        let result = reconcile_local_delta_log(directory.path(), &evidence());
+        assert_eq!(result["status"], "matched");
+        assert_eq!(result["receipts"]["in_window"], 2);
+        assert_eq!(result["observed"]["durable_rows"], 15);
+        assert_eq!(result["observed"]["committed_add_actions"], 2);
+        assert_eq!(result["csv"]["durable_rows"], 15);
+        assert_eq!(result["csv"]["commits_written"], 2);
+        assert_eq!(result["csv"]["window_commit_count"], 2);
+        assert_eq!(result["csv"]["max_commit_rows"], 10);
+        assert_eq!(result["csv"]["rate_resolution_rows_per_second"], json!(10.0 / 108.0));
+        assert!(result["csv"]["slope_rows_per_second"].is_null());
+        assert_eq!(result["csv"]["latency_p50_ms"], 5);
+        assert_eq!(result["csv"]["latency_p99_ms"], 10);
+        assert_eq!(result["interleaved_maintenance"]["OPTIMIZE"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_in_span_json_is_unavailable_and_receipt_add_divergence_is_mismatch() -> Result<()> {
+        let missing = TestDirectory::new()?;
+        write_version(missing.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
+        write_version(missing.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        let unavailable = reconcile_local_delta_log(missing.path(), &evidence());
+        assert_eq!(unavailable["status"], "unavailable");
+
+        let mismatch = TestDirectory::new()?;
+        write_version(mismatch.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 9, 300, true)])?;
+        write_version(mismatch.path(), 2, "OPTIMIZE", 1_020, &[add("rewrite.parquet", 15, 390, false)])?;
+        write_version(mismatch.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        let result = reconcile_local_delta_log(mismatch.path(), &evidence());
+        assert_eq!(result["status"], "mismatch");
+        assert!(result["csv"]["durable_rows"].is_null());
+        for value in [&unavailable, &result] {
+            for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+                assert!(value["csv"][field].is_null(), "{field}");
+                assert!(value["observed"][field].is_null(), "{field}");
+            }
+        }
+
+        let mut bad_window_totals = evidence();
+        bad_window_totals["output_throughput"]["rows"] = json!(16);
+        assert_eq!(reconcile_local_delta_log(mismatch.path(), &bad_window_totals)["status"], "mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn local_resolution_uses_selected_receipts_and_copies_screen_evidence() -> Result<()> {
+        for count in 0..=3_u64 {
+            let directory = TestDirectory::new()?;
+            let mut receipts = Vec::new();
+            for index in 0..count {
+                let version = index + 1;
+                let rows = version * 10;
+                let finish = 1_010 + index * 1_000;
+                let path = format!("part-{version}.parquet");
+                write_version(directory.path(), version, "WRITE", finish, &[add(&path, rows, 100, true)])?;
+                receipts.push(receipt(version, rows, 1, (200, 100), (1_000, 1_001), finish));
+            }
+            let total_rows = count * (count + 1) * 5;
+            let durable = json!({
+                "output_throughput": {"measurement_start_unix_ms":1_000, "measurement_end_unix_ms":109_000,
+                    "rows":total_rows, "files":count, "input_bytes":count * 200, "parquet_bytes":count * 100},
+                "run_cumulative_output":{"commits_by_version":receipts},
+            });
+            let result = reconcile_local_delta_log(directory.path(), &durable);
+            assert_eq!(result["status"], "matched");
+            let mut output = json!({"durable_commits": {}});
+            copy_local_delta_reconciliation(&mut output, &result);
+            assert_eq!(output["screen_v1"], result["csv"]);
+            for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+                assert_eq!(result["csv"][field], result["observed"][field], "{field}");
+            }
+            assert_eq!(result["csv"]["window_commit_count"], count);
+            if count == 0 {
+                assert!(result["csv"]["max_commit_rows"].is_null());
+                assert!(result["csv"]["rate_resolution_rows_per_second"].is_null());
+            } else {
+                assert_eq!(result["csv"]["max_commit_rows"], count * 10);
+                assert_eq!(result["csv"]["rate_resolution_rows_per_second"], json!((count * 10) as f64 / 108.0));
+            }
+            if count < 3 {
+                assert!(result["csv"]["slope_rows_per_second"].is_null());
+            } else {
+                assert_eq!(result["csv"]["slope_rows_per_second"], 25.0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unreceipted_data_adds_fail_except_for_allowed_maintenance_rewrites() -> Result<()> {
+        let ordinary = TestDirectory::new()?;
+        write_version(ordinary.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
+        write_version(ordinary.path(), 2, "WRITE", 1_020, &[add("unexpected.parquet", 1, 20, true)])?;
+        write_version(ordinary.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
+        assert_eq!(reconcile_local_delta_log(ordinary.path(), &evidence())["status"], "mismatch");
+
+        let maintenance = TestDirectory::new()?;
+        complete_log(maintenance.path(), add("rewrite.parquet", 1, 20, true))?;
+        let result = reconcile_local_delta_log(maintenance.path(), &evidence());
+        assert_eq!(result["status"], "matched");
+        assert_eq!(result["interleaved_maintenance"]["OPTIMIZE (data-changing rewrite, excluded)"], 1);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -863,6 +1571,164 @@ mod commit_evidence_tests {
     }
 
     #[test]
+    fn failed_teardown_retains_post_stop_receipts_and_marks_windows_diagnostic() -> Result<()> {
+        let config = config()?;
+        let table = &config.tables[0];
+        let baseline = log(&[]);
+        let first = event(&config, 100, 199)?;
+        let mut drain = event(&config, 300, 400)?;
+        drain["delta_version"] = json!(8);
+        drain["finished_at_unix_ms"] = json!(70_000);
+        let mut stopped = baseline.clone();
+        stopped
+            .text
+            .push_str(&format!("arrowcol_data_commit {first}\narrowcol_data_commit {drain}\n"));
+        let mut row = OatResult {
+            run_id: "run".into(), mode: "local".into(), stamp: None, host: "local".into(),
+            experiment: "cell".into(), started_at_ms: 100, measure_seconds: 60.0, arrowcols: 1,
+            clients: 1, tables: 1, table_owner: None, pinning_ok: true, pinning_error: None,
+            failure: None, status: "succeeded".into(), git_sha: "test".into(), tunables_json: "{}".into(),
+            evidence_json: Some(json!({"backlog":{"measurement_window":{"start_unix_ms":100,"end_unix_ms":60_100}},
+                "reconciliation":{"status":"unsettled","reason":"delta_commit_drain_timeout","exact_match_required":true,"exact_match":false},
+                "durable_commits":{"output_throughput":{"rows":10,"rows_per_second":1.0},
+                    "run_cumulative_output":{"rows":10,"settle_seconds":1.0}},
+                "client_phase_reports":[{"phase_counters":{"process_cumulative":{"completed_rows":20,"ambiguous_rows":0}}}],
+                "ranking_eligible":true,"ranking_metrics":{"committed_rows_per_second":1.0}}).to_string()),
+            replicas: 1, dfe_worker_concurrency: 1, table: table.clone(), rows: Some(20), duration_ms: Some(60_000),
+            rows_per_second: Some(1.0), cpu_millicores: None, memory_bytes: None, qap: QapMetrics::default(),
+        };
+        let mut typed = stopped.clone();
+        typed.text.push_str(&format!("arrowcol_teardown_failure {}\n", json!({
+            "kind": arrowcol_protocol::DATAFLOW_DRAIN_INCOMPLETE,
+            "triggers": ["unpublished_identities"]
+        })));
+        typed.text = filter_process_evidence_text(&typed.text)?;
+        let mut typed_row = row.clone();
+        attach_collector_teardown_failures(std::slice::from_mut(&mut typed_row), Some(std::slice::from_ref(&typed)), false)?;
+        let typed_evidence: Value = serde_json::from_str(typed_row.evidence_json.as_deref().context("missing typed evidence")?)?;
+        assert_eq!(typed_row.status, "failed");
+        assert_eq!(typed_evidence["teardown_failures"], json!([{
+            "kind": "dataflow_drain_incomplete", "triggers": ["unpublished_identities"], "collector_instance_id": "collector-test"
+        }]));
+        let mut missing = row.clone();
+        attach_collector_teardown_failures(std::slice::from_mut(&mut missing), Some(std::slice::from_ref(&stopped)), false)?;
+        assert!(serde_json::from_str::<Value>(missing.evidence_json.as_deref().context("missing evidence")?)?["teardown_failures"].is_null());
+        let mut invalid = typed.clone();
+        invalid.text.push_str("arrowcol_teardown_failure {\"kind\":\"dataflow_drain_incomplete\",\"triggers\":[]}\n");
+        assert!(attach_collector_teardown_failures(std::slice::from_mut(&mut row.clone()), Some(&[invalid]), false).is_err());
+        let mut incomplete_typed = typed.clone();
+        incomplete_typed.complete = false;
+        assert!(attach_collector_teardown_failures(std::slice::from_mut(&mut row.clone()), Some(&[incomplete_typed]), false).is_err());
+        let mut warned = stopped.clone();
+        warned.text.push_str("WARN cancelled admissions had no observed publication outcome; delivery remains ambiguous cancelled_ambiguous=2\n");
+        let mut incomplete_admissions = stopped.clone();
+        incomplete_admissions.complete = false;
+        for (logs, cleanup, expected) in [
+            (None, true, "unavailable"),
+            (Some(std::slice::from_ref(&incomplete_admissions)), true, "unavailable"),
+            (Some(std::slice::from_ref(&stopped)), false, "unavailable"),
+            (Some(std::slice::from_ref(&warned)), true, "ambiguous"),
+            (Some(std::slice::from_ref(&stopped)), true, "clear"),
+        ] {
+            let mut candidate = row.clone();
+            attach_collector_teardown_admissions(std::slice::from_mut(&mut candidate), logs, cleanup)?;
+            let evidence: Value = serde_json::from_str(candidate.evidence_json.as_deref().context("missing admissions evidence")?)?;
+            assert_eq!(evidence["durable_commits"]["collector_teardown_admissions"]["status"], expected);
+            if expected == "clear" {
+                assert_eq!(candidate.status, "succeeded");
+                assert_eq!(evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"], 0);
+            } else {
+                assert_eq!(candidate.status, "failed");
+                assert!(evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"].is_null());
+                let mut outcome = finish_matrix_cell(&config, "orchestration", "run", 1, 1, Ok(vec![candidate]), Ok(()));
+                attach_teardown_outcome(&mut outcome, "succeeded")?;
+                let evidence: Value = serde_json::from_str(outcome.rows[0].evidence_json.as_deref().context("missing final evidence")?)?;
+                assert_eq!(evidence["ranking_eligible"], false);
+                assert!(outcome.rows[0].rows_per_second.is_none());
+            }
+        }
+        let mut partial_row = row.clone();
+        let mut incomplete = stopped.clone();
+        incomplete.complete = false;
+        attach_stopped_commit_evidence(&config, std::slice::from_mut(&mut partial_row), &[incomplete], std::slice::from_ref(&baseline))?;
+        let partial: Value = serde_json::from_str(partial_row.evidence_json.as_deref().context("missing partial evidence")?)?;
+        assert_eq!(partial["durable_commits"]["run_cumulative_output"]["rows"], 10);
+        assert!(partial["durable_commits"]["post_teardown_cumulative_output"]["rows"].is_null());
+        assert_eq!(partial["reconciliation"]["status"], "unavailable");
+        assert_eq!(partial_row.status, "failed");
+        stopped.text.push_str("WARN cancelled admissions had no observed publication outcome; delivery remains ambiguous cancelled_ambiguous=2\n");
+        stopped.text = filter_process_evidence_text(&stopped.text)?;
+        attach_stopped_commit_evidence(&config, std::slice::from_mut(&mut row), &[stopped], &[baseline])?;
+        let mut clean = finish_matrix_cell(&config, "orchestration", "run", 1, 1, Ok(vec![row.clone()]), Ok(()));
+        attach_teardown_outcome(&mut clean, "succeeded")?;
+        let clean_evidence: Value = serde_json::from_str(clean.rows[0].evidence_json.as_deref().context("missing clean evidence")?)?;
+        assert_eq!(clean_evidence["teardown_outcome"], "succeeded");
+        assert_eq!(clean_evidence["complete_delivery_established"], false);
+        assert_eq!(clean.rows[0].status, "failed");
+        assert!(clean.rows[0].failure.as_deref().is_some_and(|failure| failure.contains("teardown_delivery_ambiguous")));
+        assert!(clean.rows[0].rows_per_second.is_none());
+        let mut zero_row = row.clone();
+        let mut zero_evidence: Value = serde_json::from_str(zero_row.evidence_json.as_deref().context("missing evidence")?)?;
+        zero_evidence["durable_commits"]["output_throughput"]["rows"] = json!(0);
+        zero_evidence["durable_commits"]["complete_30_second_commit_windows"][0]["rows"] = json!(0);
+        zero_row.evidence_json = Some(zero_evidence.to_string());
+        let mut zero_outcome = finish_matrix_cell(&config, "orchestration", "run", 1, 1, Ok(vec![zero_row]), Err(anyhow::anyhow!("drain failed")));
+        attach_teardown_outcome(&mut zero_outcome, "failed")?;
+        let final_evidence: Value = serde_json::from_str(zero_outcome.rows[0].evidence_json.as_deref().context("missing final evidence")?)?;
+        assert_eq!(final_evidence["durable_commits"]["output_throughput"]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        assert_eq!(final_evidence["durable_commits"]["complete_30_second_commit_windows"][0]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        assert_eq!(final_evidence["commit_window_output_throughput"]["zero_output_reason"]["classification"], "teardown_failure_observed");
+        let mut outcome = finish_matrix_cell(
+            &config,
+            "orchestration",
+            "run",
+            1,
+            1,
+            Ok(vec![row]),
+            Err(anyhow::anyhow!("drain failed")),
+        );
+        attach_teardown_outcome(&mut outcome, "failed")?;
+        let row = &outcome.rows[0];
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(row.status, "failed");
+        assert!(row.rows_per_second.is_none());
+        assert_eq!(evidence["teardown_outcome"], "failed");
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["cancelled_ambiguous"], 2);
+        assert_eq!(evidence["complete_delivery_established"], false);
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["rows"], 20);
+        assert_eq!(
+            evidence["durable_commits"]["run_cumulative_output"]["commits_by_version"]
+                .as_array()
+                .context("missing cumulative commit versions")?
+                .len(),
+            2
+        );
+        assert_eq!(evidence["reconciliation"]["status"], "within_bound");
+        assert_eq!(evidence["pre_teardown_reconciliation"], json!({
+            "status":"unsettled", "reason":"delta_commit_drain_timeout",
+            "exact_match_required":true, "exact_match":false
+        }));
+        assert_eq!(
+            evidence["durable_commits"]["complete_30_second_commit_windows"][0]["rows"],
+            10
+        );
+        assert_eq!(
+            evidence["durable_commits"]["complete_30_second_commit_windows"][0]["teardown_outcome"],
+            "failed"
+        );
+        assert_eq!(
+            evidence["commit_window_output_throughput"]["teardown_outcome"],
+            "failed"
+        );
+        assert_eq!(evidence["ranking_eligible"], false);
+        assert!(evidence["ranking_metrics"].is_null());
+        assert_eq!(evidence["commit_window_output_throughput"], evidence["durable_commits"]["output_throughput"]);
+        assert!(evidence["screen_v1"].is_null());
+        assert_eq!(evidence["screen_v1_csv_reason"], "cell_failed");
+        Ok(())
+    }
+
+    #[test]
     fn full_filtered_log_preserves_startup_readback_and_tail_commit() -> Result<()> {
         let mut config = config()?;
         config.tunables = serde_json::from_value(json!({"router":{"hard_pressure_bps":9500}}))?;
@@ -974,6 +1840,50 @@ mod commit_evidence_tests {
         assert_eq!(evidence["compression_ratio"], 2.0);
         assert!(evidence["unique_delivered_rows"].is_null());
         assert_eq!(evidence["complete_delivery_established"], false);
+        let receipts = evidence["run_cumulative_output"]["commits_by_version"].as_array().context("missing commit receipts")?;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["table_id"], "a".repeat(64));
+        assert_eq!(receipts[0]["table_name"], canonical_dmv_table_name(&config.tables[0])?);
+        assert_eq!(receipts[0]["delta_version"], 7);
+        assert_eq!(receipts[0]["rows"], 10);
+        assert_eq!(receipts[0]["files"], 1);
+        assert_eq!(receipts[0]["input_bytes"], 100);
+        assert_eq!(receipts[0]["parquet_bytes"], 50);
+        assert_eq!(receipts[0]["min_ingested_at_ms"], 100);
+        assert_eq!(receipts[0]["max_ingested_at_ms"], 199);
+        assert_eq!(receipts[0]["finished_at_unix_ms"], 200);
+        assert_eq!(receipts[0]["elapsed_seconds"], 0.5);
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_collector_output_includes_drain_and_marks_incomplete_logs() -> Result<()> {
+        let config = config()?;
+        let commit = event(&config, 100, 199)?;
+        let mut drain = event(&config, 210, 220)?;
+        drain["delta_version"] = json!(8);
+        let mut full = log(&[commit, drain]);
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let stopped = stopped_collector_commit_output(&config, &full)?;
+        assert_eq!(stopped["source"], "complete_stopped_collector_logs");
+        assert_eq!(stopped["tables"][&table]["commits_by_version"].as_array().context("missing stopped commit receipts")?.len(), 2);
+        full.complete = false;
+        let incomplete = stopped_collector_commit_output(&config, &full)?;
+        assert_eq!(incomplete["source"], "incomplete_stopped_collector_logs");
+        assert_eq!(incomplete["tables"][&table]["unavailable_reason"], "collector_commit_log_incomplete");
+        Ok(())
+    }
+
+    #[test]
+    fn cumulative_commit_receipts_without_finish_time_are_unavailable() -> Result<()> {
+        let config = config()?;
+        let mut commit = event(&config, 100, 199)?;
+        commit["finished_at_unix_ms"] = Value::Null;
+        let evidence = durable_commit_evidence(&config, &[log(&[commit])], Some((100, 200)))?;
+        let cumulative = &evidence[&config.tables[0]]["run_cumulative_output"];
+        assert!(cumulative["rows"].is_null());
+        assert_eq!(cumulative["commits_by_version"], json!([]));
+        assert_eq!(cumulative["unavailable_reason"], "cumulative_commit_finish_time_unavailable");
         Ok(())
     }
 
@@ -1039,12 +1949,21 @@ mod commit_evidence_tests {
         let mut tail = event(&config, 1000, 1001)?;
         tail["delta_version"] = json!(9);
         tail["finished_at_unix_ms"] = json!(61_000);
-        let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail])], Some((1000, 66_000)))?;
+        let mut at_end = event(&config, 1000, 1001)?;
+        at_end["delta_version"] = json!(10);
+        at_end["finished_at_unix_ms"] = json!(66_000);
+        let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail, at_end])], Some((1000, 66_000)))?;
         let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
         assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
         assert_eq!(windows[0]["rows"], 10);
         assert_eq!(windows[1]["rows"], 10);
         assert_eq!(evidence[&config.tables[0]]["output_throughput"]["rows"], 30);
+        let cumulative = &evidence[&config.tables[0]]["run_cumulative_output"];
+        let receipts = cumulative["commits_by_version"].as_array().context("missing cumulative commit receipts")?;
+        assert_eq!(receipts.len(), 4);
+        assert_eq!(receipts.iter().map(|receipt| receipt["finished_at_unix_ms"].as_i64().context("missing finish timestamp")).collect::<Result<Vec<_>>>()?,
+            vec![1_000, 31_000, 61_000, 66_000]);
+        assert_eq!(cumulative["rows"], 40);
         let mut missing = log(&[]);
         missing.complete = false;
         let evidence = durable_commit_evidence(&config, &[missing], Some((1000, 66_000)))?;
@@ -1052,6 +1971,66 @@ mod commit_evidence_tests {
         assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
         assert!(windows[0]["rows"].is_null());
         assert_eq!(windows[0]["unavailable_reason"], "collector_commit_log_incomplete");
+        for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+            assert!(windows[0][field].is_null(), "{field}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn commit_window_resolution_uses_finish_times_and_half_open_selection() -> Result<()> {
+        let config = config()?;
+        let mut events = Vec::new();
+        for index in 0..3 {
+            let mut commit = event(&config, 900, 999)?;
+            commit["delta_version"] = json!(index + 1);
+            commit["finished_at_unix_ms"] = json!(1_000 + index * 1_000);
+            commit["rows"] = json!((index + 1) * 10);
+            events.push(commit);
+        }
+        for count in 0..=3 {
+            let evidence = durable_commit_evidence(&config, &[log(&events[..count])], Some((1_000, 31_000)))?;
+            let window = &evidence[&config.tables[0]]["output_throughput"];
+            assert_eq!(window["window_commit_count"], count);
+            assert_eq!(window["commits"], count);
+            assert_eq!(window["rows_per_second"], json!((count * (count + 1) * 5) as f64 / 30.0));
+            if count == 0 {
+                assert!(window["max_commit_rows"].is_null());
+                assert!(window["rate_resolution_rows_per_second"].is_null());
+            } else {
+                assert_eq!(window["max_commit_rows"], count * 10);
+                assert_eq!(window["rate_resolution_rows_per_second"], json!((count * 10) as f64 / 30.0));
+            }
+            if count < 3 {
+                assert!(window["slope_rows_per_second"].is_null());
+            } else {
+                assert_eq!(window["slope_rows_per_second"], 25.0);
+            }
+        }
+        let coincident = commit_rate_resolution(vec![(1000, 1, 10), (1000, 2, 20), (1000, 3, 30)], 30.0)?;
+        assert!(coincident["slope_rows_per_second"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_commit_windows_have_null_resolution_for_each_early_return() -> Result<()> {
+        let config = config()?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let mut valid = event(&config, 1_000, 1_001)?;
+        valid["finished_at_unix_ms"] = json!(2_000);
+        for case in 0..4 {
+            let mut event = valid.clone();
+            if case == 1 { event["finished_at_unix_ms"] = Value::Null; }
+            if case == 2 { event["min_ingested_at_ms"] = Value::Null; }
+            if case == 3 { event["min_ingested_at_ms"] = json!(900); }
+            let events = BTreeMap::from([(("test".to_owned(), 7), serde_json::from_value(event)?)]);
+            let value = commit_window_output(&events, &table, 1_000, 31_000,
+                (case == 0).then_some("unavailable"), Some(1_000))?;
+            assert!(value["unavailable_reason"].is_string());
+            for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+                assert!(value.get(field).context("missing resolution field")?.is_null(), "{field} in case {case}");
+            }
+        }
         Ok(())
     }
 }

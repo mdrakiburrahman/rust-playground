@@ -457,10 +457,16 @@ for OPTIMIZE, and actual physical reclamation without removing active files for
 VACUUM. These evaluators do not turn an unexecuted or timed-out scenario into a
 pass; local component tests do not establish Azure QAP behavior.
 
-The DFE collector uses two CPUs and bounded buffer limits: 128 MiB overall,
+The DFE collector defaults to a two-CPU quota (`LOADTEST_CPUS`) and bounded buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
 budget. The Kusto container has a separate 6 GiB memory limit. Keep host memory
 available for the other services.
+
+OAT local mode preserves the worker-count/quota coupling when
+`platform.local.collector_cpu_quota` is unset. Set it to a positive decimal CPU
+count or `"unlimited"` to vary quota independently of `dfe_worker_concurrency`;
+`collector_cpus` controls CPU affinity only. Effective quota and measurement
+throttling counters are recorded in each result's `cpu_quota` evidence.
 
 The 6 GiB default is a container ceiling, not a measured safe working set.
 Serial heavy-query admission does not reclaim the emulator's retained engine

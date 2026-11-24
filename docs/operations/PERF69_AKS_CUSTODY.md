@@ -10,11 +10,22 @@ Custody therefore runs as a watchdog on a dedicated, separately leased devbox, n
 | Lifetime | Six-hour hard maximum; heartbeats never extend expiry |
 | Ownership | Compare-and-swap ETags plus monotonic fencing tokens reject stale owners |
 | ARM operations | Poll and reconcile operation URLs only on `management.azure.com` and the selected subscription; uncertain operations remain unsettled |
-| Safe idle | Fixed system pool (autoscale explicitly off) 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
+| Safe idle (legacy stamps) | Fixed system pool (autoscale explicitly off) 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
 | Cleanup state machine | Fencing persists ordered, stable idempotency receipts; retries resume the same step, and completion requires every step to verify |
 | Cleanup adapter | Source/mocked only. Default CLI/watchdog providers install exact discovery, bounded lifecycle/journal recovery, namespace/QAP/FIC custody, ARM rollback and independent Delta/non-run Kusto preservation. External rehearsal remains mandatory; keep custody unarmed. |
 
 The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the credential-free reference before load. `createDefaultCleanupProviders` installs concrete lifecycle/recovery and full-data observation by default; injection is optional for tests. External adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
+
+Selection retains the exact, case-sensitive subscription/cluster/location binding
+as a SHA-256 fingerprint; no runtime override selects this topology.
+For the reviewed Canada Central breakthrough topology, capacity-idle requires exactly
+five pools: the existing system pool at 3×D8ds_v6 with autoscaling pinned at
+3..3, and benchd64, benche64, supportd64 and arrowe192 at zero with autoscaling
+0..1. Kusto must independently meet the same idle requirements. The campaign
+baseline binds a separate ARM receipt to each pool. Fallback restoration for
+this profile is observation-only; drift remains pending for separately authorized
+reconciliation rather than writing to any pool or Kusto. Capacity-idle is not
+proof of workload or data safety.
 
 Before campaign load, exercise heartbeat expiry, stale-owner rejection, repeated cleanup, and a safe-idle no-op on the watchdog box. Confirm the final ARM state and preserve the evidence before handing the lease back. A cleanup operation that is pending or uncertain is never reported as complete.
 
@@ -191,6 +202,57 @@ effects; every PATCH uses UID/resourceVersion tests and a version-pinned authori
 PATCH can recover only from positive exact physically stopped state, labelled as state recovery rather than an API
 response; it is never blindly reissued. Late responses remain evidence, not successful budget completion.
 Terminal Delta is frozen only after collector and maintenance writers are physically stopped with recreation disabled.
+
+## Shutdown finalization
+
+| Boundary | Behavior |
+| --- | --- |
+| Required order | Stop admission → bounded drain → evidence capture → maintenance stop → freeze → fenced terminal-summary inputs → attach final AKS Delta reconciliation → guarded create-only finalization → validation → namespace, QAP and FIC removal → handoff. The bounded pre-drain snapshot remains diagnostic. |
+| Exit 0 | Requires the actual measured post-teardown reconciliation, settled zero ambiguity, clear teardown admissions and matching independently read frozen Delta row counts. A zero exit alone never authorizes release. |
+| Exit 143 | Always unavailable; an exact marker permits only provisional physical stop/freeze. Release and handoff stay withheld. |
+| Early failure | Stop/freeze checks still apply. Authoritatively missing pre-load Blob gives `no_baseline`, nullable missing references and an immutable unavailable record; never invented zero rows, namespace UID or terminal observations. Release stays withheld. |
+| Missing measurements | An existing baseline with missing reconciliation rows is `reconciliation_unavailable`, not `no_baseline`. Storage/authentication errors are not missing-baseline observations. |
+| Unknown write | Pre-read existing artifact; guarded canonical-equality readback only. Never repeat a conflicting or uncertain PUT. Finalization cannot settle or replay a running/UNKNOWN removal journal. |
+
+The three CLI actions are `shutdown-finalization-inputs`, `shutdown-finalize` and
+`shutdown-finalization-read`. Inputs/read require exactly
+`schema_version:1,campaign_id,orchestration_run_id,cell_run_id,expected_etag,actor`.
+Inputs return `schema_version,inventory_etag,terminal_capture,delta_before,delta_terminal,unavailable_reason,terminal_summaries`;
+source references are `{blob,etag,sha256}` or explicit null, with canonical-JSON hashes.
+Finalize additionally accepts those exact nullable references and
+`reconciliation:{profile:"single_hot_table"|"other",proof:null|{status,post_teardown_verification,
+expected_rows,observed_rows,settled_zero_ambiguity,teardown_admissions_clear}}`.
+Proof is the authenticated producer's actual measured reconciliation, not a client-supplied match flag.
+TS also checks frozen row-count differences; this is not positive exit-143 continuity proof.
+
+Final/read receipts retain immutable origin, actor, creation inventory ETag, source references and verdict identities,
+plus `status:"validated"|"unavailable"|"failed",reason_code,release_allowed,reconciliation` and the final artifact reference.
+All fields remain present, including nulls. Finalization journal I/O has its own bounded 30-second action window;
+it never extends or restarts physical stop/freeze deadlines. Read-only recovery preserves the creation ETag after later
+inventory progress. Current actor/fence and inventory version are checked throughout.
+Known non-143 failures retain only the existing validated controller unsettled-cleanup exception; never a successful cell.
+No membership, follower or positive exit-143 API is installed.
+
+### Exit-zero terminal summary
+
+`terminal_summaries` is required-present and nullable, from the same fenced terminal-capture reference:
+`[{pod_name,pod_uid,container,restart_count:0,exit_code:0,summary}] | null`.
+
+| Contract | Requirement |
+| --- | --- |
+| Producer record | Exactly one `arrowcol_terminal_evidence` JSON record per original collector container, emitted only after drain/final acknowledgement. Summary keys: `schema_version:1,admitted,committed,failed,cancelled_ambiguous,pending,committed_rows,incomplete,commits`. |
+| Units | Distinct publication IDs offered downstream, including rejected sends. `admitted = committed + failed + cancelled_ambiguous + pending`; every counter is a nonnegative JS-safe integer. |
+| Positive accounting | `failed=cancelled_ambiguous=pending=incomplete=0`; `incomplete` is numeric `0\|1`. Unknown/replayed attribution, races, overflow and missing summaries are never fabricated as zero. |
+| Commit entries | Exact `{table_id,version,rows,files,parquet_bytes}`; table ID is the existing lowercase SHA256 of the writer's normalized URL, not raw table data. Numeric totals and every unique version/row/file/byte tuple must match independently replayed frozen Delta. Entire-lifetime/pre-baseline or duplicate tuples refuse validation. |
+| Source completeness | Full log read without `--tail`/`--limit-bytes`, below the established native 64 MiB log cap (`COLLECTOR_TERMINAL_LOG_MAX_BYTES`), receiver startup preceding terminal record, complete final line, and exact fenced pod UID/container with zero restarts observed before and after read. Missing/rotated/partial/duplicate/malformed or inconsistent evidence yields null. Existing custody-Blob/Delta history bounds still apply; oversized workloads are refused, not truncated. |
+| Capture timing | Read original pods while draining, before deletion, and recheck at terminal observation. Persist only typed accounting, hashes and existing identity provenance, never raw logs or configuration. New stop journals mark `terminal_evidence_version:1`, preventing a missing new summary from falling back to legacy acceptance. |
+| Table binding | Only the independently configured ABFSS account/container/root URL with the writer's trailing slash is supported. Scheme aliases or normalization uncertainty are not equated; unequal hashes withhold release. |
+
+Delta JSON history reads use one named `DELTA_READ_CONCURRENCY=4` cap, with ordered replay after concurrent
+fetches. One absolute 35-second read deadline covers listing, all batches and retries; terminal capture takes the
+earlier persisted physical deadline. Finalization rereads share the stricter existing 30-second journal action deadline,
+not a fresh budget per replay. Expiry is unavailable/UNKNOWN, never empty/zero evidence or a restarted budget.
+CPU quota, QAP validation, mandatory process/commit capture and immutable journal fencing remain mandatory.
 
 ## Campaign-terminal providers
 

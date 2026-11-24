@@ -56,7 +56,9 @@ function tunables(row: RecordValue): RecordValue | undefined {
   }
 }
 
-function collectorOutputIssue(evidence: RecordValue, row: RecordValue): string | undefined {
+function collectorOutputIssue(
+  evidence: RecordValue, row: RecordValue, mode: 'local' | 'aks', config: RecordValue,
+): string | undefined {
   const durable = evidence.durable_commits;
   const reconciliation = record(durable) ? durable.delta_log_reconciliation : undefined;
   if (evidence.evidence_class === 'd53_exploratory' &&
@@ -102,11 +104,21 @@ function collectorOutputIssue(evidence: RecordValue, row: RecordValue): string |
   }
   const collectors = Array.isArray(evidence.processes) ? evidence.processes.filter(process =>
     record(process) && process.component === 'collector') : [];
+  const platform = record(config.platform) ? config.platform : undefined;
+  const local = record(platform?.local) ? platform.local : undefined;
+  const override = local?.collector_image_override;
+  if (override != null && (mode !== 'local' || !record(override) ||
+      typeof override.image_id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(override.image_id) ||
+      typeof override.source_revision !== 'string' || !/^[a-f0-9]{40}$/.test(override.source_revision))) {
+    return 'invalid collector image override';
+  }
   if (BigInt(collectors.length) !== integer(row.replicas) || !collectors.length || collectors.some(process => {
     if (!record(process) || process.log_complete !== true || process.effective_config_source !== 'consumer_startup_readback' ||
         typeof process.image !== 'string' || !process.image || typeof process.image_id !== 'string' ||
         !/(?:^|@|:\/\/)sha256:[a-f0-9]{64}$/.test(process.image_id) ||
-        (process.source_revision != null && process.source_revision !== row.git_sha)) return true;
+        (record(override)
+          ? process.image_id !== override.image_id || process.source_revision !== override.source_revision
+          : process.source_revision != null && process.source_revision !== row.git_sha)) return true;
     const config = process.effective_config;
     const telemetry = record(config) ? config.commit_telemetry : undefined;
     return !record(telemetry) || telemetry.schema_version !== 1 || telemetry.scope !== 'new_ingestion_addfiles_after_sync' ||
@@ -129,9 +141,9 @@ export function evaluateDataFlow(
   const downstreamProblems: string[] = [];
   const findings: string[] = [];
   let downstreamStatus: 'clear' | 'lagging' | 'unknown' = 'clear';
-  const markDownstreamUnknown = (reason: string): void => {
+  const markDownstreamUnknown = (reason: string, fatal = true): void => {
     downstreamStatus = 'unknown';
-    downstreamProblems.push(reason);
+    if (fatal) downstreamProblems.push(reason);
   };
   const rows = allRows.filter((row) => tunables(row)?.orchestration_run_id === status.id);
   if (status.state !== 'succeeded') reasons.push(`run state is ${status.state}: ${status.error ?? status.progress}`);
@@ -166,6 +178,7 @@ export function evaluateDataFlow(
   let legacyOutputs = 0;
   for (const row of rows) {
     const label = String(row.table);
+    let rowDownstreamUnavailable = false;
     if (row.schema_version !== 2 && row.schema_version !== 3) reasons.push(`${label}: unsupported result schema`);
     if (campaign && row.schema_version !== 3) reasons.push(label + ': campaign requires committed-output telemetry');
     if (row.schema_version === 3) {
@@ -173,15 +186,16 @@ export function evaluateDataFlow(
         const evidence: unknown = JSON.parse(String(row.evidence_json));
         if (!record(evidence) || evidence.version !== 1) reasons.push(`${label}: invalid measurement evidence`);
         else {
-          const issue = collectorOutputIssue(evidence, row);
+          const issue = collectorOutputIssue(evidence, row, mode, config);
           if (issue) reasons.push(`${label}: ${issue}`);
           else if (record(evidence.commit_window_output_throughput) && integer(evidence.commit_window_output_throughput.rows) === 0n) {
             knownZeroOutputs++;
             if (campaign) reasons.push(label + ': no committed output in campaign window');
           }
           if (evidence.downstream_status === 'unavailable') {
+            rowDownstreamUnavailable = true;
             if (campaign) {
-              markDownstreamUnknown(label + ": downstream evidence unavailable");
+              markDownstreamUnknown(label + ": downstream evidence unavailable", mode !== 'local');
               if (mode === 'local') localDownstreamUnavailable = true;
             } else if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
             else localDownstreamUnavailable = true;
@@ -223,7 +237,7 @@ export function evaluateDataFlow(
         typeof completion === 'number' && Number.isFinite(completion) && completion >= 0 && completion <= 100 &&
         pending !== undefined && unhealthy !== undefined;
       if (!qapComplete) {
-        if (campaign) markDownstreamUnknown(label + ': QAP observation incomplete or metrics missing');
+        if (campaign) markDownstreamUnknown(label + ': QAP observation incomplete or metrics missing', !(mode === 'local' && rowDownstreamUnavailable));
         else reasons.push(label + ': QAP observation incomplete or unhealthy');
       } else if (campaign) {
         const rowFindings: string[] = [];

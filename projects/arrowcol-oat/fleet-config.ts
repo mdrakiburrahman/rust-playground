@@ -15,7 +15,7 @@ export interface FleetSizing {
     connections_per_worker: AutoNumber;
     streams_per_worker: AutoNumber;
     rows_per_table: AutoNumber;
-    dmv_concurrency: AutoNumber;
+    dmv_concurrency?: AutoNumber;
     corpus_bytes: AutoNumber;
     max_memory_bytes: AutoNumber;
   };
@@ -64,14 +64,20 @@ function assertFleetSizing(input: unknown): asserts input is FleetSizing {
     throw new Error('fleet sizing requires an explicit collector_pool and collector/client sizing');
   for (const role of ['collector', 'client'] as const) {
     const settings = object(c[role], `fleet ${role}`);
-    if (Object.keys(settings).sort().join() !== Object.keys(bounds[role]).sort().join())
+    const expected = Object.keys(bounds[role]);
+    const optionalConcurrency = role === 'client' && !Object.hasOwn(settings, 'dmv_concurrency');
+    if (Object.keys(settings).sort().join() !== expected.filter(name => !optionalConcurrency || name !== 'dmv_concurrency').sort().join())
       throw new Error(`fleet ${role} sizing has missing or unknown fields`);
     for (const [name, maximum] of Object.entries(bounds[role])) {
       const value = settings[name];
-      if (value !== 'auto' && (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (name === 'blocking_workers' ? 2 : 1) || value > maximum))
-        throw new Error(`fleet ${role}.${name} must be auto or a bounded positive integer (maximum ${maximum})`);
+      if (role === 'client' && name === 'dmv_concurrency' && optionalConcurrency) continue;
+      if (value !== 'auto' && (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (name === 'streams_per_worker' ? 0 : name === 'blocking_workers' ? 2 : 1) || value > maximum))
+        throw new Error(`fleet ${role}.${name} must be auto or a bounded ${name === 'streams_per_worker' ? 'nonnegative' : 'positive'} integer (maximum ${maximum})`);
     }
   }
+  const client = object(c.client, 'fleet client');
+  if (Object.hasOwn(client, 'dmv_concurrency') && client.streams_per_worker !== 0)
+    throw new Error('fleet client.dmv_concurrency has no effect unless streams_per_worker is 0');
 }
 export function parseFleetSizing(input: unknown): FleetSizing {
   assertFleetSizing(input);
@@ -126,6 +132,8 @@ export function resolveFleetExperiment(
   base: Record<string, unknown>, input: unknown, observations: FleetNodeObservation[], pools: FleetPoolOutcome[],
 ): Record<string, unknown> {
   const sizing = parseFleetSizing(input);
+  if (base.dmv_concurrency != null)
+    throw new Error('dmv_concurrency has no effect with platform.fleet; set fleet client.dmv_concurrency instead');
   if (!Array.isArray(observations) || !Array.isArray(pools) ||
       new Set(pools.map(pool => pool.name)).size !== pools.length ||
       pools.some(pool => !/^[a-z][a-z0-9]{0,11}$/.test(pool.name) ||
@@ -157,6 +165,8 @@ export function resolveFleetExperiment(
     blocking_workers: numeric(sizing.collector.blocking_workers, collectorCores * 2, 256),
     cpu_workers: numeric(sizing.collector.cpu_workers, collectorCores, 128) };
   const existingClient = existingTunables.client === undefined ? {} : object(existingTunables.client, 'client');
+  if (existingClient.streams_per_worker != null)
+    throw new Error('tunables.client.streams_per_worker has no effect with fleet sizing; set fleet client.streams_per_worker instead');
   const clients = observations.filter(node => node.pool !== sizing.collector_pool).sort((a, b) => a.node.localeCompare(b.node)).map((node, index) => {
     const placement = nodeBudget(node, FLEET_CLIENT_RESERVATION);
     const cores = Math.floor(cpu(placement.resources.requests.cpu) / 1000);
@@ -168,12 +178,12 @@ export function resolveFleetExperiment(
       workers: numeric(sizing.client.workers, cores, 1024),
       runtime_threads: numeric(sizing.client.runtime_threads, cores, 1024),
       connections_per_worker: numeric(sizing.client.connections_per_worker, Math.max(1, Math.floor(cores / 16)), 4),
-      streams_per_worker: numeric(sizing.client.streams_per_worker, Math.ceil(cores / 4), 16),
+      streams_per_worker: sizing.client.streams_per_worker === 0 ? 0 : numeric(sizing.client.streams_per_worker, Math.ceil(cores / 4), 16),
       max_memory_bytes: maxMemory, corpus_bytes: corpus, pod_ordinal: index + 1 };
     delete (client as Record<string, unknown>).corpus_rows;
     return { placement,
       rows_per_table: numeric(sizing.client.rows_per_table, bytes / (Math.max(1, cores) * 4096), 1_000_000),
-      dmv_concurrency: numeric(sizing.client.dmv_concurrency, cores, 64), tunables: client };
+      ...(sizing.client.dmv_concurrency === undefined ? {} : { dmv_concurrency: numeric(sizing.client.dmv_concurrency, cores, 64) }), tunables: client };
   });
   if (clients.length < 1 || clients.length > 128) throw new Error('full fleet requires 1 through 128 client nodes');
   platform.resources = { ...(platform.resources === undefined ? {} : object(platform.resources, 'resources')),
@@ -185,6 +195,6 @@ export function resolveFleetExperiment(
   resolved.clients_per_table = clients.length;
   delete resolved.clients_per_table_sweep;
   resolved.rows_per_table = clients[0].rows_per_table;
-  resolved.dmv_concurrency = clients[0].dmv_concurrency;
+  delete resolved.dmv_concurrency;
   return resolved;
 }

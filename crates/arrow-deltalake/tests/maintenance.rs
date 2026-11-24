@@ -787,6 +787,8 @@ fn optimize_rewrites_latest_closed_partitions_preserving_rows() -> Result<()> {
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let config = OptimizeConfig {
         latest_partitions: Some(2),
+        bin_concurrency: 2,
+        input_prefetch_files: 2,
         ..optimize_config()
     };
     let plan = maintenance.plan_optimize(&config)?;
@@ -1869,6 +1871,66 @@ fn optimize_default_layout_preserves_whole_file_customer_order() -> Result<()> {
 }
 
 #[test]
+fn optimize_applies_table_resolved_descending_sort_options() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c1", "c4"], 0)?;
+    append_customers(&table, 0, &["c2", "c3"], 10)?;
+    append_customers(&table, 1, &["frontier"], 20)?;
+    let props = arrowcol_props::resolve(
+        &BTreeMap::from([
+            ("arrowcol.layout.sortColumns".to_owned(), "customer_id".to_owned()),
+            (
+                "arrowcol.layout.sortOptions".to_owned(),
+                "customer_id:descending:first".to_owned(),
+            ),
+        ]),
+        &BTreeMap::new(),
+    )?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = OptimizeConfig {
+        automatic_layout: Some(LayoutPolicy::from_properties(&props)?),
+        automatic_layout_sort_columns_explicit: true,
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(
+        (report.outcome, report.files_added, report.rows_added),
+        (Outcome::Committed, 1, 4)
+    );
+    let output = active_files(root.path())?
+        .into_iter()
+        .find(|(_, partition)| *partition == minute(0))
+        .context("missing compacted output")?
+        .0;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), &output)?)?)?;
+    let sorting = reader
+        .metadata()
+        .row_group(0)
+        .sorting_columns()
+        .context("missing sort metadata")?;
+    assert_eq!(sorting.len(), 1);
+    assert!(sorting[0].descending && sorting[0].nulls_first);
+    let mut actual = Vec::new();
+    for batch in reader.build()? {
+        let batch = batch?;
+        let customers = arrow::compute::cast(
+            batch.column_by_name("customer_id").context("customer")?,
+            &DataType::Utf8,
+        )?;
+        let customers = customers.as_any().downcast_ref::<StringArray>().context("customers")?;
+        actual.extend((0..customers.len()).map(|i| customers.value(i).to_owned()));
+    }
+    assert_eq!(actual, ["c4", "c3", "c2", "c1"]);
+    Ok(())
+}
+
+#[test]
 fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = DeltaTable::open_url(
@@ -1883,6 +1945,7 @@ fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let layout = LayoutPolicy {
         sort_columns: vec!["customer_id".into()],
+        sort_options: None,
         max_rows: 2,
         max_input_bytes: 1024 * 1024,
         row_group_rows: 2,
@@ -2141,6 +2204,7 @@ fn optimize_d42_residual_proof_write_failure_discards_prior_bin_outputs() -> Res
             ..LayoutPolicy::default()
         }),
         sealed_final: true,
+        bin_concurrency: 2,
         batch_rows: 6,
         ..optimize_config()
     };

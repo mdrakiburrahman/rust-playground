@@ -17,12 +17,28 @@ Startup and validated table policy are emitted to stderr as
 `arrowcol_maintenance_effective_config` and `arrowcol_maintenance_table_config`
 JSON events. The optional aggregate decoded-byte budget limits the product of
 per-bin decoded limits and concurrent tables; it is not an RSS limit.
+
+| Storage control | Process default | Table override | Effective `operation_settings` readback |
+| --- | --- | --- | --- |
+| Checkpoint debt threshold | `--checkpoint-every-commits` / `ARROWCOL_MAINT_CHECKPOINT_EVERY_COMMITS` | `delta.checkpointInterval` | `checkpoint_every_commits` |
+| Compaction byte target | `--target-file-mib` / `ARROWCOL_MAINT_TARGET_FILE_MIB` | `arrowcol.optimize.targetFileSize`, falling back to `delta.targetFileSize` | `optimize_target_file_bytes` |
+
+Readback reports installed operation values after table overrides; a disabled
+operation's value is null. `startup` retains the invocation values. Checkpoints
+require the checkpoint operation and `--apply`; the compaction target is not a
+hard maximum or an ingest-file size guarantee.
+
 Compaction also consumes the shared `ARROWCOL_PARQUET_CONFIG` JSON. Readback
 reports its overrides; schema compatibility is checked when rewriting files.
 `--input-read-strategy spool` streams each input to temporary local disk instead
 of buffering its compressed bytes in memory; disk space and I/O must be available.
 `--input-read-strategy range` streams Parquet ranges and requires a strong
 object ETag for every conditional request; unsupported or changed objects fail.
+`--input-prefetch-files` defaults to `1` (serial reads with any strategy). With
+`memory`, set it to 2–8 to overlap reads within each bin without changing file
+order. `spool` and `range` reject values above 1 rather than falling back to
+whole-file buffering. The small-file threshold times the prefetch count, bin
+concurrency and table concurrency must fit within 512 MiB when prefetching.
 
 | Operation | Effect |
 | --- | --- |

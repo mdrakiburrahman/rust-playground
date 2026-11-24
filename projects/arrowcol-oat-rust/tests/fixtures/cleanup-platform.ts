@@ -6,6 +6,7 @@ const root = process.env.OAT_CLEANUP_FIXTURE_ROOT!;
 const [tool, ...args] = process.argv.slice(2);
 appendFileSync(join(root, 'commands'), `${tool} ${args.join(' ')}\n`);
 const mode = readFileSync(join(root, 'mode'), 'utf8');
+const sourceRevision = process.env.GIT_SHA ?? 'local';
 const fail = (message: string): never => {
   console.error(message);
   process.exit(17);
@@ -24,13 +25,20 @@ if (tool === 'docker') {
         ? existsSync(join(root, 'guard-client-removed')) ? '' : 'guard-client'
         : Object.keys(services).join('\n'));
     } else if (args[0] === 'inspect') {
-      console.log(JSON.stringify(Object.entries(services).filter(([id]) => args.includes(id)).map(([id, service]) => {
-        const stopped = existsSync(join(root, `${id}-stopped`));
-        return { Id: id, RestartCount: 0,
-          Config: { Labels: { 'com.docker.compose.project': readFileSync(join(root, 'project'), 'utf8'), 'com.docker.compose.service': service } },
-          State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
-            Error: '', ExitCode: 0, OOMKilled: false, FinishedAt: new Date().toISOString() } };
-      })));
+      if (args.includes('--format')) {
+        console.log(Object.keys(services)
+          .filter(id => args.includes(id))
+          .map(() => '0')
+          .join('\n'));
+      } else {
+        console.log(JSON.stringify(Object.entries(services).filter(([id]) => args.includes(id)).map(([id, service]) => {
+          const stopped = existsSync(join(root, `${id}-stopped`));
+          return { Id: id, RestartCount: 0,
+            Config: { Labels: { 'com.docker.compose.project': readFileSync(join(root, 'project'), 'utf8'), 'com.docker.compose.service': service, 'org.opencontainers.image.revision': sourceRevision } },
+            State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
+              Error: '', ExitCode: 0, OOMKilled: false, FinishedAt: new Date().toISOString() } };
+        })));
+      }
     } else if (args[0] === 'stop') {
       for (const id of Object.keys(services).filter(id => args.includes(id))) writeFileSync(join(root, `${id}-stopped`), '');
     } else if (args[0] === 'logs') {
@@ -56,7 +64,7 @@ if (tool === 'docker') {
     if (args[0] === 'inspect') {
       console.log(JSON.stringify([{
         Id: 'maintenance-fixture', RestartCount: 0,
-        Config: { Labels: { 'com.docker.compose.project': project, 'com.docker.compose.service': 'delta-maintenance' } },
+        Config: { Labels: { 'com.docker.compose.project': project, 'com.docker.compose.service': 'delta-maintenance', 'org.opencontainers.image.revision': sourceRevision } },
         State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
           Error: '', ExitCode: stopped ? 1 : 0, OOMKilled: false, FinishedAt: '2026-11-16T15:54:00Z' },
       }]));

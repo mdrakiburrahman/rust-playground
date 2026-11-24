@@ -19,7 +19,24 @@
     },
     "test": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo test --locked --package arrowcol-oat-rust"}
+      "options": {"command": "GIT_SHA=$(git rev-parse HEAD) cargo test --locked --package arrowcol-oat-rust"}
+    },
+    "startup-readback-test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "parallel": false,
+        "commands": [
+          "ARROWCOL_OAT_CLIENT_BUILD_LTO=off ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS=16 ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL=3 ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU=generic CARGO_PROFILE_DEV_LTO=off CARGO_PROFILE_DEV_CODEGEN_UNITS=16 CARGO_PROFILE_DEV_OPT_LEVEL=3 cargo build --locked --package collector-chain --bin arrowcol-dmv",
+          "cargo build --locked --package arrowcol-router-rust",
+          "cargo build --locked --package arrowcol-dataflow-rust",
+          "cargo test --locked --package arrowcol-oat-rust --lib client_leaf_adapters_use_actual_consumer_startup -- --ignored",
+          "cargo test --locked --package arrowcol-oat-rust --lib router_excluded_gauges_reach_actual_startup_readback -- --ignored",
+          "cargo test --locked --package arrowcol-oat-rust --lib upload_only_reaches_actual_collector_startup -- --ignored",
+          "cargo test --locked --package arrowcol-oat-rust --lib parquet_policy_reaches_actual_collector_startup -- --ignored",
+          "cargo test --locked --package arrowcol-oat-rust --lib commit_and_pressure_reach_actual_collector_startup -- --ignored"
+        ]
+      }
     },
     "build": {
       "executor": "nx:run-commands",
@@ -37,7 +54,7 @@
     "verify": {
       "executor": "nx:run-commands",
       "cache": false,
-      "dependsOn": ["build", "format-check", "lint", "test"],
+      "dependsOn": ["build", "format-check", "lint", "test", "startup-readback-test"],
       "options": {"commands": []}
     }
   }

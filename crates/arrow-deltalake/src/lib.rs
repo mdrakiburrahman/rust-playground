@@ -25,15 +25,25 @@ pub mod commit;
 pub mod delta;
 #[cfg(feature = "delta")]
 mod delta_io;
+pub mod delta_stats;
 #[cfg(feature = "delta")]
 pub use delta_io::{DeltaRuntimeConfig, runtime_config};
+pub mod footer;
 pub mod layout;
 #[cfg(feature = "delta")]
 pub mod maintenance;
 #[cfg(feature = "delta")]
 pub mod normalize;
 #[cfg(feature = "delta")]
+mod parallel_writer;
+#[cfg(feature = "delta")]
 mod partition;
+#[cfg(feature = "delta")]
+mod publication_evidence;
+#[cfg(feature = "delta")]
+mod publication_lookup;
+#[cfg(feature = "delta")]
+pub use publication_evidence::{PublicationEvidence, PublicationOutcome, PublicationReason};
 #[cfg(feature = "delta")]
 pub mod publisher;
 #[cfg(feature = "delta")]
@@ -42,6 +52,163 @@ pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;
 pub mod writer;
+
+/// Strategy for resolving transaction identities before Delta publication.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxnLookupMode {
+    PerId,
+    #[default]
+    Batched,
+    BatchedCached,
+}
+
+impl<'de> serde::Deserialize<'de> for TxnLookupMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.txn_lookup_mode must be per_id, batched, or batched_cached";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_id") => Ok(Self::PerId),
+            Ok("batched") => Ok(Self::Batched),
+            Ok("batched_cached") => Ok(Self::BatchedCached),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// Queue discipline for the dedicated CPU workers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum CpuDispatch {
+    #[default]
+    SharedFifo,
+    BoundedShards,
+}
+
+impl CpuDispatch {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedFifo => "shared_fifo",
+            Self::BoundedShards => "bounded_shards",
+        }
+    }
+}
+
+impl TryFrom<String> for CpuDispatch {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "shared_fifo" => Ok(Self::SharedFifo),
+            "bounded_shards" => Ok(Self::BoundedShards),
+            _ => Err("expected shared_fifo or bounded_shards"),
+        }
+    }
+}
+
+/// Affinity policy for CPU workers, independent of the I/O runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum CpuPlacement {
+    #[default]
+    Os,
+    CompactAllowed,
+    ScatterAllowed,
+    PhysicalFirst,
+}
+
+impl CpuPlacement {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::CompactAllowed => "compact_allowed",
+            Self::ScatterAllowed => "scatter_allowed",
+            Self::PhysicalFirst => "physical_first",
+        }
+    }
+}
+
+impl TryFrom<String> for CpuPlacement {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "os" => Ok(Self::Os),
+            "compact_allowed" => Ok(Self::CompactAllowed),
+            "scatter_allowed" => Ok(Self::ScatterAllowed),
+            "physical_first" => Ok(Self::PhysicalFirst),
+            _ => Err("expected os, compact_allowed, scatter_allowed or physical_first"),
+        }
+    }
+}
+
+/// How the writer groups rows by their Delta partition values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum PartitionGrouping {
+    #[default]
+    ScalarMap,
+    TypedRuns,
+}
+
+impl TryFrom<String> for PartitionGrouping {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "scalar_map" => Ok(Self::ScalarMap),
+            "typed_runs" => Ok(Self::TypedRuns),
+            _ => Err("expected scalar_map or typed_runs"),
+        }
+    }
+}
+
+impl PartitionGrouping {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScalarMap => "scalar_map",
+            Self::TypedRuns => "typed_runs",
+        }
+    }
+}
+
+/// Writer-side validation of a bound ingestion partition (independent of grouping).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(try_from = "String", rename_all = "snake_case")]
+pub enum GeneratedPartitionBinding {
+    #[default]
+    RevalidateRows,
+    ProvenConstant,
+}
+
+impl GeneratedPartitionBinding {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RevalidateRows => "revalidate_rows",
+            Self::ProvenConstant => "proven_constant",
+        }
+    }
+}
+
+impl TryFrom<String> for GeneratedPartitionBinding {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: String) -> Result<Self> {
+        match raw.as_str() {
+            "revalidate_rows" => Ok(Self::RevalidateRows),
+            "proven_constant" => Ok(Self::ProvenConstant),
+            _ => {
+                anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "delta")]
+use parallel_writer::ParallelArrowWriter;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
@@ -83,11 +250,19 @@ impl CompletedFile {
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
 pub struct ParquetFileWriter {
-    writer: Option<AsyncArrowWriter<tokio::fs::File>>,
+    #[cfg(feature = "delta")]
+    properties: WriterProperties,
+    writer: Option<FileWriter>,
     durable_handle: File,
     path: PathBuf,
     rows: usize,
     input_bytes: u64,
+}
+
+enum FileWriter {
+    Sequential(AsyncArrowWriter<tokio::fs::File>),
+    #[cfg(feature = "delta")]
+    Parallel(ParallelArrowWriter<File>),
 }
 
 impl ParquetFileWriter {
@@ -108,21 +283,72 @@ impl ParquetFileWriter {
         schema: SchemaRef,
         properties: Option<WriterProperties>,
     ) -> Result<Self> {
+        Self::create_inner(path.as_ref(), schema, properties, false)
+    }
+
+    /// Opt into a schema-neutral footer declaration for level-bearing codecs (Delta ingestion and its evidence fixture).
+    ///
+    /// # Errors
+    /// Returns file creation, writer policy or Parquet schema errors.
+    pub fn create_with_codec_evidence(
+        path: impl AsRef<Path>,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+    ) -> Result<Self> {
+        Self::create_inner(path.as_ref(), schema, properties, true)
+    }
+
+    fn create_inner(
+        path: &Path,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+        declare_levels: bool,
+    ) -> Result<Self> {
         let properties = writer::process_config()?.writer_properties(
             &schema,
             properties.clone(),
             &writer::sorting_from_properties(&schema, properties.as_ref())?,
         )?;
-        let path = path.as_ref().to_path_buf();
+        let properties = if declare_levels {
+            let physical = parquet::arrow::ArrowSchemaConverter::new()
+                .with_coerce_types(properties.coerce_types())
+                .convert(&schema)?;
+            footer::stamp(&physical, properties)?
+        } else {
+            properties
+        };
+        let path = path.to_path_buf();
         let durable_handle = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
-        let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, Some(properties))?;
+        #[cfg(feature = "delta")]
+        let effective = properties.clone();
+        #[cfg(feature = "delta")]
+        let writer = {
+            let column_workers = delta_io::runtime_config()?.parquet_column_workers;
+            if column_workers > 1 {
+                FileWriter::Parallel(ParallelArrowWriter::try_new(
+                    durable_handle.try_clone()?,
+                    schema,
+                    properties,
+                    column_workers,
+                )?)
+            } else {
+                let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+                FileWriter::Sequential(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+            }
+        };
+        #[cfg(not(feature = "delta"))]
+        let writer = {
+            let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+            FileWriter::Sequential(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+        };
         Ok(Self {
             writer: Some(writer),
+            #[cfg(feature = "delta")]
+            properties: effective,
             durable_handle,
             path,
             rows: 0,
@@ -159,25 +385,35 @@ impl ParquetFileWriter {
             .context("input Arrow byte count overflow")?;
         #[cfg(feature = "delta")]
         {
-            let mut writer = self
+            let writer = self
                 .writer
                 .take()
                 .context("Parquet writer unavailable after interrupted write")?;
-            let batch = batch.clone();
-            let (writer, result) = delta_io::run_cpu_future(async move {
-                let result = writer.write(&batch).await;
-                (writer, result)
-            })
-            .await?;
-            self.writer = Some(writer);
-            result?;
+            match writer {
+                FileWriter::Sequential(mut writer) => {
+                    let batch = batch.clone();
+                    let (writer, result) = delta_io::run_cpu_future(async move {
+                        let result = writer.write(&batch).await;
+                        (writer, result)
+                    })
+                    .await?;
+                    self.writer = Some(FileWriter::Sequential(writer));
+                    result?;
+                }
+                FileWriter::Parallel(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::Parallel(writer));
+                    result?;
+                }
+            }
         }
         #[cfg(not(feature = "delta"))]
-        self.writer
-            .as_mut()
-            .context("Parquet writer unavailable")?
-            .write(batch)
-            .await?;
+        match self.writer.take().context("Parquet writer unavailable")? {
+            FileWriter::Sequential(mut writer) => {
+                writer.write(batch).await?;
+                self.writer = Some(FileWriter::Sequential(writer));
+            }
+        }
         self.rows = rows;
         self.input_bytes = input_bytes;
         Ok(())
@@ -188,26 +424,38 @@ impl ParquetFileWriter {
     /// # Errors
     /// Returns close, metadata, or synchronization errors.
     pub async fn finish(self) -> Result<CompletedFile> {
-        let writer = self
-            .writer
-            .context("Parquet writer unavailable after interrupted write")?;
-        #[cfg(feature = "delta")]
-        delta_io::run_cpu_future(async move { writer.close().await }).await??;
-        #[cfg(not(feature = "delta"))]
-        writer.close().await?;
-        let durable_handle = tokio::fs::File::from_std(self.durable_handle);
+        let Self {
+            writer,
+            durable_handle,
+            path,
+            rows,
+            input_bytes,
+            ..
+        } = self;
+        match writer.context("Parquet writer unavailable after interrupted write")? {
+            FileWriter::Sequential(writer) => {
+                #[cfg(feature = "delta")]
+                delta_io::run_cpu_future(async move { writer.close().await }).await??;
+                #[cfg(not(feature = "delta"))]
+                writer.close().await?;
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::Parallel(writer) => {
+                drop(writer.finish().await?);
+            }
+        }
+        let durable_handle = tokio::fs::File::from_std(durable_handle);
         durable_handle.sync_all().await?;
         let bytes = durable_handle.metadata().await?.len();
-        let parent = self
-            .path
+        let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok(CompletedFile {
-            path: self.path,
-            rows: self.rows,
-            input_bytes: self.input_bytes,
+            path,
+            rows,
+            input_bytes,
             bytes,
         })
     }
@@ -292,6 +540,19 @@ pub(crate) mod sync_hook {
     static FAIL: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+    type SyncGate = (PathBuf, tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+    static GATES: Mutex<Vec<SyncGate>> = Mutex::new(Vec::new());
+
+    pub(crate) fn pause_next(path: PathBuf) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        GATES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path, entered, wait));
+        (ready, release)
+    }
+
     pub(crate) fn fail_on(path: &Path) {
         FAIL.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -319,6 +580,17 @@ pub(crate) mod sync_hook {
     }
 
     pub(super) fn observe(path: &Path) -> anyhow::Result<()> {
+        let gate = {
+            let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);
+            gates
+                .iter()
+                .position(|(p, _, _)| p == path)
+                .map(|i| gates.swap_remove(i))
+        };
+        if let Some((_, entered, wait)) = gate {
+            let _ = entered.send(());
+            let _ = wait.recv();
+        }
         if FAIL
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -333,4 +605,13 @@ pub(crate) mod sync_hook {
             .push(path.to_owned());
         Ok(())
     }
+}
+
+/// Timestamp conversion used for raw Delta inputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampKernel {
+    #[default]
+    Reference,
+    FusedChecked,
 }

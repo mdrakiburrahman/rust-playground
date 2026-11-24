@@ -4,13 +4,15 @@ import { constants, existsSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readlink, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { assertLocalFailedDisposition, localDispositionSuffix, localQuarantineDispositions, recordLocalFailedDisposition, reconcileAndQuarantineLocalFailedReceipt } from './local-failed-disposition.js';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { collectorBuildProfileHash, parseCollectorBuildProfile } from './collector-build-profile.js';
 
 export interface OatRunStatus {
   id: string;
@@ -69,7 +71,7 @@ export function cliExitCode(error: unknown): number {
 }
 
 function validateArguments(args: string[]): void {
-  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only']);
+  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only', '--diagnostic-prelaunch-only']);
   let positionalConfig = false;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
@@ -100,6 +102,9 @@ Options:
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  --recover-failed-local <invocation-id> <ownership-marker-path>
+  --reconcile-failed-local <invocation-id> <ownership-marker-path>
+                       Quarantine verified failed local evidence without ranking it
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
                        Post-load evidence must be no more than 60 minutes old.
@@ -1097,13 +1102,124 @@ export async function assertCanonicalAksLaunchWorkspace(root: string): Promise<v
   }
 }
 
+async function diagnosticTransitionReceiptRoot(): Promise<string | undefined> {
+  const stateRoot = resolve(workspaceRoot, '../../..');
+  if (resolve(stateRoot, 'pressure-diagnostic-v2/trusted/runtime') !== workspaceRoot ||
+      !stateRoot.endsWith(`${sep}.darwin`)) return undefined;
+  if (process.env.OAT_DARWIN_PARITY_PRECHECK !== '1') {
+    throw new Error('Transition runtime is restricted to diagnostic parity');
+  }
+  const originalTrusted = resolve(stateRoot, 'pressure-diagnostic/trusted');
+  const originalRuntime = resolve(originalTrusted, 'runtime');
+  const receiptRoot = resolve(originalRuntime, 'out/arrowcol-oat/deadline-receipts');
+  for (const path of [workspaceRoot, originalTrusted, originalRuntime, receiptRoot]) {
+    if (await realpath(path) !== path) throw new Error('Diagnostic transition path is not canonical');
+  }
+  const revision = '86eb8ebe07d876c925e027c0c656a69917269f22';
+  const manifest: unknown = JSON.parse((await readLegacyRegularFile(resolve(originalTrusted, 'manifest.json'))).toString('utf8'));
+  const producer: unknown = JSON.parse((await readLegacyRegularFile(resolve(originalTrusted, 'producer.json'))).toString('utf8'));
+  if (!isRecord(manifest) || manifest.commit !== revision || !isRecord(producer) || producer.revision !== revision) {
+    throw new Error('Original diagnostic freeze does not match the reviewed producer');
+  }
+  const git = (...args: string[]) => execFileSync('git', ['-C', originalRuntime, ...args], { encoding: 'utf8' }).trimEnd();
+  if (git('rev-parse', '--show-toplevel') !== originalRuntime || git('rev-parse', 'HEAD') !== revision ||
+      git('status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none') ||
+      git('submodule', 'status', '--recursive').split('\n').some(line => line && !line.startsWith(' '))) {
+    throw new Error('Original diagnostic producer is not clean at the frozen revision');
+  }
+  const originalReceipt = resolve(receiptRoot, '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json');
+  await readLegacyRegularFile(originalReceipt);
+  await readLegacyRegularFile(originalReceipt + localDispositionSuffix);
+  return receiptRoot;
+}
+
+async function readOperatorFile(path: string, maximumBytes: number): Promise<Buffer> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size === 0 || info.size > maximumBytes) throw new Error(`Invalid operator evidence file: ${path}`);
+    return await file.readFile();
+  } finally {
+    await file.close();
+  }
+}
+
+function validOperatorTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+async function assertOperatorQuarantineRecords(receiptRoot: string, activeReceiptNames: string[]): Promise<void> {
+  const quarantineRoot = resolve(dirname(receiptRoot), 'operator-quarantine');
+  const entries = await readdir(quarantineRoot, { withFileTypes: true }).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !legacyUuid.test(entry.name)) throw new Error('Unexpected operator-quarantine entry');
+    const id = entry.name;
+    const directory = resolve(quarantineRoot, id);
+    const receiptBytes = await readOperatorFile(join(directory, `${id}.json`), 1024 * 1024);
+    const recordBytes = await readOperatorFile(join(directory, 'operator-reconciliation.json'), 1024 * 1024);
+    const receipt: unknown = JSON.parse(receiptBytes.toString('utf8'));
+    const record: unknown = JSON.parse(recordBytes.toString('utf8'));
+    if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== id || receipt.creation_state !== 'accepted' ||
+        receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' || !isRecord(record) || record.version !== 1 ||
+        record.authorized_by !== 'coordinator f0767c48 (ArrowCollector tunability Project)' ||
+        !localQuarantineDispositions.some(disposition => disposition === record.disposition) || record.invocation_id !== id ||
+        record.run_id !== receipt.run_id ||
+        !validOperatorTimestamp(record.authorized_at_utc) || typeof record.reason !== 'string' || record.reason.length === 0 ||
+        record.receipt_sha256 !== sha256Bytes(receiptBytes) || activeReceiptNames.includes(`${id}.json`)) {
+      throw new Error(`Invalid operator reconciliation for ${id}`);
+    }
+    const checks = record.custody_checks;
+    if (!isRecord(checks) || !isRecord(checks.server_pid) || checks.server_pid.absent !== true ||
+        !validOperatorTimestamp(checks.server_pid.checked_at_utc) || typeof checks.server_pid.output !== 'string' ||
+        !isRecord(checks.owner_pid) || checks.owner_pid.absent !== true ||
+        !validOperatorTimestamp(checks.owner_pid.checked_at_utc) || typeof checks.owner_pid.output !== 'string' ||
+        !isRecord(checks.port) || checks.port.listening !== false || !validOperatorTimestamp(checks.port.checked_at_utc) ||
+        typeof checks.port.output !== 'string' || !Array.isArray(checks.docker) || checks.docker.length < 7 ||
+        checks.docker.some(check => !isRecord(check) || !validOperatorTimestamp(check.checked_at_utc) ||
+          typeof check.output !== 'string' || check.output.trim().length !== 0 || !Array.isArray(check.args))) {
+      throw new Error(`Operator reconciliation lacks a complete zero-resource custody proof for ${id}`);
+    }
+    const archived = record.archived_evidence_files;
+    if (!Array.isArray(archived)) throw new Error(`Operator reconciliation archive list is invalid for ${id}`);
+    const kinds = new Set<string>();
+    for (const item of archived) {
+      if (!isRecord(item) || typeof item.name !== 'string' || typeof item.path !== 'string' ||
+          !item.path.startsWith('evidence/') || item.path.split(/[\\/]/).some(part => part === '..') ||
+          typeof item.sha256 !== 'string' || !legacySha256.test(item.sha256)) {
+        throw new Error(`Operator reconciliation archive entry is invalid for ${id}`);
+      }
+      const archivedPath = resolve(directory, item.path);
+      if (!relative(directory, archivedPath) || relative(directory, archivedPath).startsWith('..')) {
+        throw new Error(`Operator archive path escapes quarantine for ${id}`);
+      }
+      const archivedBytes = await readOperatorFile(archivedPath, 64 * 1024 * 1024);
+      if (sha256Bytes(archivedBytes) !== item.sha256) throw new Error(`Operator archive digest mismatch for ${id}`);
+      kinds.add(item.name);
+    }
+    if (!['result', 'run_log', 'owner_marker'].every(kind => kinds.has(kind))) {
+      throw new Error(`Operator reconciliation archive is incomplete for ${id}`);
+    }
+  }
+}
+
 export async function assertNoUnsettledDeadlineReceipts(
   root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
+  requiredLocalDisposition?: string, reconcileLocal = true,
 ): Promise<void> {
   const names: string[] = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
     throw error;
   });
+  await assertOperatorQuarantineRecords(root, names);
+  if (requiredLocalDisposition &&
+      (!names.includes(requiredLocalDisposition) || !names.includes(requiredLocalDisposition + localDispositionSuffix))) {
+    throw new Error('Required diagnostic cleanup proof is missing from the canonical ledger');
+  }
   const admittedDispositions = new Set<string>();
   for (const name of names.filter((entry) => entry.endsWith(legacyDispositionSuffix))) {
     const originalName = name.slice(0, -legacyDispositionSuffix.length);
@@ -1116,12 +1232,25 @@ export async function assertNoUnsettledDeadlineReceipts(
     await syncLegacyReceiptDirectory(resolve(root, name));
     admittedDispositions.add(originalName);
   }
+  for (const name of names.filter((entry) => entry.endsWith(localDispositionSuffix))) {
+    const originalName = name.slice(0, -localDispositionSuffix.length);
+    if (!originalName.endsWith('.json') || !names.includes(originalName) || admittedDispositions.has(originalName)) {
+      throw new Error('Orphaned or conflicting local failure disposition');
+    }
+    const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(root, originalName))).toString('utf8'));
+    if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
+    await assertLocalFailedDisposition(resolve(root, originalName), resolve(root, name));
+    admittedDispositions.add(originalName);
+  }
   for (const name of names.filter((entry) => entry.endsWith('.json'))) {
     if (admittedDispositions.has(name)) continue;
     const path = resolve(root, name);
     const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (!reconcileLocal) {
+      throw new Error(`Unsettled launcher receipt ${path}; refusing diagnostic transition without modifying it`);
+    }
     if (deadline.submittedPlatform === 'aks') {
       throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
     }
@@ -1426,6 +1555,19 @@ async function stopMarkedServer(marker: LocalRunMarker): Promise<void> {
   }
 }
 
+async function hasUnsettledLocalReceipt(runId: string): Promise<boolean> {
+  const names = await readdir(launcherDeadlineReceiptRoot).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const name of names.filter(entry => entry.endsWith('.json'))) {
+    const value: unknown = JSON.parse((await readLegacyRegularFile(resolve(launcherDeadlineReceiptRoot, name))).toString('utf8'));
+    if (isLauncherDeadlineReceipt(value) && value.run_id === runId &&
+        (value.cleanup_state === 'pending' || value.cleanup_state === 'unsettled')) return true;
+  }
+  return false;
+}
+
 async function removeStaleLocalMarkers(config: Record<string, unknown>): Promise<void> {
   const root = localStateRoot(config);
   const files = await readdir(root).catch((error: unknown) => {
@@ -1441,7 +1583,7 @@ async function removeStaleLocalMarkers(config: Record<string, unknown>): Promise
         await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
       throw new Error(`Refusing to remove ownership marker for active local run ${marker.runId}`);
     }
-    await unlink(markerPath);
+    if (!await hasUnsettledLocalReceipt(marker.runId)) await unlink(markerPath);
   }
 }
 async function recoverInterruptedLocalRuns(
@@ -1482,13 +1624,13 @@ async function recoverInterruptedLocalRuns(
         throw new Error('Local OAT recovery did not confirm cleanup for run ' + marker.runId + ': ' + (status.error ?? status.state));
       }
       await stopMarkedServer(marker);
-      await unlink(markerPath);
+      if (!await hasUnsettledLocalReceipt(marker.runId)) await unlink(markerPath);
     } else if (cleanupRunId === undefined) {
       const cellRuns = files.filter((entry) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry));
       if (cellRuns.length) {
         throw new Error('Interrupted OAT server is gone; clean each local cell with --cleanup-local <cell-run-uuid>. Remaining cells: ' + cellRuns.join(', '));
       }
-      await unlink(markerPath);
+      if (!await hasUnsettledLocalReceipt(marker.runId)) await unlink(markerPath);
     }
   }
   return explicitlyCleanedProjects;
@@ -1515,6 +1657,17 @@ export async function readOatConfigForMode(
   if (!isRecord(parsed)) throw new Error('OAT config must be a JSON object');
   parseDataFlowVerdictPolicy(parsed.dataflow_verdict_policy);
   const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
+  const tunables = isRecord(parsed.tunables) ? parsed.tunables : {};
+  const collectorProfile = parseCollectorBuildProfile(tunables.collector);
+  if (collectorProfile) {
+    const profileHash = collectorBuildProfileHash(collectorProfile);
+    if (platform.collector_build_profile_hash !== undefined && platform.collector_build_profile_hash !== profileHash) {
+      throw new Error('platform.collector_build_profile_hash does not match tunables.collector build profile');
+    }
+    platform.collector_build_profile_hash = profileHash;
+  } else if (Object.hasOwn(platform, 'collector_build_profile_hash')) {
+    throw new Error('platform.collector_build_profile_hash requires an explicit tunables.collector build profile');
+  }
   if (mode === 'local' && isRecord(platform.local)) {
     const local = { ...platform.local };
     if (local.bind_host == null || local.endpoint_host == null) {
@@ -1743,6 +1896,7 @@ export async function launchOat(
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
   let cancellationRequested = false;
   let cancellationObserved = false;
+  let consecutivePollTimeouts = 0;
   let resolveCancellationStarted!: () => void;
   const cancellationStarted = new Promise<void>((resolveStarted) => { resolveCancellationStarted = resolveStarted; });
   const runSignal = deadline
@@ -1816,9 +1970,20 @@ export async function launchOat(
           break;
         }
       }
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
-        signal: AbortSignal.timeout(30_000),
-      });
+      let response: Response;
+      try {
+        response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (error) {
+        if (mode === 'local' && error instanceof DOMException && error.name === 'TimeoutError'
+            && !cancellationRequested && !deadline?.isExpired() && ++consecutivePollTimeouts <= 3) {
+          console.error(`[oat] Run status poll timed out; retrying owned run ${ownedRunId} (${consecutivePollTimeouts}/3)`);
+          continue;
+        }
+        throw error;
+      }
+      consecutivePollTimeouts = 0;
       const next = await readStatus(response, 'poll OAT run', ownedRunId);
       if ((deadline || submission) && next.config_sha256 !== binding.submitted_config_sha256) {
         bindingFailure = new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`);
@@ -1901,11 +2066,33 @@ export async function main(
   collect: typeof collectDataFlow = collectDataFlow,
   onOwnedRun?: OatOwnedRunObserver,
   signal?: AbortSignal,
+  recordLocalFailure: typeof recordLocalFailedDisposition = recordLocalFailedDisposition,
+  reconcileLocalFailure: typeof reconcileAndQuarantineLocalFailedReceipt = reconcileAndQuarantineLocalFailedReceipt,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
     console.log(cliUsage);
+    return;
+  }
+  if (args[0] === '--reconcile-failed-local') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--reconcile-failed-local requires exactly an invocation ID and the preserved ownership marker');
+    }
+    if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
+    const record = await reconcileLocalFailure(receiptRoot, args[1], resolve(args[2]));
+    console.log(`Reconciled ${String(record.invocation_id)} as ${String(record.disposition)}.`);
+    return;
+  }
+  if (args[0] === '--recover-failed-local') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--recover-failed-local requires exactly an invocation ID and the preserved ownership marker');
+    }
+    if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
+    const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(receiptRoot, `${args[1]}.json`))).toString('utf8'));
+    if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
+    await recordLocalFailure(receiptRoot, args[1], resolve(args[2]));
+    console.log('Recorded verified local cleanup; the original failure remains unranked.');
     return;
   }
   if (args[0] === '--recover-failed-aks') {
@@ -1944,6 +2131,11 @@ export async function main(
   const viewerOnly = args.includes('--viewer-only');
   const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  const prelaunchOnly = args.includes('--diagnostic-prelaunch-only');
+  const diagnosticParity = process.env.OAT_DARWIN_PARITY_PRECHECK === '1';
+  if (prelaunchOnly && (!diagnosticParity || requestedMode === 'aks' || viewerOnly || preflightOnly || cleanupRunId !== undefined)) {
+    throw new OatCliError('Diagnostic prelaunch requires local diagnostic parity and cannot be combined with viewer, preflight, or cleanup options');
+  }
   if (deadlineSeconds !== undefined && (requestedMode === 'aks' || viewerOnly || !noViewer)) {
     throw new OatCliError('--deadline-seconds requires a local benchmark run with --no-viewer');
   }
@@ -2013,7 +2205,22 @@ export async function main(
     }
     config.subscriptionId = subscriptionId;
   }
-  await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const transitionRoot = await diagnosticTransitionReceiptRoot();
+  if (transitionRoot) receiptRoot = transitionRoot;
+  if (diagnosticParity && mode === 'local' && !transitionRoot) {
+    const names = await readdir(receiptRoot).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+      throw error;
+    });
+    if (names.length !== 0) throw new Error('Fresh diagnostic requires an empty launcher receipt ledger');
+  } else {
+    await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
+      transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !transitionRoot);
+  }
+  if (prelaunchOnly) {
+    console.log('Diagnostic ledger prelaunch gate passed; no workload started.');
+    return;
+  }
   const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
     if (deadline.isExpired()) {
@@ -2202,6 +2409,7 @@ export async function main(
         async () => {
           if (deadline && deadline.cleanupState !== 'confirmed') {
             console.error(`[oat] Preserving OAT server for unresolved run receipt ${deadline.receiptPath}`);
+            server.child.unref();
             return;
           }
           await stopLocalServer(server.child);

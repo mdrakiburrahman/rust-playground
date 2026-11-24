@@ -10,6 +10,21 @@ const rows = [
   { cohort: 'C1', candidate: 'zstd', factorX: 'codec', valueX: 'zstd', factorY: 'level', valueY: '3', repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 90 },
 ];
 
+test('validates local collector CPU quotas in official campaign configuration', () => {
+  const official = (quota: unknown) => ({
+    status: { id: 'run', state: 'failed', progress: 'failed', result_count: 0, error: null },
+    rows: [], expectedSha: 'source', mode: 'local',
+    config: { platform: { local: { collector_cpu_quota: quota } } },
+  });
+  const input = (quota: unknown) => [{ ...rows[0], officialRuns: [official(quota)] }];
+  for (const quota of [undefined, null, 0.01, 0.010000001, 4096, 'unlimited']) {
+    assert.doesNotThrow(() => validateCampaignMeasurements(input(quota)));
+  }
+  for (const quota of [0, 0.009, -1, 4096.000000001, 0.0100000001, NaN, Infinity, '1', 'max', {}, true]) {
+    assert.throws(() => validateCampaignMeasurements(input(quota)), /platform\.local\.collector_cpu_quota/);
+  }
+});
+
 test('keeps observations exploratory until official sustainable evidence is complete', () => {
   const svg = renderCampaignResults(rows, 'C1');
   assert.match(svg, /<svg[^>]+role="img"/);
@@ -17,7 +32,7 @@ test('keeps observations exploratory until official sustainable evidence is comp
   assert.match(svg, /Sustainable leaderboard \| official evidence only/);
   assert.match(svg, /No qualified winner: complete official evidence is missing or invalid/);
   assert.match(svg, /Exploratory \/ failed observations \(not ranked\)/);
-  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 110 rows\/s/);
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; no committed-rate observation \(varied factor coverage unknown/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
 
@@ -33,7 +48,7 @@ test('preserves Delta rate after Kustainer death and nulls only unavailable down
   assert.equal(validated!.qapUnhealthyCatalogs, null);
   assert.equal(validated!.collectorOnly, true);
   const svg = renderCampaignResults([...rows, result], 'C1');
-  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: 50\).*emulator exited/);
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited/);
   assert.throws(() => validateCampaignMeasurements([{ ...result, qapCompletionPercent: 100 }]), /unavailable downstream metrics to be null/);
   assert.throws(() => validateCampaignMeasurements([{ ...result, comment: null }]), /dead Kustainer requires a concrete comment/);
 });
@@ -119,6 +134,13 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
   };
   const evidence = {
     version: 1,
+    inert_fields: [],
+    projection_only: [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ],
+    runner_controls: [],
+    consumer_verified: [],
     overload_guard: {
       status: 'complete', run_id: cell, run_start_ms: start - 30_000, measurement_end_ms: end,
       requested_container_memory_limit_bytes: null,
@@ -662,7 +684,7 @@ test('preserves retries without failures but refuses missing records or growing 
     factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
     officialRuns: [{ ...run, rows: [{ ...run.rows[0]!, evidence_json: JSON.stringify(evidence) }] }],
   });
-  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
   for (const classification of ['classified_retries_only', 'nonzero_health_exit', 'unhealthy', 'no_operation_failures']) {
     evidence.shutdown_drain.maintenance[0].exit_code = 1;
     evidence.shutdown_drain.maintenance[0].exit_classification = classification;
@@ -680,7 +702,7 @@ test('preserves retries without failures but refuses missing records or growing 
   assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /unavailable or invalid/);
 });
 
-test('requires live guard coverage and confirmed caps and renders actual overload stops above the ceiling', () => {
+test('requires live guard coverage and confirmed caps and nulls actual overload stops', () => {
   const run = sourceShapedRun(92, [1, 1, 1, 1, 1], 1_000_000);
   attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
   const original = JSON.parse(String(run.rows[0]!.evidence_json));
@@ -692,7 +714,7 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
     officialRuns: [run],
   });
   run.rows[0]!.evidence_json = JSON.stringify(original);
-  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
   for (const change of [
     (evidence: typeof original) => { evidence.overload_guard = null; },
     (evidence: typeof original) => { evidence.overload_guard.status = 'unavailable'; },
@@ -702,6 +724,63 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
     (evidence: typeof original) => { evidence.overload_guard.coverage_start_ms = 1_000_001; },
   ]) {
     const changed = structuredClone(original);
+    change(changed);
+    run.rows[0]!.evidence_json = JSON.stringify(changed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  Object.assign(run.config, { overload_guard: { container_memory_metric: 'working_set' },
+    platform: { local: { collector_memory_limit_bytes: 8388608 } } });
+  const working = structuredClone(original);
+  working.overload_guard.settings.container_memory_metric = 'working_set';
+  working.overload_guard.container_memory_metric = 'working_set';
+  working.overload_guard.requested_container_memory_limit_bytes = 8388608;
+  working.overload_guard.last_caps[0].metric = 'container_working_set_bytes';
+  working.overload_guard.last_caps[0].cap = 8388608;
+  run.rows[0]!.evidence_json = JSON.stringify(working);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
+  for (const change of [
+    (evidence: typeof working) => { evidence.overload_guard.settings.container_memory_metric = 'usage'; },
+    (evidence: typeof working) => { evidence.overload_guard.settings.container_memory_metric = null; },
+    (evidence: typeof working) => { evidence.overload_guard.container_memory_metric = 'usage'; },
+    (evidence: typeof working) => { evidence.overload_guard.last_caps[0].metric = 'container_memory_bytes'; },
+    (evidence: typeof working) => { evidence.overload_guard.last_caps[0].cap = 1000; },
+  ]) {
+    const changed = structuredClone(working); change(changed);
+    run.rows[0]!.evidence_json = JSON.stringify(changed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  for (const invalid of ['working-set', 'rss', null]) {
+    Object.assign(run.config, { overload_guard: { container_memory_metric: invalid } });
+    run.rows[0]!.evidence_json = JSON.stringify(working);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  Object.assign(run.config, { overload_guard: { container_memory_metric: 'working_set' } });
+  const stoppedWorking = structuredClone(working);
+  stoppedWorking.overload_stop = { reason: 'hard_cap_fraction', metric: 'container_working_set_bytes',
+    observed_value: 900, cap: 1000, fraction: 0.9, window_index: 1, timestamp_ms: 1_060_000 };
+  run.rows[0]!.status = 'failed';
+  run.rows[0]!.evidence_json = JSON.stringify(stoppedWorking);
+  assert.match(renderCampaignResults([result()], 'C1'), /above_ceiling: overload_stop hard_cap_fraction/);
+  stoppedWorking.overload_stop.metric = 'container_memory_bytes';
+  run.rows[0]!.evidence_json = JSON.stringify(stoppedWorking);
+  assert.match(renderCampaignResults([result()], 'C1'), /overload_stop evidence is invalid/);
+  run.rows[0]!.status = 'succeeded';
+  Reflect.deleteProperty(run.config, 'platform');
+  Object.assign(run.config, { overload_guard: { memory_signal: 'cgroup_memory' } });
+  Object.assign(run.config.tunables, { collector: { pressure: { rss_limit_bytes: 1000 } } });
+  const cgroup = structuredClone(original);
+  cgroup.overload_guard.settings.memory_signal = 'cgroup_memory';
+  cgroup.overload_guard.last_caps[1].metric = 'collector_cgroup_memory_bytes';
+  run.rows[0]!.evidence_json = JSON.stringify(cgroup);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
+  for (const change of [
+    (evidence: typeof cgroup) => { evidence.overload_guard.settings.memory_signal = 'process_rss'; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].metric = 'collector_rss_bytes'; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].observed_value = 0; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].cap = 2000; },
+    (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].confirmed = false; },
+  ]) {
+    const changed = structuredClone(cgroup);
     change(changed);
     run.rows[0]!.evidence_json = JSON.stringify(changed);
     assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
@@ -782,7 +861,7 @@ test('reads one sustained run of contiguous emitter buckets but keeps missing de
     officialRuns: [sourceShapedRun(1, [1, 1, 1, 1, 1], 1_000_000)],
   };
   const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; no committed-rate observation/);
   assert.match(svg, /complete five-operation maintenance due-work evidence is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
@@ -796,7 +875,8 @@ test('does not combine separate cold runs or accept gapped buckets as a sustaine
   const coldRuns = Array.from({ length: 5 }, (_, index) => sourceShapedRun(index + 1, [1], 1_000_000 + index * 60_000));
   const coldSvg = renderCampaignResults([{ ...common, officialRuns: coldRuns }], 'C1');
   assert.match(coldSvg, /each repeat must contain exactly one official sustained run/);
-  const gapSvg = renderCampaignResults([{ ...common, officialRuns: [sourceShapedRun(10, [1, 1, 1, 1, 1], 1_000_000, 2)] }], 'C1');
+  const gapRun = sourceShapedRun(10, [1, 1, 1, 1, 1], 1_000_000, 2);
+  const gapSvg = renderCampaignResults([{ ...common, committedRowsPerSecond: gapRun.rows[0]!.rows_per_second, officialRuns: [gapRun] }], 'C1');
   assert.match(gapSvg, /official commit buckets must be positive, complete, contiguous 30-second windows/);
 });
 
@@ -862,4 +942,1011 @@ test('sorts qualified leaderboard metrics by descending mean then candidate name
     { candidate: 'beta', mean: 140 },
   ];
   assert.deepEqual(sortCampaignLeaderboard(items).map(item => item.candidate), ['beta', 'zeta', 'alpha', 'tie-z']);
+});
+
+function coveredCandidate(candidate: string, rate: number, sequence: number) {
+  return Array.from({ length: 3 }, (_, index) => {
+    const run = sourceShapedRun(sequence + index, [rate, rate, rate, rate, rate], 1_000_000);
+    attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+    const evidence = JSON.parse(run.rows[0]!.evidence_json);
+    evidence.backlog = syntheticBacklog();
+    run.rows[0]!.evidence_json = JSON.stringify(evidence);
+    run.config.tunables.parquet_writer.defaults.compression = candidate;
+    return {
+      cohort: 'C1', candidate, factorX: 'codec', valueX: candidate, factorY: 'level', valueY: '3',
+      repeat: index + 1, expectedRepeats: 3, committedRowsPerSecond: rate,
+      factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'parquet_writer.defaults.compression_level'],
+      officialRuns: [run],
+    };
+  });
+}
+
+function mutateFactorEvidence(
+  result: ReturnType<typeof coveredCandidate>[number],
+  mutate: (evidence: Record<string, unknown>) => void,
+): void {
+  const row = result.officialRuns[0]!.rows[0]!;
+  const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+  mutate(evidence);
+  row.evidence_json = JSON.stringify(evidence);
+}
+
+test('plots covered runner-control factors but does not rank without resolution', () => {
+  const candidate = coveredCandidate('runner', 100, 220).map(row => ({
+    ...row, factorConfigPaths: ['maintenance.enabled', 'maintenance.apply'],
+  }));
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.runner_controls = [
+        { path: 'maintenance.enabled', reason: 'maintenance_runner_control' },
+        { path: 'maintenance.apply', reason: 'maintenance_runner_control' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
+});
+
+test('nulls a duration-based run when the varied factor is a one-shot row limit', () => {
+  const candidate = coveredCandidate('one-shot-limit', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.client.max_rows', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: { max_rows: 129 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'client.max_rows', reason: 'duration_based_run' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: client\.max_rows: duration_based_run/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
+test('excludes collector shutdown settings from measurement heatmaps', () => {
+  const candidate = coveredCandidate('shutdown', 800, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.collector.shutdown_drain_timeout_seconds', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { collector: { shutdown_drain_timeout_seconds: 17 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'collector.shutdown_drain_timeout_seconds', reason: 'collector_shutdown_after_measurement' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: collector\.shutdown_drain_timeout_seconds: collector_shutdown_after_measurement/);
+  assert.doesNotMatch(svg, /observed mean 800 rows\/s|>800\*?<\/text>/);
+});
+
+test('nulls connection backoff when connection retries are disabled', () => {
+  const candidate = coveredCandidate('backoff', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.transport.retry_backoff_ms', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { transport: { retry_backoff_ms: 37 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'transport.retry_backoff_ms', reason: 'connection_retries_disabled' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: transport\.retry_backoff_ms: connection_retries_disabled/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
+test('nulls stream backoff when stream retries are disabled', () => {
+  const candidate = coveredCandidate('stream-backoff', 100, 235).map(row => ({
+    ...row, factorConfigPaths: ['tunables.client.stream_retry_base_backoff_ms', 'parquet_writer.defaults.compression'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: { stream_retry_base_backoff_ms: 13 } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{ path: 'client.stream_retry_base_backoff_ms', reason: 'stream_retries_disabled' }];
+      evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /inert: client\.stream_retry_base_backoff_ms: stream_retries_disabled/);
+  assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+});
+
+test('nulls HTTP/2 factors that are overridden or disabled', () => {
+  for (const [field, reason] of [
+    ['stream_window_bytes', 'adaptive_http2_window'],
+    ['keepalive_timeout_ms', 'http2_keepalive_disabled'],
+    ['tcp_keepalive_retries', 'tcp_keepalive_disabled'],
+    ['rate_limit_period_ms', 'rate_limit_disabled'],
+  ] as const) {
+    const candidate = coveredCandidate('http2', 100, 235).map(row => ({
+      ...row, factorConfigPaths: [`tunables.transport.${field}`, 'parquet_writer.defaults.compression'],
+    }));
+    for (const row of candidate) {
+      Object.assign(row.officialRuns[0]!.config.tunables, { transport: { [field]: 2000 } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `transport.${field}`, reason }];
+        evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+      });
+    }
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.ok(svg.includes(`inert: transport.${field}: ${reason}`));
+    assert.doesNotMatch(svg, /observed mean 100 rows\/s|>100\*?<\/text>/);
+  }
+});
+
+test('nulls a per-column dictionary page limit when dictionary is explicitly disabled on that column', () => {
+  const candidate = coveredCandidate('dictionary-off', 100, 240).map(row => ({
+    ...row,
+    factorX: 'dictionary_page_size_limit',
+    valueX: '4096',
+    factorY: 'codec',
+    valueY: 'dictionary-off',
+    factorConfigPaths: [
+      'tunables.parquet_writer.per_column.payload.dictionary_page_size_limit',
+      'parquet_writer.defaults.compression',
+    ],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables.parquet_writer, {
+      per_column: {
+        payload: { dictionary_enabled: false, dictionary_page_size_limit: 4096 },
+        other: { dictionary_enabled: true, dictionary_page_size_limit: 4096 },
+      },
+    });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{
+        path: 'parquet_writer.per_column.payload.dictionary_page_size_limit',
+        reason: 'dictionary_disabled',
+      }];
+      evidence.projection_only = [{
+        path: 'parquet_writer.defaults.compression',
+        reason: 'consumer_startup_proof_unverified',
+      }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /dictionary-off: unqualified.*no committed-rate observation \(inert: parquet_writer\.per_column\.payload\.dictionary_page_size_limit: dictionary_disabled/);
+  assert.doesNotMatch(svg, /dictionary-off \(3\/3\)|observed mean 100 rows\/s|>100\*?<\/text>/);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [{
+        path: 'parquet_writer.per_column.other.dictionary_page_size_limit',
+        reason: 'dictionary_disabled',
+      }];
+    });
+  }
+  const unrelatedSvg = renderCampaignResults(candidate, 'C1');
+  assert.match(unrelatedSvg, /varied factor coverage unknown/);
+  assert.doesNotMatch(unrelatedSvg, /dictionary-off: unqualified.*\(inert:/);
+});
+
+function generatorCandidate(candidate: string, rate: number, sequence: number, firstFactor = 'string_width') {
+  const results = coveredCandidate(candidate, rate, sequence).map(row => ({
+    ...row, factorConfigPaths: [`tunables.client.${firstFactor}`, 'client.guid_uniqueness'],
+  }));
+  for (const row of results) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { client: {
+      string_width: 64, guid_uniqueness: 'per_row', null_fraction: 0.1, pod_ordinal: 1,
+      value_variation: 'per_row', string_length_distribution: 'uniform', skew: 0,
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [];
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: `client.${firstFactor}`, reason: 'consumer_startup_and_prepared_corpus' },
+        { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+      ];
+    });
+  }
+  return results;
+}
+
+test('plots prepared-corpus factors with unrelated Rust generator classifications', () => {
+  const cases = [
+    ['null_fraction', 'no_nullable_generated_columns', {}],
+    ['pod_ordinal', 'no_eligible_generated_rows', {}],
+    ['value_variation', 'all_values_skewed', { skew: 1 }],
+    ['string_length_distribution', 'one_byte_maximum_width', { string_width: 1 }],
+  ] as const;
+  for (const [index, [field, reason, config]] of cases.entries()) {
+    const candidate = generatorCandidate('generator-active', 800, 360 + index * 3);
+    for (const row of candidate) {
+      const tunables = row.officialRuns[0]!.config.tunables;
+      Object.assign(tunables, { client: {
+        string_width: 64, guid_uniqueness: 'per_row', null_fraction: 0.1, pod_ordinal: 1,
+        value_variation: 'per_row', string_length_distribution: 'uniform', skew: 0, ...config,
+      } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `client.${field}`, reason }];
+        evidence.projection_only = [{ path: 'client.entropy', reason: 'consumer_startup_proof_unverified' }];
+      });
+    }
+    assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
+  }
+});
+
+test('never ranks generator factors classified inert by the Rust corpus evidence', () => {
+  const cases = [
+    ['null_fraction', 'no_nullable_generated_columns'],
+    ['pod_ordinal', 'no_eligible_generated_rows'],
+    ['value_variation', 'all_values_skewed'],
+    ['string_length_distribution', 'one_byte_maximum_width'],
+  ] as const;
+  for (const [index, [field, reason]] of cases.entries()) {
+    const candidate = generatorCandidate('generator-inert', 800, 370 + index * 3, field);
+    for (const row of candidate) {
+      if (field === 'value_variation' || field === 'string_length_distribution') {
+        Object.assign(row.officialRuns[0]!.config.tunables, { client: {
+          string_width: field === 'string_length_distribution' ? 1 : 64,
+          guid_uniqueness: 'per_row', null_fraction: 0.1, pod_ordinal: 1,
+          value_variation: 'per_row', string_length_distribution: 'uniform', skew: field === 'value_variation' ? 1 : 0,
+        } });
+      }
+      mutateFactorEvidence(row, evidence => {
+        evidence.inert_fields = [{ path: `client.${field}`, reason }];
+        evidence.consumer_verified = [
+          { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        ];
+      });
+    }
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.ok(svg.includes(`inert: client.${field}: ${reason}`));
+    assert.doesNotMatch(svg, /generator-inert \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
+test('fails closed on missing, mixed, unrecognized or malformed generator evidence', () => {
+  const mutations: Array<(evidence: Record<string, unknown>) => void> = [
+    evidence => { evidence.consumer_verified = [{ path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' }]; },
+    evidence => {
+      evidence.consumer_verified = [{ path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' }];
+      evidence.projection_only = [{ path: 'client.string_width', reason: 'consumer_startup_proof_unverified' }];
+    },
+    evidence => { evidence.inert_fields = [{ path: 'client.null_fraction', reason: 'unrecognized' }]; },
+    evidence => { evidence.consumer_verified = [
+      { path: 'client.string_width', reason: 17 },
+      { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+    ]; },
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const candidate = generatorCandidate('generator-uncertain', 800, 390 + index * 3);
+    mutateFactorEvidence(candidate[1]!, mutate);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown|consumption unproven; applicability unknown/);
+    assert.doesNotMatch(svg, /generator-uncertain \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
+test('accepts committed table metadata proof for a stats factor and unrelated factors', () => {
+  for (const factor of ['collector.commit.delta_stats_columns', 'client.string_width']) {
+    const candidate = generatorCandidate('metadata-active', 800, 410).map(row => ({
+      ...row, factorConfigPaths: [`tunables.${factor}`, 'client.guid_uniqueness'],
+    }));
+    for (const row of candidate) {
+      Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+        commit: { delta_stats_columns: ['server_name', 'database_name'] },
+      } });
+      mutateFactorEvidence(row, evidence => {
+        evidence.consumer_verified = [
+          { path: 'collector.commit.delta_stats_columns', reason: 'committed_table_metadata_readback' },
+          { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+          { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        ];
+      });
+    }
+    assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
+    mutateFactorEvidence(candidate[1]!, evidence => {
+      evidence.consumer_verified = [
+        { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+        { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        { path: 'collector.commit.delta_stats_columns', reason: 'not_a_valid_metadata_reason' },
+      ];
+    });
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /metadata-active \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
+test('accepts G2a readback only for its producer paths, including unrelated factors', () => {
+  const cases = [
+    ['collector.thp_disabled', 'consumer_linux_thp_flag_readback'],
+    ['collector.socket.recv_buffer_bytes', 'consumer_linux_listener_buffer_readback'],
+    ['collector.socket.send_buffer_bytes', 'consumer_linux_listener_buffer_readback'],
+    ['collector.socket.tcp_nodelay', 'consumer_accepted_socket_readback'],
+    ['collector.runtime.cpu_thread_stack_size', 'consumer_cpu_pool_readback'],
+  ] as const;
+  for (const [index, [path, reason]] of cases.entries()) {
+    for (const varied of [true, false]) {
+      const candidate = generatorCandidate('socket-proof', 800, 450 + index * 6 + Number(varied) * 3).map(row => {
+        Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+          thp_disabled: true,
+          socket: { recv_buffer_bytes: 32768, send_buffer_bytes: 32768, tcp_nodelay: true },
+          runtime: { cpu_thread_stack_size: 2097152 },
+        } });
+        return { ...row, factorConfigPaths: [varied ? `tunables.${path}` : 'client.string_width', 'client.guid_uniqueness'] };
+      });
+      for (const row of candidate) {
+        mutateFactorEvidence(row, evidence => {
+          evidence.consumer_verified = [
+            { path, reason },
+            { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+            { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+          ];
+        });
+      }
+      assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
+      const wrongPath = path === 'collector.thp_disabled' ? 'collector.socket.tcp_nodelay' : 'collector.thp_disabled';
+      for (const row of candidate) {
+        if (varied) row.factorConfigPaths = [wrongPath, 'client.guid_uniqueness'];
+        mutateFactorEvidence(row, evidence => {
+          evidence.consumer_verified = [
+            { path: wrongPath, reason },
+            { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
+            { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+          ];
+        });
+      }
+      const svg = renderCampaignResults(candidate, 'C1');
+      assert.match(svg, /varied factor coverage unknown/);
+      assert.doesNotMatch(svg, /socket-proof \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+    }
+  }
+});
+
+test('rejects recognized proof reasons on paths their producers cannot emit', () => {
+  const cases = [
+    ['consumer_verified', 'client.string_width', 'committed_table_metadata_readback'],
+    ['consumer_verified', 'collector.commit.delta_stats_columns', 'consumer_startup_and_prepared_corpus'],
+    ['inert_fields', 'client.entropy', 'no_nullable_generated_columns'],
+    ['inert_fields', 'client.cardinality', 'no_eligible_generated_rows'],
+    ['inert_fields', 'client.seed', 'all_values_skewed'],
+    ['inert_fields', 'client.value_variation', 'one_byte_maximum_width'],
+  ] as const;
+  for (const [index, [classification, path, reason]] of cases.entries()) {
+    const candidate = generatorCandidate('wrong-proof-path', 800, 420 + index * 3).map(row => {
+      if (path === 'collector.commit.delta_stats_columns') {
+        Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+          commit: { delta_stats_columns: ['server_name'] },
+        } });
+        return { ...row, factorConfigPaths: ['collector.commit.delta_stats_columns', 'client.guid_uniqueness'] };
+      }
+      return row;
+    });
+    mutateFactorEvidence(candidate[1]!, evidence => {
+      if (classification === 'consumer_verified' && path === 'client.string_width') {
+        evidence.consumer_verified = [
+          { path, reason },
+          { path: 'client.guid_uniqueness', reason: 'consumer_startup_and_prepared_corpus' },
+        ];
+      } else {
+        evidence[classification] = [
+          ...(evidence[classification] as Array<Record<string, unknown>>),
+          { path, reason },
+        ];
+      }
+    });
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /wrong-proof-path \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+  }
+});
+
+test('fails closed on duplicate or unknown classifications even with otherwise complete coverage', () => {
+  for (const scenario of ['unknown', 'duplicate', 'verified'] as const) {
+    const candidate = coveredCandidate('runner', 100, 230);
+    for (const row of candidate) {
+      mutateFactorEvidence(row, evidence => {
+        evidence.projection_only = [];
+        evidence.consumer_verified = [
+          { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+          { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+        ];
+      });
+    }
+    mutateFactorEvidence(candidate[1]!, evidence => {
+      if (scenario === 'unknown') {
+        evidence.consumer_verified = [
+          { path: 'parquet_writer.defaults.compression', reason: 'new_runner_reason' },
+          { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+        ];
+      } else if (scenario === 'duplicate') {
+        evidence.projection_only = [
+          { path: 'tunables.parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+        ];
+      } else {
+        evidence.consumer_verified = [
+          { path: 'tunables.parquet_writer.defaults.compression', reason: 'unrecognized' },
+        ];
+      }
+    });
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /runner \(3\/3\)|observed mean 100 rows\/s|>100<\/text>/);
+  }
+});
+
+test('excludes an entire cell when any repeat has an inert factor, including unprefixed evidence paths', () => {
+  const active = coveredCandidate('active', 100, 100);
+  const inert = coveredCandidate('inert', 900, 110);
+  mutateFactorEvidence(inert[1]!, evidence => {
+    evidence.inert_fields = [{ path: 'parquet_writer.defaults.compression_level', reason: 'maintenance_disabled' }];
+    evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+  });
+  const svg = renderCampaignResults([...active, ...inert], 'C1');
+  assert.match(svg, /No qualified winner/);
+  assert.doesNotMatch(svg, /inert \(3\/3\)/);
+  assert.match(svg, /inert: unqualified.*no committed-rate observation \(inert: parquet_writer\.defaults\.compression_level: maintenance_disabled/);
+  assert.doesNotMatch(svg, />900(?:\.00)?</);
+});
+
+test('nulls projection-only observations pending independent applicability proof and matches prefixed evidence paths', () => {
+  const projected = coveredCandidate('projected', 800, 120);
+  mutateFactorEvidence(projected[0]!, evidence => {
+    evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+      { path: 'tunables.parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const svg = renderCampaignResults([...coveredCandidate('active', 100, 130), ...projected], 'C1');
+  assert.match(svg, /No qualified winner/);
+  assert.doesNotMatch(svg, /projected \(3\/3\)/);
+  assert.match(svg, />null<\/text>/);
+  assert.doesNotMatch(svg, />800\*?<\/text>|observed mean 800 rows\/s/);
+  assert.match(svg, /projected: unqualified.*no committed-rate observation \(consumption unproven; applicability unknown: .*tunables\.parquet_writer\.defaults\.compression_level: consumer_startup_proof_unverified/);
+});
+
+test('a projection-only repeat nulls its whole cell and preserves a dead Kustainer comment', () => {
+  const candidate = coveredCandidate('projected-death', 800, 250);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+      ];
+    });
+  }
+  mutateFactorEvidence(candidate[1]!, evidence => {
+    evidence.consumer_verified = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+    ];
+    evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const results = candidate.map(row => row.repeat === 2 ?
+    { ...row, diedFirst: 'Kustainer', comment: 'emulator exited before downstream observation' } : row);
+  const svg = renderCampaignResults(results, 'C1');
+  assert.match(svg, /consumption unproven; applicability unknown/);
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: null\).*emulator exited before downstream observation/);
+  assert.doesNotMatch(svg, /projected-death \(3\/3\)|observed mean 800 rows\/s|>800\*?<\/text>/);
+});
+
+test('accepts table-writer readback for active Parquet limits', () => {
+  const candidate = coveredCandidate('writer-limits', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.parquet_writer.max_row_group_rows', 'tunables.parquet_writer.data_page_row_count_limit'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { parquet_writer: {
+      max_row_group_rows: 16384, data_page_row_count_limit: 2048,
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.max_row_group_rows', reason: 'consumer_table_writer_readback' },
+        { path: 'parquet_writer.data_page_row_count_limit', reason: 'consumer_table_writer_readback' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), />800\*?<\/text>/);
+});
+
+test('accepts table-adaptive readback for an active sizing factor', () => {
+  const candidate = coveredCandidate('adaptive-sizing', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.collector.batching.adaptive_file.target_parquet_bytes',
+      'tunables.collector.batching.adaptive_file.min_input_bytes'],
+  }));
+  for (const row of candidate) {
+    Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
+      batching: { adaptive_file: { target_parquet_bytes: 134217728, min_input_bytes: 16777216 } },
+    } });
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'collector.batching.adaptive_file.target_parquet_bytes', reason: 'consumer_table_adaptive_readback' },
+        { path: 'collector.batching.adaptive_file.min_input_bytes', reason: 'consumer_table_adaptive_readback' },
+      ];
+    });
+  }
+  assert.match(renderCampaignResults(candidate, 'C1'), />800\*?<\/text>/);
+});
+
+test('an active cell retains its committed rate after Kustainer death', () => {
+  const candidate = coveredCandidate('active-death', 800, 260);
+  for (const row of candidate) {
+    mutateFactorEvidence(row, evidence => {
+      evidence.projection_only = [];
+      evidence.consumer_verified = [
+        { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+        { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+      ];
+      const reconciliation = evidence.reconciliation as Record<string, unknown>;
+      reconciliation.completed_rows = reconciliation.delta_rows;
+      reconciliation.minimum_delta_rows = reconciliation.delta_rows;
+      reconciliation.maximum_delta_rows = reconciliation.delta_rows;
+      reconciliation.ambiguous_rows = 0;
+      reconciliation.exact_match_required = true;
+      reconciliation.exact_match = true;
+    });
+  }
+  const results = candidate.map(row => row.repeat === 2 ?
+    { ...row, diedFirst: 'Kustainer', comment: 'emulator exited before downstream observation' } : row);
+  const [death] = validateCampaignMeasurements([results[1]!]);
+  assert.equal(death!.committedRowsPerSecond, 800);
+  assert.equal(death!.qapCompletionPercent, null);
+  assert.equal(death!.qapPendingArtifacts, null);
+  assert.equal(death!.qapUnhealthyCatalogs, null);
+  const svg = renderCampaignResults(results, 'C1');
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: 800\).*emulator exited before downstream observation/);
+  assert.match(svg, />800\*?<\/text>/);
+});
+
+function comparisonCandidate(afterRate = 100, rates = [110, 111, 109]) {
+  const makeRun = (sequence: number, rate: number, start: number) => {
+    const run = sourceShapedRun(sequence, [rate, rate, rate, rate, rate], start);
+    attachMaintenanceDueWork(run, start, start + 150_000);
+    const evidence = JSON.parse(run.rows[0]!.evidence_json);
+    const backlog = syntheticBacklog();
+    const offset = start - 1_000_000;
+    backlog.measurement_window.start_unix_ms += offset;
+    backlog.measurement_window.end_unix_ms += offset;
+    for (const sample of backlog.samples) {
+      sample.request_start_unix_ms += offset;
+      sample.request_end_unix_ms += offset;
+    }
+    evidence.backlog = backlog;
+    for (const window of evidence.durable_commits.complete_30_second_commit_windows) {
+      window.rate_resolution_rows_per_second = 0.5;
+    }
+    const observed = {
+      durable_rows_per_s: rate, bytes_per_row: 5, window_commit_count: rate * 10,
+      max_commit_rows: 15, rate_resolution_rows_per_second: 0.1, slope_rows_per_second: rate,
+    };
+    evidence.durable_commits.delta_log_reconciliation = { csv: observed };
+    evidence.screen_v1 = structuredClone(observed);
+    evidence.projection_only = [];
+    evidence.consumer_verified = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+    ];
+    run.rows[0]!.evidence_json = JSON.stringify(evidence);
+    return run;
+  };
+  return rates.map((rate, index) => {
+    const start = 1_000_000 + index * 500_000;
+    return {
+      cohort: 'C1', candidate: 'comparison', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+      repeat: index + 1, expectedRepeats: 3, committedRowsPerSecond: rate,
+      factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+      officialRuns: [makeRun(700 + index * 3, rate, start + 160_000)],
+      baselineBefore: makeRun(701 + index * 3, 100, start),
+      baselineAfter: makeRun(702 + index * 3, afterRate, start + 320_000),
+      pairOrder: index === 1 ? 'BA' : 'AB', evidenceState: 'physically-observed',
+    };
+  });
+}
+
+type MutableEvidence = Record<string, unknown> & {
+  reconciliation: Record<string, unknown>;
+  durable_commits: {
+    complete_30_second_commit_windows: Array<Record<string, unknown>>;
+    output_throughput: Record<string, unknown>;
+    delta_log_reconciliation: { csv: Record<string, unknown> };
+  };
+  screen_v1: Record<string, unknown>;
+  commit_window_output_throughput: Record<string, unknown>;
+};
+
+function updateRunEvidence(run: ReturnType<typeof sourceShapedRun>, mutate: (evidence: MutableEvidence) => void) {
+  const result = run.rows[0]!;
+  const evidence = JSON.parse(result.evidence_json);
+  mutate(evidence);
+  result.evidence_json = JSON.stringify(evidence);
+}
+
+test('rejects unsettled, failed and typed quarantined cells regardless of launcher success', () => {
+  for (const change of [
+    (row: ReturnType<typeof comparisonCandidate>[number]) => updateRunEvidence(row.officialRuns[0]!, evidence => {
+      evidence.pre_teardown_reconciliation = { exact_match_required: true, exact_match: false, reason: 'delta_commit_drain_timeout' };
+    }),
+    (row: ReturnType<typeof comparisonCandidate>[number]) => updateRunEvidence(row.officialRuns[0]!, evidence => {
+      evidence.reconciliation.exact_match_required = true;
+      evidence.reconciliation.exact_match = false;
+      evidence.reconciliation.reason = 'delta_exact_match_failed';
+    }),
+    (row: ReturnType<typeof comparisonCandidate>[number]) => updateRunEvidence(row.officialRuns[0]!, evidence => {
+      evidence.teardown_failures = [{ kind: 'dataflow_drain_incomplete', triggers: ['retired_workers'], collector_instance_id: 'collector' }];
+    }),
+  ]) {
+    const candidate = comparisonCandidate();
+    change(candidate[0]!);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /delta_commit_drain_timeout|delta_exact_match_failed|dataflow_drain_incomplete/);
+    assert.doesNotMatch(svg, /comparison \(3\/3\)|>110<\/text>/);
+  }
+  for (const disposition of ['failed_incomplete_delivery_quarantined_not_settled', 'failed_teardown_drain_quarantined_not_settled']) {
+    const candidate = comparisonCandidate();
+    const svg = renderCampaignResults(candidate.map((row, index) => index ? row : { ...row, disposition, comment: 'infrastructure failure' }), 'C1');
+    assert.match(svg, /infrastructure failure/);
+    assert.doesNotMatch(svg, /comparison \(3\/3\)|performance failure/);
+  }
+  const candidate = comparisonCandidate();
+  candidate[0]!.officialRuns[0]!.status.state = 'failed' as 'succeeded';
+  assert.match(renderCampaignResults(candidate, 'C1'), /run state is failed/);
+  const failedResult = comparisonCandidate();
+  failedResult[0]!.officialRuns[0]!.rows[0]!.status = 'failed';
+  assert.match(renderCampaignResults(failedResult, 'C1'), /result status is failed/);
+  const failedOutcome = comparisonCandidate();
+  assert.match(renderCampaignResults(failedOutcome.map((row, index) => index ? row : { ...row, outcome: 'build-failed', comment: 'build failed' }), 'C1'), /build failed/);
+  assert.throws(() => validateCampaignMeasurements([{ ...failedOutcome[0], status: null }]), /result 0 status/);
+});
+
+test('preserves exactly reconciled ArrowCol observations when QAP is unavailable', () => {
+  for (const reason of ['local_qap_initialization_unavailable', 'local_qap_observation_unavailable']) {
+    const candidate = comparisonCandidate();
+    const run = candidate[0]!.officialRuns[0]!;
+    updateRunEvidence(run, evidence => {
+      Object.assign(evidence.reconciliation, {
+        completed_rows: evidence.reconciliation.delta_rows, minimum_delta_rows: evidence.reconciliation.delta_rows,
+        maximum_delta_rows: evidence.reconciliation.delta_rows, ambiguous_rows: 0,
+        exact_match_required: true, exact_match: true,
+      });
+      evidence.downstream_status = 'unavailable';
+      evidence.downstream_reason = reason;
+      evidence.downstream_comment = 'Kustainer unavailable';
+    });
+    const [validated] = validateCampaignMeasurements([{ ...candidate[0], qapCompletionPercent: 100 }]);
+    assert.equal(validated!.qapCompletionPercent, null);
+    assert.equal(validated!.collectorOnly, true);
+    assert.equal(validated!.officialRuns![0]!.rows[0]!.qap_observation_complete, 0);
+    assert.equal(validated!.officialRuns![0]!.rows[0]!.qap_cached_bytes, null);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /Kustainer unavailable/);
+    assert.match(svg, />110<\/text>/);
+  }
+});
+
+test('reads producer screen evidence and fails closed on unavailable and failed shapes', () => {
+  const screen = {
+    bytes_per_row: 5, commits_written: 3, committed_add_actions: 3, compression_ratio: 2,
+    durable_rows: 60, durable_rows_per_s: 0.5555555555555556,
+    ended_utc: '1970-01-01T00:01:49.000Z', files_written: 3, latency_p50_ms: 1010,
+    latency_p99_ms: 2010, max_commit_rows: 30,
+    rate_resolution_rows_per_second: 0.2777777777777778, slope_rows_per_second: 25,
+    started_utc: '1970-01-01T00:00:01.000Z', window_commit_count: 3,
+  };
+  const candidate = comparisonCandidate();
+  candidate[0]!.committedRowsPerSecond = screen.durable_rows_per_s;
+  updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.output_throughput.window_seconds = 108;
+    evidence.durable_commits.output_throughput.rows_per_second = screen.durable_rows_per_s;
+    evidence.durable_commits.delta_log_reconciliation = { csv: structuredClone(screen) };
+    evidence.screen_v1 = structuredClone(screen);
+  });
+  assert.match(renderCampaignResults(candidate, 'C1'), /resolution 0\.28 rows\/s, commits 3, max commit rows 30, slope 25 rows\/s/);
+
+  const unavailable = {
+    bytes_per_row: null, commits_written: null, committed_add_actions: null, compression_ratio: null,
+    durable_rows: null, durable_rows_per_s: null, ended_utc: null, files_written: null,
+    latency_p50_ms: null, latency_p99_ms: null, max_commit_rows: null,
+    rate_resolution_rows_per_second: null, slope_rows_per_second: null, started_utc: null,
+    window_commit_count: null,
+  };
+  const missing = comparisonCandidate();
+  updateRunEvidence(missing[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation = { csv: structuredClone(unavailable) };
+    evidence.screen_v1 = structuredClone(unavailable);
+  });
+  assert.match(renderCampaignResults(missing, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const zeroCommits = comparisonCandidate();
+  updateRunEvidence(zeroCommits[0]!.officialRuns[0]!, evidence => {
+    const empty = { ...unavailable, window_commit_count: 0 };
+    evidence.durable_commits.delta_log_reconciliation = { csv: structuredClone(empty) };
+    evidence.screen_v1 = structuredClone(empty);
+  });
+  assert.match(renderCampaignResults(zeroCommits, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const failed = comparisonCandidate();
+  updateRunEvidence(failed[0]!.officialRuns[0]!, evidence => {
+    Object.assign(evidence, { screen_v1: null, screen_v1_csv_reason: 'cell_failed' });
+  });
+  assert.match(renderCampaignResults(failed, 'C1'), /screen_v1: cell_failed/);
+});
+
+test('requires resolution and matching A/A for paired comparisons', () => {
+  const legacy = comparisonCandidate();
+  updateRunEvidence(legacy[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation = { csv: {} };
+    evidence.screen_v1 = {};
+  });
+  assert.match(renderCampaignResults(legacy, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const missingRankedResolution = comparisonCandidate();
+  updateRunEvidence(missingRankedResolution[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation.csv.rate_resolution_rows_per_second = null;
+    evidence.screen_v1.rate_resolution_rows_per_second = null;
+  });
+  assert.match(renderCampaignResults(missingRankedResolution, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const mismatchedCopies = comparisonCandidate();
+  updateRunEvidence(mismatchedCopies[0]!.officialRuns[0]!, evidence => {
+    evidence.screen_v1.durable_rows_per_s = 120;
+  });
+  assert.match(renderCampaignResults(mismatchedCopies, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const mismatchedRate = comparisonCandidate();
+  updateRunEvidence(mismatchedRate[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation.csv.durable_rows_per_s = 115;
+    evidence.screen_v1.durable_rows_per_s = 115;
+  });
+  assert.match(renderCampaignResults(mismatchedRate, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const candidate = comparisonCandidate();
+  assert.match(renderCampaignResults(candidate, 'C1'), /comparison \(3\/3\)/);
+  const nullSlope = comparisonCandidate();
+  updateRunEvidence(nullSlope[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation.csv.slope_rows_per_second = null;
+    evidence.screen_v1.slope_rows_per_second = null;
+  });
+  assert.match(renderCampaignResults(nullSlope, 'C1'), /comparison \(3\/3\)/);
+  updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
+    delete evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second;
+  });
+  assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
+  const badResolution = comparisonCandidate();
+  updateRunEvidence(badResolution[0]!.baselineBefore, evidence => {
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 152;
+      observed.rate_resolution_rows_per_second = 152 / 150;
+    }
+  });
+  assert.match(renderCampaignResults(badResolution, 'C1'), /invalid A\/A: commit-rate resolution exceeds 1%/);
+  const unresolved = comparisonCandidate();
+  updateRunEvidence(unresolved[0]!.officialRuns[0]!, evidence => {
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 1650;
+      observed.rate_resolution_rows_per_second = 11;
+    }
+  });
+  assert.match(renderCampaignResults(unresolved, 'C1'), /unresolved: difference is smaller than commit-rate resolution/);
+  const exactResolution = comparisonCandidate();
+  updateRunEvidence(exactResolution[0]!.officialRuns[0]!, evidence => {
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 1500;
+      observed.rate_resolution_rows_per_second = 10;
+    }
+  });
+  assert.match(renderCampaignResults(exactResolution, 'C1'), /comparison \(3\/3\)/);
+  const drift = renderCampaignResults(comparisonCandidate(106), 'C1');
+  assert.match(drift, /invalid A\/A: adjacent baselines differ by more than 5%/);
+  assert.match(drift, /normalized 1\.07/);
+  assert.doesNotMatch(drift, /comparison \(3\/3\)/);
+  assert.doesNotMatch(renderCampaignResults(comparisonCandidate(105), 'C1'), /invalid A\/A: adjacent baselines/);
+  const boundary = comparisonCandidate();
+  updateRunEvidence(boundary[0]!.baselineBefore, evidence => {
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 150;
+      observed.rate_resolution_rows_per_second = 1;
+    }
+  });
+  assert.match(renderCampaignResults(boundary, 'C1'), /comparison \(3\/3\)/);
+  const wrongOrder = comparisonCandidate().map(row => ({ ...row, pairOrder: 'AB' }));
+  assert.match(renderCampaignResults(wrongOrder, 'C1'), /AB\/BA\/AB pair order missing/);
+});
+
+test('requires effect, paired t and physical bytes-per-row thresholds', () => {
+  for (const rates of [[104, 104, 104], [106, 107, 130]]) {
+    const svg = renderCampaignResults(comparisonCandidate(100, rates), 'C1');
+    assert.match(svg, /paired winner thresholds not met/);
+    assert.doesNotMatch(svg, /comparison \(3\/3\)/);
+    assert.match(svg, /Welch t \(reference\)/);
+  }
+  const oversized = comparisonCandidate();
+  for (const row of oversized) {
+    updateRunEvidence(row.officialRuns[0]!, evidence => {
+      const output = evidence.durable_commits.output_throughput;
+      evidence.durable_commits.delta_log_reconciliation.csv.bytes_per_row = 6;
+      evidence.screen_v1.bytes_per_row = 6;
+      output.parquet_bytes = Number(output.rows) * 6;
+      output.bytes_per_row = 6;
+      output.parquet_bytes_per_second = Number(output.parquet_bytes) / Number(output.window_seconds);
+      output.compression_ratio = 10 / 6;
+      evidence.commit_window_output_throughput.parquet_bytes = output.parquet_bytes;
+      evidence.commit_window_output_throughput.bytes_per_row = 6;
+      evidence.commit_window_output_throughput.parquet_bytes_per_second = output.parquet_bytes_per_second;
+      evidence.commit_window_output_throughput.compression_ratio = output.compression_ratio;
+      for (const window of evidence.durable_commits.complete_30_second_commit_windows) {
+        window.parquet_bytes = Number(window.rows) * 6;
+        window.parquet_bytes_per_second = Number(window.parquet_bytes) / 30;
+        window.bytes_per_row = 6;
+        window.compression_ratio = 10 / 6;
+      }
+    });
+  }
+  assert.match(renderCampaignResults(oversized, 'C1'), /bytes\/row B\/A 1\.2/);
+  assert.doesNotMatch(renderCampaignResults(oversized, 'C1'), /comparison \(3\/3\)/);
+});
+
+test('reports separate CPU estimates and preserves null concurrency', () => {
+  const candidate = comparisonCandidate();
+  const run = candidate[0]!.officialRuns[0]!;
+  Object.assign(run.rows[0]!, { cpu_millicores: 2000, tunables_json: JSON.stringify({
+    orchestration_run_id: run.status.id, cpu_quota: { client: { concurrency_per_cpu_core: null } },
+  }) });
+  updateRunEvidence(run, evidence => {
+    evidence.client_phase_reports = [
+      { phase_counters: { measurement_window: { client_resources: { cpu_core_equivalents: 3 } } } },
+    ];
+  });
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /concurrency\/core null; CPU s\/M rows \(estimated\): collector 18,181\.82, DFE null, client 27,272\.73/);
+  assert.doesNotMatch(svg, /concurrency\/core 0/);
+});
+
+test('flags low-commit windows without treating absent legacy counts as zero', () => {
+  const candidate = comparisonCandidate();
+  updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
+    const windows = evidence.durable_commits.complete_30_second_commit_windows;
+    windows[0]!.window_commit_count = 16;
+    windows[1]!.window_commit_count = 99;
+    windows[2]!.window_commit_count = 100;
+    windows[3]!.window_commit_count = null;
+  });
+  updateRunEvidence(candidate[0]!.baselineBefore, evidence => {
+    evidence.durable_commits.complete_30_second_commit_windows[0]!.window_commit_count = 35;
+  });
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /low-commit windows \(&lt;100\): 1 \(16\), 2 \(99\)/);
+  assert.match(svg, /baseline before low-commit windows \(&lt;100\): 1 \(35\)/);
+  assert.doesNotMatch(svg, /3 \(100\)|4 \(0\)/);
+});
+
+test('plots a source-shaped receipt with G2a and G7 consumer readback reasons', () => {
+  const evidenceCases = [
+    { path: 'collector.thp_disabled', reason: 'consumer_linux_thp_flag_readback' },
+    { path: 'collector.socket.recv_buffer_bytes', reason: 'consumer_linux_listener_buffer_readback' },
+    { path: 'collector.socket.tcp_nodelay', reason: 'consumer_accepted_socket_readback' },
+    { path: 'collector.runtime.cpu_thread_stack_size', reason: 'consumer_cpu_pool_readback' },
+    { path: 'collector.runtime.event_interval', reason: 'consumer_startup_readback' },
+    { path: 'parquet_writer.max_row_group_rows', reason: 'consumer_table_writer_readback' },
+    { path: 'collector.batching.adaptive_file.target_parquet_bytes', reason: 'consumer_table_adaptive_readback' },
+  ];
+  const candidate = coveredCandidate('runtime-readbacks', 800, 260).map(row => ({
+    ...row, factorConfigPaths: ['tunables.collector.runtime.event_interval', 'tunables.parquet_writer.max_row_group_rows'],
+  }));
+  for (const row of candidate) {
+    const tunables = row.officialRuns[0]!.config.tunables;
+    Object.assign(tunables, { collector: {
+      thp_disabled: true,
+      socket: { recv_buffer_bytes: 32768, tcp_nodelay: true },
+      runtime: { cpu_thread_stack_size: 4194304, event_interval: 7 },
+      batching: { adaptive_file: { target_parquet_bytes: 134217728 } },
+    } });
+    Object.assign(tunables.parquet_writer, { max_row_group_rows: 1024 });
+    mutateFactorEvidence(row, evidence => {
+      evidence.inert_fields = [];
+      evidence.projection_only = [];
+      evidence.runner_controls = [];
+      evidence.consumer_verified = evidenceCases;
+      const process = (evidence.processes as Array<Record<string, unknown>>)[0]!;
+      process.effective_config = {
+        process: { scope: 'linux_thp_disable_flag' },
+        socket: { recv_buffer_bytes: 32768, tcp_nodelay: true },
+        socket_buffer_effective: { recv_buffer_bytes: 65536, scope: 'linux_flight_listener' },
+        socket_effective: { tcp_nodelay: true, scope: 'accepted_flight_socket' },
+        runtime: { cpu_thread_stack_size: 4194304, event_interval: 7 },
+        cpu_pool: { thread_stack_size: 4194304, scope: 'lazy_pool_initialization' },
+        commit_telemetry: { schema_version: 1, scope: 'new_ingestion_addfiles_after_sync', clock: 'system_unix_ms' },
+      };
+      process.layout_table_policies = [{
+        table_name: 'telemetry.sqlserver.sqlserver_availability_replica_states',
+        scope: 'table_effective_at_file_construction_not_full_run_history',
+        config: { enabled: true, max_row_group_rows: 1024 },
+      }];
+      process.adaptive_table_policies = [{
+        table_name: 'telemetry.sqlserver.sqlserver_availability_replica_states',
+        scope: 'installed_estimator_not_full_run_history',
+        config: { target_parquet_bytes: 134217728 },
+      }];
+    });
+  }
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /provisional: commit-rate resolution unavailable/);
+});
+
+test('fails closed on missing or malformed coverage and does not infer a legacy factor path', () => {
+  const mutations: Array<(evidence: Record<string, unknown>) => void> = [
+    evidence => { delete evidence.inert_fields; },
+    evidence => { delete evidence.projection_only; },
+    evidence => { delete evidence.runner_controls; },
+    evidence => { delete evidence.consumer_verified; },
+    evidence => { evidence.inert_fields = null; },
+    evidence => { evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: '' }]; },
+    evidence => { evidence.projection_only = [{ path: 'parquet_writer.defaults.compression', reason: 'new_reason' }]; },
+    evidence => { evidence.inert_fields = [{ path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }]; },
+    evidence => { evidence.projection_only = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+      { path: 'tunables.parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+    ]; },
+    evidence => {
+      evidence.inert_fields = [{ path: 'parquet_writer.defaults.compression', reason: 'maintenance_disabled' }];
+      evidence.projection_only = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' }];
+    },
+    evidence => { evidence.inert_fields = [{ path: 'unrelated', reason: 'unrecognized' }]; },
+    evidence => { evidence.inert_fields = [{ path: 'tunables..bad', reason: 'maintenance_disabled' }]; },
+    evidence => { evidence.projection_only = []; },
+    evidence => { evidence.projection_only = [{ path: 'parquet_writer.defaults', reason: 'consumer_startup_proof_unverified' }]; },
+    evidence => { evidence.runner_controls = [{ path: 'other', reason: 'unrecognized' }]; },
+    evidence => { evidence.consumer_verified = [{ path: 'other', reason: 'unrecognized' }]; },
+    evidence => {
+      evidence.runner_controls = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'unrecognized' }];
+    },
+    evidence => {
+      evidence.consumer_verified = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'unrecognized' }];
+    },
+    evidence => { evidence.runner_controls = null; },
+    evidence => {
+      evidence.runner_controls = [{ path: 'other', reason: 'unrecognized' }];
+      evidence.consumer_verified = [{ path: 'tunables.other', reason: 'unrecognized' }];
+    },
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const candidate = coveredCandidate('unknown', 700, 150 + index * 3);
+    mutateFactorEvidence(candidate[1]!, mutate);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /varied factor coverage unknown/);
+    assert.doesNotMatch(svg, /unknown \(3\/3\)|observed mean 700|>700<\/text>/);
+  }
+  const legacy = coveredCandidate('legacy', 700, 170).map(row => ({ ...row, factorConfigPaths: undefined }));
+  const svg = renderCampaignResults(legacy, 'C1');
+  assert.match(svg, /varied factor coverage unknown/);
+  assert.doesNotMatch(svg, /legacy \(3\/3\)|observed mean 700/);
+  const invalidJson = coveredCandidate('bad-json', 700, 190);
+  invalidJson[1]!.officialRuns[0]!.rows[0]!.evidence_json = '{';
+  const invalidSvg = renderCampaignResults(invalidJson, 'C1');
+  assert.match(invalidSvg, /varied factor coverage unknown/);
+  assert.doesNotMatch(invalidSvg, /bad-json \(3\/3\)|observed mean 700/);
+});
+
+test('empty arrays do not establish factor coverage and unrelated classifications do not cover a leaf', () => {
+  const candidate = coveredCandidate('active', 100, 180);
+  mutateFactorEvidence(candidate[0]!, evidence => {
+    evidence.projection_only = [];
+  });
+  assert.match(renderCampaignResults(candidate, 'C1'), /varied factor coverage unknown/);
+  mutateFactorEvidence(candidate[0]!, evidence => {
+    evidence.inert_fields = [{ path: 'tunables.parquet_writer.defaults.other', reason: 'maintenance_disabled' }];
+    evidence.projection_only = [
+      { path: 'collector.other', reason: 'consumer_startup_proof_unverified' },
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_proof_unverified' },
+    ];
+  });
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /varied factor coverage unknown/);
+  assert.doesNotMatch(svg, /active \(3\/3\)|observed mean 100 rows\/s/);
+});
+
+test('inert evidence dominates missing coverage for candidates sharing a heatmap cell', () => {
+  const complete = coveredCandidate('shared', 100, 200);
+  const other = coveredCandidate('other', 900, 210).map(row => ({ ...row, valueX: 'shared' }));
+  for (const row of other) row.officialRuns[0]!.config.tunables.parquet_writer.defaults.compression = 'shared';
+  mutateFactorEvidence(other[0]!, evidence => {
+    evidence.inert_fields = [{ path: 'tunables.parquet_writer.defaults.compression', reason: 'maintenance_disabled' }];
+    delete evidence.projection_only;
+  });
+  const svg = renderCampaignResults([...complete, ...other], 'C1');
+  assert.doesNotMatch(svg, /shared \(3\/3\)|other \(3\/3\)|observed mean (?:100|900) rows\/s|>(?:100|900)<\/text>/);
+  assert.match(svg, /inert: tunables\.parquet_writer\.defaults\.compression: maintenance_disabled/);
 });

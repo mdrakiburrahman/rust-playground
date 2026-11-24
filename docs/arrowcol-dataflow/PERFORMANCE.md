@@ -11,6 +11,7 @@
 | `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout` and `command_timeout` for receiver/exporter; rejects other backends | Startup |
 | `ARROWCOL_COLLECTOR_EXPORTER_CONFIG` | Exporter `authority_timeout` | Startup |
 | `ARROWCOL_COLLECTOR_RUNTIME_WORKERS`, `BLOCKING_WORKERS`, `UPLOAD_LIMIT`, `TASK_LIMIT`, `READ_AHEAD`, `BATCH_ROWS`, `CPU_WORKERS` | Independently bounded Delta async, blocking, upload, Kernel task, scan and dedicated CPU resources; each suffix uses the full `ARROWCOL_COLLECTOR_` prefix | Startup |
+| `ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH` | Strict `true`/`false`; default `false`. Reuses arrays when a coalesced publication has only the internally generated ingestion partition. Supplied or multiple partition columns retain the normal grouping path. | Startup |
 | Cargo feature `allocator-mimalloc` | Opt-in mimalloc allocator for the collector binary; system allocator remains default | Rebuild |
 | `RUSTFLAGS="-C target-cpu=native"` | Host-specific compiler ISA optimization; not a Cargo feature or per-cell runtime setting | Rebuild |
 

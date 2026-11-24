@@ -27,6 +27,7 @@ tonic = { version = "0.14", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
 arrow = { version = "58.3", default-features = false }
+arrowcol-tunables = { path = "../arrowcol-tunables" }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 arrowcol-catalog-rust = { path = "../../projects/arrowcol-catalog-rust" }
 assert_cmd.workspace = true

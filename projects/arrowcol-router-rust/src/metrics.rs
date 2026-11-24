@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrowcol_routing::{AdmissionPressureGauge, SqlOperationObserver};
@@ -17,6 +17,7 @@ use prometheus::{
 #[derive(Clone)]
 pub struct RouterMetrics {
     registry: Arc<Registry>,
+    cache_gauges_lock: Arc<Mutex<()>>,
     decisions: IntCounterVec,
     failures: IntCounterVec,
     refreshes: IntCounterVec,
@@ -196,6 +197,7 @@ impl RouterMetrics {
             .build();
         Ok(Self {
             registry,
+            cache_gauges_lock: Arc::new(Mutex::new(())),
             decisions,
             failures,
             refreshes,
@@ -296,6 +298,10 @@ impl RouterMetrics {
 
     /// Updates cache and table-owner gauges.
     pub fn update_cache_gauges(&self, view: &arrowcol_routing::RoutingView) {
+        let _guard = self
+            .cache_gauges_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.table_owners.reset();
         self.pressure_gauge_bps.reset();
         for pool in ["dataflow"] {
@@ -338,6 +344,7 @@ impl RouterMetrics {
                     gauge.set(gauge.get().max(i64::from(value)));
                 }
             }
+            self.cache_gauges_lock.clear_poison();
         }
     }
 
@@ -347,8 +354,14 @@ impl RouterMetrics {
     ///
     /// Returns an encoding error.
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
-        self.sync_pool_connections();
-        let families = self.registry.gather();
+        let families = {
+            let _guard = self
+                .cache_gauges_lock
+                .lock()
+                .map_err(|_| prometheus::Error::Msg("cache gauge snapshot is poisoned".to_owned()))?;
+            self.sync_pool_connections();
+            self.registry.gather()
+        };
         let mut output = Vec::new();
         TextEncoder::new().encode(&families, &mut output)?;
         Ok(output)
@@ -373,9 +386,13 @@ impl SqlOperationObserver for RouterMetrics {
 #[cfg(test)]
 mod tests {
     use super::RouterMetrics;
-    use arrowcol_protocol::UnixMillis;
-    use arrowcol_routing::RoutingView;
+    use arrowcol_protocol::{
+        CatalogName, CollectorInstanceId, FencingToken, ImplementationPool, LeaseId, SchemaName, TableIdentity,
+        TableName, UnixMillis,
+    };
     use arrowcol_routing::SqlOperationObserver;
+    use arrowcol_routing::{LeaseKey, LeaseState, RoutingLease, RoutingView};
+    use std::sync::Barrier;
     use std::time::Duration;
 
     #[test]
@@ -411,5 +428,55 @@ mod tests {
         assert!(output.contains("gauge=\"cpu_utilization_bps\""));
         assert!(output.contains("gauge=\"quiver_pressure_bps\""));
         Ok(())
+    }
+
+    #[test]
+    fn concurrent_scrapes_keep_cache_ownership_snapshot_complete() -> Result<(), Box<dyn std::error::Error>> {
+        let metrics = RouterMetrics::new()?;
+        let now = UnixMillis::new(1)?;
+        let key = LeaseKey::new(
+            ImplementationPool::Dataflow,
+            TableIdentity::new(
+                CatalogName::new("telemetry")?,
+                SchemaName::new("sqlserver")?,
+                TableName::new("orders")?,
+            ),
+        );
+        let holder = CollectorInstanceId::new();
+        let lease = RoutingLease {
+            key: key.clone(),
+            lease_id: LeaseId::new(),
+            holder_instance_id: holder,
+            fencing_epoch: FencingToken::new(1)?,
+            lease_version: 1,
+            state: LeaseState::Active,
+            issued_at_unix_ms: now,
+            renewed_at_unix_ms: now,
+            expires_at_unix_ms: UnixMillis::new(1000)?,
+            drain_started_at_unix_ms: None,
+        };
+        let mut view = RoutingView::empty(now);
+        view.leases.insert(key, lease);
+        metrics.update_cache_gauges(&view);
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..20_000 {
+                    metrics.update_cache_gauges(&view);
+                }
+            });
+            barrier.wait();
+            for _ in 0..20_000 {
+                let output = String::from_utf8(metrics.encode()?)?;
+                assert!(output.lines().any(|line| {
+                    line.starts_with("arrowcol_router_table_owners{")
+                        && line.contains(&format!("collector=\"{holder}\""))
+                        && line.ends_with("} 1")
+                }));
+                assert!(output.contains("arrowcol_router_cached_leases{pool=\"dataflow\",state=\"active\"} 1"));
+            }
+            Ok(())
+        })
     }
 }

@@ -10,7 +10,7 @@ use arrow::array::{
 };
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow_deltalake::delta::object_store_for_url;
+use arrow_deltalake::delta::{InitialDeltaProperties, object_store_for_url};
 use arrowcol_protocol::ImplementationPool;
 use arrowcol_routing::{AdmissionPressureGauge, LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
 use bytes::Bytes;
@@ -39,15 +39,22 @@ use url::Url;
 include!("runner_failure_tests.rs");
 #[cfg(all(test, unix))]
 include!("runner_pin_init_tests.rs");
+#[cfg(test)]
+include!("runner_initial_delta_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
+include!("runner_cpu_quota.rs");
+include!("runner_aks_cpu_quota.rs");
 include!("runner_process_evidence.rs");
+include!("runner_parity_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
+include!("runner_router_readiness.rs");
 include!("runner_overload.rs");
 include!("runner_admission_diagnostics.rs");
+include!("runner_realistic_diagnostic_admission.rs");
 include!("runner_fixture.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,7 +115,43 @@ pub struct RunInventory {
     pub effective_stop_budgets: Option<EffectiveStopBudgets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_cell_duration_ms: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_drain_budget",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drain_budget: Option<InventoryDrainBudget>,
     pub cleanup: InventoryCleanup,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryDrainBudget {
+    pub budget_ms: u64,
+    pub collector_grace_ms: u64,
+    pub pre_stop_capture_margin_ms: u64,
+}
+
+fn deserialize_present_drain_budget<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<InventoryDrainBudget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <InventoryDrainBudget as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+impl InventoryDrainBudget {
+    fn validate(self) -> Result<()> {
+        if self.pre_stop_capture_margin_ms != crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS
+            || !(30_000..=3_600_000).contains(&self.collector_grace_ms)
+            || self.budget_ms == 0
+            || self.budget_ms > self.collector_grace_ms - self.pre_stop_capture_margin_ms
+        {
+            bail!("invalid custody collector drain budget or grace period");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -364,6 +407,9 @@ impl RunInventory {
         validate_official_measurement_reference(self)?;
         if let Some(budgets) = self.effective_stop_budgets {
             budgets.validate()?;
+        }
+        if let Some(budget) = self.drain_budget {
+            budget.validate()?;
         }
         if let Some(duration_ms) = self.planned_cell_duration_ms {
             let no_row_rehearsal = duration_ms == 0 && self.load_admission == InventoryLoadAdmission::NotAuthorized;
@@ -718,6 +764,7 @@ impl RunInventory {
             || !self.load_admission.can_advance_to(next.load_admission)
             || self.effective_stop_budgets != next.effective_stop_budgets
             || self.planned_cell_duration_ms != next.planned_cell_duration_ms
+            || self.drain_budget != next.drain_budget
             || self.namespace.name != next.namespace.name
             || self.namespace.owner_token != next.namespace.owner_token
             || self
@@ -1016,9 +1063,15 @@ struct ClientProgress {
 #[async_trait::async_trait]
 trait Platform: Send + Sync {
     fn kind(&self) -> crate::config::OatMode;
+    async fn prebuild(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
+    }
     fn workload_endpoint(&self, config: &OatConfig) -> String;
     fn delta_root(&self) -> Option<&str> {
         None
+    }
+    fn preload_delta_evidence(&self, _config: &OatConfig, _tables: &[String]) -> Result<Option<Value>> {
+        Ok(None)
     }
     fn router_metrics_endpoint(&self, config: &OatConfig) -> Result<String>;
     async fn ensure_router_metrics_endpoint(&mut self, config: &OatConfig) -> Result<(String, bool)> {
@@ -1063,6 +1116,9 @@ trait Platform: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    async fn finish_official_publication(&mut self, _publication_succeeded: bool) -> Result<()> {
+        Ok(())
+    }
     fn mark_qap_outcome_unresolved(&mut self) {}
     async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
@@ -1083,6 +1139,10 @@ trait Platform: Send + Sync {
     async fn arm_clients(&mut self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
+    async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+        self.cancel_client(config, handle).await?;
+        Ok(None)
+    }
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
         None
     }
@@ -1108,19 +1168,35 @@ trait Platform: Send + Sync {
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         None
     }
+    fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
+        None
+    }
+    async fn capture_shutdown_inputs(&mut self) -> Option<ShutdownFinalizationInputs> {
+        None
+    }
+    fn local_lifecycle_timing(&self) -> Option<Value> {
+        None
+    }
+    fn record_setup_seconds(&mut self, _seconds: f64) {}
     fn resource_evidence(&self) -> Option<Value> {
         None
+    }
+    async fn poll_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
     }
     async fn finish_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
         Ok(())
     }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
+    async fn finish_cleanup(&mut self, _config: &OatConfig, _rows: &[OatResult], _frozen: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct AksPlatform {
     run_id: String,
     resource_readback: Vec<Value>,
-    cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
+    cpu_throttling_start: Option<AksCpuResourceMeasurement>,
     cpu_throttling_evidence: Option<Value>,
     namespace_created: bool,
     namespace_create_attempted: bool,
@@ -1146,11 +1222,33 @@ struct AksPlatform {
     router_yaml: Option<String>,
     shutdown_drain_evidence: Option<Value>,
     campaign_cli_paths: Option<OwnedAksCampaignConfigPaths>,
+    maintenance_cell_baseline: Vec<ProcessLog>,
+    stopped_collector_logs: Option<Vec<ProcessLog>>,
+    shutdown_inputs: Option<ShutdownFinalizationInputs>,
 }
 
 struct OwnedKubectlProcess {
     child: Child,
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+struct ShutdownLogFollower(JoinHandle<Result<ProcessLog>>);
+
+impl Drop for ShutdownLogFollower {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Default)]
+struct PressureHttpTiming {
+    remaining_budget_at_first_poll_ms: Option<u64>,
+    headers_ms: Option<u64>,
+    body_ms: Option<u64>,
+}
+
+fn monotonic_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 struct PublicationBacklogScraper {
@@ -1191,6 +1289,20 @@ impl PublicationBacklogScraper {
     }
 
     async fn read_endpoint(&self, endpoint: &str) -> Result<String> {
+        self.read_endpoint_timed(endpoint, None).await
+    }
+
+    async fn read_endpoint_timed(
+        &self,
+        endpoint: &str,
+        mut timing: Option<(&mut PressureHttpTiming, tokio::time::Instant)>,
+    ) -> Result<String> {
+        let started = tokio::time::Instant::now();
+        if let Some((timing, deadline)) = timing.as_mut() {
+            timing.remaining_budget_at_first_poll_ms =
+                Some(monotonic_millis(deadline.saturating_duration_since(started)));
+        }
+
         const MAX_METRICS_BYTES: u64 = 1_048_576;
         let response = self
             .client
@@ -1198,6 +1310,9 @@ impl PublicationBacklogScraper {
             .send()
             .await
             .context("request collector admin metrics")?;
+        if let Some((timing, _)) = timing.as_mut() {
+            timing.headers_ms = Some(monotonic_millis(started.elapsed()));
+        }
         if !response.status().is_success() {
             bail!("collector admin metrics returned HTTP {}", response.status());
         }
@@ -1215,6 +1330,9 @@ impl PublicationBacklogScraper {
             }
             body.extend_from_slice(&chunk);
         }
+        if let Some((timing, _)) = timing.as_mut() {
+            timing.body_ms = Some(monotonic_millis(started.elapsed()));
+        }
         String::from_utf8(body).context("collector admin metrics are not UTF-8")
     }
 }
@@ -1230,11 +1348,58 @@ struct LocalPlatform {
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
     shutdown_drain_evidence: Option<Value>,
+    build_seconds: Option<f64>,
+    setup_seconds: Option<f64>,
     maintenance_cell_baseline: Vec<ProcessLog>,
+    stopped_collector_logs: std::sync::Mutex<Option<Vec<ProcessLog>>>,
 }
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn preload_delta_evidence(&self, config: &OatConfig, tables: &[String]) -> Result<Option<Value>> {
+        let properties = config.initial_delta_properties()?;
+        if properties.properties()?.is_empty() {
+            return Ok(None);
+        }
+        let [table] = tables else {
+            bail!("AKS initial Delta property evidence requires exactly one table");
+        };
+        Ok(Some(read_aks_initial_delta_evidence(
+            self.runtime_dir
+                .as_deref()
+                .context("AKS property evidence directory missing")?,
+            &self.run_id,
+            &canonical_initializer_table_name(table)?,
+            self.delta_root
+                .as_deref()
+                .context("AKS property evidence Delta root missing")?,
+            &properties,
+        )?))
+    }
+
+    async fn capture_shutdown_inputs(&mut self) -> Option<ShutdownFinalizationInputs> {
+        match read_campaign_shutdown_inputs(self).await {
+            Ok((_, _, _, inputs)) => {
+                self.shutdown_inputs = Some(inputs.clone());
+                Some(inputs)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "frozen shutdown inputs unavailable; retaining fail-closed reconciliation");
+                None
+            }
+        }
+    }
+
+    fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
+        self.maintenance_cell_baseline = logs.to_vec();
+    }
+
+    fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
+        self.stopped_collector_logs
+            .clone()
+            .map(|logs| (logs, self.maintenance_cell_baseline.clone()))
+    }
+
     fn delta_root(&self) -> Option<&str> {
         self.delta_root.as_deref()
     }
@@ -1243,15 +1408,42 @@ impl Platform for AksPlatform {
         Some(json!({
             "readbacks": self.resource_readback,
             "cpu_throttling": self.cpu_throttling_evidence,
+            "cpu_quota": self.cpu_throttling_evidence.as_ref().and_then(|evidence| evidence.get("cpu_quota"))
+                .or_else(|| self.cpu_throttling_start.as_ref().map(|measurement| &measurement.quota_evidence)),
         }))
+    }
+
+    async fn poll_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
+        if let Some(measurement) = self.cpu_throttling_start.as_mut()
+            && let Some(window) = measurement.quota_window.as_mut()
+        {
+            window.poll(config, &measurement.quota_targets).await;
+        }
+        Ok(())
     }
 
     async fn finish_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
         let end = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
-        self.cpu_throttling_evidence = Some(compare_cpu_throttling(
-            self.cpu_throttling_start.take().as_deref().unwrap_or_default(),
-            &end,
-        ));
+        let mut measurement = self
+            .cpu_throttling_start
+            .take()
+            .context("AKS CPU quota preflight was not captured")?;
+        let mut legacy = compare_cpu_throttling(&measurement.throttling_start, &end);
+        let evidence = if let Some(window) = measurement.quota_window.take() {
+            window
+                .finish(config, &measurement.quota_targets, &measurement.quota_evidence)
+                .await
+        } else {
+            measurement.quota_evidence
+        };
+        let verified = evidence["verification_status"] == "verified";
+        let reason = evidence["throttling"]["reason"].clone();
+        legacy["cpu_quota"] = evidence;
+        self.cpu_throttling_evidence = Some(legacy);
+        ensure!(
+            verified,
+            "AKS effective collector CPU quota measurement could not be established: {reason}"
+        );
         Ok(())
     }
 
@@ -1300,6 +1492,22 @@ impl Platform for AksPlatform {
             rollout(config, name).await?;
         }
         self.resource_readback = aks_deployment_resource_evidence(config).await?;
+        self.cpu_throttling_start = None;
+        self.cpu_throttling_evidence = None;
+        let quota_targets = aks_collector_quota_targets(&self.resource_readback, usize::try_from(replicas)?)?;
+        let readback = capture_aks_collector_cpu_quota(config, &quota_targets).await?;
+        self.cpu_throttling_start = Some(AksCpuResourceMeasurement {
+            throttling_start: Vec::new(),
+            quota_targets,
+            quota_window: None,
+            quota_evidence: json!({
+                "verification_status": "unavailable",
+                "collector": {"source": "platform.resources.collector.limits.cpu",
+                    "requested_quota": config.effective_aks_resources().collector.limits.cpu.unwrap_or_else(|| "max".to_owned()),
+                    "readback": readback},
+                "throttling": {"status": "unavailable", "reason": "measurement boundaries not yet sampled"},
+            }),
+        });
         Ok(())
     }
 
@@ -1635,6 +1843,24 @@ impl Platform for AksPlatform {
         publish_campaign_official_measurement(self, config, rows, submitted, deadline).await
     }
 
+    async fn finish_official_publication(&mut self, publication_succeeded: bool) -> Result<()> {
+        if let Some(runtime_dir) = self.runtime_dir.take() {
+            let retention = runtime_evidence_retention(
+                self.fic_prepare_attempted,
+                self.fic_record_path.as_deref(),
+                self.fic_ready_snapshot_path.as_deref(),
+                self.qap_bind_attempted,
+                self.qap_record_path.as_deref(),
+                self.workload_stop_record_path.as_deref(),
+                self.qap_outcome_unresolved || !publication_succeeded,
+            );
+            apply_runtime_evidence_retention(&runtime_dir, retention)
+                .await
+                .with_context(|| format!("remove private AKS runtime files {}", runtime_dir.display()))?;
+        }
+        Ok(())
+    }
+
     fn mark_qap_outcome_unresolved(&mut self) {
         self.qap_outcome_unresolved = true;
     }
@@ -1684,7 +1910,34 @@ impl Platform for AksPlatform {
     }
 
     async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
-        self.cpu_throttling_start = Some(capture_aks_cpu_throttling(config, &self.resource_readback).await?);
+        let legacy_start = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
+        let measurement = self
+            .cpu_throttling_start
+            .as_mut()
+            .context("AKS CPU quota preflight was not captured")?;
+        measurement.throttling_start = legacy_start;
+        let start = run_start_unix_ms
+            .checked_add(
+                config
+                    .warmup_seconds
+                    .checked_mul(1000)
+                    .context("AKS CPU quota warmup duration overflow")?,
+            )
+            .context("AKS CPU quota start overflow")?;
+        let end = start
+            .checked_add(
+                config
+                    .measure_seconds
+                    .checked_mul(1000)
+                    .context("AKS CPU quota measurement duration overflow")?,
+            )
+            .context("AKS CPU quota end overflow")?;
+        measurement.quota_window = Some(start_aks_cpu_quota_window(
+            config.clone(),
+            measurement.quota_targets.clone(),
+            start,
+            end,
+        ));
         let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -1718,7 +1971,11 @@ impl Platform for AksPlatform {
     }
 
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()> {
-        cancel_aks_client_job(config, handle).await
+        cancel_aks_client_job(config, handle).await.map(|_| ())
+    }
+
+    async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+        cancel_aks_client_job(config, handle).await.map(Some)
     }
 
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
@@ -1791,12 +2048,44 @@ impl Platform for AksPlatform {
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
+        self.cpu_throttling_start = None;
         let result = cleanup_aks_platform(config, self).await;
         if self.shutdown_drain_evidence.is_none() {
             self.shutdown_drain_evidence =
                 Some(json!({"status":"unavailable", "reason":"ordered_aks_shutdown_not_completed"}));
         }
         result
+    }
+
+    async fn finish_cleanup(&mut self, config: &OatConfig, rows: &[OatResult], frozen: bool) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        if !frozen {
+            bail!("campaign shutdown freeze was not confirmed; release remains unavailable");
+        }
+        let reconciliation = shutdown_reconciliation_request(rows);
+        let receipt = match finalize_campaign_shutdown(self, &reconciliation).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+                    evidence["finalization"] =
+                        json!({"status":"unavailable", "reason":"shutdown_finalization_unconfirmed"});
+                }
+                return Err(error.context("campaign shutdown finalization unavailable; release withheld"));
+            }
+        };
+        if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+            evidence["finalization"] = serde_json::to_value(&receipt)?;
+        }
+        ensure_shutdown_release(&receipt, rows)?;
+        let release = cleanup_campaign_aks_platform(config, self, CampaignCleanupPhase::Release).await?;
+        self.qap_cleanup_confirmed = true;
+        require_aks_cleanup_confirmation(self)?;
+        if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+            evidence["release"] = release;
+        }
+        Ok(())
     }
 
     fn shutdown_drain_evidence(&self) -> Option<Value> {
@@ -1806,16 +2095,56 @@ impl Platform for AksPlatform {
 
 #[async_trait::async_trait]
 impl Platform for LocalPlatform {
+    fn preload_delta_evidence(&self, config: &OatConfig, tables: &[String]) -> Result<Option<Value>> {
+        let properties = config.initial_delta_properties()?;
+        if !config.platform.local.partitioned_table_bootstrap && properties.properties()?.is_empty() {
+            return Ok(None);
+        }
+        let [table] = tables else {
+            bail!("partitioned bootstrap requires exactly one table");
+        };
+        let canonical = canonical_initializer_table_name(table)?;
+        let initial = if !properties.properties()?.is_empty() {
+            Some(read_local_initial_delta_evidence(
+                &self.state_dir,
+                &canonical,
+                &properties,
+            )?)
+        } else {
+            None
+        };
+        let partition = if config.platform.local.partitioned_table_bootstrap {
+            let root = local_delta_table_target(&self.state_dir, table)?
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("invalid canonical local preload Delta path"))?;
+            Some(verify_preload_delta(&root.join("_delta_log"), &canonical)?)
+        } else {
+            None
+        };
+        Ok(combine_preload_delta_evidence(partition, initial))
+    }
+
     fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
-        self.maintenance_cell_baseline = logs
-            .iter()
-            .filter(|log| log.role == ComponentRole::Maintenance)
-            .cloned()
-            .collect();
+        self.maintenance_cell_baseline = logs.to_vec();
     }
 
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Local
+    }
+
+    async fn prebuild(&mut self, config: &OatConfig) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        let result = prebuild_local_platform(config, self).await;
+        self.build_seconds = Some(started.elapsed().as_secs_f64());
+        result
+    }
+
+    fn local_lifecycle_timing(&self) -> Option<Value> {
+        Some(json!({"build_seconds": self.build_seconds, "setup_seconds": self.setup_seconds}))
+    }
+
+    fn record_setup_seconds(&mut self, seconds: f64) {
+        self.setup_seconds = Some(seconds);
     }
 
     async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
@@ -1841,6 +2170,23 @@ impl Platform for LocalPlatform {
     }
 
     async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str, _replicas: u32) -> Result<()> {
+        let containerized = Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+        let host_network = if containerized {
+            let hostname =
+                fs::read_to_string("/proc/sys/kernel/hostname").context("read harness container hostname")?;
+            let mut inspect = Command::new("docker");
+            inspect.args(["inspect", "--format", "{{.HostConfig.NetworkMode}}", hostname.trim()]);
+            let output = run_command(inspect, "inspect harness container network mode").await?;
+            String::from_utf8(output.stdout)?.trim() == "host"
+        } else {
+            false
+        };
+        crate::local::validate_container_endpoints(
+            containerized,
+            host_network,
+            config.platform.local.bind_host,
+            config.platform.local.endpoint_host.as_deref(),
+        )?;
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.refresh_endpoints(config).await
@@ -1878,6 +2224,39 @@ impl Platform for LocalPlatform {
         tables: &[String],
     ) -> Result<()> {
         verify_maintenance_stop_budget_before_admission(config, self).await?;
+        let properties = config.initial_delta_properties()?;
+        if !properties.properties()?.is_empty() {
+            let [table] = tables else {
+                bail!("initial Delta property readback requires exactly one table");
+            };
+            let canonical = canonical_initializer_table_name(table)?;
+            let url = local_delta_table_target(&self.state_dir, table)?;
+            let observed = tokio::task::spawn_blocking(move || -> Result<_> {
+                arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&url)?.maintenance_properties()
+            })
+            .await
+            .context("join local initial Delta property readback")??;
+            verify_initial_delta_property_readback(&json!(observed), &properties)?;
+            let initial: Value =
+                serde_json::from_slice(&fs::read(self.state_dir.join("initial-delta-properties.json"))?)?;
+            verify_local_initial_delta_receipt(
+                &initial.to_string(),
+                &canonical,
+                local_maintenance_table_initialization_mode(config).context("missing fresh local initializer")?,
+                &properties,
+            )?;
+            let evidence = json!({
+                "table": canonical,
+                "requested_initial_properties": properties.properties()?,
+                "committed_properties": observed,
+                "source": "fresh_checkpoint_aware_delta_metadata_read",
+                "initial_receipt": initial,
+            });
+            fs::write(
+                self.state_dir.join("initial-delta-before-admission.json"),
+                serde_json::to_vec(&evidence)?,
+            )?;
+        }
         verify_local_partition_policy_before_admission(config, self, tables).await
     }
 
@@ -1956,8 +2335,12 @@ impl Platform for LocalPlatform {
         finish_local_client(handle).await
     }
 
-    async fn cancel_client(&self, _config: &OatConfig, handle: &ClientHandle) -> Result<()> {
-        cancel_local_client(handle).await
+    async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()> {
+        cancel_local_client(config, handle).await.map(|_| ())
+    }
+
+    async fn cancel_client_with_output(&self, config: &OatConfig, handle: &ClientHandle) -> Result<Option<String>> {
+        cancel_local_client(config, handle).await.map(Some)
     }
 
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
@@ -1969,7 +2352,22 @@ impl Platform for LocalPlatform {
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
-        match cleanup_local_platform(config, self).await {
+        let result = cleanup_local_platform(config, self).await;
+        let missing_logs = self
+            .stopped_collector_logs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("collector logs mutex poisoned"))?
+            .is_none();
+        if result.is_err()
+            && missing_logs
+            && let Ok(logs) = local_process_logs_for_role(config, self, Some(ComponentRole::Collector)).await
+        {
+            *self
+                .stopped_collector_logs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("collector logs mutex poisoned"))? = Some(logs);
+        }
+        match result {
             Ok(evidence) => {
                 self.shutdown_drain_evidence = Some(evidence);
                 Ok(())
@@ -1983,6 +2381,14 @@ impl Platform for LocalPlatform {
 
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         self.shutdown_drain_evidence.clone()
+    }
+
+    fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
+        self.stopped_collector_logs
+            .lock()
+            .ok()?
+            .clone()
+            .map(|logs| (logs, self.maintenance_cell_baseline.clone()))
     }
 }
 
@@ -2013,6 +2419,7 @@ impl LocalPlatform {
             .compose_state_root
             .as_deref()
             .context("local compose state root is missing")?;
+        let source_revision = local_build_source_revision()?;
         let state_dir = std::env::current_dir()?.join(state_root).join(run_id);
         crate::local::absolute_directory(&state_dir)?;
         if let Some(destination) = &config.platform.local.snapshot_root {
@@ -2043,6 +2450,8 @@ impl LocalPlatform {
             }
         };
         let control_dir = state_dir.join("control");
+        let mut environment = environment;
+        environment.insert("GIT_SHA".to_owned(), source_revision);
         Ok(Self {
             run_id: run_id.to_owned(),
             state_dir,
@@ -2054,7 +2463,10 @@ impl LocalPlatform {
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            build_seconds: None,
+            setup_seconds: None,
             maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: std::sync::Mutex::new(None),
         })
     }
 
@@ -2212,11 +2624,23 @@ async fn start_local_client(
     if container_id.is_empty() {
         bail!("Compose returned an empty local OAT client container ID");
     }
-    Ok(ClientHandle {
+    let handle = ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
-        process: ClientProcess::Local { container_id },
-    })
+        process: ClientProcess::Local {
+            container_id: container_id.clone(),
+        },
+    };
+    if let Err(error) = local_client_image_evidence(&container_id).await {
+        let error = error.context("local client image provenance must pass before measurement");
+        if let Err(cleanup_error) = cancel_local_client(config, &handle).await {
+            return Err(error.context(format!(
+                "cleanup after client provenance failure also failed: {cleanup_error:#}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(handle)
 }
 
 async fn poll_local_client(handle: &ClientHandle) -> Result<ClientProgress> {
@@ -2394,14 +2818,16 @@ async fn finish_local_client(handle: ClientHandle) -> Result<String> {
     ))
 }
 
-async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
+async fn cancel_local_client(config: &OatConfig, handle: &ClientHandle) -> Result<String> {
     let ClientProcess::Local { container_id } = &handle.process else {
         bail!("local client cancel received a non-local process handle");
     };
+    stop_local_client_containers(std::slice::from_ref(container_id), config.client_stop_grace_seconds()).await?;
+    let logs = poll_local_client(handle).await.map(|progress| progress.output);
     let mut remove = Command::new("docker");
-    remove.args(["rm", "--force", container_id]);
-    run_command(remove, "cancel local OAT client container").await?;
-    Ok(())
+    remove.args(["rm", container_id]);
+    run_command(remove, "remove cancelled local OAT client container").await?;
+    logs.context("read cancelled local OAT client logs before removal")
 }
 
 fn run_scoped_local_router_config(router_text: &str, run_id: &str, run_pin_ttl_ms: u64) -> Result<String> {
@@ -2512,6 +2938,7 @@ async fn start_aks_client_job(
     let job_name = format!("oat-{run_label}-{table_label}-c{client_index}");
     let run_seconds = i64::try_from(config.timing_budget()?.client_job_lifetime_seconds)
         .context("OAT client Job lifetime exceeds Kubernetes range")?;
+    let args = render_aks_client_args(config, args)?;
     let mut job = build_aks_client_job(AksClientJobSpec {
         namespace: &config.namespace,
         client_image: &config.dmv_client_image,
@@ -2520,8 +2947,9 @@ async fn start_aks_client_job(
         run_id,
         run_label: &run_label,
         job_name: &job_name,
-        args,
+        args: &args,
         run_seconds,
+        stop_grace_seconds: config.client_stop_grace_seconds(),
     });
     configure_fleet_client_placement(
         &mut job,
@@ -2553,6 +2981,13 @@ async fn start_aks_client_job(
     .await
     .context("read applied AKS client Job resource spec")?;
     let applied_job: Value = serde_json::from_str(&applied_job_json).context("parse applied AKS client Job")?;
+    let actual_grace = applied_job
+        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
+        .and_then(Value::as_u64)
+        .context("applied client Job omitted termination grace")?;
+    if actual_grace != config.client_stop_grace_seconds() {
+        bail!("applied client Job termination grace differs from configured quiesce budget");
+    }
     let job_containers = applied_job
         .pointer("/spec/template/spec/containers")
         .and_then(Value::as_array)
@@ -2572,7 +3007,7 @@ async fn start_aks_client_job(
         "role": "client",
         "job": job_name,
         "requested": client_resources,
-        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"]},
+        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"], "stop_grace_seconds": pod["stop_grace_seconds"]},
         "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"],
             "container": "client", "container_id": pod["container_id"]},
     }));
@@ -2581,6 +3016,30 @@ async fn start_aks_client_job(
         table: table.to_owned(),
         process: ClientProcess::Aks { job_name },
     })
+}
+
+fn render_aks_client_args(config: &OatConfig, args: &[String]) -> Result<Vec<String>> {
+    let mut rendered = Vec::with_capacity(args.len() + 4);
+    let mut input = args.iter();
+    while let Some(arg) = input.next() {
+        if matches!(arg.as_str(), "--streams-per-worker" | "--concurrency") {
+            input.next().with_context(|| format!("{arg} requires a value"))?;
+        } else if !arg.starts_with("--streams-per-worker=") && !arg.starts_with("--concurrency=") {
+            rendered.push(arg.clone());
+        }
+    }
+    if let Some(streams) = config
+        .tunables
+        .client
+        .as_ref()
+        .and_then(|client| client.streams_per_worker)
+    {
+        rendered.extend(["--streams-per-worker".to_owned(), streams.to_string()]);
+    }
+    if let Some(concurrency) = config.dmv_concurrency {
+        rendered.extend(["--concurrency".to_owned(), concurrency.to_string()]);
+    }
+    Ok(rendered)
 }
 
 struct AksClientJobSpec<'a> {
@@ -2593,6 +3052,7 @@ struct AksClientJobSpec<'a> {
     job_name: &'a str,
     args: &'a [String],
     run_seconds: i64,
+    stop_grace_seconds: u64,
 }
 
 fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
@@ -2606,6 +3066,7 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
         job_name,
         args,
         run_seconds,
+        stop_grace_seconds,
     } = spec;
     let labels = json!({
         "app": "arrowcol-oat-client",
@@ -2626,7 +3087,7 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
                 "metadata": { "labels": labels },
                 "spec": {
                     "restartPolicy": "Never",
-                    "terminationGracePeriodSeconds": 10,
+                    "terminationGracePeriodSeconds": stop_grace_seconds,
                     "automountServiceAccountToken": false,
                     "nodeSelector": { "arrow-collector/role": "client", "kubernetes.io/arch": "amd64" },
                     "tolerations": [{
@@ -2741,7 +3202,15 @@ async fn wait_for_aks_client_pod_resource_readback(
                     .and_then(Value::as_array)
                     .context("AKS client pod has no containers")?;
                 let resources = verify_container_resources(containers, "client", "client", expected)?;
+                let stop_grace = pod
+                    .pointer("/spec/terminationGracePeriodSeconds")
+                    .and_then(Value::as_u64)
+                    .context("client pod omitted termination grace")?;
+                if stop_grace != config.client_stop_grace_seconds() {
+                    bail!("client pod termination grace differs from configured quiesce budget");
+                }
                 return Ok(json!({
+                    "stop_grace_seconds": stop_grace,
                     "name": metadata.get("name"),
                     "uid": metadata.get("uid"),
                     "node": node,
@@ -3018,11 +3487,49 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
     ))
 }
 
-async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<()> {
+async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<String> {
     let ClientProcess::Aks { job_name } = &handle.process else {
         bail!("AKS client cancel received a non-AKS process handle");
     };
-    kubectl(
+    // The client is PID 1 in the dedicated, non-restarting job container. Signal
+    // it without deleting the pod so its terminal logs remain readable.
+    let target = format!("job/{job_name}");
+    let signal = tokio::time::timeout(
+        Duration::from_secs(10),
+        kubectl(
+            config,
+            vec![
+                "exec",
+                "--namespace",
+                &config.namespace,
+                &target,
+                "-c",
+                "client",
+                "--",
+                "/bin/sh",
+                "-c",
+                "kill -TERM 1",
+            ],
+            None,
+        ),
+    )
+    .await;
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(config.client_stop_grace_seconds().saturating_add(10));
+    let logs = loop {
+        let progress = tokio::time::timeout_at(deadline, poll_aks_client_job(config, handle)).await;
+        match progress {
+            Ok(Ok(progress)) if progress.completed || progress.failure.is_some() => break Ok(progress.output),
+            Ok(Err(error)) => break Err(error.context("read cancelled AKS client status and logs")),
+            Err(_) => {
+                break Err(anyhow::anyhow!(
+                    "cancelled AKS client did not exit within its grace period; signal result: {signal:?}"
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    };
+    let deletion = kubectl(
         config,
         vec![
             "delete",
@@ -3032,13 +3539,14 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
             &config.namespace,
             "--ignore-not-found",
             "--wait=true",
-            "--timeout=30s",
+            &format!("--timeout={}s", config.client_stop_grace_seconds().saturating_add(30)),
         ],
         None,
     )
     .await
-    .with_context(|| format!("cancel AKS DMV client Job {job_name}"))?;
-    Ok(())
+    .with_context(|| format!("cancel AKS DMV client Job {job_name}"));
+    deletion?;
+    logs
 }
 
 /// Runs the configured benchmark matrix and publishes its compact results.
@@ -3236,7 +3744,8 @@ async fn run_matrix(
         orchestration_id,
         &state,
         move |cell_config, run_id, replicas, concurrency| {
-            run_isolated_cell(
+            // Keep cell lifecycle state out of the matrix poll frames on debug Tokio workers.
+            Box::pin(run_isolated_cell(
                 cell_config,
                 orchestration_id,
                 run_id,
@@ -3244,7 +3753,7 @@ async fn run_matrix(
                 cancellation.clone(),
                 submitted_config.clone(),
                 Arc::clone(&cell_state),
-            )
+            ))
         },
     )
     .await
@@ -3447,6 +3956,9 @@ async fn run_isolated_cell(
                 Ok(()),
             );
             outcome.aks_cleanup_confirmed = false;
+            if let Err(evidence_error) = attach_teardown_outcome(&mut outcome, "not_started") {
+                outcome.error = Some(evidence_error.context("attach unavailable teardown evidence"));
+            }
             return outcome;
         }
     };
@@ -3463,18 +3975,28 @@ async fn run_isolated_cell(
                 Ok(()),
             );
             outcome.aks_cleanup_confirmed = false;
+            if let Err(evidence_error) = attach_teardown_outcome(&mut outcome, "not_started") {
+                outcome.error = Some(evidence_error.context("attach unavailable teardown evidence"));
+            }
             return outcome;
         }
     };
-    let lifecycle_started_at = tokio::time::Instant::now();
-    let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
-    let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id, replicas)).await {
-                Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
-                Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
-            }
+            platform.prebuild(&config).await.context("untimed prebuild of local OAT images and initializer")?;
+            let lifecycle_started_at = tokio::time::Instant::now();
+            let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
+            let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
+            let setup_started_at = tokio::time::Instant::now();
+            let setup_result = match tokio::time::timeout_at(
+                setup_deadline,
+                platform.ensure_stack(&config, orchestration_id, replicas),
+            ).await {
+                Ok(result) => result.context("prepare isolated OAT matrix-cell platform"),
+                Err(_) => Err(anyhow::anyhow!("planned pre-cell setup deadline expired; normal platform cleanup follows")),
+            };
+            platform.record_setup_seconds(setup_started_at.elapsed().as_secs_f64());
+            setup_result?;
             let timing = config.timing_budget()?;
             require_lifecycle_remaining_at(
                 tokio::time::Instant::now(),
@@ -3483,7 +4005,7 @@ async fn run_isolated_cell(
                 "ArrowCol scale",
             )?;
             match tokio::time::timeout_at(lifecycle_deadline, async {
-                let mut rows = run_matrix_cell(
+                let rows = Box::pin(run_matrix_cell(
                     &config,
                     orchestration_id,
                     &run_id,
@@ -3491,19 +4013,7 @@ async fn run_isolated_cell(
                     concurrency,
                     platform.as_mut(),
                     lifecycle_deadline,
-                ).await?;
-                if let Err(error) = platform.publish_official_measurement(
-                    &config, &rows, submitted_config.as_ref(), lifecycle_deadline,
-                ).await {
-                    tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
-                    for row in &mut rows {
-                        row.status = "failed".to_owned();
-                        row.failure = Some(match row.failure.take() {
-                            Some(prior) => format!("{prior}; official_measurement_publication_failed"),
-                            None => "official_measurement_publication_failed".to_owned(),
-                        });
-                    }
-                }
+                )).await?;
                 Ok(rows)
             }).await {
                 Ok(result) => result,
@@ -3518,26 +4028,202 @@ async fn run_isolated_cell(
     {
         publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
     }
-    let cleanup = platform.cleanup(&config).await;
-    let shutdown_drain_evidence = platform.shutdown_drain_evidence();
-    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
-    if cancelled && cleanup.is_ok() {
-        return MatrixOutcome {
-            rows: Vec::new(),
-            error: None,
-            cancelled: true,
-            aks_cleanup_confirmed,
-        };
-    }
-    let mut outcome = finish_matrix_cell(
+    let (mut outcome, cleanup_succeeded) = finalize_isolated_cell(
         &config,
         orchestration_id,
         &run_id,
-        replicas,
-        concurrency,
-        result,
-        cleanup,
-    );
+        dimensions,
+        (result, cancelled),
+        platform.as_mut(),
+        &LiveAksReconciler,
+    )
+    .await;
+    if cancelled && cleanup_succeeded {
+        return outcome;
+    }
+    {
+        let publication_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(
+                OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS + OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS + 1,
+            );
+        let publication = platform
+            .publish_official_measurement(&config, &outcome.rows, submitted_config.as_ref(), publication_deadline)
+            .await;
+        let published = publication.is_ok();
+        if let Err(error) = publication {
+            for row in &mut outcome.rows {
+                row.status = "failed".to_owned();
+                row.failure = Some(match row.failure.take() {
+                    Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                    None => "official_measurement_publication_failed".to_owned(),
+                });
+            }
+            let _ = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" });
+            outcome.error = Some(error.context("official cell measurement publication failed"));
+        }
+        if let Err(error) = platform
+            .finish_official_publication(published && cleanup_succeeded)
+            .await
+        {
+            outcome.error = Some(error.context("finalize official measurement runtime evidence"));
+        }
+    }
+    outcome
+}
+
+#[async_trait::async_trait]
+trait FinalAksReconciler: Sync {
+    async fn attach(&self, config: &OatConfig, root: Option<&str>, rows: &mut [OatResult], frozen: bool);
+}
+
+struct LiveAksReconciler;
+
+#[async_trait::async_trait]
+impl FinalAksReconciler for LiveAksReconciler {
+    async fn attach(&self, config: &OatConfig, root: Option<&str>, rows: &mut [OatResult], frozen: bool) {
+        attach_final_aks_delta_reconciliation(config, root, rows, frozen).await;
+    }
+}
+
+async fn finalize_isolated_cell(
+    config: &OatConfig,
+    orchestration_id: &str,
+    run_id: &str,
+    dimensions: (u32, u32),
+    (mut result, cancelled): (Result<Vec<OatResult>>, bool),
+    platform: &mut dyn Platform,
+    reconciler: &dyn FinalAksReconciler,
+) -> (MatrixOutcome, bool) {
+    let (replicas, concurrency) = dimensions;
+    let shutdown_started = unix_time_ms_u64();
+    let cleanup = platform.cleanup(config).await;
+    let frozen = cleanup.is_ok();
+    let stopped_logs = platform.stopped_commit_logs();
+    let summary_inputs = if frozen
+        && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        && result.is_ok()
+    {
+        platform.capture_shutdown_inputs().await
+    } else {
+        None
+    };
+    let summary_attached = if let (Ok(rows), Some(inputs)) = (&mut result, summary_inputs.as_ref()) {
+        match attach_terminal_summary_commits(config, platform.delta_root(), rows, inputs) {
+            Ok(attached) => attached,
+            Err(error) => {
+                tracing::warn!(%error, "terminal collector summary unavailable; release remains withheld");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if let Ok(rows) = &mut result
+        && let Some((logs, baseline)) = &stopped_logs
+        && let Err(error) = attach_stopped_commit_evidence(config, rows, logs, baseline)
+    {
+        for row in rows {
+            row.status = "failed".to_owned();
+            let message = format!("capture stopped collector commits: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+    }
+    if !summary_attached
+        && let Ok(rows) = &mut result
+        && let Err(error) =
+            attach_collector_teardown_admissions(rows, stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()), frozen)
+    {
+        for row in rows {
+            row.status = "failed".to_owned();
+            row.failure = Some(format!("capture collector teardown admissions evidence: {error:#}"));
+        }
+    }
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        && let Ok(rows) = &mut result
+    {
+        if config.platform.kind == crate::config::OatMode::Local {
+            attach_final_local_delta_reconciliation(config, run_id, rows, frozen);
+        } else {
+            reconciler.attach(config, platform.delta_root(), rows, frozen).await;
+        }
+    }
+    if !cancelled
+        && config.platform.kind == crate::config::OatMode::Local
+        && let Ok(rows) = &mut result
+        && let Err(error) = attach_local_delta_reconciliation(config, run_id, rows, cleanup.is_ok())
+    {
+        for row in rows {
+            row.status = "failed".to_owned();
+            let message = format!("attach local Delta reconciliation: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+    }
+    let finalization = platform
+        .finish_cleanup(config, result.as_deref().unwrap_or(&[]), frozen)
+        .await;
+    let cleanup = match (cleanup, finalization) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(final_error)) => Err(error.context(format!("finalize cleanup: {final_error:#}"))),
+    };
+    let cleanup_succeeded = cleanup.is_ok();
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    let shutdown_drain_evidence = platform.shutdown_drain_evidence().map(|mut evidence| {
+        match shutdown_started {
+            Ok(timestamp) => evidence["ordered_shutdown_started_at_unix_ms"] = json!(timestamp),
+            Err(error) => {
+                evidence["ordered_shutdown_started_at_unix_ms"] = Value::Null;
+                evidence["ordered_shutdown_timestamp_unavailable_reason"] = json!(format!("{error:#}"));
+            }
+        }
+        evidence
+    });
+    if cancelled && cleanup.is_ok() {
+        return (
+            MatrixOutcome {
+                rows: Vec::new(),
+                error: None,
+                cancelled: true,
+                aks_cleanup_confirmed,
+            },
+            cleanup_succeeded,
+        );
+    }
+    let failed_before_teardown = result.is_err();
+    let mut outcome = finish_matrix_cell(config, orchestration_id, run_id, replicas, concurrency, result, cleanup);
+    if failed_before_teardown
+        && let Some((logs, baseline)) = &stopped_logs
+        && let Err(error) = attach_stopped_commit_evidence(config, &mut outcome.rows, logs, baseline)
+    {
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("capture stopped collector commits: {error:#}")),
+            None => error,
+        });
+    }
+    if let Err(error) = attach_collector_teardown_failures(
+        &mut outcome.rows,
+        stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()),
+        cleanup_succeeded,
+    ) {
+        for row in &mut outcome.rows {
+            row.status = "failed".to_owned();
+            let message = format!("capture collector teardown failure evidence: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("capture collector teardown failure evidence: {error:#}")),
+            None => error,
+        });
+    }
     if let Some(evidence) = shutdown_drain_evidence
         && let Err(error) = attach_shutdown_drain_evidence(&mut outcome, evidence)
     {
@@ -3554,7 +4240,548 @@ async fn run_isolated_cell(
             None => error,
         });
     }
-    outcome
+    if let Some(evidence) = platform.local_lifecycle_timing()
+        && let Err(error) = attach_local_lifecycle_timing(&mut outcome, evidence)
+    {
+        for row in &mut outcome.rows {
+            row.status = "failed".to_owned();
+            let message = format!("serialize local lifecycle timing evidence: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message.clone(),
+            });
+        }
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("serialize local lifecycle timing evidence: {error:#}")),
+            None => error,
+        });
+    }
+    if let Err(error) = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" }) {
+        outcome.error = Some(error.context("attach teardown outcome"));
+    }
+    (outcome, cleanup_succeeded)
+}
+
+async fn attach_final_aks_delta_reconciliation(
+    config: &OatConfig,
+    root: Option<&str>,
+    rows: &mut [OatResult],
+    cleanup_succeeded: bool,
+) {
+    for row in rows {
+        let delta = if cleanup_succeeded {
+            match root {
+                Some(root) => {
+                    match tokio::time::timeout(Duration::from_secs(30), read_delta_log_commits(root, &row.table)).await
+                    {
+                        Ok(Ok(delta)) => Some(delta),
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Err(error) = apply_final_aks_delta_reconciliation(config, row, delta.as_ref(), cleanup_succeeded) {
+            row.status = "failed".to_owned();
+            row.failure = Some(format!("final AKS Delta reconciliation failed: {error:#}"));
+        }
+    }
+}
+
+/// Local final reconciliation reads the verified stopped snapshot's Delta log, the same source as
+/// [`attach_local_delta_reconciliation`]; an unset root or failed verification stays unavailable.
+fn attach_final_local_delta_reconciliation(
+    config: &OatConfig,
+    run_id: &str,
+    rows: &mut [OatResult],
+    cleanup_succeeded: bool,
+) {
+    let root = config.platform.local.snapshot_root.as_deref().map(Path::new);
+    let verified = cleanup_succeeded
+        && root.is_some_and(|root| crate::local::stopped_snapshot_references(root, run_id, &config.tables).is_ok());
+    for row in rows {
+        let delta = root.filter(|_| verified).and_then(|root| {
+            read_local_delta_log_commits(&root.join(run_id).join(&row.table).join("table").join("_delta_log")).ok()
+        });
+        if let Err(error) = apply_final_aks_delta_reconciliation(config, row, delta.as_ref(), cleanup_succeeded) {
+            row.status = "failed".to_owned();
+            row.failure = Some(format!("final AKS Delta reconciliation failed: {error:#}"));
+        }
+    }
+}
+
+fn apply_final_aks_delta_reconciliation(
+    config: &OatConfig,
+    row: &mut OatResult,
+    delta: Option<&Value>,
+    cleanup_succeeded: bool,
+) -> Result<()> {
+    let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing AKS cell evidence")?)?;
+    let mut cell = CellEvidence::default();
+    if let Some(reports) = evidence["client_phase_reports"].as_array()
+        && reports.len() == config.clients_per_table
+    {
+        cell.client_reports.insert(row.table.clone(), reports.clone());
+    }
+    let acknowledged = cell.client_cumulative_total(&row.table, "completed_rows");
+    let cumulative = evidence.pointer("/durable_commits/run_cumulative_output");
+    let final_delta = exploratory_delta_reconciliation(
+        delta,
+        cumulative,
+        acknowledged,
+        Some(if cleanup_succeeded {
+            "final_delta_log_unavailable"
+        } else {
+            "cleanup_failed_or_uncertain"
+        }),
+    );
+    let reconciliation = cell.reconciliation(&row.table, evidence.get("durable_commits"));
+    let established = cleanup_succeeded
+        && final_delta["status"] == "matched"
+        && reconciliation["status"] == "within_bound"
+        && reconciliation["settled"] == true
+        && reconciliation["ambiguous_rows"] == 0
+        && evidence["durable_commits"]["collector_teardown_admissions"]["status"] == "clear"
+        && evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"] == 0;
+    if !evidence["durable_commits"].is_object() {
+        evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
+    }
+    evidence["durable_commits"]["run_cumulative_output"]["post_teardown_verification"] = json!(if established {
+        "matched_final_delta_log"
+    } else {
+        "unavailable_or_mismatched"
+    });
+    evidence["durable_commits"]["post_teardown_delta_reconciliation"] = final_delta;
+    evidence["reconciliation"] = reconciliation;
+    if !established {
+        row.status = "failed".to_owned();
+        let reason = "final_aks_delta_reconciliation_unavailable_or_mismatched";
+        row.failure = Some(match row.failure.take() {
+            Some(prior) => format!("{prior}; {reason}"),
+            None => reason.to_owned(),
+        });
+    }
+    row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    Ok(())
+}
+
+fn attach_terminal_summary_commits(
+    config: &OatConfig,
+    root: Option<&str>,
+    rows: &mut [OatResult],
+    inputs: &ShutdownFinalizationInputs,
+) -> Result<bool> {
+    let Some(summaries) = &inputs.terminal_summaries else {
+        return Ok(false);
+    };
+    ensure!(
+        inputs.unavailable_reason.is_none() && inputs.terminal_capture.is_some(),
+        "terminal source unavailable"
+    );
+    let [row] = rows else {
+        bail!("terminal summary requires one original result")
+    };
+    ensure!(
+        config.tables.as_slice() == std::slice::from_ref(&row.table),
+        "terminal summary table differs from original configuration"
+    );
+    ensure!(
+        row.replicas > 0 && summaries.len() == usize::try_from(row.replicas)?,
+        "terminal replica coverage differs"
+    );
+    let mut url = Url::parse(root.context("terminal summary has no original Delta root")?)?;
+    ensure!(
+        url.scheme() == "abfss" && url.query().is_none() && url.fragment().is_none(),
+        "invalid original Delta root"
+    );
+    ensure!(
+        !row.table.is_empty()
+            && row
+                .table
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "invalid original table"
+    );
+    url.set_path(&format!(
+        "{}/telemetry/sqlserver/{}/",
+        url.path().trim_end_matches('/'),
+        row.table
+    ));
+    let expected_table = fixture_sha256(url.as_str().as_bytes());
+    let mut pod_uids = BTreeSet::new();
+    let mut pod_names = BTreeSet::new();
+    let mut versions = BTreeMap::new();
+    let mut publication_identities = BTreeSet::new();
+    let mut publication_delta_versions = Vec::new();
+    let mut total_rows = 0_u64;
+    const MAX_SAFE: u64 = 9_007_199_254_740_991;
+    for pod in summaries {
+        ensure!(
+            [&pod.pod_name, &pod.pod_uid, &pod.container]
+                .iter()
+                .all(|s| !s.is_empty() && s.len() <= 253 && !s.bytes().any(|b| b.is_ascii_control())),
+            "invalid terminal collector identity"
+        );
+        ensure!(
+            pod_uids.insert(&pod.pod_uid)
+                && pod_names.insert(&pod.pod_name)
+                && pod.container == config.dfe_container
+                && pod.restart_count == 0
+                && pod.exit_code == 0,
+            "terminal collector identity or exit differs"
+        );
+        let summary = &pod.summary;
+        ensure!(
+            summary.schema_version == 2
+                && summary.incomplete == 0
+                && summary.failed == 0
+                && summary.cancelled_ambiguous == 0
+                && summary.pending == 0
+                && summary.admitted == summary.committed,
+            "terminal admission accounting incomplete"
+        );
+        ensure!(
+            [
+                summary.admitted,
+                summary.committed,
+                summary.failed,
+                summary.cancelled_ambiguous,
+                summary.pending,
+                summary.committed_rows
+            ]
+            .iter()
+            .all(|value| *value <= MAX_SAFE),
+            "terminal admission count exceeds safe range"
+        );
+        for call in &summary.publication_evidence {
+            ensure!(
+                call.clean && call.reasons.is_empty() && !call.outcomes.is_empty(),
+                "terminal publication call evidence is incomplete"
+            );
+            for outcome in &call.outcomes {
+                ensure!(
+                    !outcome.app_id.is_empty()
+                        && outcome.app_id.len() <= 253
+                        && !outcome.app_id.bytes().any(|byte| byte.is_ascii_control())
+                        && outcome.app_version >= 0
+                        && u64::try_from(outcome.app_version).is_ok_and(|version| version <= MAX_SAFE),
+                    "terminal publication identity is invalid"
+                );
+                ensure!(
+                    publication_identities.insert((outcome.app_id.clone(), outcome.app_version)),
+                    "duplicate terminal app identity and version"
+                );
+                let delta_version = match outcome.status.as_str() {
+                    "committed_now" | "already_committed" if outcome.reason.is_none() => outcome
+                        .delta_version
+                        .context("terminal publication outcome has no exact Delta version")?,
+                    "unknown" => {
+                        ensure!(
+                            outcome.delta_version.is_none() && outcome.reason.is_some(),
+                            "unknown terminal publication outcome is malformed"
+                        );
+                        bail!("terminal publication outcome is unknown")
+                    }
+                    _ => bail!("terminal publication outcome is malformed"),
+                };
+                ensure!(
+                    delta_version <= MAX_SAFE,
+                    "terminal publication Delta version exceeds safe range"
+                );
+                publication_delta_versions.push(delta_version);
+            }
+        }
+        let mut pod_rows = 0_u64;
+        for commit in &summary.commits {
+            ensure!(
+                commit.table_id == expected_table
+                    && [commit.version, commit.rows, commit.files, commit.parquet_bytes]
+                        .iter()
+                        .all(|value| *value <= MAX_SAFE)
+                    && commit.rows > 0
+                    && commit.files > 0
+                    && commit.parquet_bytes > 0,
+                "terminal commit identity or counts invalid"
+            );
+            ensure!(versions.insert(commit.version, json!({"delta_version":commit.version,"rows":commit.rows,"files":commit.files,"parquet_bytes":commit.parquet_bytes})).is_none(), "duplicate terminal Delta version");
+            ensure!(versions.len() <= 10_000, "terminal commit evidence exceeds bound");
+            pod_rows = pod_rows
+                .checked_add(commit.rows)
+                .context("terminal commit row overflow")?;
+        }
+        ensure!(
+            pod_rows == summary.committed_rows,
+            "terminal commit rows do not match admission summary"
+        );
+        total_rows = total_rows
+            .checked_add(pod_rows)
+            .filter(|rows| *rows <= MAX_SAFE)
+            .context("terminal total exceeds safe range")?;
+    }
+    let publication_delta_versions = publication_delta_versions.into_iter().collect::<BTreeSet<_>>();
+    ensure!(
+        publication_delta_versions
+            .iter()
+            .all(|version| versions.contains_key(version))
+            && versions
+                .keys()
+                .all(|version| publication_delta_versions.contains(version)),
+        "terminal app identity evidence does not bind every physical Delta version"
+    );
+    let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+    ensure!(
+        evidence["durable_commits"].is_object(),
+        "original commit evidence unavailable"
+    );
+    let mut cell = CellEvidence::default();
+    let reports = evidence["client_phase_reports"]
+        .as_array()
+        .context("missing client phase reports")?;
+    ensure!(
+        reports.len() == config.clients_per_table,
+        "client phase coverage differs"
+    );
+    cell.client_reports.insert(row.table.clone(), reports.clone());
+    let acknowledged = cell
+        .client_cumulative_total(&row.table, "completed_rows")
+        .context("client acknowledgement unavailable")?;
+    let cumulative = &mut evidence["durable_commits"]["run_cumulative_output"];
+    ensure!(cumulative.is_object(), "original cumulative evidence unavailable");
+    cumulative["rows"] = json!(total_rows);
+    cumulative["commits"] = json!(versions.len());
+    cumulative["scope"] = json!("fenced_collector_process_lifetime_terminal_summary");
+    cumulative["commits_by_version"] = json!(versions.into_values().collect::<Vec<_>>());
+    cumulative["client_completed_rows"] = json!(acknowledged);
+    cumulative["settled"] = json!(total_rows >= acknowledged);
+    cumulative["settle_gap_rows"] = json!(acknowledged.saturating_sub(total_rows));
+    cumulative["cell_scope"] = json!("fenced_collector_process_lifetime_terminal_summary");
+    cumulative["unavailable_reason"] = Value::Null;
+    evidence["durable_commits"]["collector_teardown_admissions"] =
+        json!({"status":"clear", "cancelled_ambiguous":0, "source":"fenced_terminal_summaries"});
+    evidence["reconciliation"] = cell.reconciliation(&row.table, evidence.get("durable_commits"));
+    row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    Ok(true)
+}
+
+fn attach_collector_teardown_admissions(
+    rows: &mut [OatResult],
+    logs: Option<&[ProcessLog]>,
+    cleanup_succeeded: bool,
+) -> Result<()> {
+    for row in rows {
+        let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+        if !evidence["durable_commits"].is_object() {
+            evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
+        }
+        let warned = logs.is_some_and(|logs| {
+            logs.iter().any(|log| {
+                log.text
+                    .contains("cancelled admissions had no observed publication outcome")
+            })
+        });
+        let complete = logs.is_some_and(|logs| {
+            let identities = logs.iter().map(|log| &log.instance_id).collect::<BTreeSet<_>>();
+            cleanup_succeeded
+                && logs.len() == row.replicas as usize
+                && !logs.is_empty()
+                && identities.len() == logs.len()
+                && logs
+                    .iter()
+                    .all(|log| log.role == ComponentRole::Collector && log.complete)
+        });
+        let status = if warned {
+            "ambiguous"
+        } else if complete {
+            "clear"
+        } else {
+            "unavailable"
+        };
+        evidence["durable_commits"]["collector_teardown_admissions"] = json!({
+            "status": status,
+            "cancelled_ambiguous": if status == "clear" { Some(0_u64) } else { None },
+        });
+        if status != "clear" {
+            row.status = "failed".to_owned();
+            let reason = if warned {
+                "teardown_delivery_ambiguous"
+            } else {
+                "post_stop_collector_admission_evidence_unavailable"
+            };
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {reason}"),
+                None => reason.to_owned(),
+            });
+        }
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    }
+    Ok(())
+}
+
+fn attach_stopped_commit_evidence(
+    config: &OatConfig,
+    rows: &mut [OatResult],
+    logs: &[ProcessLog],
+    baseline: &[ProcessLog],
+) -> Result<()> {
+    let (scoped, used_offsets) = cell_scoped_commit_logs(logs, baseline)?;
+    let saw_ambiguous_warning = logs.iter().any(|log| {
+        log.text
+            .contains("cancelled admissions had no observed publication outcome")
+    });
+    let cancelled_ambiguous = if logs.is_empty() || logs.iter().any(|log| !log.complete) {
+        None
+    } else {
+        logs.iter().try_fold(0_u64, |total, log| {
+            let marker = "cancelled admissions had no observed publication outcome";
+            let count = if log.text.contains(marker) {
+                log_counter(&log.text, marker, "cancelled_ambiguous")?
+            } else {
+                0
+            };
+            total.checked_add(count)
+        })
+    };
+    for row in rows {
+        let mut evidence: Value =
+            serde_json::from_str(row.evidence_json.as_deref().context("cell evidence is missing")?)?;
+        evidence["pre_teardown_reconciliation"] = evidence["reconciliation"].clone();
+        let window = evidence
+            .pointer("/backlog/measurement_window/start_unix_ms")
+            .and_then(Value::as_u64)
+            .zip(
+                evidence
+                    .pointer("/backlog/measurement_window/end_unix_ms")
+                    .and_then(Value::as_u64),
+            );
+        let commits =
+            durable_commit_evidence_for_cell(config, logs, &scoped, window, u64::try_from(row.started_at_ms).ok())?;
+        if let Some(stopped) = commits.get(&row.table) {
+            if !evidence["durable_commits"].is_object() {
+                evidence["durable_commits"] = json!({});
+            }
+            if stopped["run_cumulative_output"]["rows"].as_u64().is_none() {
+                let post = stopped["run_cumulative_output"].clone();
+                evidence["durable_commits"]["post_teardown_cumulative_output"] = post.clone();
+                if !evidence["durable_commits"]["run_cumulative_output"].is_object() {
+                    evidence["durable_commits"]["run_cumulative_output"] = post;
+                }
+                evidence["reconciliation"] =
+                    json!({"status":"unavailable", "reason":"post_teardown_collector_commit_evidence_unavailable"});
+                row.status = "failed".to_owned();
+                let reason = "post_teardown_collector_commit_evidence_unavailable";
+                row.failure = Some(match row.failure.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason.to_owned(),
+                });
+                row.evidence_json = Some(serde_json::to_string(&evidence)?);
+                continue;
+            }
+            let mut cell = CellEvidence::default();
+            if let Some(reports) = evidence["client_phase_reports"].as_array()
+                && reports.len() == config.clients_per_table
+            {
+                cell.client_reports.insert(row.table.clone(), reports.clone());
+            }
+            let target = cell.client_cumulative_total(&row.table, "completed_rows");
+            let previous = evidence["durable_commits"]["run_cumulative_output"].clone();
+            if saw_ambiguous_warning {
+                row.status = "failed".to_owned();
+                let reason = "teardown_delivery_ambiguous";
+                row.failure = Some(match row.failure.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason.to_owned(),
+                });
+            }
+            if evidence["evidence_class"] == "d53_exploratory"
+                && previous["commits_by_version"] != stopped["run_cumulative_output"]["commits_by_version"]
+            {
+                row.status = "failed".to_owned();
+                let reason = "post_teardown_exploratory_reconciliation_required";
+                row.failure = Some(match row.failure.take() {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason.to_owned(),
+                });
+            }
+            let cumulative = &mut evidence["durable_commits"]["run_cumulative_output"];
+            *cumulative = stopped["run_cumulative_output"].clone();
+            let delta = cumulative["rows"].as_u64();
+            cumulative["client_completed_rows"] = json!(target);
+            cumulative["settled"] = json!(target.zip(delta).is_some_and(|(completed, rows)| rows >= completed));
+            cumulative["settle_gap_rows"] = json!(
+                target
+                    .zip(delta)
+                    .map(|(completed, rows)| completed.saturating_sub(rows))
+            );
+            cumulative["settle_seconds"] = previous["settle_seconds"].clone();
+            cumulative["settle_timeout_seconds"] = previous["settle_timeout_seconds"].clone();
+            cumulative["cell_scope"] = json!(if used_offsets {
+                "process_log_offset_and_ingress_time"
+            } else {
+                "ingress_time_only"
+            });
+            cumulative["capture"] = json!("post_stop_collector_logs");
+            cumulative["cancelled_ambiguous"] = json!(cancelled_ambiguous);
+            cumulative["complete_delivery_established"] = json!(false);
+            evidence["durable_commits"]["complete_30_second_commit_windows"] =
+                stopped["complete_30_second_commit_windows"].clone();
+            evidence["reconciliation"] = cell.reconciliation(&row.table, Some(&evidence["durable_commits"]));
+        }
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    }
+    Ok(())
+}
+
+fn attach_teardown_outcome(outcome: &mut MatrixOutcome, status: &str) -> Result<()> {
+    for row in &mut outcome.rows {
+        let mut evidence: Value =
+            serde_json::from_str(row.evidence_json.as_deref().context("cell evidence is missing")?)?;
+        let teardown = json!(status);
+        evidence["teardown_outcome"] = teardown.clone();
+        evidence["complete_delivery_established"] = json!(false);
+        if !evidence["durable_commits"].is_object() {
+            evidence["durable_commits"] = unavailable_commits("commit_evidence_unavailable");
+        }
+        let commits = &mut evidence["durable_commits"];
+        if !commits["collector_teardown_admissions"].is_object() {
+            commits["collector_teardown_admissions"] = json!({"status": "unavailable", "cancelled_ambiguous": null});
+        }
+        if !commits["run_cumulative_output"].is_object() {
+            commits["run_cumulative_output"] = unavailable_cumulative_output("commit_evidence_unavailable");
+        }
+        commits["complete_delivery_established"] = json!(false);
+        commits["run_cumulative_output"]["complete_delivery_established"] = json!(false);
+        commits["run_cumulative_output"]["teardown_outcome"] = teardown.clone();
+        if !commits["output_throughput"].is_object() {
+            commits["output_throughput"] = json!({"rows": null, "rows_per_second": null,
+                "window_commit_count": null, "max_commit_rows": null, "rate_resolution_rows_per_second": null,
+                "slope_rows_per_second": null, "unavailable_reason": "measurement_window_evidence_unavailable"});
+        }
+        commits["output_throughput"]["teardown_outcome"] = teardown.clone();
+        if let Some(windows) = commits["complete_30_second_commit_windows"].as_array_mut() {
+            for window in windows {
+                window["teardown_outcome"] = teardown.clone();
+            }
+        } else {
+            commits["complete_30_second_commit_windows"] = json!([]);
+            commits["complete_30_second_commit_windows_unavailable_reason"] =
+                json!("measurement_window_evidence_unavailable");
+        }
+        evidence["commit_window_output_throughput"] = commits["output_throughput"].clone();
+        if row.status != "succeeded" {
+            row.rows_per_second = None;
+            evidence["ranking_eligible"] = json!(false);
+            evidence["ranking_metrics"] = Value::Null;
+            evidence["ranking_ineligible_reason"] = json!("cell_failed");
+            evidence["screen_v1"] = Value::Null;
+            evidence["screen_v1_csv_reason"] = json!("cell_failed");
+            evidence["commit_window_output_usage"] = json!("diagnostic_only");
+        }
+        annotate_zero_durable_output(&mut evidence);
+        row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    }
+    Ok(())
 }
 
 fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: Value) -> Result<()> {
@@ -3571,6 +4798,69 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
         evidence["shutdown_drain"] = shutdown_drain.clone();
         row.evidence_json =
             Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
+    }
+    Ok(())
+}
+
+fn copy_local_delta_reconciliation(evidence: &mut Value, reconciliation: &Value) {
+    if !evidence["durable_commits"].is_object() {
+        evidence["durable_commits"] = json!({});
+    }
+    evidence["durable_commits"]["delta_log_reconciliation"] = reconciliation.clone();
+    evidence["screen_v1"] = reconciliation["csv"].clone();
+    evidence["screen_v1_csv_reason"] = reconciliation["csv_reason"].clone();
+}
+
+fn attach_local_delta_reconciliation(
+    config: &OatConfig,
+    run_id: &str,
+    rows: &mut [OatResult],
+    cleanup_confirmed: bool,
+) -> Result<()> {
+    for row in rows {
+        let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
+        let mut evidence: Value =
+            serde_json::from_str(evidence_json).context("parse cell evidence before local Delta reconciliation")?;
+        let durable = evidence.get("durable_commits").cloned().unwrap_or(Value::Null);
+        let reconciliation = if !cleanup_confirmed {
+            unavailable_local_delta_reconciliation("local_snapshot_unavailable_after_cleanup_failure")
+        } else if let Some(snapshot_root) = config.platform.local.snapshot_root.as_deref() {
+            let root = Path::new(snapshot_root);
+            match crate::local::stopped_snapshot_references(root, run_id, &config.tables) {
+                Ok(_) => {
+                    let log_path = root.join(run_id).join(&row.table).join("table").join("_delta_log");
+                    reconcile_local_delta_log(&log_path, &durable)
+                }
+                Err(error) => {
+                    unavailable_local_delta_reconciliation(format!("stopped_snapshot_verification_failed: {error:#}"))
+                }
+            }
+        } else {
+            unavailable_local_delta_reconciliation("snapshot_root_not_configured")
+        };
+        copy_local_delta_reconciliation(&mut evidence, &reconciliation);
+        if reconciliation["status"] == "mismatch" {
+            row.status = "failed".to_owned();
+            let failure = "local_delta_log_reconciliation_mismatch";
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {failure}"),
+                None => failure.to_owned(),
+            });
+        }
+        row.evidence_json =
+            Some(serde_json::to_string(&evidence).context("serialize cell evidence with local Delta reconciliation")?);
+    }
+    Ok(())
+}
+
+fn attach_local_lifecycle_timing(outcome: &mut MatrixOutcome, timing: Value) -> Result<()> {
+    for row in &mut outcome.rows {
+        let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
+        let mut evidence: Value =
+            serde_json::from_str(evidence_json).context("parse cell evidence before timing update")?;
+        evidence["local_lifecycle_timing"] = timing.clone();
+        row.evidence_json =
+            Some(serde_json::to_string(&evidence).context("serialize cell evidence with local lifecycle timing")?);
     }
     Ok(())
 }
@@ -3734,7 +5024,22 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, usize, String)> {
     cells
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static STACK_TEST_PLATFORM: std::sync::Mutex<Option<Box<dyn Platform>>>;
+}
+
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
+    #[cfg(test)]
+    if let Ok(platform) = STACK_TEST_PLATFORM.try_with(|platform| {
+        platform
+            .lock()
+            .map_err(|error| anyhow::anyhow!("stack test platform lock failed: {error}"))?
+            .take()
+            .context("stack test platform already consumed")
+    }) {
+        return platform;
+    }
     if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
         && config.platform.kind == crate::config::OatMode::Local
     {
@@ -3786,6 +5091,9 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             router_yaml: None,
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
+            shutdown_inputs: None,
         })),
     }
 }
@@ -4236,6 +5544,8 @@ async fn run_matrix_cell(
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
+    let expected_source_revision = local_build_source_revision()?;
+    verify_collector_startup_source_revision(&expected_source_revision, &baseline_logs)?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
     let diagnostics_root = Path::new("out/arrowcol-oat/admission-diagnostics");
@@ -4247,7 +5557,7 @@ async fn run_matrix_cell(
             client_run.evidence.overload_guard.as_mut(),
             None,
         );
-        return Err(error);
+        client_run.failure = Some(format!("finish resource measurement: {error:#}"));
     }
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
@@ -4277,6 +5587,7 @@ async fn run_matrix_cell(
         .await?;
         client_run.evidence.durable_commits = durable_commits;
         let process_logs = platform.process_logs(config).await?;
+        verify_collector_startup_source_revision(&expected_source_revision, &process_logs)?;
         client_run.evidence.processes = Some(process_evidence_for_cell(
             config,
             &process_logs,
@@ -4294,16 +5605,14 @@ async fn run_matrix_cell(
         startup_readback_diff,
     );
     if let Err(error) = capture {
-        if !guard_stopped {
-            return Err(error);
-        }
-        tracing::error!(%error, "post-overload output/process capture failed; retaining stop evidence for cleanup");
+        tracing::error!(%error, "post-measurement output/process capture failed; retaining evidence for cleanup");
         client_run.failure = Some(format!(
-            "{}; post_overload_stop_capture_unavailable",
-            client_run
-                .failure
-                .as_deref()
-                .unwrap_or("overload_guard stopped the cell")
+            "{}; post_measurement_capture_unavailable: {error:#}",
+            client_run.failure.as_deref().unwrap_or(if guard_stopped {
+                "overload_guard stopped the cell"
+            } else {
+                "post_measurement_capture_failed"
+            })
         ));
         if let Some(guard) = &mut client_run.evidence.overload_guard {
             guard["post_stop_capture"] = json!("unavailable");
@@ -4345,7 +5654,10 @@ async fn run_matrix_cell(
             if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() {
                 client_run
                     .evidence
-                    .downstream_unavailable("local_qap_observation_unavailable");
+                    .downstream_unavailable(
+                        "local_qap_observation_unavailable",
+                        format!("Local QAP observation unavailable: {error:#}. Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged."),
+                    );
             } else {
                 client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
             }
@@ -4423,24 +5735,64 @@ fn result_rows(
                     "reason": "AKS cAdvisor throttling evidence is unavailable"
                 })
             });
-        Some(json!({
-            "collector": {
-                "requested_workers": concurrency,
-                "limit_cpu": requested.collector.limits.cpu,
-                "limit_millicores": collector_limit_millicores,
-                "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
-            },
-            "client": {
-                "requested_concurrency_per_process": config.dmv_concurrency,
-                "limit_cpu": requested.client.limits.cpu,
-                "limit_millicores": client_limit_millicores,
-                "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
-            },
-            "throttling": throttling,
-        }))
+        Some(merge_aks_cpu_quota_evidence(
+            json!({
+                "collector": {
+                    "requested_workers": concurrency,
+                    "limit_cpu": requested.collector.limits.cpu,
+                    "limit_millicores": collector_limit_millicores,
+                    "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
+                },
+                "client": {
+                    "requested_concurrency_per_process": config.dmv_concurrency,
+                    "requested_concurrency_per_worker": config.dmv_concurrency,
+                    "limit_cpu": requested.client.limits.cpu,
+                    "limit_millicores": client_limit_millicores,
+                    "concurrency_per_cpu_core": config.dmv_concurrency
+                        .filter(|_| config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).is_none_or(|streams| streams == 0))
+                        .map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
+                },
+                "throttling": throttling,
+            }),
+            resource_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.get("cpu_quota")),
+        ))
     } else {
-        None
+        client_run.evidence.cpu_quota.clone()
     };
+    let quota_cores = if config.platform.kind == crate::config::OatMode::Aks {
+        cpu_quota_evidence
+            .as_ref()
+            .and_then(|v| v["collector"]["limit_millicores"].as_f64())
+            .map(|v| v / 1000.0)
+    } else {
+        let nano_cpus = config
+            .platform
+            .local
+            .collector_cpu_quota
+            .map_or(Ok(u64::from(concurrency) * 1_000_000_000), |quota| quota.nano_cpus())
+            .map_err(anyhow::Error::msg)?;
+        (nano_cpus != 0).then_some(nano_cpus as f64 / 1_000_000_000.0)
+    };
+    let mut leaf_evidence = tunable_leaf_evidence(config)?;
+    promote_collector_readback(
+        config,
+        &mut leaf_evidence,
+        client_run.evidence.processes.as_ref(),
+        replicas,
+    )?;
+    let router_replicas = if config.platform.kind == crate::config::OatMode::Local {
+        1
+    } else {
+        replicas
+    };
+    promote_router_readback(
+        config,
+        &mut leaf_evidence,
+        client_run.evidence.processes.as_ref(),
+        router_replicas,
+    )?;
     let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
@@ -4463,8 +5815,13 @@ fn result_rows(
         "effective_stop_budgets": config.maintenance_stop_budget()?,
         "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "inert_fields": leaf_evidence["inert_fields"],
+        "projection_only": leaf_evidence["projection_only"],
+        "runner_controls": leaf_evidence["runner_controls"],
+        "consumer_verified": leaf_evidence["consumer_verified"],
         "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
         "cpu_quota": cpu_quota_evidence,
+        "column_concurrency": requested_column_concurrency(config, concurrency, quota_cores, client_run.evidence.processes.as_ref()),
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
@@ -4495,37 +5852,79 @@ fn result_rows(
     for table in assigned_tables {
         let client = client_run.metrics.get(&table);
         let exploratory = config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable);
-        let reconciliation_failure = if exploratory {
-            match client_run
-                .evidence
-                .durable_commits
-                .get(&table)
-                .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
-                .and_then(Value::as_str)
-            {
-                Some("matched") => None,
-                Some("mismatch") => Some((
-                    "exploratory_delta_log_reconciliation_mismatch",
-                    "exploratory_reconciliation_mismatch",
-                )),
-                _ => Some((
-                    "exploratory_delta_log_reconciliation_unavailable",
-                    "exploratory_reconciliation_unavailable",
-                )),
-            }
-        } else {
-            None
-        };
-        let table_failure = match (failure.as_deref(), reconciliation_failure) {
+        let reconciliation = client_run
+            .evidence
+            .reconciliation(&table, client_run.evidence.durable_commits.get(&table));
+        let reconciliation_failure =
+            if reconciliation["exact_match_required"] == true && reconciliation["exact_match"] == false {
+                let reason = if reconciliation["status"] == "unsettled" {
+                    "delta_commit_drain_timeout"
+                } else {
+                    "delta_exact_match_failed"
+                };
+                Some((reason, reason))
+            } else if exploratory {
+                match client_run
+                    .evidence
+                    .durable_commits
+                    .get(&table)
+                    .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
+                    .and_then(Value::as_str)
+                {
+                    Some("matched") => None,
+                    Some("mismatch") => Some((
+                        "exploratory_delta_log_reconciliation_mismatch",
+                        "exploratory_reconciliation_mismatch",
+                    )),
+                    _ => Some((
+                        "exploratory_delta_log_reconciliation_unavailable",
+                        "exploratory_reconciliation_unavailable",
+                    )),
+                }
+            } else {
+                None
+            };
+        let admission =
+            client_admission_for_table(config, run_id, &table, client_run.evidence.client_reports.get(&table));
+        let admission_failure = admission["failure"].as_str();
+        let mut table_failure = match (failure.as_deref(), reconciliation_failure) {
             (Some(failure), Some((reason, _))) => Some(format!("{failure}; {reason}")),
             (None, Some((reason, _))) => Some(reason.to_owned()),
             (_, None) => failure.clone(),
         };
+        if let Some(reason) = admission_failure {
+            table_failure = Some(match table_failure.take() {
+                Some(previous) => format!("{previous}; {reason}"),
+                None => reason.to_owned(),
+            });
+        }
         if client.is_none() && table_failure.is_none() {
             bail!("DMV client did not report measurements for {table}");
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let mut table_tunables = tunables.clone();
+        let mut table_leaf_evidence = leaf_evidence.clone();
+        promote_client_readback(
+            config,
+            &mut table_leaf_evidence,
+            client_run.evidence.client_reports.get(&table),
+        )?;
+        verify_literal_delta_consumers(
+            config,
+            &mut table_leaf_evidence,
+            client_run.evidence.processes.as_ref(),
+            client_run.evidence.preload_delta.as_ref(),
+            replicas,
+            &table,
+        )?;
+        for field in [
+            "inert_fields",
+            "projection_only",
+            "runner_controls",
+            "consumer_verified",
+        ] {
+            table_tunables[field] = table_leaf_evidence[field].clone();
+        }
         if let Some((_, reason)) = reconciliation_failure {
             table_tunables["failure"] = json!(reason);
         }
@@ -4575,6 +5974,12 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                evidence["client_admission"] = admission;
+                evidence["inert_fields"] = table_leaf_evidence["inert_fields"].clone();
+                evidence["projection_only"] = table_leaf_evidence["projection_only"].clone();
+                evidence["runner_controls"] = table_leaf_evidence["runner_controls"].clone();
+                evidence["consumer_verified"] = table_leaf_evidence["consumer_verified"].clone();
+                evidence["ownership_samples"] = json!(client_run.pinning.samples);
                 if let Some(fleet) = &config.platform.fleet {
                     let mut pool_rates = BTreeMap::<String, f64>::new();
                     for report in client_run.evidence.client_reports.get(&table).into_iter().flatten() {
@@ -4621,8 +6026,11 @@ fn result_rows(
                         "window_seconds": seconds,
                         "scope": "collector_commit_finish_window_not_client_cohort",
                     });
-                    evidence["ranking_eligible"] = json!(reconciliation_failure.is_none());
-                    evidence["ranking_metrics"] = if let Some((reason, _)) = reconciliation_failure {
+                    let ineligible_reason = reconciliation_failure.map(|(reason, _)| reason).or_else(|| {
+                        (table_failure.is_some() || client_run.pinning.violation.is_some()).then_some("cell_failed")
+                    });
+                    evidence["ranking_eligible"] = json!(ineligible_reason.is_none());
+                    evidence["ranking_metrics"] = if let Some(reason) = ineligible_reason {
                         evidence["ranking_ineligible_reason"] = json!(reason);
                         evidence["commit_window_output_usage"] = json!("diagnostic_only");
                         evidence["diagnostic_client_rows_per_second"] =
@@ -4652,7 +6060,7 @@ fn result_rows(
             table,
             rows: client.map(|client| client.rows),
             duration_ms: client.map(|client| client.duration_ms),
-            rows_per_second: if reconciliation_failure.is_some() {
+            rows_per_second: if table_failure.is_some() || client_run.pinning.violation.is_some() {
                 None
             } else {
                 client.map(|client| client.rows_per_second)
@@ -4707,6 +6115,7 @@ struct PinningReport {
     owners: HashMap<String, String>,
     violation: Option<String>,
     verification_error: Option<String>,
+    samples: Vec<Value>,
 }
 
 async fn run_clients(
@@ -4717,25 +6126,33 @@ async fn run_clients(
     replicas: u32,
 ) -> Result<ClientRun> {
     let mut pinning = PinningReport::default();
-    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
-        Ok(report) => Ok(report),
+    let mut report = match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
+        Ok(report) => report,
         Err(error) => {
-            let sample = async {
-                let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-                sample_router_table_owners(platform, config, &client, tables).await
-            }
-            .await;
-            let pinning = failed_client_pinning_report(&error, sample, tables, pinning);
             tracing::error!(run_id = project_run_id, error = %error, "OAT client run failed; incomplete measurements are unavailable");
-            Ok(ClientRun {
+            ClientRun {
                 metrics: HashMap::new(),
                 pinning,
                 qap_tables: Vec::new(),
                 failure: Some(format!("{error:#}")),
                 evidence: CellEvidence::default(),
-            })
+            }
         }
+    };
+    if let Some(failure) = &report.failure {
+        let sample = async {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+            sample_router_table_owners(platform, config, &client, tables).await
+        }
+        .await;
+        report.pinning = failed_client_pinning_report(
+            &anyhow::anyhow!("{failure}"),
+            sample,
+            tables,
+            std::mem::take(&mut report.pinning),
+        );
     }
+    Ok(report)
 }
 
 fn failed_client_pinning_report(
@@ -4758,6 +6175,14 @@ fn record_owner_observation(
     tables: &[String],
     require_owner: bool,
 ) {
+    let timestamp = unix_time_ms_u64();
+    report.samples.push(json!({
+        "observed_at_unix_ms": timestamp.as_ref().ok(),
+        "timestamp_unavailable_reason": timestamp.as_ref().err().map(|error| format!("{error:#}")),
+        "owners_by_table": sample.as_ref().ok(),
+        "unavailable_reason": sample.as_ref().err().map(|error| format!("{error:#}")),
+        "require_owner": require_owner,
+    }));
     match sample {
         Ok(sample) => {
             let violation = check_owner_sample(tables, &sample, &mut report.owners).or_else(|| {
@@ -4884,8 +6309,6 @@ async fn run_clients_inner(
                 format!("oat-{project_run_id}-{table}-c{}", client_index + 1),
                 "--rows".to_owned(),
                 client_config.rows_per_table.to_string(),
-                "--concurrency".to_owned(),
-                client_config.dmv_concurrency.to_string(),
                 "--table".to_owned(),
                 table.clone(),
                 "--edge-secret-file".to_owned(),
@@ -4903,6 +6326,9 @@ async fn run_clients_inner(
                 "--schedule-timeout-secs".to_owned(),
                 timing_budget.schedule_wait_seconds.to_string(),
             ];
+            if let Some(concurrency) = client_config.dmv_concurrency {
+                arguments.extend(["--concurrency".to_owned(), concurrency.to_string()]);
+            }
             if config.pilot_mode {
                 arguments.push("--pilot".to_owned());
             }
@@ -4924,37 +6350,137 @@ async fn run_clients_inner(
         }
     }
 
-    loop {
+    let ready_clients = loop {
         let progress = match poll_clients(platform, config, &handles).await {
             Ok(progress) => progress,
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after readiness polling failed also failed: {cleanup_error:#}"
-                    ))),
-                };
+                let mut failure = format!("{error:#}");
+                if let Err(cleanup_error) = cleanup {
+                    failure.push_str(&format!(
+                        "; cancelling clients after readiness polling failed also failed: {cleanup_error:#}"
+                    ));
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some(failure),
+                    evidence,
+                });
             }
         };
+        for (handle, state) in handles.iter().zip(&progress) {
+            evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&state.output));
+        }
         match validate_client_readiness(
             &progress,
             readiness_started.elapsed(),
             Duration::from_secs(config.client_ready_timeout_seconds),
         ) {
-            Ok(true) => break,
+            Ok(true) => break progress,
             Ok(false) => {}
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after readiness failure also failed: {cleanup_error:#}"
-                    ))),
-                };
+                let mut failure = format!("{error:#}");
+                if let Err(cleanup_error) = cleanup {
+                    failure.push_str(&format!(
+                        "; cancelling clients after readiness failure also failed: {cleanup_error:#}"
+                    ));
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some(failure),
+                    evidence,
+                });
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    macro_rules! fail_prepared {
+        ($error:expr, $cleanup:expr, $qap:expr) => {{
+            let mut failure = format!("{:#}", $error);
+            if let Err(error) = $cleanup {
+                failure.push_str(&format!("; client cancellation failed: {error:#}"));
+            }
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: $qap,
+                failure: Some(failure),
+                evidence,
+            });
+        }};
+    }
+    for table in tables {
+        let admission = client_admission_for_table(config, project_run_id, table, evidence.client_reports.get(table));
+        if let Some(reason) = admission["failure"].as_str() {
+            let cleanup = cancel_clients(platform, config, &handles).await;
+            let mut failure = reason.to_owned();
+            if let Err(error) = cleanup {
+                failure.push_str(&format!(
+                    "; cancelling clients after admission failure also failed: {error:#}"
+                ));
+            }
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: Vec::new(),
+                failure: Some(failure),
+                evidence,
+            });
+        }
+    }
+    let _ =
+        match diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some(format!("{error:#}")),
+                    evidence,
+                });
+            }
+        };
+
+    let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
+    if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
+        let readback = async {
+            let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
+            parity_admission_readback(
+                config,
+                &logs,
+                &ready_clients,
+                darwin_precheck.as_deref() == Ok("qualified"),
+            )
+        }
+        .await;
+        match readback {
+            Ok(proof) => evidence.parity_admission_readback = Some(proof),
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(
+                    error.context("verify parity readback before admission"),
+                    cleanup,
+                    Vec::new()
+                );
+            }
+        }
+    }
+    if darwin_precheck.as_deref() == Ok("qualified")
+        && let Err(error) = wait_observer_barrier(config, project_run_id).await
+    {
+        let cleanup = cancel_clients(platform, config, &handles).await;
+        fail_prepared!(
+            error.context("verify observer readiness before admission"),
+            cleanup,
+            Vec::new()
+        );
     }
 
     // Delta metadata is committed during preflight, so QAP binding must precede arming.
@@ -4984,54 +6510,105 @@ async fn run_clients_inner(
         Ok(qap_tables) => qap_tables,
         Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
             platform.mark_qap_outcome_unresolved();
-            evidence.downstream_unavailable("local_qap_initialization_unavailable");
+            evidence.downstream_unavailable(
+                "local_qap_initialization_unavailable",
+                format!("Local QAP initialization unavailable: {error:#}. Derived Kusto/QAP metrics are null."),
+            );
             Vec::new()
         }
         Err(error) => {
             platform.mark_qap_outcome_unresolved();
             let cleanup = cancel_clients(platform, config, &handles).await;
-            return match cleanup {
-                Ok(()) => Err(error).context("initialize run-scoped QAP before client schedule"),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "cancelling prepared OAT clients after QAP initialization failure also failed: {cleanup_error:#}"
-                ))),
-            };
+            fail_prepared!(
+                error.context("initialize run-scoped QAP before client schedule"),
+                cleanup,
+                Vec::new()
+            );
         }
     };
-    platform
+    if let Err(error) = platform
         .finalize_campaign_load_admission(config, project_run_id, tables)
-        .await?;
+        .await
+    {
+        let cleanup = cancel_clients(platform, config, &handles).await;
+        fail_prepared!(error, cleanup, qap_tables);
+    }
+    evidence.preload_delta = match platform.preload_delta_evidence(config, tables) {
+        Ok(proof) => proof,
+        Err(error) => {
+            let cleanup = cancel_clients(platform, config, &handles).await;
+            fail_prepared!(error.context("verify pre-load Delta layout"), cleanup, qap_tables);
+        }
+    };
+    let schedule_admission = match diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await {
+        Ok(value) => value,
+        Err(error) => fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables),
+    };
+    let diagnostic_reference = if schedule_admission.is_some() {
+        match std::env::var(DIAGNOSTIC_REFERENCE_ENV).context("diagnostic reference is missing before schedule") {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(error, cleanup, qap_tables);
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = diagnostic_memory_admission_or_cancel(config, platform, &handles).await {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
+    }
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
-    let schedule_created_at_unix_ms = unix_time_ms_u64()?;
-    let run_start_unix_ms = schedule_created_at_unix_ms
-        .checked_add(
-            config
-                .schedule_lead_seconds
-                .checked_mul(1_000)
-                .context("OAT schedule lead overflow")?,
-        )
-        .context("shared OAT run start timestamp overflow")?;
-    let measurement_start_unix_ms = run_start_unix_ms
-        .checked_add(
-            config
-                .warmup_seconds
-                .checked_mul(1_000)
-                .context("OAT warm-up duration overflow")?,
-        )
-        .context("shared OAT measurement start timestamp overflow")?;
-    let measurement_end_unix_ms = measurement_start_unix_ms
-        .checked_add(
-            config
-                .measure_seconds
-                .checked_mul(1_000)
-                .context("OAT measurement duration overflow")?,
-        )
-        .context("shared OAT measurement end timestamp overflow")?;
+    let timestamps = (|| -> Result<_> {
+        let schedule_created_at_unix_ms = unix_time_ms_u64()?;
+        let run_start_unix_ms = schedule_created_at_unix_ms
+            .checked_add(
+                config
+                    .schedule_lead_seconds
+                    .checked_mul(1_000)
+                    .context("OAT schedule lead overflow")?,
+            )
+            .context("shared OAT run start timestamp overflow")?;
+        let measurement_start_unix_ms = run_start_unix_ms
+            .checked_add(
+                config
+                    .warmup_seconds
+                    .checked_mul(1_000)
+                    .context("OAT warm-up duration overflow")?,
+            )
+            .context("shared OAT measurement start timestamp overflow")?;
+        let measurement_end_unix_ms = measurement_start_unix_ms
+            .checked_add(
+                config
+                    .measure_seconds
+                    .checked_mul(1_000)
+                    .context("OAT measurement duration overflow")?,
+            )
+            .context("shared OAT measurement end timestamp overflow")?;
+        Ok((
+            schedule_created_at_unix_ms,
+            run_start_unix_ms,
+            measurement_start_unix_ms,
+            measurement_end_unix_ms,
+        ))
+    })();
+    let (schedule_created_at_unix_ms, run_start_unix_ms, measurement_start_unix_ms, measurement_end_unix_ms) =
+        match timestamps {
+            Ok(timestamps) => timestamps,
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(error, cleanup, qap_tables);
+            }
+        };
     let delivery = tokio::time::timeout_at(schedule_deadline, async {
-        platform
-            .arm_clients(config, project_run_id, run_start_unix_ms)
-            .await
-            .context("arm common OAT client schedule")?;
+        schedule_after_diagnostic_admission(
+            diagnostic_reference.as_deref(),
+            schedule_admission.as_ref(),
+            project_run_id,
+            || platform.arm_clients(config, project_run_id, run_start_unix_ms),
+        )?
+        .await
+        .context("arm common OAT client schedule")?;
         local_progress(
             config,
             &format!(
@@ -5069,12 +6646,12 @@ async fn run_clients_inner(
         Ok(observed_at) => observed_at,
         Err(error) => {
             let cleanup = cancel_clients(platform, config, &handles).await;
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "cancelling clients after schedule delivery failure also failed: {cleanup_error:#}"
-                ))),
-            };
+            fail_prepared!(
+                error,
+                cleanup
+                    .map_err(|error| error.context("cancelling clients after schedule delivery failure also failed")),
+                qap_tables
+            );
         }
     };
     evidence.client_schedule = Some(json!({
@@ -5097,7 +6674,13 @@ async fn run_clients_inner(
     if let Some(prepared) = &mut prepared_guard {
         prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
         prepared.engine.proof["run_id"] = json!(project_run_id);
-        prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
+        prepared.probe.since_ms = match unix_time_ms_u64() {
+            Ok(now) => now.saturating_sub(GUARD_MAX_GAP_MS),
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(error, cleanup, qap_tables);
+            }
+        };
     }
     let native = match platform.native_telemetry_source(config, &qap_tables).await {
         Ok(source) => source,
@@ -5127,7 +6710,30 @@ async fn run_clients_inner(
     let mut router_sql_end = None;
     let mut router_cpu_pressure_samples = Vec::new();
     let mut router_cpu_pressure_parse_failures = 0_u64;
+    macro_rules! retain_armed_client_failure {
+        ($error:expr) => {{
+            let mut failure = format!("{:#}", $error);
+            if let Err(error) =
+                cancel_active_clients_with_evidence(platform, config, &handles, &active_clients, &mut evidence).await
+            {
+                failure.push_str(&format!("; client cancellation failed: {error:#}"));
+            }
+            if let Err(error) = sampler.finish_early(&mut evidence).await {
+                failure.push_str(&format!("; terminal evidence capture failed: {error:#}"));
+            }
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables,
+                failure: Some(failure),
+                evidence,
+            });
+        }};
+    }
     while completed_clients.len() < handles.len() {
+        if let Err(error) = platform.poll_resource_measurement(config).await {
+            retain_armed_client_failure!(error);
+        }
         let pending_indices = handles
             .iter()
             .enumerate()
@@ -5140,7 +6746,7 @@ async fn run_clients_inner(
         let progress = tokio::select! {
             biased;
             reason = sampler.wait_for_overload_stop() => {
-                let cancellation = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                let cancellation = cancel_active_clients_with_evidence(platform, config, &handles, &active_clients, &mut evidence).await;
                 let capture = sampler.finish_early(&mut evidence).await;
                 let mut failure = reason;
                 if let Err(error) = cancellation {
@@ -5162,38 +6768,21 @@ async fn run_clients_inner(
         let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
-                let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling OAT clients after polling failure also failed: {cleanup_error:#}"
-                    ))),
-                };
+                retain_armed_client_failure!(error);
             }
         };
         for (index, state) in pending_indices.into_iter().zip(progress) {
             let handle = &handles[index];
             if let Some(failure) = state.failure {
+                evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&state.output));
                 let error = anyhow::anyhow!("OAT client {} failed: {failure}", handle.client_id);
-                let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling remaining OAT clients also failed: {cleanup_error:#}"
-                    ))),
-                };
+                retain_armed_client_failure!(error);
             }
             if state.completed && !completed_clients.contains(&handle.client_id) {
                 let output = match platform.finish_client(config, handle.clone()).await {
                     Ok(output) => output,
                     Err(error) => {
-                        let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                        return match cleanup {
-                            Ok(()) => Err(error),
-                            Err(cleanup_error) => Err(error.context(format!(
-                                "cancelling clients after client collection failed also failed: {cleanup_error:#}"
-                            ))),
-                        };
+                        retain_armed_client_failure!(error);
                     }
                 };
                 active_clients[index] = false;
@@ -5223,35 +6812,44 @@ async fn run_clients_inner(
                 let measurement = match measurement {
                     Ok(measurement) => measurement,
                     Err(error) => {
-                        let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                        return match cleanup {
-                            Ok(()) => Err(error),
-                            Err(cleanup_error) => Err(error.context(format!(
-                                "cancelling clients after invalid measurement also failed: {cleanup_error:#}"
-                            ))),
-                        };
+                        evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
+                        retain_armed_client_failure!(error);
                     }
                 };
-                let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
-                if let Err(error) = evidence.record_client(&effective_client_config, &handle.table, &output) {
-                    let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
-                    return match cleanup {
-                        Ok(()) => Err(error),
-                        Err(cleanup_error) => Err(error.context(format!(
-                            "cancelling clients after invalid effective-config evidence failed: {cleanup_error:#}"
-                        ))),
+                let effective_client_config =
+                    match resolved_fleet_client_config(config, index % config.clients_per_table) {
+                        Ok(config) => config,
+                        Err(error) => {
+                            evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
+                            retain_armed_client_failure!(error);
+                        }
                     };
-                }
-                if let Some(report) = evidence
-                    .client_reports
-                    .get_mut(&handle.table)
-                    .and_then(|reports| reports.last_mut())
+                if let Err(error) =
+                    evidence.record_client(&effective_client_config, &handle.table, &handle.client_id, &output)
                 {
+                    evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
+                    retain_armed_client_failure!(error);
+                }
+                let placement = match config
+                    .platform
+                    .fleet
+                    .as_ref()
+                    .map(|fleet| serde_json::to_value(&fleet.clients[index].placement))
+                    .transpose()
+                {
+                    Ok(placement) => placement,
+                    Err(error) => retain_armed_client_failure!(error),
+                };
+                if let Some(report) = evidence.client_reports.get_mut(&handle.table).and_then(|reports| {
+                    reports
+                        .iter_mut()
+                        .find(|report| report["client_id"] == handle.client_id)
+                }) {
                     report["client_id"] = json!(handle.client_id);
                     report["rows_per_second"] = json!(measurement.metrics.rows_per_second);
                     report["rows"] = json!(measurement.metrics.rows);
-                    if let Some(fleet) = &config.platform.fleet {
-                        report["placement"] = serde_json::to_value(&fleet.clients[index].placement)?;
+                    if let Some(placement) = placement {
+                        report["placement"] = placement;
                     }
                 }
                 client_metrics
@@ -5304,7 +6902,9 @@ async fn run_clients_inner(
         measurement_end_unix_ms,
     ));
     let mut metrics = HashMap::with_capacity(tables.len());
-    sampler.finish(&mut evidence).await?;
+    if let Err(error) = sampler.finish(&mut evidence).await {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
+    }
     if evidence.overload_stop.is_some()
         || evidence
             .overload_guard
@@ -5319,70 +6919,81 @@ async fn run_clients_inner(
             evidence,
         });
     }
-    for table in tables {
-        let reports = client_metrics
-            .remove(table)
-            .with_context(|| format!("no DMV clients reported measurements for {table}"))?;
-        if reports.len() != config.clients_per_table {
-            bail!(
-                "DMV table {table} returned {} of {} client measurements",
-                reports.len(),
-                config.clients_per_table
-            );
-        }
-        let rows = reports
-            .iter()
-            .try_fold(0_u64, |sum, report| sum.checked_add(report.metrics.rows))
-            .context("aggregated DMV row count overflow")?;
-        let rows_per_second = reports.iter().map(|report| report.metrics.rows_per_second).sum::<f64>();
-        if !rows_per_second.is_finite() || rows_per_second <= 0.0 {
-            bail!("aggregated DMV throughput for {table} is invalid");
-        }
-        let mut windows = std::collections::BTreeMap::<u64, u64>::new();
-        for report in &reports {
-            for window in &report.pilot_windows {
-                let rows = windows.entry(window.index).or_default();
-                *rows = rows
-                    .checked_add(window.rows)
-                    .context("aggregated pilot row count overflow")?;
-            }
-        }
-        if config.pilot_mode {
-            let expected_windows = config.measure_seconds / 30;
-            if windows.len() != expected_windows as usize || windows.keys().copied().ne(0..expected_windows) {
-                bail!("pilot clients returned an incomplete 30-second window set for {table}");
-            }
-            let mut rates = Vec::with_capacity(windows.len());
-            for (index, rows) in &windows {
-                let rate = *rows as f64 / 30.0;
-                rates.push(rate);
-                println!(
-                    "pilot_table={table} window={} window_seconds=30 rows={rows} rows_per_second={rate:.3}",
-                    index + 1
+    if darwin_precheck.as_deref() == Ok("qualified")
+        && let Err(error) = wait_observer_completion(config, project_run_id, measurement_end_unix_ms).await
+    {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
+    }
+    let aggregation = (|| -> Result<()> {
+        for table in tables {
+            let reports = client_metrics
+                .remove(table)
+                .with_context(|| format!("no DMV clients reported measurements for {table}"))?;
+            if reports.len() != config.clients_per_table {
+                bail!(
+                    "DMV table {table} returned {} of {} client measurements",
+                    reports.len(),
+                    config.clients_per_table
                 );
             }
-            let stable_horizon =
-                stable_window_horizon(&rates).map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
-            println!("pilot_table={table} stable_from_seconds={stable_horizon}");
-        } else if !windows.is_empty() {
-            bail!("non-pilot DMV client unexpectedly returned pilot windows for {table}");
+            let rows = reports
+                .iter()
+                .try_fold(0_u64, |sum, report| sum.checked_add(report.metrics.rows))
+                .context("aggregated DMV row count overflow")?;
+            let rows_per_second = reports.iter().map(|report| report.metrics.rows_per_second).sum::<f64>();
+            if !rows_per_second.is_finite() || rows_per_second <= 0.0 {
+                bail!("aggregated DMV throughput for {table} is invalid");
+            }
+            let mut windows = std::collections::BTreeMap::<u64, u64>::new();
+            for report in &reports {
+                for window in &report.pilot_windows {
+                    let rows = windows.entry(window.index).or_default();
+                    *rows = rows
+                        .checked_add(window.rows)
+                        .context("aggregated pilot row count overflow")?;
+                }
+            }
+            if config.pilot_mode {
+                let expected_windows = config.measure_seconds / 30;
+                if windows.len() != expected_windows as usize || windows.keys().copied().ne(0..expected_windows) {
+                    bail!("pilot clients returned an incomplete 30-second window set for {table}");
+                }
+                let mut rates = Vec::with_capacity(windows.len());
+                for (index, rows) in &windows {
+                    let rate = *rows as f64 / 30.0;
+                    rates.push(rate);
+                    println!(
+                        "pilot_table={table} window={} window_seconds=30 rows={rows} rows_per_second={rate:.3}",
+                        index + 1
+                    );
+                }
+                let stable_horizon =
+                    stable_window_horizon(&rates).map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
+                println!("pilot_table={table} stable_from_seconds={stable_horizon}");
+            } else if !windows.is_empty() {
+                bail!("non-pilot DMV client unexpectedly returned pilot windows for {table}");
+            }
+            metrics.insert(
+                table.clone(),
+                ClientMetrics {
+                    rows,
+                    duration_ms: reports
+                        .iter()
+                        .map(|report| report.metrics.duration_ms)
+                        .max()
+                        .unwrap_or(1),
+                    rows_per_second,
+                    completions: reports
+                        .iter()
+                        .flat_map(|report| report.metrics.completions.clone())
+                        .collect(),
+                },
+            );
         }
-        metrics.insert(
-            table.clone(),
-            ClientMetrics {
-                rows,
-                duration_ms: reports
-                    .iter()
-                    .map(|report| report.metrics.duration_ms)
-                    .max()
-                    .unwrap_or(1),
-                rows_per_second,
-                completions: reports
-                    .iter()
-                    .flat_map(|report| report.metrics.completions.clone())
-                    .collect(),
-            },
-        );
+        Ok(())
+    })();
+    if let Err(error) = aggregation {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
     }
     Ok(ClientRun {
         metrics,
@@ -5473,6 +7084,44 @@ async fn cancel_active_clients(
         .collect::<Vec<_>>();
     if !errors.is_empty() {
         bail!("one or more OAT clients could not be cancelled: {}", errors.join("; "));
+    }
+    Ok(())
+}
+
+async fn cancel_active_clients_with_evidence(
+    platform: &dyn Platform,
+    config: &OatConfig,
+    handles: &[ClientHandle],
+    active: &[bool],
+    evidence: &mut CellEvidence,
+) -> Result<()> {
+    let selected = handles
+        .iter()
+        .zip(active.iter())
+        .filter(|(_, active)| **active)
+        .map(|(handle, _)| handle)
+        .collect::<Vec<_>>();
+    let results = join_all(
+        selected
+            .iter()
+            .map(|handle| platform.cancel_client_with_output(config, handle)),
+    )
+    .await;
+    let mut errors = Vec::new();
+    for (handle, result) in selected.into_iter().zip(results) {
+        match result {
+            Ok(output) => evidence.record_cancelled_client(&handle.table, &handle.client_id, output.as_deref()),
+            Err(error) => {
+                evidence.record_cancelled_client(&handle.table, &handle.client_id, None);
+                errors.push(format!("{}: {error:#}", handle.client_id));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        bail!(
+            "one or more OAT clients could not be cancelled or their logs captured: {}",
+            errors.join("; ")
+        );
     }
     Ok(())
 }
@@ -6512,7 +8161,12 @@ async fn observe_qap(
             if matches!(mode, arrowcol_loadgen::ObservationMode::Local)
                 && failures.iter().all(|table| table["temporary_unavailable"] == true)
             {
-                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+                let diagnostic = failures
+                    .iter()
+                    .filter_map(|table| table["error"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable).context(diagnostic));
             }
             bail!("QAP table metadata/statistics observation failed; not a temporary service-availability failure");
         }
@@ -6550,16 +8204,19 @@ fn apply_qap_observation(
     evidence: &mut CellEvidence,
 ) -> QapMetrics {
     if local_downstream_optional(mode) && observation["catch_up_status"] == "deadline_incomplete" {
-        evidence.downstream_unavailable(format!(
-            "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
+        evidence.downstream_unavailable(
+            "local_qap_observation_unavailable",
+            format!(
+                "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
              Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged.",
-            metrics
-                .completion_percent
-                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-            metrics
-                .pending_artifacts
-                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-        ));
+                metrics
+                    .completion_percent
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                metrics
+                    .pending_artifacts
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            ),
+        );
         evidence.qap_observation = Some(observation);
         return QapMetrics::default();
     }
@@ -6847,6 +8504,333 @@ fn pin_init_config_json(
     }))?)
 }
 
+fn pin_config_with_initial_delta_properties(config: &str, properties: &InitialDeltaProperties) -> Result<String> {
+    if properties.properties()?.is_empty() {
+        return Ok(config.to_owned());
+    }
+    let mut config: Value = serde_json::from_str(config)?;
+    config["run_table"]
+        .as_object_mut()
+        .context("literal Delta properties require fresh run-table initialization")?
+        .insert("delta_properties".to_owned(), serde_json::to_value(properties)?);
+    Ok(serde_json::to_string(&config)?)
+}
+
+fn verify_initial_delta_property_readback(observed: &Value, properties: &InitialDeltaProperties) -> Result<()> {
+    for (key, expected) in properties.properties()? {
+        if observed.get(&key).and_then(Value::as_str) != Some(expected.as_str()) {
+            bail!("committed initial Delta property readback omitted or mismatched {key}");
+        }
+    }
+    Ok(())
+}
+
+fn read_local_initial_delta_evidence(
+    state_dir: &Path,
+    table: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    let mut evidence: Value =
+        serde_json::from_slice(&fs::read(state_dir.join("initial-delta-before-admission.json"))?)?;
+    ensure!(
+        evidence["table"] == table && evidence["requested_initial_properties"] == json!(properties.properties()?),
+        "initial Delta property evidence is for a different table or request",
+    );
+    verify_initial_delta_property_readback(&evidence["committed_properties"], properties)?;
+    evidence["consumer_evidence_scope"] =
+        json!("committed_metadata_only_not_ingest_estimator_or_maintenance_operation");
+    Ok(evidence)
+}
+
+fn enforce_delta_projection_only(config: &OatConfig, evidence: &mut Value) -> Result<()> {
+    let properties = config.initial_delta_properties()?;
+    let operation_state = |operation| {
+        let Some(settings) = config
+            .tunables
+            .maintenance
+            .as_ref()
+            .filter(|settings| settings.enabled == Some(true))
+        else {
+            return "disabled";
+        };
+        let Some(operations) = &settings.operations else {
+            return "unverified";
+        };
+        if !operations.contains(&operation) {
+            "disabled"
+        } else if settings.apply == Some(true) {
+            "configured_apply_not_effective_readback"
+        } else {
+            "plan_only_not_effective_readback"
+        }
+    };
+    for (path, requested, operation) in [
+        (
+            "delta.target_file_size_bytes",
+            properties.target_file_size_bytes,
+            arrowcol_tunables::MaintenanceOperation::Optimize,
+        ),
+        (
+            "delta.checkpoint_interval",
+            properties.checkpoint_interval,
+            arrowcol_tunables::MaintenanceOperation::Checkpoint,
+        ),
+    ] {
+        if requested.is_none() {
+            continue;
+        }
+        for field in [
+            "runner_controls",
+            "consumer_verified",
+            "inert_fields",
+            "projection_only",
+        ] {
+            evidence[field]
+                .as_array_mut()
+                .with_context(|| format!("{field} must be an array"))?
+                .retain(|entry| entry["path"] != path);
+        }
+        evidence["projection_only"].as_array_mut().context("projection_only must be an array")?.push(json!({
+            "path": path,
+            "reason": "committed_metadata_not_effective_consumer_readback",
+            "ingest_estimator": if properties.target_file_size_bytes.is_some() && path == "delta.target_file_size_bytes" {
+                Some("unverified")
+            } else {
+                None
+            },
+            "maintenance_operation": operation_state(operation),
+            "precedence": if path == "delta.target_file_size_bytes" {
+                "table_arrowcol_writer_or_optimize_target_then_table_delta_target_then_process_specific_target_then_process_delta_fallback_then_registry"
+            } else {
+                "table_delta_checkpoint_interval_then_process_interval_then_registry"
+            },
+        }));
+    }
+    Ok(())
+}
+
+fn verify_literal_delta_consumers(
+    config: &OatConfig,
+    evidence: &mut Value,
+    processes: Option<&Value>,
+    preload: Option<&Value>,
+    replicas: u32,
+    table: &str,
+) -> Result<()> {
+    enforce_delta_projection_only(config, evidence)?;
+    let properties = config.initial_delta_properties()?;
+    if properties.properties()?.is_empty() {
+        return Ok(());
+    }
+    let table = canonical_initializer_table_name(table)?;
+    let metadata = preload
+        .filter(|value| value["table"] == table)
+        .and_then(|value| {
+            let initial = &value["initial_delta_properties"];
+            initial.get("committed_properties").or_else(|| {
+                initial
+                    .get("catalog_registration_receipt")
+                    .and_then(|receipt| receipt.get("properties"))
+            })
+        })
+        .and_then(Value::as_object);
+    let literal_present = |key: &str, value: u64| {
+        metadata.and_then(|metadata| metadata.get(key)).and_then(Value::as_str) == Some(value.to_string().as_str())
+    };
+    let override_present = metadata.is_some_and(|metadata| {
+        ["arrowcol.writer.targetFileSize", "arrowcol.optimize.targetFileSize"]
+            .iter()
+            .any(|key| metadata.contains_key(*key))
+    });
+    let collectors = verified_processes(config, processes, ComponentRole::Collector, replicas);
+    let maintenance = verified_processes(config, processes, ComponentRole::Maintenance, 1);
+    let operation_enabled = |operation| {
+        config.tunables.maintenance.as_ref().is_some_and(|settings| {
+            settings.enabled == Some(true)
+                && settings.apply == Some(true)
+                && settings
+                    .operations
+                    .as_ref()
+                    .is_some_and(|operations| operations.contains(&operation))
+        })
+    };
+    for (path, requested, operation, property_key, operation_field, policy_field) in [
+        (
+            "delta.target_file_size_bytes",
+            properties.target_file_size_bytes,
+            arrowcol_tunables::MaintenanceOperation::Optimize,
+            "delta.targetFileSize",
+            "optimize_target_file_bytes",
+            "arrowcol.optimize.targetFileSize",
+        ),
+        (
+            "delta.checkpoint_interval",
+            properties.checkpoint_interval,
+            arrowcol_tunables::MaintenanceOperation::Checkpoint,
+            "delta.checkpointInterval",
+            "checkpoint_every_commits",
+            "delta.checkpointInterval",
+        ),
+    ] {
+        let Some(requested) = requested else { continue };
+        let target = path == "delta.target_file_size_bytes";
+        let operation_name = if target { "optimize" } else { "checkpoint" };
+        let mut estimator_records = Vec::new();
+        let estimator_matched = !target
+            || collectors.as_ref().is_some_and(|processes| {
+                processes.iter().all(|process| {
+                    let Some(records) = process["adaptive_table_policies"].as_array() else {
+                        return false;
+                    };
+                    let records = records
+                        .iter()
+                        .filter(|record| record["table_name"] == table)
+                        .collect::<Vec<_>>();
+                    if records.is_empty() {
+                        return false;
+                    }
+                    records.iter().all(|record| {
+                        estimator_records.push(json!({
+                            "instance_id": process["instance_id"], "table_name":record["table_name"],
+                            "scope":record["scope"], "target_parquet_bytes":record["config"]["target_parquet_bytes"],
+                        }));
+                        record["scope"] == "installed_estimator_not_full_run_history"
+                            && record["config"]["target_parquet_bytes"].as_u64() == Some(requested)
+                    })
+                })
+            });
+        let mut operation_records = Vec::new();
+        let operation_matched = operation_enabled(operation)
+            && maintenance.as_ref().is_some_and(|processes| {
+                processes.iter().all(|process| {
+                    let policies = &process["maintenance_table_policies"];
+                    let Some(policy) = policies["tables"].get(&table) else {
+                        return false;
+                    };
+                    operation_records.push(json!({
+                        "instance_id":process["instance_id"],"table":table,"active":policy["active"],
+                        "apply":policy["startup"]["apply"],"operations":policy["startup"]["operations"],
+                        "installed_value":policy["operation_settings"][operation_field],
+                        "resolved_policy_value":policy["table_policy"][policy_field],
+                    }));
+                    policies["source"] == "validated_consumer_per_table_policy"
+                        && policy["active"] == true
+                        && policy["startup"]["apply"] == true
+                        && policy["startup"]["operations"]
+                            .as_array()
+                            .is_some_and(|operations| operations.iter().any(|value| value == operation_name))
+                        && policy["operation_settings"][operation_field].as_u64() == Some(requested)
+                        && policy["table_policy"][policy_field].as_u64() == Some(requested)
+                })
+            });
+        let metadata_matched = literal_present(property_key, requested);
+        let verified = metadata_matched && (!target || !override_present) && estimator_matched && operation_matched;
+        let projection = evidence["projection_only"]
+            .as_array_mut()
+            .context("projection array missing")?;
+        let entry = projection
+            .iter_mut()
+            .find(|entry| entry["path"] == path)
+            .context("literal Delta projection entry missing")?;
+        entry["per_table_consumer_readback"] = json!({
+            "table":table,"literal_metadata_matched":metadata_matched,
+            "higher_priority_target_override_present":target && override_present,
+            "ingest_estimator_matched":target.then_some(estimator_matched),
+            "maintenance_operation_matched":operation_matched,
+            "estimator_records":estimator_records,"operation_records":operation_records,
+            "scope":"installed_configuration_snapshot_not_full_run_history_execution_or_durability_proof",
+        });
+        if verified {
+            let mut promoted = entry.clone();
+            promoted["reason"] = json!(if target {
+                "literal_table_target_installed_estimator_and_optimize_readback"
+            } else {
+                "literal_table_checkpoint_installed_operation_readback"
+            });
+            promoted["maintenance_operation"] = json!("installed_configuration_readback_not_execution_proof");
+            if target {
+                promoted["ingest_estimator"] = json!("installed_estimator_readback_not_full_run_history");
+            }
+            projection.retain(|entry| entry["path"] != path);
+            evidence["consumer_verified"]
+                .as_array_mut()
+                .context("consumer_verified array missing")?
+                .push(promoted);
+        }
+    }
+    Ok(())
+}
+
+fn combine_preload_delta_evidence(partition: Option<Value>, initial: Option<Value>) -> Option<Value> {
+    match (partition, initial) {
+        (Some(mut partition), Some(initial)) => {
+            partition["initial_delta_properties"] = initial;
+            Some(partition)
+        }
+        (None, Some(initial)) => Some(json!({
+            "table": initial["table"],
+            "initial_delta_properties": initial,
+        })),
+        (partition, None) => partition,
+    }
+}
+
+fn read_aks_initial_delta_evidence(
+    runtime_dir: &Path,
+    run_id: &str,
+    table: &str,
+    delta_root: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    let initialized: Value =
+        serde_json::from_slice(&fs::read(runtime_dir.join("run-table-initial-delta-properties.json"))?)?;
+    ensure!(
+        initialized["requested_initial_properties"] == json!(properties.properties()?),
+        "AKS initialization receipt belongs to a different property request"
+    );
+    let initialization_receipt = validate_run_table_init_receipt_with_properties(
+        &initialized["receipt"].to_string(),
+        run_id,
+        table,
+        properties,
+    )?;
+    let registered: Value =
+        serde_json::from_slice(&fs::read(runtime_dir.join("run-table-catalog-registration.json"))?)?;
+    let catalog_receipt = validate_catalog_registration_receipt_with_properties(
+        &registered["receipt"].to_string(),
+        run_id,
+        table,
+        delta_root,
+        properties,
+    )?;
+    Ok(json!({
+        "table": table,
+        "initial_delta_properties": {
+            "requested_initial_properties": properties.properties()?,
+            "initialization_receipt": initialization_receipt,
+            "catalog_registration_receipt": catalog_receipt,
+            "source": "signed_catalog_snapshot_readback",
+            "consumer_evidence_scope": "committed_metadata_only_not_ingest_estimator_or_maintenance_operation",
+        },
+    }))
+}
+
+fn canonical_initializer_table_name(table: &str) -> Result<String> {
+    collector_chain::dmv::tables()?
+        .into_iter()
+        .find(|definition| {
+            definition.identity().to_string() == table || definition.identity().table().as_str() == table
+        })
+        .map(|definition| definition.identity().to_string())
+        .context("initializer table is not a canonical DMV identity")
+}
+
+fn local_delta_table_target(state_dir: &Path, table: &str) -> Result<Url> {
+    let root = Url::from_directory_path(state_dir.join("dataflow"))
+        .map_err(|()| anyhow::anyhow!("invalid run-owned local Dataflow root"))?;
+    Ok(arrowcol_loadgen::initialize::canonical_table_target(&root, &canonical_initializer_table_name(table)?)?.0)
+}
+
 async fn run_local_pin_setup(
     config: &OatConfig,
     platform: &LocalPlatform,
@@ -6943,7 +8927,7 @@ fn run_table_initializer_cloud_env(config: &OatConfig, platform: &AksPlatform, r
     if url.scheme() != "abfss" || url.host_str() != Some(format!("{account}.dfs.core.windows.net").as_str()) {
         bail!("run-table initializer Delta account does not match the validated Azure stamp");
     }
-    Ok(json!([
+    let mut environment = json!([
         { "name": "ARROWCOL_DELTA_ROOT", "value": root },
         { "name": "ARROWCOL_AZURE_MODE", "value": "stamped" },
         { "name": "AZURE_SUBSCRIPTION_ID", "value": subscription },
@@ -6952,7 +8936,16 @@ fn run_table_initializer_cloud_env(config: &OatConfig, platform: &AksPlatform, r
         { "name": "AZURE_STORAGE_ACCOUNT", "value": account },
         { "name": "AZURE_STORAGE_CHECKPOINT_CONTAINER", "value": "checkpoints" },
         { "name": "ARROWCOL_RESET_GENERATION", "valueFrom": { "secretKeyRef": { "name": "arrowcol-generation", "key": "generation" } } },
-    ]))
+    ]);
+    if let Some(value) =
+        role_environment(config, ComponentRole::Collector)?.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+    {
+        environment
+            .as_array_mut()
+            .context("initializer environment must be an array")?
+            .push(json!({"name": "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS", "value": value}));
+    }
+    Ok(environment)
 }
 
 fn created_pin_init_job_uid(output: &str, namespace: &str, job_name: &str, run_id: &str) -> Result<String> {
@@ -7029,6 +9022,7 @@ async fn run_aks_pin_setup_job(
         router_yaml,
         run_table,
     )?;
+    let pin_config = pin_config_with_initial_delta_properties(&pin_config, &config.initial_delta_properties()?)?;
     let run_suffix = uuid::Uuid::parse_str(run_id)?.simple().to_string();
     let config_map_name = format!("oat-pin-init-config-{run_suffix}");
     let job_name = format!("oat-pin-init-{run_suffix}");
@@ -7562,8 +9556,41 @@ async fn wait_for_aks_pin_setup(
     }
     if let Some(table) = expected_table {
         validate_run_table_init_receipt(&logs, run_id, table)?;
+        let properties = config.initial_delta_properties()?;
+        if !properties.properties()?.is_empty() {
+            let receipt = validate_run_table_init_receipt_with_properties(&logs, run_id, table, &properties)?;
+            fs::write(
+                platform
+                    .runtime_dir
+                    .as_deref()
+                    .context("initial property receipt evidence directory missing")?
+                    .join("run-table-initial-delta-properties.json"),
+                serde_json::to_vec(
+                    &json!({"receipt":receipt,"requested_initial_properties":properties.properties()?}),
+                )?,
+            )?;
+        }
     }
     Ok(())
+}
+
+fn validate_run_table_init_receipt_with_properties(
+    logs: &str,
+    run_id: &str,
+    table: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    validate_run_table_init_receipt(logs, run_id, table)?;
+    let receipts = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|receipt| receipt["kind"] == "oat_run_table_initialized")
+        .collect::<Vec<_>>();
+    let [receipt] = receipts.as_slice() else {
+        bail!("initial Delta properties require exactly one committed initialization receipt");
+    };
+    verify_initial_delta_property_readback(&receipt["delta"]["properties"], properties)?;
+    Ok((*receipt).clone())
 }
 
 fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Result<()> {
@@ -7602,11 +9629,104 @@ fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Res
 }
 
 fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result<Vec<String>> {
+    local_initializer_args(table, dataflow_root, true)
+}
+
+fn verify_preload_delta(log_dir: &Path, canonical_table: &str) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+
+    let mut paths = fs::read_dir(log_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "json"));
+    paths.sort();
+    ensure!(
+        !paths.is_empty() && paths.len() <= 64,
+        "invalid pre-load Delta version count"
+    );
+    let mut files = Vec::new();
+    let mut metadata = None;
+    for (version, path) in paths.iter().enumerate() {
+        ensure!(
+            path.file_name().and_then(|name| name.to_str()) == Some(format!("{version:020}.json").as_str()),
+            "pre-load Delta versions are not contiguous"
+        );
+        let bytes = fs::read(path)?;
+        ensure!(
+            bytes.len() <= 64 * 1024 * 1024,
+            "pre-load Delta log exceeds the size limit"
+        );
+        for line in std::str::from_utf8(&bytes)?.lines().filter(|line| !line.is_empty()) {
+            let action: Value = serde_json::from_str(line)?;
+            ensure!(
+                action.is_object() && action.get("add").is_none() && action.get("remove").is_none(),
+                "pre-load Delta prefix contains data actions"
+            );
+            if let Some(value) = action.get("metaData") {
+                metadata = Some(value.clone());
+            }
+        }
+        files.push(json!({"version": version, "sha256": format!("{:x}", Sha256::digest(&bytes))}));
+    }
+    let metadata = metadata.context("pre-load Delta metadata is missing")?;
+    let schema: Value = serde_json::from_str(
+        metadata["schemaString"]
+            .as_str()
+            .context("pre-load Delta schema is missing")?,
+    )?;
+    ensure!(
+        schema == arrowcol_loadgen::initialize::canonical_table_delta_schema(canonical_table)?
+            && metadata["partitionColumns"] == json!(["__arrowcol_ingestion"])
+            && metadata
+                .pointer("/configuration/catalog.schemaHistory")
+                .and_then(Value::as_str)
+                .is_some(),
+        "catalog-registered pre-load Delta layout differs from the canonical ingestion-partitioned table"
+    );
+    Ok(json!({
+        "table": canonical_table,
+        "latest_version": paths.len() - 1,
+        "observed_at_unix_ms": unix_time_ms_u64()?,
+        "partition_columns": ["__arrowcol_ingestion"],
+        "granularity": "hour",
+        "logs": files,
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn preload_delta_rejects_data_actions_and_wrong_layout() -> Result<()> {
+    let temp = std::env::temp_dir().join(format!("oat-preload-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&temp)?;
+    let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
+    let schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
+    let metadata = json!({
+        "metaData": {
+            "schemaString": serde_json::to_string(&schema)?,
+            "partitionColumns": ["__arrowcol_ingestion"],
+            "configuration": {"catalog.schemaHistory": "[]"}
+        }
+    });
+    fs::write(temp.join("00000000000000000000.json"), format!("{metadata}\n"))?;
+    fs::write(temp.join("00000000000000000001.json"), format!("{metadata}\n"))?;
+    let proof = verify_preload_delta(&temp, table)?;
+    assert_eq!(proof["latest_version"], 1);
+    fs::write(temp.join("00000000000000000001.json"), "{\"add\":{}}\n")?;
+    assert!(verify_preload_delta(&temp, table).is_err());
+    let mut wrong = metadata;
+    wrong["metaData"]["partitionColumns"] = json!([]);
+    fs::write(temp.join("00000000000000000001.json"), format!("{wrong}\n"))?;
+    assert!(verify_preload_delta(&temp, table).is_err());
+    fs::remove_dir_all(temp)?;
+    Ok(())
+}
+
+fn local_initializer_args(table: &str, dataflow_root: &Path, partitioned: bool) -> Result<Vec<String>> {
     if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
         bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
     }
-    let canonical_table = canonical_dmv_table_name(table)?;
-    if canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
+    let canonical_table = canonical_initializer_table_name(table)?;
+    if partitioned && canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
         bail!("local partition initialization only supports the campaign hot table");
     }
     let dataflow_root = dataflow_root
@@ -7614,7 +9734,12 @@ fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result
         .context("local run-owned Dataflow directory is not valid UTF-8")?;
     Ok(vec![
         "initialize-local".to_owned(),
-        "--partition-by-ingestion-date".to_owned(),
+        if partitioned {
+            "--partition-by-ingestion-date"
+        } else {
+            "--unpartitioned"
+        }
+        .to_owned(),
         "--table".to_owned(),
         canonical_table,
         "--dataflow-root".to_owned(),
@@ -7622,37 +9747,586 @@ fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result
     ])
 }
 
-async fn initialize_local_partitioned_campaign_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
-    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
-        return Ok(());
-    }
-    let [table] = config.tables.as_slice() else {
-        bail!("local partition initialization requires exactly one campaign table");
-    };
-    let dataflow_root = platform.state_dir.join("dataflow");
-    let arguments = local_partition_initializer_args(table, &dataflow_root)?;
-    let workspace = std::env::current_dir()?;
-    let mut build = Command::new("cargo");
-    build.args([
-        "build",
-        "--locked",
-        "--package",
-        "arrowcol-loadgen",
-        "--bin",
-        "arrowcol-loadgen",
-    ]);
-    build.current_dir(&workspace);
-    run_streaming_command(build, "build setup-only local partition initializer").await?;
-
+fn local_table_initializer_command(config: &OatConfig, workspace: &Path, arguments: Vec<String>) -> Result<Command> {
     let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
     initialize.args(arguments);
     initialize.current_dir(workspace);
-    run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
-        .await
-        .context("setup local partitioned table before starting Dataflow or any DMV client")
+    initialize.env_remove("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS");
+    if let Some(value) =
+        role_environment(config, ComponentRole::Collector)?.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+    {
+        initialize.env("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS", value);
+    }
+    Ok(initialize)
 }
 
-async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+async fn initialize_local_maintenance_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let properties = config.initial_delta_properties()?;
+    let Some(partitioned) = local_maintenance_table_initialization_mode(config) else {
+        if !properties.properties()?.is_empty() {
+            bail!("literal Delta properties have no fresh local table initializer");
+        }
+        return Ok(());
+    };
+    let [table] = config.tables.as_slice() else {
+        bail!("local initialization requires exactly one table");
+    };
+    let dataflow_root = platform.state_dir.join("dataflow");
+    let mut arguments = if partitioned {
+        local_partition_initializer_args(table, &dataflow_root)?
+    } else {
+        local_initializer_args(table, &dataflow_root, false)?
+    };
+    append_initial_delta_initializer_arguments(&mut arguments, &properties)?;
+    let workspace = std::env::current_dir()?;
+    let initialize = local_table_initializer_command(config, &workspace, arguments)?;
+    if properties.properties()?.is_empty() {
+        return run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
+            .await
+            .context("setup local table before starting Dataflow or any DMV client");
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS),
+        run_command(initialize, "initialize literal Delta table properties"),
+    )
+    .await
+    .context("local initial Delta property setup timed out; indeterminate initialization is not retried")??;
+    let receipt = verify_local_initial_delta_receipt(
+        std::str::from_utf8(&output.stdout)?,
+        &canonical_initializer_table_name(table)?,
+        partitioned,
+        &properties,
+    )?;
+    tokio::fs::write(
+        platform.state_dir.join("initial-delta-properties.json"),
+        serde_json::to_vec(&receipt)?,
+    )
+    .await?;
+    Ok(())
+}
+
+fn append_initial_delta_initializer_arguments(
+    arguments: &mut Vec<String>,
+    properties: &InitialDeltaProperties,
+) -> Result<()> {
+    properties.properties()?;
+    for (flag, value) in [
+        ("--delta-target-file-size-bytes", properties.target_file_size_bytes),
+        ("--delta-checkpoint-interval", properties.checkpoint_interval),
+    ] {
+        if let Some(value) = value {
+            arguments.extend([flag.to_owned(), value.to_string()]);
+        }
+    }
+    Ok(())
+}
+
+fn verify_local_initial_delta_receipt(
+    logs: &str,
+    table: &str,
+    partitioned: bool,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    let receipts = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|receipt| receipt["kind"] == "local_delta_table_initialized")
+        .collect::<Vec<_>>();
+    let [receipt] = receipts.as_slice() else {
+        bail!("local initializer must emit exactly one committed Delta property receipt");
+    };
+    let delta = &receipt["delta"];
+    let table_id = delta["table_id"]
+        .as_str()
+        .context("local initializer Delta table ID missing")?;
+    let id = uuid::Uuid::parse_str(table_id)?;
+    let schema: Value = serde_json::from_str(
+        delta["schema_json"]
+            .as_str()
+            .context("local initializer schema missing")?,
+    )?;
+    let expected_partitions: Vec<&str> = if partitioned {
+        vec!["__arrowcol_ingestion"]
+    } else {
+        Vec::new()
+    };
+    if receipt["table"] != table
+        || receipt["publisher_drained"] != true
+        || id.is_nil()
+        || id.to_string() != table_id
+        || delta["version"] != 0
+        || delta["active_files"] != 0
+        || delta["partition_columns"] != json!(expected_partitions)
+        || schema != arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?
+    {
+        bail!("local initializer receipt does not prove the fresh canonical Delta table");
+    }
+    verify_initial_delta_property_readback(&delta["properties"], properties)?;
+    Ok((*receipt).clone())
+}
+
+fn local_collector_profile_tag(profile_hash: &str) -> String {
+    format!("arrowcol-oat/dataflow:profile-{profile_hash}")
+}
+
+fn local_client_profile_tag(profile_hash: &str) -> String {
+    format!("arrowcol-oat-client:profile-{profile_hash}")
+}
+
+fn local_build_source_revision() -> Result<String> {
+    let revision = std::env::var("GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local".to_owned());
+    if revision != "local" && !is_lower_hex_string(&revision, 40) {
+        bail!("GIT_SHA must be 'local' or a full 40-character lowercase Git revision for local image builds");
+    }
+    Ok(revision)
+}
+
+fn local_prebuild_image_sources(
+    config: &OatConfig,
+    source_revision: &str,
+) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let profile_hash = config.collector_build_profile_hash();
+    let client_profile_hash = config.client_build_profile_hash();
+    let client = client_profile_hash
+        .as_deref()
+        .map(local_client_profile_tag)
+        .unwrap_or_else(|| "arrowcol-oat-client:local".to_owned());
+    let collector = profile_hash
+        .as_deref()
+        .map(local_collector_profile_tag)
+        .unwrap_or_else(|| "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev".to_owned());
+    let collector_role = if config.platform.local.collector_image_override.is_some() {
+        "collector_build"
+    } else {
+        "collector"
+    };
+    let mut images = vec![
+        (
+            "catalog".to_owned(),
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev".to_owned(),
+            Some(source_revision.to_owned()),
+            None,
+        ),
+        (
+            "client".to_owned(),
+            client,
+            Some(source_revision.to_owned()),
+            client_profile_hash,
+        ),
+        (
+            collector_role.to_owned(),
+            collector,
+            Some(source_revision.to_owned()),
+            profile_hash,
+        ),
+        (
+            "router".to_owned(),
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust:dev".to_owned(),
+            Some(source_revision.to_owned()),
+            None,
+        ),
+        (
+            "sqlserver".to_owned(),
+            "arrowcol-loadtest/sqlserver:2022-cu27".to_owned(),
+            None,
+            None,
+        ),
+    ];
+    if maintenance_enabled(config) {
+        let external = config.maintenance_image.is_some();
+        images.push((
+            "maintenance".to_owned(),
+            config
+                .maintenance_image
+                .as_deref()
+                .unwrap_or("arrowcol-oat/maintenance:local")
+                .to_owned(),
+            (!external).then(|| source_revision.to_owned()),
+            None,
+        ));
+    }
+    if let Some(override_image) = &config.platform.local.collector_image_override {
+        images.push((
+            "collector".to_owned(),
+            override_image.image_id.clone(),
+            Some(override_image.source_revision.clone()),
+            None,
+        ));
+    }
+    images
+}
+
+async fn inspect_local_prebuild_image(
+    role: &str,
+    image: &str,
+    expected_revision: Option<&str>,
+    expected_profile_hash: Option<&str>,
+) -> Result<Value> {
+    let mut inspect = Command::new("docker");
+    inspect.args([
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}} {{if index .Config.Labels \"org.opencontainers.image.revision\"}}{{index .Config.Labels \"org.opencontainers.image.revision\"}}{{else}}-{{end}} {{if index .Config.Labels \"org.opencontainers.image.profile\"}}{{index .Config.Labels \"org.opencontainers.image.profile\"}}{{else}}-{{end}}",
+        image,
+    ]);
+    let output = run_command(inspect, &format!("inspect prebuilt local {role} image")).await?;
+    let observed = String::from_utf8(output.stdout)?;
+    local_prebuild_image_identity(role, image, &observed, expected_revision, expected_profile_hash)
+}
+
+fn local_prebuild_image_identity(
+    role: &str,
+    image: &str,
+    observed: &str,
+    expected_revision: Option<&str>,
+    expected_profile_hash: Option<&str>,
+) -> Result<Value> {
+    let fields = observed.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 {
+        bail!("prebuilt local {role} image metadata must contain image ID, source revision, and profile hash");
+    }
+    let image_id = local_client_image_id(fields[0])?.to_owned();
+    let revision = (fields[1] != "-").then(|| fields[1].to_owned());
+    let profile_hash = (fields[2] != "-").then(|| fields[2].to_owned());
+    if let Some(expected_profile) = expected_profile_hash {
+        let expected_revision = expected_revision.context("profile image requires a source revision")?;
+        verify_profile_image(role, observed, expected_revision, expected_profile)?;
+    } else if let Some(expected) = expected_revision {
+        if role == "collector" && image.starts_with("sha256:") {
+            verify_collector_image(&format!("{} {}", fields[0], fields[1]), image, expected)?;
+        } else if revision.as_deref() != Some(expected) {
+            bail!("prebuilt local {role} image source revision does not match the requested revision");
+        }
+    }
+    Ok(json!({"image": image, "image_id": image_id, "source_revision": revision, "profile_hash": profile_hash}))
+}
+
+#[cfg(test)]
+#[test]
+fn prebuild_image_identity_checks_revision_and_profile_labels() -> Result<()> {
+    let image_id = format!("sha256:{}", "c".repeat(64));
+    let revision = "a".repeat(40);
+    let profile = "b".repeat(64);
+    let observed = format!("{image_id} {revision} {profile}");
+    let actual = local_prebuild_image_identity(
+        "collector",
+        "arrowcol-oat/dataflow:profile-test",
+        &observed,
+        Some(&revision),
+        Some(&profile),
+    )?;
+    assert_eq!(actual["image_id"], image_id);
+    assert_eq!(actual["source_revision"], revision);
+    assert_eq!(actual["profile_hash"], profile);
+    assert!(
+        local_prebuild_image_identity(
+            "collector",
+            "arrowcol-oat/dataflow:profile-test",
+            &observed,
+            Some(&"d".repeat(40)),
+            Some(&profile),
+        )
+        .is_err()
+    );
+    assert!(
+        local_prebuild_image_identity(
+            "collector",
+            "arrowcol-oat/dataflow:profile-test",
+            &observed,
+            Some(&revision),
+            Some(&"e".repeat(64)),
+        )
+        .is_err()
+    );
+    let no_revision = format!("{image_id} - -");
+    assert!(local_prebuild_image_identity("router", "router:dev", &no_revision, Some(&revision), None).is_err());
+    let external = local_prebuild_image_identity("client", "client:local", &no_revision, None, None)?;
+    assert!(external["source_revision"].is_null());
+    Ok(())
+}
+
+async fn local_prebuild_manifest(config: &OatConfig) -> Result<Value> {
+    let source_revision = local_build_source_revision()?;
+    let mut images = serde_json::Map::new();
+    for (role, image, expected_revision, expected_profile_hash) in
+        local_prebuild_image_sources(config, &source_revision)
+    {
+        let identity = inspect_local_prebuild_image(
+            &role,
+            &image,
+            expected_revision.as_deref(),
+            expected_profile_hash.as_deref(),
+        )
+        .await?;
+        images.insert(role, identity);
+    }
+    Ok(json!({"version": 1, "source_revision": source_revision, "images": images}))
+}
+
+async fn write_local_prebuild_manifest(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let manifest = local_prebuild_manifest(config).await?;
+    tokio::fs::write(
+        platform.state_dir.join("prebuild-images.json"),
+        serde_json::to_vec(&manifest).context("serialize local prebuild image manifest")?,
+    )
+    .await
+    .context("write local prebuild image manifest")
+}
+
+async fn verify_local_prebuild_manifest(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let path = platform.state_dir.join("prebuild-images.json");
+    let expected: Value = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .context("read local prebuild image manifest")?,
+    )
+    .context("parse local prebuild image manifest")?;
+    let actual = local_prebuild_manifest(config).await?;
+    if expected != actual {
+        bail!("local prebuilt image IDs or source-revision labels changed before setup");
+    }
+    Ok(())
+}
+
+fn local_maintenance_table_initialization_mode(config: &OatConfig) -> Option<bool> {
+    let partitioned = config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        || config.platform.local.partitioned_table_bootstrap;
+    (partitioned || (config.campaign_profile.is_none() && maintenance_enabled(config) && config.tables.len() == 1))
+        .then_some(partitioned)
+}
+
+fn verify_profile_image(
+    role: &str,
+    observed: &str,
+    expected_source_revision: &str,
+    profile_hash: &str,
+) -> Result<String> {
+    let fields = observed.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 {
+        bail!("local {role} profile image metadata must contain image ID, source revision, and profile hash");
+    }
+    let image_digest = fields[0].strip_prefix("sha256:").unwrap_or_default();
+    if !is_lower_hex_string(image_digest, 64) {
+        bail!("local {role} profile image ID must be a full sha256 digest");
+    }
+    if !is_lower_hex_string(expected_source_revision, 40) || fields[1] != expected_source_revision {
+        bail!("local {role} profile image source revision does not match the checked-out source");
+    }
+    if !is_lower_hex_string(profile_hash, 64) || fields[2] != profile_hash {
+        bail!("local {role} image profile hash does not match the requested build profile");
+    }
+    Ok(fields[0].to_owned())
+}
+
+fn is_lower_hex_string(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+async fn pin_stable_local_images(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if !maintenance_enabled(config) {
+        bail!("stable local images require the maintenance role");
+    }
+    let maintenance = config
+        .maintenance_image
+        .as_deref()
+        .unwrap_or("arrowcol-oat/maintenance:local");
+    let sources = [
+        (
+            "catalog",
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev",
+        ),
+        ("client", "arrowcol-oat-client:local"),
+        (
+            "collector",
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev",
+        ),
+        ("maintenance", maintenance),
+        (
+            "router",
+            "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust:dev",
+        ),
+        ("sqlserver", "arrowcol-loadtest/sqlserver:2022-cu27"),
+    ];
+    let mut images = BTreeMap::new();
+    for (role, default_source) in sources {
+        let source = if role == "collector" {
+            config
+                .collector_build_profile_hash()
+                .as_deref()
+                .map(local_collector_profile_tag)
+                .unwrap_or_else(|| default_source.to_owned())
+        } else if role == "client" {
+            config
+                .client_build_profile_hash()
+                .as_deref()
+                .map(local_client_profile_tag)
+                .unwrap_or_else(|| default_source.to_owned())
+        } else {
+            default_source.to_owned()
+        };
+        let profile_hash = match role {
+            "collector" => config.collector_build_profile_hash(),
+            "client" => config.client_build_profile_hash(),
+            _ => None,
+        };
+        let image = if let Some(profile_hash) = profile_hash {
+            let mut inspect = Command::new("docker");
+            inspect.args(["image", "inspect", "--format", "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}} {{index .Config.Labels \"org.opencontainers.image.profile\"}}", &source]);
+            let output = run_command(inspect, &format!("resolve profile-specific local {role} image"))
+                .await
+                .with_context(|| format!("required immutable {role} profile image {source} is unavailable"))?;
+            let observed = String::from_utf8(output.stdout)?;
+            let mut revision = Command::new("git");
+            revision.args(["rev-parse", "HEAD"]);
+            revision.current_dir(std::env::current_dir()?);
+            let output = run_command(revision, "resolve checked-out source revision").await?;
+            let expected_revision = String::from_utf8(output.stdout)?;
+            verify_profile_image(role, &observed, expected_revision.trim(), &profile_hash)?
+        } else {
+            let mut inspect = Command::new("docker");
+            inspect.args(["image", "inspect", "--format", "{{.Id}}", &source]);
+            let output = run_command(inspect, "resolve stable local image").await?;
+            let observed = String::from_utf8(output.stdout)?;
+            local_client_image_id(&observed)?.to_owned()
+        };
+        images.insert(role.to_owned(), image);
+    }
+    if let Some(collector) = &config.platform.local.collector_image_override {
+        let mut inspect = Command::new("docker");
+        inspect.args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}}",
+            &collector.image_id,
+        ]);
+        let output = run_command(inspect, "verify control collector image").await?;
+        let observed = String::from_utf8(output.stdout)?;
+        verify_collector_image(&observed, &collector.image_id, &collector.source_revision)?;
+        images.insert("collector".to_owned(), collector.image_id.clone());
+    }
+    let path = platform.state_dir.join("tunables.compose.json");
+    let mut overlay: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+    apply_stable_local_images(&mut overlay, &images, config.platform.local.expected_image_ids.as_ref())?;
+    tokio::fs::write(&path, serde_json::to_vec(&overlay)?).await?;
+    println!("[oat] immutable local images: {}", serde_json::to_string(&images)?);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn profile_hash_selects_and_validates_local_collector_image() -> Result<()> {
+    let profile_hash = "a".repeat(64);
+    let source_revision = "c".repeat(40);
+    assert_eq!(
+        local_collector_profile_tag(&profile_hash),
+        format!("arrowcol-oat/dataflow:profile-{profile_hash}")
+    );
+    let observed = format!("sha256:{} {} {}", "b".repeat(64), source_revision, profile_hash);
+    assert_eq!(
+        verify_profile_image("collector", &observed, &source_revision, &profile_hash)?,
+        format!("sha256:{}", "b".repeat(64))
+    );
+    assert!(verify_profile_image("collector", &observed, &source_revision, &"d".repeat(64)).is_err());
+    assert!(verify_profile_image("collector", &observed, &"d".repeat(40), &profile_hash).is_err());
+    assert!(verify_profile_image("collector", "", &source_revision, &profile_hash).is_err());
+    for image_id in [
+        "sha256:short".to_owned(),
+        format!("sha256:{}", "B".repeat(64)),
+        format!("sha256:{}suffix", "b".repeat(64)),
+    ] {
+        let invalid = format!("{image_id} {source_revision} {profile_hash}");
+        assert!(verify_profile_image("collector", &invalid, &source_revision, &profile_hash).is_err());
+    }
+    Ok(())
+}
+
+fn verify_collector_image(observed: &str, image_id: &str, source_revision: &str) -> Result<()> {
+    if observed.trim() != format!("{image_id} {source_revision}") {
+        bail!("control collector image ID or source revision differs from the requested identity");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn collector_override_requires_exact_inspected_identity() {
+    assert!(verify_collector_image("sha256:abc main\n", "sha256:abc", "main").is_ok());
+    assert!(verify_collector_image("sha256:def main", "sha256:abc", "main").is_err());
+    assert!(verify_collector_image("sha256:abc candidate", "sha256:abc", "main").is_err());
+}
+
+fn apply_stable_local_images(
+    overlay: &mut Value,
+    images: &BTreeMap<String, String>,
+    expected: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    if expected.is_some_and(|expected| expected != images) {
+        bail!("local image IDs differ from the pinned ladder identity");
+    }
+    let services = overlay["services"]
+        .as_object_mut()
+        .context("local Compose services missing")?;
+    for (service, role) in [
+        ("arrowcol-catalog", "catalog"),
+        ("oat-client", "client"),
+        ("oat-pin-init", "client"),
+        ("dataflow-1", "collector"),
+        ("delta-maintenance", "maintenance"),
+        ("router", "router"),
+        ("sqlserver", "sqlserver"),
+        ("database-bootstrap", "sqlserver"),
+        ("arrowcol-migrate", "sqlserver"),
+    ] {
+        let image = images.get(role).context("stable local image role missing")?;
+        let service = services.entry(service.to_owned()).or_insert_with(|| json!({}));
+        service
+            .as_object_mut()
+            .context("invalid local Compose service")?
+            .insert("image".to_owned(), json!(image));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn stable_local_images_pin_roles_and_refuse_drift_before_overlay_changes() -> Result<()> {
+    let images: BTreeMap<String, String> = ["catalog", "client", "collector", "maintenance", "router", "sqlserver"]
+        .into_iter()
+        .map(|role| (role.to_owned(), format!("sha256:{}", "a".repeat(64))))
+        .collect();
+    let mut overlay = json!({"services": {"dataflow-1": {"environment": {"KEEP": "yes"}}}});
+    let original = overlay.clone();
+    let mut changed = images.clone();
+    changed.insert("collector".to_owned(), format!("sha256:{}", "b".repeat(64)));
+    assert!(apply_stable_local_images(&mut overlay, &images, Some(&changed)).is_err());
+    assert_eq!(overlay, original);
+    apply_stable_local_images(&mut overlay, &images, Some(&images))?;
+    for (service, role) in [
+        ("arrowcol-catalog", "catalog"),
+        ("oat-client", "client"),
+        ("oat-pin-init", "client"),
+        ("dataflow-1", "collector"),
+        ("delta-maintenance", "maintenance"),
+        ("router", "router"),
+        ("sqlserver", "sqlserver"),
+        ("database-bootstrap", "sqlserver"),
+        ("arrowcol-migrate", "sqlserver"),
+    ] {
+        assert_eq!(overlay["services"][service]["image"], images[role]);
+    }
+    assert_eq!(overlay["services"]["dataflow-1"]["environment"]["KEEP"], "yes");
+    Ok(())
+}
+
+async fn prebuild_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     run_npx_runtime(
         &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
         &[
@@ -7666,8 +10340,21 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         ],
     )
     .await
-    .context("render run-owned dataflow profile before starting local workloads")?;
-    initialize_local_partitioned_campaign_table(config, platform).await?;
+    .context("render run-owned dataflow profile before local prebuild")?;
+    if local_maintenance_table_initialization_mode(config).is_some() {
+        let mut build = Command::new("cargo");
+        build.args([
+            "build",
+            "--locked",
+            "--package",
+            "arrowcol-loadgen",
+            "--bin",
+            "arrowcol-loadgen",
+        ]);
+        build.current_dir(std::env::current_dir()?);
+        run_streaming_command(build, "build setup-only local table initializer").await?;
+    }
+
     let base_project = config
         .platform
         .compose_project
@@ -7679,20 +10366,59 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         .as_deref()
         .context("local compose file is missing")?;
     let project = scoped_compose_project(base_project, &platform.run_id);
+    let build_project = if config.platform.local.stable_image_build {
+        format!("{base_project}-images")
+    } else {
+        project
+    };
+    let source_revision = local_build_source_revision()?;
     let mut build_client = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
-        &project,
+        &build_project,
         "oat",
     );
     platform.add_compose_environment(&mut build_client);
+    build_client.env("GIT_SHA", &source_revision);
     build_client.args(["build", "oat-client"]);
     if maintenance_enabled(config) && config.maintenance_image.is_none() {
         build_client.arg("delta-maintenance");
     }
-    run_streaming_command(build_client, "build OAT client container").await?;
+    run_streaming_command(build_client, "prebuild OAT client image").await?;
+
+    let mut build_stack = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &build_project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut build_stack);
+    build_stack.env("GIT_SHA", &source_revision);
+    build_stack.args(["build", "sqlserver", "arrowcol-catalog", "dataflow-1", "router"]);
+    run_streaming_command(build_stack, "prebuild local OAT stack images").await?;
+    write_local_prebuild_manifest(config, platform).await
+}
+
+async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    verify_local_prebuild_manifest(config, platform).await?;
+    initialize_local_maintenance_table(config, platform).await?;
+    let base_project = config
+        .platform
+        .compose_project
+        .as_deref()
+        .context("local compose project name is missing")?;
+    let compose_file = config
+        .platform
+        .compose_file
+        .as_deref()
+        .context("local compose file is missing")?;
+    let project = scoped_compose_project(base_project, &platform.run_id);
     pin_local_maintenance_image(config, platform).await?;
+    if config.platform.local.stable_image_build {
+        pin_stable_local_images(config, platform).await?;
+    }
     verify_local_bind_mount(config, platform).await?;
+    preflight_local_container_memory_guard(config, platform).await?;
 
     let mut up = compose_command(
         compose_file,
@@ -7701,15 +10427,8 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
-    up.args([
-        "up",
-        "--detach",
-        "--build",
-        "--wait",
-        "--wait-timeout",
-        "600",
-        "sqlserver",
-    ]);
+    up.args(["up", "--detach", "--no-build"]);
+    up.args(["--wait", "--wait-timeout", "600", "sqlserver"]);
     run_streaming_command(up, "start local OAT SQL Server")
         .await
         .context("start local OAT stack")?;
@@ -7722,7 +10441,9 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             "benchmark",
         );
         platform.add_compose_environment(&mut migration);
-        migration.args(["run", "--rm", "--no-deps", service]);
+        migration.args(["run", "--rm", "--no-deps"]);
+        migration.args(["--pull", "never"]);
+        migration.arg(service);
         run_streaming_command(migration, &format!("run local OAT {service}")).await?;
     }
 
@@ -7733,10 +10454,8 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
+    up.args(["up", "--detach", "--no-build"]);
     up.args([
-        "up",
-        "--detach",
-        "--build",
         "--wait",
         "--wait-timeout",
         "600",
@@ -7770,7 +10489,16 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut downstream);
-    downstream.args(["up", "--detach", "--no-deps", "--wait", "--wait-timeout", "60", "kusto"]);
+    downstream.args([
+        "up",
+        "--detach",
+        "--no-build",
+        "--no-deps",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "kusto",
+    ]);
     if run_streaming_command(downstream, "start optional local Kustainer")
         .await
         .is_err()
@@ -7786,6 +10514,7 @@ async fn scale_local_arrowcols(
     replicas: u32,
     concurrency: u32,
 ) -> Result<()> {
+    validate_local_collector_cpu_quota(config).await?;
     let base_project = config
         .platform
         .compose_project
@@ -7805,9 +10534,8 @@ async fn scale_local_arrowcols(
     );
     platform.add_compose_environment(&mut up);
     up.env("LOADTEST_CPUS", concurrency.to_string());
+    up.args(["up", "--detach", "--no-build"]);
     up.args([
-        "up",
-        "--detach",
         "--wait",
         "--wait-timeout",
         "600",
@@ -7816,6 +10544,83 @@ async fn scale_local_arrowcols(
         "dataflow-1",
     ]);
     run_streaming_command(up, "scale local ArrowCol containers").await?;
+    let quota_readback = capture_local_cpu_quota(config, &platform.run_id, &platform.environment).await?;
+    verify_local_cpu_quota(config, concurrency, &quota_readback)?;
+    println!("[oat] collector CPU quota: {quota_readback}");
+    if let Some(cpus) = &config.platform.local.collector_cpus {
+        let mut ps = compose_command(
+            compose_file,
+            config.platform.compose_override_file.as_deref(),
+            &project,
+            "benchmark",
+        );
+        platform.add_compose_environment(&mut ps);
+        ps.args(["ps", "--quiet", "dataflow-1"]);
+        let id = String::from_utf8(run_command(ps, "resolve capped collector").await?.stdout)?;
+        let id = id.trim();
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("expected exactly one running collector container");
+        }
+        let mut inspect = Command::new("docker");
+        inspect.args([
+            "inspect",
+            "--format",
+            "{{.State.Running}} {{.HostConfig.CpusetCpus}}",
+            id,
+        ]);
+        let configured = String::from_utf8(run_command(inspect, "inspect collector CPU allocation").await?.stdout)?;
+        let configured = configured
+            .trim()
+            .strip_prefix("true ")
+            .context("capped collector is not running")?;
+        let mut effective = Command::new("docker");
+        effective.args(["exec", id, "cat", "/sys/fs/cgroup/cpuset.cpus.effective"]);
+        let effective = String::from_utf8(run_command(effective, "read effective collector CPUs").await?.stdout)?;
+        let expected = cpus.iter().copied().collect::<BTreeSet<_>>();
+        if parse_linux_cpu_list(configured)? != expected || parse_linux_cpu_list(effective.trim())? != expected {
+            bail!("collector configured or effective CPU allocation differs from the requested stratum");
+        }
+        println!(
+            "[oat] collector CPU allocation: {}",
+            json!({"container_id":id,"requested":cpus,"configured":configured,"effective":effective.trim()})
+        );
+    }
+    Ok(())
+}
+
+fn parse_linux_cpu_list(value: &str) -> Result<BTreeSet<u32>> {
+    let mut cpus = BTreeSet::new();
+    for part in value.split(',') {
+        let (first, last) = match part.split_once('-') {
+            Some((start, end)) => (start.parse::<u32>()?, end.parse::<u32>()?),
+            None => {
+                let cpu = part.parse::<u32>()?;
+                (cpu, cpu)
+            }
+        };
+        if first > last || last > 4095 {
+            bail!("invalid Linux CPU list");
+        }
+        for cpu in first..=last {
+            if !cpus.insert(cpu) {
+                bail!("duplicate CPU in Linux CPU list");
+            }
+        }
+    }
+    Ok(cpus)
+}
+
+#[cfg(test)]
+#[test]
+fn collector_cpu_readback_parses_linux_ranges_and_rejects_bad_lists() -> Result<()> {
+    assert_eq!(parse_linux_cpu_list("0-2,4")?, BTreeSet::from([0, 1, 2, 4]));
+    for invalid in ["", "3-1", "0-4096", "0-2,2", "0, 1"] {
+        assert!(parse_linux_cpu_list(invalid).is_err());
+    }
     Ok(())
 }
 
@@ -7860,6 +10665,13 @@ async fn local_compose_endpoint(
             .context("Docker daemon endpoint not resolved")?,
         path,
     )?;
+    if service == "router" && container_port == "50050" {
+        wait_for_local_router(&endpoint, Duration::from_secs(120), || {
+            local_router_state(config, platform)
+        })
+        .await?;
+        return Ok(endpoint);
+    }
     let url = Url::parse(&endpoint)?;
     let host = url
         .host_str()
@@ -7870,8 +10682,8 @@ async fn local_compose_endpoint(
         tokio::net::TcpStream::connect((host, url.port_or_known_default().context("local endpoint has no port")?)),
     )
     .await
-    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host, not a loopback fallback"))?
-    .with_context(|| format!("connect local {service} endpoint {endpoint}"))?;
+    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"))?
+    .with_context(|| format!("connect local {service} endpoint {endpoint}; configure platform.local.bind_host/endpoint_host to the Docker bridge gateway IP, not a loopback fallback"))?;
     Ok(endpoint)
 }
 
@@ -8049,6 +10861,25 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
             .and_then(Value::as_str)
             == Some("dataflow-1")
     });
+    let client_ids = before
+        .iter()
+        .filter(|container| {
+            container
+                .pointer("/Config/Labels/com.docker.compose.service")
+                .and_then(Value::as_str)
+                == Some("oat-client")
+        })
+        .map(|container| {
+            container
+                .get("Id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("client container ID missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !client_ids.is_empty() {
+        stop_local_client_containers(&client_ids, config.client_stop_grace_seconds()).await?;
+    }
     let phases = snapshot_stop_phases(&before)?;
     let mut maintenance_logs = None;
     let mut collector_sigterm_at_unix_ms = None;
@@ -8083,6 +10914,10 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     } else {
         Vec::new()
     };
+    *platform
+        .stopped_collector_logs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("collector logs mutex poisoned"))? = Some(collector_logs.clone());
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let after: Vec<Value> = serde_json::from_slice(
@@ -8158,6 +10993,9 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
                 outcome["exit_code"].as_i64(),
                 config.tunables.wal.is_some(),
             );
+            if config.platform.local.snapshot_root.is_some() {
+                outcome["stopped_commit_output"] = stopped_collector_commit_output(config, log)?;
+            }
         } else if service == "delta-maintenance" {
             let incomplete_log = ProcessLog {
                 role: ComponentRole::Maintenance,
@@ -8187,6 +11025,26 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     }
     Ok(outcomes)
 }
+
+fn stopped_collector_commit_output(config: &OatConfig, log: &ProcessLog) -> Result<Value> {
+    let logs = std::slice::from_ref(log);
+    let evidence = durable_commit_evidence_for_cell(config, logs, logs, Some((0, 1)), None)?;
+    let mut tables = serde_json::Map::new();
+    for table in &config.tables {
+        let output = evidence
+            .get(table)
+            .context("stopped collector commit evidence missing")?;
+        tables.insert(
+            canonical_dmv_table_name(table)?,
+            output["run_cumulative_output"].clone(),
+        );
+    }
+    Ok(json!({
+        "source": if log.complete { "complete_stopped_collector_logs" } else { "incomplete_stopped_collector_logs" },
+        "tables": tables,
+    }))
+}
+
 fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str) -> Result<Vec<Value>> {
     validate_owned_local_containers(before, project)?;
     validate_owned_local_containers(after, project)?;
@@ -8251,13 +11109,19 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         } else {
             ComponentRole::Collector
         };
-        shutdown_exit_outcome(
-            role,
-            was_running,
-            Some(exit),
-            state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
-        )
-        .with_context(|| format!("owned container {service} failed while stopping"))?;
+        if service == "oat-client" {
+            if exit == 137 || state.get("OOMKilled").and_then(Value::as_bool) != Some(false) {
+                bail!("owned client was forcibly stopped or OOM killed ({exit})");
+            }
+        } else {
+            shutdown_exit_outcome(
+                role,
+                was_running,
+                Some(exit),
+                state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
+            )
+            .with_context(|| format!("owned container {service} failed while stopping"))?;
+        }
         let finished_at = state
             .get("FinishedAt")
             .and_then(Value::as_str)
@@ -8370,8 +11234,8 @@ fn local_phase_stop_args(
     args
 }
 
-fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64) -> Duration {
-    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + 2 * 300 + 120)
+fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64, client_grace: u64) -> Duration {
+    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + client_grace + 2 * 300 + 120)
 }
 
 async fn stop_then_destroy<T>(
@@ -8392,6 +11256,7 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             local_stop_deadline(
                 config.collector_stop_grace_seconds,
                 stop_budgets.maintenance_stop_timeout_ms,
+                config.client_stop_grace_seconds(),
             ),
             stop_local_snapshot_writers(config, platform),
         )
@@ -8434,12 +11299,34 @@ fn local_oat_client_list_args(project: &str) -> Vec<String> {
 }
 
 fn local_oat_client_remove_args(container_ids: &[String]) -> Vec<String> {
-    let mut args = vec!["rm".to_owned(), "--force".to_owned()];
+    let mut args = vec!["rm".to_owned()];
     args.extend(container_ids.iter().cloned());
     args
 }
 
-async fn remove_local_oat_client_containers(project: &str) -> Result<bool> {
+async fn stop_local_client_containers(ids: &[String], grace: u64) -> Result<()> {
+    let mut stop = Command::new("docker");
+    stop.args(["stop", "--time", &grace.to_string()]).args(ids);
+    run_command(stop, "quiesce local OAT clients before removing them").await?;
+    let mut inspect = Command::new("docker");
+    inspect.args(["inspect", "--format", "{{.State.ExitCode}}"]).args(ids);
+    let output = run_command(inspect, "verify local OAT clients stopped without SIGKILL").await?;
+    let text = std::str::from_utf8(&output.stdout).context("client stop exit codes were not UTF-8")?;
+    let exit_codes = text
+        .lines()
+        .map(|line| line.trim().parse::<i32>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid client stop exit code")?;
+    if exit_codes.len() != ids.len() {
+        bail!("client stop readback omitted an exit code");
+    }
+    if exit_codes.contains(&137) {
+        bail!("local OAT client was killed before its quiesce deadline completed");
+    }
+    Ok(())
+}
+
+async fn remove_local_oat_client_containers(project: &str, client_grace: u64) -> Result<bool> {
     let mut list = Command::new("docker");
     list.args(local_oat_client_list_args(project));
     let output = run_command(list, "list local OAT client containers for cleanup").await?;
@@ -8453,6 +11340,7 @@ async fn remove_local_oat_client_containers(project: &str) -> Result<bool> {
     if ids.is_empty() {
         return Ok(false);
     }
+    stop_local_client_containers(&ids, client_grace).await?;
     let mut remove = Command::new("docker");
     remove.args(local_oat_client_remove_args(&ids));
     run_command(remove, "remove local OAT client containers").await?;
@@ -8473,7 +11361,7 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     let project = scoped_compose_project(base_project, &platform.run_id);
     let mut stack_clean = false;
     for _ in 0..3 {
-        remove_local_oat_client_containers(&project).await?;
+        remove_local_oat_client_containers(&project, config.client_stop_grace_seconds()).await?;
         let mut down = compose_command(
             compose_file,
             config.platform.compose_override_file.as_deref(),
@@ -8486,7 +11374,7 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         down.envs(&platform.environment);
         down.args(["down", "--volumes", "--remove-orphans"]);
         run_streaming_command(down, "clean up local OAT stack").await?;
-        if !remove_local_oat_client_containers(&project).await? {
+        if !remove_local_oat_client_containers(&project, config.client_stop_grace_seconds()).await? {
             stack_clean = true;
             break;
         }
@@ -8948,6 +11836,32 @@ enum CampaignCleanupAction {
     Handoff,
 }
 
+#[derive(Clone, Copy)]
+enum CampaignCleanupPhase {
+    Freeze,
+    Release,
+}
+
+impl CampaignCleanupPhase {
+    fn actions(self) -> &'static [CampaignCleanupAction] {
+        match self {
+            Self::Freeze => &[
+                CampaignCleanupAction::StopAdmission,
+                CampaignCleanupAction::BoundedDrain,
+                CampaignCleanupAction::EvidenceCapture,
+                CampaignCleanupAction::StopMaintenance,
+                CampaignCleanupAction::TerminalCapture,
+            ],
+            Self::Release => &[
+                CampaignCleanupAction::RemoveNamespace,
+                CampaignCleanupAction::RemoveQap,
+                CampaignCleanupAction::RemoveFic,
+                CampaignCleanupAction::Handoff,
+            ],
+        }
+    }
+}
+
 impl CampaignCleanupAction {
     fn selector(&self) -> &'static str {
         match self {
@@ -9074,6 +11988,491 @@ struct CampaignInventoryReadResponse {
     etag: String,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownSourceReference {
+    blob: String,
+    etag: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputsRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputs {
+    schema_version: u8,
+    inventory_etag: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    terminal_capture: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_before: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_terminal: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    unavailable_reason: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    terminal_summaries: Option<Vec<ShutdownTerminalPodSummary>>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalPodSummary {
+    pod_name: String,
+    pod_uid: String,
+    container: String,
+    restart_count: u64,
+    exit_code: i64,
+    summary: ShutdownTerminalSummary,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalSummary {
+    schema_version: u8,
+    admitted: u64,
+    committed: u64,
+    failed: u64,
+    cancelled_ambiguous: u64,
+    pending: u64,
+    committed_rows: u64,
+    incomplete: u8,
+    commits: Vec<ShutdownTerminalCommit>,
+    publication_evidence: Vec<ShutdownTerminalPublicationCall>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalPublicationCall {
+    clean: bool,
+    reasons: Vec<String>,
+    outcomes: Vec<ShutdownTerminalPublicationOutcome>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalPublicationOutcome {
+    app_id: String,
+    app_version: i64,
+    status: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_version: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalCommit {
+    table_id: String,
+    version: u64,
+    rows: u64,
+    files: u64,
+    parquet_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputsResponse {
+    ok: bool,
+    receipt: ShutdownFinalizationInputs,
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+    terminal_capture: &'a Option<ShutdownSourceReference>,
+    delta_before: &'a Option<ShutdownSourceReference>,
+    delta_terminal: &'a Option<ShutdownSourceReference>,
+    reconciliation: ShutdownReconciliationRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownReconciliationProof {
+    status: String,
+    post_teardown_verification: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    expected_rows: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    observed_rows: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    settled_zero_ambiguity: Option<bool>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    teardown_admissions_clear: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownReconciliationRequest {
+    profile: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    proof: Option<ShutdownReconciliationProof>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationOrigin {
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    namespace: InventoryNamespace,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalVerdict {
+    pod_name: String,
+    pod_uid: String,
+    container: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    restart_count: Option<u64>,
+    classification: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationReceipt {
+    schema_version: u8,
+    blob: String,
+    etag: String,
+    sha256: String,
+    inventory_etag: String,
+    actor: CampaignCleanupActor,
+    origin: ShutdownFinalizationOrigin,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    terminal_capture: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_before: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_terminal: Option<ShutdownSourceReference>,
+    verdicts: Vec<ShutdownFinalVerdict>,
+    status: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    reason_code: Option<String>,
+    release_allowed: bool,
+    reconciliation: ShutdownReconciliationRequest,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationResponse {
+    ok: bool,
+    receipt: ShutdownFinalizationReceipt,
+}
+
+fn validate_shutdown_source(source: &ShutdownSourceReference, expected_blob: &str) -> Result<()> {
+    validate_campaign_etag(&source.etag)?;
+    if source.blob != expected_blob
+        || source.sha256.len() != 64
+        || !source
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("shutdown source does not match the exact original blob identity or SHA-256");
+    }
+    Ok(())
+}
+
+fn validate_shutdown_inputs(inputs: &ShutdownFinalizationInputs, inventory: &RunInventory, etag: &str) -> Result<()> {
+    inventory.validate()?;
+    validate_campaign_etag(etag)?;
+    if inputs.schema_version != 1 || inputs.inventory_etag != etag {
+        bail!("shutdown source lacks the exact frozen inventory ETag");
+    }
+    if !matches!(
+        inputs.unavailable_reason.as_deref(),
+        None | Some(
+            "no_baseline"
+                | "terminal_capture_unavailable"
+                | "terminal_delta_unavailable"
+                | "terminal_identity_unavailable"
+        )
+    ) || (inputs.unavailable_reason.is_none()
+        && (inputs.terminal_capture.is_none() || inputs.delta_before.is_none() || inputs.delta_terminal.is_none()))
+        || (inputs.delta_before.is_none() != (inputs.unavailable_reason.as_deref() == Some("no_baseline")))
+    {
+        bail!("shutdown source is incomplete or has an invalid unavailable reason");
+    }
+    let root = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}",
+        inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+    );
+    if let Some(source) = &inputs.terminal_capture {
+        let destination = inventory
+            .evidence_destination
+            .as_ref()
+            .context("missing shutdown evidence destination")?;
+        let capture = format!(
+            "{}/custody/{}/terminal_capture.json",
+            destination.blob_prefix.trim_end_matches('/'),
+            inventory.cell_run_id
+        );
+        validate_shutdown_source(source, &capture)?;
+    }
+    if let Some(source) = &inputs.delta_before {
+        validate_shutdown_source(source, &format!("{root}/delta-before.json"))?;
+    }
+    if let Some(source) = &inputs.delta_terminal {
+        validate_shutdown_source(source, &format!("{root}/delta-terminal.json"))?;
+    }
+    Ok(())
+}
+
+fn validate_shutdown_finalization(
+    receipt: &ShutdownFinalizationReceipt,
+    inventory: &RunInventory,
+    etag: &str,
+    actor: &CampaignCleanupActor,
+    inputs: &ShutdownFinalizationInputs,
+    reconciliation: &ShutdownReconciliationRequest,
+) -> Result<()> {
+    validate_shutdown_inputs(inputs, inventory, etag)?;
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}/shutdown-finalization.json",
+        inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+    );
+    if receipt.schema_version != 1
+        || receipt.blob != expected_blob
+        || receipt.inventory_etag != etag
+        || receipt.actor != *actor
+        || receipt.terminal_capture != inputs.terminal_capture
+        || receipt.delta_before != inputs.delta_before
+        || receipt.delta_terminal != inputs.delta_terminal
+        || receipt.reconciliation != *reconciliation
+        || !matches!(receipt.status.as_str(), "validated" | "unavailable" | "failed")
+        || !matches!(
+            receipt.reason_code.as_deref(),
+            None | Some(
+                "no_baseline"
+                    | "terminal_capture_unavailable"
+                    | "terminal_delta_unavailable"
+                    | "terminal_identity_unavailable"
+                    | "reconciliation_unavailable"
+                    | "reconciliation_mismatch"
+                    | "exit_143_unavailable"
+                    | "collector_exit_failed"
+            )
+        )
+        || (receipt.status != "validated" && receipt.reason_code.is_none())
+        || (receipt.release_allowed != (receipt.status == "validated" && receipt.reason_code.is_none()))
+        || (inputs.unavailable_reason.as_deref() == Some("no_baseline")
+            && (receipt.status != "unavailable"
+                || receipt.reason_code.as_deref() != Some("no_baseline")
+                || receipt.release_allowed))
+        || receipt.origin
+            != (ShutdownFinalizationOrigin {
+                campaign_id: inventory.campaign_id.clone(),
+                owner_id: inventory.owner_id.clone(),
+                fencing_token: inventory.fencing_token,
+                orchestration_run_id: inventory.orchestration_run_id.clone(),
+                cell_run_id: inventory.cell_run_id.clone(),
+                namespace: inventory.namespace.clone(),
+            })
+        || receipt.sha256.len() != 64
+        || !receipt
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("shutdown finalization does not bind the exact frozen source and actor");
+    }
+    let mut identities = BTreeSet::new();
+    for verdict in &receipt.verdicts {
+        if [&verdict.pod_name, &verdict.pod_uid, &verdict.container]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 253 || value.bytes().any(|byte| byte.is_ascii_control()))
+            || !identities.insert((&verdict.pod_uid, &verdict.container, verdict.restart_count))
+            || !matches!(
+                verdict.classification.as_str(),
+                "exit_0"
+                    | "exit_143_terminal_reconciliation_unavailable"
+                    | "exit_143_without_drain_marker"
+                    | "exit_oom_killed"
+                    | "exit_nonzero"
+                    | "terminal_status_unavailable"
+            )
+        {
+            bail!("shutdown finalization has duplicate, malformed, or provisional collector verdicts");
+        }
+    }
+    if receipt.status == "validated"
+        && let Some(summaries) = &inputs.terminal_summaries
+        && (summaries.len() != receipt.verdicts.len()
+            || summaries.iter().any(|summary| {
+                summary.restart_count != 0
+                    || summary.exit_code != 0
+                    || !receipt.verdicts.iter().any(|verdict| {
+                        verdict.pod_name == summary.pod_name
+                            && verdict.pod_uid == summary.pod_uid
+                            && verdict.container == summary.container
+                            && verdict.restart_count == Some(0)
+                            && verdict.classification == "exit_0"
+                    })
+            }))
+    {
+        bail!("validated collector verdicts differ from terminal summary identities");
+    }
+    if receipt.status == "validated"
+        && (receipt.verdicts.is_empty()
+            || receipt
+                .verdicts
+                .iter()
+                .any(|verdict| verdict.classification != "exit_0")
+            || inputs.unavailable_reason.is_some()
+            || receipt.reconciliation.proof.as_ref().is_none_or(|proof| {
+                proof.status != "matched"
+                    || proof.post_teardown_verification != "matched_final_delta_log"
+                    || proof.expected_rows.is_none()
+                    || proof.expected_rows != proof.observed_rows
+                    || proof.settled_zero_ambiguity != Some(true)
+                    || proof.teardown_admissions_clear != Some(true)
+            }))
+    {
+        bail!("validated shutdown finalization contains unavailable or failed evidence");
+    }
+    Ok(())
+}
+
+fn shutdown_reconciliation_request(rows: &[OatResult]) -> ShutdownReconciliationRequest {
+    let proof = (|| {
+        let [row] = rows else {
+            return None;
+        };
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref()?).ok()?;
+        let final_delta = evidence.pointer("/durable_commits/post_teardown_delta_reconciliation")?;
+        let status = final_delta.get("status")?.as_str()?;
+        if !matches!(status, "matched" | "mismatch" | "unavailable") {
+            return None;
+        }
+        let verification = match evidence
+            .pointer("/durable_commits/run_cumulative_output/post_teardown_verification")?
+            .as_str()?
+        {
+            "matched_final_delta_log" => "matched_final_delta_log",
+            "unavailable_or_mismatched" if status == "mismatch" => "mismatch",
+            "unavailable_or_mismatched" => "unavailable",
+            _ => return None,
+        };
+        let safe_count = |value: &Value| value.as_u64().filter(|n| *n <= 9_007_199_254_740_991);
+        let settled = evidence.pointer("/reconciliation/settled").and_then(Value::as_bool);
+        let ambiguous = evidence
+            .pointer("/reconciliation/ambiguous_rows")
+            .and_then(Value::as_u64);
+        let admissions = evidence
+            .pointer("/durable_commits/collector_teardown_admissions/status")
+            .and_then(Value::as_str);
+        let cancelled = evidence
+            .pointer("/durable_commits/collector_teardown_admissions/cancelled_ambiguous")
+            .and_then(Value::as_u64);
+        Some(ShutdownReconciliationProof {
+            status: status.to_owned(),
+            post_teardown_verification: verification.to_owned(),
+            expected_rows: final_delta.get("client_acknowledged_rows").and_then(safe_count),
+            observed_rows: final_delta.get("delta_log_committed_rows").and_then(safe_count),
+            settled_zero_ambiguity: settled.zip(ambiguous).map(|(settled, count)| settled && count == 0),
+            teardown_admissions_clear: admissions
+                .zip(cancelled)
+                .map(|(status, count)| status == "clear" && count == 0),
+        })
+    })();
+    ShutdownReconciliationRequest {
+        profile: "single_hot_table".to_owned(),
+        proof,
+    }
+}
+
+fn ensure_shutdown_release(receipt: &ShutdownFinalizationReceipt, rows: &[OatResult]) -> Result<()> {
+    if !receipt.release_allowed || receipt.status != "validated" || receipt.reason_code.is_some() {
+        bail!("finalization is unavailable or failed; release withheld");
+    }
+    let local = shutdown_reconciliation_request(rows);
+    let proof = local.proof.as_ref().context("reconciliation proof unavailable")?;
+    if receipt.reconciliation != local
+        || proof.status != "matched"
+        || proof.post_teardown_verification != "matched_final_delta_log"
+        || proof.expected_rows.is_none()
+        || proof.expected_rows != proof.observed_rows
+        || proof.settled_zero_ambiguity != Some(true)
+        || proof.teardown_admissions_clear != Some(true)
+    {
+        bail!("final exact reconciliation unavailable or mismatched; release withheld");
+    }
+    let expected = rows
+        .first()
+        .map(|row| row.replicas as usize)
+        .context("final reconciliation unavailable")?;
+    if expected == 0 || rows.iter().any(|row| row.replicas as usize != expected) {
+        bail!("collector replica count unavailable or inconsistent");
+    }
+    let pods = receipt
+        .verdicts
+        .iter()
+        .map(|verdict| &verdict.pod_uid)
+        .collect::<BTreeSet<_>>();
+    if pods.len() != expected
+        || receipt.verdicts.is_empty()
+        || receipt
+            .verdicts
+            .iter()
+            .any(|verdict| verdict.classification != "exit_0")
+    {
+        bail!("collector final verdict is unavailable or failed; release withheld");
+    }
+    for row in rows {
+        let evidence: Value = serde_json::from_str(
+            row.evidence_json
+                .as_deref()
+                .context("missing final reconciliation evidence")?,
+        )?;
+        if evidence.pointer("/durable_commits/post_teardown_delta_reconciliation/status") != Some(&json!("matched"))
+            || evidence.pointer("/durable_commits/run_cumulative_output/post_teardown_verification")
+                != Some(&json!("matched_final_delta_log"))
+        {
+            bail!("final exact reconciliation unavailable or mismatched; release withheld");
+        }
+    }
+    Ok(())
+}
+
+async fn submit_shutdown_finalization_once<T, F, Fut, C>(mut call: F, confirm: C) -> Result<T>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    C: Fn(&[u8]) -> Result<T>,
+{
+    match call("shutdown-finalize").await.and_then(|output| confirm(&output)) {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let output = call("shutdown-finalization-read")
+                .await
+                .context("shutdown finalization outcome UNKNOWN; fenced readback failed, never retry write")?;
+            confirm(&output).context(format!(
+                "shutdown finalization readback did not confirm the original write: {error:#}"
+            ))
+        }
+    }
+}
+
 fn deserialize_present_campaign_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -9138,20 +12537,29 @@ impl std::fmt::Display for StaleCampaignVersionError {
 impl std::error::Error for StaleCampaignVersionError {}
 
 fn campaign_custody_helper_failure(action: &str, stdout: &[u8]) -> anyhow::Error {
-    let code = serde_json::from_slice::<Value>(stdout)
-        .ok()
-        .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
+    let response = serde_json::from_slice::<Value>(stdout).ok();
+    let code = response
+        .as_ref()
+        .and_then(|response| response.get("code").and_then(Value::as_str))
         .filter(|code| {
             matches!(
-                code.as_str(),
+                *code,
                 "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
             )
         })
-        .unwrap_or_else(|| "invalid_response".to_owned());
+        .unwrap_or("invalid_response");
     if action == "cleanup-step" && code == "stale_version" {
         anyhow::Error::new(StaleCampaignVersionError {
             action: action.to_owned(),
         })
+    } else if code == "write_outcome_unknown"
+        && response
+            .as_ref()
+            .and_then(|value| value.get("reason_code"))
+            .and_then(Value::as_str)
+            == Some("cleanup_deadline_expired")
+    {
+        anyhow::anyhow!("campaign custody helper {action} failed: {code} (cleanup_deadline_expired)")
     } else {
         anyhow::anyhow!("campaign custody helper {action} failed: {code}")
     }
@@ -9197,7 +12605,12 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
     .await
     {
         Ok(result) => result?,
-        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline" | "capture-baseline") => {
+        Err(_)
+            if matches!(
+                action,
+                "cleanup-step" | "capture-cell-baseline" | "capture-baseline" | "shutdown-finalize"
+            ) =>
+        {
             bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
         }
         Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
@@ -9589,7 +13002,13 @@ fn campaign_cleanup_operation_deadline_ms(
         } else {
             let timeout_ms = match action {
                 CampaignCleanupAction::StopAdmission => 60_000,
-                CampaignCleanupAction::BoundedDrain => 120_000,
+                CampaignCleanupAction::BoundedDrain => match inventory.drain_budget {
+                    Some(budget) => {
+                        budget.validate()?;
+                        budget.budget_ms
+                    }
+                    None => crate::config::DEFAULT_AKS_DRAIN_BUDGET_MS,
+                },
                 CampaignCleanupAction::StopMaintenance => {
                     inventory
                         .effective_stop_budgets
@@ -9746,7 +13165,125 @@ async fn persist_campaign_inventory_snapshot(
     Ok(())
 }
 
-async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
+async fn read_campaign_shutdown_inputs(
+    platform: &AksPlatform,
+) -> Result<(RunInventory, String, CampaignCleanupActor, ShutdownFinalizationInputs)> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let cached: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read frozen campaign inventory")?,
+    )
+    .context("parse frozen campaign inventory")?;
+    let cached_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read frozen campaign inventory ETag")?;
+    let cached_etag = cached_etag.trim();
+    validate_campaign_etag(cached_etag)?;
+    let (inventory, etag) = read_authoritative_campaign_inventory(
+        platform,
+        &identity,
+        &cached.orchestration_run_id,
+        Duration::from_secs(30),
+    )
+    .await?;
+    cached.validate_successor(&inventory)?;
+    if etag != cached_etag || inventory != cached {
+        bail!("frozen campaign inventory changed before shutdown finalization");
+    }
+    campaign_cleanup_step_complete(&CampaignCleanupAction::TerminalCapture, &inventory)?;
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let input_request = ShutdownFinalizationInputsRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+    };
+    let input_output = run_campaign_custody_json(
+        platform,
+        "shutdown-finalization-inputs",
+        None,
+        &input_request,
+        Duration::from_secs(40),
+    )
+    .await?;
+    let input_response: ShutdownFinalizationInputsResponse =
+        serde_json::from_slice(&input_output).context("parse guarded shutdown source references")?;
+    if !input_response.ok {
+        bail!("shutdown source references were not positively confirmed");
+    }
+    let inputs = input_response.receipt;
+    validate_shutdown_inputs(&inputs, &inventory, &etag)?;
+    Ok((inventory, etag, actor, inputs))
+}
+
+async fn finalize_campaign_shutdown(
+    platform: &AksPlatform,
+    reconciliation: &ShutdownReconciliationRequest,
+) -> Result<ShutdownFinalizationReceipt> {
+    let (inventory, etag, actor, inputs) = read_campaign_shutdown_inputs(platform).await?;
+    if let Some(previous) = &platform.shutdown_inputs
+        && previous != &inputs
+    {
+        bail!("frozen shutdown sources changed after reconciliation; release withheld");
+    }
+    let input_request = ShutdownFinalizationInputsRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+    };
+    let request = ShutdownFinalizationRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+        terminal_capture: &inputs.terminal_capture,
+        delta_before: &inputs.delta_before,
+        delta_terminal: &inputs.delta_terminal,
+        reconciliation: reconciliation.clone(),
+    };
+    let confirm = |output: &[u8]| -> Result<ShutdownFinalizationReceipt> {
+        let response: ShutdownFinalizationResponse =
+            serde_json::from_slice(output).context("parse guarded shutdown finalization")?;
+        if !response.ok {
+            bail!("shutdown finalization was not positively confirmed");
+        }
+        validate_shutdown_finalization(&response.receipt, &inventory, &etag, &actor, &inputs, reconciliation)?;
+        Ok(response.receipt)
+    };
+    let write = serde_json::to_value(&request)?;
+    let read = serde_json::to_value(&input_request)?;
+    let receipt = submit_shutdown_finalization_once(
+        |action| {
+            let payload = if action == "shutdown-finalize" { &write } else { &read };
+            async move { run_campaign_custody_json(platform, action, None, payload, Duration::from_secs(40)).await }
+        },
+        confirm,
+    )
+    .await?;
+    Ok(receipt)
+}
+
+async fn cleanup_campaign_aks_platform(
+    config: &OatConfig,
+    platform: &AksPlatform,
+    phase: CampaignCleanupPhase,
+) -> Result<Value> {
     let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
     let campaign_baseline = load_campaign_baseline_receipt(platform, &identity).await?;
     let runtime_dir = platform
@@ -9780,27 +13317,20 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
             .await?;
     cached.validate_successor(&inventory)?;
     persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
-    let actions = [
-        CampaignCleanupAction::StopAdmission,
-        CampaignCleanupAction::BoundedDrain,
-        CampaignCleanupAction::EvidenceCapture,
-        CampaignCleanupAction::StopMaintenance,
-        CampaignCleanupAction::TerminalCapture,
-        CampaignCleanupAction::RemoveNamespace,
-        CampaignCleanupAction::RemoveQap,
-        CampaignCleanupAction::RemoveFic,
-        CampaignCleanupAction::Handoff,
-    ];
+    if matches!(phase, CampaignCleanupPhase::Release) {
+        campaign_cleanup_step_complete(&CampaignCleanupAction::TerminalCapture, &inventory)?;
+    }
+    let actions = phase.actions();
     let mut receipts = Vec::with_capacity(actions.len());
     for action in actions {
-        if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
+        if !campaign_cleanup_action_needs_execution(action, &inventory)? {
             receipts.push(
                 json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
             );
             continue;
         }
         let (next_inventory, next_etag, receipt) =
-            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
+            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, action, &inventory, &etag)
                 .await
                 .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
         inventory = next_inventory;
@@ -9929,6 +13459,7 @@ async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInven
 struct CampaignCellBudget {
     effective_stop_budgets: EffectiveStopBudgets,
     planned_cell_duration_ms: u64,
+    drain_budget: InventoryDrainBudget,
 }
 
 fn initial_campaign_inventory(
@@ -9969,6 +13500,7 @@ fn initial_campaign_inventory(
         official_measurement: None,
         effective_stop_budgets: Some(budget.effective_stop_budgets.validate()?),
         planned_cell_duration_ms: Some(budget.planned_cell_duration_ms),
+        drain_budget: Some(budget.drain_budget),
         cleanup: InventoryCleanup {
             stop_admission: step(),
             bounded_drain: step(),
@@ -10003,6 +13535,14 @@ async fn initialize_campaign_inventory(
         CampaignCellBudget {
             effective_stop_budgets: config.maintenance_stop_budget()?,
             planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+            drain_budget: InventoryDrainBudget {
+                budget_ms: config.platform.aks_drain_budget_ms,
+                collector_grace_ms: config
+                    .collector_stop_grace_seconds
+                    .checked_mul(1_000)
+                    .context("collector grace overflow")?,
+                pre_stop_capture_margin_ms: crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS,
+            },
         },
     )?;
     persist_campaign_inventory(platform, &inventory).await?;
@@ -10078,6 +13618,179 @@ fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, rep
     Ok(())
 }
 
+fn required_cpu_feature_labels(target_cpu: arrowcol_tunables::CollectorTargetCpu) -> &'static [&'static str] {
+    match target_cpu {
+        arrowcol_tunables::CollectorTargetCpu::Generic => &[],
+        arrowcol_tunables::CollectorTargetCpu::X86_64V2 => {
+            &["CX16", "LAHF", "POPCNT", "SSE3", "SSSE3", "SSE4_1", "SSE4_2"]
+        }
+        arrowcol_tunables::CollectorTargetCpu::X86_64V3 => &[
+            "CX16", "LAHF", "POPCNT", "SSE3", "SSSE3", "SSE4_1", "SSE4_2", "AVX", "AVX2", "BMI1", "BMI2", "FMA", "ABM",
+            "MOVBE", "XSAVE",
+        ],
+        arrowcol_tunables::CollectorTargetCpu::X86_64V4 => &[
+            "CX16", "LAHF", "POPCNT", "SSE3", "SSSE3", "SSE4_1", "SSE4_2", "AVX", "AVX2", "BMI1", "BMI2", "FMA", "ABM",
+            "MOVBE", "XSAVE", "AVX512F", "AVX512BW", "AVX512CD", "AVX512DQ", "AVX512VL",
+        ],
+    }
+}
+
+async fn verify_aks_cpu_profile(config: &OatConfig) -> Result<()> {
+    let Some(target_cpu) = config
+        .tunables
+        .collector
+        .as_ref()
+        .and_then(|collector| collector.target_cpu)
+    else {
+        return Ok(());
+    };
+    let required = required_cpu_feature_labels(target_cpu);
+    if required.is_empty() {
+        return Ok(());
+    }
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command.args(["get", "nodes", "-o", "json"]);
+    let output = run_command(command, "preflight AKS collector CPU features").await?;
+    let nodes: Value = serde_json::from_slice(&output.stdout).context("parse AKS node CPU feature inventory")?;
+    let items = nodes
+        .get("items")
+        .and_then(Value::as_array)
+        .context("AKS node inventory has no items")?;
+    let selected_node = config
+        .platform
+        .fleet
+        .as_ref()
+        .map(|fleet| fleet.collector.node.as_str());
+    let mut checked = 0;
+    for node in items {
+        let name = node
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .context("AKS node inventory omitted a node name")?;
+        if selected_node.is_some_and(|selected| selected != name) {
+            continue;
+        }
+        if node.pointer("/spec/unschedulable").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let ready = node
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition["type"] == "Ready" && condition["status"] == "True")
+            });
+        if !ready {
+            continue;
+        }
+        checked += 1;
+        let labels = node
+            .pointer("/metadata/labels")
+            .and_then(Value::as_object)
+            .context("AKS node has no CPU feature labels")?;
+        let missing: Vec<_> = required
+            .iter()
+            .filter(|feature| {
+                let key = format!("feature.node.kubernetes.io/cpu-cpuid.{feature}");
+                labels.get(&key).and_then(Value::as_bool) != Some(true)
+                    && labels.get(&key).and_then(Value::as_str) != Some("true")
+            })
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "collector.target_cpu {} is unsupported on AKS node {name}; CPU feature labels missing: {}",
+                target_cpu.as_str(),
+                missing.join(", ")
+            );
+        }
+    }
+    if checked == 0 {
+        bail!(
+            "collector.target_cpu {} preflight found no Ready schedulable AKS collector nodes with verifiable CPU labels",
+            target_cpu.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn select_aks_collector_profile_image(runtime_config: &mut Value, profile_hash: &str) -> Result<()> {
+    let image = runtime_config
+        .get("collectorBuildImages")
+        .and_then(|profiles| profiles.get(profile_hash))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| {
+            format!("AKS runtime config is missing the collector image for build profile {profile_hash}")
+        })?;
+    if !is_digest_pinned_aks_image(&image) {
+        bail!("AKS collector build-profile image must be pinned by manifest digest");
+    }
+    let images = runtime_config
+        .get_mut("images")
+        .and_then(Value::as_object_mut)
+        .context("AKS runtime config images must be an object")?;
+    images.insert("dataflow".to_owned(), json!(image));
+    runtime_config["collectorBuildProfileHash"] = json!(profile_hash);
+    Ok(())
+}
+
+fn is_digest_pinned_aks_image(image: &str) -> bool {
+    let Some((registry, repository_and_digest)) = image.split_once('/') else {
+        return false;
+    };
+    let Some(registry_name) = registry.strip_suffix(".azurecr.io") else {
+        return false;
+    };
+    if registry_name.is_empty()
+        || !registry_name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Some((repository, digest)) = repository_and_digest.split_once("@sha256:") else {
+        return false;
+    };
+    let mut repository_bytes = repository.bytes();
+    if !repository_bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !repository_bytes
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'/' | b'_' | b'.' | b'-'))
+    {
+        return false;
+    }
+    is_lower_hex_string(digest, 64)
+}
+
+#[cfg(test)]
+#[test]
+fn aks_profile_hash_selects_digest_pinned_collector_image() -> Result<()> {
+    let hash = "a".repeat(64);
+    let image = format!("registry.azurecr.io/dataflow@sha256:{}", "b".repeat(64));
+    let mut runtime = json!({"images":{"dataflow":"registry.azurecr.io/dataflow@sha256:cccc"},
+        "collectorBuildImages":{(hash.clone()):image.clone()}});
+    select_aks_collector_profile_image(&mut runtime, &hash)?;
+    assert_eq!(runtime["images"]["dataflow"], image);
+    assert_eq!(runtime["collectorBuildProfileHash"], hash);
+    assert!(select_aks_collector_profile_image(&mut runtime, &"d".repeat(64)).is_err());
+    for image in [
+        format!("registry.azurecr.io/dataflow@sha256:{}", "b".repeat(63)),
+        format!("registry.azurecr.io/dataflow@sha256:{}suffix", "b".repeat(64)),
+        format!("dataflow@sha256:{}", "b".repeat(64)),
+        format!("registry.azurecr.io/dataflow@sha256:{}", "B".repeat(64)),
+    ] {
+        let mut runtime = json!({"collectorBuildImages":{(hash.clone()):image}});
+        assert!(select_aks_collector_profile_image(&mut runtime, &hash).is_err());
+    }
+    Ok(())
+}
+
 async fn prepare_aks_platform(
     config: &OatConfig,
     platform: &mut AksPlatform,
@@ -10085,6 +13798,7 @@ async fn prepare_aks_platform(
     replicas: u32,
 ) -> Result<()> {
     require_single_scale_out_collector(config, replicas)?;
+    verify_aks_cpu_profile(config).await?;
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -10120,6 +13834,9 @@ async fn prepare_aks_platform(
         serde_json::from_slice(&runtime_bytes).context("parse deployed-stamp runtime config JSON")?;
     if runtime_config.get("stamp").and_then(Value::as_str) != config.stamp.as_deref() {
         bail!("deployed-stamp runtime config does not match the OAT-selected stamp");
+    }
+    if let Some(profile_hash) = config.collector_build_profile_hash() {
+        select_aks_collector_profile_image(&mut runtime_config, &profile_hash)?;
     }
     let shared_data_root = runtime_config
         .get("deltaRoot")
@@ -11699,10 +15416,11 @@ async fn stop_aks_deployment_for_cleanup(
     deployment_name: &str,
     role: ComponentRole,
     grace_seconds: u64,
+    collector_logs: &mut Vec<ProcessLog>,
 ) -> Result<Value> {
     timed_aks_cleanup_step(
         &format!("stop AKS Deployment {deployment_name}"),
-        stop_aks_deployment_until_stopped(config, deployment_name, role, grace_seconds),
+        stop_aks_deployment_until_stopped(config, deployment_name, role, grace_seconds, collector_logs),
     )
     .await
 }
@@ -11727,6 +15445,7 @@ async fn stop_aks_deployment_until_stopped(
     deployment_name: &str,
     role: ComponentRole,
     grace_seconds: u64,
+    collector_logs: &mut Vec<ProcessLog>,
 ) -> Result<Value> {
     let output = kubectl(
         config,
@@ -11766,7 +15485,11 @@ async fn stop_aks_deployment_until_stopped(
     let initial_pods = aks_pods_by_selector(config, &selector).await?;
     let mut followers = Vec::new();
     let mut terminated = HashMap::<String, Value>::new();
-    for pod in initial_pods["items"].as_array().into_iter().flatten() {
+    let mut identities = BTreeSet::new();
+    for pod in initial_pods["items"]
+        .as_array()
+        .context("run-owned pod list is missing")?
+    {
         let pod_name = pod
             .pointer("/metadata/name")
             .and_then(Value::as_str)
@@ -11793,6 +15516,9 @@ async fn stop_aks_deployment_until_stopped(
             let pod_name = pod_name.to_owned();
             let container = container.to_owned();
             let instance_id = format!("{pod_name}/{container}");
+            if !identities.insert(instance_id.clone()) {
+                bail!("duplicate run-owned shutdown process identity: {instance_id}");
+            }
             if let Some(state) = status.pointer("/state/terminated") {
                 terminated.insert(instance_id.clone(), state.clone());
             }
@@ -11834,88 +15560,130 @@ async fn stop_aks_deployment_until_stopped(
                     text,
                 })
             });
-            followers.push((pod_name, container, status.pointer("/state/running").is_some(), task));
+            followers.push((
+                pod_name,
+                container,
+                status.pointer("/state/running").is_some(),
+                ShutdownLogFollower(task),
+            ));
         }
+    }
+    if role == ComponentRole::Collector
+        && let Some(expected) = deployment.pointer("/spec/replicas").and_then(Value::as_u64)
+        && expected > 0
+        && u64::try_from(followers.len())? != expected
+    {
+        bail!("collector shutdown process identities do not match deployment replicas");
     }
     let sigterm_at_unix_ms = (role == ComponentRole::Collector)
         .then(|| u64::try_from(unix_time_ms()).ok())
         .flatten();
-    kubectl(
-        config,
-        vec![
-            "scale",
-            "deployment",
-            deployment_name,
-            "--replicas=0",
-            "--namespace",
-            &config.namespace,
-        ],
-        None,
-    )
-    .await
-    .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
-    loop {
-        let pods = aks_pods_by_selector(config, &selector).await?;
-        for pod in pods["items"].as_array().into_iter().flatten() {
-            let pod_name = pod
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .context("run-owned pod has no name")?;
-            for status in pod
-                .pointer("/status/containerStatuses")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(state) = status.pointer("/state/terminated") {
-                    let container = status
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .context("terminated container has no name")?;
-                    terminated.insert(format!("{pod_name}/{container}"), state.clone());
+    let stopped: Result<()> = async {
+        kubectl(
+            config,
+            vec![
+                "scale",
+                "deployment",
+                deployment_name,
+                "--replicas=0",
+                "--namespace",
+                &config.namespace,
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
+        loop {
+            let pods = aks_pods_by_selector(config, &selector).await?;
+            for pod in pods["items"].as_array().into_iter().flatten() {
+                let pod_name = pod
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .context("run-owned pod has no name")?;
+                for status in pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(state) = status.pointer("/state/terminated") {
+                        let container = status
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .context("terminated container has no name")?;
+                        terminated.insert(format!("{pod_name}/{container}"), state.clone());
+                    }
                 }
             }
+            let current: Value = serde_json::from_str(
+                &kubectl(
+                    config,
+                    vec![
+                        "get",
+                        "deployment",
+                        deployment_name,
+                        "--namespace",
+                        &config.namespace,
+                        "-o",
+                        "json",
+                    ],
+                    None,
+                )
+                .await?,
+            )?;
+            let desired = current.pointer("/spec/replicas").and_then(Value::as_u64).unwrap_or(1);
+            let replicas = current.pointer("/status/replicas").and_then(Value::as_u64).unwrap_or(0);
+            let observed = rollout_generation_observed(&current);
+            let no_pods = pods["items"].as_array().is_some_and(Vec::is_empty);
+            if desired == 0 && replicas == 0 && observed && no_pods {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("run-owned deployment {deployment_name} did not stop within its bounded grace period");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let current: Value = serde_json::from_str(
-            &kubectl(
-                config,
-                vec![
-                    "get",
-                    "deployment",
-                    deployment_name,
-                    "--namespace",
-                    &config.namespace,
-                    "-o",
-                    "json",
-                ],
-                None,
-            )
-            .await?,
-        )?;
-        let desired = current.pointer("/spec/replicas").and_then(Value::as_u64).unwrap_or(1);
-        let replicas = current.pointer("/status/replicas").and_then(Value::as_u64).unwrap_or(0);
-        let observed = rollout_generation_observed(&current);
-        let no_pods = pods["items"].as_array().is_some_and(Vec::is_empty);
-        if desired == 0 && replicas == 0 && observed && no_pods {
-            break;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = stopped {
+        for (_, _, _, mut task) in followers {
+            if task.0.is_finished()
+                && let Ok(Ok(mut log)) = (&mut task.0).await
+                && role == ComponentRole::Collector
+            {
+                log.complete = false;
+                retain_aks_collector_log(collector_logs, log)?;
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("run-owned deployment {deployment_name} did not stop within its bounded grace period");
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        return Err(error);
     }
     let mut processes = Vec::new();
     let mut outcome_failures = Vec::new();
+    let log_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     for (pod_name, container, was_running, mut task) in followers {
         let instance_id = format!("{pod_name}/{container}");
-        let log = match tokio::time::timeout(Duration::from_secs(30), &mut task).await {
+        let log = match tokio::time::timeout_at(log_deadline, &mut task.0).await {
             Ok(Ok(Ok(log))) => Some(log),
             _ => {
-                task.abort();
+                task.0.abort();
                 None
             }
         };
+        if role == ComponentRole::Collector {
+            match &log {
+                Some(log) => {
+                    if !log.complete {
+                        outcome_failures.push(format!("{instance_id}: collector shutdown log is incomplete"));
+                    }
+                    if let Err(error) = retain_aks_collector_log(collector_logs, log.clone()) {
+                        outcome_failures.push(format!("{instance_id}: {error:#}"));
+                    }
+                }
+                None => outcome_failures.push(format!("{instance_id}: collector shutdown log is unavailable")),
+            }
+        }
         let terminated_state = terminated.get(&instance_id);
         let exit_code = terminated_state
             .and_then(|state| state.get("exitCode"))
@@ -11923,7 +15691,7 @@ async fn stop_aks_deployment_until_stopped(
         let finished_at = terminated_state
             .and_then(|state| state.get("finishedAt"))
             .and_then(Value::as_str);
-        let outcome = shutdown_exit_outcome(
+        let outcome = aks_shutdown_exit_outcome(
             role,
             was_running,
             exit_code,
@@ -11939,14 +15707,25 @@ async fn stop_aks_deployment_until_stopped(
                 json!({"status": "failed", "exit_code": exit_code})
             }
         };
+        if role == ComponentRole::Collector && exit_evidence["status"] == "unavailable" {
+            let reason = exit_evidence["reason"].as_str().unwrap_or("collector_exit_unavailable");
+            outcome_failures.push(format!("{instance_id}: {reason}"));
+        }
         let process_evidence = match (role, log.as_ref()) {
-            (ComponentRole::Collector, Some(log)) => collector_shutdown_drain_evidence(
-                log,
-                was_running.then_some(sigterm_at_unix_ms).flatten(),
-                finished_at,
-                exit_code,
-                config.tunables.wal.is_some(),
-            ),
+            (ComponentRole::Collector, Some(log)) => {
+                let mut evidence = collector_shutdown_drain_evidence(
+                    log,
+                    was_running.then_some(sigterm_at_unix_ms).flatten(),
+                    finished_at,
+                    exit_code,
+                    config.tunables.wal.is_some(),
+                );
+                if exit_code == Some(143) {
+                    evidence["status"] = json!("unavailable");
+                    evidence["unavailable_reason"] = json!("drain_complete_and_exact_delta_reconciliation_unverified");
+                }
+                evidence
+            }
             (ComponentRole::Collector, None) => json!({
                 "status": "unavailable", "unavailable_reason": "collector_shutdown_log_stream_unavailable",
                 "sigterm_sent": was_running, "sigterm_to_exit_seconds": null,
@@ -11983,6 +15762,7 @@ async fn stop_aks_deployment_until_stopped(
             "exit_outcome": exit_evidence,
             "finished_at": finished_at,
             "log_complete": log.as_ref().is_some_and(|log| log.complete),
+            "log_continuity": if role == ComponentRole::Collector { "unverified" } else { "not_assessed" },
             "drain": (role == ComponentRole::Collector).then_some(process_evidence.clone()),
             "operation_outcomes": (role == ComponentRole::Maintenance).then_some(process_evidence),
         }));
@@ -12036,20 +15816,50 @@ fn shutdown_exit_outcome(
     }))
 }
 
-async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
+fn aks_shutdown_exit_outcome(
+    role: ComponentRole,
+    was_running: bool,
+    exit_code: Option<i64>,
+    oom_killed: bool,
+) -> Result<Value> {
+    let outcome = shutdown_exit_outcome(role, was_running, exit_code, oom_killed)?;
+    if role == ComponentRole::Collector && exit_code == Some(143) {
+        return Ok(json!({"status": "unavailable", "exit_code": 143,
+            "reason": "drain_complete_and_exact_delta_reconciliation_unverified"}));
+    }
+    if role == ComponentRole::Collector && exit_code.is_none() {
+        return Ok(json!({"status": "unavailable", "exit_code": null, "reason": "collector_exit_not_observed"}));
+    }
+    Ok(outcome)
+}
+
+async fn stop_aks_workloads_in_order(config: &OatConfig, collector_logs: &mut Vec<ProcessLog>) -> Result<Value> {
     let mut ingress = Vec::new();
     let mut maintenance = Vec::new();
     let mut collectors = Vec::new();
     if config.arrowcol_deployment != config.dfe_deployment {
         ingress.push(
-            stop_aks_deployment_for_cleanup(config, &config.arrowcol_deployment, ComponentRole::Router, 60).await?,
+            stop_aks_deployment_for_cleanup(
+                config,
+                &config.arrowcol_deployment,
+                ComponentRole::Router,
+                60,
+                collector_logs,
+            )
+            .await?,
         );
     }
     if maintenance_enabled(config) {
         let grace_seconds = config.maintenance_stop_budget()?.maintenance_grace_seconds;
         maintenance.push(
-            stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, grace_seconds)
-                .await?,
+            stop_aks_deployment_for_cleanup(
+                config,
+                "delta-maintenance",
+                ComponentRole::Maintenance,
+                grace_seconds,
+                collector_logs,
+            )
+            .await?,
         );
     }
     collectors.push(
@@ -12058,6 +15868,7 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
             &config.dfe_deployment,
             ComponentRole::Collector,
             config.collector_stop_grace_seconds,
+            collector_logs,
         )
         .await?,
     );
@@ -12071,6 +15882,48 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
         "maintenance": maintenance,
         "collectors": collectors,
     }))
+}
+
+fn retain_aks_collector_log(logs: &mut Vec<ProcessLog>, log: ProcessLog) -> Result<()> {
+    if log.role != ComponentRole::Collector
+        || log.instance_id.is_empty()
+        || logs.iter().any(|retained| retained.instance_id == log.instance_id)
+    {
+        bail!("invalid or duplicate collector process identity");
+    }
+    logs.push(log);
+    Ok(())
+}
+
+async fn retain_aks_shutdown_logs_after_stop(
+    stopped: Result<Value>,
+    logs: &mut Vec<ProcessLog>,
+    fallback: impl std::future::Future<Output = Result<Vec<ProcessLog>>>,
+) -> Result<Value> {
+    match stopped {
+        Ok(evidence) => Ok(evidence),
+        Err(error) => {
+            let snapshots = match fallback.await {
+                Ok(snapshots) => snapshots,
+                Err(capture_error) => {
+                    return Err(error.context(format!(
+                        "capture collector logs after unsuccessful AKS stop: {capture_error:#}"
+                    )));
+                }
+            };
+            let mut observed = BTreeSet::new();
+            for mut log in snapshots {
+                if log.role != ComponentRole::Collector || !observed.insert(log.instance_id.clone()) {
+                    bail!("invalid or duplicate collector identity in unsuccessful-stop log snapshot");
+                }
+                if !logs.iter().any(|retained| retained.instance_id == log.instance_id) {
+                    log.complete = false;
+                    retain_aks_collector_log(logs, log)?;
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 fn require_aks_cleanup_confirmation(platform: &AksPlatform) -> Result<()> {
@@ -12100,10 +15953,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         platform.router_metrics_url = None;
     }
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
-        match cleanup_campaign_aks_platform(config, platform).await {
+        match cleanup_campaign_aks_platform(config, platform, CampaignCleanupPhase::Freeze).await {
             Ok(evidence) => {
                 platform.shutdown_drain_evidence = Some(evidence);
-                platform.qap_cleanup_confirmed = true;
             }
             Err(error) => {
                 let detail = format!("{error:#}");
@@ -12113,26 +15965,6 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     "failure": detail,
                 }));
                 failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
-            }
-        }
-        if let Err(error) = require_aks_cleanup_confirmation(platform) {
-            failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
-        }
-        if let Some(runtime_dir) = platform.runtime_dir.take() {
-            let retention = runtime_evidence_retention(
-                platform.fic_prepare_attempted,
-                platform.fic_record_path.as_deref(),
-                platform.fic_ready_snapshot_path.as_deref(),
-                platform.qap_bind_attempted,
-                platform.qap_record_path.as_deref(),
-                platform.workload_stop_record_path.as_deref(),
-                platform.qap_outcome_unresolved || !failures.is_empty(),
-            );
-            if let Err(error) = apply_runtime_evidence_retention(&runtime_dir, retention).await {
-                failures.push(format!(
-                    "remove private AKS runtime files {}: {error:#}",
-                    runtime_dir.display()
-                ));
             }
         }
         if failures.is_empty() {
@@ -12154,6 +15986,15 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     NamespaceCleanupAction::Delete => {
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
+                        let mut collector_logs = Vec::new();
+                        let stopped = stop_aks_workloads_in_order(config, &mut collector_logs).await;
+                        let stopped = retain_aks_shutdown_logs_after_stop(
+                            stopped,
+                            &mut collector_logs,
+                            aks_process_logs_for_role(config, Some(ComponentRole::Collector)),
+                        )
+                        .await;
+                        platform.stopped_collector_logs = Some(collector_logs);
                         let cleanup = async {
                             timed_aks_cleanup_step(
                                 "delete run-owned AKS namespace",
@@ -12178,7 +16019,7 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             .await
                             .context("write exact-run workload stop receipt")
                         };
-                        match stop_then_destroy(stop_aks_workloads_in_order(config), cleanup).await {
+                        match stop_then_destroy(async { stopped }, cleanup).await {
                             Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
                             Err(error) => failures.push(format!("ordered AKS shutdown/cleanup failed: {error:#}")),
                         }
@@ -12335,6 +16176,7 @@ async fn apply_runtime_evidence_retention(directory: &Path, retention: RuntimeEv
             for name in [
                 "run-table-initializer-job.json",
                 "run-table-initializer-termination.json",
+                "run-table-initial-delta-properties.json",
                 "run-table-catalog-registration.json",
             ] {
                 let path = directory.join(name);
@@ -13992,6 +17834,18 @@ mod tests {
             ]
         );
         assert!(super::local_partition_initializer_args("sqlserver_wait_stats", &root).is_err());
+        assert_eq!(
+            super::local_initializer_args("sqlserver_active_sessions", &root, false)?,
+            [
+                "initialize-local",
+                "--unpartitioned",
+                "--table",
+                "telemetry.sqlserver.sqlserver_active_sessions",
+                "--dataflow-root",
+                root.to_str().context("temp root is not valid UTF-8")?,
+            ]
+        );
+        assert!(super::local_initializer_args("not_a_table", &root, false).is_err());
         assert!(
             super::local_partition_initializer_args(
                 "sqlserver_availability_replica_states",
@@ -14332,6 +18186,79 @@ mod tests {
     }
 
     #[test]
+    fn aks_client_job_renders_configured_streams_and_concurrency() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for (streams, concurrency, expected) in [
+            (
+                Some(7),
+                None,
+                vec!["--endpoint", "http://router", "--streams-per-worker", "7"],
+            ),
+            (
+                Some(0),
+                Some(9),
+                vec![
+                    "--endpoint",
+                    "http://router",
+                    "--streams-per-worker",
+                    "0",
+                    "--concurrency",
+                    "9",
+                ],
+            ),
+            (None, None, vec!["--endpoint", "http://router"]),
+        ] {
+            config.tunables.client = streams.map(|streams_per_worker| arrowcol_tunables::ClientTunables {
+                streams_per_worker: Some(streams_per_worker),
+                ..Default::default()
+            });
+            config.dmv_concurrency = concurrency;
+            config.validate()?;
+            let incoming = [
+                "--endpoint",
+                "http://router",
+                "--streams-per-worker",
+                "2",
+                "--concurrency=2",
+            ]
+            .map(str::to_owned);
+            let args = render_aks_client_args(&config, &incoming)?;
+            let job = build_aks_client_job(AksClientJobSpec {
+                namespace: "oat-test",
+                client_image: "example.invalid/client@sha256:abc",
+                router_auth_secret_name: "arrowcol-router-auth",
+                schedule_configmap_name: "oat-test-schedule",
+                run_id: "00000000-0000-0000-0000-000000000001",
+                run_label: "00000000",
+                job_name: "oat-test",
+                args: &args,
+                run_seconds: 3600,
+                stop_grace_seconds: 45,
+            });
+            assert_eq!(
+                job["spec"]["template"]["spec"]["containers"][0]["args"],
+                json!(expected)
+            );
+        }
+        config.dmv_concurrency = Some(2);
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables {
+            streams_per_worker: Some(7),
+            ..Default::default()
+        });
+        assert!(
+            config
+                .validate()
+                .err()
+                .context("invalid concurrency must be rejected")?
+                .to_string()
+                .contains("dmv_concurrency")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn aks_client_job_mounts_internal_identity_key_for_direct_catalog_ddl() -> Result<()> {
         let job = build_aks_client_job(AksClientJobSpec {
             namespace: "oat-test",
@@ -14343,7 +18270,9 @@ mod tests {
             job_name: "oat-00000000-table-c0",
             args: &["--endpoint".to_owned(), "http://arrowcol-router:50050".to_owned()],
             run_seconds: 3_600,
+            stop_grace_seconds: 45,
         });
+        assert_eq!(job["spec"]["template"]["spec"]["terminationGracePeriodSeconds"], 45);
         let container = &job["spec"]["template"]["spec"]["containers"][0];
         let mounts = container["volumeMounts"].as_array().context("client volume mounts")?;
         let identity_mount = mounts
@@ -14392,7 +18321,7 @@ mod tests {
         );
         assert_eq!(
             local_oat_client_remove_args(&["client-a".to_owned(), "client-b".to_owned()]),
-            ["rm", "--force", "client-a", "client-b"]
+            ["rm", "client-a", "client-b"]
         );
     }
 
@@ -14558,7 +18487,7 @@ mod tests {
                 .is_some_and(|message| message.contains("no active ArrowCol"))
         );
         let upstream = anyhow::anyhow!("gRPC failed: pinning_violation: pinned collector became unavailable");
-        let failed = failed_client_pinning_report(&upstream, Ok(healthy), &tables, PinningReport::default());
+        let failed = failed_client_pinning_report(&upstream, Ok(healthy.clone()), &tables, PinningReport::default());
         assert_eq!(
             failed.owners.get("sqlserver_wait_stats").map(String::as_str),
             Some("collector-a")
@@ -14586,6 +18515,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("router rejected 1"))
         );
+        let mut observed = PinningReport::default();
+        record_owner_observation(&mut observed, Ok(healthy), &tables, false);
+        record_owner_observation(&mut observed, Ok(HashMap::new()), &tables, false);
+        assert!(observed.violation.is_some());
+        assert!(observed.samples[0]["observed_at_unix_ms"].is_u64());
+        assert_eq!(
+            observed.samples[0]["owners_by_table"]["sqlserver_wait_stats"][0],
+            "collector-a"
+        );
+        assert_eq!(observed.samples[1]["owners_by_table"], json!({}));
         Ok(())
     }
 
@@ -14733,6 +18672,11 @@ mod tests {
                     maintenance_stop_timeout_ms: 1_500_000,
                 },
                 planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
             },
         )?;
         super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
@@ -14748,6 +18692,38 @@ mod tests {
             1_500_000
         );
         assert_eq!(value["planned_cell_duration_ms"], 1_000);
+        assert_eq!(
+            value["drain_budget"],
+            json!({"budget_ms":90_000,"collector_grace_ms":180_000,"pre_stop_capture_margin_ms":30_000})
+        );
+        let mut legacy = value.clone();
+        legacy
+            .as_object_mut()
+            .context("inventory object")?
+            .remove("drain_budget");
+        let legacy: RunInventory = serde_json::from_value(legacy)?;
+        assert!(legacy.drain_budget.is_none());
+        assert!(legacy.validate_successor(&inventory).is_err());
+        let mut changed = inventory.clone();
+        changed.drain_budget.as_mut().context("drain budget")?.budget_ms = 80_000;
+        assert!(inventory.validate_successor(&changed).is_err());
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &inventory, 1_000)?,
+            91_000
+        );
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &legacy, 1_000)?,
+            121_000
+        );
+        let mut null_budget = value.clone();
+        null_budget["drain_budget"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<RunInventory>(null_budget).is_err());
+        let mut extra_key = value.clone();
+        extra_key["drain_budget"]["unexpected"] = json!(1);
+        assert!(serde_json::from_value::<RunInventory>(extra_key).is_err());
+        let mut invalid = inventory.clone();
+        invalid.drain_budget.as_mut().context("drain budget")?.budget_ms = 150_001;
+        assert!(invalid.validate().is_err());
         let mut no_row_rehearsal = inventory.clone();
         no_row_rehearsal.planned_cell_duration_ms = Some(0);
         no_row_rehearsal.resources.push(InventoryResource {
@@ -14870,6 +18846,422 @@ mod tests {
             assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
             assert!(error.to_string().contains(code));
         }
+        let deadline = campaign_custody_helper_failure(
+            "cleanup-step",
+            br#"{"ok":false,"code":"write_outcome_unknown","reason_code":"cleanup_deadline_expired"}"#,
+        );
+        assert!(deadline.downcast_ref::<StaleCampaignVersionError>().is_none());
+        assert!(deadline.to_string().contains("cleanup_deadline_expired"));
+        let untrusted = campaign_custody_helper_failure(
+            "cleanup-step",
+            br#"{"ok":false,"code":"write_outcome_unknown","reason_code":"secret"}"#,
+        );
+        assert!(!untrusted.to_string().contains("secret"));
+        let wrong_code = campaign_custody_helper_failure(
+            "cleanup-step",
+            br#"{"ok":false,"code":"invalid_or_storage_error","reason_code":"cleanup_deadline_expired"}"#,
+        );
+        assert!(!wrong_code.to_string().contains("cleanup_deadline_expired"));
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_finalization_binds_frozen_sources_and_never_promotes_unproved_143() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let mut inventory = initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
+            "oat-00000000000000000000000000000004",
+            "campaignstorage",
+            "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
+            },
+        )?;
+        inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let root = format!(
+            "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}",
+            inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+        );
+        let reference = |blob: String| ShutdownSourceReference {
+            blob,
+            etag: "\"source\"".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let inputs = ShutdownFinalizationInputs {
+            schema_version: 1,
+            inventory_etag: "\"inventory\"".to_owned(),
+            terminal_capture: Some(reference(format!(
+                "{}/custody/{}/terminal_capture.json",
+                inventory
+                    .evidence_destination
+                    .as_ref()
+                    .context("destination")?
+                    .blob_prefix,
+                inventory.cell_run_id
+            ))),
+            delta_before: Some(reference(format!("{root}/delta-before.json"))),
+            delta_terminal: Some(reference(format!("{root}/delta-terminal.json"))),
+            unavailable_reason: None,
+            terminal_summaries: None,
+        };
+        let mut row = sample_result("run", "table", 7);
+        row.evidence_json = Some(json!({
+            "durable_commits": {
+                "post_teardown_delta_reconciliation":{"status":"matched", "client_acknowledged_rows":7, "delta_log_committed_rows":7},
+                "run_cumulative_output":{"post_teardown_verification":"matched_final_delta_log"},
+                "collector_teardown_admissions":{"status":"clear", "cancelled_ambiguous":0}
+            }, "reconciliation":{"settled":true, "ambiguous_rows":0}
+        }).to_string());
+        let reconciliation = shutdown_reconciliation_request(std::slice::from_ref(&row));
+        let mut receipt = ShutdownFinalizationReceipt {
+            schema_version: 1,
+            blob: format!("{root}/shutdown-finalization.json"),
+            etag: "\"final\"".to_owned(),
+            sha256: "b".repeat(64),
+            inventory_etag: inputs.inventory_etag.clone(),
+            actor: actor.clone(),
+            origin: ShutdownFinalizationOrigin {
+                campaign_id: inventory.campaign_id.clone(),
+                owner_id: inventory.owner_id.clone(),
+                fencing_token: inventory.fencing_token,
+                orchestration_run_id: inventory.orchestration_run_id.clone(),
+                cell_run_id: inventory.cell_run_id.clone(),
+                namespace: inventory.namespace.clone(),
+            },
+            terminal_capture: inputs.terminal_capture.clone(),
+            delta_before: inputs.delta_before.clone(),
+            delta_terminal: inputs.delta_terminal.clone(),
+            status: "validated".to_owned(),
+            reason_code: None,
+            release_allowed: true,
+            reconciliation: reconciliation.clone(),
+            verdicts: vec![ShutdownFinalVerdict {
+                pod_name: "collector-0".to_owned(),
+                pod_uid: "pod-uid-0".to_owned(),
+                container: "dataflow".to_owned(),
+                restart_count: Some(0),
+                classification: "exit_0".to_owned(),
+            }],
+        };
+        validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)?;
+        ensure_shutdown_release(&receipt, std::slice::from_ref(&row))?;
+        assert!(ensure_shutdown_release(&receipt, &[]).is_err());
+        receipt.status = "unavailable".to_owned();
+        receipt.reason_code = Some("exit_143_unavailable".to_owned());
+        receipt.release_allowed = false;
+        for classification in [
+            "exit_143_terminal_reconciliation_unavailable",
+            "exit_143_without_drain_marker",
+        ] {
+            receipt.verdicts[0].classification = classification.to_owned();
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)?;
+            assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        }
+        receipt.status = "validated".to_owned();
+        receipt.reason_code = None;
+        receipt.release_allowed = true;
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        receipt.status = "unavailable".to_owned();
+        receipt.reason_code = Some("exit_143_unavailable".to_owned());
+        receipt.release_allowed = false;
+        receipt.verdicts[0].classification = "clean_sigterm_after_drain".to_owned();
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.verdicts[0].classification = "sigterm_after_drain_pending_reconciliation".to_owned();
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.verdicts[0].classification = "exit_0".to_owned();
+        receipt.status = "validated".to_owned();
+        receipt.reason_code = None;
+        receipt.release_allowed = true;
+        receipt.verdicts.push(receipt.verdicts[0].clone());
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.verdicts.pop();
+        receipt.delta_terminal.as_mut().context("terminal")?.sha256 = "c".repeat(64);
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.delta_terminal = inputs.delta_terminal.clone();
+        receipt.actor.fencing_token += 1;
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.actor.fencing_token -= 1;
+        receipt.origin.namespace.uid = None;
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        assert!(validate_shutdown_inputs(&inputs, &inventory, "\"changed\"").is_err());
+        let mut wrong = inputs.clone();
+        wrong.delta_before.as_mut().context("baseline")?.blob.push_str(".other");
+        assert!(validate_shutdown_inputs(&wrong, &inventory, "\"inventory\"").is_err());
+        row.evidence_json = Some(
+            json!({"durable_commits":{"post_teardown_delta_reconciliation":{"status":"unavailable"},
+            "run_cumulative_output":{"post_teardown_verification":"unavailable_or_mismatched"}}})
+            .to_string(),
+        );
+        assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        let mut no_baseline = inputs.clone();
+        no_baseline.delta_before = None;
+        no_baseline.unavailable_reason = Some("no_baseline".to_owned());
+        receipt.origin.namespace.uid = inventory.namespace.uid.clone();
+        receipt.delta_before = None;
+        receipt.status = "unavailable".to_owned();
+        receipt.reason_code = Some("no_baseline".to_owned());
+        receipt.release_allowed = false;
+        validate_shutdown_finalization(
+            &receipt,
+            &inventory,
+            "\"inventory\"",
+            &actor,
+            &no_baseline,
+            &reconciliation,
+        )?;
+        assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        inventory.namespace.uid = None;
+        no_baseline.terminal_capture = None;
+        no_baseline.delta_terminal = None;
+        receipt.origin.namespace.uid = None;
+        receipt.terminal_capture = None;
+        receipt.delta_terminal = None;
+        validate_shutdown_finalization(
+            &receipt,
+            &inventory,
+            "\"inventory\"",
+            &actor,
+            &no_baseline,
+            &reconciliation,
+        )?;
+        assert_eq!(
+            CampaignCleanupPhase::Freeze
+                .actions()
+                .last()
+                .map(CampaignCleanupAction::selector),
+            Some("terminal_capture")
+        );
+        assert_eq!(
+            CampaignCleanupPhase::Release
+                .actions()
+                .last()
+                .map(CampaignCleanupAction::selector),
+            Some("handoff")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_terminal_summary_requires_complete_identity_and_exact_delta_versions() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.clients_per_table = 1;
+        let table = "sqlserver_availability_replica_states";
+        config.tables = vec![table.to_owned()];
+        let root = "abfss://data@example.dfs.core.windows.net/campaign/run/dataflow";
+        let table_id = fixture_sha256(format!("{root}/telemetry/sqlserver/{table}/").as_bytes());
+        let source = ShutdownSourceReference {
+            blob: "terminal".to_owned(),
+            etag: "\"etag\"".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let pod = |index: u64| ShutdownTerminalPodSummary {
+            pod_name: format!("collector-{index}"),
+            pod_uid: format!("uid-{index}"),
+            container: config.dfe_container.clone(),
+            restart_count: 0,
+            exit_code: 0,
+            summary: ShutdownTerminalSummary {
+                schema_version: 2,
+                admitted: 1,
+                committed: 1,
+                failed: 0,
+                cancelled_ambiguous: 0,
+                pending: 0,
+                committed_rows: 5,
+                incomplete: 0,
+                commits: vec![ShutdownTerminalCommit {
+                    table_id: table_id.clone(),
+                    version: index + 1,
+                    rows: 5,
+                    files: 1,
+                    parquet_bytes: 50,
+                }],
+                publication_evidence: vec![ShutdownTerminalPublicationCall {
+                    clean: true,
+                    reasons: Vec::new(),
+                    outcomes: vec![ShutdownTerminalPublicationOutcome {
+                        app_id: format!("client-{index}"),
+                        app_version: 42,
+                        status: "committed_now".to_owned(),
+                        delta_version: Some(index + 1),
+                        reason: None,
+                    }],
+                }],
+            },
+        };
+        let mut inputs = ShutdownFinalizationInputs {
+            schema_version: 1,
+            inventory_etag: "\"inventory\"".to_owned(),
+            terminal_capture: Some(source.clone()),
+            delta_before: Some(source.clone()),
+            delta_terminal: Some(source),
+            unavailable_reason: None,
+            terminal_summaries: Some(vec![pod(0), pod(1)]),
+        };
+        let mut row = sample_result("run", table, 10);
+        row.replicas = 2;
+        row.evidence_json = Some(json!({
+            "client_phase_reports":[{"phase_counters":{"process_cumulative":{"completed_rows":10,"ambiguous_rows":0}}}],
+            "durable_commits":{"run_cumulative_output":{"settle_seconds":1.0,"settle_timeout_seconds":2}}
+        }).to_string());
+        let original = row.clone();
+        assert!(attach_terminal_summary_commits(
+            &config,
+            Some(root),
+            std::slice::from_mut(&mut row),
+            &inputs
+        )?);
+        let delta = json!({"rows":10,"versions":[{"delta_version":1,"rows":5,"files":1,"parquet_bytes":50},
+            {"delta_version":2,"rows":5,"files":1,"parquet_bytes":50}]});
+        apply_final_aks_delta_reconciliation(&config, &mut row, Some(&delta), true)?;
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(
+            evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"],
+            "matched"
+        );
+        assert_eq!(
+            evidence["durable_commits"]["collector_teardown_admissions"]["status"],
+            "clear"
+        );
+        let mut mismatched = delta.clone();
+        mismatched["versions"][0]["parquet_bytes"] = json!(51);
+        apply_final_aks_delta_reconciliation(&config, &mut row, Some(&mismatched), true)?;
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(
+            evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"],
+            "mismatch"
+        );
+        for fault in 0..13 {
+            let mut bad = inputs.clone();
+            let summaries = bad.terminal_summaries.as_mut().context("missing summaries")?;
+            match fault {
+                0 => summaries[0].restart_count = 1,
+                1 => summaries[0].exit_code = 143,
+                2 => summaries[0].summary.incomplete = 1,
+                3 => summaries[0].summary.cancelled_ambiguous = 1,
+                4 => summaries[0].summary.commits[0].table_id = "b".repeat(64),
+                5 => summaries[1].summary.commits[0].version = summaries[0].summary.commits[0].version,
+                6 => {
+                    let _ = summaries.pop();
+                }
+                7 => summaries[0].summary.admitted += 1,
+                8 => summaries[0].summary.pending = 1,
+                9 => summaries[1].pod_uid = summaries[0].pod_uid.clone(),
+                10 => summaries[0].summary.publication_evidence[0].clean = false,
+                11 => {
+                    let outcome = &mut summaries[0].summary.publication_evidence[0].outcomes[0];
+                    outcome.status = "unknown".to_owned();
+                    outcome.delta_version = None;
+                    outcome.reason = Some("not_submitted".to_owned());
+                }
+                12 => summaries[0].summary.publication_evidence[0].outcomes[0].delta_version = Some(42),
+                _ => bail!("invalid summary test case"),
+            }
+            let mut candidate = original.clone();
+            assert!(
+                attach_terminal_summary_commits(&config, Some(root), std::slice::from_mut(&mut candidate), &bad)
+                    .is_err()
+            );
+            assert_eq!(candidate.evidence_json, original.evidence_json);
+        }
+        let mut wire = json!({"schema_version":1,"inventory_etag":"\"inventory\"", "terminal_capture":null,
+            "delta_before":null,"delta_terminal":null,"unavailable_reason":"no_baseline"});
+        assert!(serde_json::from_value::<ShutdownFinalizationInputs>(wire.clone()).is_err());
+        wire["terminal_summaries"] = Value::Null;
+        assert!(
+            serde_json::from_value::<ShutdownFinalizationInputs>(wire)?
+                .terminal_summaries
+                .is_none()
+        );
+        inputs.terminal_summaries = None;
+        assert!(!attach_terminal_summary_commits(
+            &config,
+            Some(root),
+            std::slice::from_mut(&mut row),
+            &inputs
+        )?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalization_unknown_write_uses_readback_without_replay() -> Result<()> {
+        for readback_available in [true, false] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = std::sync::Arc::clone(&calls);
+            let result = submit_shutdown_finalization_once(
+                move |action| {
+                    let observed = std::sync::Arc::clone(&observed);
+                    async move {
+                        observed
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("calls lock poisoned"))?
+                            .push(action);
+                        if action == "shutdown-finalization-read" && readback_available {
+                            Ok(b"confirmed".to_vec())
+                        } else {
+                            Err(anyhow::anyhow!("unknown outcome"))
+                        }
+                    }
+                },
+                |bytes| {
+                    if bytes == b"confirmed" {
+                        Ok(())
+                    } else {
+                        bail!("mismatched finalization")
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), readback_available);
+            assert_eq!(
+                *calls.lock().map_err(|_| anyhow::anyhow!("calls lock poisoned"))?,
+                ["shutdown-finalize", "shutdown-finalization-read"]
+            );
+        }
         Ok(())
     }
 
@@ -14895,6 +19287,11 @@ mod tests {
                     maintenance_stop_timeout_ms: 1_500_000,
                 },
                 planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
             },
         )?;
         inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
@@ -15063,19 +19460,14 @@ mod tests {
 
     #[test]
     fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
-        let actions = [
-            CampaignCleanupAction::StopAdmission,
-            CampaignCleanupAction::BoundedDrain,
-            CampaignCleanupAction::EvidenceCapture,
-            CampaignCleanupAction::StopMaintenance,
-            CampaignCleanupAction::TerminalCapture,
-            CampaignCleanupAction::RemoveNamespace,
-            CampaignCleanupAction::RemoveQap,
-            CampaignCleanupAction::RemoveFic,
-            CampaignCleanupAction::Handoff,
-        ];
+        let actions = CampaignCleanupPhase::Freeze
+            .actions()
+            .iter()
+            .chain(CampaignCleanupPhase::Release.actions())
+            .map(CampaignCleanupAction::selector)
+            .collect::<Vec<_>>();
         assert_eq!(
-            actions.map(|action| action.selector()),
+            actions,
             [
                 "stop_admission",
                 "bounded_drain",
@@ -15529,7 +19921,10 @@ mod tests {
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            build_seconds: None,
+            setup_seconds: None,
             maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: std::sync::Mutex::new(None),
         };
         fs::write(fixture.join("mode"), "stop_failure")?;
         let error = cleanup_local_platform(&config, &local)
@@ -15751,6 +20146,9 @@ mod tests {
             router_yaml: None,
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
+            shutdown_inputs: None,
         };
         platform.run_table_initialization_attempted = true;
         assert!(require_aks_cleanup_confirmation(&platform).is_err());
@@ -15767,25 +20165,40 @@ mod tests {
         assert!(error.contains("fixture deployment stop failed"));
         assert!(error.contains("run-owned QAP cleanup was not positively confirmed"));
         assert!(error.contains("retaining owned resources"));
+        let (fallback_logs, _) = platform
+            .stopped_commit_logs()
+            .context("missing early-failure log snapshot")?;
+        assert_eq!(fallback_logs.len(), 1);
+        assert_eq!(fallback_logs[0].instance_id, "fixture-pod/dataflow");
+        assert!(!fallback_logs[0].complete);
         assert!(platform.namespace_created);
         assert!(fixture.join("namespace.json").exists(), "namespace must be retained");
         assert!(!fixture.join("delete-options.json").exists());
         assert!(!runtime.join("workload-stop-receipt.json").exists());
 
         fs::write(fixture.join("mode"), "absent_deployment")?;
-        let missing = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
+        let mut aks_logs = Vec::new();
+        let missing =
+            stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30, &mut aks_logs).await?;
         assert_eq!(missing["status"], "nothing_to_stop");
+        if fixture.join("pods-read").exists() {
+            fs::remove_file(fixture.join("pods-read"))?;
+        }
         fs::write(fixture.join("mode"), "exit_137")?;
-        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30)
+        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30, &mut aks_logs)
             .await
             .err()
             .context("AKS exit 137 must fail")?;
         assert!(format!("{error:#}").contains("forcibly stopped (137)"));
         fs::remove_file(fixture.join("pods-read"))?;
         fs::write(fixture.join("mode"), "missing_exit")?;
-        let evidence = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
-        assert_eq!(evidence["processes"][0]["exit_outcome"]["status"], "unavailable");
-        assert_eq!(evidence["processes"][0]["drain"]["exit_code"], Value::Null);
+        aks_logs.clear();
+        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30, &mut aks_logs)
+            .await
+            .err()
+            .context("unobserved AKS collector exit must fail")?;
+        assert!(format!("{error:#}").contains("collector_exit_not_observed"));
+        assert_eq!(aks_logs[0].instance_id, "fixture-pod/dataflow");
         fs::write(fixture.join("mode"), "rollout_recovers")?;
         config.aks_rollout_timeout_seconds = 30;
         rollout(&config, "fixture").await?;
@@ -15832,10 +20245,10 @@ mod tests {
 
     #[test]
     fn local_stop_deadline_covers_derived_maintenance_budget_and_other_phases() {
-        let deadline = local_stop_deadline(3600, 900_000);
+        let deadline = local_stop_deadline(3600, 900_000, 40);
         assert_eq!(
             deadline,
-            Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120)
+            Duration::from_millis(900_000) + Duration::from_secs(3600 + 40 + 2 * 300 + 120)
         );
         assert!(deadline > Duration::from_secs(3600 + 3 * 300));
     }
@@ -15872,9 +20285,116 @@ mod tests {
         }
         assert!(shutdown_exit_outcome(ComponentRole::Collector, true, Some(1), false).is_err());
         assert_eq!(
+            aks_shutdown_exit_outcome(ComponentRole::Collector, true, Some(143), false)?["reason"],
+            "drain_complete_and_exact_delta_reconciliation_unverified",
+        );
+        assert_eq!(
+            aks_shutdown_exit_outcome(ComponentRole::Collector, true, None, false)?["reason"],
+            "collector_exit_not_observed",
+        );
+        assert_eq!(
             shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["classification"],
             "requires_operation_records",
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aks_shutdown_retains_distinct_collectors_and_uses_fallback_on_early_failure() -> Result<()> {
+        let log = |instance: &str| ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: instance.to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: 10,
+            raw_log_lines: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            text: String::new(),
+        };
+        let mut logs = Vec::new();
+        retain_aks_collector_log(&mut logs, log("pod-a/dataflow"))?;
+        retain_aks_collector_log(&mut logs, log("pod-b/dataflow"))?;
+        assert!(retain_aks_collector_log(&mut logs, log("pod-a/dataflow")).is_err());
+        let called = std::cell::Cell::new(false);
+        let evidence = retain_aks_shutdown_logs_after_stop(Ok(json!({"status":"stopped"})), &mut logs, async {
+            called.set(true);
+            Ok(Vec::new())
+        })
+        .await?;
+        assert_eq!(evidence["status"], "stopped");
+        assert!(!called.get());
+        assert_eq!(logs.len(), 2);
+
+        let mut logs = vec![log("pod-a/dataflow")];
+        let error = retain_aks_shutdown_logs_after_stop(Err(anyhow::anyhow!("stop failed")), &mut logs, async {
+            Ok(vec![log("pod-a/dataflow"), log("pod-b/dataflow")])
+        })
+        .await
+        .err()
+        .context("the original stop failure must remain visible")?;
+        assert!(format!("{error:#}").contains("stop failed"));
+        assert_eq!(
+            logs.iter().map(|log| log.instance_id.as_str()).collect::<Vec<_>>(),
+            ["pod-a/dataflow", "pod-b/dataflow"]
+        );
+        assert!(logs[0].complete);
+        assert!(!logs[1].complete);
+
+        let error = retain_aks_shutdown_logs_after_stop(Err(anyhow::anyhow!("stop failed")), &mut Vec::new(), async {
+            Err(anyhow::anyhow!("snapshot failed"))
+        })
+        .await
+        .err()
+        .context("capture failures must remain visible")?;
+        let detail = format!("{error:#}");
+        assert!(detail.contains("stop failed"));
+        assert!(detail.contains("snapshot failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn aks_retained_collector_log_does_not_publish_unknown_secret_fields() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let text = concat!(
+            "arrowcol_effective_config {\"component\":\"receiver\",\"config\":{},\"unknown_secret\":\"fake-secret-123\"}\n",
+            "{\"unrecognized\":\"fake-secret-123\"}\n",
+        );
+        let text = filter_process_evidence_text(text)?;
+        assert!(text.contains("fake-secret-123"));
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "pod-a/dataflow".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: 2,
+            stdout: text.to_owned(),
+            stderr: String::new(),
+            text: text.to_owned(),
+        };
+        let mut row = sample_result("fixture", "sqlserver_wait_stats", 0);
+        row.evidence_json = Some(
+            json!({
+                "backlog": {"measurement_window": {"start_unix_ms": 1, "end_unix_ms": 2}}
+            })
+            .to_string(),
+        );
+        attach_stopped_commit_evidence(&config, std::slice::from_mut(&mut row), std::slice::from_ref(&log), &[])?;
+        assert!(
+            !row.evidence_json
+                .as_deref()
+                .context("missing evidence")?
+                .contains("fake-secret-123")
+        );
+        let drain = collector_shutdown_drain_evidence(&log, None, None, None, false);
+        assert!(!drain.to_string().contains("fake-secret-123"));
         Ok(())
     }
 
@@ -15958,7 +20478,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
+    fn snapshot_stop_distinguishes_diagnostic_client_and_maintenance_exits() -> Result<()> {
         let project = "owned-maintenance-run";
         let services = [
             "delta-maintenance",
@@ -16004,6 +20524,14 @@ mod tests {
         let outcomes = snapshot_container_outcomes(&before, &after, project)?;
         assert!(outcomes[0]["maintenance_operation_failure"].is_null());
         assert!(outcomes[0]["comment"].as_str().is_some());
+        let mut interrupted_client = after.clone();
+        interrupted_client[5]["State"]["ExitCode"] = json!(1);
+        assert_eq!(
+            snapshot_container_outcomes(&before, &interrupted_client, project)?[5]["exit_code"],
+            1
+        );
+        interrupted_client[5]["State"]["ExitCode"] = json!(137);
+        assert!(snapshot_container_outcomes(&before, &interrupted_client, project).is_err());
 
         for exit in [2, 137] {
             let mut invalid = after.clone();
@@ -17092,9 +21620,13 @@ mod tests {
 
     #[test]
     fn local_qap_deadline_keeps_progress_and_exact_snapshot_coverage_without_changing_delta_results() -> Result<()> {
-        let config: OatConfig = serde_json::from_str(include_str!(
+        let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance": {"enabled": false},
+            "logging": {"maintenance": "debug"}
+        }))?;
         let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
         let table = config.tables[0].clone();
         let external = qap_bindings(run, std::slice::from_ref(&table))?
@@ -17158,9 +21690,15 @@ mod tests {
             "unknown"
         );
         let mut pinning = PinningReport::default();
-        pinning
-            .owners
-            .insert(canonical_table_key(&table), "collector".to_owned());
+        record_owner_observation(
+            &mut pinning,
+            Ok(HashMap::from([(
+                canonical_table_key(&table),
+                vec!["collector".to_owned()],
+            )])),
+            std::slice::from_ref(&table),
+            false,
+        );
         let clients = ClientRun {
             metrics: HashMap::from([(
                 table.clone(),
@@ -17192,8 +21730,18 @@ mod tests {
         )?;
         assert_eq!(rows[0].status, "succeeded");
         let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
+        let tunables: Value = serde_json::from_str(&rows[0].tunables_json)?;
+        let inert = json!([{"path": "logging.maintenance", "reason": "maintenance_disabled"}]);
+        assert_eq!(tunables["inert_fields"], inert);
+        assert_eq!(result["inert_fields"], inert);
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
         assert_eq!(result["downstream_status"], "unavailable");
+        assert_eq!(result["downstream_reason"], "local_qap_observation_unavailable");
+        assert!(result["ownership_samples"][0]["observed_at_unix_ms"].is_u64());
+        assert_eq!(
+            result["ownership_samples"][0]["owners_by_table"][&canonical_table_key(&table)][0],
+            "collector"
+        );
         Ok(())
     }
 
@@ -17236,7 +21784,7 @@ mod tests {
                 },
             }),
         );
-        let rows_for = |evidence| {
+        let rows_for = |evidence, failure: Option<&str>, violation: Option<&str>| {
             let clients = ClientRun {
                 metrics: HashMap::from([(
                     table.clone(),
@@ -17249,10 +21797,11 @@ mod tests {
                 )]),
                 pinning: PinningReport {
                     owners: pinning.owners.clone(),
+                    violation: violation.map(str::to_owned),
                     ..PinningReport::default()
                 },
                 qap_tables: Vec::new(),
-                failure: None,
+                failure: failure.map(str::to_owned),
                 evidence,
             };
             result_rows(
@@ -17270,7 +21819,7 @@ mod tests {
                 },
             )
         };
-        let rows = rows_for(evidence.clone())?;
+        let rows = rows_for(evidence.clone(), None, None)?;
         assert_eq!(rows[0].status, "failed");
         assert!(
             rows[0]
@@ -17308,7 +21857,7 @@ mod tests {
                     .context("commit evidence object")?
                     .remove("delta_log_reconciliation");
             }
-            let rows = rows_for(cell)?;
+            let rows = rows_for(cell, None, None)?;
             let row = &rows[0];
             let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
             let eligible = reconciliation == Some("matched");
@@ -17329,6 +21878,91 @@ mod tests {
                 assert!(row.rows_per_second.is_none());
             }
         }
+        let mut matched = evidence.clone();
+        matched.durable_commits.get_mut(&table).context("commit evidence")?["delta_log_reconciliation"] =
+            json!({"status": "matched"});
+        for (failure, violation) in [
+            (Some("client infrastructure unavailable"), None),
+            (None, Some("ownership changed")),
+        ] {
+            let rows = rows_for(matched.clone(), failure, violation)?;
+            let row = &rows[0];
+            let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
+            assert_ne!(row.status, "succeeded");
+            assert!(row.rows_per_second.is_none());
+            assert_eq!(result["ranking_eligible"], false);
+            assert_eq!(result["ranking_ineligible_reason"], "cell_failed");
+            assert!(result["ranking_metrics"].is_null());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_reconciliation_mismatch_fails_the_result() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
+        let table = config.tables[0].clone();
+        let rows_for = |delta_rows, ambiguous_rows| {
+            let mut evidence = CellEvidence::default();
+            evidence.client_reports.insert(
+                table.clone(),
+                vec![json!({
+                    "client_id": format!("{run}:{table}:1"),
+                    "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": ambiguous_rows}}
+                })],
+            );
+            evidence.durable_commits.insert(table.clone(), json!({
+                "run_cumulative_output": {"rows": delta_rows, "settled": false, "settle_seconds": 120.0, "settle_timeout_seconds": 120}
+            }));
+            result_rows(
+                &config,
+                "orchestration",
+                run,
+                1,
+                1,
+                CellMeasurements {
+                    clients: ClientRun {
+                        metrics: HashMap::from([(
+                            table.clone(),
+                            ClientMetrics {
+                                rows: 10,
+                                duration_ms: 1000,
+                                rows_per_second: 10.0,
+                                completions: Vec::new(),
+                            },
+                        )]),
+                        pinning: PinningReport {
+                            owners: HashMap::from([(canonical_table_key(&table), "collector".to_owned())]),
+                            ..PinningReport::default()
+                        },
+                        qap_tables: Vec::new(),
+                        failure: None,
+                        evidence,
+                    },
+                    started_at_ms: 1,
+                    qap: QapMetrics::default(),
+                    resources: None,
+                    resource_evidence: None,
+                },
+            )
+        };
+        let failed = rows_for(8, 0)?;
+        assert_eq!(failed[0].status, "failed");
+        assert_eq!(failed[0].failure.as_deref(), Some("delta_commit_drain_timeout"));
+        assert!(failed[0].rows_per_second.is_none());
+        let evidence: Value = serde_json::from_str(failed[0].evidence_json.as_deref().context("evidence")?)?;
+        assert_eq!(evidence["reconciliation"]["exact_match_required"], true);
+        assert_eq!(evidence["reconciliation"]["exact_match"], false);
+        assert_eq!(evidence["reconciliation"]["reason"], "delta_commit_drain_timeout");
+        let excess = rows_for(12, 0)?;
+        assert_eq!(excess[0].status, "failed");
+        assert_eq!(excess[0].failure.as_deref(), Some("delta_exact_match_failed"));
+        let excess_evidence: Value = serde_json::from_str(excess[0].evidence_json.as_deref().context("evidence")?)?;
+        assert_eq!(excess_evidence["reconciliation"]["reason"], "delta_exact_match_failed");
+        let success = rows_for(10, 0)?;
+        assert_eq!(success[0].status, "succeeded");
         Ok(())
     }
 

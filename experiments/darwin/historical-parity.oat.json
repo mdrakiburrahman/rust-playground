@@ -1,0 +1,139 @@
+{
+  "overload_guard": {
+    "enabled": true,
+    "cap_fraction": 0.9,
+    "zero_progress_windows": 2
+  },
+  "platform": {
+    "kind": "local",
+    "compose_file": "projects/loadtest/compose.yaml",
+    "compose_override_file": "projects/loadtest/compose.oat.yaml",
+    "compose_project": "arrowcol-oat-historical-parity",
+    "compose_state_root": "out/arrowcol-oat/historical-parity",
+    "local": {
+      "collector_memory_limit_bytes": 92341796864,
+      "partitioned_table_bootstrap": true,
+      "stable_image_build": true
+    }
+  },
+  "warmup_seconds": 60,
+  "measure_seconds": 150,
+  "pilot_mode": false,
+  "client_ready_timeout_seconds": 600,
+  "run_pin_ttl_ms": 3600000,
+  "namespace": "arrowcol-oat",
+  "arrowcol_deployment": "arrowcol",
+  "arrowcol_container": "dataflow",
+  "dfe_deployment": "arrowcol",
+  "dfe_container": "dataflow",
+  "arrowcol_pod_selector": "app=arrowcol",
+  "dfe_pod_selector": "app=arrowcol",
+  "arrowcol_endpoint": "http://router:50050",
+  "router_metrics_endpoint": "http://127.0.0.1:15050/metrics",
+  "edge_secret_file": "/run/secrets/edge-hmac",
+  "tables": ["sqlserver_availability_replica_states"],
+  "rows_per_table": 8192,
+  "clients_per_table": 1,
+  "qap_endpoint": "http://127.0.0.1:8080",
+  "qap_timeout_seconds": 60,
+  "replica_counts": [1],
+  "dfe_worker_concurrency": [32],
+  "result_url": "file:///tmp/arrowcol-oat-historical-parity/results.parquet",
+  "website_url": "file:///tmp/arrowcol-oat-historical-parity/site/results.parquet",
+  "tunables": {
+    "client": {
+      "payload_customer_id": "direct-e64-confirmwide",
+      "corpus_rows": 65536,
+      "batch_rows": 65536,
+      "workers": 8,
+      "runtime_threads": 12,
+      "data_profile": "diagnostic",
+      "max_memory_bytes": 1073741824,
+      "interval_us": 0,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "none",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 67108864,
+      "max_message_bytes": 134217728
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "age_flush_policy": "drain_ready",
+        "global_capacity": {
+          "bytes": 4290000000,
+          "rows": 25000000,
+          "batches": 16384
+        },
+        "per_table_capacity": {
+          "bytes": 4000000000,
+          "rows": 12000000,
+          "batches": 8192
+        },
+        "max_arrow_memory_per_flush": 1073741824,
+        "max_rows_per_flush": 2000000,
+        "max_batches_per_flush": 2048,
+        "max_age": "1m",
+        "max_concurrent_flushes": 12,
+        "pipeline_depth": 8,
+        "adaptive_file": {
+          "target_parquet_bytes": 134217728,
+          "min_input_bytes": 1048576,
+          "max_input_bytes": 1073741824,
+          "cold_start_parquet_ratio": 0.25,
+          "ewma_weight": 0.2,
+          "min_parquet_ratio": 0.015625,
+          "max_parquet_ratio": 4
+        }
+      },
+      "commit": {
+        "batch_window": "2s",
+        "max_files_per_commit": 128,
+        "max_pending_files": 512
+      },
+      "limits": {
+        "max_message_bytes": 134217728
+      },
+      "pressure": {
+        "max_concurrent_streams": 256,
+        "rss_limit_bytes": 92341796864,
+        "buffered_bytes_limit": 4290000000,
+        "buffered_rows_limit": 25000000,
+        "buffered_batches_limit": 16384,
+        "pressure_interval": "2s",
+        "heartbeat_interval": "5s",
+        "registration_ttl": "30s"
+      },
+      "layout": {
+        "enabled": true,
+        "max_rows": 2000000,
+        "max_input_bytes": 1073741824,
+        "row_group_rows": 262144
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 32
+      }
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": ["optimize", "checkpoint"],
+      "apply": false,
+      "granularity": "hour",
+      "interval_secs": 60,
+      "target_file_mib": 128
+    }
+  }
+}

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { collectorBuildProfileHash, parseCollectorBuildProfile, type CollectorBuildProfile } from './collector-build-profile.js';
 import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -12,7 +13,7 @@ const repositories = {
   router: 'arrowcol-router-rust', dataflow: 'arrowcol-dataflow-rust',
   maintenance: 'delta-maintenance',
 } as const;
-type Options = ImageOptions & { runtimeConfig: string };
+type Options = ImageOptions & { runtimeConfig: string; profile?: CollectorBuildProfile };
 
 const clientRepository = 'arrowcol-oat-client';
 const revisionLabel = 'org.opencontainers.image.revision';
@@ -53,17 +54,18 @@ async function getSourceRevision(runner: typeof run_tree): Promise<string> {
   return requireRevision(result.stdout.trim());
 }
 
-function inspectLocalImage(stdout: string, role: string, revision: string): void {
+function inspectLocalImage(stdout: string, role: string, revision: string, profileHash?: string): void {
   let image: { Os?: string; Architecture?: string; Config?: { Labels?: Record<string, string> | null } };
   try { image = JSON.parse(stdout); } catch { throw new Error(`Docker returned invalid ${role} image metadata.`); }
   if (`${image.Os}/${image.Architecture}` !== 'linux/amd64') throw new Error(`Local ${role} image must be linux/amd64.`);
   if (image.Config?.Labels?.[revisionLabel] !== revision) throw new Error(`Local ${role} image revision provenance does not match ${revision}.`);
+  if (profileHash && image.Config?.Labels?.['org.opencontainers.image.profile'] !== profileHash) throw new Error(`Local ${role} image profile hash does not match ${profileHash}.`);
 }
 
-async function verifyLocalImage(role: string, reference: string, revision: string, runner: typeof run_tree): Promise<void> {
+async function verifyLocalImage(role: string, reference: string, revision: string, runner: typeof run_tree, profileHash?: string): Promise<void> {
   const result = await runner(['docker', 'image', 'inspect', '--format', '{{json .}}', reference], 30, ROOT);
   if (result.returncode) throw new Error(`Missing local ${role} image ${reference}; build it before publishing.`);
-  inspectLocalImage(result.stdout.trim(), role, revision);
+  inspectLocalImage(result.stdout.trim(), role, revision, profileHash);
 }
 
 function missingManifest(result: { stdout: string; stderr: string }): boolean {
@@ -99,16 +101,25 @@ async function publishedDigest(session: PublisherSession, options: ImageOptions,
   return digest;
 }
 
-export async function buildLocalImages({ revision, maintenance = false }: { revision: string; maintenance?: boolean }, runner: typeof run_tree = run_tree): Promise<void> {
+export async function buildLocalImages({ revision, maintenance = false, profile }: { revision: string; maintenance?: boolean; profile?: CollectorBuildProfile }, runner: typeof run_tree = run_tree): Promise<void> {
   const source = requireRevision(revision);
   if (await getSourceRevision(runner) !== source) throw new Error('Image revision does not match the checked-out source.');
   const status = await runner(['git', 'status', '--porcelain'], 15, ROOT);
   if (status.returncode || status.stdout.trim()) throw new Error('Commit the source changes before building revision-proven images.');
+  const profileHash = profile ? collectorBuildProfileHash(profile) : undefined;
   for (const [role, dockerfile, context] of imageBuilds) {
     if (role === 'maintenance' && !maintenance) continue;
+    const image = role === 'dataflow' && profileHash ? 'arrowcol-oat/dataflow:profile-' + profileHash : localImages[role];
+    const profileArgs = role === 'dataflow' && profile && profileHash ? [
+      '--build-arg', 'PROFILE_HASH=' + profileHash, '--build-arg', 'BUILD_ALLOCATOR=' + profile.allocator,
+      '--build-arg', 'BUILD_LTO=' + profile.lto, '--build-arg', 'BUILD_CODEGEN_UNITS=' + profile.codegen_units,
+      '--build-arg', 'BUILD_OPT_LEVEL=' + profile.opt_level, '--build-arg', 'BUILD_TARGET_CPU=' + profile.target_cpu,
+      '--label', 'org.opencontainers.image.profile=' + profileHash,
+    ] : [];
     const result = await runner(['docker', 'buildx', 'build', '--pull', '--platform', 'linux/amd64', '--load',
-      '--tag', localImages[role], '--label', `${revisionLabel}=${source}`, '--file', dockerfile, context], 3600, ROOT);
-    if (result.returncode) throw new Error(`Docker build failed for ${role} (${result.returncode}): ${result.stderr.trim() || 'no diagnostic output'}`);
+      '--tag', image, '--label', revisionLabel + '=' + source, '--build-arg', 'VCS_REF=' + source,
+      ...profileArgs, '--file', dockerfile, context], 3600, ROOT);
+    if (result.returncode) throw new Error('Docker build failed for ' + role + ' (' + result.returncode + '): ' + (result.stderr.trim() || 'no diagnostic output'));
   }
 }
 
@@ -154,12 +165,13 @@ export async function publishClientImage(options: ImageOptions, runner: typeof r
 }
 
 export async function readPublishedImages(
-  options: ImageOptions & { revision: string; maintenance?: boolean }, runner: typeof run_tree = run_tree,
+  options: ImageOptions & { revision: string; maintenance?: boolean; profile?: CollectorBuildProfile }, runner: typeof run_tree = run_tree,
 ): Promise<{ images: RuntimeConfig['images']; client: string }> {
   if (!options.federated) throw new Error('OAT image verification requires --federated.');
   const source = requireRevision(options.revision);
   const current = await getSourceRevision(runner);
   if (current !== source) throw new Error(`Requested image revision ${source} is not the checked-out source revision ${current}.`);
+  const profileHash = options.profile ? collectorBuildProfileHash(options.profile) : undefined;
   const tag = options.tag ?? revisionTag(source);
   return withPublisherIdentity(options, async session => {
     if (!source.startsWith(session.revision.toLowerCase())) throw new Error('Source revision changed during image verification.');
@@ -173,26 +185,28 @@ export async function readPublishedImages(
     const repositoryNames = await listRepositories(session, options);
     for (const [role, repository] of allRepositories) {
       if (!repositoryNames.has(repository)) { missing.push(role); continue; }
+      const roleTag = role === 'dataflow' && profileHash ? tag + '-p' + profileHash : tag;
       let tags = await listRepositoryTags(session, options, repository);
-      if (!tags.has(tag)) { missing.push(role); continue; }
+      if (!tags.has(roleTag)) { missing.push(role); continue; }
       const metadata = await session.run(['az', 'acr', 'manifest', 'show-metadata', '--registry', options.registry,
-        '--name', `${repository}:${tag}`, '--subscription', session.subscription, '--query', 'digest', '--output', 'tsv'], 120);
+        '--name', `${repository}:${roleTag}`, '--subscription', session.subscription, '--query', 'digest', '--output', 'tsv'], 120);
       if (metadata.returncode) {
         if (missingManifest(metadata)) {
           tags = await listRepositoryTags(session, options, repository);
-          if (!tags.has(tag)) { missing.push(role); continue; }
+          if (!tags.has(roleTag)) { missing.push(role); continue; }
         }
         session.clean(`ACR manifest ${repository}`, metadata);
       }
       const digest = session.clean(`ACR manifest ${repository}`, metadata);
       if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error(`ACR returned an invalid ${repository} manifest digest.`);
-      const tagged = `${session.loginServer}/${repository}:${tag}`;
+      const tagged = `${session.loginServer}/${repository}:${roleTag}`;
       session.clean(`docker pull ${role}`, await session.run(['docker', 'pull', tagged], 3600));
       const inspect = session.clean(`docker inspect ${role}`, await session.run(['docker', 'image', 'inspect', '--format', '{{json .}}', tagged], 30));
       let image: { Os?: string; Architecture?: string; Config?: { Labels?: Record<string, string> | null }; RepoDigests?: string[] };
       try { image = JSON.parse(inspect); } catch { throw new Error(`Docker returned invalid ${role} image metadata.`); }
       if (`${image.Os}/${image.Architecture}` !== 'linux/amd64') throw new Error(`Published ${role} image must be linux/amd64.`);
       if (image.Config?.Labels?.[revisionLabel] !== source) throw new Error(`Published ${role} image revision provenance does not match ${source}.`);
+      if (role === 'dataflow' && profileHash && image.Config?.Labels?.['org.opencontainers.image.profile'] !== profileHash) throw new Error(`Published ${role} image profile hash does not match ${profileHash}.`);
       if (!image.RepoDigests?.includes(`${session.loginServer}/${repository}@${digest}`))
         throw new Error(`Published ${role} image digest changed while it was being verified.`);
       if (role === 'client') client = `${session.loginServer}/${repository}@${digest}`;
@@ -218,28 +232,37 @@ export async function publishImages(options: Options, runner: typeof run_tree = 
     throw new Error('Runtime configuration must reuse the selected stamp namespace, ServiceAccount and UAMI.');
   }
   const source = await getSourceRevision(runner);
+  const profileHash = options.profile ? collectorBuildProfileHash(options.profile) : undefined;
   const selectedRepositories = (Object.entries(repositories) as Array<[keyof typeof repositories, string]>)
     .filter(([role]) => role !== 'maintenance' || config.images.maintenance !== undefined);
   for (const [role] of selectedRepositories) {
-    await verifyLocalImage(role, localImages[role], source, runner);
+    const image = role === 'dataflow' && profileHash ? 'arrowcol-oat/dataflow:profile-' + profileHash : localImages[role];
+    await verifyLocalImage(role, image, source, runner, role === 'dataflow' ? profileHash : undefined);
   }
   const images = await withPublisherIdentity(options, async ({ run, clean, revision, loginServer, subscription }) => {
     if (!source.startsWith(revision.toLowerCase())) throw new Error('Source revision changed during image publication.');
     const published = {} as RuntimeConfig['images'];
     const tag = options.tag ?? revisionTag(source);
     for (const [role, repository] of selectedRepositories) {
-      const tagged = `${loginServer}/${repository}:${tag}`;
-      clean(`docker tag ${role}`, await run(['docker', 'tag', `arrowcol-oat/${role}:local`, tagged], 30));
+      const roleTag = role === 'dataflow' && profileHash ? tag + '-p' + profileHash : tag;
+      const localImage = role === 'dataflow' && profileHash ? 'arrowcol-oat/dataflow:profile-' + profileHash : localImages[role];
+      const tagged = `${loginServer}/${repository}:${roleTag}`;
+      clean(`docker tag ${role}`, await run(['docker', 'tag', localImage, tagged], 30));
       clean(`docker push ${role}`, await run(['docker', 'push', tagged], 3600));
       const digest = clean(`ACR manifest ${role}`, await run(['az', 'acr', 'manifest', 'show-metadata',
-        '--registry', options.registry, '--name', `${repository}:${tag}`, '--subscription', subscription,
+        '--registry', options.registry, '--name', `${repository}:${roleTag}`, '--subscription', subscription,
         '--query', 'digest', '--output', 'tsv'], 120));
       if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error(`ACR returned an invalid ${role} manifest digest.`);
       published[role] = `${loginServer}/${repository}@${digest}`;
     }
     return published;
   }, runner, true);
-  const published = validateRuntime({ ...config, images });
+  const profileImages = { ...(config.collectorBuildImages ?? {}) };
+  if (profileHash) profileImages[profileHash] = images.dataflow;
+  const runtimeOutput: RuntimeConfig = { ...config, images, ...(Object.keys(profileImages).length ? { collectorBuildImages: profileImages } : {}) };
+  if (profileHash) runtimeOutput.collectorBuildProfileHash = profileHash;
+  else delete runtimeOutput.collectorBuildProfileHash;
+  const published = validateRuntime(runtimeOutput);
   if (await readFile(file, 'utf8') !== original) throw new Error('Runtime configuration changed during publication; refusing to overwrite it.');
   const pending = `${file}.published-${randomUUID()}`;
   try {
@@ -252,8 +275,14 @@ export async function publishImages(options: Options, runner: typeof run_tree = 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [runtimeConfig, ...args] = process.argv.slice(2);
   Promise.resolve().then(async () => {
-    if (!runtimeConfig || runtimeConfig.startsWith('--')) throw new Error('Usage: publish-images.ts <ignored-runtime.json> --federated --registry <acr> --azure-env <env> --stamp-config <stamp> [--env <env>] [--tag <tag>]');
-    const result = await publishImages({ ...parseImageOptions(args), runtimeConfig });
+    if (!runtimeConfig || runtimeConfig.startsWith('--')) throw new Error('Usage: publish-images.ts <ignored-runtime.json> --federated --registry <acr> --azure-env <env> --stamp-config <stamp> [--env <env>] [--tag <tag>] [--collector-build-profile <json-file>]');
+    const profileIndex = args.indexOf('--collector-build-profile');
+    const profilePath = profileIndex >= 0 ? args[profileIndex + 1] : undefined;
+    if (profileIndex >= 0 && (!profilePath || profilePath.startsWith('--') || args.indexOf('--collector-build-profile', profileIndex + 1) >= 0))
+      throw new Error('--collector-build-profile requires exactly one JSON file path');
+    const imageArgs = profileIndex >= 0 ? args.filter((_, index) => index !== profileIndex && index !== profileIndex + 1) : args;
+    const profile = profilePath ? parseCollectorBuildProfile(JSON.parse(await readFile(resolve(profilePath), 'utf8'))) : undefined;
+    const result = await publishImages({ ...parseImageOptions(imageArgs), runtimeConfig, ...(profile ? { profile } : {}) });
     console.log(JSON.stringify({ images: result.images, runtimeConfig }, null, 2));
   }).catch((error: unknown) => { console.error(error instanceof Error ? error.message : 'Image publication failed'); process.exitCode = 1; });
 }

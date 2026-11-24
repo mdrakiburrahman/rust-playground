@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, armCampaign, newCampaignState, publishRunInventory, startCampaign, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
-import { watchdogOnce } from './aks-watchdog.js';
+import { cleanupFailureResponse, CampaignConflictError, CUSTODY_CLEANUP_STEPS, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, armCampaign, newCampaignState, publishRunInventory, startCampaign, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
+import { CleanupDeadlineExpiredError, withCleanupDeadline } from './aks-cleanup-budget.js';
+import { runWatchdog, watchdogOnce } from './aks-watchdog.js';
 import { createSyntheticArmedCampaignState, ReadOnlyAzureAdapter, runRehearsalWatchdogOnce, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { reconcileCleanupOnce, reconcileOnce } from './aks-reconcile.js';
@@ -30,6 +31,7 @@ const inventoryFor = (state: CampaignState): RunInventory => {
     schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: state.fencingToken,
     orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId, load_admission: 'authorized',
     planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
+    drain_budget: { budget_ms: 120_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 },
     namespace: { name: namespace, uid: 'c0ffee00-0000-4000-8000-000000000009', owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
       uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
@@ -94,6 +96,79 @@ test('watchdog expiry fences first, refuses missing cleanup, and resumes idempot
   assert.equal((await store.read())!.state.cleanupStatus, 'verified');
 });
 
+
+test('campaign drain uses persisted configured budget and never extends an existing deadline', async t => {
+  const store = await armedStore();
+  store.current!.state.runInventory!.drain_budget = { budget_ms: 240_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 };
+  await reconcileOnce(store, 1_000_000 + 3 * 60_000);
+  let now = 1_200_000;
+  t.mock.method(Date, 'now', () => now);
+  const complete = async () => 'complete' as const;
+  let seen = 0;
+  const actions: ExternalCleanupActions = {
+    discoverExactInventory: async inventory => inventory, stopAdmission: complete,
+    boundedDrain: async (_inventory, deadline) => { seen++; assert.equal(deadline, 1_440_000); return 'pending'; },
+    preserveEvidence: complete, stopMaintenanceIfUidAndOwnerMatch: complete, captureTerminalState: complete,
+    deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
+    restoreSafeIdle: complete, verifySafeIdle: complete,
+  };
+  const execute = createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
+  await reconcileCleanupOnce(store, execute, now);
+  await reconcileCleanupOnce(store, execute, now);
+  assert.equal(seen, 1);
+  assert.equal(store.current!.state.runInventory!.cleanup.bounded_drain.deadline_unix_ms, 1_440_000);
+  now += 1_000;
+  await reconcileCleanupOnce(store, execute, now);
+  assert.equal(store.current!.state.runInventory!.cleanup.bounded_drain.deadline_unix_ms, 1_440_000);
+});
+
+test('campaign deadline expiry remains UNKNOWN until fenced controller records unsettled evidence', async t => {
+  const store = await armedStore();
+  store.current!.state.runInventory!.drain_budget = { budget_ms: 1_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 };
+  await reconcileOnce(store, 1_180_000);
+  let now = 1_200_000, calls = 0;
+  t.mock.method(Date, 'now', () => now);
+  const complete = async () => 'complete' as const;
+  const actions: ExternalCleanupActions = { discoverExactInventory: async inventory => inventory, stopAdmission: complete,
+    boundedDrain: async (_inventory, deadline, _key, authority) => {
+      calls++;
+      const bounded = withCleanupDeadline(authority, deadline);
+      now = deadline;
+      await bounded.assertCurrent();
+      return 'complete';
+    }, preserveEvidence: complete, stopMaintenanceIfUidAndOwnerMatch: complete, captureTerminalState: complete,
+    deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
+    restoreSafeIdle: complete, verifySafeIdle: complete };
+  const execute = createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
+  await reconcileCleanupOnce(store, execute, now);
+  await assert.rejects(reconcileCleanupOnce(store, execute, now), error => {
+    assert.ok(error instanceof CleanupDeadlineExpiredError);
+    assert.equal(cleanupFailureResponse(error).reason_code, 'cleanup_deadline_expired');
+    return true;
+  });
+  assert.equal(store.current!.state.runInventory!.cleanup.bounded_drain.state, 'running');
+  assert.equal(store.current!.state.cleanupSteps.find(step => step.step === 'bounded-drain')!.status, 'running');
+  await reconcileCleanupOnce(store, execute, now);
+  const inventory = store.current!.state.runInventory!;
+  assert.equal(inventory.cleanup.bounded_drain.state, 'uncertain');
+  assert.equal(inventory.cleanup.bounded_drain.reason_code, 'drain_deadline_expired_unsettled');
+  assert.equal(store.current!.state.cleanupSteps.find(step => step.step === 'bounded-drain')!.status, 'unsettled');
+  assert.equal(calls, 1);
+});
+
+test('watchdog emits typed expiry while retaining unknown outcome', async t => {
+  const controller = new AbortController(), lines: string[] = [];
+  t.mock.method(console, 'error', (line: string) => { lines.push(line); });
+  await runWatchdog(controller.signal, async () => {
+    controller.abort();
+    throw new CleanupDeadlineExpiredError('expired');
+  });
+  const logged = JSON.parse(lines[0]);
+  assert.equal(logged.code, 'write_outcome_unknown');
+  assert.equal(logged.reason_code, 'cleanup_deadline_expired');
+});
 
 test('external executor invokes safe-idle restoration exactly once under the cleanup fence', async () => {
   const store = await armedStore();

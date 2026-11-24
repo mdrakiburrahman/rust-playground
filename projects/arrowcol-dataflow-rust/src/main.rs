@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use arrowcol_dataflow_components as _;
@@ -8,6 +8,13 @@ use arrowcol_dataflow_components as _;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_target_cpu()?;
+    if let Some(disabled) = configure_thp()? {
+        eprintln!(
+            "arrowcol_effective_config {}",
+            serde_json::json!({"process":{"thp_disabled":disabled,"scope":"linux_thp_disable_flag"}})
+        );
+    }
     eprintln!(
         "arrowcol_effective_config {}",
         arrow_deltalake::writer::effective_startup_config_json()?
@@ -15,11 +22,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let build_config = serde_json::json!({
         "component": "build",
         "config": {
-            "allocator": if cfg!(feature = "allocator-mimalloc") {
-                "mimalloc"
-            } else {
-                "system"
-            },
+            "profile_hash": option_env!("COLLECTOR_BUILD_PROFILE_HASH").unwrap_or("65f0a48e5711a4fb91141fc590b170e6b614798bb14e6f952dd440c3be547108"),
+            "allocator": if cfg!(feature = "allocator-mimalloc") { "mimalloc" } else { "system" },
+            "lto": option_env!("COLLECTOR_BUILD_LTO").unwrap_or("off"),
+            "codegen_units": option_env!("COLLECTOR_BUILD_CODEGEN_UNITS").and_then(|value| value.parse::<u16>().ok()).unwrap_or(16),
+            "opt_level": option_env!("COLLECTOR_BUILD_OPT_LEVEL").and_then(|value| value.parse::<u8>().ok()).unwrap_or(3),
+            "target_cpu": option_env!("COLLECTOR_BUILD_TARGET_CPU").unwrap_or("generic"),
+            "source_revision": option_env!("COLLECTOR_BUILD_SOURCE_REVISION"),
             "log_filter": std::env::var("RUST_LOG").ok(),
         }
     });
@@ -41,8 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arrowcol_dataflow_components::initialize_shared_io()?;
     let shutdown_error = Rc::new(RefCell::new(None));
     let hook_error = Rc::clone(&shutdown_error);
+    let observed_startup = Rc::new(Cell::new(false));
+    let observer_started = Rc::clone(&observed_startup);
     let result = otel_arrow_dfe::run_with_config_observer_and_shutdown_status(
-        |spec| arrowcol_dataflow_components::observe_validated_topology(spec).map_err(Into::into),
+        move |spec| {
+            arrowcol_dataflow_components::observe_validated_topology(spec)?;
+            observer_started.set(true);
+            Ok(())
+        },
         move |clean| {
             let result = finish_shutdown(
                 clean,
@@ -50,6 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |clean| arrowcol_dataflow_components::finish_routing_shutdown(clean).map_err(|error| error.to_string()),
             );
             drop(metrics);
+            if clean && observed_startup.get() && result.is_ok() {
+                if let Some(evidence) = arrowcol_dataflow_components::terminal_publication_evidence() {
+                    eprintln!("arrowcol_terminal_evidence {evidence}");
+                }
+                eprintln!("arrowcol_shutdown {{\"event\":\"drain_complete\"}}");
+            }
             if let Err(error) = result {
                 eprintln!("dataflow shutdown failed: {error}");
                 // After a clean engine exit the SDK would report success, so only this hook can fail
@@ -65,6 +86,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     propagate(result, shutdown_error.take())
 }
 
+fn configure_thp() -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    const ENV: &str = "ARROWCOL_COLLECTOR_THP_DISABLED";
+    let value = match std::env::var(ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(format!("{ENV}: {error}").into()),
+    };
+    let requested = match value.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err(format!("{ENV} must be true or false").into()),
+    };
+    #[cfg(target_os = "linux")]
+    {
+        rustix::thread::disable_transparent_huge_pages(requested)
+            .map_err(|error| format!("{ENV}: setting Linux process flag: {error}"))?;
+        let actual = rustix::thread::transparent_huge_pages_are_disabled()
+            .map_err(|error| format!("{ENV}: reading Linux process flag: {error}"))?;
+        if actual != requested {
+            return Err(format!("{ENV} did not match the Linux process flag").into());
+        }
+        Ok(Some(actual))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = requested;
+        Err(format!("{ENV} is supported only on Linux").into())
+    }
+}
+
 /// Keeps the engine's own error (for example `IncompatiblePdataWiring`) as the process error
 /// and fails a run that otherwise succeeded when its shutdown hook failed.
 fn propagate(
@@ -76,6 +127,25 @@ fn propagate(
         (Ok(()), Some(error)) => Err(format!("dataflow shutdown failed: {error}").into()),
         (Ok(()), None) => Ok(()),
     }
+}
+
+fn ensure_target_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let target_cpu = option_env!("COLLECTOR_BUILD_TARGET_CPU").unwrap_or("generic");
+    if target_cpu == "generic" {
+        return Ok(());
+    }
+    if !matches!(target_cpu, "x86-64-v2" | "x86-64-v3" | "x86-64-v4") {
+        return Err(format!("unsupported compiled target CPU {target_cpu}").into());
+    }
+    let cpu_info = std::fs::read_to_string("/proc/cpuinfo")?;
+    if let Err(error) = arrowcol_tunables::verify_collector_target_cpu_flags(
+        target_cpu,
+        &cpu_info,
+        "collector.target_cpu startup guard",
+    ) {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn finish_shutdown<E: std::fmt::Display>(
@@ -107,6 +177,34 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thp_flag_reaches_linux_kernel() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("ARROWCOL_TEST_THP_CHILD").is_some() {
+            let expected = std::env::var("ARROWCOL_COLLECTOR_THP_DISABLED")? == "true";
+            assert_eq!(configure_thp()?, Some(expected));
+            assert_eq!(rustix::thread::transparent_huge_pages_are_disabled()?, expected);
+            return Ok(());
+        }
+        for value in ["true", "false"] {
+            let child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::thp_flag_reaches_linux_kernel"])
+                .env_clear()
+                .env("ARROWCOL_TEST_THP_CHILD", "1")
+                .env("ARROWCOL_COLLECTOR_THP_DISABLED", value)
+                .output()?;
+            if !child.status.success() || !String::from_utf8_lossy(&child.stdout).contains("1 passed;") {
+                return Err(format!(
+                    "THP child failed: {}\n{}",
+                    String::from_utf8_lossy(&child.stdout),
+                    String::from_utf8_lossy(&child.stderr)
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn clean_shutdown_closes_publisher_before_terminal_write() {

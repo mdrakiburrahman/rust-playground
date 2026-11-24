@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +9,7 @@ import { stringify } from 'yaml';
 import { Azure, Config, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 import { dispatchExternalEffect, EffectBoundary, withEffectBoundary } from '../../infra/azure/effect-boundary.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
+import { custodyIdleTopology } from '../../infra/azure/aks-safe-idle.js';
 import { CUSTODY_CLEANUP_STEPS, CampaignConflictError, CampaignWriteOutcomeUnknownError, campaignMain, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
   type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { captureCleanupBaseline, createDefaultCleanupProviders, readCleanupBaseline, type StampHealthReceipt } from './aks-default-providers.js';
@@ -32,6 +35,31 @@ class Store implements CampaignStore {
     return `"${this.revision}"`;
   }
 }
+
+function mockReviewedTopology(t: TestContext, c: Config) {
+  // Substitute only the selector hash; all ARM fixture identities remain synthetic.
+  const identity = JSON.stringify([c.subscription, c.cluster, c.location]);
+  const original = crypto.createHash;
+  const mocked = t.mock.method(crypto, 'createHash', (...args: Parameters<typeof crypto.createHash>) => {
+    const hash = original(...args), update = hash.update.bind(hash), digest = hash.digest.bind(hash);
+    let selected = false;
+    hash.update = (value: Parameters<typeof hash.update>[0], encoding?: BufferEncoding) => {
+      selected = typeof value === 'string' && value === identity;
+      return typeof value === 'string' && encoding ? update(value, encoding) : update(value);
+    };
+    function finish(): Buffer<ArrayBuffer>;
+    function finish(encoding: BufferEncoding): string;
+    function finish(encoding?: BufferEncoding): Buffer<ArrayBuffer> | string {
+      if (selected && encoding === 'hex') return 'dc56211918b1e151e60df60035e0ed594750a1f2c0e1a35beac3982b7810eec0';
+      return encoding ? digest(encoding) : digest();
+    }
+    hash.digest = finish;
+    return hash;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+}
+
 async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SUBSCRIPTION_ID: campaignId })) {
   const azure = new Azure(c);
   const aksId = c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster;
@@ -45,23 +73,30 @@ async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SU
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
     orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'not_authorized', namespace: { name: namespace, uid: null, owner_token: ownerId },
     planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
+    drain_budget: { budget_ms: 120_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 },
     resources: [], fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan },
     qap: null, evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: 'evidence/' + cellId },
     cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
   const store = new Store({ ...newCampaignState(campaignId, ownerId, Date.now() - 10_000), heartbeatAtMs: Date.now(), runInventory: inventory });
+  const expanded = custodyIdleTopology(c).breakthrough;
+  const expectedPools = ['systempool', 'benchd64', 'benche64', ...(expanded ? ['supportd64', 'arrowe192'] : [])];
   const resources = new Map<string, Record<string, unknown>>([
     [aksId, { id: aksId, type: 'Microsoft.ContainerService/managedClusters', tags: { ...TAGS, sandboxId: c.sandbox },
-      properties: { provisioningState: 'Succeeded', agentPoolProfiles: ['systempool', 'benchd64', 'benche64'].map(name => ({ name })) } }],
+      properties: { provisioningState: 'Succeeded', agentPoolProfiles: expectedPools.map(name => ({ name })) } }],
     [c.cluster_id, { id: c.cluster_id, type: 'Microsoft.Kusto/clusters', tags: { ...TAGS, sandboxId: c.sandbox },
       sku: { name: 'Standard_E4ads_v5', capacity: 2 }, properties: { provisioningState: 'Succeeded', state: 'Running',
         optimizedAutoscale: { isEnabled: true, minimum: 2, maximum: 4 }, enableAutoStop: true } }],
   ]);
-  for (const name of ['systempool', 'benchd64', 'benche64']) {
+  for (const name of expectedPools) {
     const id = aksId + '/agentPools/' + name;
-    resources.set(id, { id, type: 'Microsoft.ContainerService/managedClusters/agentPools',
+    resources.set(id, { id, name, type: 'Microsoft.ContainerService/managedClusters/agentPools',
       properties: { count: name === 'systempool' ? 3 : 0, vmSize: name === 'systempool' ? 'Standard_D8ds_v6' : 'Standard_D64ds_v6',
         mode: name === 'systempool' ? 'System' : 'User', provisioningState: 'Succeeded', enableAutoScaling: name !== 'systempool',
-        ...(name === 'systempool' ? {} : { minCount: 0, maxCount: 1 }) } });
+        ...(name === 'systempool' ? (expanded ? { enableAutoScaling: true, minCount: 3, maxCount: 3 } : {}) : {
+          minCount: 0, maxCount: 1,
+          vmSize: name === 'arrowe192' ? 'Standard_E192ids_v6' : name === 'benche64' ? 'Standard_E64ds_v6' : 'Standard_D64ds_v6',
+          nodeLabels: { 'arrow-collector/role': name === 'benchd64' ? 'client' : name === 'supportd64' ? 'support' : 'arrowcol' },
+        }) } });
   }
   const blobs = new Map<string, { bytes: Buffer; etag: string }>();
   const mutations: Array<{ method: string; resourceId: string; body: Record<string, unknown> }> = [];
@@ -70,6 +105,7 @@ async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SU
     return { Tables: [{ Columns: [{ ColumnName: 'TableName', ColumnType: 'string' }], Rows: [] }] };
   });
   let fault: 'none' | 'before' | 'after' = 'none';
+  const mismatchedReceipts = new Set<string>();
   t.mock.method(azure, 'request', async (method: string, url: string, _resource: string, body?: string | Buffer | null,
     _headers?: unknown, _missing?: boolean, _idempotent?: boolean, receipt?: (value: HttpReceipt) => void) => {
     const id = new URL(url).pathname, current = resources.get(id);
@@ -84,7 +120,7 @@ async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SU
       if (fault === 'after') throw new Error('injected lost response after apply');
     }
     const bytes = Buffer.from(JSON.stringify(current)), headers = { 'x-ms-request-id': 'read-provider-1' };
-    receipt?.({ status: 200, headers, bodyBase64: bytes.toString('base64') });
+    receipt?.({ status: 200, headers, bodyBase64: (mismatchedReceipts.has(id) ? Buffer.from('{}') : bytes).toString('base64') });
     return [bytes, { ':status': '200', ...headers }];
   });
   t.mock.method(azure, 'blob', async (method: string, container: string, name: string, _query?: unknown,
@@ -117,7 +153,7 @@ async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SU
     pdb_blocked: true, versions: [{ namespace: c.kubernetesNamespace, kind: 'pods', resource_version: '1' }] });
   const options = { azure, workDirectory, lifecycle, readHealth: async () => health() };
   const providers = createDefaultCleanupProviders(store, options);
-  return { c, azure, store, resources, blobs, mutations, inventory, aksId, authority, providers, options,
+  return { c, azure, store, resources, blobs, mutations, mismatchedReceipts, inventory, aksId, authority, providers, options,
     fault: (value: typeof fault) => { fault = value; }, health: (value: typeof health) => { health = value; } };
 }
 const properties = (value: Record<string, unknown>) => value.properties as Record<string, unknown>;
@@ -401,7 +437,60 @@ test('default restoration is a true no-op at supported safe capacity and capacit
   assert.equal(await f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), 'complete');
   assert.equal(await f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), 'complete');
   assert.deepEqual(f.mutations, []);
-  await assert.rejects(f.providers.verifySafeIdle(f.store.state, 'verify'), /positively completed exact removals/);
+  await assert.rejects(f.providers.verifySafeIdle(f.store.state, 'verify'), /release and handoff withheld/);
+});
+
+test('breakthrough baseline and restore require all five pools and leave shared and added capacity untouched', async t => {
+  const env = { AZURE_SUBSCRIPTION_ID: campaignId, AZURE_STAMP: '54321', AZURE_LOCATION: 'canadacentral' };
+  const config = new Config(env, defaultStampConfig(env));
+  mockReviewedTopology(t, config);
+  assert.equal(custodyIdleTopology(config).breakthrough, true);
+  for (const key of ['subscription', 'cluster', 'location'] as const) {
+    const changed = new Config(env, defaultStampConfig(env));
+    changed[key] += 'x';
+    assert.equal(custodyIdleTopology(changed).breakthrough, false);
+  }
+  const f = await fixture(t, true, config);
+  assert.equal((await readCleanupBaseline(f.azure, f.store.state)).status, 'captured');
+  const restore = () => f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority);
+  assert.equal(await restore(), 'complete');
+  const id = (name: string) => f.aksId + '/agentPools/' + name;
+  const system = properties(f.resources.get(id('systempool'))!);
+  const support = properties(f.resources.get(id('supportd64'))!);
+  const pools = properties(f.resources.get(f.aksId)!);
+  const original = pools.agentPoolProfiles as Array<{ name: string }>;
+  for (const invalid of [original.slice(0, -1), [...original, { name: 'foreign' }], [...original.slice(0, -1), original[0]!]]) {
+    pools.agentPoolProfiles = invalid;
+    await assert.rejects(restore(), /unexpected pool inventory/);
+  }
+  pools.agentPoolProfiles = original;
+  for (const [member, key, wrong] of [
+    [system, 'maxCount', 4], [support, 'maxCount', 2],
+    [properties(f.resources.get(id('benchd64'))!), 'count', 1],
+    [properties(f.resources.get(f.c.cluster_id)!), 'enableAutoStop', false],
+  ] as const) {
+    const prior = member[key];
+    member[key] = wrong;
+    assert.equal(await restore(), 'pending');
+    member[key] = prior;
+  }
+  for (const [key, wrong] of [['vmSize', 'Standard_D8ds_v6'], ['nodeLabels', { 'arrow-collector/role': 'client' }]] as const) {
+    const prior = support[key];
+    support[key] = wrong;
+    await assert.rejects(restore(), /pool SKU, mode or role mismatch/);
+    support[key] = prior;
+  }
+  f.mismatchedReceipts.add(id('arrowe192'));
+  await assert.rejects(restore(), /no original successful response receipt/);
+  f.mismatchedReceipts.clear();
+  assert.equal(await restore(), 'complete');
+  const key = '_arrowcol-custody/campaigns/' + campaignId + '/baseline.json';
+  const blob = f.blobs.get(key)!;
+  const value = JSON.parse(blob.bytes.toString());
+  value.capacity.receipts = value.capacity.receipts.filter((receipt: HttpReceipt & { resource_id: string }) => receipt.resource_id !== id('arrowe192'));
+  f.blobs.set(key, { ...blob, bytes: Buffer.from(JSON.stringify(value)) });
+  await assert.rejects(restore(), /incomplete ARM receipts/);
+  assert.deepEqual(f.mutations, []);
 });
 
 test('default restoration changes only one dimension at a time and reconciles exact ARM targets before continuing', async t => {
@@ -426,9 +515,9 @@ test('default restoration changes only one dimension at a time and reconciles ex
     measurements: { qapNotHealthyReasons: 0, qapPendingBacklog: 0, previousQapPendingBacklog: 0,
       deltaRowsBefore: 42, deltaRowsAfter: 42, kustoRowsBefore: 42, kustoRowsAfter: 42 },
   }) });
-  assert.equal(await full.verifySafeIdle(f.store.state, 'verify'), 'complete');
+  await assert.rejects(full.verifySafeIdle(f.store.state, 'verify'), /release and handoff withheld/);
   properties(f.resources.get(f.c.cluster_id)!).optimizedAutoscale = { isEnabled: false, minimum: 2, maximum: 4 };
-  assert.equal(await full.verifySafeIdle(f.store.state, 'verify'), 'pending');
+  await assert.rejects(full.verifySafeIdle(f.store.state, 'verify'), /release and handoff withheld/);
 });
 
 for (const fault of ['before', 'after'] as const) test(`unknown ARM ${fault}-apply outcome is reconciled without replay`, async t => {

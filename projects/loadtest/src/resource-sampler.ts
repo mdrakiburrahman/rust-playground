@@ -11,11 +11,21 @@ const execute = promisify(execFile);
 export const SAMPLE_INTERVAL_MS = 10_000;
 const TIMEOUT_MS = 2500;
 
+export type ContainerMemoryMetric = 'usage' | 'working_set';
+
+export function parseContainerMemoryMetric(value: unknown): ContainerMemoryMetric {
+  if (value !== 'usage' && value !== 'working_set') {
+    throw new Error('container_memory_metric must be usage or working_set');
+  }
+  return value;
+}
+
 export interface SamplerOptions {
   project: string;
   results: string;
   dataflowAdmin: string;
   ownerPid?: number;
+  containerMemoryMetric?: ContainerMemoryMetric;
 }
 
 function safeFailure(error: unknown): { kind: string; code?: string | number } {
@@ -87,7 +97,8 @@ export const resourceScript = [
     `printf '\\n__${name}__\\n'; cat ${file} 2>/dev/null || printf '__READ_ERROR__\\n'`),
 ].join('; ');
 
-export function parseResources(text: string): Record<string, unknown> {
+export function parseResources(text: string, memoryMetric: ContainerMemoryMetric = 'usage'): Record<string, unknown> {
+  const metric = parseContainerMemoryMetric(memoryMetric);
   const sections = (name: string): string => {
     const match = new RegExp(`__${name}__\\n([\\s\\S]*?)(?=\\n__[a-z]+__\\n|$)`, 'u').exec(text);
     if (!match || match[1].includes('__READ_ERROR__')) throw new Error(`Unavailable ${name}`);
@@ -108,7 +119,8 @@ export function parseResources(text: string): Record<string, unknown> {
     const stat = parseCounters(sections('stat'));
     if (stat.inactive_file === undefined) throw new Error('Missing inactive_file');
     const currentBytes = Number(current);
-    return { currentBytes, workingSetBytes: Math.max(0, currentBytes - stat.inactive_file), stat };
+    const workingSetBytes = Math.max(0, currentBytes - stat.inactive_file);
+    return { metric, valueBytes: metric === 'usage' ? currentBytes : workingSetBytes, currentBytes, workingSetBytes, stat };
   });
   read('cpu', () => parseCounters(sections('cpu')));
   read('events', () => parseCounters(sections('events')));
@@ -133,7 +145,7 @@ async function adminSample(endpoint: string): Promise<Record<string, unknown>> {
   return { metrics, readiness };
 }
 
-export async function collectorSample(project: string, service: string, endpoint: string): Promise<Record<string, unknown>> {
+export async function collectorSample(project: string, service: string, endpoint: string, memoryMetric: ContainerMemoryMetric = 'usage'): Promise<Record<string, unknown>> {
   const timestamp = new Date().toISOString();
   const identity = await capture(async () => {
     const ids = (await docker([
@@ -150,13 +162,14 @@ export async function collectorSample(project: string, service: string, endpoint
       '{"id":{{json .Id}},"imageId":{{json .Image}},"hostPid":{{json .State.Pid}},"running":{{json .State.Running}},"restartCount":{{json .RestartCount}}}',
       identity.value,
     ])) as unknown),
-    capture(async () => parseResources(await docker(['exec', identity.value, 'sh', '-c', resourceScript]))),
+    capture(async () => parseResources(await docker(['exec', identity.value, 'sh', '-c', resourceScript]), memoryMetric)),
     adminSample(endpoint),
   ]);
   return { timestamp, service, container, resources, admin };
 }
 
 export async function runResourceSampler(options: SamplerOptions): Promise<void> {
+  const memoryMetric = parseContainerMemoryMetric(options.containerMemoryMetric ?? 'usage');
   const results = path.resolve(options.results);
   mkdirSync(results, { recursive: true });
   const statusFile = path.join(results, 'sampler-status.json');
@@ -193,7 +206,7 @@ export async function runResourceSampler(options: SamplerOptions): Promise<void>
       const timestamp = new Date().toISOString();
       const start = Date.now();
       const collectors = await Promise.all([
-        collectorSample(options.project, 'dataflow-1', options.dataflowAdmin),
+        collectorSample(options.project, 'dataflow-1', options.dataflowAdmin, memoryMetric),
       ]);
       appendFileSync(samples, `${JSON.stringify({ timestamp, sequence: sequence++, collectors })}\n`);
       status('running');
@@ -219,6 +232,7 @@ export async function startResourceSampler(options: SamplerOptions, env: NodeJS.
     '--project', options.project, '--results', options.results,
     '--dataflow-admin', options.dataflowAdmin,
     '--owner-pid', String(process.pid),
+    '--container-memory-metric', parseContainerMemoryMetric(options.containerMemoryMetric ?? 'usage'),
   ], { env, stdio: ['ignore', fd, fd] });
   closeSync(fd);
   let launchError: unknown;
@@ -260,7 +274,7 @@ export async function startResourceSampler(options: SamplerOptions, env: NodeJS.
 function parseSamplerOptions(args: string[]): SamplerOptions {
   const values = new Map<string, string>();
   for (let index = 0; index < args.length; index += 2) {
-    if (!['--project', '--results', '--dataflow-admin', '--owner-pid'].includes(args[index]) || !args[index + 1]) {
+    if (!['--project', '--results', '--dataflow-admin', '--owner-pid', '--container-memory-metric'].includes(args[index]) || !args[index + 1]) {
       throw new Error('Invalid sampler arguments');
     }
     values.set(args[index], args[index + 1]);
@@ -286,6 +300,7 @@ function parseSamplerOptions(args: string[]): SamplerOptions {
   return {
     project, results, dataflowAdmin: endpoint('--dataflow-admin'),
     ownerPid: owner === undefined ? undefined : Number(owner),
+    containerMemoryMetric: parseContainerMemoryMetric(values.get('--container-memory-metric') ?? 'usage'),
   };
 }
 

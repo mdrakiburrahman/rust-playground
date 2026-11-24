@@ -147,7 +147,12 @@ export function prepareExperiments(
   const higherDfe = integer(binding.higherDfeConcurrency, 1, 256, 'higher DFE concurrency');
   if (higherDfe <= baselineDfe) throw new Error('E5 DFE concurrency must exceed the baseline');
   integer(base.rows_per_table, 1, 1_000_000, 'rows per table');
-  integer(base.dmv_concurrency, 1, 64, 'DMV concurrency');
+  if (base.dmv_concurrency != null) {
+    integer(base.dmv_concurrency, 1, 64, 'dmv_concurrency');
+    const tunables = base.tunables as { client?: { streams_per_worker?: unknown } } | undefined;
+    if (typeof tunables?.client?.streams_per_worker === 'number' && tunables.client.streams_per_worker > 0)
+      throw new Error('dmv_concurrency has no effect when tunables.client.streams_per_worker is nonzero');
+  }
   if (typeof base.qap_database !== 'string' || !base.qap_database.trim()) {
     throw new Error('generated AKS config must supply its QAP observation database');
   }

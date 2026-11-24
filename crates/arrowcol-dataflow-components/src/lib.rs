@@ -44,5 +44,5 @@ pub use metrics::{
 };
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};
-pub use shutdown::{RoutingShutdown, finish_routing_shutdown};
+pub use shutdown::{RoutingShutdown, finish_routing_shutdown, terminal_publication_evidence};
 pub use topology::observe_validated_topology;

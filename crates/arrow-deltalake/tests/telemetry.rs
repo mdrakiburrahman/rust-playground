@@ -58,6 +58,23 @@ async fn real_kernel_and_publication_events_reach_meter_provider() -> Result<()>
     ] {
         assert!(names.contains(expected), "missing {expected}: {names:?}");
     }
+    let lock = metrics
+        .iter()
+        .find(|metric| metric.name() == "delta.publication.commit_lock.duration")
+        .context("publication lock duration")?;
+    assert_eq!(lock.unit(), "s");
+    let AggregatedMetrics::F64(MetricData::Histogram(lock)) = lock.data() else {
+        anyhow::bail!("publication lock duration did not export a histogram");
+    };
+    for phase in ["wait", "hold"] {
+        assert!(
+            lock.data_points().any(|point| point.count() == 2
+                && point
+                    .attributes()
+                    .any(|attribute| attribute.key.as_str() == "phase" && attribute.value.as_str() == phase)),
+            "expected a {phase} sample for both commit and deduplicated return"
+        );
+    }
     let version = metrics
         .iter()
         .find(|metric| metric.name() == "delta.kernel.version")

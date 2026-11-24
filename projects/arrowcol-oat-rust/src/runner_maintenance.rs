@@ -90,7 +90,8 @@ fn compose_maintenance(config: &OatConfig, services: &mut serde_json::Map<String
         worker["build"] = json!({
             "context": std::env::current_dir()?,
             "dockerfile": "crates/delta-maintenance/Dockerfile",
-            "labels": { "org.opencontainers.image.revision": std::env::var("GIT_SHA").unwrap_or_else(|_| "unknown".to_owned()) },
+            "args": { "VCS_REF": std::env::var("GIT_SHA").unwrap_or_else(|_| "local".to_owned()) },
+            "labels": { "org.opencontainers.image.revision": std::env::var("GIT_SHA").unwrap_or_else(|_| "local".to_owned()) },
         });
     }
     services.insert("delta-maintenance".to_owned(), worker);
@@ -199,7 +200,9 @@ async fn verify_local_partition_policy_before_admission(
     platform: &LocalPlatform,
     tables: &[String],
 ) -> Result<()> {
-    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable)
+        && !config.platform.local.partitioned_table_bootstrap
+    {
         return Ok(());
     }
     let [table] = tables else {
@@ -336,6 +339,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "MAX_CONSECUTIVE_STALE_PLANS"
         | "SEALED_PARTITIONS_ONLY"
         | "MAX_CONCURRENT_TABLES"
+        | "BIN_CONCURRENCY"
         | "MAX_CONCURRENT_DECODED_BYTES"
         | "COMMIT_ATTEMPTS"
         | "COMMIT_BUDGET_SECS"
@@ -343,6 +347,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "MAX_PRUNE_FILES"
         | "ANCHOR_MS"
         | "INPUT_READ_STRATEGY"
+        | "INPUT_PREFETCH_FILES"
         | "CATALOG_RUNTIME_THREADS"
         | "CATALOG_RPC_TIMEOUT_SECS"
         | "CATALOG_MAX_DECODING_MESSAGE_BYTES" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
@@ -350,6 +355,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "PURGE_MAX_PLAN_BYTES"
         | "OPTIMIZE_UPLOAD_MODE"
         | "OPTIMIZE_UPLOAD_BUFFER_BYTES"
+        | "OPTIMIZE_UPLOAD_CONCURRENCY"
         | "VACUUM_DELETE_CHUNK"
         | "VACUUM_MAX_PLAN_BYTES"
         | "REPLAY_MAX_LOG_FILES"
@@ -368,7 +374,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
             false,
         ),
         "TARGET_FILE_MIB" => (
-            "/table_policy/arrowcol.optimize.targetFileSize".to_owned(),
+            "/startup/optimize_target_file_bytes".to_owned(),
             1024 * 1024,
             false,
         ),
@@ -383,6 +389,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         "VACUUM_MAX_LISTED_FILES" => ("/table_policy/arrowcol.vacuum.maxListedFiles".to_owned(), 1, false),
         "LAYOUT_ENABLED" => ("/table_policy/arrowcol.layout.enabled".to_owned(), 1, false),
         "LAYOUT_SORT_COLUMNS" => ("/table_policy/arrowcol.layout.sortColumns".to_owned(), 1, false),
+        "LAYOUT_SORT_OPTIONS" => ("/table_policy/arrowcol.layout.sortOptions".to_owned(), 1, false),
         "LAYOUT_BLOOM_COLUMNS" => ("/table_policy/arrowcol.layout.bloomColumns".to_owned(), 1, false),
         "LAYOUT_MAX_ROWS" => ("/table_policy/arrowcol.layout.maxRows".to_owned(), 1, false),
         "LAYOUT_MAX_INPUT_BYTES" => ("/table_policy/arrowcol.layout.maxInputSize".to_owned(), 1, false),
@@ -412,7 +419,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
             1,
             true,
         ),
-        "CHECKPOINT_EVERY_COMMITS" => ("/table_policy/delta.checkpointInterval".to_owned(), 1, false),
+        "CHECKPOINT_EVERY_COMMITS" => ("/startup/checkpoint_every_commits".to_owned(), 1, false),
         _ => bail!("maintenance environment has no checked effective-policy adapter: {variable}"),
     };
     let expected = if invert {
@@ -437,13 +444,23 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
     } else {
         expected
     };
-    Ok((
-        observed
+    let actual = observed
             .pointer(&path)
             .with_context(|| format!("maintenance startup omitted {variable}"))?
-            .clone(),
-        expected,
-    ))
+            .clone();
+    if field == "LAYOUT_SORT_OPTIONS" {
+        let parse = |values: Vec<&str>| -> Result<Value> {
+            let options = values.into_iter()
+                .map(arrow_deltalake::layout::SortKeyOptions::from_property)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(serde_json::to_value(options)?)
+        };
+        let actual: Vec<arrow_deltalake::layout::SortKeyOptions> = serde_json::from_value(actual)
+            .context("maintenance sort options readback must be a typed array")?;
+        let expected = expected.as_str().context("maintenance sort options must be comma separated")?;
+        return Ok((serde_json::to_value(actual)?, parse(expected.split(',').collect())?));
+    }
+    Ok((actual, expected))
 }
 
 fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<()> {
@@ -463,6 +480,41 @@ fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<(
             || observed.pointer("/operation_settings/max_consecutive_stale_plans") != Some(&json!(expected)))
     {
         bail!("maintenance did not confirm its effective stale-plan health limit");
+    }
+    for (enabled, requested, startup_path, effective_path, policy_path) in [
+        (
+            settings.operations.as_ref().is_some_and(|operations| {
+                operations.contains(&arrowcol_tunables::MaintenanceOperation::Checkpoint)
+            }),
+            settings.checkpoint_every_commits,
+            "/startup/checkpoint_every_commits",
+            "/operation_settings/checkpoint_every_commits",
+            "/table_policy/delta.checkpointInterval",
+        ),
+        (
+            settings.operations.as_ref().is_some_and(|operations| {
+                operations.contains(&arrowcol_tunables::MaintenanceOperation::Optimize)
+            }),
+            settings
+                .target_file_mib
+                .map(|value| value.checked_mul(1024 * 1024).context("maintenance target file size overflow"))
+                .transpose()?,
+            "/startup/optimize_target_file_bytes",
+            "/operation_settings/optimize_target_file_bytes",
+            "/table_policy/arrowcol.optimize.targetFileSize",
+        ),
+    ] {
+        if enabled && let Some(requested) = requested {
+            let effective = observed
+                .pointer(effective_path)
+                .filter(|value| value.as_u64().is_some_and(|number| number > 0))
+                .with_context(|| format!("maintenance effective {effective_path} missing"))?;
+            if observed.pointer(startup_path) != Some(&json!(requested))
+                || observed.pointer(policy_path) != Some(effective)
+            {
+                bail!("maintenance {effective_path} requested or effective setting does not match readback");
+            }
+        }
     }
     if let Some(requested) = settings.sealed_partitions_only {
         if observed.pointer("/startup/sealed_partitions_only") != Some(&json!(requested)) {
@@ -783,6 +835,27 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance table readback omitted resolved table policy");
         }
         verify_maintenance_controls(config, &policy)?;
+        if config.tunables.maintenance.as_ref().and_then(|settings| settings.layout_sort_options.as_ref()).is_some() {
+            let source = policy.pointer("/layout_sources/arrowcol.layout.sortOptions")
+                .and_then(Value::as_str).context("maintenance sort options source missing")?;
+            let expected = config.tunables.environment_for(ComponentRole::Maintenance)?
+                .remove("ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS")
+                .context("maintenance sort options projection missing")?;
+            let (actual, requested) = maintenance_readback_value(&policy, "ARROWCOL_MAINT_LAYOUT_SORT_OPTIONS", json!(expected))?;
+            let columns = policy.pointer("/table_policy/arrowcol.layout.sortColumns")
+                .and_then(Value::as_array).context("maintenance effective sort columns missing")?;
+            let options = actual.as_array().context("maintenance effective sort options missing")?;
+            if !options.is_empty() && (options.len() != columns.len() || options.iter().zip(columns)
+                .any(|(option, column)| option.get("column") != Some(column)))
+            {
+                bail!("maintenance effective sort options do not match sort columns");
+            }
+            match source {
+                "process" if actual == requested => {},
+                "table" => {},
+                _ => bail!("maintenance effective sort options do not match their source"),
+            }
+        }
         verify_effective_maintenance_stop_budget(config, &policy["table_policy"])?;
         if let Some(previous) = tables.insert(table.to_owned(), policy.clone())
             && previous != policy
@@ -1035,6 +1108,42 @@ mod maintenance_topology_tests {
     }
 
     #[test]
+    fn maintenance_sort_options_require_startup_and_effective_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"operations":["optimize"],
+                "layout_sort_columns":["customer_id"],
+                "layout_sort_options":[{"column":"customer_id","direction":"descending","nulls":"first"}]}
+        }))?;
+        let mut observed = json!({
+            "startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
+            "table_policy":{"arrowcol.maintenance.operationTimeout":300_000,
+                "arrowcol.layout.sortColumns":["customer_id"],
+                "arrowcol.layout.sortOptions":[{"column":"customer_id","direction":"descending","nulls":"first"}]},
+            "layout_sources":{"arrowcol.layout.sortOptions":"process"}, "active":true
+        });
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let event = |policy: &Value| format!("arrowcol_maintenance_table_config {}\n", json!({"table":table,"config":policy}));
+        maintenance_table_evidence(&config, &event(&observed))?;
+        observed["table_policy"]["arrowcol.layout.sortOptions"] =
+            json!([{"column":"customer_id","direction":"ascending","nulls":"last"}]);
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
+        assert!(maintenance_table_evidence(&config, &event(&observed)).is_err());
+        observed["layout_sources"]["arrowcol.layout.sortOptions"] = json!("table");
+        maintenance_table_evidence(&config, &event(&observed))?;
+        observed["table_policy"]["arrowcol.layout.sortOptions"] = json!([]);
+        maintenance_table_evidence(&config, &event(&observed))?;
+        observed["table_policy"].as_object_mut().context("policy")?.remove("arrowcol.layout.sortOptions");
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
+        assert!(maintenance_table_evidence(&config, &event(&observed)).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn maintenance_readback_converts_units_without_truncation_and_preserves_table_overrides() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -1042,7 +1151,9 @@ mod maintenance_topology_tests {
         config.tunables = serde_json::from_value(
             json!({"maintenance":{"enabled":true,"operations":["optimize"],"target_file_mib":17}}),
         )?;
-        let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
+        let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60,
+                "optimize_target_file_bytes":17_u64*1024*1024},
+            "operation_settings":{"optimize_target_file_bytes":17_u64*1024*1024},
             "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024,
                 "arrowcol.maintenance.operationTimeout":300_000},"active":true});
         verify_process_configuration(&config, ComponentRole::Maintenance, &startup)?;
@@ -1053,6 +1164,7 @@ mod maintenance_topology_tests {
         for table in &config.tables {
             let mut policy = startup.clone();
             policy["table_policy"]["arrowcol.optimize.targetFileSize"] = json!(32_u64 * 1024 * 1024);
+            policy["operation_settings"]["optimize_target_file_bytes"] = json!(32_u64 * 1024 * 1024);
             text.push_str(&format!(
                 "arrowcol_maintenance_table_config {}\n",
                 json!({
@@ -1223,6 +1335,30 @@ mod maintenance_topology_tests {
     }
 
     #[test]
+    fn maintenance_checkpoint_and_target_readbacks_match_effective_table_policy() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"operations":["checkpoint","optimize"],
+                "checkpoint_every_commits":42,"target_file_mib":17}
+        }))?;
+        let mut observed = json!({
+            "startup":{"apply":false,"operations":["checkpoint","optimize"],"interval_secs":60,
+                "checkpoint_every_commits":42,"optimize_target_file_bytes":17825792},
+            "operation_settings":{"checkpoint_every_commits":55,"optimize_target_file_bytes":33554432},
+            "table_policy":{"delta.checkpointInterval":55,"arrowcol.optimize.targetFileSize":33554432}
+        });
+        verify_maintenance_controls(&config, &observed)?;
+        observed["operation_settings"]["checkpoint_every_commits"] = json!(42);
+        assert!(verify_maintenance_controls(&config, &observed).is_err());
+        observed["operation_settings"]["checkpoint_every_commits"] = json!(55);
+        observed["operation_settings"]["optimize_target_file_bytes"] = Value::Null;
+        assert!(verify_maintenance_controls(&config, &observed).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn effective_table_timeout_is_budgeted_before_admission() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -1261,11 +1397,13 @@ mod maintenance_topology_tests {
         ))?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "maintenance": {"enabled": true, "operations": ["optimize"],
-                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3,
+                "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64, "input_prefetch_files": 2}
         }))?;
         let mut observed = json!({"startup": {
             "apply": false, "operations": ["optimize"], "interval_secs": 60,
-            "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+            "bin_concurrency": 2, "max_concurrent_decoded_bytes": 2147483648u64, "input_prefetch_files": 2,
+            "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304, "optimize_upload_concurrency": 3}
         }});
         verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
         observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"] = Value::Null;

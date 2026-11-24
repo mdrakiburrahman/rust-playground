@@ -82,6 +82,83 @@ mod override_tests {
         Ok(())
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn large_byte_capacities_round_trip_through_oat_and_runtime_validation() -> Result<(), String> {
+        let values = serde_json::json!({
+            "global_capacity":{"bytes":6_000_000_000_u64},
+            "per_table_capacity":{"bytes":5_000_000_000_u64}
+        });
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"batching":values}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        let config = merge_config(
+            &FileBatchConfig::default(),
+            &environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"],
+            None,
+        )?;
+        config.validate()?;
+        assert_eq!(config.global_capacity.bytes, 6_000_000_000);
+        assert_eq!(config.per_table_capacity.bytes, 5_000_000_000);
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"batching":{"global_capacity":{"bytes":invalid}}}
+                }))
+                .is_err()
+            );
+        }
+
+        let oversized = format!(
+            r#"{{"global_capacity":{{"bytes":{}}}}}"#,
+            arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1
+        );
+        assert!(
+            merge_config(&FileBatchConfig::default(), &oversized, None)?
+                .validate()
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stage_file_concurrency_validates_the_merged_batch_policy() {
+        let config = FileBatchConfig::default();
+        assert_eq!(config.stage_file_concurrency, 1);
+        let enabled = FileBatchConfig {
+            coalesce_publications: true,
+            ..config.clone()
+        };
+        assert!(
+            merge_config(&enabled, r#"{"stage_file_concurrency":16}"#, None)
+                .and_then(|merged| merged.validate())
+                .is_ok()
+        );
+        for (raw, valid) in [
+            ("1", true),
+            ("16", false),
+            ("0", false),
+            ("17", false),
+            ("-1", false),
+            ("1.5", false),
+            ("\"2\"", false),
+            ("null", false),
+        ] {
+            let json = format!(r#"{{"stage_file_concurrency":{raw}}}"#);
+            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+            assert_eq!(result.is_ok(), valid, "{json}");
+        }
+    }
+
     #[test]
     fn channels_reject_capacity_that_would_panic_at_startup() {
         let limits = RuntimeLimitsConfig {
@@ -169,6 +246,52 @@ mod override_tests {
         assert!(routing.apply_override(r#"{"host":"replacement"}"#).is_err());
         routing.apply_override(r#"{"command_timeout":"0s"}"#)?;
         assert!(routing.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oat_partial_overrides_reach_the_shipped_collector_baseline() -> Result<(), String> {
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"pressure":{"heartbeat_interval":"25s","buffered_bytes_limit":3_000_000_000_u64},
+                         "batching":{"adaptive_file":{"max_input_bytes":8_388_608}}}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        for template in [
+            include_str!("../../../projects/arrowcol-dataflow-rust/config.yaml"),
+            include_str!("../../../projects/arrowcol-dataflow-rust/config.quiver.yaml"),
+        ] {
+            let expanded = otel_arrow_dfe_config::env_substitution::substitute_env_vars(template)
+                .map_err(|error| error.to_string())?;
+            let pipeline = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_yaml(&expanded)
+                .map_err(|error| error.to_string())?;
+            let pipeline = serde_json::to_value(pipeline).map_err(|error| error.to_string())?;
+            let registration: RegistrationConfig = serde_json::from_value(
+                pipeline
+                    .pointer("/groups/arrowcol/pipelines/ingest/nodes/flight/config/registration")
+                    .ok_or("missing receiver registration")?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let effective: RegistrationConfig =
+                merge_config(&registration, &environment["ARROWCOL_COLLECTOR_PRESSURE_CONFIG"], None)?;
+            effective.validate()?;
+            assert_eq!(effective.heartbeat_interval, Duration::from_secs(25));
+            assert_eq!(effective.buffered_bytes_limit, 3_000_000_000);
+            let batch: FileBatchConfig = serde_json::from_value(
+                pipeline
+                    .pointer("/groups/arrowcol/pipelines/ingest/nodes/delta/config/batching")
+                    .ok_or("missing exporter batching")?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let effective: FileBatchConfig =
+                merge_config(&batch, &environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"], None)?;
+            effective.validate()?;
+            assert_eq!(effective.adaptive_file.max_input_bytes, 8_388_608);
+        }
         Ok(())
     }
 
@@ -802,6 +925,9 @@ pub struct FlightReceiverConfig {
     /// Flight resource limits.
     #[serde(default)]
     pub limits: RuntimeLimitsConfig,
+    /// Flight listener and accepted-socket settings.
+    #[serde(default)]
+    pub socket: arrowcol_tunables::CollectorSocketTunables,
     /// Enables durable admission through native Quiver persistence.
     ///
     /// The topology must route this receiver into a `processor:durable_buffer`
@@ -830,6 +956,7 @@ impl FlightReceiverConfig {
             }
         }
         apply_json_environment(&mut self.limits, "ARROWCOL_COLLECTOR_LIMITS_CONFIG", None)?;
+        apply_json_environment(&mut self.socket, "ARROWCOL_COLLECTOR_SOCKET_CONFIG", None)?;
         apply_json_environment(
             &mut self.registration,
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
@@ -852,6 +979,7 @@ impl FlightReceiverConfig {
         serde_json::json!({
             "cpu_pressure": self.cpu_pressure,
             "limits": self.limits,
+            "socket": self.socket,
             "pressure": {
                 "max_concurrent_streams": self.registration.max_concurrent_streams,
                 "rss_limit_bytes": self.registration.rss_limit_bytes,
@@ -878,6 +1006,12 @@ impl FlightReceiverConfig {
         self.routing.validate()?;
         self.registration.validate()?;
         self.limits.build().map_err(|error| error.to_string())?;
+        self.socket.validate()?;
+        if !cfg!(target_os = "linux")
+            && (self.socket.recv_buffer_bytes.is_some() || self.socket.send_buffer_bytes.is_some())
+        {
+            return Err("collector.socket buffer settings are only supported on Linux".to_owned());
+        }
         Ok(())
     }
 }
@@ -886,6 +1020,8 @@ impl FlightReceiverConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitConfig {
+    /// Strategy used to resolve prior Delta transactions.
+    pub txn_lookup_mode: arrow_deltalake::TxnLookupMode,
     /// Maximum batching delay.
     #[serde(with = "humantime_serde")]
     pub batch_window: Duration,
@@ -899,6 +1035,7 @@ impl Default for CommitConfig {
     fn default() -> Self {
         let options = arrow_deltalake::commit::CommitOptions::default();
         Self {
+            txn_lookup_mode: options.txn_lookup_mode,
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
@@ -909,6 +1046,7 @@ impl Default for CommitConfig {
 impl CommitConfig {
     pub(crate) fn build(&self) -> Result<arrow_deltalake::commit::CommitOptions, String> {
         let options = arrow_deltalake::commit::CommitOptions {
+            txn_lookup_mode: self.txn_lookup_mode,
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
@@ -979,7 +1117,7 @@ impl DeltaExporterConfig {
 #[serde(deny_unknown_fields)]
 pub struct BatchCapacity {
     /// Logical Arrow bytes.
-    pub bytes: u32,
+    pub bytes: u64,
     /// Rows.
     pub rows: u32,
     /// Batches.
@@ -1009,6 +1147,8 @@ pub struct FileBatchConfig {
     pub max_age: Duration,
     /// Maximum simultaneous file publications.
     pub max_concurrent_flushes: usize,
+    /// Maximum sibling files staged concurrently within one coalesced publication.
+    pub stage_file_concurrency: usize,
     /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
     pub pipeline_depth: usize,
     /// Compressed Parquet target and estimator limits.
@@ -1035,6 +1175,7 @@ impl Default for FileBatchConfig {
             max_batches_per_flush: 512,
             max_age: Duration::from_secs(30),
             max_concurrent_flushes: 4,
+            stage_file_concurrency: 1,
             pipeline_depth: 1,
             adaptive_file: AdaptiveFileConfig::default(),
         }
@@ -1045,20 +1186,25 @@ impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         let global = self.global_capacity;
         let table = self.per_table_capacity;
-        if [
-            global.bytes,
-            global.rows,
-            global.batches,
-            table.bytes,
-            table.rows,
-            table.batches,
-        ]
-        .contains(&0)
+        if !(1..=16).contains(&self.stage_file_concurrency) {
+            return Err("stage_file_concurrency must be in 1..=16".to_owned());
+        }
+        if self.stage_file_concurrency > 1 && !self.coalesce_publications {
+            return Err("stage_file_concurrency > 1 requires coalesce_publications=true".to_owned());
+        }
+        if [global.rows, global.batches, table.rows, table.batches].contains(&0)
+            || global.bytes == 0
+            || table.bytes == 0
+            || global.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || table.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || [global.rows, global.batches, table.rows, table.batches]
+                .into_iter()
+                .any(|value| u64::from(value) > tokio::sync::Semaphore::MAX_PERMITS as u64)
             || table.bytes > global.bytes
             || table.rows > global.rows
             || table.batches > global.batches
             || self.max_arrow_memory_per_flush == 0
-            || self.max_arrow_memory_per_flush > u64::from(table.bytes)
+            || self.max_arrow_memory_per_flush > table.bytes
             || self.max_rows_per_flush == 0
             || self.max_rows_per_flush > u64::from(table.rows)
             || self.max_batches_per_flush == 0

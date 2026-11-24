@@ -20,6 +20,9 @@ mod metadata;
 mod pressure;
 mod protocol;
 
+/// Teardown failure kind emitted when dataflow shutdown leaves work undrained.
+pub const DATAFLOW_DRAIN_INCOMPLETE: &str = "dataflow_drain_incomplete";
+
 /// gRPC metadata key set to `true` only when a delivery was rejected before admission.
 pub const NOT_ADMITTED_METADATA_KEY: &str = "arrowcol-not-admitted";
 

@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArrowCol Darwin evaluator result",
+  "oneOf": [
+    { "$ref": "#/$defs/stub" },
+    { "$ref": "#/$defs/smoke" },
+    { "$ref": "#/$defs/qualification" },
+    { "$ref": "#/$defs/qualificationFailure" }
+  ],
+  "$defs": {
+    "qualificationFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "experiment", "tier", "objective", "valid", "combined_score", "accepted", "reason",
+        "durable_rows_per_second", "measurement_unavailable_reason"],
+      "properties": {
+        "version": { "const": 1 },
+        "experiment": { "const": "layout-sort" },
+        "tier": { "enum": ["tier2-smoke", "tier2-series"] },
+        "objective": { "const": "durable-rate" },
+        "valid": { "const": 0 },
+        "combined_score": { "const": 0 },
+        "accepted": { "const": false },
+        "reason": { "type": "string", "minLength": 1 },
+        "durable_rows_per_second": { "type": "null" },
+        "measurement_unavailable_reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "experiment", "tier", "objective", "valid", "combined_score", "accepted", "reason", "qualification"],
+      "properties": {
+        "version": { "const": 1 },
+        "experiment": { "const": "layout-sort" },
+        "tier": { "enum": ["tier2-smoke", "tier2-series"] },
+        "objective": { "const": "durable-rate" },
+        "valid": { "const": 0 },
+        "combined_score": { "const": 0 },
+        "accepted": { "const": false },
+        "reason": { "type": "string", "minLength": 1 },
+        "qualification": {
+          "type": "object",
+          "required": ["kind", "valid", "accepted", "reason", "original", "smoke", "reportPath"],
+          "properties": {
+            "kind": { "enum": ["smoke", "tier2"] },
+            "valid": { "const": 0 },
+            "accepted": { "const": false },
+            "reason": { "type": "string", "minLength": 1 },
+            "original": {
+              "type": "object",
+              "required": ["version", "bindingSha256", "startedAtUnixMs", "deadlineUnixMs"],
+              "properties": {
+                "version": { "const": 1 },
+                "bindingSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                "startedAtUnixMs": { "type": "integer", "minimum": 0 },
+                "deadlineUnixMs": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "smoke": {
+              "type": "object",
+              "required": ["measurement", "cellRunId", "snapshotReconciled", "deliveryIdentity", "observer", "runRoot"],
+              "properties": {
+                "measurement": { "$ref": "#/$defs/measurement" },
+                "cellRunId": { "type": "string", "format": "uuid" },
+                "snapshotReconciled": { "const": true },
+                "deliveryIdentity": { "type": "object", "required": ["verified"], "properties": { "verified": { "const": true } } },
+                "observer": { "$ref": "#/$defs/qualifiedObserver" },
+                "runRoot": { "type": "string", "minLength": 1 }
+              }
+            },
+            "control": { "$ref": "#/$defs/qualifiedSeries" },
+            "trial": { "$ref": "#/$defs/qualifiedSeries" },
+            "reportPath": { "type": "string", "minLength": 1 }
+          },
+          "allOf": [
+            { "if": { "properties": { "kind": { "const": "tier2" } } }, "then": { "required": ["control", "trial"] } }
+          ]
+        }
+      }
+    },
+    "qualifiedObserver": {
+      "type": "object",
+      "required": ["complete", "readyUnixMs", "startUnixMs", "endUnixMs", "maxGapMs"],
+      "properties": {
+        "complete": { "const": true },
+        "readyUnixMs": { "type": "integer", "minimum": 0 },
+        "startUnixMs": { "type": "integer", "minimum": 0 },
+        "endUnixMs": { "type": "integer", "minimum": 0 },
+        "maxGapMs": { "type": "integer", "minimum": 0, "maximum": 5000 }
+      }
+    },
+    "qualifiedSeries": {
+      "type": "object",
+      "required": ["kind", "arms", "score", "noiseFloorLog", "tier2Passed"],
+      "properties": {
+        "kind": { "enum": ["noise-control", "trial"] },
+        "arms": {
+          "type": "array", "minItems": 6, "maxItems": 6,
+          "items": {
+            "type": "object", "required": ["pair", "role", "cellRunId", "runRoot", "binding", "measurement", "deliveryIdentity", "observer"],
+            "properties": {
+              "pair": { "type": "integer", "minimum": 0, "maximum": 2 },
+              "role": { "enum": ["baseline", "candidate"] },
+              "cellRunId": { "type": "string", "format": "uuid" },
+              "runRoot": { "type": "string", "minLength": 1 },
+              "binding": { "type": "object" },
+              "measurement": { "$ref": "#/$defs/measurement" },
+              "deliveryIdentity": { "type": "object", "required": ["verified"], "properties": { "verified": { "const": true } } },
+              "observer": { "$ref": "#/$defs/qualifiedObserver" }
+            }
+          }
+        },
+        "score": { "type": "object" },
+        "noiseFloorLog": { "type": ["number", "null"], "minimum": 0 },
+        "tier2Passed": { "type": "boolean" }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startUnixMs", "endUnixMs", "rows", "parquetBytes", "files", "commits", "completeBuckets",
+        "durableRowsPerSecond", "parquetBytesPerRow", "commitLatencySeconds", "cpuMillicoresMean",
+        "memoryBytesMaxObserved", "rssBytesMaxObserved", "rssUnavailableReason", "resourceSampleCount",
+        "downstreamRowsPerSecond", "downstreamUnavailableReason"
+      ],
+      "properties": {
+        "startUnixMs": { "type": "integer", "minimum": 0 },
+        "endUnixMs": { "type": "integer", "minimum": 0 },
+        "rows": { "type": "integer", "minimum": 1 },
+        "parquetBytes": { "type": "integer", "minimum": 1 },
+        "files": { "type": "integer", "minimum": 1 },
+        "commits": { "type": "integer", "minimum": 1 },
+        "completeBuckets": { "type": "integer", "minimum": 5 },
+        "durableRowsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
+        "parquetBytesPerRow": { "type": "number", "exclusiveMinimum": 0 },
+        "commitLatencySeconds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["p50", "p99", "samples"],
+          "properties": {
+            "p50": { "type": "number", "minimum": 0 },
+            "p99": { "type": "number", "minimum": 0 },
+            "samples": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "cpuMillicoresMean": { "type": ["number", "null"], "minimum": 0 },
+        "memoryBytesMaxObserved": { "type": ["number", "null"], "minimum": 0 },
+        "rssBytesMaxObserved": { "type": "null" },
+        "rssUnavailableReason": { "type": "string", "minLength": 1 },
+        "resourceSampleCount": { "type": "integer", "minimum": 0 },
+        "downstreamRowsPerSecond": { "type": "null" },
+        "downstreamUnavailableReason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measurement", "images", "clientEvidence", "activeRows", "snapshotVersion", "cellRunId", "snapshotReconciled", "binaryHash", "configHash", "runRoot"],
+      "properties": {
+        "measurement": { "$ref": "#/$defs/measurement" },
+        "images": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[^:]+:sha256:[a-f0-9]{64}$" } },
+        "clientEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["payloadCorpusSha256", "cpu"],
+          "properties": {
+            "payloadCorpusSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "cpu": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["coreEquivalents", "sampleStartUnixMs", "sampleEndUnixMs", "unavailableReason"],
+              "properties": {
+                "coreEquivalents": { "type": ["number", "null"], "minimum": 0 },
+                "sampleStartUnixMs": { "type": ["integer", "null"], "minimum": 0 },
+                "sampleEndUnixMs": { "type": ["integer", "null"], "minimum": 0 },
+                "unavailableReason": { "type": ["string", "null"], "minLength": 1 }
+              }
+            }
+          }
+        },
+        "activeRows": { "type": "integer", "minimum": 1 },
+        "snapshotVersion": { "type": "integer", "minimum": 0 },
+        "cellRunId": { "type": "string", "format": "uuid" },
+        "snapshotReconciled": { "const": true },
+        "binaryHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "configHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "runRoot": { "type": "string", "minLength": 1 }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "trusted_revision", "seed_sha256", "controller_stack_bytes", "profile", "baseline_level", "candidate_level", "paired_rate_ratio", "bytes_guard_passed", "baseline", "candidate"],
+      "properties": {
+        "source_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "trusted_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "seed_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "controller_stack_bytes": { "type": "integer", "minimum": 2097152, "maximum": 134217728 },
+        "profile": { "const": "realistic-seed-20260923-v9" },
+        "baseline_level": { "type": "integer", "minimum": 1, "maximum": 22 },
+        "candidate_level": { "type": "integer", "minimum": 1, "maximum": 22 },
+        "paired_rate_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "bytes_guard_passed": { "type": "boolean" },
+        "baseline": { "$ref": "#/$defs/run" },
+        "candidate": { "$ref": "#/$defs/run" }
+      }
+    },
+    "smoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "experiment", "tier", "objective", "valid", "combined_score", "accepted", "reason"],
+      "properties": {
+        "version": { "const": 1 },
+        "experiment": { "const": "compression-config" },
+        "tier": { "const": "tier2-smoke" },
+        "objective": { "const": "durable-rate" },
+        "valid": { "const": 0 },
+        "combined_score": { "const": 0 },
+        "accepted": { "const": false },
+        "reason": { "type": "string", "minLength": 1 },
+        "unattributed_rows": { "type": "null" },
+        "unattributed_reason": { "type": "string", "minLength": 1 },
+        "replay": { "$ref": "#/$defs/replay" },
+        "single_run": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_revision", "trusted_revision", "seed_sha256", "controller_stack_bytes", "profile", "baseline_level", "baseline"],
+          "properties": {
+            "source_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+            "trusted_revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+            "seed_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "controller_stack_bytes": { "type": "integer", "minimum": 2097152, "maximum": 134217728 },
+            "profile": { "const": "realistic-seed-20260923-v9" },
+            "baseline_level": { "type": "integer", "minimum": 1, "maximum": 22 },
+            "baseline": { "$ref": "#/$defs/run" }
+          }
+        }
+      }
+    },
+    "stub": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "experiment", "tier", "objective", "proxy", "valid", "combined_score", "accepted", "reason", "durable_rows_per_second", "parquet_bytes_per_row", "commit_latency_seconds", "resources", "downstream", "window"],
+      "properties": {
+        "version": { "const": 1 },
+        "experiment": { "type": "string", "minLength": 1 },
+        "tier": { "const": "stub" },
+        "objective": { "const": "stub" },
+        "proxy": { "type": "null" },
+        "valid": { "const": 0 },
+        "combined_score": { "const": 0 },
+        "accepted": { "const": false },
+        "reason": { "type": "string", "minLength": 1 },
+        "durable_rows_per_second": { "type": "null" },
+        "parquet_bytes_per_row": { "type": "null" },
+        "commit_latency_seconds": { "type": "null" },
+        "resources": { "type": "null" },
+        "downstream": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rows_per_second", "unavailable_reason"],
+          "properties": {
+            "rows_per_second": { "type": "null" },
+            "unavailable_reason": { "type": "string", "minLength": 1 }
+          }
+        },
+        "window": { "type": "null" }
+      }
+    }
+  }
+}

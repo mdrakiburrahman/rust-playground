@@ -231,6 +231,10 @@ fn automatic_layout_uses_table_policy_over_process_and_reports_applied_source() 
         .0
         .properties
         .insert("arrowcol.layout.sortColumns".into(), "id".into());
+    source
+        .0
+        .properties
+        .insert("arrowcol.layout.sortOptions".into(), "id:descending:first".into());
     source.0.properties.insert("arrowcol.layout.maxRows".into(), "2".into());
     source
         .0
@@ -245,6 +249,14 @@ fn automatic_layout_uses_table_policy_over_process_and_reports_applied_source() 
     assert_eq!(evidence.config["layout_mode"], "automatic");
     assert_eq!(evidence.config["layout_applied"], true);
     assert_eq!(evidence.config["layout"]["sort_columns"], serde_json::json!(["id"]));
+    assert_eq!(
+        evidence.config["layout"]["sort_options"],
+        serde_json::json!([{"column":"id","direction":"descending","nulls":"first"}])
+    );
+    assert_eq!(
+        evidence.config["layout_sources"]["arrowcol.layout.sortOptions"],
+        "table"
+    );
     assert_eq!(evidence.config["layout"]["max_rows"], 2);
     assert_eq!(evidence.config["layout"]["bloom_columns"], serde_json::json!(["id"]));
     assert_eq!(
@@ -662,12 +674,9 @@ fn decoded_budget_rejects_table_override_without_mutating_data() -> Result<()> {
     persist_policy(&source)?;
     let before = inventory(root.path())?;
     let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
-    assert!(
-        results[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("aggregate decode budget"))
-    );
+    assert!(results[0].error.as_deref().is_some_and(|error| {
+        error.contains("max_decoded_bytes_per_bin") && error.contains("max_concurrent_decoded_bytes")
+    }));
     assert_eq!(before, inventory(root.path())?);
     Ok(())
 }
@@ -1148,6 +1157,179 @@ fn startup_readback_reports_effective_optimize_upload_settings() -> Result<()> {
     assert_eq!(
         readback["optimize_upload"]["buffer_bytes_effective"].as_u64(),
         Some(16 * 1024 * 1024)
+    );
+    Ok(())
+}
+
+#[test]
+fn storage_knob_readback_reports_installed_values_and_inactive_operations() -> Result<()> {
+    let (_root, mut settings, _) = fixture()?;
+    settings.checkpoint_every_commits = 64;
+    settings.optimize.target_file_bytes = 256 * 1024 * 1024;
+    settings
+        .process_properties
+        .insert("delta.checkpointInterval".into(), "32".into());
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.targetFileSize".into(), "64 MiB".into());
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(readback["startup"]["checkpoint_every_commits"], 64);
+    assert_eq!(readback["startup"]["optimize_target_file_bytes"], 256 * 1024 * 1024);
+    assert_eq!(readback["operation_settings"]["checkpoint_every_commits"], 32);
+    assert_eq!(
+        readback["operation_settings"]["optimize_target_file_bytes"],
+        64 * 1024 * 1024
+    );
+
+    settings.operations = vec![Operation::Vacuum];
+    let readback = startup_configuration(&settings)?;
+    assert!(readback["operation_settings"]["checkpoint_every_commits"].is_null());
+    assert!(readback["operation_settings"]["optimize_target_file_bytes"].is_null());
+    settings
+        .process_properties
+        .insert("arrowcol.maintenance.enabled".into(), "false".into());
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(readback["active"], false);
+    assert!(readback["operation_settings"].is_null());
+    Ok(())
+}
+
+#[test]
+fn storage_knob_checkpoint_interval_table_override_controls_due_work_and_apply() -> Result<()> {
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Checkpoint];
+    settings.checkpoint_every_commits = 100;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hint = root.path().join("events/_delta_log/_last_checkpoint");
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &cancel)?;
+    assert!(results[0].error.is_none(), "{results:?}");
+    assert_eq!(
+        results[0].report.as_ref().context("checkpoint report")?.outcome,
+        Outcome::Noop
+    );
+    assert!(!hint.exists());
+
+    let before = DeltaTable::open_for_maintenance(&source.0.url)?.version()?;
+    source
+        .0
+        .properties
+        .insert("delta.checkpointInterval".into(), (before + 2).to_string());
+    persist_policy(&source)?;
+    assert_eq!(
+        DeltaTable::open_for_maintenance(&source.0.url)?.version()? + 1,
+        before + 2
+    );
+    settings.apply = false;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &cancel)?;
+    assert!(results[0].error.is_none(), "{results:?}");
+    assert_eq!(
+        results[0].report.as_ref().context("checkpoint report")?.outcome,
+        Outcome::Planned
+    );
+    assert!(!hint.exists());
+
+    settings.apply = true;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &cancel)?;
+    assert!(results[0].error.is_none(), "{results:?}");
+    assert_eq!(
+        results[0].report.as_ref().context("checkpoint report")?.outcome,
+        Outcome::Checkpointed
+    );
+    assert!(hint.exists());
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &cancel)?;
+    assert!(results[0].error.is_none(), "{results:?}");
+    assert_eq!(
+        results[0].report.as_ref().context("checkpoint report")?.outcome,
+        Outcome::Noop
+    );
+    Ok(())
+}
+
+#[test]
+fn storage_knob_delta_target_file_size_reaches_optimize_plan_and_explicit_override_wins() -> Result<()> {
+    let (_root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings.apply = false;
+    settings.optimize.target_file_bytes = 256 * 1024 * 1024;
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.minFiles".into(), "2".into());
+    source
+        .0
+        .properties
+        .insert("delta.targetFileSize".into(), "64 MiB".into());
+    persist_policy(&source)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &cancel)?;
+    assert!(results[0].error.is_none(), "{results:?}");
+    let evidence = results[0].optimize.as_ref().context("OPTIMIZE evidence")?;
+    assert_eq!(evidence.plan.target_file_bytes, 64 * 1024 * 1024);
+    assert_eq!(evidence.config["target_file_bytes"], 64 * 1024 * 1024);
+
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.targetFileSize".into(), "32 MiB".into());
+    persist_policy(&source)?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &cancel)?;
+    assert!(results[0].error.is_none(), "{results:?}");
+    let evidence = results[0].optimize.as_ref().context("OPTIMIZE evidence")?;
+    assert_eq!(evidence.plan.target_file_bytes, 32 * 1024 * 1024);
+    assert_eq!(evidence.config["target_file_bytes"], 32 * 1024 * 1024);
+    Ok(())
+}
+
+#[test]
+fn retention_overrides_are_validated_against_physical_table_policy_before_operations() -> Result<()> {
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::PruneLog];
+    settings.log_retention_ms = Some(14 * 24 * 60 * 60 * 1000);
+    let error = startup_configuration(&settings)
+        .err()
+        .context("below default physical retention accepted")?;
+    assert!(error.to_string().contains("maintenance.log_retention_secs"));
+    settings.log_retention_ms = Some(2_592_000_000);
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(
+        readback["physical_retention_floor"]["delta.logRetentionDuration"],
+        2_592_000_000_u64
+    );
+    source
+        .0
+        .properties
+        .insert("delta.logRetentionDuration".into(), "interval 60 days".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(!results.is_empty());
+    assert!(results.iter().all(|result| {
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("maintenance.log_retention_secs"))
+    }));
+    assert_eq!(inventory(root.path())?, before);
+    settings.operations = vec![Operation::Vacuum];
+    settings.log_retention_ms = None;
+    source
+        .0
+        .properties
+        .insert("delta.deletedFileRetentionDuration".into(), "interval 14 days".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(results.iter().all(|result| {
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("maintenance.vacuum_retention_secs"))
+    }));
+    assert_eq!(inventory(root.path())?, before);
+    settings.allow_short_vacuum_retention = true;
+    assert_eq!(
+        startup_configuration(&settings)?["operation_settings"]["allow_short_vacuum_retention"],
+        true
     );
     Ok(())
 }

@@ -5,6 +5,8 @@ use clap::Parser;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_SCHEDULE_TIMEOUT_SECS: u64 = 2_160;
+// OAT keeps AKS and pilot runs at 600 seconds; only local non-pilot runs use the longer window.
+const MAX_DURATION_SECS: u64 = 1_800;
 
 #[derive(Parser)]
 #[command(about = "Generate deterministic DMV Arrow batches and upload them to ArrowCol")]
@@ -17,8 +19,8 @@ struct Args {
     client_id: String,
     #[arg(long, env = "ARROWCOL_CLIENT_ROWS", default_value_t = 1_000)]
     rows: usize,
-    #[arg(long, env = "ARROWCOL_CLIENT_CONCURRENCY", default_value_t = 4)]
-    concurrency: usize,
+    #[arg(long, env = "ARROWCOL_CLIENT_CONCURRENCY")]
+    concurrency: Option<usize>,
     #[arg(long, env = "ARROWCOL_CLIENT_TABLE")]
     table: Option<String>,
     #[arg(long, env = "ARROWCOL_CLIENT_EDGE_SECRET_FILE")]
@@ -43,9 +45,45 @@ struct Args {
     pilot: bool,
 }
 
+fn emit_build_profile_readback() -> Result<()> {
+    let (lto, codegen_units, opt_level, target_cpu) = (
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_LTO"),
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS"),
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL"),
+        option_env!("ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU"),
+    );
+    if lto.is_none() && codegen_units.is_none() && opt_level.is_none() && target_cpu.is_none() {
+        return Ok(());
+    }
+    let (Some(lto), Some(codegen_units), Some(opt_level), Some(target_cpu)) =
+        (lto, codegen_units, opt_level, target_cpu)
+    else {
+        anyhow::bail!("client build profile readback is incomplete");
+    };
+    let build_profile = serde_json::json!({
+        "lto": lto,
+        "codegen_units": codegen_units.parse::<u16>().context("invalid client codegen-units readback")?,
+        "opt_level": opt_level.parse::<u8>().context("invalid client opt-level readback")?,
+        "target_cpu": target_cpu,
+    });
+    println!("OAT_CLIENT_BUILD_PROFILE {build_profile}");
+    Ok(())
+}
+
+fn validate_concurrency(args: &Args) -> Result<()> {
+    if args.concurrency.is_some() && args.tuning.streams_per_worker > 0 {
+        anyhow::bail!("concurrency has no effect when streams_per_worker is nonzero; omit concurrency");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    emit_build_profile_readback()?;
     let mut args = Args::parse();
-    let (tuning, resolution) = args.tuning.resolve_with_evidence(args.rows, args.concurrency)?;
+    validate_concurrency(&args)?;
+    let (tuning, resolution) = args
+        .tuning
+        .resolve_with_evidence(args.rows, args.concurrency.unwrap_or(4))?;
     args.tuning = tuning;
     println!("OAT_CLIENT_RESOLUTION {resolution}");
     tokio::runtime::Builder::new_multi_thread()
@@ -55,16 +93,9 @@ fn main() -> Result<()> {
         .block_on(run(args))
 }
 
-async fn run(args: Args) -> Result<()> {
-    if args.duration_secs > 600 || args.warmup_secs > 300 {
-        anyhow::bail!("duration_secs must be at most 600 and warmup_secs at most 300");
-    }
-    validate_schedule_timeout(args.schedule_timeout_secs)?;
-    if args.duration_secs > 0 && args.schedule_file.is_some() == args.run_start_unix_ms.is_some() {
-        anyhow::bail!("duration-based clients require exactly one of --schedule-file or --run-start-unix-ms");
-    }
-    if args.duration_secs == 0 && args.warmup_secs > 0 {
-        anyhow::bail!("warmup-secs requires a positive duration-secs");
+fn validate_window(args: &Args) -> Result<()> {
+    if args.duration_secs > MAX_DURATION_SECS || args.warmup_secs > 300 {
+        anyhow::bail!("duration_secs must be at most {MAX_DURATION_SECS} and warmup_secs at most 300");
     }
     if args.pilot
         && (!(60..=600).contains(&args.duration_secs)
@@ -74,6 +105,18 @@ async fn run(args: Args) -> Result<()> {
         anyhow::bail!(
             "pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
         );
+    }
+    Ok(())
+}
+
+async fn run(args: Args) -> Result<()> {
+    validate_window(&args)?;
+    validate_schedule_timeout(args.schedule_timeout_secs)?;
+    if args.duration_secs > 0 && args.schedule_file.is_some() == args.run_start_unix_ms.is_some() {
+        anyhow::bail!("duration-based clients require exactly one of --schedule-file or --run-start-unix-ms");
+    }
+    if args.duration_secs == 0 && args.warmup_secs > 0 {
+        anyhow::bail!("warmup-secs requires a positive duration-secs");
     }
     let options = args.tuning.clone();
     println!("OAT_CLIENT_EFFECTIVE_CONFIG {}", serde_json::to_string(&options)?);
@@ -85,10 +128,13 @@ async fn run(args: Args) -> Result<()> {
         options,
     )
     .await?;
+    println!("OAT_CLIENT_APPLIED_TRANSPORT {}", client.applied_transport_json()?);
     println!("OAT_CLIENT_METRICS {}", client.metrics("prepared")?);
     let result = run_prepared(&args, &client).await;
     if result.is_err() {
         eprintln!("OAT_CLIENT_METRICS {}", client.failed_terminal_metrics()?);
+    } else if let Ok(final_transport) = client.applied_transport_json() {
+        println!("OAT_CLIENT_FINAL_TRANSPORT {final_transport}");
     }
     result
 }
@@ -124,7 +170,6 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
         let measurement_window_end_unix_ms = measurement_window_start_unix_ms
             .checked_add(args.duration_secs.saturating_mul(1_000))
             .ok_or_else(|| anyhow::anyhow!("shared measurement end timestamp overflow"))?;
-        wait_until_unix_ms(run_start_unix_ms, unix_time_ms).await?;
         let report = client
             .run_continuous(
                 run_start_unix_ms,
@@ -246,6 +291,7 @@ fn unix_time_ms() -> Result<u64> {
     )?)
 }
 
+#[cfg(test)]
 async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>) -> Result<()> {
     loop {
         let current = now()?;
@@ -259,7 +305,57 @@ async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>)
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_schedule_timeout, wait_until_unix_ms};
+    use super::{
+        Args, MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_concurrency, validate_schedule_timeout,
+        validate_window, wait_until_unix_ms,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn only_non_pilot_clients_accept_windows_up_to_thirty_minutes() -> anyhow::Result<()> {
+        let window = |extra: &[&str]| {
+            Args::try_parse_from(
+                ["test", "--endpoint", "http://localhost"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .map_err(anyhow::Error::from)
+            .and_then(|args| validate_window(&args))
+        };
+        window(&["--duration-secs", "1200"])?;
+        window(&["--duration-secs", "1800", "--warmup-secs", "300"])?;
+        assert!(window(&["--duration-secs", "1801"]).is_err());
+        window(&["--pilot", "--duration-secs", "600"])?;
+        assert!(window(&["--pilot", "--duration-secs", "630"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_legacy_concurrency_conflicts_with_explicit_streams() -> anyhow::Result<()> {
+        let conflict = Args::try_parse_from([
+            "test",
+            "--endpoint",
+            "http://localhost",
+            "--concurrency",
+            "2",
+            "--streams-per-worker",
+            "2",
+        ])?;
+        assert!(matches!(validate_concurrency(&conflict), Err(error) if error.to_string().contains("concurrency")));
+        let legacy = Args::try_parse_from([
+            "test",
+            "--endpoint",
+            "http://localhost",
+            "--concurrency",
+            "28",
+            "--streams-per-worker",
+            "0",
+        ])?;
+        validate_concurrency(&legacy)?;
+        let explicit = Args::try_parse_from(["test", "--endpoint", "http://localhost", "--streams-per-worker", "2"])?;
+        validate_concurrency(&explicit)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn shared_start_wait_rechecks_backward_clock_steps() -> anyhow::Result<()> {
