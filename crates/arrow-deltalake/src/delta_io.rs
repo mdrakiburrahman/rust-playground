@@ -87,6 +87,9 @@ pub struct DeltaRuntimeConfig {
     /// Maximum concurrent Parquet leaf-column encoders; 1 preserves AsyncArrowWriter.
     #[serde(default = "default_parquet_column_workers")]
     pub parquet_column_workers: u8,
+    /// Column waves by default; the pipeline retains a bounded window of input slices.
+    #[serde(default)]
+    pub parquet_encode_mode: crate::ParquetEncodeMode,
     /// CPU queue capacity, 1..=128; absent means the resolved CPU worker count.
     #[serde(default)]
     pub cpu_queue_jobs: Option<usize>,
@@ -152,6 +155,7 @@ impl DeltaRuntimeConfig {
             cpu_dispatch: CpuDispatch::default(),
             cpu_placement: CpuPlacement::default(),
             parquet_column_workers: default_parquet_column_workers(),
+            parquet_encode_mode: crate::ParquetEncodeMode::default(),
             cpu_queue_jobs: None,
             partition_grouping: crate::PartitionGrouping::default(),
             event_interval: None,
@@ -216,6 +220,10 @@ impl DeltaRuntimeConfig {
                 "{name} must be an unsigned decimal integer"
             );
             config.parquet_column_workers = raw.parse().with_context(|| format!("parse {name}"))?;
+        }
+        let name = "ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE";
+        if let Some(raw) = lookup(name)? {
+            config.parquet_encode_mode = raw.try_into().map_err(|why: &str| anyhow::anyhow!("{name}: {why}"))?;
         }
         let name = "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS";
         if let Some(raw) = lookup(name)? {
@@ -332,6 +340,10 @@ impl DeltaRuntimeConfig {
             self.blocking_fs_reserve > 0 && self.blocking_fs_reserve < self.blocking_workers,
             "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE must be positive and less than BLOCKING_WORKERS"
         );
+        anyhow::ensure!(
+            self.parquet_encode_mode != crate::ParquetEncodeMode::ColumnPipeline || self.parquet_column_workers > 1,
+            "ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE=column_pipeline requires PARQUET_COLUMN_WORKERS > 1"
+        );
         if let Some(queue) = self.cpu_queue_jobs {
             anyhow::ensure!(
                 (1..=128).contains(&queue),
@@ -354,8 +366,10 @@ impl DeltaRuntimeConfig {
         }
         if self.staging_mode == crate::StagingMode::Streaming {
             anyhow::ensure!(
-                self.upload_mode == UploadMode::BufferedMultipart && self.parquet_column_workers == 1,
-                "streaming staging requires buffered_multipart and parquet_column_workers=1"
+                self.upload_mode == UploadMode::BufferedMultipart
+                    && (self.parquet_column_workers == 1
+                        || self.parquet_encode_mode == crate::ParquetEncodeMode::ColumnPipeline),
+                "streaming staging requires buffered_multipart and either parquet_column_workers=1 or parquet_encode_mode=column_pipeline"
             );
         }
         if self.upload_mode == UploadMode::BufferedMultipart {
@@ -369,6 +383,13 @@ impl DeltaRuntimeConfig {
                 "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY must be in 1..=16, got {}",
                 self.upload_request_concurrency
             );
+            let bridge_bytes = if self.staging_mode == crate::StagingMode::Streaming
+                && self.parquet_encode_mode == crate::ParquetEncodeMode::ColumnPipeline
+            {
+                crate::streaming_columns::BRIDGE_BUFFER_BYTES
+            } else {
+                0
+            };
             let in_flight = self
                 .upload_buffer_capacity_bytes
                 .checked_mul(
@@ -377,6 +398,7 @@ impl DeltaRuntimeConfig {
                         .context("upload request concurrency overflow")?,
                 )
                 .and_then(|bytes| bytes.checked_add(UPLOAD_COPY_BUFFER_BYTES))
+                .and_then(|bytes| bytes.checked_add(bridge_bytes))
                 .context("upload buffering size overflow")?;
             let total = self
                 .upload_limit
@@ -1121,6 +1143,35 @@ mod tests {
                 .context("invalid binding unexpectedly accepted")?;
             assert!(format!("{error:#}").contains(name));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn column_pipeline_requires_multiple_workers_and_composes_with_streaming() -> Result<()> {
+        for mode in ["", "pipeline", "ColumnPipeline", "column_pipeline "] {
+            assert!(
+                DeltaRuntimeConfig::from_lookup(|name| Ok(
+                    (name == "ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE").then(|| mode.to_owned())
+                ))
+                .is_err()
+            );
+        }
+        for workers in [1, 2, 16] {
+            let config = DeltaRuntimeConfig::from_lookup(|name| {
+                Ok(match name {
+                    "ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE" => Some("column_pipeline".into()),
+                    "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS" => Some(workers.to_string()),
+                    "ARROWCOL_COLLECTOR_UPLOAD_MODE" => Some("buffered_multipart".into()),
+                    "ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE" => Some("streaming".into()),
+                    _ => None,
+                })
+            });
+            assert_eq!(config.is_ok(), workers > 1);
+        }
+        assert_eq!(
+            DeltaRuntimeConfig::from_lookup(|_| Ok(None))?.parquet_encode_mode,
+            crate::ParquetEncodeMode::ColumnWaves
+        );
         Ok(())
     }
 

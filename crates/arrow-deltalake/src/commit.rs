@@ -600,9 +600,29 @@ impl BatchedTable {
         entries: Vec<(RecordBatch, String, i64, i64)>,
         stage_file_concurrency: usize,
     ) -> Result<PreparedPublicationGroup> {
+        self.stage_coalesced_publications_with_file_policy(entries, stage_file_concurrency, 1)
+            .await
+    }
+
+    /// Split each unsorted partition into up to `stage_files_per_group` balanced files,
+    /// stage at the requested concurrency, and retain one atomic commit and replay identity set.
+    ///
+    /// # Errors
+    /// Rejects widths outside 1..=16, sorted layouts with splitting, file-cap overflow and staging failures.
+    pub async fn stage_coalesced_publications_with_file_policy(
+        &self,
+        entries: Vec<(RecordBatch, String, i64, i64)>,
+        stage_file_concurrency: usize,
+        stage_files_per_group: usize,
+    ) -> Result<PreparedPublicationGroup> {
         let table = Arc::clone(self.preparation.get().context("Delta owner is not initialized")?);
         let (appends, identities, committed_identities, preparation_build, preparation_sort) = table
-            .stage_coalesced_publications(entries, self.options.max_files_per_commit, stage_file_concurrency)
+            .stage_coalesced_publications(
+                entries,
+                self.options.max_files_per_commit,
+                stage_file_concurrency,
+                stage_files_per_group,
+            )
             .await
             .map_err(CommitReceiptError::from_anyhow)?;
         Ok(PreparedPublicationGroup {
@@ -1105,6 +1125,92 @@ mod tests {
         assert_eq!(result.files.len(), 2);
         let actions = std::fs::read_to_string(log)?;
         assert_eq!(actions.lines().filter(|line| line.contains("\"add\":")).count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_coalesced_files_preserve_partition_rows_and_atomic_replay() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let (table, batch) = partitioned_stage_fixture(&root).await?;
+        let entries = vec![(batch.clone(), "first".into(), 0, 10), (batch, "second".into(), 0, 10)];
+        let group = table
+            .stage_coalesced_publications_with_file_policy(entries.clone(), 3, 3)
+            .await?;
+        assert_eq!(
+            group.appends.iter().map(|append| append.file.rows).collect::<Vec<_>>(),
+            [1, 1, 2, 1, 1]
+        );
+        let identities = group.identities.clone();
+        let mut rows = Vec::new();
+        for append in &group.appends {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(
+                &append.file.path,
+            )?)?;
+            for decoded in reader.build()? {
+                let decoded = decoded?;
+                let ids = decoded
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .context("id array")?;
+                rows.extend_from_slice(ids.values());
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, [1, 1, 2, 2, 3, 3]);
+        let result = table.submit_prepared_group(group, true).await?.wait().await?;
+        assert_eq!(result.version, 1);
+        assert_eq!(result.files.len(), 5);
+        let actions = std::fs::read_to_string(root.join("_delta_log/00000000000000000001.json"))?;
+        assert_eq!(actions.lines().filter(|line| line.contains("\"add\":")).count(), 5);
+        let replay = table
+            .stage_coalesced_publications_with_file_policy(entries, 3, 3)
+            .await?;
+        assert!(replay.appends.is_empty());
+        assert!(replay.identities.is_empty());
+        assert_eq!(replay.committed_identities, identities);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_coalesced_files_reject_cap_before_staging() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let schema = input()?.schema();
+        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid test path"))?;
+        DeltaTable::open_catalog(url)?.commit_catalog(
+            None,
+            Arc::clone(&schema),
+            Vec::new(),
+            Default::default(),
+            None,
+        )?;
+        let table = BatchedTable::open(
+            &root,
+            CommitOptions {
+                max_files_per_commit: 2,
+                ..CommitOptions::default()
+            },
+        )
+        .await?;
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))])?;
+        let error = table
+            .stage_coalesced_publications_with_file_policy(vec![(batch, "split".into(), 0, 10)], 2, 3)
+            .await
+            .err()
+            .context("file cap must reject the split")?;
+        assert!(matches!(
+            error.downcast_ref::<CommitReceiptError>(),
+            Some(CommitReceiptError::GroupCapacityExceeded {
+                required_files: 3,
+                max_files: 2
+            })
+        ));
+        assert!(
+            !std::fs::read_dir(&root)?
+                .any(|entry| entry.is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet")))
+        );
         Ok(())
     }
 
