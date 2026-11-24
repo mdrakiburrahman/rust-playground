@@ -483,14 +483,18 @@ fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<(
     }
     for (enabled, requested, startup_path, effective_path, policy_path) in [
         (
-            settings.operations.contains(&arrowcol_tunables::MaintenanceOperation::Checkpoint),
+            settings.operations.as_ref().is_some_and(|operations| {
+                operations.contains(&arrowcol_tunables::MaintenanceOperation::Checkpoint)
+            }),
             settings.checkpoint_every_commits,
             "/startup/checkpoint_every_commits",
             "/operation_settings/checkpoint_every_commits",
             "/table_policy/delta.checkpointInterval",
         ),
         (
-            settings.operations.contains(&arrowcol_tunables::MaintenanceOperation::Optimize),
+            settings.operations.as_ref().is_some_and(|operations| {
+                operations.contains(&arrowcol_tunables::MaintenanceOperation::Optimize)
+            }),
             settings
                 .target_file_mib
                 .map(|value| value.checked_mul(1024 * 1024).context("maintenance target file size overflow"))
