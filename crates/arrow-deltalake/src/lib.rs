@@ -61,15 +61,66 @@ pub enum TxnLookupMode {
     #[default]
     Batched,
     BatchedCached,
+    /// Maintains a complete in-memory transaction index advanced from new log tails.
+    Incremental,
 }
 
 impl<'de> serde::Deserialize<'de> for TxnLookupMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const EXPECTED: &str = "collector.commit.txn_lookup_mode must be per_id, batched, or batched_cached";
+        const EXPECTED: &str =
+            "collector.commit.txn_lookup_mode must be per_id, batched, batched_cached, or incremental";
         match String::deserialize(deserializer).as_deref() {
             Ok("per_id") => Ok(Self::PerId),
             Ok("batched") => Ok(Self::Batched),
             Ok("batched_cached") => Ok(Self::BatchedCached),
+            Ok("incremental") => Ok(Self::Incremental),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// How the commit owner refreshes its cached Delta snapshot between commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCacheMode {
+    /// Reuses local snapshots only while the log holds plain commit JSON.
+    #[default]
+    JsonOnly,
+    /// Also reuses snapshots across checkpoints, and on object stores.
+    CheckpointAware,
+}
+
+impl<'de> serde::Deserialize<'de> for SnapshotCacheMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.snapshot_cache_mode must be json_only or checkpoint_aware";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("json_only") => Ok(Self::JsonOnly),
+            Ok("checkpoint_aware") => Ok(Self::CheckpointAware),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// Who writes Delta checkpoints for a collector-owned table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointMode {
+    /// Leaves checkpoints to the maintenance service.
+    #[default]
+    External,
+    /// Checkpoints on the commit thread after every interval of commits.
+    Inline,
+    /// Checkpoints on a dedicated thread, coalescing requests while one runs.
+    Async,
+}
+
+impl<'de> serde::Deserialize<'de> for CheckpointMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.checkpoint_mode must be external, inline, or async";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("external") => Ok(Self::External),
+            Ok("inline") => Ok(Self::Inline),
+            Ok("async") => Ok(Self::Async),
             _ => Err(serde::de::Error::custom(EXPECTED)),
         }
     }
