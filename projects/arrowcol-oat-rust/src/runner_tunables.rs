@@ -302,8 +302,10 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             };
             if tables_covered
                 && table_policies.iter().all(|policy| {
-                    policy["config"]["enabled"] == true
-                        && policy["config"][observed_field] == *requested
+                    policy["parquet_properties"].get(requested_field).map_or_else(
+                        || policy["config"]["enabled"] == true && policy["config"][observed_field] == *requested,
+                        |actual| actual == requested,
+                    )
                 })
             {
                 promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
