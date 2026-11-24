@@ -37,6 +37,9 @@ if (kind === 'control') {
   grid('rows-target', [262144, 1048576, 2000000], [8388608, 33554432, 134217728],
     (x, y) => ({ BWA_MRPF: x, BWA_TARGET: y }));
   grid('capacity-flush', [4, 8, 16], [4, 12, 32], (x, y) => ({ ...capacity(Number(x)), BWA_MCF: y }));
+  grid('capacity-handoff', [4, 8, 16], [0, 4, 16], (x, y) => ({
+    ...capacity(Number(x)), ARROWCOL_COLLECTOR_BATCHING_CONFIG: JSON.stringify({ max_pending_commit_bytes: Number(y) * 1e9 }),
+  }));
   grid('capacity-stage', [4, 8, 16], [1, 4, 8], (x, y) => ({ ...capacity(Number(x)), BWA_SFC: y }));
   grid('cpu-blocking', [4, 12, 24], [16, 48, 128], (x, y) =>
     ({ ARROWCOL_COLLECTOR_CPU_WORKERS: x, ARROWCOL_COLLECTOR_BLOCKING_WORKERS: y }));

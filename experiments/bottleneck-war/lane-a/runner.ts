@@ -5,7 +5,6 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createServer } from 'node:net';
-import { pathToFileURL } from 'node:url';
 import { snapshot, difference, proc, procDifference, clientMetrics } from './measure.js';
 
 type Cell = { id: string; grid: string; x: string; y: string; env: Record<string, string> };
@@ -175,7 +174,7 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
       env, path.join(run, 'ddl.log'), kcpus);
     if (await ddl.done !== 0) throw new Error(`DDL failed: ${fs.readFileSync(ddl.log, 'utf8').slice(-700)}`);
     const maintenance = env.BWA_CHECKPOINT_EVERY_COMMITS ? start(path.join(bin, 'delta-maintenance'), [
-      '--root', pathToFileURL(root + path.sep).href, '--operation', 'checkpoint', '--apply',
+      '--catalog-endpoint', 'http://127.0.0.1:8817', '--operation', 'checkpoint', '--apply',
       '--interval-secs', '1', '--max-idle-backoff-secs', '1',
       '--checkpoint-every-commits', String(positive(env, 'BWA_CHECKPOINT_EVERY_COMMITS', 5, 100000)),
       '--no-metrics-listener',
@@ -245,12 +244,14 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     const startup = fs.readFileSync(collector.log, 'utf8').split('\n')
       .filter((line) => line.startsWith('arrowcol_effective_config '))
       .map((line) => JSON.parse(line.slice('arrowcol_effective_config '.length)));
-    valid = clientErrors === 0;
+    const checkpointMissing = maintenance !== null && stats.checkpoints === 0;
+    valid = clientErrors === 0 && !checkpointMissing;
     result = {
-      ...metadata, status: clientErrors ? 'invalid_client_errors' : 'ok',
-      committed_rps: clientErrors || diagnostic ? null : stats.committed_rps,
+      ...metadata, status: clientErrors ? 'invalid_client_errors' : checkpointMissing ? 'checkpoint_not_exercised' : 'ok',
+      committed_rps: !valid || diagnostic ? null : stats.committed_rps,
       diagnostic_rps: diagnostic && !clientErrors ? admitted / plan.duration : null,
       comment: clientErrors ? 'Client errors or ambiguous outcomes: see raw stats' :
+        checkpointMissing ? 'Requested checkpoint service produced no checkpoint files; raw Delta rate is not a checkpoint treatment' :
         diagnostic ? 'Diagnostic discard path: not admission, durability or production throughput' :
           observationErrors.length ? 'Some admin telemetry unavailable; Delta boundary evidence and process counters retained' : null,
       admitted_rps: diagnostic ? null : admitted / plan.duration,
