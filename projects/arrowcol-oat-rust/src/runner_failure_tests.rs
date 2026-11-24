@@ -958,10 +958,13 @@ mod offline_finalization_tests {
         let capture = format!("{}/custody/{CELL}/terminal_capture.json", inventory.evidence_destination.as_ref().context("missing evidence destination")?.blob_prefix);
         let summary = ShutdownTerminalPodSummary { pod_name: "collector-0".into(), pod_uid: "replacement-pod".into(),
             container: config.dfe_container.clone(), restart_count: 0, exit_code: 0,
-            summary: ShutdownTerminalSummary { schema_version: 1, admitted: 1, committed: 1, failed: 0,
+            summary: ShutdownTerminalSummary { schema_version: 2, admitted: 1, committed: 1, failed: 0,
                 cancelled_ambiguous: 0, pending: 0, committed_rows: 300, incomplete: 0,
                 commits: vec![ShutdownTerminalCommit { table_id: fixture_sha256(format!("{ROOT}/telemetry/sqlserver/{}/", config.tables[0]).as_bytes()),
-                    version: 0, rows: 300, files: 1, parquet_bytes: 900 }] } };
+                    version: 0, rows: 300, files: 1, parquet_bytes: 900 }],
+                publication_evidence: vec![ShutdownTerminalPublicationCall { clean: true, reasons: Vec::new(),
+                    outcomes: vec![ShutdownTerminalPublicationOutcome { app_id: "offline-client".into(), app_version: 42,
+                        status: "committed_now".into(), delta_version: Some(0), reason: None }] }] } };
         let inputs = ShutdownFinalizationInputs { schema_version: 1, inventory_etag: "\"inventory\"".into(),
             terminal_capture: Some(reference(capture)), delta_before: Some(reference(format!("{prefix}/delta-before.json"))),
             delta_terminal: Some(reference(format!("{prefix}/delta-terminal.json"))),
