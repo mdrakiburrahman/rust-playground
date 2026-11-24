@@ -21,6 +21,11 @@ mod fixture_setup_tests {
                     maintenance_stop_timeout_ms: 5_100_000,
                 },
                 planned_cell_duration_ms: 0,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 120_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS,
+                },
             },
         )?;
         inventory.fic = Some(serde_json::from_value(json!({

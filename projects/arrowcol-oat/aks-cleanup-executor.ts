@@ -8,7 +8,7 @@ import { DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, publishCleanupRunInv
   type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
 import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
-import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, withCleanupDeadline } from './aks-cleanup-budget.js';
+import { ADMISSION_STOP_BUDGET_MS, drainBudgetMs, TERMINAL_CAPTURE_BUDGET_MS, withCleanupDeadline } from './aks-cleanup-budget.js';
 import { MAINTENANCE_STOP_TIMEOUT_CEILING_MS, type EffectiveStopBudgets } from './stop-budgets.js';
 
 export type CleanupActionResult = 'pending' | 'complete' | 'uncertain';
@@ -210,7 +210,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       case 'stop-admission':
         return runAction('stop_admission', deadline => actions.stopAdmission(inventory, deadline!, idempotencyKey, authority), ADMISSION_STOP_BUDGET_MS);
       case 'bounded-drain':
-        return runAction('bounded_drain', deadline => actions.boundedDrain(inventory, deadline!, idempotencyKey, authority), DRAIN_BUDGET_MS);
+        return runAction('bounded_drain', deadline => actions.boundedDrain(inventory, deadline!, idempotencyKey, authority), drainBudgetMs(inventory));
       case 'preserve-evidence':
         return runAction('evidence_capture', () => actions.preserveEvidence(inventory, idempotencyKey, authority));
       case 'stop-maintenance': {

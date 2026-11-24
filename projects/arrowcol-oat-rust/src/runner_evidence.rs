@@ -251,6 +251,11 @@ mod official_cell_measurement_tests {
             CampaignCellBudget {
                 effective_stop_budgets: config.maintenance_stop_budget()?,
                 planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: config.platform.aks_drain_budget_ms,
+                    collector_grace_ms: config.collector_stop_grace_seconds * 1_000,
+                    pre_stop_capture_margin_ms: crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS,
+                },
             },
         )?;
         let mut rows = result_rows(&config, &inventory.orchestration_run_id, cell, 1, 1, CellMeasurements {
