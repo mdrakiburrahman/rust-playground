@@ -117,6 +117,7 @@ fn effective_configuration_is_reported_with_protected_partition_debt() -> Result
     let table = event("arrowcol_maintenance_table_config ")?;
     assert_eq!(startup["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(startup["startup"]["input_read_strategy"], "spool");
+    assert_eq!(startup["startup"]["input_prefetch_files"], 1);
     assert_eq!(table["table"], "events");
     assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
@@ -141,6 +142,33 @@ fn effective_configuration_is_reported_with_protected_partition_debt() -> Result
         .args(["--operation", "optimize", "--input-read-strategy", "invalid"])
         .output()?;
     assert!(!invalid.status.success());
+    Ok(())
+}
+
+#[test]
+fn oat_prefetch_reaches_optimize_without_overriding_input_strategy() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    table(&root.path().join("events"))?;
+    let maintenance_env = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+        "maintenance": {"enabled": true, "operations": ["optimize"], "input_prefetch_files": 2}
+    }))?
+    .environment_for(arrowcol_tunables::ComponentRole::Maintenance)?;
+    for strategy in ["spool", "range"] {
+        let rejected = service(root.path())?
+            .envs(&maintenance_env)
+            .args(["--operation", "optimize", "--input-read-strategy", strategy])
+            .output()?;
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires memory input_read_strategy"));
+    }
+    let applied = service(root.path())?
+        .envs(&maintenance_env)
+        .args(["--operation", "optimize", "--apply"])
+        .output()?;
+    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+    let result = &lines(&applied.stdout)?[0];
+    assert_eq!(result["optimize"]["config"]["input_prefetch_files"], 2);
+    assert!(result["report"]["files_added"].as_u64().context("files added")? > 0);
     Ok(())
 }
 
