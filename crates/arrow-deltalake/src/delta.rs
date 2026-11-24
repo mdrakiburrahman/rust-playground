@@ -5271,10 +5271,12 @@ impl DeltaTable {
         groups: &[CoalescedCommitGroup],
     ) -> TimedCommitResult {
         let mut observation = crate::telemetry::PublicationObservation::start();
+        let mut lock_timer = crate::telemetry::PublicationLockTimer::start();
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
+        lock_timer.acquired();
         let started = Instant::now();
         for attempt in 0..8 {
             observation.event("attempt");
