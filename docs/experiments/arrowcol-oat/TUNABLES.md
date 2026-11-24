@@ -382,6 +382,16 @@ Short admission/smoke runs remain supported; duration below a flush timer alone
 does not make a configuration invalid. Increase the measurement window when
 evaluating sustained durable output, and report the changed duration explicitly.
 
+## Measurement window
+
+| Setting | Contract |
+| --- | --- |
+| `warmup_seconds` | Unsigned 64-bit integer whole seconds, `0..=300`. |
+| `measure_seconds` | Unsigned 64-bit integer whole seconds. Local non-pilot: `1..=1800`. AKS: `1..=600`. Pilot: a multiple of 30 from 60 to 600, with warm-up plus measurement at most 600. |
+| Run budget | `run_pin_ttl_ms` must cover the client schedule wait, warm-up, measurement, client stop grace, pin setup, catalog registration, settle, collector stop grace and QAP timeout. A longer window may need a larger TTL; validation rejects any TTL below that budget. |
+| `arrowcol-dmv` | `--duration-secs` accepts up to 1,800; pilot mode still accepts only 60 to 600. |
+| Launcher deadline | `launch.ts --deadline-seconds` caps the whole invocation at 600 seconds; omit it for longer windows. |
+
 ## Collector runtime compatibility
 
 | Setting | Contract |

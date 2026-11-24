@@ -5,6 +5,8 @@ use clap::Parser;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_SCHEDULE_TIMEOUT_SECS: u64 = 2_160;
+// OAT keeps AKS and pilot runs at 600 seconds; only local non-pilot runs use the longer window.
+const MAX_DURATION_SECS: u64 = 1_800;
 
 #[derive(Parser)]
 #[command(about = "Generate deterministic DMV Arrow batches and upload them to ArrowCol")]
@@ -91,16 +93,9 @@ fn main() -> Result<()> {
         .block_on(run(args))
 }
 
-async fn run(args: Args) -> Result<()> {
-    if args.duration_secs > 600 || args.warmup_secs > 300 {
-        anyhow::bail!("duration_secs must be at most 600 and warmup_secs at most 300");
-    }
-    validate_schedule_timeout(args.schedule_timeout_secs)?;
-    if args.duration_secs > 0 && args.schedule_file.is_some() == args.run_start_unix_ms.is_some() {
-        anyhow::bail!("duration-based clients require exactly one of --schedule-file or --run-start-unix-ms");
-    }
-    if args.duration_secs == 0 && args.warmup_secs > 0 {
-        anyhow::bail!("warmup-secs requires a positive duration-secs");
+fn validate_window(args: &Args) -> Result<()> {
+    if args.duration_secs > MAX_DURATION_SECS || args.warmup_secs > 300 {
+        anyhow::bail!("duration_secs must be at most {MAX_DURATION_SECS} and warmup_secs at most 300");
     }
     if args.pilot
         && (!(60..=600).contains(&args.duration_secs)
@@ -110,6 +105,18 @@ async fn run(args: Args) -> Result<()> {
         anyhow::bail!(
             "pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
         );
+    }
+    Ok(())
+}
+
+async fn run(args: Args) -> Result<()> {
+    validate_window(&args)?;
+    validate_schedule_timeout(args.schedule_timeout_secs)?;
+    if args.duration_secs > 0 && args.schedule_file.is_some() == args.run_start_unix_ms.is_some() {
+        anyhow::bail!("duration-based clients require exactly one of --schedule-file or --run-start-unix-ms");
+    }
+    if args.duration_secs == 0 && args.warmup_secs > 0 {
+        anyhow::bail!("warmup-secs requires a positive duration-secs");
     }
     let options = args.tuning.clone();
     println!("OAT_CLIENT_EFFECTIVE_CONFIG {}", serde_json::to_string(&options)?);
@@ -300,9 +307,28 @@ async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>)
 mod tests {
     use super::{
         Args, MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_concurrency, validate_schedule_timeout,
-        wait_until_unix_ms,
+        validate_window, wait_until_unix_ms,
     };
     use clap::Parser;
+
+    #[test]
+    fn only_non_pilot_clients_accept_windows_up_to_thirty_minutes() -> anyhow::Result<()> {
+        let window = |extra: &[&str]| {
+            Args::try_parse_from(
+                ["test", "--endpoint", "http://localhost"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .map_err(anyhow::Error::from)
+            .and_then(|args| validate_window(&args))
+        };
+        window(&["--duration-secs", "1200"])?;
+        window(&["--duration-secs", "1800", "--warmup-secs", "300"])?;
+        assert!(window(&["--duration-secs", "1801"]).is_err());
+        window(&["--pilot", "--duration-secs", "600"])?;
+        assert!(window(&["--pilot", "--duration-secs", "630"]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn explicit_legacy_concurrency_conflicts_with_explicit_streams() -> anyhow::Result<()> {
