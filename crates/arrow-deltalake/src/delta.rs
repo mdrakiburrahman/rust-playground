@@ -4924,6 +4924,7 @@ impl DeltaTable {
                 if let Some(previous) = previous
                     && previous == version
                 {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     committed_identities.push((identity, version, stamp));
                     continue;
                 }
@@ -5491,6 +5492,7 @@ impl DeltaTable {
         for attempt in 0..8 {
             if attempt != 0 {
                 evidence.mark(PublicationReason::Retry);
+                crate::telemetry::mark_terminal_commit_incomplete();
             }
             for outcome in evidence.outcomes.values_mut() {
                 *outcome = PublicationOutcome::Unknown(PublicationReason::NotSubmitted);
@@ -5524,6 +5526,7 @@ impl DeltaTable {
                 }
                 if previous == version {
                     replay(app_id, version, evidence);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     self.sync_replayed_local_state(snapshot.version())
                         .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                     observation.finish("deduplicated");
@@ -5567,12 +5570,14 @@ impl DeltaTable {
                 }
                 if committed != 0 && committed != group.identities.len() {
                     evidence.fail(PublicationReason::PartialGroup);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     return Err(anyhow::Error::new(PartialPublicationGroup {
                         committed,
                         total: group.identities.len(),
                     }));
                 }
                 if committed == group.identities.len() {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     skipped.extend(group.start..group.end);
                     continue;
                 }
@@ -5607,6 +5612,7 @@ impl DeltaTable {
                         }
                         if previous == *version {
                             replay(app_id, *version, evidence);
+                            crate::telemetry::mark_terminal_commit_incomplete();
                             continue;
                         }
                     }
@@ -5622,6 +5628,7 @@ impl DeltaTable {
             }
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
                 evidence.mark(PublicationReason::Deduplicated);
+                crate::telemetry::mark_terminal_commit_incomplete();
                 self.sync_replayed_local_state(snapshot.version())
                     .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                 observation.finish("deduplicated");
@@ -5728,6 +5735,7 @@ impl DeltaTable {
                     .all(|(append, index)| append.publication.is_some() || group_pending_indices.contains(index));
             if !identifiable {
                 evidence.mark(PublicationReason::Unidentifiable);
+                crate::telemetry::mark_terminal_commit_incomplete();
             }
             let submitted = group_transaction_ids
                 .iter()
@@ -5804,8 +5812,18 @@ impl DeltaTable {
                 .collect();
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
-                    sync_directory(&self.root).inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
+                    sync_directory(&self.root).inspect_err(|_| {
+                        evidence.fail(PublicationReason::SyncFailed);
+                        crate::telemetry::mark_terminal_commit_incomplete();
+                    })?;
                     let version = commit.commit_version();
+                    crate::telemetry::record_terminal_commit(
+                        &table_id,
+                        version,
+                        rows,
+                        files_count,
+                        parquet_bytes,
+                    );
                     for &(id, v) in &submitted {
                         evidence
                             .outcomes
@@ -5835,10 +5853,12 @@ impl DeltaTable {
                 }
                 Ok(CommitResult::Conflicted(_)) => {
                     evidence.mark(PublicationReason::Conflict);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     observation.event("conflict");
                 }
                 Ok(CommitResult::Retryable(retry)) => {
                     evidence.mark(PublicationReason::RetryableIo);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
@@ -5852,6 +5872,7 @@ impl DeltaTable {
                 }
                 Err(error) => {
                     evidence.mark(PublicationReason::Error);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     // Kernel can surface post-publication I/O as Err, not only Retryable.
                     // A proven transaction is success; an unreadable outcome stays an error.
                     if identifiable && let Some(version) = reconcile(evidence)? {
