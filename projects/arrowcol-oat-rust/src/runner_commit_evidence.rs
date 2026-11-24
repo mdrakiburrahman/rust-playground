@@ -37,6 +37,34 @@ fn percentile(values: &[f64], percentile: usize) -> Option<f64> {
     values.get(index).copied()
 }
 
+fn commit_rate_resolution(mut commits: Vec<(u64, u64, u64)>, window_seconds: f64) -> Result<Value> {
+    commits.sort_unstable();
+    let max_rows = commits.iter().map(|(_, _, rows)| *rows).max();
+    let mut cumulative = 0_u64;
+    let origin = commits.first().map_or(0, |(time, _, _)| *time);
+    let mut points = Vec::with_capacity(commits.len());
+    for (time, _, rows) in &commits {
+        cumulative = cumulative.checked_add(*rows).context("commit resolution row overflow")?;
+        points.push(((*time - origin) as f64 / 1000.0, cumulative as f64));
+    }
+    let slope = if points.len() >= 3 {
+        let count = points.len() as f64;
+        let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / count;
+        let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / count;
+        let numerator = points.iter().map(|(x, y)| (x - mean_x) * (y - mean_y)).sum::<f64>();
+        let denominator = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum::<f64>();
+        (denominator > 0.0).then(|| numerator / denominator)
+    } else {
+        None
+    };
+    Ok(json!({
+        "window_commit_count": commits.len(),
+        "max_commit_rows": max_rows,
+        "rate_resolution_rows_per_second": max_rows.map(|rows| rows as f64 / window_seconds),
+        "slope_rows_per_second": slope,
+    }))
+}
+
 fn canonical_dmv_table_name(table: &str) -> Result<String> {
     let definitions = collector_chain::dmv::tables()?;
     let definition = definitions
@@ -70,6 +98,8 @@ fn commit_window_output(
         "measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": seconds,
         "clock": "collector_system_unix_ms_shared_schedule_clock_skew_not_measured",
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null, "rows_per_second": null,
+        "window_commit_count": null, "max_commit_rows": null,
+        "rate_resolution_rows_per_second": null, "slope_rows_per_second": null,
         "input_bytes_per_second": null, "parquet_bytes_per_second": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
         "unique_delivered_rows": null, "complete_delivery_established": false,
@@ -85,6 +115,7 @@ fn commit_window_output(
     let mut input_bytes = 0_u64;
     let mut parquet_bytes = 0_u64;
     let mut latencies = Vec::new();
+    let mut resolution_commits = Vec::new();
     for event in events
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
@@ -130,7 +161,10 @@ fn commit_window_output(
             .checked_add(event_bytes)
             .context("commit output byte overflow")?;
         latencies.push(elapsed);
+        resolution_commits.push((finished, event.delta_version.context("commit version unavailable")?, event_rows));
     }
+    result.as_object_mut().context("commit window is not an object")?
+        .extend(commit_rate_resolution(resolution_commits, seconds)?.as_object().context("invalid resolution")?.clone());
     latencies.sort_by(f64::total_cmp);
     result["rows"] = json!(rows);
     result["files"] = json!(files);
@@ -808,8 +842,14 @@ fn unavailable_local_delta_reconciliation(reason: impl Into<String>) -> Value {
     json!({
         "version": 1, "status": "unavailable", "reconciliation_state": "unavailable",
         "unavailable_reason": reason, "csv_reason": format!("reconciliation unavailable: {reason}"),
+        "observed": {
+            "window_commit_count": null, "max_commit_rows": null,
+            "rate_resolution_rows_per_second": null, "slope_rows_per_second": null,
+        },
         "csv": {
             "started_utc": null, "ended_utc": null, "durable_rows_per_s": null,
+            "window_commit_count": null, "max_commit_rows": null,
+            "rate_resolution_rows_per_second": null, "slope_rows_per_second": null,
             "durable_rows": null, "committed_add_actions": null, "bytes_per_row": null,
             "compression_ratio": null, "latency_p50_ms": null, "latency_p99_ms": null,
             "files_written": null, "commits_written": null,
@@ -1000,9 +1040,14 @@ fn reconcile_local_delta_log_inner(delta_log: &Path, durable: &Value) -> Result<
     let bytes_per_row = (observed_rows > 0).then_some(observed_bytes as f64 / observed_rows as f64);
     let input_bytes = receipt_totals["input_bytes"].as_u64().unwrap_or_default();
     let compression_ratio = (observed_bytes > 0).then_some(input_bytes as f64 / observed_bytes as f64);
+    let resolution = commit_rate_resolution(selected.iter()
+        .map(|receipt| (receipt.finished_at_unix_ms, receipt.version, receipt.rows)).collect(), window_seconds)?;
     let csv = json!({
         "started_utc": start_utc, "ended_utc": end_utc,
         "durable_rows_per_s": observed_rows as f64 / window_seconds, "durable_rows": observed_rows,
+        "window_commit_count": resolution["window_commit_count"], "max_commit_rows": resolution["max_commit_rows"],
+        "rate_resolution_rows_per_second": resolution["rate_resolution_rows_per_second"],
+        "slope_rows_per_second": resolution["slope_rows_per_second"],
         "committed_add_actions": observed_files, "bytes_per_row": bytes_per_row,
         "compression_ratio": compression_ratio, "latency_p50_ms": p50, "latency_p99_ms": p99,
         "files_written": observed_files, "commits_written": selected.len(),
@@ -1017,6 +1062,9 @@ fn reconcile_local_delta_log_inner(delta_log: &Path, durable: &Value) -> Result<
         "observed": {
             "durable_rows": observed_rows, "committed_add_actions": observed_files, "parquet_bytes": observed_bytes,
             "durable_rows_per_s": observed_rows as f64 / window_seconds, "bytes_per_row": bytes_per_row,
+            "window_commit_count": resolution["window_commit_count"], "max_commit_rows": resolution["max_commit_rows"],
+            "rate_resolution_rows_per_second": resolution["rate_resolution_rows_per_second"],
+            "slope_rows_per_second": resolution["slope_rows_per_second"],
             "compression_ratio": compression_ratio,
             "ingest_to_commit_oldest_row_ms": {"p50": p50, "p99": p99, "commits": selected.len()},
             "ingest_to_commit_newest_row_ms": {"p50": newest_p50, "p99": newest_p99},
@@ -1182,6 +1230,10 @@ mod local_delta_reconciliation_tests {
         assert_eq!(result["observed"]["committed_add_actions"], 2);
         assert_eq!(result["csv"]["durable_rows"], 15);
         assert_eq!(result["csv"]["commits_written"], 2);
+        assert_eq!(result["csv"]["window_commit_count"], 2);
+        assert_eq!(result["csv"]["max_commit_rows"], 10);
+        assert_eq!(result["csv"]["rate_resolution_rows_per_second"], json!(10.0 / 108.0));
+        assert!(result["csv"]["slope_rows_per_second"].is_null());
         assert_eq!(result["csv"]["latency_p50_ms"], 5);
         assert_eq!(result["csv"]["latency_p99_ms"], 10);
         assert_eq!(result["interleaved_maintenance"]["OPTIMIZE"], 1);
@@ -1193,7 +1245,8 @@ mod local_delta_reconciliation_tests {
         let missing = TestDirectory::new()?;
         write_version(missing.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 10, 300, true)])?;
         write_version(missing.path(), 3, "WRITE", 1_050, &[add("part-3.parquet", 5, 100, true)])?;
-        assert_eq!(reconcile_local_delta_log(missing.path(), &evidence())["status"], "unavailable");
+        let unavailable = reconcile_local_delta_log(missing.path(), &evidence());
+        assert_eq!(unavailable["status"], "unavailable");
 
         let mismatch = TestDirectory::new()?;
         write_version(mismatch.path(), 1, "WRITE", 1_010, &[add("part-1.parquet", 9, 300, true)])?;
@@ -1202,10 +1255,61 @@ mod local_delta_reconciliation_tests {
         let result = reconcile_local_delta_log(mismatch.path(), &evidence());
         assert_eq!(result["status"], "mismatch");
         assert!(result["csv"]["durable_rows"].is_null());
+        for value in [&unavailable, &result] {
+            for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+                assert!(value["csv"][field].is_null(), "{field}");
+                assert!(value["observed"][field].is_null(), "{field}");
+            }
+        }
 
         let mut bad_window_totals = evidence();
         bad_window_totals["output_throughput"]["rows"] = json!(16);
         assert_eq!(reconcile_local_delta_log(mismatch.path(), &bad_window_totals)["status"], "mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn local_resolution_uses_selected_receipts_and_copies_screen_evidence() -> Result<()> {
+        for count in 0..=3_u64 {
+            let directory = TestDirectory::new()?;
+            let mut receipts = Vec::new();
+            for index in 0..count {
+                let version = index + 1;
+                let rows = version * 10;
+                let finish = 1_010 + index * 1_000;
+                let path = format!("part-{version}.parquet");
+                write_version(directory.path(), version, "WRITE", finish, &[add(&path, rows, 100, true)])?;
+                receipts.push(receipt(version, rows, 1, (200, 100), (1_000, 1_001), finish));
+            }
+            let total_rows = count * (count + 1) * 5;
+            let durable = json!({
+                "output_throughput": {"measurement_start_unix_ms":1_000, "measurement_end_unix_ms":109_000,
+                    "rows":total_rows, "files":count, "input_bytes":count * 200, "parquet_bytes":count * 100},
+                "run_cumulative_output":{"commits_by_version":receipts},
+            });
+            let result = reconcile_local_delta_log(directory.path(), &durable);
+            assert_eq!(result["status"], "matched");
+            let mut output = json!({"durable_commits": {}});
+            copy_local_delta_reconciliation(&mut output, &result);
+            assert_eq!(output["screen_v1"], result["csv"]);
+            for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+                assert_eq!(result["csv"][field], result["observed"][field], "{field}");
+            }
+            assert_eq!(result["csv"]["window_commit_count"], count);
+            if count == 0 {
+                assert!(result["csv"]["max_commit_rows"].is_null());
+                assert!(result["csv"]["rate_resolution_rows_per_second"].is_null());
+            } else {
+                assert_eq!(result["csv"]["max_commit_rows"], count * 10);
+                assert_eq!(result["csv"]["rate_resolution_rows_per_second"], json!((count * 10) as f64 / 108.0));
+            }
+            if count < 3 {
+                assert!(result["csv"]["slope_rows_per_second"].is_null());
+            } else {
+                assert_eq!(result["csv"]["slope_rows_per_second"], 25.0);
+                println!("resolution_fixture={}", json!({"screen_v1": output["screen_v1"], "observed": result["observed"]}));
+            }
+        }
         Ok(())
     }
 
@@ -1571,6 +1675,9 @@ mod commit_evidence_tests {
         );
         assert_eq!(evidence["ranking_eligible"], false);
         assert!(evidence["ranking_metrics"].is_null());
+        assert_eq!(evidence["commit_window_output_throughput"], evidence["durable_commits"]["output_throughput"]);
+        assert!(evidence["screen_v1"].is_null());
+        assert_eq!(evidence["screen_v1_csv_reason"], "cell_failed");
         Ok(())
     }
 
@@ -1817,6 +1924,44 @@ mod commit_evidence_tests {
         assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
         assert!(windows[0]["rows"].is_null());
         assert_eq!(windows[0]["unavailable_reason"], "collector_commit_log_incomplete");
+        for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+            assert!(windows[0][field].is_null(), "{field}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn commit_window_resolution_uses_finish_times_and_half_open_selection() -> Result<()> {
+        let config = config()?;
+        let mut events = Vec::new();
+        for index in 0..3 {
+            let mut commit = event(&config, 1000, 1001)?;
+            commit["delta_version"] = json!(index + 1);
+            commit["finished_at_unix_ms"] = json!(1_000 + index * 1_000);
+            commit["rows"] = json!((index + 1) * 10);
+            events.push(commit);
+        }
+        for count in 0..=3 {
+            let evidence = durable_commit_evidence(&config, &[log(&events[..count])], Some((1_000, 31_000)))?;
+            let window = &evidence[&config.tables[0]]["output_throughput"];
+            assert_eq!(window["window_commit_count"], count);
+            assert_eq!(window["commits"], count);
+            assert_eq!(window["rows_per_second"], json!((count * (count + 1) * 5) as f64 / 30.0));
+            if count == 0 {
+                assert!(window["max_commit_rows"].is_null());
+                assert!(window["rate_resolution_rows_per_second"].is_null());
+            } else {
+                assert_eq!(window["max_commit_rows"], count * 10);
+                assert_eq!(window["rate_resolution_rows_per_second"], json!((count * 10) as f64 / 30.0));
+            }
+            if count < 3 {
+                assert!(window["slope_rows_per_second"].is_null());
+            } else {
+                assert_eq!(window["slope_rows_per_second"], 25.0);
+            }
+        }
+        let coincident = commit_rate_resolution(vec![(1000, 1, 10), (1000, 2, 20), (1000, 3, 30)], 30.0)?;
+        assert!(coincident["slope_rows_per_second"].is_null());
         Ok(())
     }
 }

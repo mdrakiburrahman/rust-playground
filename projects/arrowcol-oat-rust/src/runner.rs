@@ -4242,7 +4242,9 @@ fn attach_teardown_outcome(outcome: &mut MatrixOutcome, status: &str) -> Result<
         commits["run_cumulative_output"]["complete_delivery_established"] = json!(false);
         commits["run_cumulative_output"]["teardown_outcome"] = teardown.clone();
         if !commits["output_throughput"].is_object() {
-            commits["output_throughput"] = json!({"rows": null, "rows_per_second": null, "unavailable_reason": "measurement_window_evidence_unavailable"});
+            commits["output_throughput"] = json!({"rows": null, "rows_per_second": null,
+                "window_commit_count": null, "max_commit_rows": null, "rate_resolution_rows_per_second": null,
+                "slope_rows_per_second": null, "unavailable_reason": "measurement_window_evidence_unavailable"});
         }
         commits["output_throughput"]["teardown_outcome"] = teardown.clone();
         if let Some(windows) = commits["complete_30_second_commit_windows"].as_array_mut() {
@@ -4288,6 +4290,15 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
     Ok(())
 }
 
+fn copy_local_delta_reconciliation(evidence: &mut Value, reconciliation: &Value) {
+    if !evidence["durable_commits"].is_object() {
+        evidence["durable_commits"] = json!({});
+    }
+    evidence["durable_commits"]["delta_log_reconciliation"] = reconciliation.clone();
+    evidence["screen_v1"] = reconciliation["csv"].clone();
+    evidence["screen_v1_csv_reason"] = reconciliation["csv_reason"].clone();
+}
+
 fn attach_local_delta_reconciliation(
     config: &OatConfig,
     run_id: &str,
@@ -4315,12 +4326,7 @@ fn attach_local_delta_reconciliation(
         } else {
             unavailable_local_delta_reconciliation("snapshot_root_not_configured")
         };
-        if !evidence["durable_commits"].is_object() {
-            evidence["durable_commits"] = json!({});
-        }
-        evidence["durable_commits"]["delta_log_reconciliation"] = reconciliation.clone();
-        evidence["screen_v1"] = reconciliation["csv"].clone();
-        evidence["screen_v1_csv_reason"] = reconciliation["csv_reason"].clone();
+        copy_local_delta_reconciliation(&mut evidence, &reconciliation);
         if reconciliation["status"] == "mismatch" {
             row.status = "failed".to_owned();
             let failure = "local_delta_log_reconciliation_mismatch";
