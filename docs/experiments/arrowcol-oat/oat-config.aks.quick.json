@@ -9,6 +9,7 @@
   "warmup_seconds": 10,
   "measure_seconds": 30,
   "reconciliation_settle_timeout_seconds": 600,
+  "collector_stop_grace_seconds": 600,
   "client_ready_timeout_seconds": 600,
   "run_pin_ttl_ms": 3600000,
   "pilot_mode": false,
