@@ -303,6 +303,7 @@ mod initial_delta_tests {
                     "runner::initial_delta_tests::actual_local_initializer_receipt_probe",
                     "--ignored",
                     "--nocapture",
+                    "--format=terse",
                 ])
                 .env("OAT_DELTA_INITIALIZER_PROBE_ROOT", &root)
                 .output()?;
