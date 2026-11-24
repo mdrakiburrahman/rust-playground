@@ -60,11 +60,14 @@ requires distinct roles.
 `null` selects the writer default (gzip 6, brotli/zstd 1), or no level for a
 level-less codec. Reconciliation checks the physical codec of every selected
 column chunk in every row group. Parquet has **no standard compression-level
-field**. ArrowCol records `arrowcol.writer.codec_levels.v1` as file key-value
-metadata: a JSON array of `[codec, level-or-null]` pairs in physical leaf order,
+field**. For Delta ingestion and the explicit component evidence writer, ArrowCol appends
+`; arrowcol.writer.codec_levels.v2=` to the existing footer `created_by` string,
+followed by a JSON array of `[codec, level-or-null]` pairs in physical leaf order,
 derived from the final `WriterProperties` after base and column overrides. This
 is a writer declaration, not an independent measurement of encoder behavior.
-Compression runs require a matching declaration as well as the existing
+Standalone writers and files using only level-less codecs do not add the suffix.
+The file key-value map and decoded Arrow schema (including user metadata) are unchanged.
+Runs requesting a level require a matching declaration as well as the existing
 startup and pre-admission checks. Legacy files still have physical codec
 evidence, but cannot qualify a level. New footers change file sizes; compare
 bytes between worker modes at the same writer revision.

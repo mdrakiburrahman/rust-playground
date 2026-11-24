@@ -5085,7 +5085,7 @@ impl DeltaTable {
         fs::create_dir_all(&directory)?;
         let path = directory.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));
         let physical = Arc::new(context.physical_data_schema().as_ref().try_into_arrow()?);
-        let parquet = ParquetFileWriter::create_with_properties(path, physical, properties)?;
+        let parquet = ParquetFileWriter::create_with_codec_evidence(path, physical, properties)?;
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(DeltaFileWriter {
             mapping,

@@ -460,7 +460,7 @@ impl ParquetWriterConfig {
             "offset_index_enabled=false requires statistics=none or chunk for every column; page statistics force offset indexes"
         );
         self.verify_effective(&descriptor, &properties)?;
-        crate::footer::stamp(&descriptor, properties)
+        Ok(properties)
     }
 
     fn verify_effective(

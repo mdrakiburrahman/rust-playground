@@ -3,14 +3,15 @@ use anyhow::{Context, Result, ensure};
 use parquet::{
     basic::Compression,
     file::{
-        metadata::{KeyValue, ParquetMetaData},
+        metadata::ParquetMetaData,
         properties::{WriterProperties, WriterPropertiesBuilder},
     },
     schema::types::SchemaDescriptor,
 };
 use serde::Serialize;
 
-const KEY: &str = "arrowcol.writer.codec_levels.v1";
+// A valued file key-value would become user-visible Arrow Schema.metadata on read.
+const MARKER: &str = "; arrowcol.writer.codec_levels.v2=";
 
 pub(crate) fn codec(compression: Compression) -> (&'static str, Option<i64>) {
     match compression {
@@ -31,12 +32,20 @@ pub(crate) fn stamp(schema: &SchemaDescriptor, properties: WriterProperties) -> 
         .iter()
         .map(|c| codec(properties.compression(c.path())))
         .collect();
-    let mut entries = properties.key_value_metadata().cloned().unwrap_or_default();
-    // Never carry a stale declaration from the caller's base properties.
-    entries.retain(|entry| entry.key != KEY);
-    entries.push(KeyValue::new(KEY.into(), serde_json::to_string(&columns)?));
+    if columns.iter().all(|(_, level)| level.is_none()) {
+        return Ok(properties);
+    }
+    ensure!(
+        !properties.created_by().contains(MARKER),
+        "reserved writer codec marker already present"
+    );
+    let creator = format!(
+        "{}{MARKER}{}",
+        properties.created_by(),
+        serde_json::to_string(&columns)?
+    );
     Ok(WriterPropertiesBuilder::from(properties)
-        .set_key_value_metadata(Some(entries))
+        .set_created_by(creator)
         .build())
 }
 
@@ -71,11 +80,10 @@ impl FooterEvidence {
         let file = metadata.file_metadata();
         let width = file.schema_descr().num_columns();
         let entries = file.key_value_metadata().map(Vec::as_slice).unwrap_or_default();
-        let mut declarations = entries.iter().filter(|entry| entry.key == KEY);
-        let declared = declarations
-            .next()
-            .map(|entry| -> Result<Vec<(String, Option<i64>)>> {
-                let value = entry.value.as_ref().context("missing writer codec declaration value")?;
+        let declared = file
+            .created_by()
+            .and_then(|creator| creator.split_once(MARKER))
+            .map(|(_, value)| -> Result<Vec<(String, Option<i64>)>> {
                 // Canonical tuples contain only a fixed codec name and an integer or null.
                 ensure!(
                     value.len() <= 2 + width.saturating_mul(32),
@@ -88,9 +96,8 @@ impl FooterEvidence {
                 Ok(columns)
             })
             .transpose()?;
-        ensure!(declarations.next().is_none(), "duplicate writer codec declaration");
         let present = declared.is_some();
-        self.unrelated_key_value_entries += entries.len() - usize::from(present);
+        self.unrelated_key_value_entries += entries.len();
         for (row_group, group) in metadata.row_groups().iter().enumerate() {
             ensure!(group.num_columns() == width, "physical footer width differs");
             for (leaf, chunk) in group.columns().iter().enumerate() {
@@ -145,13 +152,24 @@ mod tests {
     #[test]
     fn real_footers_preserve_base_level_redact_and_fail_closed() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("i", DataType::Int32, false)],
+            [
+                ("arrowcol.writer.codec_levels.v1".into(), "owned-by-user".into()),
+                ("private-key".into(), "private-value".into()),
+            ]
+            .into(),
+        ));
         let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&schema)?;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from_iter_values(0..35))])?;
-        let read = |entries: Vec<KeyValue>, resolve: bool| -> Result<FooterEvidence> {
+        let read = |creator: &str, resolve: bool| -> Result<FooterEvidence> {
             let props = WriterProperties::builder()
                 .set_max_row_group_row_count(Some(1))
-                .set_key_value_metadata(Some(entries))
+                .set_created_by(creator.to_owned())
+                .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+                    "private-key".into(),
+                    "private-value".to_owned(),
+                )]))
                 .set_compression(Compression::ZSTD(ZstdLevel::try_new(8)?))
                 .build();
             let props = if resolve { stamp(&descriptor, props)? } else { props };
@@ -160,18 +178,15 @@ mod tests {
             writer.write(&batch)?;
             writer.close()?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+            assert!(
+                reader.schema().as_ref() == schema.as_ref(),
+                "decoded user schema changed"
+            );
             let mut evidence = FooterEvidence::default();
             evidence.observe(reader.metadata())?;
             Ok(evidence)
         };
-        let entry = |value: &str| KeyValue::new(KEY.into(), value.to_owned());
-        let evidence = read(
-            vec![
-                entry("stale"),
-                KeyValue::new("private-key".into(), "private-value".to_owned()),
-            ],
-            true,
-        )?;
+        let evidence = read("fixture", true)?;
         assert_eq!(evidence.files_with_writer_declaration, 1);
         assert_eq!(evidence.unrelated_key_value_entries, 2); // caller plus Arrow schema
         assert_eq!(evidence.column_chunks, 35);
@@ -183,14 +198,16 @@ mod tests {
                 .all(|s| s.physical_codec == "zstd" && s.writer_declared_level == Some(8))
         );
         assert!(!serde_json::to_string(&evidence)?.contains("private"));
-        assert_eq!(read(vec![], false)?.files_missing_writer_declaration, 1);
-        for entries in [
-            vec![entry("private-value")],
-            vec![entry(r#"[["gzip",8]]"#)],
-            vec![entry("[]")],
-            vec![entry(r#"[["zstd",8]]"#), entry(r#"[["zstd",8]]"#)],
+        assert_eq!(read("fixture", false)?.files_missing_writer_declaration, 1);
+        for payload in [
+            "private-value",
+            r#"[["gzip",8]]"#,
+            "[]",
+            &format!(r#"[["zstd",8]]{MARKER}[["zstd",8]]"#),
         ] {
-            let err = read(entries, false).err().context("invalid footer was accepted")?;
+            let err = read(&format!("fixture{MARKER}{payload}"), false)
+                .err()
+                .context("invalid footer was accepted")?;
             assert!(!err.to_string().contains("private"));
         }
         Ok(())
