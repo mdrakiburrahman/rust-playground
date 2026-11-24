@@ -368,6 +368,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.file_mapping_cache", "false"),
     capability!("collector.runtime.generated_partition_binding", "revalidate_rows"),
     capability!("collector.upload.mode", "put_create"),
+    capability!("collector.upload.staging_mode", "local_fsync"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
     capability!("collector.upload.request_concurrency", "2"),
     capability!("parquet_writer.defaults.compression", "inherit component default"),
@@ -1376,6 +1377,12 @@ impl Tunables {
                     }
                 }
                 if let Some(upload) = &collector.upload {
+                    if let Some(staging) = upload.staging_mode {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE".into(),
+                            staging.as_str().to_owned(),
+                        );
+                    }
                     if let Some(mode) = upload.mode {
                         output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
                     }
@@ -2142,6 +2149,17 @@ fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
     let Some(upload) = &collector.upload else {
         return Ok(());
     };
+    if upload.staging_mode == Some(arrow_deltalake::StagingMode::Streaming)
+        && (upload.mode != Some(CollectorUploadMode::BufferedMultipart)
+            || collector
+                .runtime
+                .as_ref()
+                .and_then(|r| r.parquet_column_workers)
+                .unwrap_or(1)
+                != 1)
+    {
+        bail!("collector.upload.staging_mode=streaming requires buffered_multipart and parquet_column_workers=1");
+    }
     if upload.mode.unwrap_or_default() == CollectorUploadMode::PutCreate {
         if upload.buffer_capacity_bytes.is_some() || upload.request_concurrency.is_some() {
             bail!("collector.upload buffer_capacity_bytes and request_concurrency require buffered_multipart mode");
