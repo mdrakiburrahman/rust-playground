@@ -14,8 +14,7 @@ mod tests {
 
     #[test]
     fn lto_modes_map_to_distinct_cargo_settings() {
-        let settings = ["off", "thin-local", "thin", "fat"]
-            .map(|mode| cargo_lto_setting(mode).expect("supported client LTO mode"));
-        assert_eq!(settings, ["off", "false", "thin", "fat"]);
+        let settings = ["off", "thin-local", "thin", "fat"].map(cargo_lto_setting);
+        assert_eq!(settings, [Some("off"), Some("false"), Some("thin"), Some("fat")]);
     }
 }
