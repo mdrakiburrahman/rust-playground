@@ -141,9 +141,9 @@ export function evaluateDataFlow(
   const downstreamProblems: string[] = [];
   const findings: string[] = [];
   let downstreamStatus: 'clear' | 'lagging' | 'unknown' = 'clear';
-  const markDownstreamUnknown = (reason: string): void => {
+  const markDownstreamUnknown = (reason: string, fatal = true): void => {
     downstreamStatus = 'unknown';
-    downstreamProblems.push(reason);
+    if (fatal) downstreamProblems.push(reason);
   };
   const rows = allRows.filter((row) => tunables(row)?.orchestration_run_id === status.id);
   if (status.state !== 'succeeded') reasons.push(`run state is ${status.state}: ${status.error ?? status.progress}`);
@@ -178,6 +178,7 @@ export function evaluateDataFlow(
   let legacyOutputs = 0;
   for (const row of rows) {
     const label = String(row.table);
+    let rowDownstreamUnavailable = false;
     if (row.schema_version !== 2 && row.schema_version !== 3) reasons.push(`${label}: unsupported result schema`);
     if (campaign && row.schema_version !== 3) reasons.push(label + ': campaign requires committed-output telemetry');
     if (row.schema_version === 3) {
@@ -192,8 +193,9 @@ export function evaluateDataFlow(
             if (campaign) reasons.push(label + ': no committed output in campaign window');
           }
           if (evidence.downstream_status === 'unavailable') {
+            rowDownstreamUnavailable = true;
             if (campaign) {
-              markDownstreamUnknown(label + ": downstream evidence unavailable");
+              markDownstreamUnknown(label + ": downstream evidence unavailable", mode !== 'local');
               if (mode === 'local') localDownstreamUnavailable = true;
             } else if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
             else localDownstreamUnavailable = true;
@@ -235,7 +237,7 @@ export function evaluateDataFlow(
         typeof completion === 'number' && Number.isFinite(completion) && completion >= 0 && completion <= 100 &&
         pending !== undefined && unhealthy !== undefined;
       if (!qapComplete) {
-        if (campaign) markDownstreamUnknown(label + ': QAP observation incomplete or metrics missing');
+        if (campaign) markDownstreamUnknown(label + ': QAP observation incomplete or metrics missing', !(mode === 'local' && rowDownstreamUnavailable));
         else reasons.push(label + ': QAP observation incomplete or unhealthy');
       } else if (campaign) {
         const rowFindings: string[] = [];

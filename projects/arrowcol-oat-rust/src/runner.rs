@@ -4041,6 +4041,7 @@ fn attach_stopped_commit_evidence(
     for row in rows {
         let mut evidence: Value =
             serde_json::from_str(row.evidence_json.as_deref().context("cell evidence is missing")?)?;
+        evidence["pre_teardown_reconciliation"] = evidence["reconciliation"].clone();
         let window = evidence
             .pointer("/backlog/measurement_window/start_unix_ms")
             .and_then(Value::as_u64)
@@ -5412,7 +5413,7 @@ fn result_rows(
             table,
             rows: client.map(|client| client.rows),
             duration_ms: client.map(|client| client.duration_ms),
-            rows_per_second: if reconciliation_failure.is_some() {
+            rows_per_second: if table_failure.is_some() || client_run.pinning.violation.is_some() {
                 None
             } else {
                 client.map(|client| client.rows_per_second)
@@ -19344,6 +19345,7 @@ mod tests {
             let row = &rows[0];
             let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
             assert_ne!(row.status, "succeeded");
+            assert!(row.rows_per_second.is_none());
             assert_eq!(result["ranking_eligible"], false);
             assert_eq!(result["ranking_ineligible_reason"], "cell_failed");
             assert!(result["ranking_metrics"].is_null());
@@ -19410,6 +19412,11 @@ mod tests {
         assert_eq!(evidence["reconciliation"]["exact_match_required"], true);
         assert_eq!(evidence["reconciliation"]["exact_match"], false);
         assert_eq!(evidence["reconciliation"]["reason"], "delta_commit_drain_timeout");
+        let excess = rows_for(12, 0)?;
+        assert_eq!(excess[0].status, "failed");
+        assert_eq!(excess[0].failure.as_deref(), Some("delta_exact_match_failed"));
+        let excess_evidence: Value = serde_json::from_str(excess[0].evidence_json.as_deref().context("evidence")?)?;
+        assert_eq!(excess_evidence["reconciliation"]["reason"], "delta_exact_match_failed");
         let success = rows_for(10, 0)?;
         assert_eq!(success[0].status, "succeeded");
         Ok(())

@@ -167,11 +167,19 @@ test('single-hot-table campaign separates QAP lag from ingest validity and rejec
     assert.match(unknown.reasons.join('; '), /QAP observation incomplete or metrics missing/);
   }
 
-  const unavailable = evaluateDataFlow(status, [row({ ...valid, mode: 'local', evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }) })], sha, 'local', config, 'single_hot_table_campaign');
-  assert.equal(unavailable.pass, false);
+  const unavailable = evaluateDataFlow(status, [row({ ...valid, mode: 'local',
+    qap_completion_percent: null, qap_pending_artifacts: null, qap_unhealthy_catalogs: null,
+    qap_observation_complete: null, qap_observed_tables: null,
+    evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable',
+      downstream_reason: 'local_qap_observation_unavailable', downstream_comment: 'invalid JSON' }) })], sha, 'local', config, 'single_hot_table_campaign');
+  assert.equal(unavailable.pass, true);
   assert.equal(unavailable.ingestPass, true);
   assert.equal(unavailable.downstreamStatus, 'unknown');
   assert.match(formatDataFlow(unavailable), /downstream metrics are null/);
+  assert.equal(evaluateDataFlow(status, [row({ ...valid, mode: 'local', qap_completion_percent: null })], sha, 'local', config, 'single_hot_table_campaign').pass, false);
+  assert.equal(evaluateDataFlow(status, [row({ ...valid, mode: 'local', status: 'failed',
+    qap_completion_percent: null, evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }) })],
+  sha, 'local', config, 'single_hot_table_campaign').pass, false);
 
   const unbalanced = evaluateDataFlow(status, [valid], sha, 'aks', { ...config, dfe_worker_concurrency: [8, 16] }, 'single_hot_table_campaign');
   assert.equal(unbalanced.pass, false);
