@@ -4060,6 +4060,20 @@ impl DeltaTable {
         control.check()?;
         self.check_publication()?;
         let snapshot = self.snapshot()?;
+        self.write_checkpoint(control, snapshot)
+    }
+
+    pub(crate) fn checkpoint_detached(&self, last: Option<u64>) -> Result<u64> {
+        self.check_publication()?;
+        // Do not hold the publication thread's cache lock during checkpoint replay or I/O.
+        let snapshot = Snapshot::builder_for(self.url.as_str()).build(&self.engine)?;
+        if Some(snapshot.version()) == last {
+            return Ok(snapshot.version());
+        }
+        self.write_checkpoint(&crate::maintenance::MaintenanceControl::default(), snapshot)
+    }
+
+    fn write_checkpoint(&self, control: &crate::maintenance::MaintenanceControl, snapshot: SnapshotRef) -> Result<u64> {
         Self::validate_retention(&snapshot)?;
         control.check()?;
         let writer = Arc::clone(&snapshot).create_checkpoint_writer(&self.engine)?;
@@ -5771,9 +5785,9 @@ impl DeltaTable {
             }
             observation.event("attempt");
             self.check_publication()?;
-            let (snapshot, lineage) = self.snapshot_with_lineage()?;
+            let (snapshot, lineage) = crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())?;
             Self::validate_retention(&snapshot)?;
-            let versions = self.publication_versions(&snapshot, lineage, ids)?;
+            let versions = crate::telemetry::publication_phase("lookup", || self.publication_versions(&snapshot, lineage, ids))?;
             let replay = |id: &str, v: i64, evidence: &mut PublicationEvidence| {
                 evidence.mark(PublicationReason::Deduplicated);
                 let proven = self
@@ -5799,7 +5813,7 @@ impl DeltaTable {
                 if previous == version {
                     replay(app_id, version, evidence);
                     crate::telemetry::mark_terminal_commit_incomplete();
-                    self.sync_replayed_local_state(snapshot.version())
+                    crate::telemetry::publication_phase("sync", || self.sync_replayed_local_state(snapshot.version()))
                         .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                     observation.finish("deduplicated");
                     return Ok((snapshot.version(), None, Vec::new()));
@@ -5901,7 +5915,7 @@ impl DeltaTable {
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
                 evidence.mark(PublicationReason::Deduplicated);
                 crate::telemetry::mark_terminal_commit_incomplete();
-                self.sync_replayed_local_state(snapshot.version())
+                crate::telemetry::publication_phase("sync", || self.sync_replayed_local_state(snapshot.version()))
                     .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                 observation.finish("deduplicated");
                 return Ok((snapshot.version(), None, Vec::new()));
@@ -6023,8 +6037,7 @@ impl DeltaTable {
                 .chain(identity)
                 .collect::<Vec<_>>();
             let reconcile = |evidence: &mut PublicationEvidence| -> Result<Option<u64>> {
-                let (latest, latest_lineage) = self
-                    .snapshot_with_lineage()
+                let (latest, latest_lineage) = crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())
                     .context("unknown publication outcome; reconciliation failed")?;
                 Self::validate_retention(&latest)?;
                 let mut ids = pending
@@ -6047,11 +6060,11 @@ impl DeltaTable {
                 let mut group_committed = 0;
                 let group_total = group_transaction_ids.len();
                 let mut all_committed = true;
-                let versions = self.publication_versions(
+                let versions = crate::telemetry::publication_phase("lookup", || self.publication_versions(
                     &latest,
                     latest_lineage,
                     &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-                )?;
+                ))?;
                 for (id, version, is_group) in ids {
                     match versions[id] {
                         Some(previous) if previous > version => {
@@ -6077,7 +6090,7 @@ impl DeltaTable {
                     return Ok(None);
                 }
                 // Visibility is not proof of local durability after an I/O error.
-                self.sync_replayed_local_state(latest.version())
+                crate::telemetry::publication_phase("sync", || self.sync_replayed_local_state(latest.version()))
                     .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                 evidence.fail(PublicationReason::Reconciled);
                 crate::telemetry::ambiguous_commit_reconciled(&table_id, table_name.as_deref(), started.elapsed());
@@ -6088,9 +6101,9 @@ impl DeltaTable {
                 .zip(&pending_indices)
                 .map(|(append, index)| (*index, append.observation()))
                 .collect();
-            match transaction.commit(&self.engine) {
+            match crate::telemetry::publication_phase("commit", || transaction.commit(&self.engine)) {
                 Ok(CommitResult::Committed(commit)) => {
-                    sync_directory(&self.root).inspect_err(|_| {
+                    crate::telemetry::publication_phase("sync", || sync_directory(&self.root)).inspect_err(|_| {
                         evidence.fail(PublicationReason::SyncFailed);
                         crate::telemetry::mark_terminal_commit_incomplete();
                     })?;

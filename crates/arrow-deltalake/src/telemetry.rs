@@ -198,6 +198,7 @@ struct PublicationMetrics {
     events: Counter<u64>,
     duration: Histogram<f64>,
     commit_lock: Histogram<f64>,
+    phase: Histogram<f64>,
     binding_batches: Counter<u64>,
     committed_rows: Counter<u64>,
     committed_files: Counter<u64>,
@@ -214,6 +215,10 @@ fn publications() -> &'static PublicationMetrics {
             duration: meter.f64_histogram("delta.publication.duration").with_unit("s").build(),
             commit_lock: meter
                 .f64_histogram("delta.publication.commit_lock.duration")
+                .with_unit("s")
+                .build(),
+            phase: meter
+                .f64_histogram("delta.publication.phase.duration")
                 .with_unit("s")
                 .build(),
             binding_batches: meter.u64_counter("delta.partition.binding.batches").build(),
@@ -439,6 +444,15 @@ fn ambiguous_commit_event(table_id: &str, table_name: Option<&str>, elapsed: Dur
 /// Count a publication-side event outside a timed publication attempt.
 pub(crate) fn publication_event(outcome: &'static str) {
     publications().events.add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
+pub(crate) fn publication_phase<T>(phase: &'static str, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = operation();
+    publications()
+        .phase
+        .record(started.elapsed().as_secs_f64(), &[KeyValue::new("phase", phase)]);
+    result
 }
 
 /// Declare before the guard: reverse drop order releases the lock before recording metrics.
