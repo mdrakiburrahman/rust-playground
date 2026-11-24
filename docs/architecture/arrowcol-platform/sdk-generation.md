@@ -543,7 +543,7 @@ them from the configured sink, with admission distinguished from durable deliver
 
 ### Current collector integration
 
-Upstream `main` through `9e2b2f4` was merged locally, including the matching
+Upstream `main` through `3630d3e4` was merged locally, including the matching
 `otel-arrow` submodule revision. The current collector supports a remote
 catalogue/cache, standalone or SQL routing, Arrow Flight admission, Delta export
 and optional Quiver durable admission. Production ingestion-layout metadata
@@ -558,10 +558,15 @@ The SDK sender receives only the Arrowcol endpoint, not a catalogue argument.
 The proof keeps its rows/evidence and refuses a nonempty or external table.
 It shuts down only its own collector and does not replay CREATE.
 
-This qualifies **SDK -> endpoint Arrowcol -> Delta**, not the complete
-on-node -> regional chain or Kusto. The existing on-node Flight exporter
-replays schema DDL downstream on first use; it does not yet implement a
-shared-authority, admission-only forwarding mode. That difference must be
-resolved before presenting the two-hop path as the same contract workflow.
-Unity Catalog/Hive runtime adapters remain unimplemented; their native endpoints
-cannot be substituted for an Arrowcol `SchemaCatalog` RPC endpoint.
+That original three-row proof qualifies **SDK -> endpoint Arrowcol -> Delta**;
+it does not by itself establish the two-hop chain or Kusto visibility.
+The [localhost demo](localhost-demo.md) adds an optional on-node forwarder using
+explicit `registration: shared_catalog`, plus a local native Delta external
+table in Kusto. The exporter never sends DDL in shared-authority mode; the legacy
+DDL-replay mode remains the default for independent catalogues.
+
+Unity/Hive builds and runtime lookups use the enabled native CES bridge, which
+validates native identity and metadata. Their REST/Thrift endpoints still cannot
+be substituted directly for an Arrowcol `SchemaCatalog` RPC endpoint.
+The [developer guide](sdk-developer-guide.md) describes the protobuf models,
+generated contract adapters and shared stream runtime used by the new samples.

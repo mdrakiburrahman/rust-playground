@@ -47,6 +47,7 @@ edition = \"2024\"\n\
 publish = false\n\n\
 [workspace]\n\n\
 [dependencies]\n\
+arrowcol-sdk-runtime = {{ path = \"../runtime/arrowcol-sdk-runtime\" }}\n\
 arrow-array = \"=58.4.0\"\n\
 arrow-buffer = \"=58.4.0\"\n\
 arrow-flight = {{ version = \"=58.4.0\", default-features = false }}\n\
@@ -81,6 +82,9 @@ fn library(context: &RenderContext<'_>) -> SdkGenResult<String> {
     .map_err(format_error)?;
     output.push_str(include_str!("templates/rust_imports.rs.txt"));
     output.push_str("\n/// Prost-generated schema contract types. Arrow Flight remains the wire.\npub mod proto;\n");
+    if super::stream::supported(context) {
+        output.push_str("pub mod stream;\npub use stream::*;\n");
+    }
     writeln!(
         output,
         "\npub const TABLE_CATALOG: &str = {:?};\n\

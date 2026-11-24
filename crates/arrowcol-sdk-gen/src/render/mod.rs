@@ -1,4 +1,5 @@
 mod rust;
+mod stream;
 mod typescript;
 
 use std::{
@@ -49,6 +50,7 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
     let mut files = BTreeMap::new();
     files.extend(rust::render(&context)?);
     files.extend(typescript::render(&context)?);
+    files.extend(stream::render(&context, bundle)?);
     let requests = bundle
         .descriptors()
         .file
@@ -445,6 +447,16 @@ fn sdk_manifest<'a>(
                 root: "typescript",
             },
         },
+        streams: StreamManifest {
+            available: stream::supported(context),
+            languages: if stream::supported(context) {
+                vec!["rust", "cpp", "csharp"]
+            } else {
+                Vec::new()
+            },
+            guide: "STREAMS.md",
+            runtime: "runtime/arrowcol-sdk-runtime",
+        },
         flight: FlightManifest {
             do_put_path: "/arrow.flight.protocol.FlightService/DoPut",
             descriptor_path: vec![
@@ -474,6 +486,7 @@ It is replaced as one unit; do not edit files in place.\n\n\
 - Rust package: `{}` under `rust/`\n\
 - TypeScript package: `{}` under `typescript/`\n\
 - Catalog descriptors: `descriptors/`\n\
+- Protobuf stream APIs, C++/C# bridges and shared runtime: [STREAMS.md](STREAMS.md)\n\
 - Machine-readable integration manifest: `sdk-manifest.json`\n",
         context.schema.identity(),
         context.schema.version(),
@@ -489,8 +502,17 @@ struct SdkManifest<'a> {
     table: TableManifest<'a>,
     artifacts: ArtifactManifest<'a>,
     packages: PackageManifest<'a>,
+    streams: StreamManifest<'a>,
     flight: FlightManifest<'a>,
     outputs: Vec<OutputFile>,
+}
+
+#[derive(Serialize)]
+struct StreamManifest<'a> {
+    available: bool,
+    languages: Vec<&'a str>,
+    guide: &'a str,
+    runtime: &'a str,
 }
 
 #[derive(Serialize)]

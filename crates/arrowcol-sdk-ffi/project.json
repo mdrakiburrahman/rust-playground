@@ -1,0 +1,11 @@
+{
+  "name": "arrowcol-sdk-ffi",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-sdk-ffi/src",
+  "targets": {
+    "build": {"executor": "nx:run-commands", "options": {"command": "cargo build --locked -p arrowcol-sdk-ffi"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked -p arrowcol-sdk-ffi"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked -p arrowcol-sdk-ffi --all-targets -- -D warnings"}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

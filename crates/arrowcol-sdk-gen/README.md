@@ -6,6 +6,12 @@
 | Generate Rust/TypeScript SDKs | Exact Arrow builders and Dataflow Flight helpers; Rust prost contract types |
 | Validate evolution | Nullable-tail Arrow policy plus real Buf `WIRE_JSON` through Nx |
 | Build a new contract before registration | Prepare exact candidate, verify both SDKs, stage, promote, publish |
+| Typed protobuf streams for flat scalar contracts | Rust, C++ and C# adapters backed by one shared Rust stream runtime |
+
+| Guide | Contents |
+| --- | --- |
+| [Localhost demo](../../docs/architecture/arrowcol-platform/localhost-demo.md) | UI, SDK build, editable five-minute emitters, optional node, regional Delta and local Kusto; Linux and Windows CMD commands |
+| [SDK developer guide](../../docs/architecture/arrowcol-platform/sdk-developer-guide.md) | Two compiler stages, minimal Rust/C++/C# APIs, options and delivery guarantees |
 
 ## Catalogue Explorer and contract builds
 

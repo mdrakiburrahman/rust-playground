@@ -1,0 +1,12 @@
+{
+  "name": "arrowcol-sdk-runtime",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-sdk-runtime/src",
+  "targets": {
+    "build": {"executor": "nx:run-commands", "options": {"command": "cargo build --locked -p arrowcol-sdk-runtime"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked -p arrowcol-sdk-runtime"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked -p arrowcol-sdk-runtime --all-targets -- -D warnings"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt -p arrowcol-sdk-runtime -- --check"}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

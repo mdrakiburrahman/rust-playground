@@ -10,11 +10,38 @@
       "{workspaceRoot}/Cargo.lock",
       "{workspaceRoot}/rust-toolchain.toml",
       "{workspaceRoot}/tools/libs/arrowcol-sdk-gen/**/*",
+      "{workspaceRoot}/crates/arrowcol-sdk-runtime/**/*",
+      "{workspaceRoot}/crates/arrowcol-sdk-ffi/**/*",
+      "{workspaceRoot}/examples/arrowcol-stream/**/*",
       "{workspaceRoot}/package.json",
       "{workspaceRoot}/package-lock.json"
     ]
   },
   "targets": {
+    "stream-demo-e2e": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "commands": [
+          { "command": "cargo build --locked --package arrowcol-dataflow-rust", "forwardAllArgs": false },
+          { "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/test/stream-demo.e2e.ts", "forwardAllArgs": false }
+        ],
+        "parallel": false,
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "stream-demo": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "commands": [
+          { "command": "cargo build --locked --package arrowcol-dataflow-rust", "forwardAllArgs": false },
+          { "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/stream-demo.ts", "forwardAllArgs": true }
+        ],
+        "parallel": false,
+        "cwd": "{workspaceRoot}"
+      }
+    },
     "native-catalogues": {
       "executor": "nx:run-commands",
       "cache": false,
