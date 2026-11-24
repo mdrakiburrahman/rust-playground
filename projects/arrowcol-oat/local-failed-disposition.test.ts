@@ -429,6 +429,7 @@ for (const dispositionCase of ['before', 'delivery', 'drain'] as const) test(`op
     rows: { delta_committed: null },
   };
   const measuredEvidence = { ...evidence, overload_guard: { run_id: cell },
+    ...(dispositionCase === 'drain' ? { teardown_failures: [{ kind: 'dataflow_drain_incomplete', triggers: ['unpublished_identities'], collector_instance_id: 'collector-1' }] } : {}),
     durable_commits: { complete_delivery_established: false },
     teardown_outcome: dispositionCase === 'drain' ? 'failed' : 'succeeded' };
   const makeResult = (resultEvidence: object, status = 'failed') => {
@@ -454,6 +455,15 @@ for (const dispositionCase of ['before', 'delivery', 'drain'] as const) test(`op
     await writeFile(resultPath, makeResult({ ...measuredEvidence, durable_commits: {} }));
     if (dispositionCase === 'delivery') await assert.rejects(
       reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env), /supported failed-run disposition/);
+    if (dispositionCase === 'drain') {
+      await writeFile(resultPath, makeResult({ ...measuredEvidence, durable_commits: {}, teardown_outcome: 'succeeded' }));
+      await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env), /supported failed-run disposition/);
+      for (const invalid of [undefined, [], [{ kind: 'dataflow_drain_incomplete', triggers: [], collector_instance_id: 'collector-1' }],
+        [{ kind: 'other', triggers: ['unpublished_identities'], collector_instance_id: 'collector-1' }]]) {
+        await writeFile(resultPath, makeResult({ ...measuredEvidence, durable_commits: {}, teardown_failures: invalid }));
+        await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env), /supported failed-run disposition/);
+      }
+    }
     await writeFile(resultPath, makeResult(measuredEvidence, 'succeeded'));
     await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env), /Failed cell identity mismatch/);
     await writeFile(resultPath, resultBytes);
@@ -486,6 +496,8 @@ for (const dispositionCase of ['before', 'delivery', 'drain'] as const) test(`op
     delivery: 'failed_incomplete_delivery_quarantined_not_settled',
     drain: 'failed_teardown_drain_quarantined_not_settled',
   }[dispositionCase]);
+  assert.deepEqual(record.trigger, dispositionCase === 'drain' ? measuredEvidence.teardown_failures :
+    dispositionCase === 'before' ? 'before_measurement' : 'durable_complete_delivery_not_established');
   assert.equal(record.receipt_sha256, hash(JSON.stringify(receipt)));
   assert.deepEqual(JSON.parse(await readFile(path.join(quarantineDir, `${invocation}.json`), 'utf8')), receipt);
   await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });

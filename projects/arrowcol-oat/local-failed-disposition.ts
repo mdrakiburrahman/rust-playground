@@ -274,7 +274,7 @@ async function inspect(
     state_root: stateRoot, owner_pid: marker.ownerPid, owner_start_ticks: marker.ownerStartTicks,
     server_pid: marker.serverPid, server_start_ticks: marker.serverStartTicks,
     measurement_produced: evidence.overload_guard !== null || evidence.durable_commits !== null || evidence.client_schedule !== null,
-    ...(classifyQuarantine ? { quarantine_disposition: classifyLocalQuarantine(row, evidence, status.error) } : {}),
+    ...(classifyQuarantine ? classifyLocalQuarantine(row, evidence) : {}),
     port: Number(serverUrl.port), listener_output: listenerOutput,
     cleanup: { state_empty: true, compose_resources: 0, legacy_resources: 0, client_containers: 0 },
   };
@@ -363,21 +363,34 @@ export const localQuarantineDispositions = [
   'failed_teardown_drain_quarantined_not_settled',
 ] as const;
 
-function classifyLocalQuarantine(row: Json, evidence: Json, error: string): string | null {
+function classifyLocalQuarantine(row: Json, evidence: Json): Json {
+  const failures = evidence.teardown_failures;
+  if (failures !== undefined && (!Array.isArray(failures) || failures.length === 0 || failures.some(failure => {
+    if (!isRecord(failure) || Object.keys(failure).sort().join(',') !== 'collector_instance_id,kind,triggers' ||
+        failure.kind !== 'dataflow_drain_incomplete' || typeof failure.collector_instance_id !== 'string' ||
+        failure.collector_instance_id.length === 0 || !Array.isArray(failure.triggers) || failure.triggers.length === 0) return true;
+    return failure.triggers.some((trigger: unknown) => typeof trigger !== 'string' ||
+      !['unpublished_identities', 'retired_workers', 'ingress_failure'].includes(trigger)) ||
+      new Set(failure.triggers).size !== failure.triggers.length;
+  }))) return { quarantine_disposition: null, quarantine_trigger: null };
   const measured = evidence.overload_guard !== null || evidence.durable_commits !== null || evidence.client_schedule !== null;
-  if (!measured) return localQuarantineDispositions[0];
-  if (row.status !== 'failed') return null;
-  const failure = typeof row.failure === 'string' ? row.failure : '';
-  if (error.includes('dataflow drain incomplete') || failure.includes('dataflow drain incomplete')) {
-    return localQuarantineDispositions[2];
+  if (!measured) return { quarantine_disposition: localQuarantineDispositions[0], quarantine_trigger: 'before_measurement' };
+  if (row.status !== 'failed') return { quarantine_disposition: null, quarantine_trigger: null };
+  if (Array.isArray(failures) && failures.length > 0) {
+    return evidence.teardown_outcome === 'failed'
+      ? { quarantine_disposition: localQuarantineDispositions[2], quarantine_trigger: failures }
+      : { quarantine_disposition: null, quarantine_trigger: null };
   }
   const durable = isRecord(evidence.durable_commits) ? evidence.durable_commits : undefined;
   const reconciliation = isRecord(evidence.reconciliation) ? evidence.reconciliation : undefined;
   const admissions = isRecord(durable?.collector_teardown_admissions) ? durable.collector_teardown_admissions : undefined;
-  if (evidence.complete_delivery_established === false || durable?.complete_delivery_established === false ||
-      reconciliation?.status === 'unsettled' || reconciliation?.status === 'outside_bound' ||
-      admissions?.status === 'ambiguous') return localQuarantineDispositions[1];
-  return null;
+  const trigger = evidence.complete_delivery_established === false ? 'complete_delivery_not_established' :
+    durable?.complete_delivery_established === false ? 'durable_complete_delivery_not_established' :
+    reconciliation?.status === 'unsettled' ? 'reconciliation_unsettled' :
+    reconciliation?.status === 'outside_bound' ? 'reconciliation_outside_bound' :
+    admissions?.status === 'ambiguous' ? 'collector_teardown_admissions_ambiguous' : null;
+  return trigger ? { quarantine_disposition: localQuarantineDispositions[1], quarantine_trigger: trigger } :
+    { quarantine_disposition: null, quarantine_trigger: null };
 }
 
 async function writeDurable(path: string, contents: Uint8Array): Promise<void> {
@@ -522,6 +535,7 @@ export async function reconcileAndQuarantineLocalFailedReceipt(
       missing_evidence: missingEvidence,
       custody_checks: checks,
       disposition: proof.quarantine_disposition,
+      trigger: proof.quarantine_trigger,
     };
     await syncDirectory(evidenceDir);
     const finalProof = await inspect(receiptPath, markerPath, env, undefined, true);
