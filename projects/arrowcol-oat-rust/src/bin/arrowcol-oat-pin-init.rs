@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::{
-    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
-    PublicationFenceError, object_store_for_url,
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, InitialDeltaProperties, PublicationFence,
+    PublicationFenceContext, PublicationFenceError, object_store_for_url,
 };
 use arrow_deltalake::publisher::{MutationRetries, PublisherSession};
 use arrowcol_protocol::{CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis};
@@ -71,6 +71,8 @@ struct PinInitConfig {
 struct RunTableInitialization {
     delta_root: String,
     table: String,
+    #[serde(default)]
+    delta_properties: InitialDeltaProperties,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,6 +320,7 @@ fn validate_run_table_initialization(run_table: Option<&RunTableInitialization>,
     let Some(run_table) = run_table else {
         return Ok(());
     };
+    run_table.delta_properties.properties()?;
     let root = Url::parse(&run_table.delta_root).context("parse run-scoped table initialization root")?;
     let expected_suffix = format!("/runs/{run_id}/dataflow");
     if root.scheme() != "abfss"
@@ -368,8 +371,9 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
     });
     let init_url = url.clone();
     let init_session = Arc::clone(&session);
+    let properties = run_table.delta_properties.clone();
     let initialization = tokio::task::spawn_blocking(move || {
-        DeltaTable::initialize_fresh_url_with_session(
+        DeltaTable::initialize_fresh_url_with_session_and_properties(
             init_url,
             schema,
             vec![INGESTION_PARTITION.to_owned()],
@@ -379,6 +383,7 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
                 store,
                 mutation_retries: MutationRetries::Disabled,
             },
+            &properties,
         )
     })
     .await
@@ -498,6 +503,34 @@ mod tests {
     }
 
     #[test]
+    fn pin_init_literal_properties_are_optional_strict_and_validated_before_admission() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let base = serde_json::json!({
+            "delta_root": format!("abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"),
+            "table": HOT_RUN_TABLE
+        });
+        let default: RunTableInitialization = serde_json::from_value(base.clone())?;
+        assert!(default.delta_properties.properties()?.is_empty());
+        let mut configured = base.clone();
+        configured["delta_properties"] =
+            serde_json::json!({"target_file_size_bytes":67108864,"checkpoint_interval":17});
+        let parsed: RunTableInitialization = serde_json::from_value(configured.clone())?;
+        validate_run_table_initialization(Some(&parsed), run_id)?;
+        let properties = parsed.delta_properties.properties()?;
+        assert_eq!(properties["delta.targetFileSize"], "67108864");
+        assert_eq!(properties["delta.checkpointInterval"], "17");
+        for field in ["target_file_size_bytes", "checkpoint_interval"] {
+            let mut invalid = configured.clone();
+            invalid["delta_properties"][field] = serde_json::json!(0);
+            let parsed: RunTableInitialization = serde_json::from_value(invalid)?;
+            assert!(validate_run_table_initialization(Some(&parsed), run_id).is_err());
+        }
+        configured["delta_properties"]["unsupported"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RunTableInitialization>(configured).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn pin_init_config_requires_matching_digest_and_validated_table_identities() -> Result<()> {
         let valid = config()?;
         assert_eq!(validate_config(&valid)?.len(), 1);
@@ -507,6 +540,7 @@ mod tests {
                 "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"
             ),
             table: HOT_RUN_TABLE.to_owned(),
+            delta_properties: InitialDeltaProperties::default(),
         };
         validate_run_table_initialization(Some(&valid_run_table), run_id)?;
         let mut wrong_table = valid_run_table;

@@ -5,8 +5,8 @@ use std::{collections::BTreeSet, env, fs, io::Read, path::Path, sync::Arc};
 use anyhow::{Context, Result, bail};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::{
-    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
-    PublicationFenceError,
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, InitialDeltaProperties, PublicationFence,
+    PublicationFenceContext, PublicationFenceError,
 };
 use arrow_deltalake::publisher::{ControlMetadata, MutationRetries, PublisherSession, SessionMode, canonical_uuid};
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
@@ -539,7 +539,7 @@ pub fn canonical_table_delta_schema(table: &str) -> Result<serde_json::Value> {
 
 /// Initialize only selected, fresh local table directories; existing tables are never opened.
 pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statements: &[SchemaStatement]) -> Result<()> {
-    initialize_fresh_local_with_partition(root, selected, statements, true)
+    initialize_fresh_local_with_partition(root, selected, statements, true, &InitialDeltaProperties::default())
 }
 
 fn initialize_fresh_local_with_partition(
@@ -547,7 +547,9 @@ fn initialize_fresh_local_with_partition(
     selected: &[String],
     statements: &[SchemaStatement],
     partitioned: bool,
+    properties: &InitialDeltaProperties,
 ) -> Result<()> {
+    properties.properties()?;
     let requested = selected.iter().cloned().collect::<BTreeSet<_>>();
     if requested.is_empty() || requested.len() != selected.len() {
         bail!("local initialization requires explicit, unique --table selections");
@@ -589,9 +591,9 @@ fn initialize_fresh_local_with_partition(
             Ok(_) => bail!("refusing to initialize existing local table: {}", path.display()),
             Err(error) => return Err(error.into()),
         }
-        prepared.push((path, schema));
+        prepared.push((path, schema, statement.identity.to_string()));
     }
-    for (path, schema) in prepared {
+    for (path, schema, table) in prepared {
         fs::create_dir(&path).with_context(|| format!("claim fresh local table {}", path.display()))?;
         let url = Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("invalid local table directory"))?;
         let partitions = if partitioned {
@@ -599,10 +601,50 @@ fn initialize_fresh_local_with_partition(
         } else {
             Vec::new()
         };
-        DeltaTable::initialize_url_for_bootstrap(url, schema, partitions)
-            .with_context(|| format!("initialize fresh local table {}", path.display()))?;
+        let session = PublisherSession::local();
+        let fence = Arc::new(LocalInitializationFence {
+            session: Arc::clone(&session),
+        });
+        let initialization = DeltaTable::initialize_fresh_url_with_session_and_properties(
+            url.clone(),
+            schema,
+            partitions,
+            Arc::clone(&session),
+            fence,
+            FreshTableTransport {
+                store: arrow_deltalake::delta::object_store_for_url(&url)?,
+                mutation_retries: MutationRetries::Disabled,
+            },
+            properties,
+        );
+        let drained = session.close_after_drain();
+        let receipt = initialization.with_context(|| format!("initialize fresh local table {}", path.display()))?;
+        drained.context("drain local table initializer publisher")?;
+        if properties.target_file_size_bytes.is_some() || properties.checkpoint_interval.is_some() {
+            println!(
+                "{}",
+                serde_json::json!({"kind":"local_delta_table_initialized","table":table,"delta":receipt,"publisher_drained":true})
+            );
+        }
     }
     Ok(())
+}
+
+struct LocalInitializationFence {
+    session: Arc<PublisherSession>,
+}
+
+impl PublicationFence for LocalInitializationFence {
+    fn check_before_commit(&self, context: &PublicationFenceContext<'_>) -> Result<(), PublicationFenceError> {
+        if context.read_version() != 0 || context.proposed_version() != 0 || context.file_count() != 0 {
+            return Err(PublicationFenceError::stale(
+                "local initialization permits only an empty version0 schema commit",
+            ));
+        }
+        self.session
+            .check()
+            .map_err(|error| PublicationFenceError::check_failed(format!("{error:#}")))
+    }
 }
 
 /// Initialize exactly one fresh local table without Flight, catalog registration, or load generation.
@@ -623,6 +665,10 @@ pub fn initialize_local(args: InitializeLocalArgs) -> Result<()> {
         &[args.table],
         &schema_statements()?,
         args.partition_by_ingestion_date,
+        &InitialDeltaProperties {
+            target_file_size_bytes: args.delta_target_file_size_bytes,
+            checkpoint_interval: args.delta_checkpoint_interval,
+        },
     )
 }
 
@@ -773,6 +819,8 @@ mod tests {
             unpartitioned: true,
             table: table.clone(),
             dataflow_root: root.path().to_owned(),
+            delta_target_file_size_bytes: None,
+            delta_checkpoint_interval: None,
         };
         initialize_local(args())?;
         let log = root

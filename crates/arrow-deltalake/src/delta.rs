@@ -3247,6 +3247,38 @@ pub struct FreshTableReceipt {
     pub partition_columns: Vec<String>,
     /// Must be zero; initialization does not publish data.
     pub active_files: usize,
+    /// Actual committed Delta configuration, not requested process defaults.
+    pub properties: BTreeMap<String, String>,
+}
+
+/// Literal properties applied only while creating fresh version-zero metadata.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InitialDeltaProperties {
+    /// Compressed-byte target; explicit writer or optimize table policy takes precedence.
+    pub target_file_size_bytes: Option<u64>,
+    /// Commits of checkpoint debt required by checkpoint maintenance.
+    pub checkpoint_interval: Option<u64>,
+}
+
+impl InitialDeltaProperties {
+    /// Return validated literal Delta properties without performing storage I/O.
+    ///
+    /// # Errors
+    /// Rejects zero-valued targets or checkpoint intervals.
+    pub fn properties(&self) -> Result<BTreeMap<String, String>> {
+        let mut properties = BTreeMap::new();
+        for (key, value) in [
+            ("delta.targetFileSize", self.target_file_size_bytes),
+            ("delta.checkpointInterval", self.checkpoint_interval),
+        ] {
+            if let Some(value) = value {
+                properties.insert(key.to_owned(), value.to_string());
+            }
+        }
+        arrowcol_props::validate_table_properties(&properties)?;
+        Ok(properties)
+    }
 }
 
 /// Explicit transport provenance for fresh initialization. Opaque retries are refused.
@@ -3404,6 +3436,32 @@ impl DeltaTable {
         publication_fence: Arc<dyn PublicationFence>,
         data: FreshTableTransport,
     ) -> Result<FreshTableReceipt> {
+        Self::initialize_fresh_url_with_session_and_properties(
+            url,
+            schema,
+            partition_columns,
+            session,
+            publication_fence,
+            data,
+            &InitialDeltaProperties::default(),
+        )
+    }
+
+    /// Create fresh metadata atomically with explicit literal Delta properties.
+    ///
+    /// # Errors
+    /// Rejects invalid properties, existing objects, unsafe transport, failed fencing
+    /// or committed metadata that differs from the requested configuration.
+    pub fn initialize_fresh_url_with_session_and_properties(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+        publication_fence: Arc<dyn PublicationFence>,
+        data: FreshTableTransport,
+        properties: &InitialDeltaProperties,
+    ) -> Result<FreshTableReceipt> {
+        let requested_properties = properties.properties()?;
         if session.mode() != SessionMode::Publisher
             || data.mutation_retries != crate::publisher::MutationRetries::Disabled
         {
@@ -3425,7 +3483,7 @@ impl DeltaTable {
         if nonempty {
             bail!("fresh table target is not empty; existing objects are never adopted");
         }
-        table.create_schema(Arc::clone(&incoming), Some(publication_fence))?;
+        table.create_schema_with_properties(Arc::clone(&incoming), Some(publication_fence), properties)?;
         let prefix = table.object_path("")?;
         let store = Arc::clone(&table.store);
         let objects: Vec<_> = shared_executor()?.block_on(async move {
@@ -3437,6 +3495,17 @@ impl DeltaTable {
         }
         let snapshot = table.snapshot()?;
         let metadata = snapshot.table_configuration().metadata();
+        let committed_properties: BTreeMap<String, String> = metadata
+            .configuration()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if requested_properties
+            .iter()
+            .any(|(key, value)| committed_properties.get(key) != Some(value))
+        {
+            bail!("fresh table property readback differs from creation");
+        }
         let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
         if snapshot.version() != 0 || existing != *incoming || metadata.partition_columns() != table.partition_columns {
             bail!("fresh table schema/version/partition readback differs from creation");
@@ -3462,6 +3531,7 @@ impl DeltaTable {
             schema_json: metadata.schema_string().to_string(),
             partition_columns: metadata.partition_columns().to_vec(),
             active_files: 0,
+            properties: committed_properties,
         })
     }
 
@@ -4206,6 +4276,16 @@ impl DeltaTable {
     }
 
     fn create_schema(&self, incoming: SchemaRef, fresh_fence: Option<Arc<dyn PublicationFence>>) -> Result<()> {
+        self.create_schema_with_properties(incoming, fresh_fence, &InitialDeltaProperties::default())
+    }
+
+    fn create_schema_with_properties(
+        &self,
+        incoming: SchemaRef,
+        fresh_fence: Option<Arc<dyn PublicationFence>>,
+        initial: &InitialDeltaProperties,
+    ) -> Result<()> {
+        let mut properties = initial.properties()?;
         let stats_policy = crate::delta_stats::DeltaStatsPolicy::from_env()?;
         if let Some(policy) = &stats_policy {
             policy.validate_schema(&incoming)?;
@@ -4215,6 +4295,7 @@ impl DeltaTable {
             delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake");
         if let Some(policy) = &stats_policy {
             builder = builder.with_table_properties(policy.properties());
+            properties.extend(policy.properties());
         }
         if !self.partition_columns.is_empty() {
             builder = builder.with_data_layout(delta_kernel::transaction::data_layout::DataLayout::partitioned(
@@ -4222,7 +4303,7 @@ impl DeltaTable {
             ));
         }
         let strict = fresh_fence.is_some();
-        let committer: Box<dyn Committer> = if let Some(fence) = fresh_fence {
+        let mut committer: Box<dyn Committer> = if let Some(fence) = fresh_fence {
             Box::new(FreshSchemaCommitter {
                 inner: GuardedCommitter {
                     session: self.session.clone(),
@@ -4233,6 +4314,16 @@ impl DeltaTable {
         } else {
             self.committer()
         };
+        if initial.target_file_size_bytes.is_some() || initial.checkpoint_interval.is_some() {
+            // Kernel's CREATE allowlist excludes these protocol-neutral properties.
+            // Reuse catalog's validated pre-publication metadata augmentation.
+            committer = Box::new(crate::catalog::MetadataCommitter {
+                inner: committer,
+                properties,
+                comment: None,
+                merge_properties: true,
+            });
+        }
         let transaction = builder.build(&self.engine, committer)?;
         let result = transaction.commit(&self.engine)?;
         if strict {
