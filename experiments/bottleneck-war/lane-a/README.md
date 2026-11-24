@@ -49,3 +49,6 @@ is not the canonical production row shape. Client ACKs measure admission, not
 durability, and do not establish offered-capacity headroom. Local filesystem
 results do not measure remote streaming uploads or cloud commit latency.
 Boundary scan lag is recorded; coarse, bursty commits require longer repeat runs.
+The start/end scans record each table's latest JSON version and total regular-file
+bytes under its `_delta_log`, including checkpoint sidecars. A final inventory
+after owned services stop is recorded before the generated table is deleted.

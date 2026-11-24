@@ -222,6 +222,7 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     fs.writeFileSync(path.join(run, 'commit-boundaries.json'), JSON.stringify({
       start: [...before.commits], end: [...after.commits], requested: { start: ws, end: we },
       observed: { start: before.observedAt, end: after.observedAt },
+      table_logs: { start: before.tableLogs, end: after.tableLogs },
     }));
     for (const client of load) {
       const deadline = Date.now() + 45000;
@@ -278,6 +279,13 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     for (const child of children.slice(offset).reverse()) await stop(child);
     fs.rmSync(key, { force: true });
     fs.writeFileSync(path.join(run, 'observation-errors.json'), JSON.stringify(observationErrors));
+  }
+  try {
+    result = { ...result, table_logs_after_stop: snapshot(root).tableLogs };
+  } catch (error) {
+    valid = false;
+    result = { ...result, status: 'failed_final_log_inventory', committed_rps: null, table_logs_after_stop: null,
+      comment: `Final Delta log inventory failed: ${error instanceof Error ? error.message : String(error)}` };
   }
   fs.appendFileSync(results, JSON.stringify(result) + '\n');
   fs.rmSync(root, { recursive: true });

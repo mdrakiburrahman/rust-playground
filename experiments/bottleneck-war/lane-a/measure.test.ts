@@ -18,6 +18,8 @@ test('counts newly visible commits even when their commitInfo timestamp precedes
     fs.writeFileSync(path.join(log, '00000000000000000001.json'),
       '{"commitInfo":{"timestamp":1}}\n{"add":{"size":400,"stats":"{\\"numRecords\\":20}"}}\n');
     fs.writeFileSync(path.join(log, '00000000000000000001.checkpoint.parquet'), '');
+    fs.mkdirSync(path.join(log, '_sidecars'));
+    fs.writeFileSync(path.join(log, '_sidecars', 'test.parquet'), 'sidecar');
     const end = snapshot(root);
     end.observedAt = 3000;
     const stats = difference(start, end);
@@ -27,6 +29,9 @@ test('counts newly visible commits even when their commitInfo timestamp precedes
     assert.equal(stats.commits, 1);
     assert.equal(stats.checkpoints, 2);
     assert.equal(stats.checkpoint_files_added, 1);
+    assert.deepEqual(stats.table_logs_end.table, { version: 1, bytes: 7 +
+      fs.statSync(path.join(log, '00000000000000000000.json')).size +
+      fs.statSync(path.join(log, '00000000000000000001.json')).size });
     fs.writeFileSync(path.join(log, '00000000000000000002.json'), '{"add":{"size":20}}\n');
     assert.throws(() => snapshot(root), /statistics/);
   } finally { fs.rmSync(root, { recursive: true }); }

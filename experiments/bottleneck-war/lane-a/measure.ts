@@ -2,11 +2,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export type Commit = { rows: number; bytes: number; files: number; timestamp: number };
-export type Snapshot = { observedAt: number; commits: Map<string, Commit>; checkpoints: Set<string> };
+type TableLog = { version: number | null; bytes: number };
+export type Snapshot = { observedAt: number; commits: Map<string, Commit>; checkpoints: Set<string>;
+  tableLogs: Record<string, TableLog> };
+
+function logSize(dir: string): number {
+  let bytes = 0;
+  for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, item.name);
+    if (item.isFile()) bytes += fs.statSync(full).size;
+    else if (item.isDirectory()) bytes += logSize(full);
+  }
+  return bytes;
+}
 
 export function snapshot(root: string): Snapshot {
   const commits = new Map<string, Commit>();
   const checkpoints = new Set<string>();
+  const tableLogs: Record<string, TableLog> = {};
   function walk(dir: string): void {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
@@ -15,13 +28,23 @@ export function snapshot(root: string): Snapshot {
         if (!entry.name.startsWith('__arrowcol_ingestion=')) walk(full);
         continue;
       }
-      for (const name of fs.readdirSync(full).sort()) {
+      const table: TableLog = { version: null, bytes: 0 };
+      tableLogs[path.relative(root, dir)] = table;
+      for (const entry of fs.readdirSync(full, { withFileTypes: true })) {
+        const name = entry.name;
+        const file = path.join(full, name);
+        if (entry.isDirectory()) { table.bytes += logSize(file); continue; }
+        if (!entry.isFile()) continue;
+        const stat = fs.statSync(file);
+        table.bytes += stat.size;
         if (/^\d{20}\.checkpoint(?:\.(?:\d+\.\d+|[a-f0-9-]+))?\.(?:parquet|json)$/i.test(name)) {
           checkpoints.add(path.relative(root, path.join(full, name)));
         }
         if (!/^\d{20}\.json$/.test(name)) continue;
-        const file = path.join(full, name);
-        const commit = { rows: 0, bytes: 0, files: 0, timestamp: fs.statSync(file).mtimeMs };
+        const version = Number(name.slice(0, 20));
+        if (!Number.isSafeInteger(version)) throw new Error(`Unrepresentable Delta version ${name}`);
+        table.version = Math.max(table.version ?? 0, version);
+        const commit = { rows: 0, bytes: 0, files: 0, timestamp: stat.mtimeMs };
         for (const line of fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)) {
           const action = JSON.parse(line);
           if (!action.add) continue;
@@ -38,7 +61,7 @@ export function snapshot(root: string): Snapshot {
     }
   }
   walk(root);
-  return { observedAt: Date.now(), commits, checkpoints };
+  return { observedAt: Date.now(), commits, checkpoints, tableLogs };
 }
 
 export function difference(start: Snapshot, end: Snapshot) {
@@ -58,6 +81,7 @@ export function difference(start: Snapshot, end: Snapshot) {
     files_per_commit: added.length ? files / added.length : null,
     checkpoints: end.checkpoints.size,
     checkpoint_files_added: [...end.checkpoints].filter((key) => !start.checkpoints.has(key)).length,
+    table_logs_start: start.tableLogs, table_logs_end: end.tableLogs,
     start_observed_ms: start.observedAt, end_observed_ms: end.observedAt,
     semantics: 'new_local_Delta_versions_visible_between_boundary_scans_not_client_ACKs',
   };
