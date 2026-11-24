@@ -1018,6 +1018,25 @@ pub struct CollectorSocketTunables {
         deserialize_with = "deserialize_present_bool"
     )]
     pub tcp_nodelay: Option<bool>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_stream_window_bytes: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_connection_window_bytes: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_max_frame_bytes: Option<u32>,
+}
+
+fn deserialize_present_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
 }
 
 impl CollectorSocketTunables {
@@ -1034,6 +1053,20 @@ impl CollectorSocketTunables {
                 && !(1..=1_073_741_823).contains(&value)
             {
                 return Err(format!("{name} must be in 1..=1073741823"));
+            }
+        }
+        for (name, value, min, max) in [
+            ("h2_stream_window_bytes", self.h2_stream_window_bytes, 65_535, 64 << 20),
+            (
+                "h2_connection_window_bytes",
+                self.h2_connection_window_bytes,
+                65_535,
+                256 << 20,
+            ),
+            ("h2_max_frame_bytes", self.h2_max_frame_bytes, 16_384, 1 << 20),
+        ] {
+            if value.is_some_and(|bytes| !(min..=max).contains(&bytes)) {
+                return Err(format!("collector.socket.{name} must be in {min}..={max}"));
             }
         }
         Ok(())
