@@ -3378,6 +3378,8 @@ mod downstream_runner_tests {
             Ok(Some(format!("OAT_CLIENT_METRICS {terminal}\n")))
         }
         async fn process_logs(&self, _: &OatConfig) -> Result<Vec<ProcessLog>> {
+            let source_revision = std::env::var("GIT_SHA").unwrap_or_else(|_| "local".to_owned());
+            let collector_text = format!("arrowcol_effective_config {{\"source_revision\":\"{source_revision}\"}}\n");
             Ok(vec![ProcessLog {
                 role: ComponentRole::Router,
                 instance_id: "router-fault-test".to_owned(),
@@ -3390,6 +3392,18 @@ mod downstream_runner_tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 text: "arrowcol_router_effective_config {\"log_filter\":\"warn,tiberius=error\"}\n".to_owned(),
+            }, ProcessLog {
+                role: ComponentRole::Collector,
+                instance_id: "collector-fault-test".to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: true,
+                raw_log_bytes: collector_text.len() as u64,
+                raw_log_lines: 1,
+                stdout: collector_text.clone(),
+                stderr: String::new(),
+                text: collector_text,
             }])
         }
         async fn process_logs_for_role(&self, _: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
