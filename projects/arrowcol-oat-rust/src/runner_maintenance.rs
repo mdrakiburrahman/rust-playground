@@ -374,7 +374,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
             false,
         ),
         "TARGET_FILE_MIB" => (
-            "/table_policy/arrowcol.optimize.targetFileSize".to_owned(),
+            "/startup/optimize_target_file_bytes".to_owned(),
             1024 * 1024,
             false,
         ),
@@ -419,7 +419,7 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
             1,
             true,
         ),
-        "CHECKPOINT_EVERY_COMMITS" => ("/table_policy/delta.checkpointInterval".to_owned(), 1, false),
+        "CHECKPOINT_EVERY_COMMITS" => ("/startup/checkpoint_every_commits".to_owned(), 1, false),
         _ => bail!("maintenance environment has no checked effective-policy adapter: {variable}"),
     };
     let expected = if invert {
@@ -1151,7 +1151,9 @@ mod maintenance_topology_tests {
         config.tunables = serde_json::from_value(
             json!({"maintenance":{"enabled":true,"operations":["optimize"],"target_file_mib":17}}),
         )?;
-        let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
+        let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60,
+                "optimize_target_file_bytes":17_u64*1024*1024},
+            "operation_settings":{"optimize_target_file_bytes":17_u64*1024*1024},
             "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024,
                 "arrowcol.maintenance.operationTimeout":300_000},"active":true});
         verify_process_configuration(&config, ComponentRole::Maintenance, &startup)?;
@@ -1162,6 +1164,7 @@ mod maintenance_topology_tests {
         for table in &config.tables {
             let mut policy = startup.clone();
             policy["table_policy"]["arrowcol.optimize.targetFileSize"] = json!(32_u64 * 1024 * 1024);
+            policy["operation_settings"]["optimize_target_file_bytes"] = json!(32_u64 * 1024 * 1024);
             text.push_str(&format!(
                 "arrowcol_maintenance_table_config {}\n",
                 json!({
