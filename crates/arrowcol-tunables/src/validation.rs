@@ -303,6 +303,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.batch_window", "2s in OAT YAML; 10s component default"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.txn_lookup_mode", "batched"),
+    capability!("collector.commit.trigger", "window"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!(
         "collector.commit.delta_stats_columns",
@@ -1997,6 +1998,31 @@ fn txn_lookup_mode_rejects_invalid_inputs_by_field_name() -> Result<()> {
         };
         assert!(format!("{error:#}").contains("collector.commit.txn_lookup_mode"));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn commit_trigger_is_strict_and_projected() -> Result<()> {
+    for value in [
+        serde_json::json!("Eager"),
+        serde_json::json!("immediate"),
+        serde_json::json!(42),
+        Value::Null,
+    ] {
+        let Err(error) = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"trigger": value}}
+        })) else {
+            bail!("invalid commit trigger accepted");
+        };
+        assert!(format!("{error:#}").contains("collector.commit.trigger"));
+    }
+    let environment = Tunables::parse_oat_json(serde_json::json!({
+        "collector": {"commit": {"trigger": "eager"}}
+    }))?
+    .environment_for(ComponentRole::Collector)?;
+    let commit: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"])?;
+    assert_eq!(commit, serde_json::json!({"trigger": "eager"}));
     Ok(())
 }
 

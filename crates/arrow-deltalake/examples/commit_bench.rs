@@ -1,55 +1,116 @@
-use anyhow::{Context, Result};
+//! Coalesced commit-path benchmark for one local Delta table.
+//!
+//! Rows/s counts durable `arrowcol_data_commit` events whose commit finished in the
+//! half-open window `[start + warmup, start + warmup + measure)`, the same rule as the
+//! OAT shared commit window. Warmup backlog counts when its commit finishes in the window.
+//!
+//! Usage: `commit_bench <table-root>`. Unset variables take their defaults; any value
+//! that does not parse, or a zero count/duration, is an error.
+
+use anyhow::{Context, Result, bail, ensure};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow_deltalake::TxnLookupMode;
 use arrow_deltalake::commit::{BatchedTable, CommitOptions, CommitTrigger};
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use serde_json::{Value, json};
+use std::collections::VecDeque;
+use std::fmt::{Debug, Display};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 
-fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
-}
-
-struct Sample {
-    finished: Duration,
-    latency: Duration,
-    stage: Duration,
-    rows: u64,
-    version: u64,
-    files: usize,
-    commit: Option<Duration>,
-}
-
-fn pct(values: &mut [f64], q: f64) -> f64 {
-    if values.is_empty() {
-        return f64::NAN;
+fn var(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("{name} is not valid UTF-8")),
     }
+}
+
+fn positive<T: FromStr + PartialEq + Default>(name: &str, default: T) -> Result<T>
+where
+    T::Err: Display + Send + Sync + 'static,
+{
+    let Some(text) = var(name)? else { return Ok(default) };
+    let value = text
+        .trim()
+        .parse::<T>()
+        .map_err(|error| anyhow::anyhow!("{name}={text:?} is invalid: {error}"))?;
+    ensure!(value != T::default(), "{name} must be positive");
+    Ok(value)
+}
+
+fn strict<T: serde::de::DeserializeOwned>(name: &str, default: &str) -> Result<T> {
+    let text = var(name)?.unwrap_or_else(|| default.to_owned());
+    serde_json::from_value(json!(text)).with_context(|| format!("{name}={text:?} is invalid"))
+}
+
+/// Captures durable commit events emitted by `arrow_deltalake::telemetry::data_commit`.
+#[derive(Clone, Default)]
+struct Commits(Arc<Mutex<Vec<Value>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Commits {
+    fn on_event(&self, event: &tracing::Event<'_>, _: LayerContext<'_, S>) {
+        struct Field(Option<String>);
+        impl tracing::field::Visit for Field {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+                if field.name() == "commit" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut field = Field(None);
+        event.record(&mut field);
+        if let Some(text) = field.0
+            && let Ok(value) = serde_json::from_str::<Value>(&text)
+            && let Ok(mut commits) = self.0.lock()
+        {
+            commits.push(value);
+        }
+    }
+}
+
+fn pct(values: &mut [f64], q: f64) -> Option<f64> {
     values.sort_by(f64::total_cmp);
-    values[((values.len() - 1) as f64 * q).round() as usize]
+    let last = values.len().checked_sub(1)?;
+    Some(values[(last as f64 * q).round() as usize])
+}
+
+fn unix_ms() -> Result<u64> {
+    Ok(u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?)
+}
+
+fn field_u64(event: &Value, name: &str) -> Result<u64> {
+    event[name].as_u64().with_context(|| format!("commit event omitted {name}: {event}"))
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let root = std::env::args().nth(1).context("usage: commit_bench <table-root>")?;
-    let producers = env("BENCH_PRODUCERS", 4_usize);
-    let depth = env("BENCH_DEPTH", 8_usize);
-    let warmup = Duration::from_secs(env("BENCH_WARMUP", 5_u64));
-    let measure = Duration::from_secs(env("BENCH_SECONDS", 20_u64));
-    let ids = env("BENCH_IDS_PER_GROUP", 16_usize);
-    let rows = env("BENCH_ROWS_PER_ID", 4096_usize);
-    let width = env("BENCH_WIDTH", 64_usize);
-    let stage_concurrency = env("BENCH_STAGE_CONCURRENCY", 1_usize);
+    let commits = Commits::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(commits.clone()))?;
+    let mut args = std::env::args().skip(1);
+    let root = args.next().context("usage: commit_bench <table-root>")?;
+    ensure!(args.next().is_none(), "usage: commit_bench <table-root>");
+    if var("BENCH_EAGER")?.is_some() {
+        bail!("BENCH_EAGER was replaced by BENCH_TRIGGER=window|eager");
+    }
+    let producers = positive("BENCH_PRODUCERS", 4_usize)?;
+    let depth = positive("BENCH_DEPTH", 8_usize)?;
+    let warmup = Duration::from_secs(positive("BENCH_WARMUP", 5_u64)?);
+    let measure = Duration::from_secs(positive("BENCH_SECONDS", 20_u64)?);
+    let ids = positive("BENCH_IDS_PER_GROUP", 16_usize)?;
+    let rows = positive("BENCH_ROWS_PER_ID", 4096_usize)?;
+    let width = positive("BENCH_WIDTH", 64_usize)?;
+    let stage_concurrency = positive("BENCH_STAGE_CONCURRENCY", 1_usize)?;
     let options = CommitOptions {
-        batch_window: Duration::from_millis(env("BENCH_WINDOW_MS", 2000_u64)),
-        max_files_per_commit: env("BENCH_MAX_FILES", 128_usize),
-        max_pending_files: env("BENCH_MAX_PENDING", 512_usize),
-        trigger: if env("BENCH_EAGER", 0_u8) == 1 { CommitTrigger::Eager } else { CommitTrigger::Window },
-        txn_lookup_mode: match std::env::var("BENCH_LOOKUP").as_deref() {
-            Ok("per_id") => arrow_deltalake::TxnLookupMode::PerId,
-            Ok("batched_cached") => arrow_deltalake::TxnLookupMode::BatchedCached,
-            _ => arrow_deltalake::TxnLookupMode::Batched,
-        },
+        batch_window: Duration::from_millis(positive("BENCH_WINDOW_MS", 2000_u64)?),
+        max_files_per_commit: positive("BENCH_MAX_FILES", 128_usize)?,
+        max_pending_files: positive("BENCH_MAX_PENDING", 512_usize)?,
+        trigger: strict::<CommitTrigger>("BENCH_TRIGGER", "window")?,
+        txn_lookup_mode: strict::<TxnLookupMode>("BENCH_LOOKUP", "batched")?,
     };
+    options.validate()?;
     let payload = "x".repeat(width);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -57,23 +118,26 @@ async fn main() -> Result<()> {
             Field::new("payload", DataType::Utf8, false),
         ])),
         vec![
-            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(Int64Array::from_iter_values(0..i64::try_from(rows)?)),
             Arc::new(StringArray::from_iter_values((0..rows).map(|row| format!("{payload}{row}")))),
         ],
     )?;
     let table = BatchedTable::open(&root, options.clone()).await?;
+    let start_ms = unix_ms()?;
     let started = Instant::now();
     let total = warmup + measure;
+    let window_start = start_ms + u64::try_from(warmup.as_millis())?;
+    let window_end = window_start + u64::try_from(measure.as_millis())?;
     let mut workers = Vec::new();
     for producer in 0..producers {
         let table = Arc::clone(&table);
         let batch = batch.clone();
         workers.push(tokio::spawn(async move {
-            let mut samples = Vec::new();
+            let mut receipts = Vec::new();
             let mut in_flight = VecDeque::new();
             let mut group = 0_u64;
             while started.elapsed() < total {
-                let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+                let stamp = i64::try_from(unix_ms()?)?;
                 let entries = (0..ids)
                     .map(|id| (batch.clone(), format!("bench.{producer}.{group}.{id}"), 0, stamp))
                     .collect::<Vec<_>>();
@@ -85,67 +149,76 @@ async fn main() -> Result<()> {
                         .stage_coalesced_publications_with_concurrency(entries, stage_concurrency)
                         .await?;
                     let stage = begin.elapsed();
-                    let result = table.submit_prepared_group(prepared, false).await?.wait().await?;
-                    anyhow::Ok(Sample {
-                        finished: started.elapsed(),
-                        latency: begin.elapsed(),
-                        stage,
-                        rows: result.files.iter().map(|file| file.rows as u64).sum(),
-                        version: result.version,
-                        files: result.files.len(),
-                        commit: result.commit_duration,
-                    })
+                    table.submit_prepared_group(prepared, false).await?.wait().await?;
+                    anyhow::Ok((unix_ms()?, begin.elapsed(), stage))
                 }));
                 if in_flight.len() >= depth {
-                    samples.push(in_flight.pop_front().context("in-flight group")?.await??);
+                    receipts.push(in_flight.pop_front().context("in-flight group")?.await??);
                 }
             }
             table.flush_pending();
             for task in in_flight {
-                samples.push(task.await??);
+                receipts.push(task.await??);
             }
-            anyhow::Ok(samples)
+            anyhow::Ok(receipts)
         }));
     }
-    let mut samples = Vec::new();
+    let mut receipts = Vec::new();
     for worker in workers {
-        samples.extend(worker.await??);
+        receipts.extend(worker.await??);
     }
-    let window = samples
-        .iter()
-        .filter(|sample| sample.finished >= warmup && sample.finished < total)
-        .collect::<Vec<_>>();
-    let committed: u64 = window.iter().map(|sample| sample.rows).sum();
-    let mut versions = BTreeMap::new();
-    for sample in &window {
-        let entry = versions.entry(sample.version).or_insert((0_usize, Duration::ZERO));
-        entry.0 += sample.files;
-        if let Some(commit) = sample.commit {
-            entry.1 = entry.1.max(commit);
+    let events = commits.0.lock().map_err(|_| anyhow::anyhow!("commit capture poisoned"))?.clone();
+    let uncertain = events.iter().filter(|event| event["outcome"] != "committed").count();
+    ensure!(uncertain == 0, "{uncertain} commit events were not clean commits");
+    let (mut committed, mut files, mut parquet_bytes, mut versions) = (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut commit_seconds = Vec::new();
+    for event in &events {
+        let finished = field_u64(event, "finished_at_unix_ms")?;
+        if finished < window_start || finished >= window_end {
+            continue;
         }
+        committed += field_u64(event, "rows")?;
+        files += field_u64(event, "files")?;
+        parquet_bytes += field_u64(event, "parquet_bytes")?;
+        versions += 1;
+        commit_seconds.push(event["elapsed_seconds"].as_f64().context("commit event omitted elapsed_seconds")?);
     }
-    let mut latency = window.iter().map(|sample| sample.latency.as_secs_f64()).collect::<Vec<_>>();
-    let mut stage = window.iter().map(|sample| sample.stage.as_secs_f64()).collect::<Vec<_>>();
-    let mut commit = versions.values().map(|(_, commit)| commit.as_secs_f64()).collect::<Vec<_>>();
-    let busy = commit.iter().sum::<f64>() / measure.as_secs_f64();
-    let files: usize = versions.values().map(|(files, _)| files).sum();
+    ensure!(versions > 0, "no durable commit finished inside the measurement window");
+    let in_window = |finished: &u64| (window_start..window_end).contains(finished);
+    let mut latency = receipts
+        .iter()
+        .filter(|(finished, ..)| in_window(finished))
+        .map(|(_, latency, _)| latency.as_secs_f64())
+        .collect::<Vec<_>>();
+    let mut stage = receipts
+        .iter()
+        .filter(|(finished, ..)| in_window(finished))
+        .map(|(.., stage)| stage.as_secs_f64())
+        .collect::<Vec<_>>();
+    let seconds = measure.as_secs_f64();
     println!(
         "{}",
-        serde_json::json!({
-            "trigger": format!("{:?}", options.trigger),
+        json!({
+            "rows_basis": "durable_commit_events_finished_in_half_open_window",
+            "trigger": options.trigger,
             "window_ms": options.batch_window.as_millis(),
-            "lookup": format!("{:?}", options.txn_lookup_mode),
+            "lookup": options.txn_lookup_mode,
             "producers": producers, "depth": depth, "ids_per_group": ids, "rows_per_id": rows,
-            "rows_per_s": committed as f64 / measure.as_secs_f64(),
-            "groups": window.len(),
-            "versions": versions.len(),
-            "groups_per_version": window.len() as f64 / versions.len().max(1) as f64,
-            "files_per_version": files as f64 / versions.len().max(1) as f64,
-            "latency_p50_s": pct(&mut latency, 0.5), "latency_p99_s": pct(&mut latency, 0.99),
+            "warmup_s": warmup.as_secs(), "measure_s": measure.as_secs(),
+            "rows_per_s": committed as f64 / seconds,
+            "rows": committed,
+            "versions": versions,
+            "versions_per_s": versions as f64 / seconds,
+            "files_per_version": files as f64 / versions as f64,
+            "parquet_bytes_per_s": parquet_bytes as f64 / seconds,
+            "commit_p50_s": pct(&mut commit_seconds.clone(), 0.5),
+            "commit_p99_s": pct(&mut commit_seconds.clone(), 0.99),
+            "commit_busy": commit_seconds.iter().sum::<f64>() / seconds,
+            "receipts_in_window": latency.len(),
+            "receipt_latency_p50_s": pct(&mut latency, 0.5),
+            "receipt_latency_p99_s": pct(&mut latency, 0.99),
             "stage_p50_s": pct(&mut stage, 0.5),
-            "commit_p50_s": pct(&mut commit, 0.5), "commit_p99_s": pct(&mut commit, 0.99),
-            "commit_busy": busy,
-            "last_version": versions.keys().last(),
+            "events_total": events.len(),
         })
     );
     Ok(())

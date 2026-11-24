@@ -1127,6 +1127,11 @@ pub struct CommitTunables {
         deserialize_with = "deserialize_txn_lookup_mode"
     )]
     pub txn_lookup_mode: Option<arrow_deltalake::TxnLookupMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_commit_trigger"
+    )]
+    pub trigger: Option<arrow_deltalake::CommitTrigger>,
     pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
@@ -1141,6 +1146,12 @@ fn deserialize_txn_lookup_mode<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::TxnLookupMode>, D::Error> {
     arrow_deltalake::TxnLookupMode::deserialize(d).map(Some)
+}
+
+fn deserialize_commit_trigger<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CommitTrigger>, D::Error> {
+    arrow_deltalake::CommitTrigger::deserialize(d).map(Some)
 }
 
 fn deserialize_delta_stats_columns<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>

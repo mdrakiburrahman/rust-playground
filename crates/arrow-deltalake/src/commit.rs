@@ -17,28 +17,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-/// When a partially filled batch is committed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommitTrigger {
-    /// Wait up to `batch_window` for more files unless forced or full.
-    #[default]
-    Window,
-    /// Commit everything already queued as soon as the worker is idle.
-    Eager,
-}
-
-impl<'de> serde::Deserialize<'de> for CommitTrigger {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        match String::deserialize(deserializer).as_deref() {
-            Ok("window") => Ok(Self::Window),
-            Ok("eager") => Ok(Self::Eager),
-            _ => Err(serde::de::Error::custom(
-                "collector.commit.trigger must be window or eager",
-            )),
-        }
-    }
-}
+pub use crate::CommitTrigger;
 
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1303,6 +1282,90 @@ mod tests {
             table.submit_prepared_group(prepared, true).await?.wait().await?.version,
             2
         );
+        Ok(())
+    }
+
+    /// Scenario: unforced groups reach the worker while an earlier commit is blocked.
+    /// Guarantees: eager commits the first group without its window and group-commits the
+    /// queued cohort as the next version; window mode still holds a lone group until flushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_trigger_group_commits_queued_cohort_without_waiting_for_window() -> Result<()> {
+        type Gates = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+        struct Gate(Mutex<Option<Gates>>);
+        impl PublicationFence for Gate {
+            fn check_before_commit(
+                &self,
+                context: &crate::delta::PublicationFenceContext<'_>,
+            ) -> std::result::Result<(), PublicationFenceError> {
+                if context.file_count() > 0
+                    && let Some((entered, release)) = self
+                        .0
+                        .lock()
+                        .map_err(|_| PublicationFenceError::check_failed("test gate poisoned"))?
+                        .take()
+                {
+                    let _ = entered.send(());
+                    release
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|_| PublicationFenceError::check_failed("test gate was not released"))?;
+                }
+                Ok(())
+            }
+        }
+        let bound = Duration::from_secs(3);
+        let options = CommitOptions {
+            trigger: CommitTrigger::Eager,
+            batch_window: Duration::from_secs(60),
+            max_files_per_commit: 8,
+            max_pending_files: 8,
+            ..Default::default()
+        };
+        let directory = tempfile::tempdir()?;
+        let (entered, observed) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let fence = Arc::new(Gate(Mutex::new(Some((entered, wait)))));
+        let table = BatchedTable::open_with_fence(directory.path(), options.clone(), fence).await?;
+        let mut groups = Vec::new();
+        for (stamp, name) in [(10, "first"), (20, "second"), (30, "third")] {
+            groups.push(
+                table
+                    .stage_coalesced_publications(vec![(input()?, name.into(), 0, stamp)])
+                    .await?,
+            );
+        }
+        let mut groups = groups.into_iter();
+        let first = table
+            .submit_prepared_group(groups.next().context("first group")?, false)
+            .await?;
+        tokio::time::timeout(bound, observed)
+            .await
+            .context("eager commit waited for the window")??;
+        let mut queued = Vec::new();
+        for group in groups {
+            queued.push(table.submit_prepared_group(group, false).await?);
+        }
+        release.send(())?;
+        assert_eq!(tokio::time::timeout(bound, first.wait()).await??.version, 1);
+        for receipt in queued {
+            assert_eq!(tokio::time::timeout(bound, receipt.wait()).await??.version, 2);
+        }
+        let log = std::fs::read_to_string(directory.path().join("_delta_log/00000000000000000002.json"))?;
+        assert_eq!(log.lines().filter(|line| line.starts_with(r#"{"add""#)).count(), 2);
+
+        let directory = tempfile::tempdir()?;
+        let windowed = CommitOptions {
+            trigger: CommitTrigger::Window,
+            ..options
+        };
+        let table = BatchedTable::open(directory.path(), windowed).await?;
+        let group = table
+            .stage_coalesced_publications(vec![(input()?, "window".into(), 0, 10)])
+            .await?;
+        let receipt = tokio::spawn(table.submit_prepared_group(group, false).await?.wait());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!receipt.is_finished(), "window trigger committed before its window or a flush");
+        table.flush_pending();
+        assert_eq!(tokio::time::timeout(bound, receipt).await???.version, 1);
         Ok(())
     }
 
