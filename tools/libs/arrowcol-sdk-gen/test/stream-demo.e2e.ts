@@ -9,12 +9,27 @@ const id = process.env.CONTRACT_STREAM_RUN;
 assert.ok(id, 'Set CONTRACT_STREAM_RUN to a successful new flat events contract; the proof refuses nonempty tables');
 const execute = commandRunner(process.cwd());
 const cli = ['--no-install', 'tsx', 'tools/libs/arrowcol-sdk-gen/src/stream-demo.ts'];
-const call = (action: string, extra: string[] = []) => execute('npx', [...cli, `--action=${action}`, `--run-id=${id}`, ...extra]);
+const call = (action: string, extra: string[] = [], env?: NodeJS.ProcessEnv) =>
+  execute('npx', [...cli, `--action=${action}`, `--run-id=${id}`, ...extra], undefined, env);
 await call('prepare');
 const root = resolve(contractRoot, 'demos', id);
 const baseline = JSON.parse(await call('inspect'));
 assert.deepEqual(baseline.rows, [], 'Use a fresh empty table; this proof never deletes data or replays CREATE');
 for (const language of ['rust', 'cpp', 'csharp']) await call('build', [`--language=${language}`]);
+function emitter(language: string, args: string[], env: NodeJS.ProcessEnv): Promise<string> {
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  if (language === 'csharp') return execute('dotnet',
+    [join(root, 'apps/csharp/bin/Release/net8.0/Emitter.dll'), ...args], undefined, env);
+  const binary = language === 'rust'
+    ? resolve(`target/arrowcol-sdk-gen-validation-cargo-target/debug/emitter${suffix}`)
+    : join(root, 'apps/cpp/build', process.platform === 'win32' ? 'Release/emitter.exe' : 'emitter');
+  return execute(binary, args, undefined, env);
+}
+for (const language of ['rust', 'cpp', 'csharp']) {
+  await assert.rejects(emitter(language, [], { ARROWCOL_ENDPOINT: undefined }), /Set ARROWCOL_ENDPOINT or pass --endpoint/);
+  await assert.rejects(emitter(language, [], { ARROWCOL_ENDPOINT: ' ' }), /must not be blank/);
+  await assert.rejects(emitter(language, ['--endpoint', ' '], { ARROWCOL_ENDPOINT: 'http://localhost:18830' }), /must not be blank/);
+}
 assert.ok(!existsSync(join(root, 'serve.lock')), 'Do not run the proof alongside another demo collector');
 let collector: ChildProcess | undefined, kustoStarted = false;
 const expected: [number, number, string][] = [];
@@ -44,9 +59,12 @@ try {
     await delay(250);
   }
   assert.ok(ready, 'Demo collectors did not become ready');
+  const endpoints = JSON.parse(readFileSync(join(root, 'endpoints.json'), 'utf8'));
   for (const language of ['rust', 'cpp', 'csharp']) {
     for (const node of [false, true]) {
-      const output = await call('emit', [`--language=${language}`, '--duration-seconds=2', ...(node ? ['--node'] : [])]);
+      const output = node
+        ? await emitter(language, ['--duration-seconds', '2'], { ARROWCOL_ENDPOINT: endpoints.node.replace('127.0.0.1', 'localhost') })
+        : await call('emit', [`--language=${language}`, '--duration-seconds=2'], { ARROWCOL_ENDPOINT: 'invalid-must-be-overridden' });
       const result = output.trim().split('\n').map((line) => line.trim()).reverse().find((line) => line.startsWith('{"language":'));
       assert.ok(result, `Missing emitter summary: ${output}`);
       const summary = JSON.parse(result);

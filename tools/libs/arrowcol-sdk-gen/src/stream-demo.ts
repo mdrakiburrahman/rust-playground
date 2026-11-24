@@ -88,7 +88,7 @@ serde_json = "=1.0.154"
 </ItemGroup></Project>
 `);
     writeFileSync(join(root, 'apps/csharp/Schema.cs'),
-      `global using Event = ${csEvent};\nglobal using EventsStream = Arrowcol.Generated.EventsStream;\n`);
+      `global using Events = ${csEvent};\n`);
     writeFileSync(join(cppProject, 'CMakeLists.txt'), `cmake_minimum_required(VERSION 3.20)
 project(arrowcol_emitter LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)

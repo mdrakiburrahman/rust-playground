@@ -8,8 +8,8 @@ contract, runs editable Rust/C++/C# emitters, and inspects actual Delta/Kusto ou
 | Piece | Produced by | Responsibility |
 | --- | --- | --- |
 | `Events` | Ordinary protobuf compilation: prost, protoc C++ or Grpc.Tools C# | Event fields and protobuf presence |
-| `EventsContract` | Arrowcol protoc plugin | Pinned schema/identity, validation and protobuf-to-Arrow conversion |
-| `EventsStream` | Generated convenience alias/wrapper | Connect the event contract to the shared engine |
+| `ArrowcolEventsContract` | Arrowcol protoc plugin | Pinned schema/identity, validation and protobuf-to-Arrow conversion |
+| `ArrowcolEventsStream` | Generated convenience alias/wrapper | Connect the event contract to the shared engine |
 | `ArrowcolStream` | Handwritten reusable runtime | Connection, bounded buffering, batching, push, flush and close |
 
 The generated archive bundles the shared runtime source unchanged so it can be
@@ -23,6 +23,16 @@ Its guarantees are Arrowcol's, not Zerobus's.
 Protobuf is the application model/schema contract. The wire is Arrow Flight;
 the adapter builds exact Arrow batches internally. Applications do not implement
 interfaces on their events or manually map fields to Arrow arrays.
+
+Only the Arrowcol-specific helpers receive the `Arrowcol` prefix. Ordinary
+protobuf classes stay `Events`, reusable independently of the Arrowcol SDK.
+The pattern is `Arrowcol<MessageName>Contract` and `Arrowcol<MessageName>Stream`:
+a protobuf message named `Demo` produces `ArrowcolDemoContract` and
+`ArrowcolDemoStream`, while its ordinary event type remains `Demo`.
+The existing protobuf packages, descriptors and schema fingerprints do not change.
+New SDK builds retain `EventsContract` and `EventsStream` as compatibility names;
+existing archives are immutable, so rebuild a pinned version to obtain the new
+helpers rather than editing an old archive.
 
 ## Build and consume an SDK
 
@@ -51,40 +61,103 @@ stream capability note; no lossy repeated-field/null-container mapping is hidden
 
 ## Minimal application APIs
 
+In each language below, keep the extracted `sdk/` tree beside your `app/`
+directory. A source-level `use`, `using` or `#include` does not replace the
+Cargo, .NET or CMake dependency declaration. These examples read
+`ARROWCOL_ENDPOINT` from application configuration; see
+[endpoint configuration](#configure-the-collector-connection) before running.
+
 ### Rust
 
-Alias the generated package as `sdk` in your Cargo manifest. Use its generated
-package name, not a guessed version/fingerprint:
+Create `app/Cargo.toml` with the following content. Replace
+`GENERATED_RUST_PACKAGE` with `packages.rust.name` from `sdk/sdk-manifest.json`;
+do not guess a version/fingerprint. `sdk` is the application's local import name:
 
-```rust
-use sdk::{EventsStream, StreamOptions, proto::Events};
+```toml
+[package]
+name = "events-demo"
+version = "0.1.0"
+edition = "2024"
 
-let mut stream = EventsStream::connect(
-    "http://127.0.0.1:18830",
-    StreamOptions { batch_rows: 1024, ..Default::default() },
-).await?;
+[workspace]
 
-stream.push(Events {
-    event_id: Some(42),
-    observed_at: Some(1_700_000_000_000_000),
-    payload: Some("example".to_owned()),
-}).await?;
-stream.flush().await?;
-stream.close().await?;
+[dependencies]
+sdk = { package = "GENERATED_RUST_PACKAGE", path = "../sdk/rust" }
+tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
+In `app/src/main.rs`, import the ordinary prost event and the Arrowcol helper.
+Cargo compiles and links the generated SDK and bundled runtime automatically;
+the generated SDK already contains `rust/src/proto.rs`:
+
+```rust
+use sdk::{ArrowcolEventsStream, StreamOptions, proto::Events};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = std::env::var("ARROWCOL_ENDPOINT")?;
+    let mut stream = ArrowcolEventsStream::connect(
+        &endpoint,
+        StreamOptions { batch_rows: 1024, ..Default::default() },
+    ).await?;
+    stream.push(Events {
+        event_id: Some(42),
+        observed_at: Some(1_700_000_000_000_000),
+        payload: Some("example".to_owned()),
+    }).await?;
+    stream.flush().await?;
+    stream.close().await?;
+    Ok(())
+}
+```
+
+From the directory containing `app/` and `sdk/`, run
+`cargo run --manifest-path app/Cargo.toml`.
 `push_batch(&events)` queues several protobuf events at once. The sample app's
 complete `main` and error handling are in `examples/arrowcol-stream/rust/main.rs`.
-The generic engine is `ArrowcolStream<EventsContract>`; `EventsStream` hides that
-contract parameter without requiring traits on consumer-authored event classes.
+You can copy that loop into `app/src/main.rs` instead. The generic engine is
+`ArrowcolStream<ArrowcolEventsContract>`; `ArrowcolEventsStream` hides that contract
+parameter without requiring traits on consumer-authored event classes.
 
 ### C# (.NET)
 
-Build the native library first, then reference `csharp/Contract.csproj`:
+Keep the extracted `sdk/` directory beside your application's `app/` directory:
+
+```text
+demo/
+  sdk/                 # Entire extracted SDK, including native/ and runtime/
+  app/
+    Emitter.csproj
+    Program.cs
+```
+
+Add this project reference in `app/Emitter.csproj` (or add the `ProjectReference`
+to your existing project, adjusting its relative path):
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../sdk/csharp/Contract.csproj" />
+  </ItemGroup>
+</Project>
+```
+
+This references the SDK assembly, including its generated `Events` message,
+contract and stream helper. Building the application invokes Grpc.Tools to
+generate and compile the protobuf classes in the referenced SDK project; no
+manual copy of `Events.cs` or precompiled managed DLL is needed. A C# `using`
+directive alone does **not** add an assembly reference.
+
+From `demo/`, build the native library first:
 
 ```bash
 cargo build --release --manifest-path sdk/native/Cargo.toml
-dotnet build sdk/csharp/Contract.csproj
+dotnet build app/Emitter.csproj
 ```
 
 The native binary must match the application's OS/architecture. Do not override
@@ -92,13 +165,19 @@ its target directory for these manual commands; the project copies the matching
 library from `native/target/release`. The Nx sample wrapper manages its shared
 build cache and copies that library for you.
 
-```csharp
-using Arrowcol.Client;
-using Arrowcol.Generated;
-using Arrowcol.Demo.Public;
+For the walkthrough's `demo.public.events` table, put this in `app/Program.cs`.
+`Events` is the ordinary protobuf class; the helper comes from `Arrowcol.Generated`:
 
-await using var stream = await ArrowcolStream<Events>.ConnectAsync(
-    "http://127.0.0.1:18830", EventsContract.Instance,
+```csharp
+using System;
+using Arrowcol.Client;
+using Arrowcol.Demo.Public;
+using Arrowcol.Generated;
+
+var endpoint = Environment.GetEnvironmentVariable("ARROWCOL_ENDPOINT")
+    ?? throw new InvalidOperationException("Set ARROWCOL_ENDPOINT");
+await using var stream = await ArrowcolEventsStream.ConnectAsync(
+    endpoint,
     new StreamOptions { BatchRows = 1024 });
 await stream.PushAsync(new Events {
     EventId = 42, ObservedAt = 1_700_000_000_000_000, Payload = "example"
@@ -107,32 +186,89 @@ await stream.FlushAsync();
 await stream.CloseAsync();
 ```
 
-`EventsStream.ConnectAsync(endpoint)` is the shorter generated equivalent.
+With the local collector running, run `dotnet run --project app/Emitter.csproj`
+from `demo/`. For a different table, use the event type and stream helper named
+in your SDK's `csharp/Contract.cs` instead of these demo-specific imports.
+
+`ArrowcolEventsStream.ConnectAsync(endpoint)` is shorthand for
+`ArrowcolStream<Events>.ConnectAsync(endpoint, ArrowcolEventsContract.Instance)`.
 `PushBatchAsync(events)` accepts multiple events. Required SQL fields must have
 protobuf presence; leaving a required field unset fails even if its default value
 would be zero. `DisposeAsync` releases resources; it does not hide a final flush.
 
+The checked-in loop sample is `examples/arrowcol-stream/csharp/Program.cs`.
+The Nx demo's `prepare` action generates its `Emitter.csproj` and a `Schema.cs`
+containing `global using Events = global::Arrowcol.Demo.Public.Events;` under
+`.temp/contract-builder/demos/<run-id>/apps/csharp/`. Those project files are
+local, Git-ignored outputs, not checked-in examples. When copying the loop into
+your own project, add `using Arrowcol.Demo.Public;` to `Program.cs` as above, or
+put the event alias in `Schema.cs`. Aliases only shorten names; they do not
+generate a new event class.
+
 ### C++
 
-Build `native/Cargo.toml` as above, add the generated `cpp/` CMake subdirectory,
-and link `arrowcol_contract`. CMake invokes ordinary protoc for the model.
+Build `native/Cargo.toml` as above, then create `app/CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(events_demo LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../sdk/cpp" contract)
+add_executable(emitter main.cpp)
+target_link_libraries(emitter PRIVATE arrowcol_contract)
+if(WIN32)
+  add_custom_command(TARGET emitter POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_FILE:contract_native> $<TARGET_FILE_DIR:emitter>)
+endif()
+```
+
+`arrowcol_contract` supplies headers, compiled protobuf models, libprotobuf and
+the native Arrowcol bridge. CMake invokes ordinary protoc for the model;
+`#include "contract.hpp"` alone is not enough to compile/link an application.
 For C++ reserved package components such as SQL schema `public`, the bundled
 `cpp/model/schema.proto` escapes the language namespace to `public_`. Field
 numbers, types and encoded event bytes are unchanged; canonical descriptors and
 the registry identity remain untouched. This avoids protoc 3.x generating an
 invalid C++ namespace.
 
+Use this `app/main.cpp`, or copy the editable loop from
+`examples/arrowcol-stream/cpp/main.cpp`:
+
 ```cpp
 #include "contract.hpp"
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
 
-auto stream = arrowcol_generated::EventsStream::Connect("http://127.0.0.1:18830");
-arrowcol_generated::EventsContract::Event event;
-event.set_event_id(42);
-event.set_observed_at(1700000000000000);
-event.set_payload("example");
-stream.Push(event);
-stream.Flush();
-stream.Close();
+int main() {
+    try {
+        const char* endpoint = std::getenv("ARROWCOL_ENDPOINT");
+        if (!endpoint || !*endpoint)
+            throw std::invalid_argument("Set ARROWCOL_ENDPOINT");
+        auto stream = arrowcol_generated::ArrowcolEventsStream::Connect(endpoint);
+        arrowcol_generated::ArrowcolEventsContract::Event event;
+        event.set_event_id(42);
+        event.set_observed_at(1700000000000000);
+        event.set_payload("example");
+        stream.Push(event);
+        stream.Flush();
+        stream.Close();
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
+```
+
+`ArrowcolEventsContract::Event` is an alias for the ordinary protoc class
+`::arrowcol::demo::public_::Events`, not an Arrowcol-prefixed event type.
+From the directory containing `app/` and `sdk/`, build and run on Linux:
+
+```bash
+cmake -S app -B app/build
+cmake --build app/build --config Release
+./app/build/emitter
 ```
 
 `PushBatch(events)` accepts a vector of events. The wrapper is move-only and
@@ -140,6 +276,50 @@ throws on errors; the sample catches them and exits nonzero. Its destructor
 releases resources without an implicit flush. Serialize access to each stream.
 On Windows, deploy its matching DLL alongside the application; do not mix a
 Linux `.so` with a Windows .NET/C++ process.
+
+## Configure the collector connection
+
+Keep deployment addresses out of event definitions and generated code. Pass a
+configured Flight URI into `connect`/`ConnectAsync`/`Connect`; the shared runtime
+does not read environment variables or discover a collector on your behalf.
+
+| Running the application | Endpoint configuration |
+| --- | --- |
+| Same host/network namespace as local regional | `ARROWCOL_ENDPOINT=http://localhost:18830` |
+| Same host/network namespace as local node | `ARROWCOL_ENDPOINT=http://localhost:18832` |
+| Nx localhost wrapper | Uses the active run's `endpoints.json` and passes `--endpoint`; `--node` chooses the hop |
+| Containers on a shared network | Use a real Compose/service DNS name and its internal port, e.g. `http://arrowcol-regional:18830`, only if that service/listener is configured |
+| Hosted deployment | Use the operator-provided stable DNS endpoint, e.g. `https://ingest.example.com:443`; this example hostname is not a provisioned service |
+
+The three checked-in loop apps use **`--endpoint` first, then `ARROWCOL_ENDPOINT`**.
+Missing or blank configuration fails explicitly; there is no fallback to another
+collector. In the Nx wrapper, its explicit active-demo endpoint deliberately
+overrides the environment, so a localhost demo cannot accidentally publish to a
+hosted destination.
+
+Set configuration in the shell that actually launches the application:
+
+```bash
+export ARROWCOL_ENDPOINT=http://localhost:18830
+cargo run --manifest-path app/Cargo.toml
+# Or: dotnet run --project app/Emitter.csproj
+# Or: ./app/build/emitter
+```
+
+In Windows CMD, use `set ARROWCOL_ENDPOINT=http://localhost:18830` for an application
+built for Windows. A host environment variable is not automatically forwarded by
+`docker exec`: pass `-e ARROWCOL_ENDPOINT=...` when launching inside a container.
+`localhost` always means the application's own host/container. The documented
+collectors bind to loopback inside the devcontainer; publishing/forwarding a port
+or changing the listener requires an intentional network configuration, not
+substituting a container IP.
+
+DNS keeps an address stable when service IPs change, but does not add authentication,
+retry safety or service discovery. Hosted ingress must support Arrow Flight/gRPC
+over HTTP/2. HTTPS uses native trusted roots and hostname verification. This SDK
+does not yet supply bearer-token/mTLS configuration, so do not claim support for
+a hosted endpoint that requires those credentials, disable TLS validation, or
+expose unauthenticated demo collectors publicly.
 
 ## Options, schema and delivery semantics
 

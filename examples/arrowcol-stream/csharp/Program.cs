@@ -2,9 +2,11 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-// The demo's generated project aliases Event and EventsStream to the generated schema classes.
+using Arrowcol.Generated;
+// The prepared demo's Schema.cs aliases Events to the ordinary protobuf message.
+// For your own project reference and aliases, see docs/architecture/arrowcol-platform/sdk-developer-guide.md.
 
-string endpoint = "http://127.0.0.1:18830";
+string? endpoint = null;
 int seconds = 300, intervalMs = 1000;
 for (int i = 0; i < args.Length; i += 2)
 {
@@ -18,15 +20,19 @@ for (int i = 0; i < args.Length; i += 2)
 }
 if (seconds is < 1 or > 86400 || intervalMs is < 1 or > 60000)
     throw new ArgumentException("Duration must be 1..86400 seconds; interval 1..60000 ms");
+endpoint ??= Environment.GetEnvironmentVariable("ARROWCOL_ENDPOINT")
+    ?? throw new ArgumentException("Set ARROWCOL_ENDPOINT or pass --endpoint");
+if (string.IsNullOrWhiteSpace(endpoint))
+    throw new ArgumentException("ARROWCOL_ENDPOINT or --endpoint must not be blank");
 using var stop = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
-await using var stream = await EventsStream.ConnectAsync(endpoint);
+await using var stream = await ArrowcolEventsStream.ConnectAsync(endpoint);
 var clock = Stopwatch.StartNew();
 long id = 0;
 while (clock.Elapsed.TotalSeconds < seconds && !stop.IsCancellationRequested)
 {
     // Edit event values here; the generated adapter supplies the Arrow schema and routing.
-    await stream.PushAsync(new Event {
+    await stream.PushAsync(new Events {
         EventId = id,
         ObservedAt = 1_700_000_000_000_000 + id,
         Payload = $"csharp-event-{id}"

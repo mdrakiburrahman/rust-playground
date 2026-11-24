@@ -28,13 +28,16 @@ fn protobuf_stream_adapter_checks_presence_ranges_and_decimal_values() {
         .unwrap_or_else(|| panic!("package name"))
         .replace('-', "_");
     let test = format!(
-        r#"use {name}::{{EventsContract, proto::Events}};
+        r#"use {name}::{{ArrowcolEventsContract, ArrowcolEventsStream, EventsContract, EventsStream, proto::Events}};
 use arrowcol_sdk_runtime::Contract;
 use arrow_array::{{Array, Decimal128Array}};
 #[test]
 fn conversion_preserves_values_and_rejects_loss() {{
     let mut event = Events {{ id: Some(127), price: Some("12.34".into()), observed_at: Some(1700000000000000), payload: None }};
-    let batch = EventsContract::record_batch(&[event.clone()]).unwrap();
+    let batch = ArrowcolEventsContract::record_batch(&[event.clone()]).unwrap();
+    assert_eq!(batch, EventsContract::record_batch(&[event.clone()]).unwrap());
+    let legacy: Option<EventsStream> = None;
+    let _branded: Option<ArrowcolEventsStream> = legacy;
     assert_eq!(batch.column(1).as_any().downcast_ref::<Decimal128Array>().unwrap().value(0), 1234);
     assert!(batch.column(3).is_null(0));
     event.id = None;

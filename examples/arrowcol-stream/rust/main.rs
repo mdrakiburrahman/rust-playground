@@ -1,16 +1,16 @@
 use std::time::{Duration, Instant};
-use sdk::{EventsStream, proto::Events};
+use sdk::{ArrowcolEventsStream, proto::Events};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut endpoint = "http://127.0.0.1:18830".to_owned();
+    let mut endpoint = None;
     let mut seconds = 300u64;
     let mut interval_ms = 1000u64;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("each option requires a value")?;
         match flag.as_str() {
-            "--endpoint" => endpoint = value,
+            "--endpoint" => endpoint = Some(value),
             "--duration-seconds" => seconds = value.parse()?,
             "--interval-ms" => interval_ms = value.parse()?,
             _ => return Err(format!("unknown option: {flag}").into()),
@@ -19,7 +19,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if seconds == 0 || seconds > 86_400 || interval_ms == 0 || interval_ms > 60_000 {
         return Err("duration must be 1..86400 seconds and interval 1..60000 ms".into());
     }
-    let mut stream = EventsStream::connect(&endpoint, Default::default()).await?;
+    let endpoint = match endpoint {
+        Some(value) => value,
+        None => std::env::var("ARROWCOL_ENDPOINT")
+            .map_err(|error| format!("Set ARROWCOL_ENDPOINT or pass --endpoint: {error}"))?,
+    };
+    if endpoint.trim().is_empty() {
+        return Err("ARROWCOL_ENDPOINT or --endpoint must not be blank".into());
+    }
+    let mut stream = ArrowcolEventsStream::connect(&endpoint, Default::default()).await?;
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut id = 0i64;
     while Instant::now() < deadline {

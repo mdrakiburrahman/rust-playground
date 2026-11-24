@@ -60,7 +60,8 @@ pub(super) fn render(context: &RenderContext<'_>, bundle: &ArtifactBundle) -> Sd
         .last()
         .ok_or_else(|| SdkGenError::Artifact("missing event message".into()))?
         .name();
-    let contract = format!("{event}Contract");
+    let contract = format!("Arrowcol{event}Contract");
+    let stream = format!("Arrowcol{event}Stream");
     let prefix = format!(
         "arrowcol_{}_v{}",
         context.schema.table_id().to_string().replace('-', ""),
@@ -105,7 +106,9 @@ pub(super) fn render(context: &RenderContext<'_>, bundle: &ArtifactBundle) -> Sd
 use super::*;
 pub use arrowcol_sdk_runtime::{{ArrowcolStream, StreamOptions}};
 pub struct {contract};
-pub type {event}Stream = ArrowcolStream<{contract}>;
+pub type {stream} = ArrowcolStream<{contract}>;
+pub use {contract} as {event}Contract;
+pub type {event}Stream = {stream};
 impl Contract for {contract} {{
     type Event = proto::{event};
     fn schema() -> arrow_schema::SchemaRef {{ arrow_schema() }}
@@ -207,7 +210,9 @@ struct {contract} {{
     static void Destroy(void* handle) {{ {prefix}_destroy(handle); }}
     static void FreeError(char* error) {{ {prefix}_free_error(error); }}
 }};
-using {event}Stream = arrowcol::ArrowcolStream<{contract}>;
+using {stream} = arrowcol::ArrowcolStream<{contract}>;
+using {event}Contract = {contract};
+using {event}Stream = {stream};
 }}
 "#
     );
@@ -245,9 +250,18 @@ public sealed class {contract} : IArrowcolContract<{cs_event}> {{
     [DllImport("{prefix}", EntryPoint="{prefix}_free_error", CallingConvention=CallingConvention.Cdecl)]
     private static extern void FreeError(IntPtr error);
 }}
-public static class {event}Stream {{
+public static class {stream} {{
     public static Task<ArrowcolStream<{cs_event}>> ConnectAsync(string endpoint, StreamOptions? options = null) =>
         ArrowcolStream<{cs_event}>.ConnectAsync(endpoint, {contract}.Instance, options);
+}}
+public sealed class {event}Contract : IArrowcolContract<{cs_event}> {{
+    public static {event}Contract Instance {{ get; }} = new();
+    public byte[] Encode({cs_event} value) => {contract}.Instance.Encode(value);
+    public NativeApi Native => {contract}.Instance.Native;
+}}
+public static class {event}Stream {{
+    public static Task<ArrowcolStream<{cs_event}>> ConnectAsync(string endpoint, StreamOptions? options = null) =>
+        {stream}.ConnectAsync(endpoint, options);
 }}
 "#
     );
@@ -291,6 +305,6 @@ add_library(arrowcol_contract ${{PROTO_SOURCES}})
 target_include_directories(arrowcol_contract PUBLIC "${{CMAKE_CURRENT_BINARY_DIR}}" "${{CMAKE_CURRENT_SOURCE_DIR}}" "${{CMAKE_CURRENT_SOURCE_DIR}}/../runtime/arrowcol-sdk-runtime/bindings/cpp")
 target_link_libraries(arrowcol_contract PUBLIC protobuf::libprotobuf contract_native)
 "#).into_bytes());
-    files.insert("STREAMS.md".into(), format!("# Typed streams\n\n| Piece | Source |\n| --- | --- |\n| Event `{event}` | Standard protobuf compiler (prost, protoc C++ or Grpc.Tools C#) |\n| `{contract}` | Arrowcol plugin: validates presence/types and maps to the committed Arrow schema |\n| Stream engine | Shared `arrowcol-sdk-runtime`, copied verbatim under `runtime/` for an offline source bundle |\n| C++ / C# bridge | Table-specific `native/` adapter to the same Rust engine, not another transport |\n\nUse Rust `{event}Stream::connect(endpoint, Default::default()).await?`, C# `Arrowcol.Generated.{event}Stream.ConnectAsync(endpoint)`, or C++ `arrowcol_generated::{event}Stream::Connect(endpoint)`. Push normal generated protobuf events, then explicitly flush and close. A collector endpoint is the only destination configuration; there is no registry argument.\n\nBuild `native/Cargo.toml` with `cargo build --release --manifest-path native/Cargo.toml` before C++/C# builds. Do not override its target directory. C# `dotnet build csharp/Contract.csproj` and CMake `cpp/` invoke standard language protobuf generation; do not edit their generated message classes. Use matching native binaries for your OS/architecture. Native adapters are source-distributed, not prebuilt binaries.\n\nThe initial stream surface supports flat scalar schemas. Required fields preserve protobuf presence, integers are range checked, and decimal strings express numeric values (for example `12.34`, not an unscaled integer). Existing direct Arrow builders also support their previous nested types.\n\nPush queues a copied snapshot, with bounded backpressure; it does not wait for a per-record acknowledgement. Flush waits for validated collector admission. Neither flush nor on-node admission proves regional delivery or Delta/Kusto publication. There are no automatic network retries or exactly-once promises. Retain the application's source events for recovery; uncertain failures must be reconciled, not blindly replayed. Explicit Close surfaces errors; destruction/disposal alone does not flush. One logical writer per stream; C# serializes calls and C++ callers must serialize access.\n\nDefaults: 1,024 rows, 1 MiB Arrow batches, 32 MiB retained Arrow buffers, 1-second flush interval and 30-second per-RPC/capacity timeouts. The buffer budget is not total RSS. Oversized single calls fail before enqueueing and must be split. TLS uses native roots for HTTPS; HTTP is for trusted local development. This SDK does not provision authentication or enable public collector exposure.\n").into_bytes());
+    files.insert("STREAMS.md".into(), format!("# Typed streams\n\n| Piece | Source |\n| --- | --- |\n| Event `{event}` | Standard protobuf compiler (prost, protoc C++ or Grpc.Tools C#); no Arrowcol type prefix |\n| `{contract}` | Arrowcol plugin: validates presence/types and maps to the committed Arrow schema |\n| `{stream}` | Arrowcol-specific convenience helper |\n| Stream engine | Shared `arrowcol-sdk-runtime`, copied verbatim under `runtime/` for an offline source bundle |\n| C++ / C# bridge | Table-specific `native/` adapter to the same Rust engine, not another transport |\n\nUse Rust `{stream}::connect(endpoint, Default::default()).await?`, C# `Arrowcol.Generated.{stream}.ConnectAsync(endpoint)`, or C++ `arrowcol_generated::{stream}::Connect(endpoint)`. The older `{event}Contract` and `{event}Stream` names remain available for source compatibility. Ordinary protobuf message names, descriptors and schema identity are unchanged. Push normal generated protobuf events, then explicitly flush and close. Read the collector endpoint from application configuration (for example `ARROWCOL_ENDPOINT`); prefer a stable DNS service name to a machine IP. The SDK takes the resolved configuration value explicitly, not a registry argument, and does not discover services or read environment variables itself.\n\nBuild `native/Cargo.toml` with `cargo build --release --manifest-path native/Cargo.toml` before C++/C# builds. Do not override its target directory. C# `dotnet build csharp/Contract.csproj` and CMake `cpp/` invoke standard language protobuf generation; do not edit their generated message classes. Use matching native binaries for your OS/architecture. Native adapters are source-distributed, not prebuilt binaries.\n\nThe initial stream surface supports flat scalar schemas. Required fields preserve protobuf presence, integers are range checked, and decimal strings express numeric values (for example `12.34`, not an unscaled integer). Existing direct Arrow builders also support their previous nested types.\n\nPush queues a copied snapshot, with bounded backpressure; it does not wait for a per-record acknowledgement. Flush waits for validated collector admission. Neither flush nor on-node admission proves regional delivery or Delta/Kusto publication. There are no automatic network retries or exactly-once promises. Retain the application's source events for recovery; uncertain failures must be reconciled, not blindly replayed. Explicit Close surfaces errors; destruction/disposal alone does not flush. One logical writer per stream; C# serializes calls and C++ callers must serialize access.\n\nDefaults: 1,024 rows, 1 MiB Arrow batches, 32 MiB retained Arrow buffers, 1-second flush interval and 30-second per-RPC/capacity timeouts. The buffer budget is not total RSS. Oversized single calls fail before enqueueing and must be split. TLS uses native roots for HTTPS; HTTP is for trusted local development. This SDK does not provision authentication or enable public collector exposure.\n").into_bytes());
     Ok(files)
 }
