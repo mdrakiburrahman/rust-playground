@@ -3756,6 +3756,10 @@ mod downstream_runner_tests {
             assert_eq!(rows[0].status, "succeeded", "failure: {:?}", rows[0].failure);
             assert_eq!(rows[0].rows, Some(100));
             assert!(rows[0].qap.completion_percent.is_none());
+            assert!(rows[0].qap.pending_artifacts.is_none());
+            assert!(rows[0].qap.cached_bytes.is_none());
+            assert!(rows[0].qap.unhealthy_catalogs.is_none());
+            assert!(rows[0].qap.lag_seconds.is_none());
             let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
             assert_eq!(evidence["downstream_status"], "unavailable");
             if matches!(fault, Fault::ObservationInvalidJson) {
