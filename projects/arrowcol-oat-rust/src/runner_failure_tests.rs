@@ -666,7 +666,9 @@ mod qap_helper_lifetime_tests {
     fn process_status(pid: u32) -> Result<Option<(char, u32, u64)>> {
         let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let (_, fields) = stat.rsplit_once(')').context("fixture process stat")?;
