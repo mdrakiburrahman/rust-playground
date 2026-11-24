@@ -576,3 +576,15 @@ the observed admission ACK timestamp instead. Divide each count by the same
 window duration; do not add retries to fresh offers or count ACKs as Delta
 commits. A closed-loop sender can remain near one offer per ACK even with
 CPU headroom: measure spare sending capacity against an independent sink.
+
+### Collector Flight HTTP/2 receive settings
+
+| `collector.socket` field | Accepted bytes | Effect |
+| --- | --- | --- |
+| `h2_stream_window_bytes` | 65,535–67,108,864 | Initial receive credit per stream. |
+| `h2_connection_window_bytes` | 65,535–268,435,456 | Initial receive credit shared by streams on a connection. |
+| `h2_max_frame_bytes` | 16,384–1,048,576 | Maximum HTTP/2 frame size advertised to the sender. |
+
+All three are optional startup settings. Omitted values preserve the underlying
+tonic defaults. They do not change gRPC message limits, collector admission or
+commit acknowledgements. A configured value alone is not wire-level evidence.

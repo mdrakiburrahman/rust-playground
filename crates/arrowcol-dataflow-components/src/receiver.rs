@@ -627,12 +627,12 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             registration_shutdown,
         ));
         let flight_shutdown = shutdown.child_token();
-        let tcp_nodelay = self.config.socket.tcp_nodelay;
+        let socket = self.config.socket.clone();
         let mut flight = tokio::spawn(async move {
             let mut reported = false;
             let incoming = TcpListenerStream::new(flight_listener).map(move |result| {
                 result.and_then(|stream| {
-                    let (stream, actual) = configure_flight_socket(stream, tcp_nodelay)?;
+                    let (stream, actual) = configure_flight_socket(stream, socket.tcp_nodelay)?;
                     if let Some(actual) = actual
                         && !reported
                     {
@@ -646,6 +646,9 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                 })
             });
             Server::builder()
+                .initial_stream_window_size(socket.h2_stream_window_bytes)
+                .initial_connection_window_size(socket.h2_connection_window_bytes)
+                .max_frame_size(socket.h2_max_frame_bytes)
                 .add_service(service.into_tonic_service())
                 .serve_with_incoming_shutdown(incoming, flight_shutdown.cancelled_owned())
                 .await
