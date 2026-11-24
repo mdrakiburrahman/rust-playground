@@ -441,12 +441,14 @@ test('default restoration is a true no-op at supported safe capacity and capacit
 });
 
 test('breakthrough baseline and restore require all five pools and leave shared and added capacity untouched', async t => {
-  const env = { AZURE_SUBSCRIPTION_ID: campaignId, AZURE_STAMP: '54321', AZURE_LOCATION: 'canadacentral' };
+  const env = { AZURE_SUBSCRIPTION_ID: campaignId, AZURE_STAMP: '54321' };
   const config = new Config(env, defaultStampConfig(env));
+  config.location = 'fixturelocation';
   mockReviewedTopology(t, config);
   assert.equal(custodyIdleTopology(config).breakthrough, true);
   for (const key of ['subscription', 'cluster', 'location'] as const) {
     const changed = new Config(env, defaultStampConfig(env));
+    changed.location = config.location;
     changed[key] += 'x';
     assert.equal(custodyIdleTopology(changed).breakthrough, false);
   }

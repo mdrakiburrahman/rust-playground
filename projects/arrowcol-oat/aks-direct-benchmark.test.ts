@@ -48,8 +48,8 @@ test('rendered benchmark manifest enforces ownership, stage, image, and timed-wi
     BENCHRUNHEX: runId.replaceAll('-', ''),
     BENCHOWNER: owner,
     BENCHCLIENTID: '11111111-2222-4333-8444-555555555555',
-    BENCHREGISTRY: 'arrowcollector54321.azurecr.io',
-    BENCHDELTA_ROOT: 'abfss://arrowcol@arrowcollector54321.dfs.core.windows.net/direct-baseline-1/runs/' + runId + '/dataflow',
+    BENCHREGISTRY: 'fixture-registry.invalid',
+    BENCHDELTA_ROOT: 'abfss://arrowcol@fixture-storage.invalid/direct-baseline-1/runs/' + runId + '/dataflow',
     BENCHSTAMP: '54321',
     BENCHSUBSCRIPTION: '00000000-0000-4000-8000-000000000000',
     BENCHRESOURCEGROUP: 'fixture-rg',
@@ -59,12 +59,12 @@ test('rendered benchmark manifest enforces ownership, stage, image, and timed-wi
   });
   for (const duration of ['60', '600']) {
     const rendered = renderManifest(source, values(duration));
-    assertRenderedManifest(rendered, runId, owner, 'arrowcollector54321.azurecr.io');
-    assert.throws(() => assertRenderedManifest(rendered.replace('benchmark-stage: load', 'benchmark-stage: unknown'), runId, owner, 'arrowcollector54321.azurecr.io'), /stage label/);
-    assert.throws(() => assertRenderedManifest(rendered.replace('@sha256:', ':latest'), runId, owner, 'arrowcollector54321.azurecr.io'), /pinned SHA-256 digest/);
-    assert.throws(() => assertRenderedManifest(rendered.replace('arrowcol-oat/owner-token: ' + owner, 'arrowcol-oat/owner-token: ' + 'b'.repeat(48)), runId, owner, 'arrowcollector54321.azurecr.io'), /ownership markers/);
-    assert.throws(() => assertRenderedManifest(rendered.replace('kubernetes.azure.com/agentpool: benche64', 'kubernetes.azure.com/agentpool: arrowe192'), runId, owner, 'arrowcollector54321.azurecr.io'), /must select agent pool benche64/);
-    assert.throws(() => assertRenderedManifest(rendered.replace('        kubernetes.azure.com/agentpool: benche64\n', ''), runId, owner, 'arrowcollector54321.azurecr.io'), /must select agent pool benche64/);
+    assertRenderedManifest(rendered, runId, owner, 'fixture-registry.invalid');
+    assert.throws(() => assertRenderedManifest(rendered.replace('benchmark-stage: load', 'benchmark-stage: unknown'), runId, owner, 'fixture-registry.invalid'), /stage label/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('@sha256:', ':latest'), runId, owner, 'fixture-registry.invalid'), /pinned SHA-256 digest/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('arrowcol-oat/owner-token: ' + owner, 'arrowcol-oat/owner-token: ' + 'b'.repeat(48)), runId, owner, 'fixture-registry.invalid'), /ownership markers/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('kubernetes.azure.com/agentpool: benche64', 'kubernetes.azure.com/agentpool: arrowe192'), runId, owner, 'fixture-registry.invalid'), /must select agent pool benche64/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('        kubernetes.azure.com/agentpool: benche64\n', ''), runId, owner, 'fixture-registry.invalid'), /must select agent pool benche64/);
   }
 });
 
