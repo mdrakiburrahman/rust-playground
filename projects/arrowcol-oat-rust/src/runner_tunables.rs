@@ -494,7 +494,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         }
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
-            | "collector.commit.max_pending_files" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
+            | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
             | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"

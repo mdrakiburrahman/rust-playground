@@ -1020,6 +1020,8 @@ impl FlightReceiverConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitConfig {
+    /// Strategy used to resolve prior Delta transactions.
+    pub txn_lookup_mode: arrow_deltalake::TxnLookupMode,
     /// Maximum batching delay.
     #[serde(with = "humantime_serde")]
     pub batch_window: Duration,
@@ -1033,6 +1035,7 @@ impl Default for CommitConfig {
     fn default() -> Self {
         let options = arrow_deltalake::commit::CommitOptions::default();
         Self {
+            txn_lookup_mode: options.txn_lookup_mode,
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
@@ -1043,6 +1046,7 @@ impl Default for CommitConfig {
 impl CommitConfig {
     pub(crate) fn build(&self) -> Result<arrow_deltalake::commit::CommitOptions, String> {
         let options = arrow_deltalake::commit::CommitOptions {
+            txn_lookup_mode: self.txn_lookup_mode,
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,

@@ -480,6 +480,7 @@ fn candidates(path: &str) -> Vec<Value> {
         "client.build_profile.codegen_units" => return vec![json!(16)],
         "client.build_profile.opt_level" => return vec![json!(3)],
         "client.build_profile.target_cpu" => return vec![json!("generic")],
+        "collector.commit.txn_lookup_mode" => return vec![json!("batched_cached"), json!("per_id"), json!("batched")],
         "collector.runtime.cpu_dispatch" => return vec![json!("bounded_shards")],
         "collector.runtime.cpu_placement" => return vec![json!("scatter_allowed")],
         "collector.batching.stage_file_concurrency" => return vec![json!(16)],
