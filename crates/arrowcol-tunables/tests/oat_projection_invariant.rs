@@ -470,6 +470,9 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "collector.runtime.parquet_encode_mode" {
         input["collector"] = json!({"runtime":{"parquet_column_workers":4}});
     }
+    if path.starts_with("collector.mimalloc.") {
+        input["collector"] = json!({"allocator":"mimalloc"});
+    }
     if path == "router.sql_pool_acquire_timeout_ms" {
         input["router"] = json!({"sql_pool_max_size": 1});
     }
@@ -530,6 +533,9 @@ fn candidates(path: &str) -> Vec<Value> {
         "collector.isolation_level" => return vec![json!("l2")],
         "collector.allocator" => return vec![json!("system")],
         "collector.malloc.hugetlb" => return vec![json!("transparent")],
+        "collector.mimalloc.arena_eager_commit" => return vec![json!("always")],
+        "collector.mimalloc.page_commit_on_demand" => return vec![json!("on_demand")],
+        "collector.mimalloc.page_reclaim_on_free" => return vec![json!("any_heap")],
         "collector.lto" => return vec![json!("off")],
         "collector.codegen_units" => return vec![json!(16)],
         "collector.opt_level" => return vec![json!(3)],
@@ -701,7 +707,8 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
         ),
         "collector"
             if [
-                "batching", "catalog", "commit", "exporter", "limits", "malloc", "pressure", "routing", "socket",
+                "batching", "catalog", "commit", "exporter", "limits", "malloc", "mimalloc", "pressure", "routing",
+                "socket",
             ]
             .contains(&parts[1]) =>
         {

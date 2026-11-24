@@ -352,6 +352,35 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.malloc.tcache_max", "glibc default: 1032"),
     capability!("collector.malloc.tcache_unsorted_limit", "glibc default: 0 (unlimited)"),
     capability!("collector.malloc.hugetlb", "glibc default: disabled"),
+    capability!("collector.mimalloc.purge_delay_ms", "mimalloc default: 1000"),
+    capability!("collector.mimalloc.purge_decommits", "mimalloc default: true"),
+    capability!(
+        "collector.mimalloc.arena_eager_commit",
+        "mimalloc default: on_overcommit"
+    ),
+    capability!("collector.mimalloc.allow_large_os_pages", "mimalloc default: false"),
+    capability!("collector.mimalloc.reserve_huge_os_pages", "mimalloc default: 0"),
+    capability!("collector.mimalloc.reserve_os_memory_kib", "mimalloc default: 0"),
+    capability!("collector.mimalloc.arena_reserve_kib", "mimalloc default: 1048576"),
+    capability!("collector.mimalloc.arena_purge_mult", "mimalloc default: 1"),
+    capability!(
+        "collector.mimalloc.minimal_purge_size_kib",
+        "mimalloc default: 0 (automatic)"
+    ),
+    capability!("collector.mimalloc.page_commit_on_demand", "mimalloc default: eager"),
+    capability!("collector.mimalloc.page_max_candidates", "mimalloc default: 4"),
+    capability!("collector.mimalloc.page_full_retain", "mimalloc default: 2"),
+    capability!("collector.mimalloc.generic_collect", "mimalloc default: 10000"),
+    capability!("collector.mimalloc.page_reclaim_on_free", "mimalloc default: own_heap"),
+    capability!(
+        "collector.mimalloc.page_max_reclaim",
+        "mimalloc default: -1 (unlimited)"
+    ),
+    capability!(
+        "collector.mimalloc.page_cross_thread_max_reclaim",
+        "mimalloc default: 32"
+    ),
+    capability!("collector.mimalloc.use_numa_nodes", "mimalloc default: 0 (detected)"),
     capability!("collector.pressure.buffered_rows_limit", "10000000"),
     capability!("collector.pressure.buffered_batches_limit", "4096"),
     capability!("collector.pressure.pressure_interval", "2s"),
@@ -1321,6 +1350,9 @@ impl Tunables {
                 if let Some(value) = &collector.malloc {
                     insert_json_config("ARROWCOL_COLLECTOR_MALLOC_CONFIG", value, &mut output)?;
                 }
+                if let Some(value) = &collector.mimalloc {
+                    insert_json_config("ARROWCOL_COLLECTOR_MIMALLOC_CONFIG", value, &mut output)?;
+                }
                 if let Some(value) = collector.thp_disabled {
                     output.insert("ARROWCOL_COLLECTOR_THP_DISABLED".to_owned(), value.to_string());
                 }
@@ -1899,6 +1931,12 @@ fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
         }
         if malloc.hugetlb == Some(GlibcMallocHugetlb::Transparent) && collector.thp_disabled == Some(true) {
             bail!("collector.malloc.hugetlb transparent cannot take effect with collector.thp_disabled true");
+        }
+    }
+    if let Some(mimalloc) = &collector.mimalloc {
+        mimalloc.validate().map_err(anyhow::Error::msg)?;
+        if collector.allocator != Some(CollectorAllocator::Mimalloc) {
+            bail!("collector.mimalloc requires collector.allocator mimalloc");
         }
     }
     if collector.codegen_units.is_some_and(|units| !(1..=256).contains(&units)) {
@@ -3343,6 +3381,120 @@ mod tests {
                 !valid
                     .environment_for(role)?
                     .contains_key("ARROWCOL_COLLECTOR_MALLOC_CONFIG")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mimalloc_options_are_strict_and_project_to_the_collector() -> Result<()> {
+        for (mimalloc, expected) in [
+            (serde_json::json!({}), "collector.mimalloc"),
+            (serde_json::json!(null), "collector.mimalloc"),
+            (
+                serde_json::json!({"purge_delay_ms":-2}),
+                "collector.mimalloc.purge_delay_ms",
+            ),
+            (
+                serde_json::json!({"purge_delay_ms":1.5}),
+                "collector.mimalloc.purge_delay_ms",
+            ),
+            (
+                serde_json::json!({"purge_delay_ms":"10"}),
+                "collector.mimalloc.purge_delay_ms",
+            ),
+            (
+                serde_json::json!({"purge_decommits":1}),
+                "collector.mimalloc.purge_decommits",
+            ),
+            (
+                serde_json::json!({"arena_eager_commit":2}),
+                "collector.mimalloc.arena_eager_commit",
+            ),
+            (
+                serde_json::json!({"arena_eager_commit":"lazy"}),
+                "collector.mimalloc.arena_eager_commit",
+            ),
+            (
+                serde_json::json!({"reserve_huge_os_pages":1_025}),
+                "collector.mimalloc.reserve_huge_os_pages",
+            ),
+            (
+                serde_json::json!({"arena_reserve_kib":-1}),
+                "collector.mimalloc.arena_reserve_kib",
+            ),
+            (
+                serde_json::json!({"page_max_candidates":0}),
+                "collector.mimalloc.page_max_candidates",
+            ),
+            (
+                serde_json::json!({"page_full_retain":33}),
+                "collector.mimalloc.page_full_retain",
+            ),
+            (
+                serde_json::json!({"generic_collect":0}),
+                "collector.mimalloc.generic_collect",
+            ),
+            (
+                serde_json::json!({"page_reclaim_on_free":"all"}),
+                "collector.mimalloc.page_reclaim_on_free",
+            ),
+            (
+                serde_json::json!({"page_commit_on_demand":null}),
+                "collector.mimalloc.page_commit_on_demand",
+            ),
+            (serde_json::json!({"eager_commit_delay":1}), "eager_commit_delay"),
+            (serde_json::json!({"allow_thp":false}), "allow_thp"),
+        ] {
+            let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"allocator":"mimalloc","mimalloc":mimalloc}
+            })));
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        for allocator in [serde_json::json!({}), serde_json::json!({"allocator":"system"})] {
+            let mut collector = allocator;
+            collector["mimalloc"] = serde_json::json!({"purge_delay_ms":-1});
+            let error = error_text(Tunables::parse_oat_json(serde_json::json!({"collector":collector})));
+            assert!(error.contains("collector.allocator mimalloc"), "{error}");
+        }
+
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"allocator":"mimalloc","mimalloc":{
+            "purge_delay_ms":-1,"arena_eager_commit":"always","allow_large_os_pages":true,"arena_reserve_kib":65_536,
+            "page_reclaim_on_free":"disabled","page_commit_on_demand":"on_demand_unless_overcommit"
+        }}}))?;
+        let mimalloc = valid
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.mimalloc.as_ref())
+            .context("mimalloc")?;
+        let environment: Vec<_> = mimalloc
+            .mimalloc_options()
+            .iter()
+            .map(|option| format!("{}={}", option.environment_name(), option.environment_value()))
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "MIMALLOC_PURGE_DELAY=-1",
+                "MIMALLOC_ARENA_EAGER_COMMIT=1",
+                "MIMALLOC_ALLOW_LARGE_OS_PAGES=1",
+                "MIMALLOC_ARENA_RESERVE=65536KiB",
+                "MIMALLOC_PAGE_COMMIT_ON_DEMAND=2",
+                "MIMALLOC_PAGE_RECLAIM_ON_FREE=-1",
+            ]
+        );
+        let environment = valid.environment_for(ComponentRole::Collector)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&environment["ARROWCOL_COLLECTOR_MIMALLOC_CONFIG"])?,
+            serde_json::json!({"purge_delay_ms":-1,"arena_eager_commit":"always","allow_large_os_pages":true,
+                "arena_reserve_kib":65_536,"page_commit_on_demand":"on_demand_unless_overcommit",
+                "page_reclaim_on_free":"disabled"})
+        );
+        for role in [ComponentRole::Client, ComponentRole::Router, ComponentRole::Maintenance] {
+            assert!(
+                !valid
+                    .environment_for(role)?
+                    .contains_key("ARROWCOL_COLLECTOR_MIMALLOC_CONFIG")
             );
         }
         Ok(())

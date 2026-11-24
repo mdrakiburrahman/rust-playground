@@ -349,6 +349,26 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if let Some(field) = path.strip_prefix("collector.mimalloc.") {
+            let requested = environment.get("ARROWCOL_COLLECTOR_MIMALLOC_CONFIG")
+                .and_then(|value| serde_json::from_str::<arrowcol_tunables::CollectorMimallocTunables>(value).ok());
+            let option = requested.as_ref().and_then(|requested| {
+                requested.mimalloc_options().into_iter().find(|option| option.field == field)
+            });
+            if let (Some(requested), Some(option)) = (requested, option)
+                && let Ok(requested) = serde_json::to_value(&requested)
+                && collectors.iter().all(|process| {
+                    let process = &process["effective_config"]["process"];
+                    process["mimalloc_scope"] == "mimalloc_env_startup_verbose_probe"
+                        && process["mimalloc"][field] == requested[field]
+                        && process["mimalloc_options"][option.name] == option.value
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_mimalloc_option_readback"}));
+                return false;
+            }
+            return true;
+        }
         if let Some(field) = path.strip_prefix("collector.socket.")
             && matches!(field, "recv_buffer_bytes" | "send_buffer_bytes")
         {
@@ -1973,6 +1993,41 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             let promoted = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
             for path in ["collector.malloc.arena_max", "collector.malloc.hugetlb"] {
                 assert_eq!(promoted.iter().any(|entry| entry["path"] == path), verified, "{path}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mimalloc_evidence_requires_allocator_readback() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"allocator":"mimalloc","mimalloc":{"purge_delay_ms":-1,"arena_eager_commit":"always"}}
+        }))?;
+        let typed = json!({"purge_delay_ms":-1,"arena_eager_commit":"always"});
+        let scope = "mimalloc_env_startup_verbose_probe";
+        for (observed, verified) in [
+            (json!({}), false),
+            (json!({"mimalloc":typed,"mimalloc_options":{"purge_delay":-1,"arena_eager_commit":1}}), false),
+            (json!({"mimalloc":typed,"mimalloc_scope":scope,
+                "mimalloc_options":{"purge_delay":1000,"arena_eager_commit":2}}), false),
+            (json!({"mimalloc":typed,"mimalloc_scope":scope,
+                "mimalloc_options":{"purge_delay":-1,"arena_eager_commit":1}}), true),
+        ] {
+            let process = json!({
+                "component":"collector", "instance_id":"collector-1", "log_complete":true,
+                "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+                "effective_config":{"process":observed}
+            });
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+            let promoted = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            for path in ["collector.mimalloc.purge_delay_ms", "collector.mimalloc.arena_eager_commit"] {
+                let entry = promoted.iter().find(|entry| entry["path"] == path);
+                assert_eq!(entry.is_some(), verified, "{path}");
+                if let Some(entry) = entry {
+                    assert_eq!(entry["reason"], "consumer_mimalloc_option_readback");
+                }
             }
         }
         Ok(())

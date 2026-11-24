@@ -14,6 +14,7 @@
 | `ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH` | Strict `true`/`false`; default `false`. Reuses arrays when a coalesced publication has only the internally generated ingestion partition. Supplied or multiple partition columns retain the normal grouping path. | Startup |
 | Cargo feature `allocator-mimalloc` | Opt-in mimalloc allocator for the collector binary; system allocator remains default | Rebuild |
 | `ARROWCOL_COLLECTOR_MALLOC_CONFIG` | Strict JSON of glibc malloc tunables (`arena_max`, `arena_test`, `mmap_threshold`, `mmap_max`, `trim_threshold`, `top_pad`, `mxfast`, `tcache_count`, `tcache_max`, `tcache_unsorted_limit`, `hugetlb`). The collector re-executes itself once with the matching `GLIBC_TUNABLES` and reads back `process.glibc_malloc`. Rejected by mimalloc builds and outside Linux glibc | Process start |
+| `ARROWCOL_COLLECTOR_MIMALLOC_CONFIG` | Strict JSON of mimalloc v3 options (`collector.mimalloc.*` in the OAT tunables reference). The collector re-executes itself once with the matching `MIMALLOC_*` variables, runs a `MIMALLOC_VERBOSE=1` probe of itself and reads back `process.mimalloc` and `process.mimalloc_options`. Rejected by system-allocator builds and outside Unix | Process start |
 | `RUSTFLAGS="-C target-cpu=native"` | Host-specific compiler ISA optimization; not a Cargo feature or per-cell runtime setting | Rebuild |
 
 JSON collector overrides preserve unspecified pipeline YAML values. Unknown

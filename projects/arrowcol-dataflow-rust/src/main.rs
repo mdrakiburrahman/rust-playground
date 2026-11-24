@@ -8,6 +8,9 @@ use arrowcol_dataflow_components as _;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os(MIMALLOC_PROBE).is_some() {
+        return Ok(());
+    }
     if let Some(malloc) = configure_malloc()? {
         eprintln!(
             "arrowcol_effective_config {}",
@@ -16,6 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "glibc_malloc_scope": "glibc_tunables_startup",
             }})
         );
+    }
+    if let Some(mimalloc) = configure_mimalloc()? {
+        eprintln!("arrowcol_effective_config {}", serde_json::json!({"process": mimalloc}));
     }
     ensure_target_cpu()?;
     if let Some(disabled) = configure_thp()? {
@@ -193,6 +199,140 @@ fn configure_malloc() -> Result<Option<arrowcol_tunables::CollectorMallocTunable
     }
 }
 
+const MIMALLOC_CONFIG: &str = "ARROWCOL_COLLECTOR_MIMALLOC_CONFIG";
+const MIMALLOC_REEXEC: &str = "ARROWCOL_COLLECTOR_MIMALLOC_REEXEC";
+const MIMALLOC_PROBE: &str = "ARROWCOL_COLLECTOR_MIMALLOC_PROBE";
+
+/// mimalloc reads `MIMALLOC_*` once while the process loads, so the collector re-executes itself once
+/// with the requested options. It then runs itself as a probe that exits before `main` does any work,
+/// with `MIMALLOC_VERBOSE=1`, and requires mimalloc's own printout to show every requested value.
+fn configure_mimalloc() -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let raw = match std::env::var(MIMALLOC_CONFIG) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(format!("{MIMALLOC_CONFIG}: {error}").into()),
+    };
+    let tunables: arrowcol_tunables::CollectorMimallocTunables =
+        serde_json::from_str(&raw).map_err(|error| format!("{MIMALLOC_CONFIG}: {error}"))?;
+    tunables
+        .validate()
+        .map_err(|error| format!("{MIMALLOC_CONFIG}: {error}"))?;
+    if !cfg!(feature = "allocator-mimalloc") {
+        return Err(format!("{MIMALLOC_CONFIG} requires a collector built with allocator-mimalloc").into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let options = tunables.mimalloc_options();
+        let mut requested: Vec<(String, String)> = options
+            .iter()
+            .map(|option| (option.environment_name(), option.environment_value()))
+            .collect();
+        requested.sort_unstable();
+        let mut inherited = Vec::new();
+        for (name, value) in std::env::vars_os() {
+            if !name.to_string_lossy().to_ascii_uppercase().starts_with("MIMALLOC_") {
+                continue;
+            }
+            let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+                return Err(format!("{MIMALLOC_CONFIG}: an inherited MIMALLOC_* variable is not UTF-8").into());
+            };
+            inherited.push((name, value));
+        }
+        inherited.sort_unstable();
+        if inherited == requested {
+            return probe_mimalloc(&tunables, &options).map(Some);
+        }
+        if !inherited.is_empty() || std::env::var_os(MIMALLOC_REEXEC).is_some() {
+            return Err(format!(
+                "{MIMALLOC_CONFIG}: inherited mimalloc options {inherited:?} do not match the requested {requested:?}"
+            )
+            .into());
+        }
+        let mut arguments = std::env::args_os();
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        if let Some(program) = arguments.next() {
+            command.arg0(program);
+        }
+        let error = command.args(arguments).envs(requested).env(MIMALLOC_REEXEC, "1").exec();
+        Err(format!("{MIMALLOC_CONFIG}: re-executing with mimalloc options: {error}").into())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!("{MIMALLOC_CONFIG} is supported only on Unix").into())
+    }
+}
+
+#[cfg(unix)]
+fn probe_mimalloc(
+    tunables: &arrowcol_tunables::CollectorMimallocTunables,
+    options: &[arrowcol_tunables::MimallocOption],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+
+    let mut arguments = std::env::args_os();
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    if let Some(program) = arguments.next() {
+        command.arg0(program);
+    }
+    let output = command
+        .args(arguments)
+        .env(MIMALLOC_PROBE, "1")
+        .env("MIMALLOC_VERBOSE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "{MIMALLOC_CONFIG}: mimalloc probe failed with {}: {stderr}",
+            output.status
+        )
+        .into());
+    }
+    let mut version = None;
+    let mut effective = serde_json::Map::new();
+    let mut warnings = Vec::new();
+    for line in stderr.lines() {
+        let line = line.strip_prefix("mimalloc: ").unwrap_or(line).trim();
+        if let Some(option) = line.strip_prefix("option '") {
+            let (name, value) = option
+                .split_once("': ")
+                .ok_or_else(|| format!("{MIMALLOC_CONFIG}: unrecognized mimalloc option line {line:?}"))?;
+            let value: i64 = value
+                .trim_end_matches(" KiB")
+                .parse()
+                .map_err(|error| format!("{MIMALLOC_CONFIG}: mimalloc option line {line:?}: {error}"))?;
+            effective.insert(name.to_owned(), value.into());
+        } else if line.starts_with('v') && line.contains(" (built on ") {
+            version = line.split_whitespace().next().map(str::to_owned);
+        } else if line.starts_with("warning:") || line.starts_with("error:") {
+            warnings.push(line.to_owned());
+        }
+    }
+    let version = version.ok_or_else(|| format!("{MIMALLOC_CONFIG}: mimalloc probe printed no version: {stderr}"))?;
+    // `verbose` is the probe's own setting, not the collector's.
+    effective.remove("verbose");
+    for option in options {
+        let actual = effective.get(option.name).and_then(serde_json::Value::as_i64);
+        if actual != Some(option.value) {
+            return Err(format!(
+                "{MIMALLOC_CONFIG}: mimalloc reports {} = {actual:?}, requested {}; probe output: {stderr}",
+                option.name, option.value
+            )
+            .into());
+        }
+    }
+    Ok(serde_json::json!({
+        "mimalloc": serde_json::to_value(tunables)?,
+        "mimalloc_options": effective,
+        "mimalloc_version": version,
+        "mimalloc_warnings": warnings,
+        "mimalloc_scope": "mimalloc_env_startup_verbose_probe",
+    }))
+}
+
 /// Keeps the engine's own error (for example `IncompatiblePdataWiring`) as the process error
 /// and fails a run that otherwise succeeded when its shutdown hook failed.
 fn propagate(
@@ -335,6 +475,73 @@ mod tests {
             String::from_utf8_lossy(&mismatched.stderr)
         );
         assert!(output.contains("do not match the requested"), "{output}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mimalloc_options_reach_the_allocator_at_startup() -> Result<(), Box<dyn std::error::Error>> {
+        const TEST: &str = "tests::mimalloc_options_reach_the_allocator_at_startup";
+        if std::env::var_os(MIMALLOC_PROBE).is_some() {
+            return Ok(());
+        }
+        if std::env::var_os("ARROWCOL_TEST_MIMALLOC_CHILD").is_some() {
+            let result = configure_mimalloc();
+            if !cfg!(feature = "allocator-mimalloc") {
+                let error = result
+                    .err()
+                    .ok_or("a system-allocator build accepted mimalloc options")?;
+                assert!(error.to_string().contains("allocator-mimalloc"), "{error}");
+                return Ok(());
+            }
+            let readback = result?.ok_or("missing mimalloc readback")?;
+            assert!(std::env::var_os(MIMALLOC_REEXEC).is_some());
+            assert_eq!(readback["mimalloc_scope"], "mimalloc_env_startup_verbose_probe");
+            assert_eq!(readback["mimalloc"]["arena_eager_commit"], "always");
+            assert!(readback["mimalloc_options"].get("verbose").is_none());
+            for (name, value) in [
+                ("purge_delay", -1),
+                ("arena_eager_commit", 1),
+                ("arena_reserve", 65_536),
+            ] {
+                assert_eq!(readback["mimalloc_options"][name], value, "{name}");
+            }
+            return Ok(());
+        }
+        let run = |inherited: Option<(&str, &str)>| -> std::io::Result<std::process::Output> {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", TEST])
+                .env_clear()
+                .env("ARROWCOL_TEST_MIMALLOC_CHILD", "1")
+                .env(
+                    MIMALLOC_CONFIG,
+                    r#"{"purge_delay_ms":-1,"arena_eager_commit":"always","arena_reserve_kib":65536}"#,
+                );
+            if let Some((name, value)) = inherited {
+                command.env(name, value);
+            }
+            command.output()
+        };
+        let child = run(None)?;
+        if !child.status.success() || !String::from_utf8_lossy(&child.stdout).contains("1 passed;") {
+            return Err(format!(
+                "mimalloc child failed: {}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            )
+            .into());
+        }
+        if cfg!(feature = "allocator-mimalloc") {
+            let mismatched = run(Some(("MIMALLOC_PURGE_DELAY", "10")))?;
+            assert!(!mismatched.status.success());
+            let output = format!(
+                "{}{}",
+                String::from_utf8_lossy(&mismatched.stdout),
+                String::from_utf8_lossy(&mismatched.stderr)
+            );
+            assert!(output.contains("do not match the requested"), "{output}");
+        }
         Ok(())
     }
 
