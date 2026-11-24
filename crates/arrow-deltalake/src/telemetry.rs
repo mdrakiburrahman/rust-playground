@@ -196,6 +196,7 @@ impl MetricsReporter for KernelReporter {
 struct PublicationMetrics {
     events: Counter<u64>,
     duration: Histogram<f64>,
+    commit_lock: Histogram<f64>,
     binding_batches: Counter<u64>,
     committed_rows: Counter<u64>,
     committed_files: Counter<u64>,
@@ -210,6 +211,10 @@ fn publications() -> &'static PublicationMetrics {
         PublicationMetrics {
             events: meter.u64_counter("delta.publication.events").build(),
             duration: meter.f64_histogram("delta.publication.duration").with_unit("s").build(),
+            commit_lock: meter
+                .f64_histogram("delta.publication.commit_lock.duration")
+                .with_unit("s")
+                .build(),
             binding_batches: meter.u64_counter("delta.partition.binding.batches").build(),
             committed_rows: meter.u64_counter("delta.commit.rows").build(),
             committed_files: meter.u64_counter("delta.commit.files").build(),
@@ -361,6 +366,39 @@ pub(crate) fn publication_event(outcome: &'static str) {
     publications().events.add(1, &[KeyValue::new("outcome", outcome)]);
 }
 
+/// Declare before the guard: reverse drop order releases the lock before recording metrics.
+pub(crate) struct PublicationLockTimer {
+    requested: Instant,
+    acquired: Option<Instant>,
+}
+
+impl PublicationLockTimer {
+    pub(crate) fn start() -> Self {
+        Self {
+            requested: Instant::now(),
+            acquired: None,
+        }
+    }
+
+    pub(crate) fn acquired(&mut self) {
+        self.acquired = Some(Instant::now());
+    }
+}
+
+impl Drop for PublicationLockTimer {
+    fn drop(&mut self) {
+        let released = Instant::now();
+        let metrics = &publications().commit_lock;
+        let acquired = self.acquired.unwrap_or(released);
+        metrics.record(
+            (acquired - self.requested).as_secs_f64(),
+            &[KeyValue::new("phase", "wait")],
+        );
+        if self.acquired.is_some() {
+            metrics.record((released - acquired).as_secs_f64(), &[KeyValue::new("phase", "hold")]);
+        }
+    }
+}
 pub(crate) struct PublicationObservation {
     started: Instant,
     outcome: &'static str,
