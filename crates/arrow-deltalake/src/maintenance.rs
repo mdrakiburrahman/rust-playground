@@ -2564,7 +2564,8 @@ async fn fetch_prefetched_input(
         ));
     }
     let mut stream = object.into_stream();
-    let mut bytes = bytes::BytesMut::new();
+    // Reserve the verified size once; geometric growth can exceed the encoded-input budget.
+    let mut bytes = bytes::BytesMut::with_capacity(usize::try_from(expected)?);
     while let Some(chunk) = stream.try_next().await? {
         let size = u64::try_from(bytes.len())?
             .checked_add(u64::try_from(chunk.len())?)
@@ -2598,6 +2599,7 @@ fn prefetch_inputs<T>(
     let mut inputs = inputs.into_iter();
     let mut pending = std::collections::VecDeque::new();
     let result = (|| -> Result<()> {
+        control.check()?;
         for (key, path, expected) in inputs.by_ref().take(usize::from(concurrency)) {
             let task =
                 crate::delta_io::spawn_shared_io(fetch_prefetched_input(Arc::clone(&store), path, expected, limit))?;
@@ -2610,6 +2612,7 @@ fn prefetch_inputs<T>(
             control.check()?;
             consume(&key, bytes)?;
             if let Some((key, path, expected)) = inputs.next() {
+                control.check()?;
                 let task = crate::delta_io::spawn_shared_io(fetch_prefetched_input(
                     Arc::clone(&store),
                     path,
@@ -2663,6 +2666,7 @@ pub struct OptimizeConfig {
     pub batch_rows: usize,
     /// Input buffering strategy; spool uses temporary local disk.
     pub input_read_strategy: InputReadStrategy,
+    /// Maximum in-flight or buffered inputs per bin, including the file being decoded.
     pub input_prefetch_files: u8,
     pub upload_concurrency: usize,
     pub bin_concurrency: usize,
