@@ -8,17 +8,25 @@ const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) as {
   scaled: boolean;
   fail?: string;
   routerExited?: boolean;
+  noNanoCpus?: boolean;
   before: Record<string, number>;
   after: Record<string, number>;
 };
 if (args[0] === 'inspect') {
-  console.log(args.includes('{{json .HostConfig.NanoCpus}}') ? '1000000000' : state.routerExited ? 'exited|17' : 'running|0');
+  console.log(args.includes('{{json .HostConfig.NanoCpus}}') ? (state.noNanoCpus ? 'null' : '1000000000') : state.routerExited ? 'exited|17' : 'running|0');
 } else if (args[0] === 'exec') {
   console.log('100000 100000\nnr_periods 10\nnr_throttled 0\nthrottled_usec 0');
 } else if (args[0] === 'logs') {
   console.log('fixture router failed');
 } else if (args.includes('ps')) {
   console.log('a'.repeat(64));
+} else if (args.includes('config')) {
+  const files = args.flatMap((arg, index) => arg === '--file' ? [args[index + 1]] : []);
+  const expected = process.env.OAT_EXPECTED_COMPOSE_FILES?.split('|');
+  if (!expected || JSON.stringify(files) !== JSON.stringify(expected)) {
+    throw new Error('preflight did not render all Compose layers in order');
+  }
+  console.log(JSON.stringify({ services: { 'dataflow-1': { mem_limit: 8388608 } } }));
 } else if (args.includes('up')) {
   state.scaled = true;
   writeFileSync(join(root, 'state.json'), JSON.stringify(state));

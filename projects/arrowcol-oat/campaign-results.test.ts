@@ -10,6 +10,21 @@ const rows = [
   { cohort: 'C1', candidate: 'zstd', factorX: 'codec', valueX: 'zstd', factorY: 'level', valueY: '3', repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 90 },
 ];
 
+test('validates local collector CPU quotas in official campaign configuration', () => {
+  const official = (quota: unknown) => ({
+    status: { id: 'run', state: 'failed', progress: 'failed', result_count: 0, error: null },
+    rows: [], expectedSha: 'source', mode: 'local',
+    config: { platform: { local: { collector_cpu_quota: quota } } },
+  });
+  const input = (quota: unknown) => [{ ...rows[0], officialRuns: [official(quota)] }];
+  for (const quota of [undefined, null, 0.01, 0.010000001, 4096, 'unlimited']) {
+    assert.doesNotThrow(() => validateCampaignMeasurements(input(quota)));
+  }
+  for (const quota of [0, 0.009, -1, 4096.000000001, 0.0100000001, NaN, Infinity, '1', 'max', {}, true]) {
+    assert.throws(() => validateCampaignMeasurements(input(quota)), /platform\.local\.collector_cpu_quota/);
+  }
+});
+
 test('keeps observations exploratory until official sustainable evidence is complete', () => {
   const svg = renderCampaignResults(rows, 'C1');
   assert.match(svg, /<svg[^>]+role="img"/);
@@ -713,6 +728,44 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
     run.rows[0]!.evidence_json = JSON.stringify(changed);
     assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
   }
+  Object.assign(run.config, { overload_guard: { container_memory_metric: 'working_set' },
+    platform: { local: { collector_memory_limit_bytes: 8388608 } } });
+  const working = structuredClone(original);
+  working.overload_guard.settings.container_memory_metric = 'working_set';
+  working.overload_guard.container_memory_metric = 'working_set';
+  working.overload_guard.requested_container_memory_limit_bytes = 8388608;
+  working.overload_guard.last_caps[0].metric = 'container_working_set_bytes';
+  working.overload_guard.last_caps[0].cap = 8388608;
+  run.rows[0]!.evidence_json = JSON.stringify(working);
+  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  for (const change of [
+    (evidence: typeof working) => { evidence.overload_guard.settings.container_memory_metric = 'usage'; },
+    (evidence: typeof working) => { evidence.overload_guard.settings.container_memory_metric = null; },
+    (evidence: typeof working) => { evidence.overload_guard.container_memory_metric = 'usage'; },
+    (evidence: typeof working) => { evidence.overload_guard.last_caps[0].metric = 'container_memory_bytes'; },
+    (evidence: typeof working) => { evidence.overload_guard.last_caps[0].cap = 1000; },
+  ]) {
+    const changed = structuredClone(working); change(changed);
+    run.rows[0]!.evidence_json = JSON.stringify(changed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  for (const invalid of ['working-set', 'rss', null]) {
+    Object.assign(run.config, { overload_guard: { container_memory_metric: invalid } });
+    run.rows[0]!.evidence_json = JSON.stringify(working);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  Object.assign(run.config, { overload_guard: { container_memory_metric: 'working_set' } });
+  const stoppedWorking = structuredClone(working);
+  stoppedWorking.overload_stop = { reason: 'hard_cap_fraction', metric: 'container_working_set_bytes',
+    observed_value: 900, cap: 1000, fraction: 0.9, window_index: 1, timestamp_ms: 1_060_000 };
+  run.rows[0]!.status = 'failed';
+  run.rows[0]!.evidence_json = JSON.stringify(stoppedWorking);
+  assert.match(renderCampaignResults([result()], 'C1'), /above_ceiling: overload_stop hard_cap_fraction/);
+  stoppedWorking.overload_stop.metric = 'container_memory_bytes';
+  run.rows[0]!.evidence_json = JSON.stringify(stoppedWorking);
+  assert.match(renderCampaignResults([result()], 'C1'), /overload_stop evidence is invalid/);
+  run.rows[0]!.status = 'succeeded';
+  Reflect.deleteProperty(run.config, 'platform');
   Object.assign(run.config, { overload_guard: { memory_signal: 'cgroup_memory' } });
   Object.assign(run.config.tunables, { collector: { pressure: { rss_limit_bytes: 1000 } } });
   const cgroup = structuredClone(original);
