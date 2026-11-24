@@ -808,6 +808,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_SOCKET_CONFIG" => "/socket".to_owned(),
             "ARROWCOL_COLLECTOR_THP_DISABLED" => "/process/thp_disabled".to_owned(),
             "ARROWCOL_COLLECTOR_MALLOC_CONFIG" => "/process/glibc_malloc".to_owned(),
+            "ARROWCOL_COLLECTOR_MIMALLOC_CONFIG" => "/process/mimalloc".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
             "ARROWCOL_COLLECTOR_ISOLATION_LEVEL" => "/isolation_level".to_owned(),

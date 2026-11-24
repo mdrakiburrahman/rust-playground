@@ -375,6 +375,8 @@ pub struct CollectorTunables {
         deserialize_with = "deserialize_present_malloc"
     )]
     pub malloc: Option<CollectorMallocTunables>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub mimalloc: Option<CollectorMimallocTunables>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_bool"
@@ -1234,6 +1236,237 @@ where
     D: serde::Deserializer<'de>,
 {
     GlibcMallocHugetlb::deserialize(deserializer).map(Some)
+}
+
+/// mimalloc `arena_eager_commit` modes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MimallocArenaEagerCommit {
+    Never,
+    Always,
+    OnOvercommit,
+}
+
+/// mimalloc `page_commit_on_demand` modes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MimallocPageCommit {
+    Eager,
+    OnDemand,
+    OnDemandUnlessOvercommit,
+}
+
+/// mimalloc `page_reclaim_on_free` modes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MimallocPageReclaim {
+    Disabled,
+    OwnHeap,
+    AnyHeap,
+}
+
+/// Options of the bundled mimalloc v3 that the collector sets through `MIMALLOC_*` at process startup.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorMimallocTunables {
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub purge_delay_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub purge_decommits: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub arena_eager_commit: Option<MimallocArenaEagerCommit>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub allow_large_os_pages: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub reserve_huge_os_pages: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub reserve_os_memory_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub arena_reserve_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub arena_purge_mult: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub minimal_purge_size_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_commit_on_demand: Option<MimallocPageCommit>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_max_candidates: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_full_retain: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub generic_collect: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_reclaim_on_free: Option<MimallocPageReclaim>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_max_reclaim: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_cross_thread_max_reclaim: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub use_numa_nodes: Option<i64>,
+}
+
+/// One configured mimalloc option: the OAT field, mimalloc's option name and its value in mimalloc units.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MimallocOption {
+    pub field: &'static str,
+    pub name: &'static str,
+    pub value: i64,
+    pub kib: bool,
+}
+
+impl MimallocOption {
+    /// The `MIMALLOC_*` environment variable mimalloc reads for this option.
+    #[must_use]
+    pub fn environment_name(&self) -> String {
+        format!("MIMALLOC_{}", self.name.to_ascii_uppercase())
+    }
+
+    /// Size options take an explicit `KiB` suffix; mimalloc reads a bare number as bytes.
+    #[must_use]
+    pub fn environment_value(&self) -> String {
+        if self.kib {
+            format!("{}KiB", self.value)
+        } else {
+            self.value.to_string()
+        }
+    }
+}
+
+impl CollectorMimallocTunables {
+    /// Rejects values mimalloc would clamp, ignore or treat as a different mode.
+    ///
+    /// # Errors
+    /// Returns an error for an empty section or an out-of-range value.
+    pub fn validate(&self) -> Result<(), String> {
+        if self == &Self::default() {
+            return Err("collector.mimalloc must set at least one mimalloc option".to_owned());
+        }
+        for (name, value, range) in [
+            ("purge_delay_ms", self.purge_delay_ms, -1..=600_000),
+            ("reserve_huge_os_pages", self.reserve_huge_os_pages, 0..=1_024),
+            ("reserve_os_memory_kib", self.reserve_os_memory_kib, 0..=268_435_456),
+            ("arena_reserve_kib", self.arena_reserve_kib, 0..=268_435_456),
+            ("arena_purge_mult", self.arena_purge_mult, 0..=1_000),
+            ("minimal_purge_size_kib", self.minimal_purge_size_kib, 0..=1_048_576),
+            ("page_max_candidates", self.page_max_candidates, 1..=256),
+            ("page_full_retain", self.page_full_retain, -1..=32),
+            ("generic_collect", self.generic_collect, 1..=1_000_000),
+            ("page_max_reclaim", self.page_max_reclaim, -1..=65_535),
+            (
+                "page_cross_thread_max_reclaim",
+                self.page_cross_thread_max_reclaim,
+                -1..=65_535,
+            ),
+            ("use_numa_nodes", self.use_numa_nodes, 0..=1_024),
+        ] {
+            if let Some(value) = value
+                && !range.contains(&value)
+            {
+                return Err(format!(
+                    "collector.mimalloc.{name} must be in {}..={}",
+                    range.start(),
+                    range.end()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured options in a fixed order, in the units mimalloc reports them.
+    #[must_use]
+    pub fn mimalloc_options(&self) -> Vec<MimallocOption> {
+        [
+            ("purge_delay_ms", "purge_delay", self.purge_delay_ms, false),
+            (
+                "purge_decommits",
+                "purge_decommits",
+                self.purge_decommits.map(i64::from),
+                false,
+            ),
+            (
+                "arena_eager_commit",
+                "arena_eager_commit",
+                self.arena_eager_commit.map(|mode| match mode {
+                    MimallocArenaEagerCommit::Never => 0,
+                    MimallocArenaEagerCommit::Always => 1,
+                    MimallocArenaEagerCommit::OnOvercommit => 2,
+                }),
+                false,
+            ),
+            (
+                "allow_large_os_pages",
+                "allow_large_os_pages",
+                self.allow_large_os_pages.map(i64::from),
+                false,
+            ),
+            (
+                "reserve_huge_os_pages",
+                "reserve_huge_os_pages",
+                self.reserve_huge_os_pages,
+                false,
+            ),
+            (
+                "reserve_os_memory_kib",
+                "reserve_os_memory",
+                self.reserve_os_memory_kib,
+                true,
+            ),
+            ("arena_reserve_kib", "arena_reserve", self.arena_reserve_kib, true),
+            ("arena_purge_mult", "arena_purge_mult", self.arena_purge_mult, false),
+            (
+                "minimal_purge_size_kib",
+                "minimal_purge_size",
+                self.minimal_purge_size_kib,
+                true,
+            ),
+            (
+                "page_commit_on_demand",
+                "page_commit_on_demand",
+                self.page_commit_on_demand.map(|mode| match mode {
+                    MimallocPageCommit::Eager => 0,
+                    MimallocPageCommit::OnDemand => 1,
+                    MimallocPageCommit::OnDemandUnlessOvercommit => 2,
+                }),
+                false,
+            ),
+            (
+                "page_max_candidates",
+                "page_max_candidates",
+                self.page_max_candidates,
+                false,
+            ),
+            ("page_full_retain", "page_full_retain", self.page_full_retain, false),
+            ("generic_collect", "generic_collect", self.generic_collect, false),
+            (
+                "page_reclaim_on_free",
+                "page_reclaim_on_free",
+                self.page_reclaim_on_free.map(|mode| match mode {
+                    MimallocPageReclaim::Disabled => -1,
+                    MimallocPageReclaim::OwnHeap => 0,
+                    MimallocPageReclaim::AnyHeap => 1,
+                }),
+                false,
+            ),
+            ("page_max_reclaim", "page_max_reclaim", self.page_max_reclaim, false),
+            (
+                "page_cross_thread_max_reclaim",
+                "page_cross_thread_max_reclaim",
+                self.page_cross_thread_max_reclaim,
+                false,
+            ),
+            ("use_numa_nodes", "use_numa_nodes", self.use_numa_nodes, false),
+        ]
+        .into_iter()
+        .filter_map(|(field, name, value, kib)| {
+            value.map(|value| MimallocOption {
+                field,
+                name,
+                value,
+                kib,
+            })
+        })
+        .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
