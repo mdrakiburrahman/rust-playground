@@ -503,7 +503,10 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         }
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
-            | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
+            | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode"
+            | "collector.commit.snapshot_cache_mode" | "collector.commit.checkpoint_mode"
+            | "collector.commit.checkpoint_interval" =>
+                ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
             | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
@@ -1686,6 +1689,36 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 assert_eq!(is_verified, expected[index], "{path}");
                 assert_eq!(is_projected, !expected[index], "{path}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn commit_modes_require_matching_startup_readback_from_every_collector() -> Result<()> {
+        let mut config = config()?;
+        let commit = json!({"snapshot_cache_mode":"checkpoint_aware","checkpoint_mode":"async",
+            "checkpoint_interval":17,"txn_lookup_mode":"incremental"});
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"commit":commit}}))?;
+        let first = json!({
+            "component":"collector","instance_id":"collector-1","log_complete":true,
+            "startup_tunables_verified":true,"effective_config_source":"consumer_startup_readback",
+            "effective_config":{"commit":commit}
+        });
+        let mut second = first.clone();
+        second["instance_id"] = json!("collector-2");
+        let initial = tunable_leaf_evidence(&config)?;
+        let mut matching = initial.clone();
+        promote_collector_readback(&config, &mut matching, Some(&json!([first, second])), 2)?;
+        let verified = matching["consumer_verified"].as_array().context("consumer_verified array")?;
+        for field in ["snapshot_cache_mode", "checkpoint_mode", "checkpoint_interval", "txn_lookup_mode"] {
+            let path = format!("collector.commit.{field}");
+            assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
+            let mut missing = second.clone();
+            missing["effective_config"]["commit"].as_object_mut().context("commit config")?
+                .remove(field).context("expected commit field")?;
+            let mut uncovered = initial.clone();
+            promote_collector_readback(&config, &mut uncovered, Some(&json!([first, missing])), 2)?;
+            assert_eq!(uncovered, initial, "{path}");
         }
         Ok(())
     }

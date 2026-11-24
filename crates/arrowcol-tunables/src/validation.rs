@@ -547,6 +547,9 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.operation_max_active_files", "1000000"),
     capability!("maintenance.discovery_max_log_files", "100000"),
     capability!("maintenance.discovery_max_log_file_bytes", "67108864"),
+    capability!("collector.commit.snapshot_cache_mode", "json_only"),
+    capability!("collector.commit.checkpoint_mode", "external"),
+    capability!("collector.commit.checkpoint_interval", "10"),
 ];
 
 #[must_use]
@@ -1051,6 +1054,22 @@ impl Tunables {
         validate_wal(self.wal.as_ref())?;
         if let Some(maintenance) = &self.maintenance {
             validate_maintenance(maintenance)?;
+            if maintenance.enabled == Some(true)
+                && maintenance
+                    .operations
+                    .as_ref()
+                    .is_some_and(|ops| ops.contains(&MaintenanceOperation::Checkpoint))
+                && self
+                    .collector
+                    .as_ref()
+                    .and_then(|collector| collector.commit.as_ref())
+                    .and_then(|commit| commit.checkpoint_mode)
+                    .is_some_and(|mode| mode != arrow_deltalake::CheckpointMode::External)
+            {
+                bail!(
+                    "collector.commit.checkpoint_mode must be external when maintenance.operations includes checkpoint"
+                );
+            }
             if maintenance.enabled == Some(true)
                 && maintenance.layout_enabled != Some(false)
                 && maintenance
@@ -1969,6 +1988,12 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
 
 fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     let commit = commit.cloned().unwrap_or_default();
+    if commit
+        .checkpoint_interval
+        .is_some_and(|value| !(1..=100_000).contains(&value))
+    {
+        bail!("collector.commit.checkpoint_interval must be in 1..=100000");
+    }
     if let Some(columns) = &commit.delta_stats_columns {
         arrow_deltalake::delta_stats::DeltaStatsPolicy {
             columns: columns.clone(),
@@ -1988,14 +2013,62 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
 
 #[cfg(test)]
 #[test]
-fn txn_lookup_mode_rejects_invalid_inputs_by_field_name() -> Result<()> {
-    for value in [serde_json::json!("cached"), serde_json::json!(42), Value::Null] {
+fn commit_modes_reject_invalid_inputs_by_field_name() -> Result<()> {
+    for (field, misspelled) in [
+        ("txn_lookup_mode", "Incremental"),
+        ("snapshot_cache_mode", "checkpoint-aware"),
+        ("checkpoint_mode", "Async"),
+    ] {
+        for value in [
+            Value::from(misspelled),
+            Value::from(42),
+            Value::Null,
+            serde_json::json!({"async": null}),
+        ] {
+            let Err(error) = Tunables::parse_oat_json(serde_json::json!({
+                "collector": {"commit": {field: value}}
+            })) else {
+                bail!("invalid collector.commit.{field} accepted");
+            };
+            assert!(format!("{error:#}").contains(&format!("collector.commit.{field}")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn checkpoint_interval_is_a_bounded_integer_even_in_external_mode() -> Result<()> {
+    for value in [
+        Value::from(0),
+        Value::from(100_001),
+        Value::from(-1),
+        Value::from(1.5),
+        Value::from("10"),
+        Value::Null,
+    ] {
         let Err(error) = Tunables::parse_oat_json(serde_json::json!({
-            "collector": {"commit": {"txn_lookup_mode": value}}
+            "collector": {"commit": {"checkpoint_interval": value}}
         })) else {
-            bail!("invalid txn lookup mode accepted");
+            bail!("invalid collector.commit.checkpoint_interval accepted");
         };
-        assert!(format!("{error:#}").contains("collector.commit.txn_lookup_mode"));
+        assert!(format!("{error:#}").contains("collector.commit.checkpoint_interval"));
+    }
+    for interval in [1, 100_000] {
+        let settings = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"checkpoint_interval": interval}},
+            "maintenance": {"enabled": true, "operations": ["checkpoint"]}
+        }))?;
+        let environment = settings.environment_for(ComponentRole::Collector)?;
+        let commit: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"])?;
+        assert_eq!(commit, serde_json::json!({"checkpoint_interval": interval}));
+    }
+    for mode in ["async", "inline"] {
+        let config = serde_json::json!({
+            "collector": {"commit": {"checkpoint_mode": mode}},
+            "maintenance": {"enabled": true, "operations": ["checkpoint"]}
+        });
+        assert!(Tunables::parse_oat_json(config).is_err());
     }
     Ok(())
 }

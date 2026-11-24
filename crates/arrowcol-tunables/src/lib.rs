@@ -1135,6 +1135,19 @@ pub struct CommitTunables {
         deserialize_with = "deserialize_delta_stats_columns"
     )]
     pub delta_stats_columns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub snapshot_cache_mode: Option<arrow_deltalake::SnapshotCacheMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub checkpoint_mode: Option<arrow_deltalake::CheckpointMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub checkpoint_interval: Option<u64>,
+}
+
+fn deserialize_present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 fn deserialize_txn_lookup_mode<'de, D: serde::Deserializer<'de>>(
