@@ -255,12 +255,41 @@ impl ParquetFileWriter {
         schema: SchemaRef,
         properties: Option<WriterProperties>,
     ) -> Result<Self> {
+        Self::create_inner(path.as_ref(), schema, properties, false)
+    }
+
+    /// Opt into a schema-neutral footer declaration for level-bearing codecs (Delta ingestion and its evidence fixture).
+    ///
+    /// # Errors
+    /// Returns file creation, writer policy or Parquet schema errors.
+    pub fn create_with_codec_evidence(
+        path: impl AsRef<Path>,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+    ) -> Result<Self> {
+        Self::create_inner(path.as_ref(), schema, properties, true)
+    }
+
+    fn create_inner(
+        path: &Path,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+        declare_levels: bool,
+    ) -> Result<Self> {
         let properties = writer::process_config()?.writer_properties(
             &schema,
             properties.clone(),
             &writer::sorting_from_properties(&schema, properties.as_ref())?,
         )?;
-        let path = path.as_ref().to_path_buf();
+        let properties = if declare_levels {
+            let physical = parquet::arrow::ArrowSchemaConverter::new()
+                .with_coerce_types(properties.coerce_types())
+                .convert(&schema)?;
+            footer::stamp(&physical, properties)?
+        } else {
+            properties
+        };
+        let path = path.to_path_buf();
         let durable_handle = OpenOptions::new()
             .write(true)
             .create_new(true)

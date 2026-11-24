@@ -94,7 +94,7 @@ async fn darwin_parquet_encode() -> Result<()> {
 
     let started = Instant::now();
     let cpu_started = process_cpu_ticks()?;
-    let mut writer = ParquetFileWriter::create_with_properties(&path, Arc::clone(&schema), Some(properties))?;
+    let mut writer = ParquetFileWriter::create_with_codec_evidence(&path, Arc::clone(&schema), Some(properties))?;
     let create_wall_ns = started.elapsed().as_nanos();
     let create_cpu_ticks = process_cpu_ticks()? - cpu_started;
 

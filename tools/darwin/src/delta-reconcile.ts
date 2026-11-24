@@ -247,15 +247,13 @@ export async function reconcileStoppedSnapshot(
       try {
         footerRows = fileMetadata.numRows();
         if (selectedPaths.has(add.path) || (verifyAllActiveCodecs && active.has(add.path))) {
-          const kv = fileMetadata.keyValueMetadata();
-          const key = "arrowcol.writer.codec_levels.v1";
-          const present = kv.has(key);
-          parquetFooter.unrelatedKeyCount += kv.size - Number(present);
+          const creator = fileMetadata.createdBy() ?? "";
+          const marker = "; arrowcol.writer.codec_levels.v2=";
+          const offset = creator.indexOf(marker);
+          const present = offset >= 0;
+          parquetFooter.unrelatedKeyCount += fileMetadata.keyValueMetadata().size;
           if (present) parquetFooter.filesWithDeclaration++;
-          else {
-            parquetFooter.filesMissingDeclaration++;
-            if (expectedWriterLevel !== undefined) throw new Error("selected Parquet writer codec declaration is missing (legacy file)");
-          }
+          else parquetFooter.filesMissingDeclaration++;
           if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
           for (let i = 0; i < metadata.numRowGroups(); i++) {
             const group = metadata.rowGroup(i);
@@ -268,10 +266,11 @@ export async function reconcileStoppedSnapshot(
                   if (column.compression() !== expectedCodec) throw new Error("selected Parquet codec differs from expected codec");
                 } finally { column.free(); }
               }
+              if (!present && typeof expectedWriterLevel === "number") throw new Error("selected Parquet writer codec declaration is missing (legacy file)");
               if (present && i === 0) {
-                const value: unknown = kv.get(key);
+                const value = creator.slice(offset + marker.length);
                 let columns: unknown;
-                if (typeof value === "string" && value.length <= 2 + 32 * width) {
+                if (value.length <= 2 + 32 * width) {
                   try { columns = JSON.parse(value); } catch { /* Never expose parser input. */ }
                 }
                 if (!Array.isArray(columns) || columns.length !== width || !columns.every(pair => {
