@@ -1098,6 +1098,12 @@ struct Attempt<'a> {
     send_unix_ns: u64,
 }
 
+#[derive(Default)]
+struct OfferedRows {
+    first_attempt: AtomicU64,
+    retry: AtomicU64,
+}
+
 struct Measurement {
     start_unix_ms: u64,
     end_unix_ms: u64,
@@ -1109,6 +1115,7 @@ struct Measurement {
     raw_window_bytes: Vec<AtomicU64>,
     wire_window_bytes: Vec<AtomicU64>,
     window_latency: Vec<Mutex<[u64; 64]>>,
+    window_offers: Vec<OfferedRows>,
     window_completed_sends: Vec<AtomicU64>,
     window_timed_out_sends: Vec<AtomicU64>,
     window_ambiguous_sends: Vec<AtomicU64>,
@@ -1166,6 +1173,9 @@ impl Measurement {
             window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| Mutex::new([0; 64]))
                 .collect(),
+            window_offers: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| OfferedRows::default())
+                .collect(),
             window_completed_sends: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -1200,6 +1210,19 @@ impl Measurement {
             if stop.changed().await.is_err() {
                 break;
             }
+        }
+    }
+
+    fn record_offer(&self, send_unix_ns: u64, rows: u64, attempt_number: u32) {
+        let ms = send_unix_ns / 1_000_000;
+        if ms >= self.start_unix_ms && ms < self.end_unix_ms {
+            let offers = &self.window_offers[((ms - self.start_unix_ms) / 30_000) as usize];
+            let counter = if attempt_number == 1 {
+                &offers.first_attempt
+            } else {
+                &offers.retry
+            };
+            counter.fetch_add(rows, Ordering::Relaxed);
         }
     }
 
@@ -1282,6 +1305,8 @@ impl Measurement {
     fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "start_unix_ms": self.start_unix_ms, "end_unix_ms": self.end_unix_ms,
+            "offered_rows": self.window_offers.iter().map(|v| v.first_attempt.load(Ordering::Relaxed)).sum::<u64>(),
+            "retry_offered_rows": self.window_offers.iter().map(|v| v.retry.load(Ordering::Relaxed)).sum::<u64>(),
             "completed_rows": self.rows.load(Ordering::Relaxed),
             "completed_bytes": self.bytes.load(Ordering::Relaxed),
             "completed_wire_bytes": self.bytes.load(Ordering::Relaxed),
@@ -1296,6 +1321,8 @@ impl Measurement {
                 let latency = self.window_latency[index].lock().unwrap_or_else(|error| error.into_inner());
                 serde_json::json!({
                     "start_unix_ms": start_unix_ms, "end_unix_ms": end_unix_ms,
+                    "offered_rows": self.window_offers[index].first_attempt.load(Ordering::Relaxed),
+                    "retry_offered_rows": self.window_offers[index].retry.load(Ordering::Relaxed),
                     "completed_rows": self.pilot_rows[index].load(Ordering::Relaxed),
                     "completed_flight_data_bytes_uncompressed": self.raw_window_bytes[index].load(Ordering::Relaxed),
                     "completed_flight_data_bytes_configured_ipc_compression": self.wire_window_bytes[index].load(Ordering::Relaxed),
@@ -2385,7 +2412,7 @@ impl PreparedClient {
             return Ok(None);
         }
         let logical = self.prepare_logical_batch(worker, template).await?;
-        self.send_encoded_one(worker, channel, &logical, measurement).await
+        self.send_encoded_one(worker, channel, &logical, measurement, 1).await
     }
 
     async fn send_encoded_one(
@@ -2394,6 +2421,7 @@ impl PreparedClient {
         channel: Channel,
         logical: &LogicalBatch,
         measurement: Option<&Measurement>,
+        attempt_number: u32,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
         if let Some(measurement) = measurement
             && (measurement.stopped() || unix_ms()? >= measurement.end_unix_ms)
@@ -2430,6 +2458,9 @@ impl PreparedClient {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
             }
             counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
+            if let Some(measurement) = measurement {
+                measurement.record_offer(observation.send_unix_ns, batch.rows, attempt_number);
+            }
             counters
                 .attempted_bytes
                 .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
@@ -2593,7 +2624,7 @@ impl PreparedClient {
                 return Ok(false);
             }
             match self
-                .send_encoded_one(worker, channel.clone(), &logical, Some(measurement))
+                .send_encoded_one(worker, channel.clone(), &logical, Some(measurement), attempt)
                 .await
             {
                 Ok(Some(_)) => return Ok(true),
@@ -5289,7 +5320,7 @@ mod tests {
         let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
         assert!(
             client
-                .send_encoded_one(0, channel, &logical, Some(&measurement))
+                .send_encoded_one(0, channel, &logical, Some(&measurement), 1)
                 .await?
                 .is_none()
         );
@@ -5600,6 +5631,11 @@ mod tests {
     #[test]
     fn individual_stream_completions_are_attributed_even_when_a_peer_spans_the_window() -> Result<()> {
         let measurement = Measurement::new(10_000, 70_000, 2)?;
+        measurement.record_offer(9_999_999_999, 11, 1);
+        measurement.record_offer(10_000_000_000, 13, 1);
+        measurement.record_offer(40_000_000_000, 13, 2);
+        measurement.record_offer(69_999_999_999, 17, 1);
+        measurement.record_offer(70_000_000_000, 19, 2);
         measurement.record_send_latency(10, 9_999_000_000)?;
         measurement.record_send_latency(50, 10_000_000_000)?;
         measurement.record_send_latency(100, 39_999_000_000)?;
@@ -5615,6 +5651,11 @@ mod tests {
         measurement.record_completion(1, 400, 3600, 4000, 70_000);
         let snapshot = measurement.snapshot();
         assert_eq!(snapshot["completed_rows"], 500);
+        assert_eq!(snapshot["offered_rows"], 30);
+        assert_eq!(snapshot["retry_offered_rows"], 13);
+        assert_eq!(snapshot["windows"][0]["offered_rows"], 13);
+        assert_eq!(snapshot["windows"][1]["offered_rows"], 17);
+        assert_eq!(snapshot["windows"][1]["retry_offered_rows"], 13);
         assert_eq!(snapshot["completed_bytes"], 5000);
         assert_eq!(snapshot["completed_raw_arrow_bytes"], 4500);
         assert_eq!(snapshot["completed_flight_data_bytes_uncompressed"], 4500);
