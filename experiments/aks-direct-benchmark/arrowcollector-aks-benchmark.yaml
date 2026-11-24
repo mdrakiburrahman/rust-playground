@@ -1,5 +1,6 @@
 # Direct ArrowCollector benchmark for AKS context arrow-collector-68590.
 # A staged deployment, not a single apply. Use only a new isolated benchmark namespace.
+# Collector-stack pods are pinned to benche64; the role label also matches other stamp pools.
 # Render BENCHRUNUUID as a fresh lowercase UUID and BENCHRUNHEX as its 32 lowercase hex digits.
 # Render BENCHOWNER as the approved custody owner in both identity annotations and labels.
 # 9876543210000 is a placeholder, not a usable expiry. Immediately before applying
@@ -183,6 +184,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:
@@ -278,6 +280,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:
@@ -605,6 +608,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:
@@ -725,6 +729,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:
@@ -913,6 +918,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:
@@ -1040,6 +1046,7 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:
@@ -1208,6 +1215,7 @@ spec:
         azure.workload.identity/use: "true"
     spec:
       nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
         arrow-collector/role: arrowcol
         kubernetes.io/arch: amd64
       tolerations:

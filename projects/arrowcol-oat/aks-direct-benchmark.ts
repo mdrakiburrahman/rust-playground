@@ -459,6 +459,15 @@ export function assertRenderedManifest(rendered: string, runId: string, owner: s
       throw new Error('Every rendered resource must have a recognized benchmark-stage label.');
     foundStages.add(stage);
     collectImages(resource);
+    if (resource.kind === 'Deployment' || resource.kind === 'Job') {
+      const spec = requireRecord(resource.spec, 'Rendered workload spec');
+      const template = requireRecord(spec.template, 'Rendered workload template');
+      const podSpec = requireRecord(template.spec, 'Rendered workload pod spec');
+      const selector = requireRecord(podSpec.nodeSelector, 'Rendered workload node selector');
+      const expectedPool = metadata.name === 'direct-load-confirmwide' ? 'benchd64' : 'benche64';
+      if (selector['kubernetes.azure.com/agentpool'] !== expectedPool)
+        throw new Error(`Rendered workload ${String(metadata.name)} must select agent pool ${expectedPool}.`);
+    }
     if (resource.kind === 'Namespace') {
       namespaceCount++;
       const annotations = requireRecord(metadata.annotations, 'Rendered namespace annotations');
@@ -497,6 +506,40 @@ async function prepareNamespace(config: Config, namespace: string, runId: string
     if (!namespaceMatches(resource, runId, owner)) throw new Error('Namespace creation did not preserve the run and owner markers.');
     return verifyNamespace(config, namespace, runId, owner);
   });
+}
+
+export function verifyBenchmarkPlacement(pods: unknown[], nodes: unknown[]): { pod: string; node: string; pool: string }[] {
+  const pools = new Map<string, string>();
+  for (const value of nodes) {
+    const node = requireRecord(value, 'Placement node');
+    const metadata = requireRecord(node.metadata, 'Placement node metadata');
+    const labels = isRecord(metadata.labels) ? metadata.labels : {};
+    if (typeof metadata.name === 'string' && typeof labels['kubernetes.azure.com/agentpool'] === 'string')
+      pools.set(metadata.name, labels['kubernetes.azure.com/agentpool']);
+  }
+  if (!pods.length) throw new Error('Benchmark placement has no pods.');
+  return pods.map(value => {
+    const pod = requireRecord(value, 'Placement pod');
+    const metadata = requireRecord(pod.metadata, 'Placement pod metadata');
+    const labels = isRecord(metadata.labels) ? metadata.labels : {};
+    const spec = requireRecord(pod.spec, 'Placement pod spec');
+    const pool = typeof spec.nodeName === 'string' ? pools.get(spec.nodeName) : undefined;
+    const load = labels['batch.kubernetes.io/job-name'] === 'direct-load-confirmwide' ||
+      labels['job-name'] === 'direct-load-confirmwide';
+    const expectedPool = load ? 'benchd64' : 'benche64';
+    if (typeof metadata.name !== 'string' || typeof spec.nodeName !== 'string' || pool !== expectedPool)
+      throw new Error(`Benchmark pod ${String(metadata.name)} is on ${pool ?? 'unknown'}, expected ${expectedPool}.`);
+    return { pod: metadata.name, node: spec.nodeName, pool };
+  });
+}
+
+async function readBenchmarkPlacement(config: Config, namespace: string) {
+  const pods = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace, '-o', 'json'],
+    'Read benchmark pod placement'), 'Benchmark pods'), 'Benchmark pods');
+  const nodes = requireRecord(parseJson(await kubectl(config, ['get', 'nodes', '-o', 'json'],
+    'Read benchmark node pool labels'), 'Benchmark nodes'), 'Benchmark nodes');
+  if (!Array.isArray(pods.items) || !Array.isArray(nodes.items)) throw new Error('Benchmark placement inventory is invalid.');
+  return verifyBenchmarkPlacement(pods.items, nodes.items);
 }
 
 async function waitForReadyLoad(config: Config, namespace: string, writer: WriterIdentity): Promise<void> {
@@ -582,6 +625,7 @@ interface BenchmarkReport {
   active_rows: number;
   writer_pod_uid: string;
   writer_restart_counts: number[];
+  pod_placement: { pod: string; node: string; pool: string }[];
   namespace_removed: boolean;
   run_fic_removed: boolean;
   workload_pools_at_zero: boolean;
@@ -716,6 +760,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   let measurementStart = 0;
   let measurementEnd = 0;
   let metrics: Awaited<ReturnType<typeof readDeltaAddWindow>> | undefined;
+  let podPlacement: BenchmarkReport['pod_placement'] = [];
   console.log('Run ' + runId + ': namespace ' + namespace + '; report ' + reportPath);
   try {
     await runStage('AKS preflight', 5 * 60_000, async () => {
@@ -769,6 +814,8 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       if (!writer || !namespaceUid) throw new Error('Writer or owned namespace readiness was not established.');
       await applyStage(config, namespace, renderedPath, 'load');
       await waitForReadyLoad(config, namespace, writer);
+      podPlacement = await readBenchmarkPlacement(config, namespace);
+      await writePrivateFile(resolve(runDir, 'pod-placement.json'), `${JSON.stringify(podPlacement, null, 2)}\n`);
       const scheduleStart = Date.now() + 130_000;
       if (scheduleStart - Date.now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
       await kubectl(config, ['patch', 'configmap', 'direct-schedule-confirmwide', '-n', namespace, '--type', 'merge',
@@ -776,6 +823,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       measurementStart = scheduleStart + 60_000;
       measurementEnd = measurementStart + measurementSeconds * 1000;
       await waitForLoad(config, namespace, writer, 22 * 60_000);
+      podPlacement = await readBenchmarkPlacement(config, namespace);
       await assertWriterStable(config, namespace, writer);
       await verifyNamespace(config, namespace, runId, owner, namespaceUid);
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
@@ -846,6 +894,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     active_rows: metrics.active_rows,
     writer_pod_uid: writer.uid,
     writer_restart_counts: writer.restartCounts,
+    pod_placement: podPlacement,
     namespace_removed: namespaceRemoved,
     run_fic_removed: ficRemoved,
     workload_pools_at_zero: poolsAtZero,
