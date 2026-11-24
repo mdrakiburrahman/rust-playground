@@ -8,9 +8,7 @@ fn tunable_leaf_evidence(config: &OatConfig) -> Result<Value> {
 fn same_column_membership(requested: &Value, observed: &Value) -> bool {
     fn columns(value: &Value) -> Option<std::collections::BTreeSet<&str>> {
         let array = value.as_array()?;
-        let columns = array
-            .iter()
-            .map(Value::as_str)
+        let columns = array.iter().map(Value::as_str)
             .collect::<Option<std::collections::BTreeSet<_>>>()?;
         (columns.len() == array.len()).then_some(columns)
     }
@@ -21,23 +19,15 @@ fn same_column_membership(requested: &Value, observed: &Value) -> bool {
 }
 
 fn verified_processes<'a>(
-    config: &OatConfig,
-    processes: Option<&'a Value>,
-    role: ComponentRole,
-    replicas: u32,
+    config: &OatConfig, processes: Option<&'a Value>, role: ComponentRole, replicas: u32,
 ) -> Option<Vec<&'a Value>> {
-    let processes = processes?
-        .as_array()?
-        .iter()
+    let processes = processes?.as_array()?.iter()
         .filter(|process| process["component"] == role_name(role))
         .collect::<Vec<_>>();
-    let identities = processes
-        .iter()
+    let identities = processes.iter()
         .filter_map(|process| process["instance_id"].as_str().filter(|id| !id.is_empty()))
         .collect::<std::collections::BTreeSet<_>>();
-    if replicas == 0
-        || processes.len() != replicas as usize
-        || identities.len() != processes.len()
+    if replicas == 0 || processes.len() != replicas as usize || identities.len() != processes.len()
         || processes.iter().any(|process| {
             process["log_complete"] != true
                 || process["startup_tunables_verified"] != true
@@ -52,8 +42,7 @@ fn verified_processes<'a>(
                     }
                     verify_process_configuration(config, role, &observed).is_err()
                 }
-        })
-    {
+        }) {
         return None;
     }
     Some(processes)
@@ -61,100 +50,58 @@ fn verified_processes<'a>(
 
 fn physical_pool_witness(effective: &Value) -> bool {
     let pool = &effective["cpu_pool"];
-    let Some(workers) = pool["worker_topology"].as_array() else {
-        return false;
-    };
+    let Some(workers) = pool["worker_topology"].as_array() else { return false };
     !workers.is_empty()
         && pool["workers_started"].as_u64() == Some(workers.len() as u64)
         && pool["workers_started"] == effective["runtime"]["cpu_workers"]
-        && workers
-            .iter()
-            .all(|worker| ["cpu", "core", "package"].iter().all(|&key| worker[key].is_u64()))
+        && workers.iter().all(|worker| ["cpu", "core", "package"].iter().all(|&key| worker[key].is_u64()))
 }
 
-fn promote_collector_readback(
-    config: &OatConfig,
-    evidence: &mut Value,
-    processes: Option<&Value>,
-    replicas: u32,
-) -> Result<()> {
+fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
     let Some(collectors) = verified_processes(config, processes, ComponentRole::Collector, replicas) else {
         return Ok(());
     };
     let environment = role_environment(config, ComponentRole::Collector)?;
-    let stats_columns = environment
-        .get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
-        .map(|value| serde_json::from_str::<Vec<String>>(value))
-        .transpose()?;
-    let parquet_policy: Option<Value> = environment
-        .get("ARROWCOL_PARQUET_CONFIG")
-        .map(|value| serde_json::from_str(value))
-        .transpose()?;
-    let layout_policy = config
-        .tunables
-        .collector
-        .as_ref()
-        .and_then(|collector| collector.layout.as_ref())
-        .map(serde_json::to_value)
-        .transpose()?;
-    let expected_tables = config
-        .tables
-        .iter()
-        .map(|table| canonical_dmv_table_name(table))
+    let stats_columns = environment.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+        .map(|value| serde_json::from_str::<Vec<String>>(value)).transpose()?;
+    let parquet_policy: Option<Value> = environment.get("ARROWCOL_PARQUET_CONFIG")
+        .map(|value| serde_json::from_str(value)).transpose()?;
+    let layout_policy = config.tunables.collector.as_ref().and_then(|collector| collector.layout.as_ref())
+        .map(serde_json::to_value).transpose()?;
+    let expected_tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
-    let table_policies = collectors
-        .iter()
+    let table_policies = collectors.iter()
         .flat_map(|process| process["layout_table_policies"].as_array().into_iter().flatten())
         .collect::<Vec<_>>();
-    let observed_tables = table_policies
-        .iter()
+    let observed_tables = table_policies.iter()
         .filter_map(|policy| policy["table_name"].as_str())
         .collect::<std::collections::BTreeSet<_>>();
     let tables_covered = !expected_tables.is_empty()
-        && collectors
-            .iter()
-            .all(|process| process["layout_table_policies"].is_array())
-        && expected_tables
-            .iter()
-            .all(|table| observed_tables.contains(table.as_str()))
+        && collectors.iter().all(|process| process["layout_table_policies"].is_array())
+        && expected_tables.iter().all(|table| observed_tables.contains(table.as_str()))
         && table_policies.iter().all(|policy| {
-            policy["table_name"]
-                .as_str()
-                .is_some_and(|table| expected_tables.contains(table))
+            policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "table_effective_at_file_construction_not_full_run_history"
         });
-    let adaptive_policies = collectors
-        .iter()
+    let adaptive_policies = collectors.iter()
         .flat_map(|process| process["adaptive_table_policies"].as_array().into_iter().flatten())
         .collect::<Vec<_>>();
-    let adaptive_tables = adaptive_policies
-        .iter()
+    let adaptive_tables = adaptive_policies.iter()
         .filter_map(|policy| policy["table_name"].as_str())
         .collect::<std::collections::BTreeSet<_>>();
     let adaptive_covered = !expected_tables.is_empty()
-        && collectors
-            .iter()
-            .all(|process| process["adaptive_table_policies"].is_array())
-        && expected_tables
-            .iter()
-            .all(|table| adaptive_tables.contains(table.as_str()))
+        && collectors.iter().all(|process| process["adaptive_table_policies"].is_array())
+        && expected_tables.iter().all(|table| adaptive_tables.contains(table.as_str()))
         && adaptive_policies.iter().all(|policy| {
-            policy["table_name"]
-                .as_str()
-                .is_some_and(|table| expected_tables.contains(table))
+            policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                 && policy["scope"] == "installed_estimator_not_full_run_history"
         });
-    let projected = [
-        "ARROWCOL_COLLECTOR_COMMIT_CONFIG",
-        "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
-        "ARROWCOL_COLLECTOR_LIMITS_CONFIG",
-        "ARROWCOL_COLLECTOR_EXPORTER_CONFIG",
-        "ARROWCOL_COLLECTOR_BATCHING_CONFIG",
-    ]
-    .into_iter()
-    .filter_map(|name| environment.get(name).map(|value| (name, value)))
-    .map(|(name, value)| Ok((name, serde_json::from_str::<Value>(value)?)))
-    .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let projected = ["ARROWCOL_COLLECTOR_COMMIT_CONFIG", "ARROWCOL_COLLECTOR_PRESSURE_CONFIG", "ARROWCOL_COLLECTOR_LIMITS_CONFIG", "ARROWCOL_COLLECTOR_EXPORTER_CONFIG",
+        "ARROWCOL_COLLECTOR_BATCHING_CONFIG"]
+        .into_iter()
+        .filter_map(|name| environment.get(name).map(|value| (name, value)))
+        .map(|(name, value)| Ok((name, serde_json::from_str::<Value>(value)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
     let projection = evidence["projection_only"]
         .as_array_mut()
         .context("projection_only must be an array")?;
@@ -164,27 +111,18 @@ fn promote_collector_readback(
             return true;
         };
         if path == "collector.commit.delta_stats_columns" {
-            let policies = collectors
-                .iter()
+            let policies = collectors.iter()
                 .flat_map(|process| process["delta_stats_table_metadata"].as_array().into_iter().flatten())
                 .collect::<Vec<_>>();
             let covered = !expected_tables.is_empty()
-                && collectors
-                    .iter()
-                    .all(|process| process["delta_stats_table_metadata"].is_array())
-                && expected_tables
-                    .iter()
-                    .all(|table| policies.iter().any(|policy| policy["table_name"] == *table))
+                && collectors.iter().all(|process| process["delta_stats_table_metadata"].is_array())
+                && expected_tables.iter().all(|table| policies.iter().any(|policy| policy["table_name"] == *table))
                 && policies.iter().all(|policy| {
                     policy["scope"] == "committed_table_metadata"
-                        && policy["table_name"]
-                            .as_str()
-                            .is_some_and(|table| expected_tables.contains(table))
+                        && policy["table_name"].as_str().is_some_and(|table| expected_tables.contains(table))
                         && policy["table_id"].as_str().is_some_and(|id| !id.is_empty())
                         && policy["version"].as_u64().is_some()
-                        && stats_columns
-                            .as_ref()
-                            .is_some_and(|columns| delta_stats_properties_match(columns, &policy["properties"]))
+                        && stats_columns.as_ref().is_some_and(|columns| delta_stats_properties_match(columns, &policy["properties"]))
                 });
             if covered {
                 promoted.push(json!({"path": path, "reason": "committed_table_metadata_readback"}));
@@ -193,26 +131,14 @@ fn promote_collector_readback(
             return true;
         }
         if let Some(field) = path.strip_prefix("collector.batching.adaptive_file.")
-            && matches!(
-                field,
-                "target_parquet_bytes"
-                    | "min_input_bytes"
-                    | "max_input_bytes"
-                    | "cold_start_parquet_ratio"
-                    | "ewma_weight"
-                    | "min_parquet_ratio"
-                    | "max_parquet_ratio"
-            )
+            && matches!(field, "target_parquet_bytes" | "min_input_bytes" | "max_input_bytes"
+                | "cold_start_parquet_ratio" | "ewma_weight" | "min_parquet_ratio" | "max_parquet_ratio")
         {
-            let requested = projected
-                .get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
+            let requested = projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
                 .and_then(|value| value["adaptive_file"].get(field))
                 .filter(|value| !value.is_null());
-            if adaptive_covered
-                && requested.is_some()
-                && adaptive_policies
-                    .iter()
-                    .all(|policy| policy["config"].get(field) == requested)
+            if adaptive_covered && requested.is_some()
+                && adaptive_policies.iter().all(|policy| policy["config"].get(field) == requested)
             {
                 promoted.push(json!({"path": path, "reason": "consumer_table_adaptive_readback"}));
                 return false;
@@ -234,17 +160,13 @@ fn promote_collector_readback(
                     | "detach_ratio"
             )
         {
-            let requested = layout_policy
-                .as_ref()
-                .and_then(|policy| policy.get(field))
+            let requested = layout_policy.as_ref().and_then(|policy| policy.get(field))
                 .filter(|value| !value.is_null());
-            if tables_covered
-                && requested.is_some()
+            if tables_covered && requested.is_some()
                 && table_policies.iter().all(|record| {
                     (field == "enabled" || record["config"]["enabled"] == true)
                         && if field == "bloom_columns" {
-                            requested
-                                .zip(record["config"].get(field))
+                            requested.zip(record["config"].get(field))
                                 .is_some_and(|(requested, observed)| same_column_membership(requested, observed))
                         } else {
                             record["config"].get(field) == requested
@@ -257,22 +179,12 @@ fn promote_collector_readback(
             return true;
         }
         if let Some(field) = path.strip_prefix("parquet_writer.")
-            && matches!(
-                field,
-                "writer_version"
-                    | "max_row_group_bytes"
-                    | "write_batch_size"
-                    | "offset_index_enabled"
-                    | "column_index_truncate_length"
-                    | "statistics_truncate_length"
-            )
+            && matches!(field, "writer_version" | "max_row_group_bytes" | "write_batch_size"
+                | "offset_index_enabled" | "column_index_truncate_length" | "statistics_truncate_length")
         {
-            let requested = parquet_policy
-                .as_ref()
-                .and_then(|policy| policy.get(field))
+            let requested = parquet_policy.as_ref().and_then(|policy| policy.get(field))
                 .filter(|value| !value.is_null());
-            if tables_covered
-                && requested.is_some()
+            if tables_covered && requested.is_some()
                 && table_policies.iter().all(|record| {
                     record["parquet_properties"].get(field) == requested
                         && (!matches!(field, "column_index_truncate_length" | "statistics_truncate_length")
@@ -292,81 +204,49 @@ fn promote_collector_readback(
             }
             return true;
         }
-        let column_option = path
-            .strip_prefix("parquet_writer.defaults.")
+        let column_option = path.strip_prefix("parquet_writer.defaults.")
             .map(|field| (None, field))
-            .or_else(|| {
-                path.strip_prefix("parquet_writer.columns.")
-                    .and_then(|path| path.rsplit_once('.').map(|(column, field)| (Some(column), field)))
-            });
+            .or_else(|| path.strip_prefix("parquet_writer.columns.").and_then(|path| {
+                path.rsplit_once('.').map(|(column, field)| (Some(column), field))
+            }));
         if let Some((column, field)) = column_option
-            && matches!(
-                field,
-                "encoding"
-                    | "dictionary_enabled"
-                    | "dictionary_page_size_limit"
-                    | "data_page_size_limit"
-                    | "statistics"
-                    | "write_page_header_statistics"
-                    | "bloom_filter_enabled"
-                    | "bloom_filter_fpp"
-                    | "bloom_filter_ndv"
-                    | "data_page_v2_compression_ratio_threshold"
-            )
+            && matches!(field, "encoding" | "dictionary_enabled" | "dictionary_page_size_limit"
+                | "data_page_size_limit" | "statistics" | "write_page_header_statistics"
+                | "bloom_filter_enabled" | "bloom_filter_fpp" | "bloom_filter_ndv"
+                | "data_page_v2_compression_ratio_threshold")
         {
-            let Some(policy) = parquet_policy.as_ref() else {
-                return true;
-            };
+            let Some(policy) = parquet_policy.as_ref() else { return true; };
             let options = if let Some(column) = column {
                 policy.get("columns").and_then(|columns| columns.get(column))
             } else {
                 policy.get("defaults")
             };
-            let Some(requested) = options
-                .and_then(|options| options.get(field))
-                .filter(|value| !value.is_null())
-            else {
+            let Some(requested) = options.and_then(|options| options.get(field)).filter(|value| !value.is_null()) else {
                 return true;
             };
-            let matches = tables_covered
-                && table_policies.iter().all(|record| {
-                    let Some(columns) = record["parquet_column_options"]
-                        .as_object()
-                        .filter(|columns| !columns.is_empty())
-                    else {
-                        return false;
-                    };
-                    let applicable = |name: &str, actual: &Value| {
-                        (field != "dictionary_page_size_limit" || actual["dictionary_enabled"] == true)
-                            && (field != "write_page_header_statistics" || actual["statistics"] == "page")
-                            && (!matches!(field, "bloom_filter_fpp" | "bloom_filter_ndv")
-                                || actual["bloom_filter_enabled"] == true)
-                            && (field != "data_page_v2_compression_ratio_threshold"
-                                || (record["parquet_properties"]["writer_version"] == "v2"
-                                    && record["parquet_columns"][name]["compression"]
-                                        .as_str()
-                                        .is_some_and(|codec| codec != "uncompressed")))
-                    };
-                    if let Some(column) = column {
-                        columns
-                            .get(column)
-                            .is_some_and(|actual| applicable(column, actual) && actual.get(field) == Some(requested))
-                    } else {
-                        let effective = columns
-                            .iter()
-                            .filter(|(name, actual)| {
-                                applicable(name, actual)
-                                    && policy
-                                        .get("columns")
-                                        .and_then(|columns| columns.get(*name))
-                                        .and_then(|options| options.get(field))
-                                        .is_none_or(Value::is_null)
-                            })
-                            .collect::<Vec<_>>();
-                        !effective.is_empty()
-                            && effective.iter().all(|(_, actual)| actual.get(field) == Some(requested))
-                    }
-                });
+            let matches = tables_covered && table_policies.iter().all(|record| {
+                let Some(columns) = record["parquet_column_options"].as_object().filter(|columns| !columns.is_empty()) else {
+                    return false;
+                };
+                let applicable = |name: &str, actual: &Value| {
+                    (field != "dictionary_page_size_limit" || actual["dictionary_enabled"] == true)
+                        && (field != "write_page_header_statistics" || actual["statistics"] == "page")
+                        && (!matches!(field, "bloom_filter_fpp" | "bloom_filter_ndv") || actual["bloom_filter_enabled"] == true)
+                        && (field != "data_page_v2_compression_ratio_threshold"
+                            || (record["parquet_properties"]["writer_version"] == "v2"
+                                && record["parquet_columns"][name]["compression"].as_str()
+                                    .is_some_and(|codec| codec != "uncompressed")))
+                };
+                if let Some(column) = column {
+                    columns.get(column).is_some_and(|actual| applicable(column, actual) && actual.get(field) == Some(requested))
+                } else {
+                    let effective = columns.iter().filter(|(name, actual)| {
+                        applicable(name, actual) && policy.get("columns").and_then(|columns| columns.get(*name))
+                            .and_then(|options| options.get(field)).is_none_or(Value::is_null)
+                    }).collect::<Vec<_>>();
+                    !effective.is_empty() && effective.iter().all(|(_, actual)| actual.get(field) == Some(requested))
+                }
+            });
             if matches {
                 promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
                 return false;
@@ -378,65 +258,41 @@ fn promote_collector_readback(
         } else if path == "parquet_writer.defaults.compression_level" {
             Some((None, "compression_level"))
         } else if let Some(column) = path.strip_prefix("parquet_writer.columns.") {
-            column
-                .strip_suffix(".compression_level")
-                .map(|column| (Some(column), "compression_level"))
-                .or_else(|| {
-                    column
-                        .strip_suffix(".compression")
-                        .map(|column| (Some(column), "compression"))
-                })
+            column.strip_suffix(".compression_level").map(|column| (Some(column), "compression_level"))
+                .or_else(|| column.strip_suffix(".compression").map(|column| (Some(column), "compression")))
         } else {
             None
         };
         if let Some((column, field)) = codec {
-            let Some(policy) = parquet_policy.as_ref() else {
-                return true;
-            };
+            let Some(policy) = parquet_policy.as_ref() else { return true; };
             let options = if let Some(column) = column {
                 policy.get("columns").and_then(|columns| columns.get(column))
             } else {
                 policy.get("defaults")
             };
-            let Some(requested) = options
-                .and_then(|options| options.get(field))
-                .filter(|value| !value.is_null())
-            else {
+            let Some(requested) = options.and_then(|options| options.get(field)).filter(|value| !value.is_null()) else {
                 return true;
             };
-            let Some(requested_codec) = options
-                .and_then(|options| options.get("compression"))
-                .filter(|value| value.is_string())
-            else {
+            let Some(requested_codec) = options.and_then(|options| options.get("compression")).filter(|value| value.is_string()) else {
                 return true;
             };
-            let matches = tables_covered
-                && table_policies.iter().all(|record| {
-                    let Some(columns) = record["parquet_columns"]
-                        .as_object()
-                        .filter(|columns| !columns.is_empty())
-                    else {
-                        return false;
-                    };
-                    let agrees = |actual: &Value| {
-                        actual.get(field) == Some(requested) && actual.get("compression") == Some(requested_codec)
-                    };
-                    if let Some(column) = column {
-                        columns.get(column).is_some_and(agrees)
-                    } else {
-                        let effective = columns
-                            .iter()
-                            .filter(|(name, _)| {
-                                policy
-                                    .get("columns")
-                                    .and_then(|columns| columns.get(*name))
-                                    .and_then(|options| options.get("compression"))
-                                    .is_none_or(Value::is_null)
-                            })
-                            .collect::<Vec<_>>();
-                        !effective.is_empty() && effective.iter().all(|(_, actual)| agrees(actual))
-                    }
-                });
+            let matches = tables_covered && table_policies.iter().all(|record| {
+                let Some(columns) = record["parquet_columns"].as_object().filter(|columns| !columns.is_empty()) else {
+                    return false;
+                };
+                let agrees = |actual: &Value| {
+                    actual.get(field) == Some(requested) && actual.get("compression") == Some(requested_codec)
+                };
+                if let Some(column) = column {
+                    columns.get(column).is_some_and(agrees)
+                } else {
+                    let effective = columns.iter().filter(|(name, _)| {
+                        policy.get("columns").and_then(|columns| columns.get(*name))
+                            .and_then(|options| options.get("compression")).is_none_or(Value::is_null)
+                    }).collect::<Vec<_>>();
+                    !effective.is_empty() && effective.iter().all(|(_, actual)| agrees(actual))
+                }
+            });
             if matches {
                 promoted.push(json!({"path": path, "reason": "consumer_table_writer_readback"}));
                 return false;
@@ -449,11 +305,8 @@ fn promote_collector_readback(
             _ => None,
         };
         if let Some((requested_field, observed_field)) = parquet_field {
-            let Some(requested) = parquet_policy
-                .as_ref()
-                .and_then(|policy| policy.get(requested_field))
-                .filter(|value| value.as_u64().is_some_and(|number| number > 0))
-            else {
+            let Some(requested) = parquet_policy.as_ref().and_then(|policy| policy.get(requested_field))
+                .filter(|value| value.as_u64().is_some_and(|number| number > 0)) else {
                 return true;
             };
             if tables_covered
@@ -471,9 +324,9 @@ fn promote_collector_readback(
         }
         if path == "collector.thp_disabled" {
             if environment.contains_key("ARROWCOL_COLLECTOR_THP_DISABLED")
-                && collectors
-                    .iter()
-                    .all(|process| process["effective_config"]["process"]["scope"] == "linux_thp_disable_flag")
+                && collectors.iter().all(|process| {
+                    process["effective_config"]["process"]["scope"] == "linux_thp_disable_flag"
+                })
             {
                 promoted.push(json!({"path": path, "reason": "consumer_linux_thp_flag_readback"}));
                 return false;
@@ -513,38 +366,27 @@ fn promote_collector_readback(
             return true;
         }
         if path == "collector.exporter.authority_timeout"
-            && projected
-                .get("ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
+            && projected.get("ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
                 .and_then(|value| value.get("authority_timeout"))
                 .is_some_and(|value| !value.is_null())
-            && collectors
-                .iter()
-                .all(|process| process["effective_config"]["authority_timeout"].is_string())
+            && collectors.iter().all(|process| {
+                process["effective_config"]["authority_timeout"].is_string()
+            })
         {
             promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
             return false;
         }
 
         let channel = match path {
-            "collector.channel_capacity.control_node" => {
-                Some(("control_node", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE"))
-            }
-            "collector.channel_capacity.control_pipeline" => {
-                Some(("control_pipeline", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE"))
-            }
-            "collector.channel_capacity.control_completion" => {
-                Some(("control_completion", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION"))
-            }
+            "collector.channel_capacity.control_node" => Some(("control_node", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE")),
+            "collector.channel_capacity.control_pipeline" => Some(("control_pipeline", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE")),
+            "collector.channel_capacity.control_completion" => Some(("control_completion", "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION")),
             "collector.channel_capacity.pdata" => Some(("pdata", "ARROWCOL_COLLECTOR_CHANNEL_PDATA")),
             _ => None,
         };
         if let Some((field, variable)) = channel {
             if environment.contains_key(variable)
-                && collectors.iter().all(|process| {
-                    process["effective_config"]["engine"]["channel_capacity"]
-                        .get(field)
-                        .is_some()
-                })
+                && collectors.iter().all(|process| process["effective_config"]["engine"]["channel_capacity"].get(field).is_some())
             {
                 promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
                 return false;
@@ -555,15 +397,10 @@ fn promote_collector_readback(
             let requested = config.tunables.wal.as_ref().and_then(|wal| wal.max_in_flight);
             if let Some(requested) = requested
                 && collectors.iter().all(|process| {
-                    process
-                        .pointer("/effective_config/wal/instances")
+                    process.pointer("/effective_config/wal/instances")
                         .and_then(Value::as_array)
-                        .is_some_and(|instances| {
-                            !instances.is_empty()
-                                && instances
-                                    .iter()
-                                    .all(|instance| instance["max_in_flight"].as_u64() == Some(requested as u64))
-                        })
+                        .is_some_and(|instances| !instances.is_empty()
+                            && instances.iter().all(|instance| instance["max_in_flight"].as_u64() == Some(requested as u64)))
                 })
             {
                 promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
@@ -573,9 +410,7 @@ fn promote_collector_readback(
         }
         if path == "collector.upload.staging_mode" {
             if let Some(mode) = environment.get("ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE")
-                && collectors
-                    .iter()
-                    .all(|p| p["effective_config"]["runtime"]["staging_mode"].as_str() == Some(mode.as_str()))
+                && collectors.iter().all(|p| p["effective_config"]["runtime"]["staging_mode"].as_str() == Some(mode.as_str()))
             {
                 promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
                 return false;
@@ -586,9 +421,7 @@ fn promote_collector_readback(
             "collector.runtime.timestamp_kernel" => Some(("timestamp_kernel", "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL")),
             "collector.runtime.workers" => Some(("runtime_workers", "ARROWCOL_COLLECTOR_RUNTIME_WORKERS")),
             "collector.runtime.blocking_workers" => Some(("blocking_workers", "ARROWCOL_COLLECTOR_BLOCKING_WORKERS")),
-            "collector.runtime.blocking_fs_reserve" => {
-                Some(("blocking_fs_reserve", "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE"))
-            }
+            "collector.runtime.blocking_fs_reserve" => Some(("blocking_fs_reserve", "ARROWCOL_COLLECTOR_BLOCKING_FS_RESERVE")),
             "collector.runtime.task_limit" => Some(("task_limit", "ARROWCOL_COLLECTOR_TASK_LIMIT")),
             "collector.runtime.read_ahead" => Some(("read_ahead", "ARROWCOL_COLLECTOR_READ_AHEAD")),
             "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
@@ -613,53 +446,33 @@ fn promote_collector_readback(
             }
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
             "collector.runtime.event_interval" => Some(("event_interval", "ARROWCOL_COLLECTOR_EVENT_INTERVAL")),
-            "collector.runtime.global_queue_interval" => {
-                Some(("global_queue_interval", "ARROWCOL_COLLECTOR_GLOBAL_QUEUE_INTERVAL"))
-            }
-            "collector.runtime.thread_stack_size" => {
-                Some(("thread_stack_size", "ARROWCOL_COLLECTOR_THREAD_STACK_SIZE"))
-            }
-            "collector.runtime.thread_keep_alive_ms" => {
-                Some(("thread_keep_alive_ms", "ARROWCOL_COLLECTOR_THREAD_KEEP_ALIVE_MS"))
-            }
-            "collector.runtime.cpu_thread_stack_size" => {
-                Some(("cpu_thread_stack_size", "ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE"))
-            }
+            "collector.runtime.global_queue_interval" => Some(("global_queue_interval", "ARROWCOL_COLLECTOR_GLOBAL_QUEUE_INTERVAL")),
+            "collector.runtime.thread_stack_size" => Some(("thread_stack_size", "ARROWCOL_COLLECTOR_THREAD_STACK_SIZE")),
+            "collector.runtime.thread_keep_alive_ms" => Some(("thread_keep_alive_ms", "ARROWCOL_COLLECTOR_THREAD_KEEP_ALIVE_MS")),
+            "collector.runtime.cpu_thread_stack_size" => Some(("cpu_thread_stack_size", "ARROWCOL_COLLECTOR_CPU_THREAD_STACK_SIZE")),
             _ => None,
         };
         if let Some((field, variable)) = runtime {
-            let requires_io_build_witness = matches!(
-                field,
-                "event_interval" | "global_queue_interval" | "thread_stack_size" | "thread_keep_alive_ms"
-            );
-            let io_build_matches = !requires_io_build_witness
-                || collectors.iter().all(|process| {
-                    let effective = &process["effective_config"];
-                    effective["runtime"]
-                        .get(field)
-                        .is_some_and(|requested| effective["delta_io_runtime_build"].get(field) == Some(requested))
-                });
+            let requires_io_build_witness = matches!(field, "event_interval" | "global_queue_interval" | "thread_stack_size" | "thread_keep_alive_ms");
+            let io_build_matches = !requires_io_build_witness || collectors.iter().all(|process| {
+                let effective = &process["effective_config"];
+                effective["runtime"].get(field).is_some_and(|requested| {
+                    effective["delta_io_runtime_build"].get(field) == Some(requested)
+                })
+            });
             let pool_field = match field {
                 "cpu_thread_stack_size" => Some("thread_stack_size"),
                 "cpu_dispatch" | "cpu_placement" => Some(field),
                 _ => None,
             };
-            let pool_matches = pool_field.is_none_or(|pool_field| {
-                collectors.iter().all(|process| {
-                    let effective = &process["effective_config"];
-                    matches!(
-                        effective["cpu_pool"]["scope"].as_str(),
-                        Some("runtime_initialization" | "lazy_pool_initialization")
-                    ) && effective["cpu_pool"].get(pool_field) == effective["runtime"].get(field)
-                        && (field != "cpu_placement"
-                            || effective["runtime"][field] != "physical_first"
-                            || physical_pool_witness(effective))
-                })
-            });
+            let pool_matches = pool_field.is_none_or(|pool_field| collectors.iter().all(|process| {
+                let effective = &process["effective_config"];
+                matches!(effective["cpu_pool"]["scope"].as_str(), Some("runtime_initialization" | "lazy_pool_initialization"))
+                    && effective["cpu_pool"].get(pool_field) == effective["runtime"].get(field)
+                    && (field != "cpu_placement" || effective["runtime"][field] != "physical_first" || physical_pool_witness(effective))
+            }));
             if environment.contains_key(variable)
-                && collectors
-                    .iter()
-                    .all(|process| process["effective_config"]["runtime"].get(field).is_some())
+                && collectors.iter().all(|process| process["effective_config"]["runtime"].get(field).is_some())
                 && io_build_matches
                 && pool_matches
             {
@@ -674,34 +487,17 @@ fn promote_collector_readback(
             return true;
         }
         if let Some(field) = path.strip_prefix("collector.batching.")
-            && matches!(
-                field,
-                "coalesce_publications"
-                    | "age_flush_policy"
-                    | "pipeline_depth"
-                    | "global_capacity.bytes"
-                    | "global_capacity.rows"
-                    | "global_capacity.batches"
-                    | "per_table_capacity.bytes"
-                    | "per_table_capacity.rows"
-                    | "per_table_capacity.batches"
-                    | "max_arrow_memory_per_flush"
-                    | "max_rows_per_flush"
-                    | "max_batches_per_flush"
-                    | "max_age"
-                    | "max_concurrent_flushes"
-                    | "stage_file_concurrency"
-                    | "stage_files_per_group"
-            )
+            && matches!(field,
+                "coalesce_publications" | "age_flush_policy" | "pipeline_depth"
+                | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
+                | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
+                | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
+                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency" | "stage_files_per_group")
         {
             let pointer = format!("/{}", field.replace('.', "/"));
-            if projected
-                .get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
-                .and_then(|value| value.pointer(&pointer))
-                .is_some()
-                && collectors
-                    .iter()
-                    .all(|process| process["effective_config"]["batching"].pointer(&pointer).is_some())
+            if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
+                .and_then(|value| value.pointer(&pointer)).is_some()
+                && collectors.iter().all(|process| process["effective_config"]["batching"].pointer(&pointer).is_some())
             {
                 promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
                 return false;
@@ -709,46 +505,23 @@ fn promote_collector_readback(
             return true;
         }
         let (section, field, variable) = match path {
-            "collector.commit.batch_window"
-            | "collector.commit.max_files_per_commit"
-            | "collector.commit.max_pending_files"
-            | "collector.commit.txn_lookup_mode" => (
-                "commit",
-                path.rsplit('.').next().unwrap_or_default(),
-                "ARROWCOL_COLLECTOR_COMMIT_CONFIG",
-            ),
-            "collector.pressure.max_concurrent_streams"
-            | "collector.pressure.rss_limit_bytes"
-            | "collector.pressure.buffered_bytes_limit"
-            | "collector.pressure.buffered_rows_limit"
-            | "collector.pressure.buffered_batches_limit"
-            | "collector.pressure.pressure_interval"
-            | "collector.pressure.heartbeat_interval"
-            | "collector.pressure.registration_ttl" => (
-                "pressure",
-                path.rsplit('.').next().unwrap_or_default(),
-                "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
-            ),
-            "collector.limits.batch_channel_capacity"
-            | "collector.limits.put_result_channel_capacity"
-            | "collector.limits.grpc_accept_compression"
-            | "collector.limits.grpc_send_compression"
-            | "collector.limits.max_metadata_bytes"
-            | "collector.limits.max_schema_bytes"
-            | "collector.limits.max_message_bytes" => (
-                "limits",
-                path.rsplit('.').next().unwrap_or_default(),
-                "ARROWCOL_COLLECTOR_LIMITS_CONFIG",
-            ),
+            "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
+            | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode" => ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
+            "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
+            | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
+            | "collector.pressure.buffered_batches_limit" | "collector.pressure.pressure_interval"
+            | "collector.pressure.heartbeat_interval" | "collector.pressure.registration_ttl" => ("pressure", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_PRESSURE_CONFIG"),
+            "collector.limits.batch_channel_capacity" | "collector.limits.put_result_channel_capacity"
+            | "collector.limits.grpc_accept_compression" | "collector.limits.grpc_send_compression"
+            | "collector.limits.max_metadata_bytes" | "collector.limits.max_schema_bytes"
+            | "collector.limits.max_message_bytes" =>
+                ("limits", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_LIMITS_CONFIG"),
             _ => return true,
         };
         if projected.get(variable).and_then(|value| value.get(field)).is_none() {
             return true;
         }
-        if collectors
-            .iter()
-            .any(|process| process["effective_config"][section].get(field).is_none())
-        {
+        if collectors.iter().any(|process| process["effective_config"][section].get(field).is_none()) {
             return true;
         }
         promoted.push(json!({"path": path, "reason": "consumer_startup_readback"}));
@@ -761,27 +534,16 @@ fn promote_collector_readback(
     Ok(())
 }
 
-fn promote_router_readback(
-    config: &OatConfig,
-    evidence: &mut Value,
-    processes: Option<&Value>,
-    replicas: u32,
-) -> Result<()> {
+fn promote_router_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
     let Some(routers) = verified_processes(config, processes, ComponentRole::Router, replicas) else {
         return Ok(());
     };
     if !role_environment(config, ComponentRole::Router)?.contains_key("ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")
-        || routers.iter().any(|process| {
-            process
-                .pointer("/effective_config/routing/excluded_admission_gauges")
-                .is_none()
-        })
+        || routers.iter().any(|process| process.pointer("/effective_config/routing/excluded_admission_gauges").is_none())
     {
         return Ok(());
     }
-    let projection = evidence["projection_only"]
-        .as_array_mut()
-        .context("projection_only must be an array")?;
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
     let mut promoted = Vec::new();
     projection.retain(|entry| {
         if entry["path"] == "router.excluded_admission_gauges" {
@@ -791,10 +553,7 @@ fn promote_router_readback(
             true
         }
     });
-    evidence["consumer_verified"]
-        .as_array_mut()
-        .context("consumer_verified must be an array")?
-        .extend(promoted);
+    evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
     Ok(())
 }
 
@@ -802,23 +561,17 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
     let Some(reports) = reports else {
         return Ok(());
     };
-    let ids = reports
-        .iter()
+    let ids = reports.iter()
         .filter_map(|report| report["client_id"].as_str().filter(|id| !id.is_empty()))
         .collect::<std::collections::BTreeSet<_>>();
-    if reports.len() != config.clients_per_table
-        || ids.len() != reports.len()
+    if reports.len() != config.clients_per_table || ids.len() != reports.len()
         || reports.is_empty()
-        || reports.iter().any(|report| {
-            verify_process_configuration(config, ComponentRole::Client, &report["consumer_effective_config"]).is_err()
-        })
+        || reports.iter().any(|report| verify_process_configuration(config, ComponentRole::Client, &report["consumer_effective_config"]).is_err())
     {
         return Ok(());
     }
     let environment = role_environment(config, ComponentRole::Client)?;
-    let projection = evidence["projection_only"]
-        .as_array_mut()
-        .context("projection_only must be an array")?;
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
     let mut promoted = Vec::new();
     let mut inert = Vec::new();
     projection.retain(|entry| {
@@ -1040,14 +793,8 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         } else { "consumer_startup_readback" }}));
         false
     });
-    evidence["inert_fields"]
-        .as_array_mut()
-        .context("inert_fields must be an array")?
-        .extend(inert);
-    evidence["consumer_verified"]
-        .as_array_mut()
-        .context("consumer_verified must be an array")?
-        .extend(promoted);
+    evidence["inert_fields"].as_array_mut().context("inert_fields must be an array")?.extend(inert);
+    evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.extend(promoted);
     Ok(())
 }
 
@@ -1092,12 +839,7 @@ fn capability_evidence() -> Vec<Value> {
 fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::collections::BTreeMap<String, String>> {
     config.tunables.validate_for_oat()?;
     if matches!(role, ComponentRole::Collector)
-        && config
-            .tunables
-            .logging
-            .as_ref()
-            .and_then(|logging| logging.collector)
-            .is_some()
+        && config.tunables.logging.as_ref().and_then(|logging| logging.collector).is_some()
     {
         let pipeline = if config.tunables.wal.is_some() {
             include_str!("../../arrowcol-dataflow-rust/config.quiver.yaml")
@@ -1110,8 +852,8 @@ fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::coll
 }
 
 fn validate_collector_pipeline_log_level(pipeline_yaml: &str) -> Result<()> {
-    let pipeline: serde_yaml::Value =
-        serde_yaml::from_str(pipeline_yaml).context("parse rendered collector pipeline for logging precedence")?;
+    let pipeline: serde_yaml::Value = serde_yaml::from_str(pipeline_yaml)
+        .context("parse rendered collector pipeline for logging precedence")?;
     let mut engine = pipeline
         .get("engine")
         .cloned()
@@ -1120,8 +862,8 @@ fn validate_collector_pipeline_log_level(pipeline_yaml: &str) -> Result<()> {
     if let Some(mapping) = engine.as_mapping_mut() {
         mapping.remove("shutdown_drain_timeout_seconds");
     }
-    let engine: EngineConfig =
-        serde_yaml::from_value(engine).context("parse collector engine settings for logging precedence")?;
+    let engine: EngineConfig = serde_yaml::from_value(engine)
+        .context("parse collector engine settings for logging precedence")?;
     if engine.telemetry.logs.level.is_some() {
         bail!("logging.collector cannot override engine.telemetry.logs.level in the rendered pipeline");
     }
@@ -1140,20 +882,14 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             if config.platform.kind == crate::config::OatMode::Local
                 && (config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
                     || config.platform.local.partitioned_table_bootstrap)
-                && let Some(granularity) = config
-                    .tunables
-                    .maintenance
-                    .as_ref()
+                && let Some(granularity) = config.tunables.maintenance.as_ref()
                     .filter(|settings| settings.enabled == Some(true))
                     .and_then(|settings| settings.granularity)
             {
                 let value = serde_json::to_value(granularity)?;
                 environment.insert(
                     "ARROWCOL_PARTITION_GRANULARITY".to_owned(),
-                    value
-                        .as_str()
-                        .context("invalid typed partition granularity")?
-                        .to_owned(),
+                    value.as_str().context("invalid typed partition granularity")?.to_owned(),
                 );
             }
             for &(legacy, canonical, _) in arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES {
@@ -1169,25 +905,22 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
     if config.platform.kind == crate::config::OatMode::Local
         && let Some(profile_hash) = config.client_build_profile_hash()
     {
-        let profile = config
-            .tunables
-            .client
-            .as_ref()
-            .and_then(|client| client.build_profile.as_ref())
-            .context("client profile hash requires client build-profile tunables")?
-            .build_profile();
-        let image = local_client_profile_tag(&profile_hash);
-        let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
-        client["image"] = json!(image);
-        client["build"]["args"] = json!({
-            "OAT_CLIENT_BUILD_PROFILE_HASH": profile_hash,
-            "OAT_CLIENT_BUILD_LTO": profile.lto.as_str(),
-            "OAT_CLIENT_BUILD_CODEGEN_UNITS": profile.codegen_units.to_string(),
-            "OAT_CLIENT_BUILD_OPT_LEVEL": profile.opt_level.as_u8().to_string(),
-            "OAT_CLIENT_BUILD_TARGET_CPU": profile.target_cpu.as_str(),
-        });
-        let pin_init = services.entry("oat-pin-init".to_owned()).or_insert_with(|| json!({}));
-        pin_init["image"] = json!(image);
+            let profile = config.tunables.client.as_ref()
+                .and_then(|client| client.build_profile.as_ref())
+                .context("client profile hash requires client build-profile tunables")?
+                .build_profile();
+            let image = local_client_profile_tag(&profile_hash);
+            let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
+            client["image"] = json!(image);
+            client["build"]["args"] = json!({
+                "OAT_CLIENT_BUILD_PROFILE_HASH": profile_hash,
+                "OAT_CLIENT_BUILD_LTO": profile.lto.as_str(),
+                "OAT_CLIENT_BUILD_CODEGEN_UNITS": profile.codegen_units.to_string(),
+                "OAT_CLIENT_BUILD_OPT_LEVEL": profile.opt_level.as_u8().to_string(),
+                "OAT_CLIENT_BUILD_TARGET_CPU": profile.target_cpu.as_str(),
+            });
+            let pin_init = services.entry("oat-pin-init".to_owned()).or_insert_with(|| json!({}));
+            pin_init["image"] = json!(image);
     }
     if config.platform.kind == crate::config::OatMode::Local {
         let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
@@ -1201,8 +934,7 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
     let services = overlay["services"]
         .as_object_mut()
         .context("Compose tunable services missing")?;
-    services.entry("oat-client").or_insert_with(|| json!({}))["stop_grace_period"] =
-        json!(format!("{}s", config.client_stop_grace_seconds()));
+    services.entry("oat-client").or_insert_with(|| json!({}))["stop_grace_period"] = json!(format!("{}s", config.client_stop_grace_seconds()));
     let collector = services.entry("dataflow-1").or_insert_with(|| json!({}));
     if let Some(bytes) = config.platform.local.collector_memory_limit_bytes {
         collector["mem_limit"] = json!(bytes);
@@ -1327,16 +1059,12 @@ fn validate_collector_exporter_override(
         .pointer("/spec/template/spec/containers")
         .and_then(Value::as_array)
         .context("collector Deployment has no containers")?;
-    let mut selected = containers
-        .iter()
-        .filter(|item| item["name"].as_str() == Some(container_name));
+    let mut selected = containers.iter().filter(|item| item["name"].as_str() == Some(container_name));
     let container = selected.next().context("collector container is missing")?;
     if selected.next().is_some() {
         bail!("collector container is ambiguous");
     }
-    let entries = container["env"]
-        .as_array()
-        .context("collector environment is missing")?;
+    let entries = container["env"].as_array().context("collector environment is missing")?;
     let mut entries = entries
         .iter()
         .filter(|entry| entry["name"].as_str() == Some("ARROWCOL_COLLECTOR_EXPORTER_CONFIG"));
@@ -1347,15 +1075,13 @@ fn validate_collector_exporter_override(
     let Some(entry) = entry else {
         return Ok(());
     };
-    let value = entry["value"]
-        .as_str()
-        .context("collector exporter override must have a literal value")?;
+    let value = entry["value"].as_str().context("collector exporter override must have a literal value")?;
     let rendered: arrowcol_tunables::ExporterTunables =
         serde_json::from_str(value).context("invalid rendered collector exporter override")?;
     let name = "ARROWCOL_COLLECTOR_EXPORTER_CONFIG";
-    let requested: arrowcol_tunables::ExporterTunables =
-        serde_json::from_str(variables.get(name).context("unrequested collector exporter override")?)
-            .context("invalid collector exporter tunable override")?;
+    let requested: arrowcol_tunables::ExporterTunables = serde_json::from_str(
+        variables.get(name).context("unrequested collector exporter override")?,
+    ).context("invalid collector exporter tunable override")?;
     if serde_json::to_value(rendered)? != serde_json::to_value(requested)? {
         bail!("collector exporter override differs from requested tunables");
     }
@@ -1374,37 +1100,17 @@ mod tunable_injection_tests {
                 "lto":"thin-local","codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"
             }}
         }))?;
-        let profile_hash = first
-            .client_build_profile_hash()
-            .context("client profile hash missing")?;
+        let profile_hash = first.client_build_profile_hash().context("client profile hash missing")?;
         let image = local_client_profile_tag(&profile_hash);
         let overlay = compose_tunables(&first)?;
         assert_eq!(overlay["services"]["oat-client"]["image"], image);
         assert_eq!(overlay["services"]["oat-pin-init"]["image"], image);
-        assert_eq!(
-            overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_PROFILE_HASH"],
-            profile_hash
-        );
-        assert_eq!(
-            overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_LTO"],
-            "thin-local"
-        );
-        assert_eq!(
-            overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_CODEGEN_UNITS"],
-            "8"
-        );
-        assert_eq!(
-            overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_OPT_LEVEL"],
-            "2"
-        );
-        assert_eq!(
-            overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_TARGET_CPU"],
-            "x86-64-v3"
-        );
-        assert_eq!(
-            overlay["services"]["oat-client"]["build"]["args"]["VCS_REF"],
-            "${GIT_SHA:-local}"
-        );
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_PROFILE_HASH"], profile_hash);
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_LTO"], "thin-local");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_CODEGEN_UNITS"], "8");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_OPT_LEVEL"], "2");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_TARGET_CPU"], "x86-64-v3");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["VCS_REF"], "${GIT_SHA:-local}");
 
         let mut alternate = config()?;
         alternate.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
@@ -1412,12 +1118,7 @@ mod tunable_injection_tests {
                 "lto":"thin-local","codegen_units":8,"opt_level":3,"target_cpu":"x86-64-v3"
             }}
         }))?;
-        assert_ne!(
-            profile_hash,
-            alternate
-                .client_build_profile_hash()
-                .context("alternate client profile hash missing")?
-        );
+        assert_ne!(profile_hash, alternate.client_build_profile_hash().context("alternate client profile hash missing")?);
         Ok(())
     }
 
@@ -1489,28 +1190,19 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             .stderr(Stdio::piped())
             .spawn()
             .context("start actual TypeScript runtime renderer")?;
-        child
-            .stdin
-            .take()
-            .context("renderer stdin missing")?
-            .write_all(&serde_json::to_vec(&runtime)?)?;
+        child.stdin.take().context("renderer stdin missing")?.write_all(&serde_json::to_vec(&runtime)?)?;
         let output = child.wait_with_output().context("wait for runtime renderer")?;
         if !output.status.success() {
             bail!("runtime renderer failed: {}", String::from_utf8_lossy(&output.stderr));
         }
         let mut resources: Vec<Value> = serde_json::from_slice(&output.stdout)?;
         assert_exporter_configs(&resources, None)?;
-        let rendered_collector = resources
-            .iter()
-            .find(|resource| resource["kind"] == "Deployment" && resource["metadata"]["name"] == config.dfe_deployment)
-            .context("collector Deployment missing")?
-            .clone();
+        let rendered_collector = resources.iter().find(|resource| resource["kind"] == "Deployment"
+            && resource["metadata"]["name"] == config.dfe_deployment).context("collector Deployment missing")?.clone();
         inject_workload_environment(&config, &mut resources)?;
         assert_exporter_configs(&resources, timeout)?;
-        let collector = resources
-            .iter_mut()
-            .find(|resource| resource["kind"] == "Deployment" && resource["metadata"]["name"] == config.dfe_deployment)
-            .context("collector Deployment missing")?;
+        let collector = resources.iter_mut().find(|resource| resource["kind"] == "Deployment"
+            && resource["metadata"]["name"] == config.dfe_deployment).context("collector Deployment missing")?;
         configure_collector_deployment(&config, collector, 1)?;
         assert_exporter_configs(std::slice::from_ref(collector), timeout)?;
         let configured = collector.clone();
@@ -1529,29 +1221,19 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             r#"{"authority_timeout":"10s","authority_timeout":"10s"}"#,
         ] {
             let mut invalid_deployment = configured.clone();
-            let entries = invalid_deployment
-                .pointer_mut("/spec/template/spec/containers/0/env")
-                .and_then(Value::as_array_mut)
-                .context("collector env missing")?;
+            let entries = invalid_deployment.pointer_mut("/spec/template/spec/containers/0/env")
+                .and_then(Value::as_array_mut).context("collector env missing")?;
             entries.retain(|entry| entry["name"] != "ARROWCOL_COLLECTOR_EXPORTER_CONFIG");
             entries.push(json!({"name":"ARROWCOL_COLLECTOR_EXPORTER_CONFIG","value":invalid}));
-            assert!(
-                configure_collector_deployment(&config, &mut invalid_deployment.clone(), 1).is_err(),
-                "{invalid}"
-            );
-            assert!(
-                inject_workload_environment(&config, std::slice::from_mut(&mut invalid_deployment)).is_err(),
-                "{invalid}"
-            );
+            assert!(configure_collector_deployment(&config, &mut invalid_deployment.clone(), 1).is_err(), "{invalid}");
+            assert!(inject_workload_environment(&config, std::slice::from_mut(&mut invalid_deployment)).is_err(), "{invalid}");
         }
         let mut duplicated = configured.clone();
-        let entries = duplicated
-            .pointer_mut("/spec/template/spec/containers/0/env")
-            .and_then(Value::as_array_mut)
-            .context("collector env missing")?;
+        let entries = duplicated.pointer_mut("/spec/template/spec/containers/0/env")
+            .and_then(Value::as_array_mut).context("collector env missing")?;
         let entry = json!({"name":"ARROWCOL_COLLECTOR_EXPORTER_CONFIG","value":r#"{"authority_timeout":"10s"}"#});
         entries.retain(|entry| entry["name"] != "ARROWCOL_COLLECTOR_EXPORTER_CONFIG");
-        entries.extend([entry.clone(), entry]);
+        entries.extend([entry.clone(),entry]);
         assert!(configure_collector_deployment(&config, &mut duplicated.clone(), 1).is_err());
         assert!(inject_workload_environment(&config, std::slice::from_mut(&mut duplicated)).is_err());
         Ok(())
@@ -1560,20 +1242,13 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     fn assert_exporter_configs(resources: &[Value], timeout: Option<&str>) -> Result<()> {
         let mut count = 0;
         for resource in resources {
-            if let Some(containers) = resource
-                .pointer("/spec/template/spec/containers")
-                .and_then(Value::as_array)
-            {
+            if let Some(containers) = resource.pointer("/spec/template/spec/containers").and_then(Value::as_array) {
                 for container in containers {
                     if let Some(env) = container["env"].as_array() {
-                        for entry in env
-                            .iter()
-                            .filter(|entry| entry["name"] == "ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
-                        {
+                        for entry in env.iter().filter(|entry| entry["name"] == "ARROWCOL_COLLECTOR_EXPORTER_CONFIG") {
                             let parsed: arrowcol_tunables::ExporterTunables = serde_json::from_str(
-                                entry["value"].as_str().context("exporter config must be a string")?,
-                            )
-                            .context("actual collector exporter parser rejected emitted config")?;
+                                entry["value"].as_str().context("exporter config must be a string")?
+                            ).context("actual collector exporter parser rejected emitted config")?;
                             assert_eq!(parsed.authority_timeout.as_deref(), timeout);
                             count += 1;
                         }
@@ -1626,16 +1301,12 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
         assert_eq!(overlay["services"]["dataflow-1"]["mem_limit"], 4 * 1024_u64.pow(3));
         for (service, value) in overlay["services"].as_object().context("services missing")? {
-            if service != "dataflow-1" {
-                assert!(value.get("mem_limit").is_none());
-            }
+            if service != "dataflow-1" { assert!(value.get("mem_limit").is_none()); }
         }
 
         for invalid in [json!("4GiB"), json!("4096Mi"), json!(-1), json!(1.5)] {
-            assert!(
-                serde_json::from_value::<crate::config::LocalOptions>(json!({"collector_memory_limit_bytes":invalid}))
-                    .is_err()
-            );
+            assert!(serde_json::from_value::<crate::config::LocalOptions>(
+                json!({"collector_memory_limit_bytes":invalid})).is_err());
         }
         config.platform.local.collector_memory_limit_bytes = Some(1);
         assert!(config.validate().is_err());
@@ -1678,105 +1349,51 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             "maintenance":{"enabled":true,"operations":["purge"],"granularity":"hour"}
         }))?;
         let overlay = compose_tunables(&config)?;
-        let collector_env = overlay
-            .pointer("/services/dataflow-1/environment")
-            .and_then(Value::as_object)
-            .context("collector environment missing")?
-            .iter()
-            .map(|(key, value)| Ok((key.clone(), value.as_str().context("not a string")?.to_owned())))
+        let collector_env = overlay.pointer("/services/dataflow-1/environment")
+            .and_then(Value::as_object).context("collector environment missing")?
+            .iter().map(|(key, value)| Ok((key.clone(), value.as_str().context("not a string")?.to_owned())))
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let writer = arrow_deltalake::delta::resolve_process_writer_properties_from_environment(&collector_env)?;
-        assert_eq!(
-            writer.get("arrowcol.partition.granularity").map(String::as_str),
-            Some("hour")
-        );
-        assert_eq!(
-            overlay.pointer("/services/delta-maintenance/environment/ARROWCOL_MAINT_GRANULARITY"),
-            Some(&json!("hour"))
-        );
+        assert_eq!(writer.get("arrowcol.partition.granularity").map(String::as_str), Some("hour"));
+        assert_eq!(overlay.pointer("/services/delta-maintenance/environment/ARROWCOL_MAINT_GRANULARITY"), Some(&json!("hour")));
         let table = canonical_dmv_table_name(&config.tables[0])?;
         let collector = json!({"Config":{"Env":["ARROWCOL_PARTITION_GRANULARITY=hour"]}});
-        let event = |granularity: &str| {
-            format!(
-                "arrowcol_maintenance_table_config {}\n",
-                json!({
-                    "table": table,
-                    "config": {"active":true,"table_policy":{"arrowcol.partition.granularity":granularity}}
-                })
-            )
-        };
+        let event = |granularity: &str| format!("arrowcol_maintenance_table_config {}\n", json!({
+            "table": table,
+            "config": {"active":true,"table_policy":{"arrowcol.partition.granularity":granularity}}
+        }));
         assert!(local_partition_policy_evidence("hour", &table, &collector, "")?.is_none());
-        let evidence =
-            local_partition_policy_evidence("hour", &table, &collector, &event("hour"))?.context("missing evidence")?;
+        let evidence = local_partition_policy_evidence("hour", &table, &collector, &event("hour"))?
+            .context("missing evidence")?;
         assert_eq!(evidence["maintenance_table_effective"], "hour");
         assert!(local_partition_policy_evidence("hour", &table, &collector, &event("minute")).is_err());
         let mut properties = std::collections::BTreeMap::new();
         assert_eq!(validate_local_table_partition_property(&properties, "hour")?, None);
         properties.insert("arrowcol.partition.granularity".to_owned(), "hour".to_owned());
-        assert_eq!(
-            validate_local_table_partition_property(&properties, "hour")?,
-            Some("hour")
-        );
+        assert_eq!(validate_local_table_partition_property(&properties, "hour")?, Some("hour"));
         properties.insert("arrowcol.partition.granularity".to_owned(), "minute".to_owned());
         assert!(validate_local_table_partition_property(&properties, "hour").is_err());
-        assert!(
-            local_partition_policy_evidence(
-                "hour",
-                &table,
-                &json!({"Config":{"Env":["ARROWCOL_PARTITION_GRANULARITY=minute"]}}),
-                &event("hour")
-            )
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<arrowcol_tunables::Tunables>(json!({"maintenance":{"granularity":"hours"}}))
-                .is_err()
-        );
+        assert!(local_partition_policy_evidence(
+            "hour", &table, &json!({"Config":{"Env":["ARROWCOL_PARTITION_GRANULARITY=minute"]}}), &event("hour")
+        ).is_err());
+        assert!(serde_json::from_value::<arrowcol_tunables::Tunables>(
+            json!({"maintenance":{"granularity":"hours"}})
+        ).is_err());
         config.campaign_profile = None;
         let noncampaign = compose_tunables(&config)?;
-        assert!(
-            noncampaign
-                .pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY")
-                .is_none()
-        );
+        assert!(noncampaign.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
         config.platform.local.partitioned_table_bootstrap = true;
         let bootstrap = compose_tunables(&config)?;
-        assert_eq!(
-            bootstrap.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY"),
-            Some(&json!("hour"))
-        );
+        assert_eq!(bootstrap.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY"), Some(&json!("hour")));
         config.platform.local.partitioned_table_bootstrap = false;
         config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
-        config
-            .tunables
-            .maintenance
-            .as_mut()
-            .context("maintenance missing")?
-            .enabled = Some(false);
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.enabled = Some(false);
         let disabled = compose_tunables(&config)?;
-        assert!(
-            disabled
-                .pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY")
-                .is_none()
-        );
-        config
-            .tunables
-            .maintenance
-            .as_mut()
-            .context("maintenance missing")?
-            .enabled = Some(true);
-        config
-            .tunables
-            .maintenance
-            .as_mut()
-            .context("maintenance missing")?
-            .granularity = None;
+        assert!(disabled.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.enabled = Some(true);
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.granularity = None;
         let unset = compose_tunables(&config)?;
-        assert!(
-            unset
-                .pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY")
-                .is_none()
-        );
+        assert!(unset.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
         Ok(())
     }
 
@@ -1794,12 +1411,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let root = TempRoot(root);
         let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
         arrowcol_loadgen::initialize::initialize_local(arrowcol_loadgen::cli::InitializeLocalArgs {
-            partition_by_ingestion_date: true,
-            unpartitioned: false,
-            table: table.to_owned(),
-            dataflow_root: root.0.clone(),
-            delta_target_file_size_bytes: None,
-            delta_checkpoint_interval: None,
+            partition_by_ingestion_date: true, unpartitioned: false, table: table.to_owned(), dataflow_root: root.0.clone(),
+            delta_target_file_size_bytes: None, delta_checkpoint_interval: None,
         })?;
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -1811,52 +1424,30 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 "purge_retention_secs":2592000}
         }))?;
         let overlay = compose_tunables(&config)?;
-        let environment = overlay
-            .pointer("/services/dataflow-1/environment")
-            .and_then(Value::as_object)
-            .context("collector environment missing")?;
-        let env = environment
-            .iter()
-            .map(|(key, value)| {
-                Ok(format!(
-                    "{key}={}",
-                    value.as_str().context("environment value is not a string")?
-                ))
-            })
+        let environment = overlay.pointer("/services/dataflow-1/environment")
+            .and_then(Value::as_object).context("collector environment missing")?;
+        let env = environment.iter().map(|(key, value)|
+            Ok(format!("{key}={}", value.as_str().context("environment value is not a string")?)))
             .collect::<Result<Vec<_>>>()?;
         let collector = json!({"Config":{"Env": env}});
         let url = url::Url::from_directory_path(&root.0).map_err(|()| anyhow::anyhow!("invalid root"))?;
         let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/delta-maintenance");
-        let output = std::process::Command::new(binary)
-            .env_clear()
+        let output = std::process::Command::new(binary).env_clear()
             .envs(role_environment(&config, ComponentRole::Maintenance)?)
-            .args([
-                "--root",
-                url.as_str(),
-                "--table",
-                table,
-                "--operation",
-                "purge",
-                "--interval-secs",
-                "60",
-                "--max-cycles",
-                "1",
-                "--no-metrics-listener",
-            ])
+            .args(["--root", url.as_str(), "--table", table, "--operation", "purge",
+                "--interval-secs", "60", "--max-cycles", "1", "--no-metrics-listener"])
             .output()?;
         let stderr = String::from_utf8(output.stderr)?;
-        if !output.status.success() {
-            bail!("maintenance fixture failed: {stderr}");
-        }
+        if !output.status.success() { bail!("maintenance fixture failed: {stderr}"); }
         verify_process_configuration(&config, ComponentRole::Maintenance, &process_configurations(&stderr)?)?;
         let evidence = local_partition_policy_evidence("hour", table, &collector, &stderr)?
             .context("real maintenance consumer omitted effective table policy")?;
         assert_eq!(evidence["maintenance_table_effective"], "hour");
-        let metadata_url =
-            url::Url::from_directory_path(root.0.join("telemetry/sqlserver/sqlserver_availability_replica_states"))
-                .map_err(|()| anyhow::anyhow!("invalid table"))?;
-        let properties =
-            arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&metadata_url)?.maintenance_properties()?;
+        let metadata_url = url::Url::from_directory_path(root.0.join(
+            "telemetry/sqlserver/sqlserver_availability_replica_states"
+        )).map_err(|()| anyhow::anyhow!("invalid table"))?;
+        let properties = arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&metadata_url)?
+            .maintenance_properties()?;
         assert!(!properties.contains_key("arrowcol.partition.granularity"));
         Ok(())
     }
@@ -1866,57 +1457,31 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         if std::env::var_os("OAT_UPLOAD_RUNTIME_CHILD").is_some() {
             let actual = serde_json::to_value(arrow_deltalake::DeltaRuntimeConfig::from_env()?)?;
             let expected: Value = serde_json::from_str(&std::env::var("OAT_UPLOAD_RUNTIME_EXPECTED")?)?;
-            for (key, value) in expected
-                .as_object()
-                .context("expected runtime configuration must be an object")?
-            {
+            for (key, value) in expected.as_object().context("expected runtime configuration must be an object")? {
                 assert_eq!(actual[key], *value, "{key}");
             }
             println!("OAT_UPLOAD_RUNTIME_READBACK {actual}");
             return Ok(());
         }
         for (tunables, expected) in [
-            (
-                json!({"collector":{"runtime":{"timestamp_kernel":"fused_checked"}}}),
-                json!({"timestamp_kernel":"fused_checked"}),
-            ),
-            (
-                json!({"collector":{"runtime":{"upload_limit":1},"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":16}}}),
-                json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1}),
-            ),
-            (
-                json!({"collector":{"upload":{"mode":"buffered_multipart","staging_mode":"streaming"}}}),
-                json!({"staging_mode":"streaming"}),
-            ),
-            (
-                json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
-                json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256}),
-            ),
-            (
-                json!({"collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":2}}}),
-                json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":2,"upload_limit":32}),
-            ),
-            (
-                json!({"collector":{"runtime":{"file_mapping_cache":true}}}),
-                json!({"file_mapping_cache":true}),
-            ),
-            (
-                json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
-                json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}),
-            ),
-            (
-                json!({"collector":{"runtime":{"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152}}}),
-                json!({"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152}),
-            ),
-            (
-                json!({"collector":{"runtime":{"parquet_column_workers":4}}}),
-                json!({"parquet_column_workers":4}),
-            ),
-            (
-                json!({"collector":{"runtime":{"parquet_column_workers":4,"parquet_encode_mode":"column_pipeline"},
+            (json!({"collector":{"runtime":{"timestamp_kernel":"fused_checked"}}}), json!({"timestamp_kernel":"fused_checked"})),
+            (json!({"collector":{"runtime":{"upload_limit":1},"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":16}}}),
+             json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1})),
+            (json!({"collector":{"upload":{"mode":"buffered_multipart","staging_mode":"streaming"}}}), json!({"staging_mode":"streaming"})),
+            (json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
+             json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256})),
+            (json!({"collector":{"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":2}}}),
+             json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":2,"upload_limit":32})),
+            (json!({"collector":{"runtime":{"file_mapping_cache":true}}}), json!({"file_mapping_cache":true})),
+            (json!({"collector":{"runtime":{"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2}}}),
+             json!({"cpu_workers":4,"cpu_queue_jobs":2,"blocking_workers":4,"blocking_fs_reserve":2})),
+            (json!({"collector":{"runtime":{"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152}}}),
+             json!({"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152})),
+            (json!({"collector":{"runtime":{"parquet_column_workers":4}}}),
+             json!({"parquet_column_workers":4})),
+            (json!({"collector":{"runtime":{"parquet_column_workers":4,"parquet_encode_mode":"column_pipeline"},
                 "upload":{"mode":"buffered_multipart","staging_mode":"streaming"}}}),
-                json!({"parquet_column_workers":4,"parquet_encode_mode":"column_pipeline","staging_mode":"streaming"}),
-            ),
+             json!({"parquet_column_workers":4,"parquet_encode_mode":"column_pipeline","staging_mode":"streaming"})),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
@@ -1971,11 +1536,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             .envs(role_environment(&config, ComponentRole::Collector)?)
             .output()
             .context("launch actual collector for startup readback")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "collector startup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
         let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
         assert_eq!(observed["runtime"]["upload_mode"], "buffered_multipart");
         assert_eq!(observed["runtime"]["upload_buffer_capacity_bytes"], 1048576);
@@ -2013,10 +1574,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong_process])), 1)?;
         assert_eq!(uncovered, initial);
         let mut missing = observed.clone();
-        missing["runtime"]
-            .as_object_mut()
-            .context("missing runtime readback")?
-            .remove("upload_mode");
+        missing["runtime"].as_object_mut().context("missing runtime readback")?.remove("upload_mode");
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err());
         let mut wrong = observed;
         wrong["runtime"]["upload_request_concurrency"] = json!(2);
@@ -2032,16 +1590,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector":{"layout":{"detach_ratio":5}}
         }))?;
-        let output = std::process::Command::new(binary)
-            .arg("--help")
-            .env_clear()
-            .envs(role_environment(&config, ComponentRole::Collector)?)
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "collector startup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output = std::process::Command::new(binary).arg("--help").env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?).output()?;
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
         let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         assert_eq!(observed["runtime"]["layout_detach_ratio"], 5);
@@ -2068,11 +1619,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             .env_clear()
             .envs(role_environment(&config, ComponentRole::Collector)?)
             .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "collector failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::ensure!(output.status.success(), "collector failed: {}", String::from_utf8_lossy(&output.stderr));
         let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
         assert_eq!(observed["process"]["thp_disabled"], true);
         assert_eq!(observed["process"]["scope"], "linux_thp_disable_flag");
@@ -2084,13 +1631,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         });
         let mut evidence = tunable_leaf_evidence(&config)?;
         promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
-        assert!(
-            evidence["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?
-                .iter()
-                .any(|entry| entry["path"] == "collector.thp_disabled")
-        );
+        assert!(evidence["consumer_verified"].as_array().context("consumer_verified array")?
+            .iter().any(|entry| entry["path"] == "collector.thp_disabled"));
         Ok(())
     }
 
@@ -2102,16 +1644,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector":{"runtime":{"timestamp_kernel":"fused_checked"}}
         }))?;
-        let output = std::process::Command::new(binary)
-            .arg("--help")
-            .env_clear()
-            .envs(role_environment(&config, ComponentRole::Collector)?)
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "collector startup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output = std::process::Command::new(binary).arg("--help").env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?).output()?;
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
         let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
         verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
         observed["runtime"]["timestamp_kernel"] = json!("reference");
@@ -2139,12 +1674,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         });
         let cases: Vec<(Option<Value>, [bool; 4])> = vec![
             (None, [false; 4]),
-            (
-                Some(
-                    json!({"event_interval":6,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000}),
-                ),
-                [false, true, true, true],
-            ),
+            (Some(json!({"event_interval":6,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000})), [false,true,true,true]),
             (Some(runtime.clone()), [true; 4]),
         ];
         for (build, expected) in cases {
@@ -2154,12 +1684,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             }
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
-            let verified = evidence["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?;
-            let projected = evidence["projection_only"]
-                .as_array()
-                .context("projection_only array")?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            let projected = evidence["projection_only"].as_array().context("projection_only array")?;
             for (index, path) in paths.iter().enumerate() {
                 let is_verified = verified.iter().any(|entry| entry["path"] == *path);
                 let is_projected = projected.iter().any(|entry| entry["path"] == *path);
@@ -2186,21 +1712,13 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         });
         for (pool, expected_modes) in [
             (Value::Null, [false, false]),
-            (
-                json!({"scope":"runtime_initialization","cpu_dispatch":"shared_fifo","cpu_placement":"compact_allowed"}),
-                [false, true],
-            ),
-            (
-                json!({"scope":"runtime_initialization","cpu_dispatch":"bounded_shards","cpu_placement":"compact_allowed"}),
-                [true, true],
-            ),
+            (json!({"scope":"runtime_initialization","cpu_dispatch":"shared_fifo","cpu_placement":"compact_allowed"}), [false, true]),
+            (json!({"scope":"runtime_initialization","cpu_dispatch":"bounded_shards","cpu_placement":"compact_allowed"}), [true, true]),
         ] {
             process["effective_config"]["cpu_pool"] = pool;
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
-            let verified = evidence["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?;
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
             for (path, expected) in [
                 ("collector.runtime.cpu_dispatch", expected_modes[0]),
                 ("collector.runtime.cpu_placement", expected_modes[1]),
@@ -2219,31 +1737,19 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     #[test]
     fn physical_first_requires_each_workers_observed_topology() -> Result<()> {
         let mut config = config()?;
-        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(
-            json!({"collector":{"runtime":{"cpu_placement":"physical_first"}}}),
-        )?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"runtime":{"cpu_placement":"physical_first"}}}))?;
         let mut process = json!({"component":"collector", "instance_id":"collector-1", "log_complete":true,
             "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
             "effective_config":{"runtime":{"cpu_placement":"physical_first","cpu_workers":2},
                 "cpu_pool":{"scope":"runtime_initialization","workers_started":2,"cpu_placement":"physical_first"}}});
         let worker = json!({"cpu":4,"core":1,"package":0});
-        for (workers, expected) in [
-            (Value::Null, false),
-            (json!([worker]), false),
-            (json!([worker,{"cpu":8,"core":null,"package":0}]), false),
-            (json!([worker, worker]), true),
-        ] {
+        for (workers, expected) in [(Value::Null,false), (json!([worker]),false),
+            (json!([worker,{"cpu":8,"core":null,"package":0}]),false), (json!([worker,worker]),true)] {
             process["effective_config"]["cpu_pool"]["worker_topology"] = workers;
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
-            assert_eq!(
-                evidence["consumer_verified"]
-                    .as_array()
-                    .context("verified leaves")?
-                    .iter()
-                    .any(|entry| entry["path"] == "collector.runtime.cpu_placement"),
-                expected
-            );
+            assert_eq!(evidence["consumer_verified"].as_array().context("verified leaves")?.iter()
+                .any(|entry| entry["path"] == "collector.runtime.cpu_placement"), expected);
         }
         Ok(())
     }
@@ -2266,15 +1772,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             }
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
-            let verified = evidence["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?;
-            assert_eq!(
-                verified
-                    .iter()
-                    .any(|entry| entry["path"] == "collector.runtime.cpu_thread_stack_size"),
-                observed == Some(4194304)
-            );
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.runtime.cpu_thread_stack_size"),
+                observed == Some(4194304));
         }
         Ok(())
     }
@@ -2297,15 +1797,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             }
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
-            let verified = evidence["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?;
-            assert_eq!(
-                verified
-                    .iter()
-                    .any(|entry| entry["path"] == "collector.socket.tcp_nodelay"),
-                observed == Some(true)
-            );
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.socket.tcp_nodelay"),
+                observed == Some(true));
         }
         Ok(())
     }
@@ -2328,15 +1822,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             }
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
-            let verified = evidence["consumer_verified"]
-                .as_array()
-                .context("consumer_verified array")?;
-            assert_eq!(
-                verified
-                    .iter()
-                    .any(|entry| entry["path"] == "collector.socket.recv_buffer_bytes"),
-                observed == Some(65536)
-            );
+            let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.socket.recv_buffer_bytes"),
+                observed == Some(65536));
         }
         Ok(())
     }
@@ -2366,12 +1854,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 );
                 let actual = parsed.engine.shutdown_drain_timeout_seconds.get();
                 assert_eq!(actual, 240);
-                let line = format!(
-                    "df_engine_effective_config {}",
-                    json!({
-                        "engine": {"shutdown_drain_timeout_seconds": actual}
-                    })
-                );
+                let line = format!("df_engine_effective_config {}", json!({
+                    "engine": {"shutdown_drain_timeout_seconds": actual}
+                }));
                 let text = filter_process_evidence_text(&line)?;
                 let observed = process_configurations(&text)?;
                 verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
@@ -2382,26 +1867,14 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             return Ok(());
         }
         let compose = compose_tunables(&config)?;
-        let expected = compose["services"]["dataflow-1"]["environment"][ENV]
-            .as_str()
-            .context("missing Compose tunable")?;
+        let expected = compose["services"]["dataflow-1"]["environment"][ENV].as_str().context("missing Compose tunable")?;
         let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
-        inject_deployment_environment(
-            &mut deployment,
-            "dataflow",
-            &role_environment(&config, ComponentRole::Collector)?,
-        )?;
-        assert_eq!(
-            deployment["spec"]["template"]["spec"]["containers"][0]["env"],
-            json!([{"name": ENV,"value":expected}])
-        );
+        inject_deployment_environment(&mut deployment, "dataflow", &role_environment(&config, ComponentRole::Collector)?)?;
+        assert_eq!(deployment["spec"]["template"]["spec"]["containers"][0]["env"], json!([{"name": ENV,"value":expected}]));
         let output = std::process::Command::new(std::env::current_exe()?)
             .env(CHILD, "1")
             .env(ENV, expected)
-            .args([
-                "collector_shutdown_drain_timeout_reaches_dfe_profiles_and_readback",
-                "--nocapture",
-            ])
+            .args(["collector_shutdown_drain_timeout_reaches_dfe_profiles_and_readback", "--nocapture"])
             .output()?;
         anyhow::ensure!(
             output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
@@ -2421,10 +1894,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 Ok(_) => bail!("invalid channel capacity accepted"),
                 Err(error) => error.to_string(),
             };
-            assert!(
-                error.contains(&format!("collector.channel_capacity.{field}")),
-                "{error}"
-            );
+            assert!(error.contains(&format!("collector.channel_capacity.{field}")), "{error}");
             assert!(!error.contains("private-marker"), "{error}");
         }
         Ok(())
@@ -2441,36 +1911,20 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             ] {
                 let parsed = OtelDataflowSpec::from_yaml(&substitute_env_vars(template)?)?;
                 let (_, pipelines, _) = parsed.resolve().into_parts();
-                let [pipeline] = pipelines.as_slice() else {
-                    bail!("expected one pipeline");
-                };
+                let [pipeline] = pipelines.as_slice() else { bail!("expected one pipeline"); };
                 let capacity = &pipeline.policies.channel_capacity;
-                assert_eq!(
-                    (
-                        capacity.control.node,
-                        capacity.control.pipeline,
-                        capacity.control.completion,
-                        capacity.pdata
-                    ),
-                    (64, 64, 512, 32)
-                );
+                assert_eq!((capacity.control.node, capacity.control.pipeline, capacity.control.completion, capacity.pdata),
+                    (64, 64, 512, 32));
             }
             return Ok(());
         }
         let output = std::process::Command::new(std::env::current_exe()?)
-            .env_clear()
-            .env(CHILD, "1")
-            .args([
-                "collector_channel_capacity_omission_preserves_profile_defaults",
-                "--nocapture",
-            ])
+            .env_clear().env(CHILD, "1")
+            .args(["collector_channel_capacity_omission_preserves_profile_defaults", "--nocapture"])
             .output()?;
-        anyhow::ensure!(
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
-            "channel defaults subprocess failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "channel defaults subprocess failed: {}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
         Ok(())
     }
 
@@ -2493,20 +1947,15 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             ] {
                 let parsed = OtelDataflowSpec::from_yaml(&substitute_env_vars(template)?)?;
                 let (_, pipelines, _) = parsed.resolve().into_parts();
-                let [pipeline] = pipelines.as_slice() else {
-                    bail!("expected one pipeline");
-                };
+                let [pipeline] = pipelines.as_slice() else { bail!("expected one pipeline"); };
                 let capacity = &pipeline.policies.channel_capacity;
                 let observed = json!({"engine":{"channel_capacity":{
                     "control_node":capacity.control.node,"control_pipeline":capacity.control.pipeline,
                     "control_completion":capacity.control.completion,"pdata":capacity.pdata
                 }}});
-                assert_eq!(
-                    observed["engine"]["channel_capacity"],
-                    json!({
-                        "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
-                    })
-                );
+                assert_eq!(observed["engine"]["channel_capacity"], json!({
+                    "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
+                }));
                 verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
                 let process = json!({
                     "component":"collector","instance_id":"one","log_complete":true,
@@ -2515,33 +1964,19 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 });
                 let mut evidence = tunable_leaf_evidence(&config)?;
                 promote_collector_readback(&config, &mut evidence, Some(&json!([process.clone()])), 1)?;
-                assert_eq!(
-                    evidence["consumer_verified"]
-                        .as_array()
-                        .context("missing verified")?
-                        .len(),
-                    4
-                );
+                assert_eq!(evidence["consumer_verified"].as_array().context("missing verified")?.len(), 4);
                 for field in ["control_node", "control_pipeline", "control_completion", "pdata"] {
                     for missing in [false, true] {
                         let mut wrong = process.clone();
                         if missing {
                             wrong["effective_config"]["engine"]["channel_capacity"]
-                                .as_object_mut()
-                                .context("missing capacity")?
-                                .remove(field);
+                                .as_object_mut().context("missing capacity")?.remove(field);
                         } else {
                             wrong["effective_config"]["engine"]["channel_capacity"][field] = json!(1);
                         }
                         let mut evidence = tunable_leaf_evidence(&config)?;
                         promote_collector_readback(&config, &mut evidence, Some(&json!([wrong])), 1)?;
-                        assert_eq!(
-                            evidence["consumer_verified"]
-                                .as_array()
-                                .context("missing verified")?
-                                .len(),
-                            0
-                        );
+                        assert_eq!(evidence["consumer_verified"].as_array().context("missing verified")?.len(), 0);
                     }
                 }
             }
@@ -2554,29 +1989,17 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
         inject_deployment_environment(&mut deployment, "dataflow", &environment)?;
         let entries = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
-            .as_array()
-            .context("missing deployment environment")?;
+            .as_array().context("missing deployment environment")?;
         for (key, value) in &environment {
-            assert!(
-                entries
-                    .iter()
-                    .any(|entry| entry["name"] == *key && entry["value"] == *value)
-            );
+            assert!(entries.iter().any(|entry| entry["name"] == *key && entry["value"] == *value));
         }
         let output = std::process::Command::new(std::env::current_exe()?)
-            .env(CHILD, "1")
-            .envs(environment)
-            .args([
-                "collector_channel_capacity_reaches_profiles_and_readback",
-                "--nocapture",
-            ])
+            .env(CHILD, "1").envs(environment)
+            .args(["collector_channel_capacity_reaches_profiles_and_readback", "--nocapture"])
             .output()?;
-        anyhow::ensure!(
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
-            "channel capacity subprocess failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "channel capacity subprocess failed: {}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
         Ok(())
     }
 
@@ -2605,37 +2028,23 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             let environment = role_environment(&config, ComponentRole::Collector)?;
             assert_eq!(environment[ENV], enabled.to_string());
             let compose = compose_tunables(&config)?;
-            assert_eq!(
-                compose["services"]["dataflow-1"]["environment"][ENV],
-                enabled.to_string()
-            );
+            assert_eq!(compose["services"]["dataflow-1"]["environment"][ENV], enabled.to_string());
             let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
             inject_deployment_environment(&mut deployment, "dataflow", &environment)?;
-            assert!(
-                deployment["spec"]["template"]["spec"]["containers"][0]["env"]
-                    .as_array()
-                    .context("deployment environment")?
-                    .iter()
-                    .any(|entry| entry["name"] == ENV && entry["value"].as_str() == Some(environment[ENV].as_str()))
-            );
+            assert!(deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array().context("deployment environment")?
+                .iter().any(|entry| entry["name"] == ENV && entry["value"].as_str() == Some(environment[ENV].as_str())));
             let actual = json!({"runtime":{"generated_partition_fast_path":enabled}});
             verify_process_configuration(&config, ComponentRole::Collector, &actual)?;
-            assert!(
-                verify_process_configuration(
-                    &config,
-                    ComponentRole::Collector,
-                    &json!({"runtime":{"generated_partition_fast_path":!enabled}})
-                )
-                .is_err()
-            );
+            assert!(verify_process_configuration(
+                &config, ComponentRole::Collector,
+                &json!({"runtime":{"generated_partition_fast_path":!enabled}})
+            ).is_err());
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
         }
-        assert!(
-            arrowcol_tunables::Tunables::parse_oat_json(json!({
-                "collector":{"runtime":{"generated_partition_fast_path":"true"}}
-            }))
-            .is_err()
-        );
+        assert!(arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"runtime":{"generated_partition_fast_path":"true"}}
+        })).is_err());
         Ok(())
     }
 
@@ -2655,36 +2064,20 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             "spec":{"template":{"spec":{"containers":[{"name":config.dfe_container,"env":[]}]}}}
         })];
         inject_workload_environment(&config, &mut resources)?;
-        let injected = resources[0]
-            .pointer("/spec/template/spec/containers/0/env")
-            .and_then(Value::as_array)
-            .context("injected environment")?;
-        assert!(
-            injected
-                .iter()
-                .any(|entry| entry["name"] == "ARROWCOL_COLLECTOR_BATCHING_CONFIG"
-                    && entry["value"] == environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])
-        );
-        let startup = |policy: &str| {
-            format!(
-                "arrowcol_effective_config {}\n",
-                json!({
-                    "component":"exporter","config":{"batching":{"age_flush_policy":policy,"max_age":"30s"}}
-                })
-            )
-        };
+        let injected = resources[0].pointer("/spec/template/spec/containers/0/env")
+            .and_then(Value::as_array).context("injected environment")?;
+        assert!(injected.iter().any(|entry| entry["name"] == "ARROWCOL_COLLECTOR_BATCHING_CONFIG"
+            && entry["value"] == environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"]));
+        let startup = |policy: &str| format!("arrowcol_effective_config {}\n", json!({
+            "component":"exporter","config":{"batching":{"age_flush_policy":policy,"max_age":"30s"}}
+        }));
         let actual = process_configurations(&startup("drain_ready"))?;
         verify_process_configuration(&config, ComponentRole::Collector, &actual)?;
         assert_eq!(actual["batching"]["age_flush_policy"], requested["age_flush_policy"]);
         for policy in ["immediate", "drain_forever"] {
-            assert!(
-                verify_process_configuration(
-                    &config,
-                    ComponentRole::Collector,
-                    &process_configurations(&startup(policy))?
-                )
-                .is_err()
-            );
+            assert!(verify_process_configuration(
+                &config, ComponentRole::Collector, &process_configurations(&startup(policy))?
+            ).is_err());
         }
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
         Ok(())
@@ -2703,10 +2096,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             compose["services"]["oat-client"]["environment"]["ARROWCOL_CLIENT_BATCH_ROWS"],
             "257"
         );
-        assert_eq!(
-            compose["services"]["router"]["environment"]["RUST_LOG"],
-            "warn,tiberius=error"
-        );
+        assert_eq!(compose["services"]["router"]["environment"]["RUST_LOG"], "warn,tiberius=error");
         let mut client = json!({ "env": [{ "name": "ARROWCOL_OAT_RUN_ID", "value": "owned" }] });
         inject_container_environment(&mut client, &role_environment(&config, ComponentRole::Client)?)?;
         assert_eq!(client["env"][1]["value"], "257");
@@ -2764,27 +2154,22 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             .map(|(name, value)| {
                 Ok((
                     name.clone(),
-                    value
-                        .as_str()
+                    value.as_str()
                         .context("local collector environment values must be strings")?
                         .to_owned(),
                 ))
             })
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-        let effective = arrow_deltalake::delta::resolve_process_writer_properties_from_environment(&environment)?;
+        let effective =
+            arrow_deltalake::delta::resolve_process_writer_properties_from_environment(&environment)?;
         let aliases = arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES;
         assert_eq!(
-            aliases
-                .iter()
-                .filter(|(_, canonical, _)| environment.contains_key(*canonical))
-                .count(),
+            aliases.iter().filter(|(_, canonical, _)| environment.contains_key(*canonical)).count(),
             aliases.len(),
             "the test configuration should set every aliased layout knob"
         );
         for &(legacy, canonical, property) in aliases {
-            let value = environment
-                .get(canonical)
-                .context("missing canonical OAT layout value")?;
+            let value = environment.get(canonical).context("missing canonical OAT layout value")?;
             assert_eq!(environment.get(legacy), Some(value));
             assert_eq!(effective.get(property), Some(value));
         }
