@@ -1251,6 +1251,7 @@ test('accepts committed table metadata proof for a stats factor and unrelated fa
 test('accepts G2a readback only for its producer paths, including unrelated factors', () => {
   const cases = [
     ['collector.thp_disabled', 'consumer_linux_thp_flag_readback'],
+    ['collector.malloc.arena_max', 'consumer_glibc_tunables_startup_readback'],
     ['collector.socket.recv_buffer_bytes', 'consumer_linux_listener_buffer_readback'],
     ['collector.socket.send_buffer_bytes', 'consumer_linux_listener_buffer_readback'],
     ['collector.socket.tcp_nodelay', 'consumer_accepted_socket_readback'],
@@ -1261,6 +1262,7 @@ test('accepts G2a readback only for its producer paths, including unrelated fact
       const candidate = generatorCandidate('socket-proof', 800, 450 + index * 6 + Number(varied) * 3).map(row => {
         Object.assign(row.officialRuns[0]!.config.tunables, { collector: {
           thp_disabled: true,
+          malloc: { arena_max: 1 },
           socket: { recv_buffer_bytes: 32768, send_buffer_bytes: 32768, tcp_nodelay: true },
           runtime: { cpu_thread_stack_size: 2097152 },
         } });

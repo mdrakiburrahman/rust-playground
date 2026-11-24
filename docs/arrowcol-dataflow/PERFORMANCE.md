@@ -13,6 +13,7 @@
 | `ARROWCOL_COLLECTOR_RUNTIME_WORKERS`, `BLOCKING_WORKERS`, `UPLOAD_LIMIT`, `TASK_LIMIT`, `READ_AHEAD`, `BATCH_ROWS`, `CPU_WORKERS` | Independently bounded Delta async, blocking, upload, Kernel task, scan and dedicated CPU resources; each suffix uses the full `ARROWCOL_COLLECTOR_` prefix | Startup |
 | `ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH` | Strict `true`/`false`; default `false`. Reuses arrays when a coalesced publication has only the internally generated ingestion partition. Supplied or multiple partition columns retain the normal grouping path. | Startup |
 | Cargo feature `allocator-mimalloc` | Opt-in mimalloc allocator for the collector binary; system allocator remains default | Rebuild |
+| `ARROWCOL_COLLECTOR_MALLOC_CONFIG` | Strict JSON of glibc malloc tunables (`arena_max`, `arena_test`, `mmap_threshold`, `mmap_max`, `trim_threshold`, `top_pad`, `mxfast`, `tcache_count`, `tcache_max`, `tcache_unsorted_limit`, `hugetlb`). The collector re-executes itself once with the matching `GLIBC_TUNABLES` and reads back `process.glibc_malloc`. Rejected by mimalloc builds and outside Linux glibc | Process start |
 | `RUSTFLAGS="-C target-cpu=native"` | Host-specific compiler ISA optimization; not a Cargo feature or per-cell runtime setting | Rebuild |
 
 JSON collector overrides preserve unspecified pipeline YAML values. Unknown
@@ -146,3 +147,10 @@ Native-CPU binaries must run only on compatible CPUs. Jemalloc was considered;
 this build offers one opt-in alternative allocator rather than introducing two
 native allocator dependencies without comparative workload evidence. No
 allocator, compression or concurrency setting is claimed universally faster.
+
+The system allocator can be tuned without a rebuild. In the `stage_bench`
+allocator comparison (4 groups of 64 batches, 121-byte strings), glibc with
+`{"arena_max":1,"mmap_threshold":33554432,"trim_threshold":4294967295,"top_pad":268435456}`
+roughly halved CPU seconds per million rows, cut minor faults about fivefold
+against default glibc, and matched or beat mimalloc. These results are
+workload-dependent, and a single arena can contend at higher worker counts.
