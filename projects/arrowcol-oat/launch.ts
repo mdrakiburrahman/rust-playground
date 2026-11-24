@@ -1971,6 +1971,7 @@ export async function launchOat(
         }
       }
       let response: Response;
+      const diagnosticAttemptStart = performance.now();
       try {
         response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
           signal: AbortSignal.timeout(30_000),
@@ -1982,9 +1983,17 @@ export async function launchOat(
           continue;
         }
         throw error;
+      } finally {
+        console.error(`[oat-diag] status_fetch at_ms=${Date.now()} run=${ownedRunId} elapsed_ms=${Math.round(performance.now() - diagnosticAttemptStart)}`);
       }
       consecutivePollTimeouts = 0;
-      const next = await readStatus(response, 'poll OAT run', ownedRunId);
+      const diagnosticBodyStart = performance.now();
+      let next: OatRunStatus;
+      try {
+        next = await readStatus(response, 'poll OAT run', ownedRunId);
+      } finally {
+        console.error(`[oat-diag] status_body at_ms=${Date.now()} run=${ownedRunId} elapsed_ms=${Math.round(performance.now() - diagnosticBodyStart)}`);
+      }
       if ((deadline || submission) && next.config_sha256 !== binding.submitted_config_sha256) {
         bindingFailure = new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`);
         await deadline?.markBindingFailure(bindingFailure);

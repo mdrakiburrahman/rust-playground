@@ -203,7 +203,20 @@ async fn get_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<RunStatus>, (StatusCode, Json<ApiError>)> {
-    state.runs.lock().await.get(&id).cloned().map(Json).ok_or_else(|| {
+    let started = std::time::Instant::now();
+    eprintln!("OAT_STATUS_DIAGNOSTIC_BEGIN at_ms={} id={}", unix_time_ms(), id);
+    let runs = state.runs.lock().await;
+    let acquired = started.elapsed();
+    let found = runs.get(&id).cloned();
+    drop(runs);
+    eprintln!(
+        "OAT_STATUS_DIAGNOSTIC at_ms={} id={} lock_wait_us={} lock_hold_us={}",
+        unix_time_ms(),
+        id,
+        acquired.as_micros(),
+        started.elapsed().saturating_sub(acquired).as_micros()
+    );
+    found.map(Json).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ApiError {

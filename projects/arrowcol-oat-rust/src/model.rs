@@ -120,9 +120,24 @@ impl AppState {
     }
 
     pub async fn update(&self, id: &str, update: impl FnOnce(&mut RunStatus)) {
-        if let Some(status) = self.runs.lock().await.get_mut(id) {
+        let started = std::time::Instant::now();
+        eprintln!("OAT_UPDATE_DIAGNOSTIC_BEGIN at_ms={} id={}", unix_time_ms(), id);
+        let mut runs = self.runs.lock().await;
+        let acquired = started.elapsed();
+        let mut resulting_state = None;
+        if let Some(status) = runs.get_mut(id) {
             update(status);
+            resulting_state = Some(format!("{:?}", status.state));
         }
+        drop(runs);
+        eprintln!(
+            "OAT_UPDATE_DIAGNOSTIC at_ms={} id={} state={:?} lock_wait_us={} lock_hold_us={}",
+            unix_time_ms(),
+            id,
+            resulting_state,
+            acquired.as_micros(),
+            started.elapsed().saturating_sub(acquired).as_micros()
+        );
     }
 
     pub async fn finish_failed_run(&self, id: &str, error: String) {
