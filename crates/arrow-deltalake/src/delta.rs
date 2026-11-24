@@ -6300,11 +6300,8 @@ impl DeltaFileWriter {
             }
             for (name, expected) in &self.partition_values {
                 if let Ok(index) = batch.schema().index_of(name) {
-                    for row in 0..batch.num_rows() {
-                        let actual = crate::partition::value(batch.column(index).as_ref(), row)?;
-                        if actual != *expected {
-                            bail!("batch partition value differs from bound write context");
-                        }
+                    if !crate::partition::all_rows_equal(batch.column(index), expected)? {
+                        bail!("batch partition value differs from bound write context");
                     }
                 } else {
                     let mut fields = batch.schema().fields().to_vec();
