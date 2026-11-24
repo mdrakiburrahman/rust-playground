@@ -20,6 +20,7 @@ use tokio::time::Instant;
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitOptions {
+    pub txn_lookup_mode: crate::TxnLookupMode,
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
@@ -31,6 +32,7 @@ impl Default for CommitOptions {
             batch_window: Duration::from_secs(10),
             max_files_per_commit: 64,
             max_pending_files: 256,
+            txn_lookup_mode: Default::default(),
         }
     }
 }
@@ -76,7 +78,7 @@ pub struct BatchedTable {
 struct Publication {
     appends: Vec<StagedAppend>,
     identities: Vec<(String, i64, i64)>,
-    reply: oneshot::Sender<std::result::Result<GroupAppendResult, CommitReceiptError>>,
+    reply: oneshot::Sender<PublicationReply>,
     _slot: OwnedSemaphorePermit,
     force: bool,
 }
@@ -119,14 +121,16 @@ enum Request {
 }
 
 /// A submitted file's eventual durable Delta version.
-pub struct CommitReceipt(oneshot::Receiver<std::result::Result<GroupAppendResult, CommitReceiptError>>);
+pub struct CommitReceipt(oneshot::Receiver<PublicationReply>);
 
 /// One atomic coalesced publication's durable Delta version and output files.
-pub struct GroupCommitReceipt(oneshot::Receiver<std::result::Result<GroupAppendResult, CommitReceiptError>>);
+pub struct GroupCommitReceipt(oneshot::Receiver<PublicationReply>);
 
 /// Successful result for every physical file in one atomic publication group.
 #[derive(Debug)]
 pub struct GroupAppendResult {
+    /// Shared evidence for the entire physical publication call.
+    pub evidence: Arc<crate::PublicationEvidence>,
     pub version: u64,
     pub files: Vec<crate::CompletedFile>,
     pub commit_duration: Option<Duration>,
@@ -166,6 +170,33 @@ pub enum CommitReceiptError {
     RetryablePublicationGroup { committed: usize, total: usize },
     /// Preparation found that the group needs more files than one atomic commit permits.
     GroupCapacityExceeded { required_files: usize, max_files: usize },
+}
+
+/// Failure of this publication attempt. Admission and stopped-worker failures have no evidence.
+#[derive(Clone, Debug)]
+pub struct PublicationFailure {
+    pub error: CommitReceiptError,
+    pub evidence: Option<Arc<crate::PublicationEvidence>>,
+}
+
+type PublicationReply = std::result::Result<GroupAppendResult, PublicationFailure>;
+
+impl From<CommitReceiptError> for PublicationFailure {
+    fn from(error: CommitReceiptError) -> Self {
+        Self { error, evidence: None }
+    }
+}
+
+impl PublicationFailure {
+    fn from_anyhow(error: anyhow::Error) -> Self {
+        let evidence = error
+            .downcast_ref::<crate::PublicationEvidence>()
+            .map(|e| Arc::new(e.clone()));
+        Self {
+            evidence,
+            error: CommitReceiptError::from_anyhow(error),
+        }
+    }
 }
 
 impl CommitReceiptError {
@@ -245,17 +276,25 @@ impl CommitReceipt {
     /// # Errors
     /// Returns a typed fence, commit, or worker-stopped error.
     pub async fn wait_typed(self) -> std::result::Result<AppendResult, CommitReceiptError> {
-        let result = self.0.await.unwrap_or(Err(CommitReceiptError::WorkerStopped))?;
+        self.wait_with_evidence().await.map_err(|failure| failure.error)
+    }
+
+    /// # Errors
+    /// Returns both the original worker error classification and any publication evidence.
+    pub async fn wait_with_evidence(self) -> std::result::Result<AppendResult, PublicationFailure> {
+        let result = self
+            .0
+            .await
+            .unwrap_or_else(|_| Err(CommitReceiptError::WorkerStopped.into()))?;
         let mut files = result.files.into_iter();
         let file = files
             .next()
             .ok_or_else(|| CommitReceiptError::commit_failed("single-file commit returned no result"))?;
         if files.next().is_some() {
-            return Err(CommitReceiptError::commit_failed(
-                "single-file commit returned multiple files",
-            ));
+            return Err(CommitReceiptError::commit_failed("single-file commit returned multiple files").into());
         }
         Ok(AppendResult {
+            evidence: result.evidence,
             version: result.version,
             file,
             commit_duration: result.commit_duration,
@@ -278,7 +317,15 @@ impl GroupCommitReceipt {
     /// # Errors
     /// Returns typed worker, replay-race or commit failures.
     pub async fn wait_typed(self) -> std::result::Result<GroupAppendResult, CommitReceiptError> {
-        self.0.await.unwrap_or(Err(CommitReceiptError::WorkerStopped))
+        self.wait_with_evidence().await.map_err(|failure| failure.error)
+    }
+
+    /// # Errors
+    /// Returns both the original worker error classification and any publication evidence.
+    pub async fn wait_with_evidence(self) -> std::result::Result<GroupAppendResult, PublicationFailure> {
+        self.0
+            .await
+            .unwrap_or_else(|_| Err(CommitReceiptError::WorkerStopped.into()))
     }
 }
 
@@ -616,7 +663,7 @@ impl BatchedTable {
         appends: Vec<StagedAppend>,
         identities: Vec<(String, i64, i64)>,
         force: bool,
-    ) -> Result<oneshot::Receiver<std::result::Result<GroupAppendResult, CommitReceiptError>>> {
+    ) -> Result<oneshot::Receiver<PublicationReply>> {
         let (slot, queue) = self.reserve_publication(appends.len()).await?;
         Ok(Self::enqueue_publication(queue, slot, appends, identities, force))
     }
@@ -636,7 +683,7 @@ impl BatchedTable {
         appends: Vec<StagedAppend>,
         identities: Vec<(String, i64, i64)>,
         force: bool,
-    ) -> oneshot::Receiver<std::result::Result<GroupAppendResult, CommitReceiptError>> {
+    ) -> oneshot::Receiver<PublicationReply> {
         let (reply, receive) = oneshot::channel();
         queue.send(Request::Publish(Box::new(Publication {
             appends,
@@ -678,14 +725,21 @@ fn run_worker(
     publication_fence: Option<Arc<dyn PublicationFence>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-    let table = publication_fence.map_or_else(
-        || DeltaTable::open(root),
-        |publication_fence| {
-            root.to_str()
-                .context("invalid table URI")
-                .and_then(|root| DeltaTable::open_uri_with_fence(root, publication_fence))
-        },
-    );
+    let table = publication_fence
+        .map_or_else(
+            || DeltaTable::open(root),
+            |publication_fence| {
+                root.to_str()
+                    .context("invalid table URI")
+                    .and_then(|root| DeltaTable::open_uri_with_fence(root, publication_fence))
+            },
+        )
+        .and_then(|mut table| {
+            Arc::get_mut(&mut table)
+                .context("new Delta worker table is already shared")?
+                .txn_lookup_mode = options.txn_lookup_mode;
+            Ok(table)
+        });
     let mut failure = table
         .as_ref()
         .err()
@@ -805,7 +859,7 @@ fn run_worker(
                     }
                     Some(Request::Publish(publication)) => {
                         if let Some(error) = &failure {
-                            let _ = publication.reply.send(Err(error.clone()));
+                            let _ = publication.reply.send(Err(error.clone().into()));
                             continue;
                         }
                         let file_count = batch
@@ -858,7 +912,7 @@ fn run_worker(
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::Publish(publication) => {
-                        let _ = publication.reply.send(Err(message.clone()));
+                        let _ = publication.reply.send(Err(message.clone().into()));
                     }
                 }
             }
@@ -894,28 +948,32 @@ fn publish_batch(
     let result = match (table, failure.as_ref()) {
         (Ok(table), None) if groups.is_empty() => table
             .commit_files_timed(&appends)
-            .map_err(CommitReceiptError::from_anyhow),
+            .map_err(PublicationFailure::from_anyhow),
         (Ok(table), None) => table
             .commit_files_with_groups_timed(&appends, &groups)
-            .map_err(CommitReceiptError::from_anyhow),
+            .map_err(PublicationFailure::from_anyhow),
         _ => Err(failure
             .clone()
-            .unwrap_or_else(|| CommitReceiptError::commit_failed("Delta table unavailable"))),
+            .unwrap_or_else(|| CommitReceiptError::commit_failed("Delta table unavailable"))
+            .into()),
     };
+    let result =
+        result.map(|(head, duration, observations, evidence)| (head, duration, observations, Arc::new(evidence)));
     if let Err(error) = &result
-        && !error.is_retryable()
+        && !error.error.is_retryable()
     {
-        *failure = Some(error.clone());
+        *failure = Some(error.error.clone());
     }
     let mut files = appends.into_iter().map(|append| Some(append.file)).collect::<Vec<_>>();
-    let mut commit_duration = result.as_ref().ok().and_then(|(_, duration, _)| *duration);
+    let mut commit_duration = result.as_ref().ok().and_then(|(_, duration, _, _)| *duration);
     for (start, end, reply, _slot) in replies {
         let delivered = match result.as_ref() {
-            Ok((version, _, observations)) => files[start..end]
+            Ok((version, _, observations, evidence)) => files[start..end]
                 .iter_mut()
                 .map(|file| file.take().context("Delta worker lost staged output file"))
                 .collect::<Result<Vec<_>>>()
                 .map(|files| GroupAppendResult {
+                    evidence: Arc::clone(evidence),
                     version: *version,
                     files,
                     commit_duration: commit_duration.take(),
@@ -925,7 +983,7 @@ fn publish_batch(
                         .map(|(_, observation)| *observation)
                         .collect(),
                 })
-                .map_err(CommitReceiptError::from_anyhow),
+                .map_err(PublicationFailure::from_anyhow),
             Err(error) => Err(error.clone()),
         };
         // Cancellation never replays a possibly committed file. A live waiter
@@ -1201,6 +1259,7 @@ mod tests {
                 batch_window: Duration::from_secs(60),
                 max_files_per_commit: 2,
                 max_pending_files: 4,
+                ..Default::default()
             },
         )
         .await?;
@@ -1345,14 +1404,29 @@ mod tests {
                 .version,
             1
         );
-        let error = match table.submit_prepared_group(group, true).await?.wait_typed().await {
+        let failure = match table
+            .submit_prepared_group(group, true)
+            .await?
+            .wait_with_evidence()
+            .await
+        {
             Err(error) => error,
             Ok(_) => bail!("partially committed coalesced group unexpectedly succeeded"),
         };
         assert!(matches!(
-            error,
+            failure.error,
             CommitReceiptError::RetryablePublicationGroup { committed: 1, total: 2 }
         ));
+        let evidence = failure.evidence.context("missing partial-group evidence")?;
+        assert!(!evidence.clean && evidence.reasons.contains(&crate::PublicationReason::PartialGroup));
+        assert_eq!(
+            evidence.outcomes[&("logical-a".into(), 0)],
+            crate::PublicationOutcome::AlreadyCommitted(1)
+        );
+        assert_eq!(
+            evidence.outcomes[&("logical-b".into(), 0)],
+            crate::PublicationOutcome::Unknown(crate::PublicationReason::PartialGroup)
+        );
         assert_eq!(
             table
                 .lookup_publications(vec![("logical-a".into(), 0), ("logical-b".into(), 0)])

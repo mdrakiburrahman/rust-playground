@@ -40,7 +40,9 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 type FileCommitObservations = Vec<(usize, CompletedFileObservation)>;
-type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations)>;
+type PublishedFiles = (u64, Option<Duration>, FileCommitObservations);
+type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations, PublicationEvidence)>;
+use crate::{PublicationEvidence, PublicationOutcome, PublicationReason, TxnLookupMode};
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
     read_process_writer_properties(Some(schema))
@@ -489,6 +491,59 @@ mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    #[test]
+    fn mixed_publication_one_lookup_preserves_exact_versions_and_partial_group_fence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let table = DeltaTable::open(dir.path())?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        table.new_file(schema)?;
+        let (one, first) = table.commit_files_with_transaction_evidence(&[], "old", 711)?;
+        assert!(first.clean);
+        let group = |items: &[(&str, i64)]| CoalescedCommitGroup {
+            start: 0,
+            end: 0,
+            identities: items.iter().map(|&(id, v)| (id.to_owned(), v, 0)).collect(),
+        };
+        crate::publication_lookup::LOOKUPS.set(0);
+        let (two, _, _, mixed) =
+            table.commit_files_with_groups_timed(&[], &[group(&[("old", 711)]), group(&[("new", 913)])])?;
+        assert_eq!(crate::publication_lookup::LOOKUPS.get(), 1);
+        assert!(!mixed.clean);
+        assert_eq!(
+            mixed.outcomes[&("old".into(), 711)],
+            PublicationOutcome::AlreadyCommitted(one)
+        );
+        assert_eq!(
+            mixed.outcomes[&("new".into(), 913)],
+            PublicationOutcome::CommittedNow(two)
+        );
+        assert_eq!(two, one + 1);
+        let err = table
+            .commit_files_with_groups_timed(&[], &[group(&[("new", 913), ("absent", 10)])])
+            .err()
+            .context("expected publication rejection")?;
+        assert!(err.downcast_ref::<PartialPublicationGroup>().is_some());
+        let partial = err
+            .downcast_ref::<PublicationEvidence>()
+            .context("missing partial evidence")?;
+        assert!(!partial.clean && partial.reasons.contains(&PublicationReason::PartialGroup));
+        let err = table
+            .commit_files_with_transaction_evidence(&[], "old", 710)
+            .err()
+            .context("expected publication rejection")?;
+        let fenced = err
+            .downcast_ref::<PublicationEvidence>()
+            .context("missing fence evidence")?;
+        assert!(!fenced.clean && fenced.reasons.contains(&PublicationReason::Fenced));
+        let (_, replay) = table.commit_files_with_transaction_evidence(&[], "old", 711)?;
+        assert_eq!(
+            replay.outcomes[&("old".into(), 711)],
+            PublicationOutcome::Unknown(PublicationReason::NoCommitProvenance)
+        );
+        assert_eq!(table.version()?, two);
+        Ok(())
+    }
 
     #[test]
     fn fitting_sort_chunk_preserves_ownership_and_exact_budget_behavior() -> Result<()> {
@@ -3006,6 +3061,8 @@ pub struct DeltaTable {
     partition_columns: Vec<String>,
     session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
+    pub(crate) txn_lookup_mode: crate::TxnLookupMode,
+    pub(crate) publication_cache: Mutex<crate::publication_lookup::PublicationCache>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     layout_readback: Mutex<Option<serde_json::Value>>,
     stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
@@ -3673,6 +3730,8 @@ impl DeltaTable {
             partition_columns,
             _lock: None,
             commit_lock: Mutex::new(()),
+            txn_lookup_mode: Default::default(),
+            publication_cache: Default::default(),
             snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
             stats_readback: Mutex::new(None),
@@ -3962,6 +4021,8 @@ impl DeltaTable {
                 Vec::new()
             },
             commit_lock: Mutex::new(()),
+            txn_lookup_mode: Default::default(),
+            publication_cache: Default::default(),
             snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
             stats_readback: Mutex::new(None),
@@ -5147,7 +5208,7 @@ impl DeltaTable {
 
     #[cfg(test)]
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
-        self.commit_files_timed(files).map(|(version, _, _)| version)
+        self.commit_files_timed(files).map(|(version, _, _, _)| version)
     }
 
     pub(crate) fn commit_files_timed(&self, files: &[StagedAppend]) -> TimedCommitResult {
@@ -5173,18 +5234,24 @@ impl DeltaTable {
     /// # Errors
     /// Rejects stale/fenced identities, changed schemas and exhausted collision budgets.
     pub fn commit_files_with_transaction(&self, files: &[StagedAppend], app_id: &str, version: i64) -> Result<u64> {
-        validate_transaction_id(app_id, version)?;
-        self.commit_files_inner(files, Some((app_id, version)), &[])
+        self.commit_files_with_transaction_evidence(files, app_id, version)
+            .map(|(head, _)| head)
     }
 
-    fn commit_files_inner(
+    /// Publish with a stable identity and return per-identity evidence separately from the observed head.
+    ///
+    /// # Errors
+    /// Returns validation, fencing, durability, or publication errors. Publication errors
+    /// carry a downcastable [PublicationEvidence] alongside their original cause.
+    pub fn commit_files_with_transaction_evidence(
         &self,
         files: &[StagedAppend],
-        identity: Option<(&str, i64)>,
-        groups: &[CoalescedCommitGroup],
-    ) -> Result<u64> {
-        self.commit_files_inner_timed(files, identity, groups)
-            .map(|(version, _, _)| version)
+        app_id: &str,
+        version: i64,
+    ) -> Result<(u64, PublicationEvidence)> {
+        validate_transaction_id(app_id, version)?;
+        self.commit_files_inner_timed(files, Some((app_id, version)), &[])
+            .map(|(head, _, _, evidence)| (head, evidence))
     }
 
     fn commit_files_inner_timed(
@@ -5193,9 +5260,36 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> TimedCommitResult {
-        let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
+        let ids = identity
+            .into_iter()
+            .chain(
+                groups
+                    .iter()
+                    .flat_map(|g| g.identities.iter().map(|(id, v, _)| (id.as_str(), *v))),
+            )
+            .chain(
+                files
+                    .iter()
+                    .filter_map(|a| a.publication.as_ref().map(|(id, v)| (id.as_str(), *v))),
+            );
+        let mut evidence = PublicationEvidence::new(ids.clone());
+        let ids = ids
+            .map(|(id, _)| id)
+            .chain([PURGE_WATERMARK])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (version, commit_duration, file_observations) =
+            match self.publish_files(files, identity, groups, &ids, &mut evidence) {
+                Ok(result) => result,
+                Err(error) => {
+                    evidence.fail(PublicationReason::Error);
+                    let message = error.to_string();
+                    return Err(error.context(evidence).context(message));
+                }
+            };
         self.reclaim_unsubmitted(files);
-        Ok((version, commit_duration, file_observations))
+        Ok((version, commit_duration, file_observations, evidence))
     }
 
     /// After a successful publication call, delete staged files that no commit attempt
@@ -5264,12 +5358,37 @@ impl DeltaTable {
         }
     }
 
+    fn publication_versions<'a>(
+        &self,
+        snapshot: &SnapshotRef,
+        ids: &[&'a str],
+    ) -> Result<std::collections::HashMap<&'a str, Option<i64>>> {
+        match self.txn_lookup_mode {
+            TxnLookupMode::PerId => ids
+                .iter()
+                .map(|&id| Ok((id, snapshot.get_app_id_version(id, &self.engine)?)))
+                .collect(),
+            TxnLookupMode::Batched => Ok(crate::publication_lookup::get_app_id_versions(
+                snapshot,
+                &self.engine,
+                ids.iter().copied(),
+            )?),
+            TxnLookupMode::BatchedCached => Ok(self
+                .publication_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication cache poisoned"))?
+                .lookup(snapshot, &self.engine, ids)?),
+        }
+    }
+
     fn publish_files(
         &self,
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> TimedCommitResult {
+        ids: &[&str],
+        evidence: &mut PublicationEvidence,
+    ) -> Result<PublishedFiles> {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let mut lock_timer = crate::telemetry::PublicationLockTimer::start();
         let _guard = self
@@ -5279,18 +5398,43 @@ impl DeltaTable {
         lock_timer.acquired();
         let started = Instant::now();
         for attempt in 0..8 {
+            if attempt != 0 {
+                evidence.mark(PublicationReason::Retry);
+            }
+            for outcome in evidence.outcomes.values_mut() {
+                *outcome = PublicationOutcome::Unknown(PublicationReason::NotSubmitted);
+            }
             observation.event("attempt");
             self.check_publication()?;
             let snapshot = self.snapshot()?;
             Self::validate_retention(&snapshot)?;
+            let versions = self.publication_versions(&snapshot, ids)?;
+            let replay = |id: &str, v: i64, evidence: &mut PublicationEvidence| {
+                evidence.mark(PublicationReason::Deduplicated);
+                let proven = self
+                    .publication_cache
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.proven(&snapshot, id, v));
+                evidence.outcomes.insert(
+                    (id.to_owned(), v),
+                    proven.map_or(
+                        PublicationOutcome::Unknown(PublicationReason::NoCommitProvenance),
+                        PublicationOutcome::AlreadyCommitted,
+                    ),
+                );
+            };
             if let Some((app_id, version)) = identity
-                && let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)?
+                && let Some(previous) = versions[app_id]
             {
                 if previous > version {
+                    evidence.fail(PublicationReason::Fenced);
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
-                    self.sync_replayed_local_state(snapshot.version())?;
+                    replay(app_id, version, evidence);
+                    self.sync_replayed_local_state(snapshot.version())
+                        .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                     observation.finish("deduplicated");
                     return Ok((snapshot.version(), None, Vec::new()));
                 }
@@ -5301,7 +5445,7 @@ impl DeltaTable {
             let mut skipped = std::collections::HashSet::new();
             let mut group_pending_indices = std::collections::HashSet::new();
             let mut group_transaction_ids = Vec::new();
-            let purge_before = snapshot.get_app_id_version(PURGE_WATERMARK, &self.engine)?;
+            let purge_before = versions[PURGE_WATERMARK];
             let mut previous_end = 0;
             for group in groups {
                 if group.start < previous_end
@@ -5319,16 +5463,19 @@ impl DeltaTable {
                     if *stamp < 0 || !group_ids.insert(app_id.as_str()) {
                         bail!("invalid or duplicate coalesced publication identity");
                     }
-                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                    if let Some(previous) = versions[app_id.as_str()] {
                         if previous > *version {
+                            evidence.fail(PublicationReason::Fenced);
                             bail!("publication transaction fenced by newer application version");
                         }
                         if previous == *version {
+                            replay(app_id, *version, evidence);
                             committed += 1;
                         }
                     }
                 }
                 if committed != 0 && committed != group.identities.len() {
+                    evidence.fail(PublicationReason::PartialGroup);
                     return Err(anyhow::Error::new(PartialPublicationGroup {
                         committed,
                         total: group.identities.len(),
@@ -5342,6 +5489,7 @@ impl DeltaTable {
                     if let Some(cutoff) = purge_before
                         && *stamp < cutoff
                     {
+                        evidence.fail(PublicationReason::Fenced);
                         bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
                     }
                 }
@@ -5361,11 +5509,13 @@ impl DeltaTable {
                     if !identities.insert(app_id.as_str()) {
                         bail!("duplicate application identity in commit");
                     }
-                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                    if let Some(previous) = versions[app_id.as_str()] {
                         if previous > *version {
+                            evidence.fail(PublicationReason::Fenced);
                             bail!("publication transaction fenced by newer application version");
                         }
                         if previous == *version {
+                            replay(app_id, *version, evidence);
                             continue;
                         }
                     }
@@ -5373,13 +5523,16 @@ impl DeltaTable {
                 if let (Some(stamp), Some(cutoff)) = (append.ingested_at_ms, purge_before)
                     && stamp < cutoff
                 {
+                    evidence.fail(PublicationReason::Fenced);
                     bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
                 }
                 pending.push(append);
                 pending_indices.push(index);
             }
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
-                self.sync_replayed_local_state(snapshot.version())?;
+                evidence.mark(PublicationReason::Deduplicated);
+                self.sync_replayed_local_state(snapshot.version())
+                    .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                 observation.finish("deduplicated");
                 return Ok((snapshot.version(), None, Vec::new()));
             }
@@ -5421,6 +5574,7 @@ impl DeltaTable {
             let table_name = telemetry_table_name(&self.url);
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
+            let table_uuid = snapshot.table_configuration().metadata().id().to_owned();
             let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
             let mut transaction = snapshot
                 .transaction(self.committer(), &self.engine)?
@@ -5473,6 +5627,7 @@ impl DeltaTable {
                         proposed_version,
                         file_count: files.len(),
                     })
+                    .inspect_err(|_| evidence.fail(PublicationReason::Fenced))
                     .map_err(anyhow::Error::new)?;
             }
             let identifiable = identity.is_some()
@@ -5480,7 +5635,20 @@ impl DeltaTable {
                     .iter()
                     .zip(&pending_indices)
                     .all(|(append, index)| append.publication.is_some() || group_pending_indices.contains(index));
-            let reconcile = || -> Result<Option<u64>> {
+            if !identifiable {
+                evidence.mark(PublicationReason::Unidentifiable);
+            }
+            let submitted = group_transaction_ids
+                .iter()
+                .map(|(id, v, _)| (id.as_str(), *v))
+                .chain(
+                    pending
+                        .iter()
+                        .filter_map(|a| a.publication.as_ref().map(|(id, v)| (id.as_str(), *v))),
+                )
+                .chain(identity)
+                .collect::<Vec<_>>();
+            let reconcile = |evidence: &mut PublicationEvidence| -> Result<Option<u64>> {
                 let latest = self
                     .snapshot()
                     .context("unknown publication outcome; reconciliation failed")?;
@@ -5505,9 +5673,12 @@ impl DeltaTable {
                 let mut group_committed = 0;
                 let group_total = group_transaction_ids.len();
                 let mut all_committed = true;
+                let versions =
+                    self.publication_versions(&latest, &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>())?;
                 for (id, version, is_group) in ids {
-                    match latest.get_app_id_version(id, &self.engine)? {
+                    match versions[id] {
                         Some(previous) if previous > version => {
+                            evidence.fail(PublicationReason::Fenced);
                             bail!("publication transaction fenced by newer application version")
                         }
                         Some(previous) if previous == version => {
@@ -5519,6 +5690,7 @@ impl DeltaTable {
                     }
                 }
                 if group_committed != 0 && group_committed != group_total {
+                    evidence.fail(PublicationReason::PartialGroup);
                     return Err(anyhow::Error::new(PartialPublicationGroup {
                         committed: group_committed,
                         total: group_total,
@@ -5528,7 +5700,9 @@ impl DeltaTable {
                     return Ok(None);
                 }
                 // Visibility is not proof of local durability after an I/O error.
-                self.sync_replayed_local_state(latest.version())?;
+                self.sync_replayed_local_state(latest.version())
+                    .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
+                evidence.fail(PublicationReason::Reconciled);
                 crate::telemetry::ambiguous_commit_reconciled(&table_id, table_name.as_deref(), started.elapsed());
                 Ok(Some(latest.version()))
             };
@@ -5539,7 +5713,16 @@ impl DeltaTable {
                 .collect();
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
-                    sync_directory(&self.root)?;
+                    sync_directory(&self.root).inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
+                    let version = commit.commit_version();
+                    for &(id, v) in &submitted {
+                        evidence
+                            .outcomes
+                            .insert((id.to_owned(), v), PublicationOutcome::CommittedNow(version));
+                    }
+                    if let Ok(mut cache) = self.publication_cache.lock() {
+                        cache.remember(table_uuid, version, submitted.iter().map(|&(id, v)| (id.to_owned(), v)));
+                    }
                     crate::telemetry::data_commit(
                         commit.commit_version(),
                         rows,
@@ -5559,23 +5742,28 @@ impl DeltaTable {
                         committed_file_observations,
                     ));
                 }
-                Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
+                Ok(CommitResult::Conflicted(_)) => {
+                    evidence.mark(PublicationReason::Conflict);
+                    observation.event("conflict");
+                }
                 Ok(CommitResult::Retryable(retry)) => {
+                    evidence.mark(PublicationReason::RetryableIo);
                     observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
                     if !identifiable {
                         bail!("uncertain publication without retry identity: {}", retry.error);
                     }
-                    if let Some(version) = reconcile()? {
+                    if let Some(version) = reconcile(evidence)? {
                         observation.finish("reconciled");
                         return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                 }
                 Err(error) => {
+                    evidence.mark(PublicationReason::Error);
                     // Kernel can surface post-publication I/O as Err, not only Retryable.
                     // A proven transaction is success; an unreadable outcome stays an error.
-                    if identifiable && let Some(version) = reconcile()? {
+                    if identifiable && let Some(version) = reconcile(evidence)? {
                         observation.finish("reconciled");
                         return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
@@ -5670,6 +5858,7 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 /// exist.
 #[derive(Debug)]
 pub struct AppendResult {
+    pub evidence: Arc<PublicationEvidence>,
     pub version: u64,
     pub file: CompletedFile,
     pub commit_duration: Option<Duration>,
@@ -6193,9 +6382,10 @@ impl DeltaFileWriter {
         // Kernel is synchronous. This offload is bounded by the caller's open files;
         // the collector uses the dedicated, bounded coordinator instead.
         tokio::task::spawn_blocking(move || {
-            let (version, commit_duration, file_observations) =
+            let (version, commit_duration, file_observations, evidence) =
                 append.table.commit_files_timed(std::slice::from_ref(&append))?;
             Ok(AppendResult {
+                evidence: Arc::new(evidence),
                 version,
                 file: append.file,
                 commit_duration,
