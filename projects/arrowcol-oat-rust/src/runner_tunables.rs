@@ -489,7 +489,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
                 | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
                 | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
-                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency")
+                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency" | "max_pending_commit_bytes")
         {
             let pointer = format!("/{}", field.replace('.', "/"));
             if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
@@ -1694,7 +1694,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     fn cpu_modes_need_pool_readback_and_stage_concurrency_needs_batching_readback() -> Result<()> {
         let mut config = config()?;
         let runtime = json!({"cpu_dispatch":"bounded_shards", "cpu_placement":"compact_allowed"});
-        let batching = json!({"coalesce_publications":true,"stage_file_concurrency":8});
+        let batching = json!({"coalesce_publications":true,"stage_file_concurrency":8,"max_pending_commit_bytes":4096});
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector":{"runtime":runtime,"batching":batching}
         }))?;
@@ -1716,10 +1716,14 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 ("collector.runtime.cpu_dispatch", expected_modes[0]),
                 ("collector.runtime.cpu_placement", expected_modes[1]),
                 ("collector.batching.stage_file_concurrency", true),
+                ("collector.batching.max_pending_commit_bytes", true),
             ] {
                 assert_eq!(verified.iter().any(|entry| entry["path"] == path), expected, "{path}");
             }
         }
+        let mut wrong_budget = process.clone();
+        wrong_budget["effective_config"]["batching"]["max_pending_commit_bytes"] = json!(0);
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong_budget["effective_config"]).is_err());
         process["effective_config"]["batching"]["stage_file_concurrency"] = json!(1);
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &process["effective_config"]).is_err());
         Ok(())

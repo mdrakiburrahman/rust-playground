@@ -131,6 +131,25 @@ mod override_tests {
     }
 
     #[test]
+    fn pending_commit_budget_validates_the_merged_config() {
+        let config = FileBatchConfig::default();
+        assert_eq!(config.max_pending_commit_bytes, 0);
+        let limit = arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES;
+        for (value, valid) in [
+            (limit.to_string(), true),
+            ((limit + 1).to_string(), false),
+            ("null".into(), false),
+            ("-1".into(), false),
+            ("1.5".into(), false),
+            ("\"16\"".into(), false),
+        ] {
+            let json = format!(r#"{{"max_pending_commit_bytes":{value}}}"#);
+            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+            assert_eq!(result.is_ok(), valid, "{json}");
+        }
+    }
+
+    #[test]
     fn stage_file_concurrency_validates_the_merged_batch_policy() {
         let config = FileBatchConfig::default();
         assert_eq!(config.stage_file_concurrency, 1);
@@ -1112,7 +1131,7 @@ impl DeltaExporterConfig {
     }
 }
 
-/// Logical Arrow capacity retained until publication finishes.
+/// Admission limits for queued and in-flight Arrow input.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BatchCapacity {
@@ -1151,6 +1170,9 @@ pub struct FileBatchConfig {
     pub stage_file_concurrency: usize,
     /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
     pub pipeline_depth: usize,
+    /// Backend-wide logical bytes allowed to release Arrow and flush capacity after queue handoff.
+    /// Zero keeps both reservations through the durable receipt.
+    pub max_pending_commit_bytes: u64,
     /// Compressed Parquet target and estimator limits.
     pub adaptive_file: AdaptiveFileConfig,
 }
@@ -1177,6 +1199,7 @@ impl Default for FileBatchConfig {
             max_concurrent_flushes: 4,
             stage_file_concurrency: 1,
             pipeline_depth: 1,
+            max_pending_commit_bytes: 0,
             adaptive_file: AdaptiveFileConfig::default(),
         }
     }
@@ -1184,6 +1207,9 @@ impl Default for FileBatchConfig {
 
 impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.max_pending_commit_bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES {
+            return Err("max_pending_commit_bytes exceeds the exact byte capacity limit".to_owned());
+        }
         let global = self.global_capacity;
         let table = self.per_table_capacity;
         if !(1..=16).contains(&self.stage_file_concurrency) {

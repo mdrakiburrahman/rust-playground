@@ -265,6 +265,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.max_age", "5s in OAT YAML; 30s component default"),
     capability!("collector.batching.max_concurrent_flushes", "4"),
     capability!("collector.batching.pipeline_depth", "1"),
+    capability!("collector.batching.max_pending_commit_bytes", "0"),
     capability!("collector.batching.stage_file_concurrency", "1"),
     capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
     capability!(
@@ -1910,6 +1911,9 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
     if flushes > (usize::MAX >> 3) {
         bail!("collector.batching.max_concurrent_flushes exceeds Semaphore::MAX_PERMITS");
     }
+    if batching.max_pending_commit_bytes.unwrap_or(0) > MAX_QUEUE_CAPACITY_BYTES {
+        bail!("collector.batching.max_pending_commit_bytes exceeds the exact byte capacity limit");
+    }
     let depth = batching.pipeline_depth.unwrap_or(1);
     if !(1..=16).contains(&batching.stage_file_concurrency.unwrap_or(1)) {
         bail!("collector.batching.stage_file_concurrency must be an integer in 1..=16");
@@ -3113,6 +3117,33 @@ mod tests {
                 assert!(error.contains(field), "{field}: {error}");
             }
         }
+    }
+
+    #[test]
+    fn pending_commit_bytes_is_exact_and_omitted_unless_requested() -> Result<()> {
+        let env = |v| {
+            Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":v}}))?
+                .environment_for(ComponentRole::Collector)
+        };
+        for amount in [0, MAX_QUEUE_CAPACITY_BYTES] {
+            let projected = env(serde_json::json!({"max_pending_commit_bytes":amount}))?;
+            let batching: Value = serde_json::from_str(&projected["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+            assert_eq!(batching["max_pending_commit_bytes"], amount);
+        }
+        let projected = env(serde_json::json!({"pipeline_depth":1}))?;
+        let batching: Value = serde_json::from_str(&projected["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert!(batching.get("max_pending_commit_bytes").is_none());
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!("1"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(MAX_QUEUE_CAPACITY_BYTES + 1),
+        ] {
+            assert!(env(serde_json::json!({"max_pending_commit_bytes":bad})).is_err());
+        }
+        Ok(())
     }
 
     #[test]

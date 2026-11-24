@@ -1108,6 +1108,11 @@ pub struct BatchingTunables {
     pub pipeline_depth: Option<usize>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_pending_commit_bytes"
+    )]
+    pub max_pending_commit_bytes: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_stage_file_concurrency"
     )]
     pub stage_file_concurrency: Option<usize>,
@@ -1353,6 +1358,12 @@ fn deserialize_cpu_placement<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::CpuPlacement>, D::Error> {
     deserialize_mode(d, "collector.runtime.cpu_placement")
+}
+
+fn deserialize_pending_commit_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(d).map(Some).map_err(|_| {
+        serde::de::Error::custom("collector.batching.max_pending_commit_bytes must be an unsigned integer")
+    })
 }
 
 fn deserialize_stage_file_concurrency<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
