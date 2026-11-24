@@ -57,6 +57,10 @@ type Summary = {
 };
 type OfficialWindow = { rate: number; resolution: number | null };
 type RepeatAssessment = { qualified: boolean; rates: number[]; reason: string; ratio?: number; pairRatio?: number; candidateBytes?: number; baselineBytes?: number; pairedBaselineRate?: number };
+type RankedObservation = {
+  rate: number; resolution: number; bytesPerRow: number | null;
+  commitCount: number; maxCommitRows: number; slope: number | null;
+};
 
 function isRecord(value: unknown): value is RecordValue {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -463,9 +467,42 @@ function evidenceForRow(row: RecordValue): RecordValue | undefined {
   }
 }
 
+function rankedObservation(run: OfficialRun): RankedObservation | undefined {
+  const evidence = evidenceForRow(run.rows[0] ?? {});
+  const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+  const reconciliation = isRecord(durable?.delta_log_reconciliation) ? durable.delta_log_reconciliation : undefined;
+  const csv = isRecord(reconciliation?.csv) ? reconciliation.csv : undefined;
+  const reconciled = csv;
+  const screen = isRecord(evidence?.screen_v1) ? evidence.screen_v1 : undefined;
+  const observed = screen;
+  if (!observed || !reconciled || stableJson(observed) !== stableJson(reconciled)) return undefined;
+  const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+  const seconds = output?.window_seconds;
+  const rate = observed.durable_rows_per_s;
+  const outputRate = output?.rows_per_second;
+  const resolution = observed.rate_resolution_rows_per_second;
+  const count = nonNegativeInteger(observed.window_commit_count);
+  const maximum = nonNegativeInteger(observed.max_commit_rows);
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0 ||
+      typeof outputRate !== 'number' || !Number.isFinite(outputRate) ||
+      Math.abs(rate - outputRate) > 1e-9 ||
+      typeof resolution !== 'number' || !Number.isFinite(resolution) || resolution <= 0 ||
+      typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0 ||
+      count === undefined || count === 0 || maximum === undefined || maximum === 0 ||
+      Math.abs(resolution - maximum / seconds) > Math.max(1e-9, resolution * 1e-9)) return undefined;
+  const bytes = observed.bytes_per_row;
+  const slope = observed.slope_rows_per_second;
+  return {
+    rate, resolution, commitCount: count, maxCommitRows: maximum,
+    slope: typeof slope === 'number' && Number.isFinite(slope) ? slope : null,
+    bytesPerRow: typeof bytes === 'number' && Number.isFinite(bytes) && bytes > 0 ? bytes : null,
+  };
+}
+
 function cellFailure(row: CampaignMeasurement): string | undefined {
   for (const result of row.officialRuns?.flatMap(run => run.rows) ?? []) {
     const evidence = evidenceForRow(result);
+    if (evidence?.screen_v1_csv_reason === 'cell_failed') return 'screen_v1: cell_failed';
     for (const key of ['pre_teardown_reconciliation', 'reconciliation']) {
       const reconciliation = evidence?.[key];
       if (isRecord(reconciliation) && reconciliation.exact_match_required === true && reconciliation.exact_match === false) {
@@ -1063,6 +1100,8 @@ function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
   if (inspected.windows.some(window => window.resolution === null)) {
     return { qualified: false, rates, reason: 'provisional: commit-rate resolution unavailable' };
   }
+  const ranked = rankedObservation(row.officialRuns[0]!);
+  if (!ranked) return { qualified: false, rates, reason: 'provisional: reconciled ranked rate or resolution unavailable' };
   if (row.evidenceState !== 'physically-observed' && row.evidenceState !== 'measured') {
     return { qualified: false, rates, reason: 'provisional: physical factor evidence unavailable' };
   }
@@ -1085,7 +1124,11 @@ function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
   if (before!.some(window => window.resolution === null) || after!.some(window => window.resolution === null)) {
     return { qualified: false, rates, reason: 'provisional: baseline commit-rate resolution unavailable' };
   }
-  const baselineRates = [average(before!.map(window => window.rate)), average(after!.map(window => window.rate))];
+  const baselineRanked = baselineRuns.map(rankedObservation);
+  if (baselineRanked.some(observation => !observation)) {
+    return { qualified: false, rates, reason: 'provisional: reconciled baseline rate or resolution unavailable' };
+  }
+  const baselineRates = baselineRanked.map(observation => observation!.rate);
   const baselineMean = average(baselineRates);
   if ([before!, after!].some(windows => {
     const values = windows.map(window => window.rate);
@@ -1094,15 +1137,15 @@ function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
   if (Math.abs(baselineRates[1]! - baselineRates[0]!) > baselineRates[0]! * 0.05 + Number.EPSILON * baselineMean * 4) {
     return { qualified: false, rates, reason: 'invalid A/A: adjacent baselines differ by more than 5%' };
   }
-  const baselineResolution = Math.max(...before!.map(window => window.resolution!), ...after!.map(window => window.resolution!));
+  const baselineResolution = Math.max(...baselineRanked.map(observation => observation!.resolution));
   if (Math.max(
-    Math.max(...before!.map(window => window.resolution!)) / baselineRates[0]!,
-    Math.max(...after!.map(window => window.resolution!)) / baselineRates[1]!,
+    baselineRanked[0]!.resolution / baselineRates[0]!,
+    baselineRanked[1]!.resolution / baselineRates[1]!,
   ) > 0.01) {
     return { qualified: false, rates, reason: 'invalid A/A: commit-rate resolution exceeds 1%' };
   }
-  const resolution = Math.max(...inspected.windows.map(window => window.resolution!), baselineResolution);
-  if (Math.abs(mean - baselineMean) < resolution) {
+  const resolution = Math.max(ranked.resolution, baselineResolution);
+  if (Math.abs(ranked.rate - baselineMean) < resolution) {
     return { qualified: false, rates, reason: 'unresolved: difference is smaller than commit-rate resolution' };
   }
   const output = (run: OfficialRun): RecordValue | undefined => {
@@ -1123,21 +1166,18 @@ function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
       new Set([row.baselineBefore.status.id, row.officialRuns[0]!.status.id, row.baselineAfter.status.id]).size !== 3) {
     return { qualified: false, rates, reason: 'invalid adjacent baseline ordering' };
   }
-  const pairedOutput = row.pairOrder === 'AB' ? beforeOutput : afterOutput;
-  if (Math.abs(mean - baselineRates[row.pairOrder === 'AB' ? 0 : 1]!) < resolution) {
+  if (Math.abs(ranked.rate - baselineRates[row.pairOrder === 'AB' ? 0 : 1]!) < resolution) {
     return { qualified: false, rates, reason: 'unresolved: paired difference is smaller than commit-rate resolution' };
   }
-  const candidateBytes = typeof candidateOutput.parquet_bytes === 'number' && typeof candidateOutput.rows === 'number'
-    ? candidateOutput.parquet_bytes / candidateOutput.rows : null;
-  const baselineBytes = typeof pairedOutput.parquet_bytes === 'number' && typeof pairedOutput.rows === 'number'
-    ? pairedOutput.parquet_bytes / pairedOutput.rows : null;
+  const candidateBytes = ranked.bytesPerRow;
+  const baselineBytes = baselineRanked[row.pairOrder === 'AB' ? 0 : 1]!.bytesPerRow;
   if (typeof candidateBytes !== 'number' || !Number.isFinite(candidateBytes) || candidateBytes <= 0 ||
       typeof baselineBytes !== 'number' || !Number.isFinite(baselineBytes) || baselineBytes <= 0) {
     return { qualified: false, rates, reason: 'provisional: paired bytes per row unavailable' };
   }
   return {
-    qualified: true, rates, ratio: mean / baselineMean,
-    pairRatio: mean / baselineRates[row.pairOrder === 'AB' ? 0 : 1]!,
+    qualified: true, rates: [ranked.rate], ratio: ranked.rate / baselineMean,
+    pairRatio: ranked.rate / baselineRates[row.pairOrder === 'AB' ? 0 : 1]!,
     candidateBytes, baselineBytes, pairedBaselineRate: baselineRates[row.pairOrder === 'AB' ? 0 : 1]!,
     reason: 'normalized to adjacent baseline mean; resolution ' + numberLabel(resolution) + ' rows/s',
   };
@@ -1233,8 +1273,18 @@ function normalizedRatio(row: CampaignMeasurement): number | undefined {
   }
   const runs = [row.officialRuns[0], row.baselineBefore, row.baselineAfter].map(inspectOfficialRun);
   if (runs.some(run => !run.windows)) return undefined;
-  const rates = runs.map(run => average(run.windows!.map(window => window.rate)));
-  return rates[0]! / average([rates[1]!, rates[2]!]);
+  const observations = [row.officialRuns[0], row.baselineBefore, row.baselineAfter].map(rankedObservation);
+  if (observations.some(observation => !observation)) return undefined;
+  return observations[0]!.rate / average([observations[1]!.rate, observations[2]!.rate]);
+}
+
+function lowCommitWindowLabels(evidence: RecordValue | undefined): string[] {
+  const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+  const windows = Array.isArray(durable?.complete_30_second_commit_windows) ? durable.complete_30_second_commit_windows : [];
+  return windows.flatMap((window, index) => {
+    const count = isRecord(window) ? nonNegativeInteger(window.window_commit_count) : undefined;
+    return count !== undefined && count < 100 ? [String(index + 1) + ' (' + count + ')'] : [];
+  });
 }
 
 function measurementDetails(row: CampaignMeasurement): string {
@@ -1244,10 +1294,12 @@ function measurementDetails(row: CampaignMeasurement): string {
   const evidence = result && evidenceForRow(result);
   const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
   const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
-  const windows = Array.isArray(durable?.complete_30_second_commit_windows) ? durable.complete_30_second_commit_windows : [];
-  const resolutions = windows.map(window => isRecord(window) ? window.rate_resolution_rows_per_second : null);
-  const resolution = resolutions.length && resolutions.every(value => typeof value === 'number' && Number.isFinite(value) && value > 0)
-    ? Math.max(...resolutions as number[]) : null;
+  const lowCommitWindows = lowCommitWindowLabels(evidence);
+  const baselineWarnings = ([['before', row.baselineBefore], ['after', row.baselineAfter]] as const).flatMap(([name, run]) => {
+    const labels = lowCommitWindowLabels(run ? evidenceForRow(run.rows[0] ?? {}) : undefined);
+    return labels.length ? ['; baseline ' + name + ' low-commit windows (<100): ' + labels.join(', ')] : [];
+  }).join('');
+  const ranked = row.officialRuns?.[0] ? rankedObservation(row.officialRuns[0]) : undefined;
   const rate = typeof output?.rows_per_second === 'number' && Number.isFinite(output.rows_per_second) && output.rows_per_second > 0 ? output.rows_per_second : null;
   const collector = result && typeof result.cpu_millicores === 'number' && Number.isFinite(result.cpu_millicores) && result.cpu_millicores >= 0 && rate
     ? result.cpu_millicores / 1000 / rate * 1_000_000 : null;
@@ -1274,10 +1326,15 @@ function measurementDetails(row: CampaignMeasurement): string {
   }
   const label = (value: number | null | undefined) => value == null ? 'null' : numberLabel(value);
   return row.candidate + ' #' + row.repeat + ': normalized ' + label(normalizedRatio(row)) +
-    ', resolution ' + label(resolution) + ' rows/s, concurrency/core ' + label(concurrency) +
+    ', resolution ' + label(ranked?.resolution) + ' rows/s, commits ' + label(ranked?.commitCount) +
+    ', max commit rows ' + label(ranked?.maxCommitRows) + ', slope ' + label(ranked?.slope) +
+    ' rows/s, concurrency/core ' + label(concurrency) +
     (quotaError ? ' (invalid tunables JSON)' : '') +
     '; CPU s/M rows (estimated): collector ' + label(collector) +
-    ', DFE null, client ' + label(client) + (row.comment ? '; ' + row.comment : '');
+    ', DFE null, client ' + label(client) +
+    (lowCommitWindows.length ? '; low-commit windows (<100): ' + lowCommitWindows.join(', ') : '') +
+    baselineWarnings +
+    (row.comment ? '; ' + row.comment : '');
 }
 
 export function sortCampaignLeaderboard<T extends { candidate: string; mean: number }>(items: T[]): T[] {
