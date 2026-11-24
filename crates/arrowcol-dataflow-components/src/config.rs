@@ -143,6 +143,7 @@ mod override_tests {
                 .and_then(|merged| merged.validate())
                 .is_ok()
         );
+        for field in ["stage_file_concurrency", "stage_files_per_group"] {
         for (raw, valid) in [
             ("1", true),
             ("16", false),
@@ -153,9 +154,10 @@ mod override_tests {
             ("\"2\"", false),
             ("null", false),
         ] {
-            let json = format!(r#"{{"stage_file_concurrency":{raw}}}"#);
+            let json = format!(r#"{{"{field}":{raw}}}"#);
             let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
             assert_eq!(result.is_ok(), valid, "{json}");
+        }
         }
     }
 
@@ -1149,6 +1151,8 @@ pub struct FileBatchConfig {
     pub max_concurrent_flushes: usize,
     /// Maximum sibling files staged concurrently within one coalesced publication.
     pub stage_file_concurrency: usize,
+    /// Balanced sibling files per unsorted partition in a coalesced group.
+    pub stage_files_per_group: usize,
     /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
     pub pipeline_depth: usize,
     /// Compressed Parquet target and estimator limits.
@@ -1176,6 +1180,7 @@ impl Default for FileBatchConfig {
             max_age: Duration::from_secs(30),
             max_concurrent_flushes: 4,
             stage_file_concurrency: 1,
+            stage_files_per_group: 1,
             pipeline_depth: 1,
             adaptive_file: AdaptiveFileConfig::default(),
         }
@@ -1191,6 +1196,12 @@ impl FileBatchConfig {
         }
         if self.stage_file_concurrency > 1 && !self.coalesce_publications {
             return Err("stage_file_concurrency > 1 requires coalesce_publications=true".to_owned());
+        }
+        if !(1..=16).contains(&self.stage_files_per_group) {
+            return Err("stage_files_per_group must be in 1..=16".to_owned());
+        }
+        if self.stage_files_per_group > 1 && !self.coalesce_publications {
+            return Err("stage_files_per_group > 1 requires coalesce_publications=true".to_owned());
         }
         if [global.rows, global.batches, table.rows, table.batches].contains(&0)
             || global.bytes == 0

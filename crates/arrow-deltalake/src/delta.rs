@@ -2053,6 +2053,7 @@ mod io_tests {
                 ],
                 2,
                 2,
+                1,
             )
             .await?;
         assert_eq!(identities.len(), 2);
@@ -2121,7 +2122,7 @@ mod io_tests {
         assert!(error.to_string().contains("differs from bound write context"));
         drop(direct);
         let error = match table
-            .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2, 2)
+            .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2, 2, 1)
             .await
         {
             Ok(_) => bail!("mismatched ingestion partition was accepted"),
@@ -2250,6 +2251,7 @@ mod io_tests {
                 ],
                 2,
                 2,
+                1,
             )
             .await?;
         assert_eq!(files.len(), 2);
@@ -2997,6 +2999,37 @@ struct CoalescedPartitionOutput {
     files: Vec<Vec<(RecordBatch, Option<GeneratedIngestion>)>>,
     file_rows: Vec<usize>,
     file_bytes: Vec<usize>,
+}
+
+impl CoalescedPartitionOutput {
+    fn split_unsorted(&mut self, width: usize) -> Result<()> {
+        let rows = *self.file_rows.first().context("missing coalesced partition rows")?;
+        let width = width.min(rows);
+        anyhow::ensure!(width > 0 && self.files.len() == 1, "invalid unsorted partition split");
+        let batches = self.files.pop().context("missing coalesced partition batches")?;
+        let targets = (0..width)
+            .map(|index| rows / width + usize::from(index < rows % width))
+            .collect::<Vec<_>>();
+        self.files = (0..width).map(|_| Vec::new()).collect();
+        self.file_rows = vec![0; width];
+        self.file_bytes = vec![0; width];
+        let mut file = 0;
+        for (batch, proof) in batches {
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let remaining = targets[file] - self.file_rows[file];
+                let take = remaining.min(batch.num_rows() - offset);
+                self.files[file].push((batch.slice(offset, take), proof.clone()));
+                self.file_rows[file] += take;
+                offset += take;
+                if self.file_rows[file] == targets[file] && file + 1 < width {
+                    file += 1;
+                }
+            }
+        }
+        anyhow::ensure!(self.file_rows == targets, "coalesced partition split lost rows");
+        Ok(())
+    }
 }
 
 struct PreparedWrite {
@@ -4816,6 +4849,7 @@ impl DeltaTable {
         entries: Vec<(RecordBatch, String, i64, i64)>,
         max_files: usize,
         concurrency: usize,
+        files_per_group: usize,
     ) -> Result<(
         Vec<StagedAppend>,
         Vec<(String, i64, i64)>,
@@ -4827,11 +4861,15 @@ impl DeltaTable {
             (1..=16).contains(&concurrency),
             "stage_file_concurrency must be in 1..=16"
         );
+        anyhow::ensure!(
+            (1..=16).contains(&files_per_group),
+            "stage_files_per_group must be in 1..=16"
+        );
         let table = Arc::clone(self);
         let plan = crate::delta_io::run_cpu_async(move || {
             let executor = shared_executor()?;
             let _guard = executor.enter();
-            table.plan_coalesced_publications(entries, max_files)
+            table.plan_coalesced_publications(entries, max_files, files_per_group)
         })
         .await??;
         let policy = Arc::new(plan.policy);
@@ -4877,6 +4915,7 @@ impl DeltaTable {
         &self,
         entries: Vec<(RecordBatch, String, i64, i64)>,
         max_files: usize,
+        files_per_group: usize,
     ) -> Result<CoalescedPlan> {
         let preparation_started = Instant::now();
         let mut preparation_sort = Duration::ZERO;
@@ -4901,6 +4940,10 @@ impl DeltaTable {
         let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&first.schema())?)?;
         let mode = collector_sort_execution()?;
         let layout = collector_publication_layout(&first.schema(), &resolved, mode)?;
+        anyhow::ensure!(
+            files_per_group == 1 || layout.is_none(),
+            "stage_files_per_group > 1 is only supported for unsorted layouts; sorted layouts use their row and byte limits"
+        );
         if let Some(policy) = &layout {
             for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
                 if partitions.contains(name) {
@@ -5133,6 +5176,20 @@ impl DeltaTable {
             }
         }
         let schema = schema.context("coalesced publication has no input schema")?;
+        if files_per_group > 1 {
+            planned_files = output.values().try_fold(0_usize, |total, partition| {
+                total.checked_add(partition.file_rows[0].min(files_per_group))
+            }).context("coalesced output file count overflow")?;
+            if planned_files > max_files {
+                return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                    required_files: planned_files,
+                    max_files,
+                }));
+            }
+            for partition in output.values_mut() {
+                partition.split_unsorted(files_per_group)?;
+            }
+        }
         let counted_files = output
             .values()
             .try_fold(0_usize, |total, partition| total.checked_add(partition.files.len()))

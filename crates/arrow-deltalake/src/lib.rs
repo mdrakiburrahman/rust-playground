@@ -37,6 +37,10 @@ pub mod normalize;
 #[cfg(feature = "delta")]
 mod parallel_writer;
 #[cfg(feature = "delta")]
+mod pipelined_writer;
+#[cfg(feature = "delta")]
+mod streaming_columns;
+#[cfg(feature = "delta")]
 mod partition;
 #[cfg(feature = "delta")]
 mod publication_evidence;
@@ -101,6 +105,37 @@ impl TryFrom<String> for StagingMode {
             "local_fsync" => Ok(Self::LocalFsync),
             "streaming" => Ok(Self::Streaming),
             _ => Err("staging_mode must be local_fsync or streaming"),
+        }
+    }
+}
+
+/// Scheduling of Parquet column encoders; one column worker stays sequential.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum ParquetEncodeMode {
+    #[default]
+    ColumnWaves,
+    ColumnPipeline,
+}
+
+impl ParquetEncodeMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ColumnWaves => "column_waves",
+            Self::ColumnPipeline => "column_pipeline",
+        }
+    }
+}
+
+impl TryFrom<String> for ParquetEncodeMode {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "column_waves" => Ok(Self::ColumnWaves),
+            "column_pipeline" => Ok(Self::ColumnPipeline),
+            _ => Err("expected column_waves or column_pipeline"),
         }
     }
 }
@@ -239,6 +274,10 @@ impl TryFrom<String> for GeneratedPartitionBinding {
 
 #[cfg(feature = "delta")]
 use parallel_writer::ParallelArrowWriter;
+#[cfg(feature = "delta")]
+use pipelined_writer::PipelinedArrowWriter;
+#[cfg(feature = "delta")]
+use streaming_columns::StreamingColumnWriter;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
@@ -295,7 +334,11 @@ enum FileWriter {
     #[cfg(feature = "delta")]
     Parallel(ParallelArrowWriter<File>),
     #[cfg(feature = "delta")]
+    Pipelined(PipelinedArrowWriter<File>),
+    #[cfg(feature = "delta")]
     Streaming(AsyncArrowWriter<delta::streaming_sink::StreamingSink>),
+    #[cfg(feature = "delta")]
+    StreamingColumns(StreamingColumnWriter),
 }
 
 impl ParquetFileWriter {
@@ -372,8 +415,16 @@ impl ParquetFileWriter {
         let effective = properties.clone();
         #[cfg(feature = "delta")]
         let writer = {
-            let column_workers = delta_io::runtime_config()?.parquet_column_workers;
-            if column_workers > 1 {
+            let config = delta_io::runtime_config()?;
+            let column_workers = config.parquet_column_workers;
+            if config.parquet_encode_mode == ParquetEncodeMode::ColumnPipeline {
+                FileWriter::Pipelined(PipelinedArrowWriter::try_new(
+                    durable_handle.try_clone()?,
+                    schema,
+                    properties,
+                    column_workers,
+                )?)
+            } else if column_workers > 1 {
                 FileWriter::Parallel(ParallelArrowWriter::try_new(
                     durable_handle.try_clone()?,
                     schema,
@@ -409,10 +460,20 @@ impl ParquetFileWriter {
         sink: delta::streaming_sink::StreamingSink,
     ) -> Result<Self> {
         let properties = Self::effective_properties(&schema, properties, true)?;
-        let writer = AsyncArrowWriter::try_new(sink, schema, Some(properties.clone()))?;
+        let config = delta_io::runtime_config()?;
+        let writer = if config.parquet_encode_mode == ParquetEncodeMode::ColumnPipeline {
+            FileWriter::StreamingColumns(StreamingColumnWriter::try_new(
+                sink,
+                schema,
+                properties.clone(),
+                config.parquet_column_workers,
+            )?)
+        } else {
+            FileWriter::Streaming(AsyncArrowWriter::try_new(sink, schema, Some(properties.clone()))?)
+        };
         Ok(Self {
             properties,
-            writer: Some(FileWriter::Streaming(writer)),
+            writer: Some(writer),
             durable_handle: None,
             path,
             rows: 0,
@@ -420,7 +481,7 @@ impl ParquetFileWriter {
         })
     }
 
-    /// Append a batch without retaining it in memory.
+    /// Append a batch. Column-pipeline mode retains a bounded window of Arrow slices.
     ///
     /// # Errors
     /// Returns byte-accounting, schema, or file-write errors.
@@ -477,6 +538,16 @@ impl ParquetFileWriter {
                 FileWriter::Parallel(mut writer) => {
                     let result = writer.write(batch).await;
                     self.writer = Some(FileWriter::Parallel(writer));
+                    result?;
+                }
+                FileWriter::Pipelined(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::Pipelined(writer));
+                    result?;
+                }
+                FileWriter::StreamingColumns(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::StreamingColumns(writer));
                     result?;
                 }
             }
@@ -537,6 +608,15 @@ impl ParquetFileWriter {
             #[cfg(feature = "delta")]
             FileWriter::Parallel(writer) => {
                 drop(writer.finish().await?);
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::Pipelined(writer) => {
+                drop(writer.finish().await?);
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::StreamingColumns(writer) => {
+                let (bytes, duration) = writer.finish().await?;
+                return Ok((CompletedFile { path, rows, input_bytes, bytes }, Some(duration)));
             }
         }
         let durable_handle =

@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "linux", feature = "delta"))]
+
 use anyhow::{Context, Result, ensure};
 use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -107,14 +109,15 @@ fn corpus(batches: usize, rows: usize, width: usize, random: bool) -> Result<Vec
     slots.into_iter().map(|slot| slot.context("missing corpus batch")).collect()
 }
 
-fn process_cpu_seconds() -> Result<f64> {
+fn process_usage() -> Result<(f64, f64, u64)> {
     let stat = std::fs::read_to_string("/proc/self/stat")?;
     let fields: Vec<_> = stat.rsplit_once(") ").context("invalid /proc/self/stat")?.1.split_whitespace().collect();
     let user: u64 = fields.get(11).context("missing user ticks")?.parse()?;
     let system: u64 = fields.get(12).context("missing system ticks")?.parse()?;
+    let minor_faults: u64 = fields.get(7).context("missing minor faults")?.parse()?;
     let result = std::process::Command::new("getconf").arg("CLK_TCK").output()?;
     let ticks: f64 = std::str::from_utf8(&result.stdout)?.trim().parse()?;
-    Ok((user + system) as f64 / ticks)
+    Ok((user as f64 / ticks, system as f64 / ticks, minor_faults))
 }
 
 #[cfg(target_os = "linux")]
@@ -127,9 +130,14 @@ async fn parquet_encode_parallelism() -> Result<()> {
     let files = env_usize("BENCH_FILES", 1)?;
     let width = env_usize("BENCH_STRING_BYTES", 28)?;
     let zstd_level = env_usize("BENCH_ZSTD_LEVEL", 1)?;
-    let random = std::env::var("BENCH_DATA").map_or(true, |value| value != "loadgen");
+    let random = match std::env::var("BENCH_DATA").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("random") => true,
+        Ok("loadgen") => false,
+        _ => anyhow::bail!("BENCH_DATA must be random or loadgen"),
+    };
     ensure!(
-        files > 0 && rows % (batch_rows * files) == 0,
+        files > 0 && rows > 0 && batch_rows > 0
+            && batch_rows.checked_mul(files).is_some_and(|divisor| rows.is_multiple_of(divisor)),
         "rows must divide into whole batches per file"
     );
 
@@ -147,7 +155,7 @@ async fn parquet_encode_parallelism() -> Result<()> {
             .build())
     };
 
-    let cpu_started = process_cpu_seconds()?;
+    let cpu_started = process_usage()?;
     let started = Instant::now();
     let tasks = batches.chunks(per_file).enumerate().map(|(index, chunk)| {
         let path = dir.path().join(format!("file-{index}.parquet"));
@@ -166,7 +174,10 @@ async fn parquet_encode_parallelism() -> Result<()> {
     });
     let results = try_join_all(tasks.map(tokio::spawn)).await?;
     let wall = started.elapsed().as_secs_f64();
-    let cpu = process_cpu_seconds()? - cpu_started;
+    let cpu_finished = process_usage()?;
+    let user = cpu_finished.0 - cpu_started.0;
+    let system = cpu_finished.1 - cpu_started.1;
+    let cpu = user + system;
 
     let mut total_rows = 0_usize;
     let mut input_bytes = 0_u64;
@@ -194,6 +205,9 @@ async fn parquet_encode_parallelism() -> Result<()> {
             "zstd_level": zstd_level,
             "column_workers": std::env::var("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS").ok(),
             "cpu_workers": std::env::var("ARROWCOL_COLLECTOR_CPU_WORKERS").ok(),
+            "encode_mode": arrow_deltalake::runtime_config()?.parquet_encode_mode.as_str(),
+            "allocator": "system",
+            "glibc_tunables": std::env::var("GLIBC_TUNABLES").ok(),
             "wall_s": wall,
             "rows_per_s": total_rows as f64 / wall,
             "encode_s": encode_s,
@@ -202,10 +216,83 @@ async fn parquet_encode_parallelism() -> Result<()> {
             "arrow_mb_per_s": input_bytes as f64 / wall / 1e6,
             "parquet_bytes_per_row": parquet_bytes as f64 / total_rows as f64,
             "cpu_s": cpu,
+            "user_cpu_s": user,
+            "system_cpu_s": system,
+            "minor_faults": cpu_finished.2 - cpu_started.2,
             "cpu_s_per_mrow": cpu / total_rows as f64 * 1e6,
             "cores_busy": cpu / wall,
             "slowest_finish_s": finish_s,
         })
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual release-mode L5 benchmark; configure with BENCH_* and ARROWCOL_* variables"]
+async fn parquet_commit_parallelism() -> Result<()> {
+    use arrow_deltalake::{commit::{BatchedTable, CommitOptions}, delta::DeltaTable};
+    let rows = env_usize("BENCH_ROWS", 1_048_576)?;
+    let batch_rows = env_usize("BENCH_BATCH_ROWS", 8_192)?;
+    let files = env_usize("BENCH_FILES", 1)?;
+    let concurrency = env_usize("BENCH_STAGE_CONCURRENCY", 1)?;
+    let width = env_usize("BENCH_STRING_BYTES", 150)?;
+    let random = match std::env::var("BENCH_DATA").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("random") => true,
+        Ok("loadgen") => false,
+        _ => anyhow::bail!("BENCH_DATA must be random or loadgen"),
+    };
+    ensure!(rows > 0 && batch_rows > 0 && rows.is_multiple_of(batch_rows), "rows must divide into whole batches");
+    ensure!((1..=16).contains(&files) && (1..=16).contains(&concurrency), "file widths must be in 1..=16");
+    let batches = corpus(rows / batch_rows, batch_rows, width, random)?;
+    let schema = batches[0].schema();
+    let dir = match std::env::var_os("BENCH_DIR") {
+        Some(base) => tempfile::tempdir_in(base)?,
+        None => tempfile::tempdir()?,
+    };
+    let root = dir.path().canonicalize()?;
+    let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid benchmark path"))?;
+    DeltaTable::open_catalog(url)?.commit_catalog(None, schema, Vec::new(), Default::default(), None)?;
+    let table = BatchedTable::open(&root, CommitOptions::default()).await?;
+    let input_bytes = batches.iter().try_fold(0_u64, |total, batch| {
+        Ok::<_, anyhow::Error>(total + arrow_deltalake::record_batch_logical_bytes(batch)?)
+    })?;
+    let entries = batches.into_iter().enumerate()
+        .map(|(index, batch)| (batch, format!("bench-{index}"), 0, 1_700_000_000_000)).collect();
+    let usage_started = process_usage()?;
+    let started = Instant::now();
+    let group = table.stage_coalesced_publications_with_file_policy(entries, concurrency, files).await?;
+    let stage_s = started.elapsed().as_secs_f64();
+    let result = table.submit_prepared_group(group, true).await?.wait().await?;
+    let wall_s = started.elapsed().as_secs_f64();
+    let usage_finished = process_usage()?;
+    let mut committed_rows = 0_u64;
+    let log = std::fs::read_to_string(root.join(format!("_delta_log/{:020}.json", result.version)))?;
+    for line in log.lines() {
+        let action: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(add) = action.get("add") {
+            let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().context("missing add statistics")?)?;
+            committed_rows += stats["numRecords"].as_u64().context("missing committed row count")?;
+        }
+    }
+    ensure!(committed_rows == rows as u64, "Delta log row count mismatch");
+    let user_s = usage_finished.0 - usage_started.0;
+    let system_s = usage_finished.1 - usage_started.1;
+    let parquet_bytes: u64 = result.files.iter().map(|file| file.bytes).sum();
+    println!("BW_COMMIT_RESULT={}", json!({
+        "level":"L5_local_fsync", "rows":committed_rows, "files":result.files.len(),
+        "stage_file_concurrency":concurrency, "requested_files":files,
+        "batch_rows":batch_rows, "data":if random {"random"} else {"loadgen"},
+        "string_bytes":width, "wall_s":wall_s, "stage_s":stage_s,
+        "commit_s":wall_s-stage_s, "committed_rows_per_s":committed_rows as f64 / wall_s,
+        "arrow_bytes_per_row":input_bytes as f64 / committed_rows as f64,
+        "parquet_bytes_per_row":parquet_bytes as f64 / committed_rows as f64,
+        "user_cpu_s":user_s, "system_cpu_s":system_s,
+        "minor_faults":usage_finished.2-usage_started.2,
+        "cpu_s_per_mrow":(user_s+system_s) / committed_rows as f64 * 1e6,
+        "cores_busy":(user_s+system_s) / wall_s,
+        "allocator":"system", "glibc_tunables":std::env::var("GLIBC_TUNABLES").ok(),
+        "runtime":arrow_deltalake::runtime_config()?,
+        "parquet_config":std::env::var("ARROWCOL_PARQUET_CONFIG").ok(),
+    }));
     Ok(())
 }
