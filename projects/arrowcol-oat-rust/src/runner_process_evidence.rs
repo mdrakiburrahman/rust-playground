@@ -102,6 +102,7 @@ fn is_process_evidence_line(line: &str) -> bool {
         "arrowcol_layout_",
         "arrowcol_data_commit ",
         "arrowcol_teardown_failure ",
+        "arrowcol_shutdown ",
         "cancelled admissions had no observed publication outcome",
         "arrowcol_maintenance_",
         "delta-maintenance ",
@@ -2486,6 +2487,14 @@ mod startup_readback_tests {
             "maintenance": {"enabled": true, "operations": ["optimize"]}
         }))?;
         assert!(inert_tunable_fields(&config)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn process_log_filter_retains_collector_drain_marker() -> Result<()> {
+        let marker = "arrowcol_shutdown {\"event\":\"drain_complete\"}";
+        let input = format!("unrelated line\n{marker}\n");
+        assert_eq!(filter_process_evidence_text(&input)?, format!("{marker}\n"));
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use arrowcol_dataflow_components as _;
@@ -50,8 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arrowcol_dataflow_components::initialize_shared_io()?;
     let shutdown_error = Rc::new(RefCell::new(None));
     let hook_error = Rc::clone(&shutdown_error);
+    let observed_startup = Rc::new(Cell::new(false));
+    let observer_started = Rc::clone(&observed_startup);
     let result = otel_arrow_dfe::run_with_config_observer_and_shutdown_status(
-        |spec| arrowcol_dataflow_components::observe_validated_topology(spec).map_err(Into::into),
+        move |spec| {
+            arrowcol_dataflow_components::observe_validated_topology(spec)?;
+            observer_started.set(true);
+            Ok(())
+        },
         move |clean| {
             let result = finish_shutdown(
                 clean,
@@ -59,6 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |clean| arrowcol_dataflow_components::finish_routing_shutdown(clean).map_err(|error| error.to_string()),
             );
             drop(metrics);
+            if clean && observed_startup.get() && result.is_ok() {
+                eprintln!("arrowcol_shutdown {{\"event\":\"drain_complete\"}}");
+            }
             if let Err(error) = result {
                 eprintln!("dataflow shutdown failed: {error}");
                 // After a clean engine exit the SDK would report success, so only this hook can fail

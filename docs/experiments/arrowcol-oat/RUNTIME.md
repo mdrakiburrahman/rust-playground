@@ -44,6 +44,12 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 | Commit-rate resolution | Commit windows and reconciled local `screen_v1` report `window_commit_count`, `max_commit_rows`, `rate_resolution_rows_per_second` (largest commit divided by window seconds), and `slope_rows_per_second` (least-squares cumulative committed rows against finish time). No commits leaves the maximum, resolution and slope null; fewer than three commits or identical finish times leaves slope null. Unavailable evidence has all four fields null. The slope orders equal finish times by Delta version. |
 | Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
 
+Client quiescence is capped at 86,400,000 ms and must be at least the request
+timeout and strictly less than collector stop grace. The client stop grace is
+the quiesce timeout rounded up to seconds plus 10 seconds. Separately, campaign
+cleanup bounds its collector drain step to 120 seconds; increasing the pod's
+termination grace does not increase that custody deadline.
+
 Local teardown includes the maintenance Compose profile only when maintenance
 was enabled for the cell; other profiles remain excluded.
 After a successful measurement, `local_teardown` identifies the cell and its

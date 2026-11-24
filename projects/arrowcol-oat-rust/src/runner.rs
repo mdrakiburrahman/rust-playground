@@ -1176,11 +1176,21 @@ struct AksPlatform {
     router_yaml: Option<String>,
     shutdown_drain_evidence: Option<Value>,
     campaign_cli_paths: Option<OwnedAksCampaignConfigPaths>,
+    maintenance_cell_baseline: Vec<ProcessLog>,
+    stopped_collector_logs: Option<Vec<ProcessLog>>,
 }
 
 struct OwnedKubectlProcess {
     child: Child,
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+struct ShutdownLogFollower(JoinHandle<Result<ProcessLog>>);
+
+impl Drop for ShutdownLogFollower {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Default)]
@@ -1318,6 +1328,16 @@ impl Platform for AksPlatform {
                 .context("AKS property evidence Delta root missing")?,
             &properties,
         )?))
+    }
+
+    fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
+        self.maintenance_cell_baseline = logs.to_vec();
+    }
+
+    fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
+        self.stopped_collector_logs
+            .clone()
+            .map(|logs| (logs, self.maintenance_cell_baseline.clone()))
     }
 
     fn delta_root(&self) -> Option<&str> {
@@ -2815,6 +2835,7 @@ async fn start_aks_client_job(
     let job_name = format!("oat-{run_label}-{table_label}-c{client_index}");
     let run_seconds = i64::try_from(config.timing_budget()?.client_job_lifetime_seconds)
         .context("OAT client Job lifetime exceeds Kubernetes range")?;
+    let args = render_aks_client_args(config, args)?;
     let mut job = build_aks_client_job(AksClientJobSpec {
         namespace: &config.namespace,
         client_image: &config.dmv_client_image,
@@ -2823,7 +2844,7 @@ async fn start_aks_client_job(
         run_id,
         run_label: &run_label,
         job_name: &job_name,
-        args,
+        args: &args,
         run_seconds,
         stop_grace_seconds: config.client_stop_grace_seconds(),
     });
@@ -2892,6 +2913,25 @@ async fn start_aks_client_job(
         table: table.to_owned(),
         process: ClientProcess::Aks { job_name },
     })
+}
+
+fn render_aks_client_args(config: &OatConfig, args: &[String]) -> Result<Vec<String>> {
+    let mut rendered = Vec::with_capacity(args.len() + 4);
+    let mut input = args.iter();
+    while let Some(arg) = input.next() {
+        if matches!(arg.as_str(), "--streams-per-worker" | "--concurrency") {
+            input.next().with_context(|| format!("{arg} requires a value"))?;
+        } else if !arg.starts_with("--streams-per-worker=") && !arg.starts_with("--concurrency=") {
+            rendered.push(arg.clone());
+        }
+    }
+    if let Some(streams) = config.tunables.client.as_ref().and_then(|client| client.streams_per_worker) {
+        rendered.extend(["--streams-per-worker".to_owned(), streams.to_string()]);
+    }
+    if let Some(concurrency) = config.dmv_concurrency {
+        rendered.extend(["--concurrency".to_owned(), concurrency.to_string()]);
+    }
+    Ok(rendered)
 }
 
 struct AksClientJobSpec<'a> {
@@ -3951,6 +3991,7 @@ async fn run_isolated_cell(
             aks_cleanup_confirmed,
         };
     }
+    let failed_before_teardown = result.is_err();
     let mut outcome = finish_matrix_cell(
         &config,
         orchestration_id,
@@ -3960,6 +4001,15 @@ async fn run_isolated_cell(
         result,
         cleanup,
     );
+    if failed_before_teardown
+        && let Some((logs, baseline)) = &stopped_logs
+        && let Err(error) = attach_stopped_commit_evidence(&config, &mut outcome.rows, logs, baseline)
+    {
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("capture stopped collector commits: {error:#}")),
+            None => error,
+        });
+    }
     if let Err(error) = attach_collector_teardown_failures(
         &mut outcome.rows,
         stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()),
@@ -4674,6 +4724,8 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             router_yaml: None,
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
         })),
     }
 }
@@ -14344,10 +14396,11 @@ async fn stop_aks_deployment_for_cleanup(
     deployment_name: &str,
     role: ComponentRole,
     grace_seconds: u64,
+    collector_logs: &mut Vec<ProcessLog>,
 ) -> Result<Value> {
     timed_aks_cleanup_step(
         &format!("stop AKS Deployment {deployment_name}"),
-        stop_aks_deployment_until_stopped(config, deployment_name, role, grace_seconds),
+        stop_aks_deployment_until_stopped(config, deployment_name, role, grace_seconds, collector_logs),
     )
     .await
 }
@@ -14372,6 +14425,7 @@ async fn stop_aks_deployment_until_stopped(
     deployment_name: &str,
     role: ComponentRole,
     grace_seconds: u64,
+    collector_logs: &mut Vec<ProcessLog>,
 ) -> Result<Value> {
     let output = kubectl(
         config,
@@ -14411,7 +14465,11 @@ async fn stop_aks_deployment_until_stopped(
     let initial_pods = aks_pods_by_selector(config, &selector).await?;
     let mut followers = Vec::new();
     let mut terminated = HashMap::<String, Value>::new();
-    for pod in initial_pods["items"].as_array().into_iter().flatten() {
+    let mut identities = BTreeSet::new();
+    for pod in initial_pods["items"]
+        .as_array()
+        .context("run-owned pod list is missing")?
+    {
         let pod_name = pod
             .pointer("/metadata/name")
             .and_then(Value::as_str)
@@ -14438,6 +14496,9 @@ async fn stop_aks_deployment_until_stopped(
             let pod_name = pod_name.to_owned();
             let container = container.to_owned();
             let instance_id = format!("{pod_name}/{container}");
+            if !identities.insert(instance_id.clone()) {
+                bail!("duplicate run-owned shutdown process identity: {instance_id}");
+            }
             if let Some(state) = status.pointer("/state/terminated") {
                 terminated.insert(instance_id.clone(), state.clone());
             }
@@ -14479,88 +14540,130 @@ async fn stop_aks_deployment_until_stopped(
                     text,
                 })
             });
-            followers.push((pod_name, container, status.pointer("/state/running").is_some(), task));
+            followers.push((
+                pod_name,
+                container,
+                status.pointer("/state/running").is_some(),
+                ShutdownLogFollower(task),
+            ));
         }
+    }
+    if role == ComponentRole::Collector
+        && let Some(expected) = deployment.pointer("/spec/replicas").and_then(Value::as_u64)
+        && expected > 0
+        && u64::try_from(followers.len())? != expected
+    {
+        bail!("collector shutdown process identities do not match deployment replicas");
     }
     let sigterm_at_unix_ms = (role == ComponentRole::Collector)
         .then(|| u64::try_from(unix_time_ms()).ok())
         .flatten();
-    kubectl(
-        config,
-        vec![
-            "scale",
-            "deployment",
-            deployment_name,
-            "--replicas=0",
-            "--namespace",
-            &config.namespace,
-        ],
-        None,
-    )
-    .await
-    .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
-    loop {
-        let pods = aks_pods_by_selector(config, &selector).await?;
-        for pod in pods["items"].as_array().into_iter().flatten() {
-            let pod_name = pod
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .context("run-owned pod has no name")?;
-            for status in pod
-                .pointer("/status/containerStatuses")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(state) = status.pointer("/state/terminated") {
-                    let container = status
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .context("terminated container has no name")?;
-                    terminated.insert(format!("{pod_name}/{container}"), state.clone());
+    let stopped: Result<()> = async {
+        kubectl(
+            config,
+            vec![
+                "scale",
+                "deployment",
+                deployment_name,
+                "--replicas=0",
+                "--namespace",
+                &config.namespace,
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
+        loop {
+            let pods = aks_pods_by_selector(config, &selector).await?;
+            for pod in pods["items"].as_array().into_iter().flatten() {
+                let pod_name = pod
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .context("run-owned pod has no name")?;
+                for status in pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(state) = status.pointer("/state/terminated") {
+                        let container = status
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .context("terminated container has no name")?;
+                        terminated.insert(format!("{pod_name}/{container}"), state.clone());
+                    }
                 }
             }
+            let current: Value = serde_json::from_str(
+                &kubectl(
+                    config,
+                    vec![
+                        "get",
+                        "deployment",
+                        deployment_name,
+                        "--namespace",
+                        &config.namespace,
+                        "-o",
+                        "json",
+                    ],
+                    None,
+                )
+                .await?,
+            )?;
+            let desired = current.pointer("/spec/replicas").and_then(Value::as_u64).unwrap_or(1);
+            let replicas = current.pointer("/status/replicas").and_then(Value::as_u64).unwrap_or(0);
+            let observed = rollout_generation_observed(&current);
+            let no_pods = pods["items"].as_array().is_some_and(Vec::is_empty);
+            if desired == 0 && replicas == 0 && observed && no_pods {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("run-owned deployment {deployment_name} did not stop within its bounded grace period");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let current: Value = serde_json::from_str(
-            &kubectl(
-                config,
-                vec![
-                    "get",
-                    "deployment",
-                    deployment_name,
-                    "--namespace",
-                    &config.namespace,
-                    "-o",
-                    "json",
-                ],
-                None,
-            )
-            .await?,
-        )?;
-        let desired = current.pointer("/spec/replicas").and_then(Value::as_u64).unwrap_or(1);
-        let replicas = current.pointer("/status/replicas").and_then(Value::as_u64).unwrap_or(0);
-        let observed = rollout_generation_observed(&current);
-        let no_pods = pods["items"].as_array().is_some_and(Vec::is_empty);
-        if desired == 0 && replicas == 0 && observed && no_pods {
-            break;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = stopped {
+        for (_, _, _, mut task) in followers {
+            if task.0.is_finished()
+                && let Ok(Ok(mut log)) = (&mut task.0).await
+                && role == ComponentRole::Collector
+            {
+                log.complete = false;
+                retain_aks_collector_log(collector_logs, log)?;
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("run-owned deployment {deployment_name} did not stop within its bounded grace period");
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        return Err(error);
     }
     let mut processes = Vec::new();
     let mut outcome_failures = Vec::new();
+    let log_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     for (pod_name, container, was_running, mut task) in followers {
         let instance_id = format!("{pod_name}/{container}");
-        let log = match tokio::time::timeout(Duration::from_secs(30), &mut task).await {
+        let log = match tokio::time::timeout_at(log_deadline, &mut task.0).await {
             Ok(Ok(Ok(log))) => Some(log),
             _ => {
-                task.abort();
+                task.0.abort();
                 None
             }
         };
+        if role == ComponentRole::Collector {
+            match &log {
+                Some(log) => {
+                    if !log.complete {
+                        outcome_failures.push(format!("{instance_id}: collector shutdown log is incomplete"));
+                    }
+                    if let Err(error) = retain_aks_collector_log(collector_logs, log.clone()) {
+                        outcome_failures.push(format!("{instance_id}: {error:#}"));
+                    }
+                }
+                None => outcome_failures.push(format!("{instance_id}: collector shutdown log is unavailable")),
+            }
+        }
         let terminated_state = terminated.get(&instance_id);
         let exit_code = terminated_state
             .and_then(|state| state.get("exitCode"))
@@ -14568,7 +14671,7 @@ async fn stop_aks_deployment_until_stopped(
         let finished_at = terminated_state
             .and_then(|state| state.get("finishedAt"))
             .and_then(Value::as_str);
-        let outcome = shutdown_exit_outcome(
+        let outcome = aks_shutdown_exit_outcome(
             role,
             was_running,
             exit_code,
@@ -14584,14 +14687,25 @@ async fn stop_aks_deployment_until_stopped(
                 json!({"status": "failed", "exit_code": exit_code})
             }
         };
+        if role == ComponentRole::Collector && exit_evidence["status"] == "unavailable" {
+            let reason = exit_evidence["reason"].as_str().unwrap_or("collector_exit_unavailable");
+            outcome_failures.push(format!("{instance_id}: {reason}"));
+        }
         let process_evidence = match (role, log.as_ref()) {
-            (ComponentRole::Collector, Some(log)) => collector_shutdown_drain_evidence(
-                log,
-                was_running.then_some(sigterm_at_unix_ms).flatten(),
-                finished_at,
-                exit_code,
-                config.tunables.wal.is_some(),
-            ),
+            (ComponentRole::Collector, Some(log)) => {
+                let mut evidence = collector_shutdown_drain_evidence(
+                    log,
+                    was_running.then_some(sigterm_at_unix_ms).flatten(),
+                    finished_at,
+                    exit_code,
+                    config.tunables.wal.is_some(),
+                );
+                if exit_code == Some(143) {
+                    evidence["status"] = json!("unavailable");
+                    evidence["unavailable_reason"] = json!("drain_complete_and_exact_delta_reconciliation_unverified");
+                }
+                evidence
+            }
             (ComponentRole::Collector, None) => json!({
                 "status": "unavailable", "unavailable_reason": "collector_shutdown_log_stream_unavailable",
                 "sigterm_sent": was_running, "sigterm_to_exit_seconds": null,
@@ -14628,6 +14742,7 @@ async fn stop_aks_deployment_until_stopped(
             "exit_outcome": exit_evidence,
             "finished_at": finished_at,
             "log_complete": log.as_ref().is_some_and(|log| log.complete),
+            "log_continuity": if role == ComponentRole::Collector { "unverified" } else { "not_assessed" },
             "drain": (role == ComponentRole::Collector).then_some(process_evidence.clone()),
             "operation_outcomes": (role == ComponentRole::Maintenance).then_some(process_evidence),
         }));
@@ -14681,20 +14796,50 @@ fn shutdown_exit_outcome(
     }))
 }
 
-async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
+fn aks_shutdown_exit_outcome(
+    role: ComponentRole,
+    was_running: bool,
+    exit_code: Option<i64>,
+    oom_killed: bool,
+) -> Result<Value> {
+    let outcome = shutdown_exit_outcome(role, was_running, exit_code, oom_killed)?;
+    if role == ComponentRole::Collector && exit_code == Some(143) {
+        return Ok(json!({"status": "unavailable", "exit_code": 143,
+            "reason": "drain_complete_and_exact_delta_reconciliation_unverified"}));
+    }
+    if role == ComponentRole::Collector && exit_code.is_none() {
+        return Ok(json!({"status": "unavailable", "exit_code": null, "reason": "collector_exit_not_observed"}));
+    }
+    Ok(outcome)
+}
+
+async fn stop_aks_workloads_in_order(config: &OatConfig, collector_logs: &mut Vec<ProcessLog>) -> Result<Value> {
     let mut ingress = Vec::new();
     let mut maintenance = Vec::new();
     let mut collectors = Vec::new();
     if config.arrowcol_deployment != config.dfe_deployment {
         ingress.push(
-            stop_aks_deployment_for_cleanup(config, &config.arrowcol_deployment, ComponentRole::Router, 60).await?,
+            stop_aks_deployment_for_cleanup(
+                config,
+                &config.arrowcol_deployment,
+                ComponentRole::Router,
+                60,
+                collector_logs,
+            )
+            .await?,
         );
     }
     if maintenance_enabled(config) {
         let grace_seconds = config.maintenance_stop_budget()?.maintenance_grace_seconds;
         maintenance.push(
-            stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, grace_seconds)
-                .await?,
+            stop_aks_deployment_for_cleanup(
+                config,
+                "delta-maintenance",
+                ComponentRole::Maintenance,
+                grace_seconds,
+                collector_logs,
+            )
+            .await?,
         );
     }
     collectors.push(
@@ -14703,6 +14848,7 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
             &config.dfe_deployment,
             ComponentRole::Collector,
             config.collector_stop_grace_seconds,
+            collector_logs,
         )
         .await?,
     );
@@ -14716,6 +14862,48 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
         "maintenance": maintenance,
         "collectors": collectors,
     }))
+}
+
+fn retain_aks_collector_log(logs: &mut Vec<ProcessLog>, log: ProcessLog) -> Result<()> {
+    if log.role != ComponentRole::Collector
+        || log.instance_id.is_empty()
+        || logs.iter().any(|retained| retained.instance_id == log.instance_id)
+    {
+        bail!("invalid or duplicate collector process identity");
+    }
+    logs.push(log);
+    Ok(())
+}
+
+async fn retain_aks_shutdown_logs_after_stop(
+    stopped: Result<Value>,
+    logs: &mut Vec<ProcessLog>,
+    fallback: impl std::future::Future<Output = Result<Vec<ProcessLog>>>,
+) -> Result<Value> {
+    match stopped {
+        Ok(evidence) => Ok(evidence),
+        Err(error) => {
+            let snapshots = match fallback.await {
+                Ok(snapshots) => snapshots,
+                Err(capture_error) => {
+                    return Err(error.context(format!(
+                        "capture collector logs after unsuccessful AKS stop: {capture_error:#}"
+                    )));
+                }
+            };
+            let mut observed = BTreeSet::new();
+            for mut log in snapshots {
+                if log.role != ComponentRole::Collector || !observed.insert(log.instance_id.clone()) {
+                    bail!("invalid or duplicate collector identity in unsuccessful-stop log snapshot");
+                }
+                if !logs.iter().any(|retained| retained.instance_id == log.instance_id) {
+                    log.complete = false;
+                    retain_aks_collector_log(logs, log)?;
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 fn require_aks_cleanup_confirmation(platform: &AksPlatform) -> Result<()> {
@@ -14782,6 +14970,15 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     NamespaceCleanupAction::Delete => {
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
+                        let mut collector_logs = Vec::new();
+                        let stopped = stop_aks_workloads_in_order(config, &mut collector_logs).await;
+                        let stopped = retain_aks_shutdown_logs_after_stop(
+                            stopped,
+                            &mut collector_logs,
+                            aks_process_logs_for_role(config, Some(ComponentRole::Collector)),
+                        )
+                        .await;
+                        platform.stopped_collector_logs = Some(collector_logs);
                         let cleanup = async {
                             timed_aks_cleanup_step(
                                 "delete run-owned AKS namespace",
@@ -14806,7 +15003,7 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             .await
                             .context("write exact-run workload stop receipt")
                         };
-                        match stop_then_destroy(stop_aks_workloads_in_order(config), cleanup).await {
+                        match stop_then_destroy(async { stopped }, cleanup).await {
                             Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
                             Err(error) => failures.push(format!("ordered AKS shutdown/cleanup failed: {error:#}")),
                         }
@@ -16973,6 +17170,45 @@ mod tests {
     }
 
     #[test]
+    fn aks_client_job_renders_configured_streams_and_concurrency() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for (streams, concurrency, expected) in [
+            (Some(7), None, vec!["--endpoint", "http://router", "--streams-per-worker", "7"]),
+            (Some(0), Some(9), vec!["--endpoint", "http://router", "--streams-per-worker", "0", "--concurrency", "9"]),
+            (None, None, vec!["--endpoint", "http://router"]),
+        ] {
+            config.tunables.client = streams.map(|streams_per_worker| arrowcol_tunables::ClientTunables {
+                streams_per_worker: Some(streams_per_worker),
+                ..Default::default()
+            });
+            config.dmv_concurrency = concurrency;
+            config.validate()?;
+            let incoming = ["--endpoint", "http://router", "--streams-per-worker", "2", "--concurrency=2"]
+                .map(str::to_owned);
+            let args = render_aks_client_args(&config, &incoming)?;
+            let job = build_aks_client_job(AksClientJobSpec {
+                namespace: "oat-test",
+                client_image: "example.invalid/client@sha256:abc",
+                router_auth_secret_name: "arrowcol-router-auth",
+                schedule_configmap_name: "oat-test-schedule",
+                run_id: "00000000-0000-0000-0000-000000000001",
+                run_label: "00000000",
+                job_name: "oat-test",
+                args: &args,
+                run_seconds: 3600,
+                stop_grace_seconds: 45,
+            });
+            assert_eq!(job["spec"]["template"]["spec"]["containers"][0]["args"], json!(expected));
+        }
+        config.dmv_concurrency = Some(2);
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables { streams_per_worker: Some(7), ..Default::default() });
+        assert!(config.validate().unwrap_err().to_string().contains("dmv_concurrency"));
+        Ok(())
+    }
+
+    #[test]
     fn aks_client_job_mounts_internal_identity_key_for_direct_catalog_ddl() -> Result<()> {
         let job = build_aks_client_job(AksClientJobSpec {
             namespace: "oat-test",
@@ -18407,6 +18643,8 @@ mod tests {
             router_yaml: None,
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
         };
         platform.run_table_initialization_attempted = true;
         assert!(require_aks_cleanup_confirmation(&platform).is_err());
@@ -18423,25 +18661,40 @@ mod tests {
         assert!(error.contains("fixture deployment stop failed"));
         assert!(error.contains("run-owned QAP cleanup was not positively confirmed"));
         assert!(error.contains("retaining owned resources"));
+        let (fallback_logs, _) = platform
+            .stopped_commit_logs()
+            .context("missing early-failure log snapshot")?;
+        assert_eq!(fallback_logs.len(), 1);
+        assert_eq!(fallback_logs[0].instance_id, "fixture-pod/dataflow");
+        assert!(!fallback_logs[0].complete);
         assert!(platform.namespace_created);
         assert!(fixture.join("namespace.json").exists(), "namespace must be retained");
         assert!(!fixture.join("delete-options.json").exists());
         assert!(!runtime.join("workload-stop-receipt.json").exists());
 
         fs::write(fixture.join("mode"), "absent_deployment")?;
-        let missing = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
+        let mut aks_logs = Vec::new();
+        let missing =
+            stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30, &mut aks_logs).await?;
         assert_eq!(missing["status"], "nothing_to_stop");
+        if fixture.join("pods-read").exists() {
+            fs::remove_file(fixture.join("pods-read"))?;
+        }
         fs::write(fixture.join("mode"), "exit_137")?;
-        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30)
+        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30, &mut aks_logs)
             .await
             .err()
             .context("AKS exit 137 must fail")?;
         assert!(format!("{error:#}").contains("forcibly stopped (137)"));
         fs::remove_file(fixture.join("pods-read"))?;
         fs::write(fixture.join("mode"), "missing_exit")?;
-        let evidence = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
-        assert_eq!(evidence["processes"][0]["exit_outcome"]["status"], "unavailable");
-        assert_eq!(evidence["processes"][0]["drain"]["exit_code"], Value::Null);
+        aks_logs.clear();
+        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30, &mut aks_logs)
+            .await
+            .err()
+            .context("unobserved AKS collector exit must fail")?;
+        assert!(format!("{error:#}").contains("collector_exit_not_observed"));
+        assert_eq!(aks_logs[0].instance_id, "fixture-pod/dataflow");
         fs::write(fixture.join("mode"), "rollout_recovers")?;
         config.aks_rollout_timeout_seconds = 30;
         rollout(&config, "fixture").await?;
@@ -18528,9 +18781,114 @@ mod tests {
         }
         assert!(shutdown_exit_outcome(ComponentRole::Collector, true, Some(1), false).is_err());
         assert_eq!(
+            aks_shutdown_exit_outcome(ComponentRole::Collector, true, Some(143), false)?["reason"],
+            "drain_complete_and_exact_delta_reconciliation_unverified",
+        );
+        assert_eq!(
+            aks_shutdown_exit_outcome(ComponentRole::Collector, true, None, false)?["reason"],
+            "collector_exit_not_observed",
+        );
+        assert_eq!(
             shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["classification"],
             "requires_operation_records",
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aks_shutdown_retains_distinct_collectors_and_uses_fallback_on_early_failure() -> Result<()> {
+        let log = |instance: &str| ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: instance.to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: 10,
+            raw_log_lines: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            text: String::new(),
+        };
+        let mut logs = Vec::new();
+        retain_aks_collector_log(&mut logs, log("pod-a/dataflow"))?;
+        retain_aks_collector_log(&mut logs, log("pod-b/dataflow"))?;
+        assert!(retain_aks_collector_log(&mut logs, log("pod-a/dataflow")).is_err());
+        let called = std::cell::Cell::new(false);
+        let evidence = retain_aks_shutdown_logs_after_stop(Ok(json!({"status":"stopped"})), &mut logs, async {
+            called.set(true);
+            Ok(Vec::new())
+        })
+        .await?;
+        assert_eq!(evidence["status"], "stopped");
+        assert!(!called.get());
+        assert_eq!(logs.len(), 2);
+
+        let mut logs = vec![log("pod-a/dataflow")];
+        let error = retain_aks_shutdown_logs_after_stop(Err(anyhow::anyhow!("stop failed")), &mut logs, async {
+            Ok(vec![log("pod-a/dataflow"), log("pod-b/dataflow")])
+        })
+        .await
+        .expect_err("the original stop failure must remain visible");
+        assert!(format!("{error:#}").contains("stop failed"));
+        assert_eq!(
+            logs.iter().map(|log| log.instance_id.as_str()).collect::<Vec<_>>(),
+            ["pod-a/dataflow", "pod-b/dataflow"]
+        );
+        assert!(logs[0].complete);
+        assert!(!logs[1].complete);
+
+        let error = retain_aks_shutdown_logs_after_stop(Err(anyhow::anyhow!("stop failed")), &mut Vec::new(), async {
+            Err(anyhow::anyhow!("snapshot failed"))
+        })
+        .await
+        .expect_err("capture failures must remain visible");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("stop failed"));
+        assert!(detail.contains("snapshot failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn aks_retained_collector_log_does_not_publish_unknown_secret_fields() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let text = concat!(
+            "arrowcol_effective_config {\"component\":\"receiver\",\"config\":{},\"unknown_secret\":\"fake-secret-123\"}\n",
+            "{\"unrecognized\":\"fake-secret-123\"}\n",
+        );
+        let text = filter_process_evidence_text(text)?;
+        assert!(text.contains("fake-secret-123"));
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "pod-a/dataflow".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: 2,
+            stdout: text.to_owned(),
+            stderr: String::new(),
+            text: text.to_owned(),
+        };
+        let mut row = sample_result("fixture", "sqlserver_wait_stats", 0);
+        row.evidence_json = Some(
+            json!({
+                "backlog": {"measurement_window": {"start_unix_ms": 1, "end_unix_ms": 2}}
+            })
+            .to_string(),
+        );
+        attach_stopped_commit_evidence(&config, std::slice::from_mut(&mut row), std::slice::from_ref(&log), &[])?;
+        assert!(
+            !row.evidence_json
+                .as_deref()
+                .context("missing evidence")?
+                .contains("fake-secret-123")
+        );
+        let drain = collector_shutdown_drain_evidence(&log, None, None, None, false);
+        assert!(!drain.to_string().contains("fake-secret-123"));
         Ok(())
     }
 

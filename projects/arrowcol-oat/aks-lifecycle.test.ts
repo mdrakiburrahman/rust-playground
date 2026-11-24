@@ -56,7 +56,10 @@ async function fixture(t: TestContext, deployment = false) {
   const effectCalls: ExternalEffect[] = [];
   let fault: 'none' | 'patch_unknown' | 'completion_unknown' = 'none', patched = false, patchCount = 0, wrongUid = false;
   let onPatch: (() => void) | undefined, onIntent: (() => void) | undefined;
-  let podShape: 'regular' | 'init_sidecar' | 'missing' | 'ephemeral' | 'terminal_auxiliary' = 'regular';
+  let podShape: 'regular' | 'init_sidecar' | 'missing' | 'ephemeral' | 'terminal_auxiliary' | 'gone' = 'regular';
+  let restartCount = 0;
+  let logText = 'secret=must-not-be-persisted\n2026-01-01T00:00:00Z {"rows":9,"token":"must-not-be-persisted"}\n' +
+    '2026-01-01T00:00:01Z arrowcol_shutdown {"event":"drain_complete"}\n';
   const timeouts: number[] = [];
   t.mock.method(azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
     const [method, container, name = '', , body, headers] = args;
@@ -90,7 +93,8 @@ async function fixture(t: TestContext, deployment = false) {
     timeouts.push(timeout ?? -1);
     if (args.includes('patch')) {
       patchCount++;
-      assert.equal(JSON.parse([...blobs.values()][0]!.bytes.toString()).phase, 'intent', 'durable intent must precede PATCH');
+      assert.ok([...blobs.values()].some(blob => JSON.parse(blob.bytes.toString()).phase === 'intent'),
+        'durable intent must precede PATCH');
       const patch = JSON.parse(args[args.indexOf('--patch') + 1]!);
       assert.deepEqual(patch.slice(0, 2), [{ op: 'test', path: '/metadata/uid', value: workloadUid },
         { op: 'test', path: '/metadata/resourceVersion', value: '1' }]);
@@ -99,8 +103,7 @@ async function fixture(t: TestContext, deployment = false) {
       if (fault === 'patch_unknown') throw new Error('Lost PATCH response');
       return { returncode: 0, stdout: JSON.stringify(job()), stderr: '' };
     }
-    if (args.includes('logs')) return { returncode: 0,
-      stdout: 'secret=must-not-be-persisted\n2026-01-01T00:00:00Z {"rows":9,"token":"must-not-be-persisted"}\n', stderr: '' };
+    if (args.includes('logs')) return { returncode: 0, stdout: logText, stderr: '' };
     const kind = args[args.indexOf('get') + 1];
     let response: unknown;
     if (kind === 'namespace') response = { apiVersion: 'v1', kind: 'Namespace', metadata: metadata(namespace, cellId) };
@@ -109,29 +112,29 @@ async function fixture(t: TestContext, deployment = false) {
       metadata: { uid: campaignId, ownerReferences: [{ uid: workloadUid, kind: 'Deployment', controller: true }] },
     }] };
     else if (kind === 'horizontalpodautoscalers.autoscaling') response = { kind: 'HorizontalPodAutoscalerList', metadata: { resourceVersion: '1' }, items: [] };
-    else if (kind === 'pods') response = { kind: 'PodList', metadata: { resourceVersion: '1' }, items: [{
+    else if (kind === 'pods') response = { kind: 'PodList', metadata: { resourceVersion: '1' }, items: podShape === 'gone' ? [] : [{
       apiVersion: 'v1', kind: 'Pod', metadata: { ...metadata('maintenance-pod', ownerId),
         ownerReferences: [{ uid: deployment ? campaignId : workloadUid, kind: deployment ? 'ReplicaSet' : 'Job', controller: true }] },
       spec: { containers: [{ name: 'main' }, ...(podShape === 'missing' ? [{ name: 'unobserved-writer' }] : [])],
         ...(['init_sidecar', 'terminal_auxiliary'].includes(podShape) ? { initContainers: [{ name: 'sidecar', restartPolicy: 'Always' }] } : {}),
         ...(['ephemeral', 'terminal_auxiliary'].includes(podShape) ? { ephemeralContainers: [{ name: 'debug-writer' }] } : {}) },
-      status: { containerStatuses: [{ name: 'main', state: patched ? { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } : { running: {} } }],
-        ...(podShape === 'init_sidecar' ? { initContainerStatuses: [{ name: 'sidecar', state: { running: {} } }] } : {}),
-        ...(podShape === 'ephemeral' ? { ephemeralContainerStatuses: [{ name: 'debug-writer', state: { running: {} } }] } : {}),
+      status: { containerStatuses: [{ name: 'main', restartCount, state: patched ? { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } : { running: {} } }],
+        ...(podShape === 'init_sidecar' ? { initContainerStatuses: [{ name: 'sidecar', restartCount: 0, state: { running: {} } }] } : {}),
+        ...(podShape === 'ephemeral' ? { ephemeralContainerStatuses: [{ name: 'debug-writer', restartCount: 0, state: { running: {} } }] } : {}),
         ...(podShape === 'terminal_auxiliary' ? {
-          initContainerStatuses: [{ name: 'sidecar', state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
-          ephemeralContainerStatuses: [{ name: 'debug-writer', state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
+          initContainerStatuses: [{ name: 'sidecar', restartCount: 0, state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
+          ephemeralContainerStatuses: [{ name: 'debug-writer', restartCount: 0, state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
         } : {}) },
     }] };
     else throw new Error('Unexpected mock kubectl command: ' + args.join(' '));
     return { returncode: 0, stdout: JSON.stringify(response), stderr: '' };
   });
-  const controller = async () => {
+  const controller = async (originalDeadline?: number) => {
     const now = Date.now();
     inventory.load_admission = 'not_authorized';
     inventory.resources[0]!.role = 'collector';
     inventory.cleanup.stop_admission = { ...step, state: 'complete' };
-    inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: now - 1000, reason_code: null };
+    inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: originalDeadline ?? now - 1000, reason_code: null };
     inventory.cleanup.stop_maintenance = { ...step, state: 'complete' };
     inventory.cleanup.evidence_capture = { ...step, state: 'complete' };
     inventory.cleanup.terminal_capture = { state: 'running', deadline_unix_ms: now + 120_000, reason_code: null };
@@ -150,6 +153,8 @@ async function fixture(t: TestContext, deployment = false) {
     onPatch: (value: () => void) => { onPatch = value; }, onIntent: (value: () => void) => { onIntent = value; },
     alreadyStopped: () => { patched = true; }, touchVersion: () => { revision++; },
     setPodShape: (value: typeof podShape) => { podShape = value; },
+    setRestartCount: (value: number) => { restartCount = value; },
+    setLogText: (value: string) => { logText = value; },
     fence: () => { state.fencingToken++; }, get state() { return state; },
     get patchCount() { return patchCount; }, setFault: (value: typeof fault) => { fault = value; }, wrongUid: () => { wrongUid = true; } };
 }
@@ -181,8 +186,68 @@ test('default lifecycle confirms exact Job suspension, physical stop and sanitiz
   assert.equal(JSON.parse(journal).terminal_pods[0].containers[0].exit_code, 0);
   assert.ok(!journal.includes('must-not-be-persisted'));
   assert.ok(JSON.parse(journal).logs.some((value: { numeric_samples: unknown[] }) => value.numeric_samples.length === 1));
+  assert.ok(JSON.parse(journal).logs.some((value: { drain_complete_marker: boolean }) => value.drain_complete_marker));
   assert.equal(await f.actions.recoverLifecycle!('stop_maintenance', f.inventory, f.inventory.cleanup.stop_maintenance.deadline_unix_ms, 'key', f.authority), 'complete');
   assert.equal(f.patchCount, 1, 'confirmed recovery must never PATCH again');
+});
+test('drain marker proof rejects lookalikes and extra secret-bearing fields', async t => {
+  const f = await fixture(t);
+  f.setLogText('2026-01-01T00:00:01Z arrowcol_shutdown {"event":"drain_complete","secret":"must-not-be-persisted"}\n' +
+    '2026-01-01T00:00:01Z fake-arrowcol_shutdown {"event":"drain_complete"}\n');
+  assert.equal(await f.actions.stopMaintenanceIfUidAndOwnerMatch(f.inventory.resources[0]!, ownerId, 'key', f.authority), 'complete');
+  const journal = [...f.blobs.values()][0]!.bytes.toString();
+  assert.ok(JSON.parse(journal).logs.every((value: { drain_complete_marker: boolean }) => !value.drain_complete_marker));
+  assert.ok(!journal.includes('must-not-be-persisted'));
+});
+test('collector evidence is persisted before drain scales down the deployment', async t => {
+  const f = await fixture(t, true);
+  f.inventory.resources[0]!.role = 'collector';
+  f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: Date.now() + 120_000, reason_code: null };
+  let evidenceBeforePatch = false;
+  f.onPatch(() => {
+    evidenceBeforePatch = [...f.blobs.values()].some(blob => {
+      const value = JSON.parse(blob.bytes.toString());
+      return value.field === 'pre_stop_capture' && value.workloads?.length === 1;
+    });
+  });
+  assert.equal(await f.actions.boundedDrain(f.inventory, f.inventory.cleanup.bounded_drain.deadline_unix_ms!, 'key', f.authority), 'complete');
+  assert.equal(evidenceBeforePatch, true);
+  assert.equal(f.patchCount, 1);
+  const evidence = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
+    .find(value => value.field === 'pre_stop_capture');
+  assert.equal(evidence.workloads[0].current_logs[0].phase, 'evidence');
+  assert.ok(!JSON.stringify(evidence).includes('must-not-be-persisted'));
+  assert.equal(await f.actions.preserveEvidence(f.inventory, 'key', f.authority), 'complete');
+  const postStop = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
+    .find(value => value.field === 'evidence_capture');
+  assert.equal(postStop.workloads[0].original_stop.phase, 'complete');
+});
+test('a collector pod lost before terminal sampling makes log custody incomplete', async t => {
+  const f = await fixture(t, true);
+  f.inventory.resources[0]!.role = 'collector';
+  const deadline = Date.now() + 100;
+  f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
+  f.onPatch(() => f.setPodShape('gone'));
+  assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), 'pending');
+  const current = await f.controller(deadline);
+  assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
+  const evidence = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
+    .find(value => value.field === 'terminal_capture' && Array.isArray(value.workloads));
+  assert.equal(evidence.workloads[0].terminal_samples[0].terminal_sample, 'pod_gone');
+  assert.equal(evidence.workloads[0].log_custody, 'incomplete');
+  assert.equal(evidence.workloads[0].log_metrics, 'provisional');
+});
+test('restart captures previous container logs before stopping the workload', async t => {
+  const f = await fixture(t);
+  f.setRestartCount(1);
+  assert.equal(await f.actions.stopMaintenanceIfUidAndOwnerMatch(f.inventory.resources[0]!, ownerId, 'key', f.authority), 'complete');
+  const requests = f.effectCalls.filter(value => value.transport === 'process');
+  const previous = requests.findIndex(value => value.method === 'KUBECTL_LOGS' && value.path.includes('--previous'));
+  const patch = requests.findIndex(value => value.method === 'KUBECTL_PATCH');
+  assert.ok(previous >= 0 && previous < patch);
+  const journal = [...f.blobs.values()][0]!.bytes.toString();
+  assert.ok(JSON.parse(journal).logs.some((value: { phase: string }) => value.phase === 'previous'));
+  assert.ok(!journal.includes('must-not-be-persisted'));
 });
 test('default cell terminal capture preserves the active producer path when the scale journal is empty', async t => {
   const f = await fixture(t);

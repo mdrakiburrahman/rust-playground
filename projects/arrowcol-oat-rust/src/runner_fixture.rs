@@ -592,6 +592,8 @@ fn fixture_platform(input: &FixtureSetupInput) -> AksPlatform {
             stamp_config_path: input.stamp_config_path.clone(),
             bootstrap_env_file: input.bootstrap_env_file.clone(),
         }),
+        maintenance_cell_baseline: Vec::new(),
+        stopped_collector_logs: None,
     }
 }
 

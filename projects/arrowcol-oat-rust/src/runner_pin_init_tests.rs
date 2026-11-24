@@ -75,6 +75,8 @@ mod pin_init_tests {
             router_yaml: Some(serde_yaml::to_string(&router)?),
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
         };
         Ok((config, platform, runtime))
     }
