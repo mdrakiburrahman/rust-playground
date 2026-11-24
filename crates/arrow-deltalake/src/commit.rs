@@ -17,10 +17,34 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+/// When a partially filled batch is committed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitTrigger {
+    /// Wait up to `batch_window` for more files unless forced or full.
+    #[default]
+    Window,
+    /// Commit everything already queued as soon as the worker is idle.
+    Eager,
+}
+
+impl<'de> serde::Deserialize<'de> for CommitTrigger {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        match String::deserialize(deserializer).as_deref() {
+            Ok("window") => Ok(Self::Window),
+            Ok("eager") => Ok(Self::Eager),
+            _ => Err(serde::de::Error::custom(
+                "collector.commit.trigger must be window or eager",
+            )),
+        }
+    }
+}
+
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitOptions {
     pub txn_lookup_mode: crate::TxnLookupMode,
+    pub trigger: CommitTrigger,
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
@@ -33,6 +57,7 @@ impl Default for CommitOptions {
             max_files_per_commit: 64,
             max_pending_files: 256,
             txn_lookup_mode: Default::default(),
+            trigger: CommitTrigger::default(),
         }
     }
 }
@@ -913,6 +938,10 @@ fn run_worker(
                         if force || draining.load(Ordering::Acquire) || file_count >= options.max_files_per_commit {
                             publish_batch(&table, &mut batch, &mut failure);
                             deadline = None;
+                        } else if options.trigger == CommitTrigger::Eager && !flushing {
+                            // Group-commit the queued cohort; later arrivals form the next batch.
+                            flushing = true;
+                            flush_remaining = receiver.len();
                         }
                     }
                     None => {
