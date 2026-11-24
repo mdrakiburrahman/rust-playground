@@ -7,7 +7,7 @@ import { assertRunCleanupActor, observeExactKubernetes, type CustodyCommandRunne
 import type { CleanupActionResult, CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { cleanupBudget, CleanupDeadlineExpiredError, withCleanupDeadline } from './aks-cleanup-budget.js';
 import { captureTerminalData } from './aks-data-safety.js';
-import { COLLECTOR_TERMINAL_LOG_MAX_BYTES, collectorStartupObserved, extractTerminalSummary, parseTerminalSummary, type TerminalSummary } from './aks-terminal-evidence.js';
+import { COLLECTOR_TERMINAL_LOG_MAX_BYTES, collectorStartupObserved, extractTerminalSummary, parseTerminalSummary, type TerminalSummaryRecord } from './aks-terminal-evidence.js';
 
 type LifecycleField = 'stop_admission' | 'bounded_drain' | 'evidence_capture' | 'stop_maintenance' | 'terminal_capture';
 export type LifecycleActions = Pick<ExternalCleanupActions, 'stopAdmission' | 'boundedDrain' | 'preserveEvidence' |
@@ -21,7 +21,7 @@ interface LogProof {
   drain_complete_marker?: boolean;
   full_log_read?: boolean;
   restart_count?: number;
-  terminal_summary?: TerminalSummary | null;
+  terminal_summary?: TerminalSummaryRecord | null;
   terminal_summary_status?: 0 | 1 | 2 | 3;
   collector_startup_observed?: boolean;
 }

@@ -537,9 +537,11 @@ test('fenced terminal summary inputs cross-check every version, row, file and by
   const { COLLECTOR_TERMINAL_LOG_MAX_BYTES, terminalTableDigest } = await import('./aks-terminal-evidence.js');
   const f = await shutdownFixture(t, 0), matched = await installMatchedFinalization(t, f);
   f.blobs.delete(matched.receipt.blob);
-  const summary = { schema_version: 1, admitted: 1, committed: 1, failed: 0, cancelled_ambiguous: 0, pending: 0,
+  const summary = { schema_version: 2, admitted: 1, committed: 1, failed: 0, cancelled_ambiguous: 0, pending: 0,
     committed_rows: 7, incomplete: 0, commits: [{ table_id: terminalTableDigest(f.azure.c.account, f.azure.c.data,
-      f.inventory.qap!.bindings[0]!.relative_path), version: 0, rows: 7, files: 1, parquet_bytes: 100 }] };
+      f.inventory.qap!.bindings[0]!.relative_path), version: 0, rows: 7, files: 1, parquet_bytes: 100 }],
+    publication_evidence: [{ clean: true, reasons: [], outcomes: [{ app_id: 'offline-client', app_version: 42,
+      status: 'committed_now', delta_version: 0, reason: null }] }] };
   const log = f.terminal.workloads[0]!.original_stop.logs[0]!;
   const publish = (value: unknown) => {
     Object.assign(log, { full_log_read: true, restart_count: 0, terminal_summary: value, terminal_summary_status: 0,

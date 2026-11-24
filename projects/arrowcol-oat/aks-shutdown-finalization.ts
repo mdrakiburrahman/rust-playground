@@ -184,8 +184,16 @@ async function refs(azure: Azure, inventory: RunInventory, guard: () => Promise<
         const frozen = await readFrozenDeltaCommits(azure, initial, final, guard, deadlineUnixMs);
         const numeric = tuples.map(({ version, rows, files, parquet_bytes }) => ({ version, rows, files, parquet_bytes }))
           .sort((a, b) => a.version - b.version);
+        const publicationVersions = candidates.flatMap(value => value.summary.publication_evidence.flatMap(call =>
+          call.outcomes.flatMap(outcome => outcome.delta_version === null ? [] : [outcome.delta_version])))
+          .sort((a, b) => a - b);
+        const publicationIdentities = candidates.flatMap(value => value.summary.publication_evidence.flatMap(call =>
+          call.outcomes.map(outcome => JSON.stringify([outcome.app_id, outcome.app_version]))));
+        const frozenVersions = frozen.map(value => value.version).sort((a, b) => a - b);
         const rows = candidates.reduce((sum, value) => sum + value.summary.committed_rows, 0);
-        if (canonical_json(numeric) !== canonical_json(frozen) || !Number.isSafeInteger(rows) ||
+        if (canonical_json(numeric) !== canonical_json(frozen) ||
+            new Set(publicationIdentities).size !== publicationIdentities.length ||
+            canonical_json(publicationVersions) !== canonical_json(frozenVersions) || !Number.isSafeInteger(rows) ||
             rows !== final.row_count - (initial.observation === 'table' ? initial.row_count! : 0))
           throw new Error('Terminal summary tuples differ from independently frozen Delta.');
         terminal_summaries = candidates;

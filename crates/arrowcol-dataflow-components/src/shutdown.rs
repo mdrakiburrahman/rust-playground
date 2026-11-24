@@ -453,12 +453,19 @@ impl RoutingShutdown {
         {
             return None;
         }
-        Some(serde_json::json!({
-            "schema_version": 2, "admitted": admitted, "committed": committed,
-            "failed": failed, "cancelled_ambiguous": cancelled_ambiguous, "pending": pending,
-            "committed_rows": committed_rows, "incomplete": u8::from(incomplete), "commits": commits,
-            "publication_evidence": publication_evidence
-        }))
+        Some(terminal_evidence_payload(
+            TerminalEvidenceCounts {
+                admitted,
+                committed,
+                failed,
+                cancelled_ambiguous,
+                pending,
+                committed_rows,
+                incomplete,
+            },
+            &commits,
+            &publication_evidence,
+        ))
     }
 
     pub(crate) fn track_worker(&self, root: PathBuf, retired: Arc<AtomicBool>) -> Result<()> {
@@ -590,6 +597,29 @@ fn terminal_state(clean: bool, failed: bool) -> CollectorState {
     }
 }
 
+struct TerminalEvidenceCounts {
+    admitted: u64,
+    committed: u64,
+    failed: u64,
+    cancelled_ambiguous: u64,
+    pending: u64,
+    committed_rows: u64,
+    incomplete: bool,
+}
+
+fn terminal_evidence_payload(
+    counts: TerminalEvidenceCounts,
+    commits: &[arrow_deltalake::telemetry::TerminalCommit],
+    publication_evidence: &[serde_json::Value],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 2, "admitted": counts.admitted, "committed": counts.committed,
+        "failed": counts.failed, "cancelled_ambiguous": counts.cancelled_ambiguous, "pending": counts.pending,
+        "committed_rows": counts.committed_rows, "incomplete": u8::from(counts.incomplete), "commits": commits,
+        "publication_evidence": publication_evidence
+    })
+}
+
 /// Returns process-lifetime evidence after the terminal shutdown hook, if complete accounting is available.
 #[must_use]
 pub fn terminal_publication_evidence() -> Option<serde_json::Value> {
@@ -614,6 +644,46 @@ pub fn finish_routing_shutdown(clean: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_evidence_v2_wire_fixture_matches_emitter() -> Result<()> {
+        let commits = [arrow_deltalake::telemetry::TerminalCommit {
+            table_id: "a".repeat(64),
+            version: 0,
+            rows: 300,
+            files: 1,
+            parquet_bytes: 900,
+        }];
+        let publication_evidence = [serde_json::json!({
+            "clean": true,
+            "reasons": [],
+            "outcomes": [{
+                "app_id": "offline-client",
+                "app_version": 42,
+                "status": "committed_now",
+                "delta_version": 0,
+                "reason": null
+            }]
+        })];
+        let payload = terminal_evidence_payload(
+            TerminalEvidenceCounts {
+                admitted: 1,
+                committed: 1,
+                failed: 0,
+                cancelled_ambiguous: 0,
+                pending: 0,
+                committed_rows: 300,
+                incomplete: false,
+            },
+            &commits,
+            &publication_evidence,
+        );
+        assert_eq!(
+            serde_json::to_string(&payload)?,
+            include_str!("../tests/fixtures/terminal-evidence-v2.json").trim_end()
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn terminal_evidence_conserves_success_failed_and_cancelled_admissions() -> Result<()> {
