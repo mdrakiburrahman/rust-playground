@@ -1509,6 +1509,12 @@ function comparisonCandidate(afterRate = 100, rates = [110, 111, 109]) {
     for (const window of evidence.durable_commits.complete_30_second_commit_windows) {
       window.rate_resolution_rows_per_second = 0.5;
     }
+    const observed = {
+      durable_rows_per_s: rate, bytes_per_row: 5, window_commit_count: rate * 10,
+      max_commit_rows: 15, rate_resolution_rows_per_second: 0.1, slope_rows_per_second: rate,
+    };
+    evidence.durable_commits.delta_log_reconciliation = { csv: observed };
+    evidence.screen_v1 = structuredClone(observed);
     evidence.projection_only = [];
     evidence.consumer_verified = [
       { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
@@ -1533,7 +1539,12 @@ function comparisonCandidate(afterRate = 100, rates = [110, 111, 109]) {
 
 type MutableEvidence = Record<string, unknown> & {
   reconciliation: Record<string, unknown>;
-  durable_commits: { complete_30_second_commit_windows: Array<Record<string, unknown>>; output_throughput: Record<string, unknown> };
+  durable_commits: {
+    complete_30_second_commit_windows: Array<Record<string, unknown>>;
+    output_throughput: Record<string, unknown>;
+    delta_log_reconciliation: { csv: Record<string, unknown> };
+  };
+  screen_v1: Record<string, unknown>;
   commit_window_output_throughput: Record<string, unknown>;
 };
 
@@ -1606,7 +1617,74 @@ test('preserves exactly reconciled ArrowCol observations when QAP is unavailable
   }
 });
 
+test('reads producer screen evidence and fails closed on unavailable and failed shapes', () => {
+  const screen = {
+    bytes_per_row: 5, commits_written: 3, committed_add_actions: 3, compression_ratio: 2,
+    durable_rows: 60, durable_rows_per_s: 0.5555555555555556,
+    ended_utc: '1970-01-01T00:01:49.000Z', files_written: 3, latency_p50_ms: 1010,
+    latency_p99_ms: 2010, max_commit_rows: 30,
+    rate_resolution_rows_per_second: 0.2777777777777778, slope_rows_per_second: 25,
+    started_utc: '1970-01-01T00:00:01.000Z', window_commit_count: 3,
+  };
+  const candidate = comparisonCandidate();
+  candidate[0]!.committedRowsPerSecond = screen.durable_rows_per_s;
+  updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.output_throughput.window_seconds = 108;
+    evidence.durable_commits.output_throughput.rows_per_second = screen.durable_rows_per_s;
+    evidence.durable_commits.delta_log_reconciliation = { csv: structuredClone(screen) };
+    evidence.screen_v1 = structuredClone(screen);
+  });
+  assert.match(renderCampaignResults(candidate, 'C1'), /resolution 0\.28 rows\/s, commits 3, max commit rows 30, slope 25 rows\/s/);
+
+  const unavailable = {
+    bytes_per_row: null, commits_written: null, committed_add_actions: null, compression_ratio: null,
+    durable_rows: null, durable_rows_per_s: null, ended_utc: null, files_written: null,
+    latency_p50_ms: null, latency_p99_ms: null, max_commit_rows: null,
+    rate_resolution_rows_per_second: null, slope_rows_per_second: null, started_utc: null,
+    window_commit_count: null,
+  };
+  const missing = comparisonCandidate();
+  updateRunEvidence(missing[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation = { csv: structuredClone(unavailable) };
+    evidence.screen_v1 = structuredClone(unavailable);
+  });
+  assert.match(renderCampaignResults(missing, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const failed = comparisonCandidate();
+  updateRunEvidence(failed[0]!.officialRuns[0]!, evidence => {
+    Object.assign(evidence, { screen_v1: null, screen_v1_csv_reason: 'cell_failed' });
+  });
+  assert.match(renderCampaignResults(failed, 'C1'), /screen_v1: cell_failed/);
+});
+
 test('requires resolution and matching A/A for paired comparisons', () => {
+  const legacy = comparisonCandidate();
+  updateRunEvidence(legacy[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation = { csv: {} };
+    evidence.screen_v1 = {};
+  });
+  assert.match(renderCampaignResults(legacy, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const missingRankedResolution = comparisonCandidate();
+  updateRunEvidence(missingRankedResolution[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation.csv.rate_resolution_rows_per_second = null;
+    evidence.screen_v1.rate_resolution_rows_per_second = null;
+  });
+  assert.match(renderCampaignResults(missingRankedResolution, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const mismatchedCopies = comparisonCandidate();
+  updateRunEvidence(mismatchedCopies[0]!.officialRuns[0]!, evidence => {
+    evidence.screen_v1.durable_rows_per_s = 120;
+  });
+  assert.match(renderCampaignResults(mismatchedCopies, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
+  const mismatchedRate = comparisonCandidate();
+  updateRunEvidence(mismatchedRate[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation.csv.durable_rows_per_s = 115;
+    evidence.screen_v1.durable_rows_per_s = 115;
+  });
+  assert.match(renderCampaignResults(mismatchedRate, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
   const candidate = comparisonCandidate();
   assert.match(renderCampaignResults(candidate, 'C1'), /comparison \(3\/3\)/);
   updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
@@ -1615,12 +1693,18 @@ test('requires resolution and matching A/A for paired comparisons', () => {
   assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
   const badResolution = comparisonCandidate();
   updateRunEvidence(badResolution[0]!.baselineBefore, evidence => {
-    evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second = 1.01;
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 152;
+      observed.rate_resolution_rows_per_second = 152 / 150;
+    }
   });
   assert.match(renderCampaignResults(badResolution, 'C1'), /invalid A\/A: commit-rate resolution exceeds 1%/);
   const unresolved = comparisonCandidate();
   updateRunEvidence(unresolved[0]!.officialRuns[0]!, evidence => {
-    evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second = 11;
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 1650;
+      observed.rate_resolution_rows_per_second = 11;
+    }
   });
   assert.match(renderCampaignResults(unresolved, 'C1'), /unresolved: difference is smaller than commit-rate resolution/);
   const drift = renderCampaignResults(comparisonCandidate(106), 'C1');
@@ -1630,7 +1714,10 @@ test('requires resolution and matching A/A for paired comparisons', () => {
   assert.doesNotMatch(renderCampaignResults(comparisonCandidate(105), 'C1'), /invalid A\/A: adjacent baselines/);
   const boundary = comparisonCandidate();
   updateRunEvidence(boundary[0]!.baselineBefore, evidence => {
-    evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second = 1;
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 150;
+      observed.rate_resolution_rows_per_second = 1;
+    }
   });
   assert.match(renderCampaignResults(boundary, 'C1'), /comparison \(3\/3\)/);
   const wrongOrder = comparisonCandidate().map(row => ({ ...row, pairOrder: 'AB' }));
@@ -1648,6 +1735,8 @@ test('requires effect, paired t and physical bytes-per-row thresholds', () => {
   for (const row of oversized) {
     updateRunEvidence(row.officialRuns[0]!, evidence => {
       const output = evidence.durable_commits.output_throughput;
+      evidence.durable_commits.delta_log_reconciliation.csv.bytes_per_row = 6;
+      evidence.screen_v1.bytes_per_row = 6;
       output.parquet_bytes = Number(output.rows) * 6;
       output.bytes_per_row = 6;
       output.parquet_bytes_per_second = Number(output.parquet_bytes) / Number(output.window_seconds);
@@ -1682,6 +1771,24 @@ test('reports separate CPU estimates and preserves null concurrency', () => {
   const svg = renderCampaignResults(candidate, 'C1');
   assert.match(svg, /concurrency\/core null; CPU s\/M rows \(estimated\): collector 18,181\.82, DFE null, client 27,272\.73/);
   assert.doesNotMatch(svg, /concurrency\/core 0/);
+});
+
+test('flags low-commit windows without treating absent legacy counts as zero', () => {
+  const candidate = comparisonCandidate();
+  updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
+    const windows = evidence.durable_commits.complete_30_second_commit_windows;
+    windows[0]!.window_commit_count = 16;
+    windows[1]!.window_commit_count = 99;
+    windows[2]!.window_commit_count = 100;
+    windows[3]!.window_commit_count = null;
+  });
+  updateRunEvidence(candidate[0]!.baselineBefore, evidence => {
+    evidence.durable_commits.complete_30_second_commit_windows[0]!.window_commit_count = 35;
+  });
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /low-commit windows \(&lt;100\): 1 \(16\), 2 \(99\)/);
+  assert.match(svg, /baseline before low-commit windows \(&lt;100\): 1 \(35\)/);
+  assert.doesNotMatch(svg, /3 \(100\)|4 \(0\)/);
 });
 
 test('plots a source-shaped receipt with G2a and G7 consumer readback reasons', () => {
