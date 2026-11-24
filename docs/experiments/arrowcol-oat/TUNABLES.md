@@ -234,6 +234,7 @@ selection and effect claims.
 | Other receiver TCP options and pre-bind socket settings | The DFE listener is bound and listening before the collector receives it; the current listener API offers no pre-bind socket-option hook. The documented listener buffers and accepted-socket `TCP_NODELAY` are applied separately. |
 | Allocator environment tuning | `MALLOC_*` and `MIMALLOC_*` are not typed OAT fields here. The effective allocator build readback does not establish that an environment option was consumed. Even with mimalloc for the Rust heap, C libraries can still use glibc allocation. |
 | Arbitrary OTEL environment | Unrestricted environment pass-through cannot establish which options are consumed or preserve telemetry destination and measurement provenance. Only explicitly documented controls are supported. |
+| WAL group ACK | Not exposed: downstream acknowledgements and WAL configuration readback do not establish that a durable synchronization barrier completed before acknowledgement. |
 | Per-allocation `madvise` | No collector allocation-specific control/readback is available. The process THP-disable flag does not establish actual huge-page use. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
