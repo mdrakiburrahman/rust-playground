@@ -1,5 +1,8 @@
 //! Process-wide Kernel I/O runtime, independent of the caller's Tokio runtime.
 
+#[cfg(target_os = "linux")]
+mod topology;
+
 use crate::{CpuDispatch, CpuPlacement};
 use anyhow::{Context, Result};
 use delta_kernel::{DeltaResult, Error};
@@ -403,7 +406,14 @@ type CpuJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct CpuPool {
     queues: CpuQueues,
-    worker_cpu_ids: Vec<Option<usize>>,
+    worker_topology: Vec<WorkerLocation>,
+}
+
+#[derive(Default, Serialize)]
+struct WorkerLocation {
+    cpu: Option<usize>,
+    package: Option<usize>,
+    core: Option<usize>,
 }
 
 type ShardJob = (tokio::sync::OwnedSemaphorePermit, CpuJob);
@@ -506,6 +516,11 @@ fn worker_targets(placement: CpuPlacement, workers: usize) -> Result<Vec<Option<
     #[cfg(target_os = "linux")]
     {
         let allowed = effective_cpus()?;
+        let allowed = if placement == CpuPlacement::PhysicalFirst {
+            topology::physical_first(topology::CPU_ROOT.as_ref(), &allowed)?
+        } else {
+            allowed
+        };
         Ok((0..workers)
             .map(|i| Some(allowed[placement_index(placement, i, workers, allowed.len())]))
             .collect())
@@ -518,25 +533,47 @@ fn worker_targets(placement: CpuPlacement, workers: usize) -> Result<Vec<Option<
 fn placement_index(policy: CpuPlacement, worker: usize, workers: usize, allowed: usize) -> usize {
     match policy {
         CpuPlacement::ScatterAllowed => (worker % allowed) * allowed / workers.min(allowed),
-        CpuPlacement::CompactAllowed => worker % allowed,
+        CpuPlacement::CompactAllowed | CpuPlacement::PhysicalFirst => worker % allowed,
         CpuPlacement::Os => unreachable!("OS placement does not select CPUs"),
     }
 }
 
-fn start_on_cpu(target: Option<usize>) -> Result<Option<usize>> {
-    let Some(cpu) = target else { return Ok(None) };
+fn start_on_cpu(target: Option<usize>, placement: CpuPlacement) -> Result<WorkerLocation> {
     #[cfg(target_os = "linux")]
     {
         use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
-        let mut requested = CpuSet::new();
-        requested.set(cpu);
-        sched_setaffinity(None, &requested).with_context(|| format!("pin CPU worker to {cpu}"))?;
-        let observed = sched_getaffinity(None).context("verify CPU worker affinity")?;
-        anyhow::ensure!(observed == requested, "CPU worker affinity mismatch for CPU {cpu}");
-        Ok(Some(cpu))
+        if let Some(cpu) = target {
+            let mut requested = CpuSet::new();
+            requested.set(cpu);
+            sched_setaffinity(None, &requested).with_context(|| format!("pin CPU worker to {cpu}"))?;
+            let observed = sched_getaffinity(None).context("verify CPU worker affinity")?;
+            anyhow::ensure!(observed == requested, "CPU worker affinity mismatch for CPU {cpu}");
+        }
+        let cpu = rustix::thread::sched_getcpu();
+        anyhow::ensure!(
+            target.is_none_or(|id| id == cpu),
+            "CPU worker running on unexpected CPU {cpu}"
+        );
+        let core = topology::core(topology::CPU_ROOT.as_ref(), cpu);
+        let core = if placement == CpuPlacement::PhysicalFirst {
+            Some(core?)
+        } else {
+            core.ok()
+        };
+        Ok(WorkerLocation {
+            cpu: Some(cpu),
+            package: core.map(|p| p.0),
+            core: core.map(|p| p.1),
+        })
     }
     #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("cannot pin CPU worker to {cpu} on this OS")
+    {
+        anyhow::ensure!(
+            target.is_none() && placement == CpuPlacement::Os,
+            "explicit CPU placement requires Linux"
+        );
+        Ok(WorkerLocation::default())
+    }
 }
 
 thread_local! {
@@ -564,7 +601,7 @@ impl CpuPool {
     ) -> Result<Self> {
         let targets = worker_targets(placement, workers)?;
         let (queues, receivers) = CpuQueues::new(dispatch, workers, queue_jobs);
-        let mut worker_cpu_ids = Vec::with_capacity(workers);
+        let mut worker_topology = Vec::with_capacity(workers);
         for (index, (mut receiver, target)) in receivers.into_iter().zip(targets).enumerate() {
             let (started, ready) = mpsc::sync_channel(1);
             let mut builder = std::thread::Builder::new().name(format!("delta-cpu-{index}"));
@@ -573,7 +610,7 @@ impl CpuPool {
             }
             builder
                 .spawn(move || {
-                    let result = start_on_cpu(target);
+                    let result = start_on_cpu(target, placement);
                     let ok = result.is_ok();
                     if started.send(result).is_err() || !ok {
                         return;
@@ -584,9 +621,12 @@ impl CpuPool {
                     }
                 })
                 .context("create Delta CPU worker")?;
-            worker_cpu_ids.push(ready.recv().context("CPU worker stopped during startup")??);
+            worker_topology.push(ready.recv().context("CPU worker stopped during startup")??);
         }
-        Ok(Self { queues, worker_cpu_ids })
+        Ok(Self {
+            queues,
+            worker_topology,
+        })
     }
 
     #[cfg(test)]
@@ -648,7 +688,8 @@ fn configured_cpu_pool(config: &DeltaRuntimeConfig, scope: &str) -> Result<&'sta
                 "thread_stack_size":config.cpu_thread_stack_size, "scope":scope,
                 "cpu_dispatch":config.cpu_dispatch, "cpu_placement":config.cpu_placement,
                 "shard_count":pool.queues.count(), "queue_jobs":queue_jobs,
-                "workers_started":pool.worker_cpu_ids.len(), "worker_cpu_ids":pool.worker_cpu_ids,
+                "workers_started":pool.worker_topology.len(), "worker_topology":pool.worker_topology,
+                "worker_cpu_ids":pool.worker_topology.iter().map(|worker| worker.cpu).collect::<Vec<_>>(),
             }})
         );
         Ok(pool)
@@ -1271,7 +1312,7 @@ mod tests {
                     })??;
                     let cpu = inherited[i % inherited.len()];
                     assert_eq!(observed, vec![cpu]);
-                    assert_eq!(pool.worker_cpu_ids[i], Some(cpu));
+                    assert_eq!(pool.worker_topology[i].cpu, Some(cpu));
                     assert_eq!(inner, outer);
                 }
             }
@@ -1319,6 +1360,7 @@ mod tests {
         for (mode, dispatch, placement, scope) in [
             ("lazy", "shared_fifo", "os", "lazy_pool_initialization"),
             ("startup", "bounded_shards", "scatter_allowed", "runtime_initialization"),
+            ("startup", "bounded_shards", "physical_first", "runtime_initialization"),
         ] {
             let output = std::process::Command::new(std::env::current_exe()?)
                 .args([
@@ -1355,10 +1397,17 @@ mod tests {
             assert_eq!(pool["shard_count"], if mode == "lazy" { 1 } else { 2 });
             let ids = pool["worker_cpu_ids"].as_array().context("worker CPU IDs")?;
             assert_eq!(ids.len(), 2);
-            assert!(
-                ids.iter()
-                    .all(|cpu| if mode == "lazy" { cpu.is_null() } else { cpu.is_u64() })
-            );
+            if placement == "physical_first" {
+                for (index, cpu) in ids.iter().enumerate() {
+                    let cpu = cpu.as_u64().context("actual worker CPU")? as usize;
+                    let (package, core) = topology::core(topology::CPU_ROOT.as_ref(), cpu)?;
+                    assert_eq!(
+                        pool["worker_topology"][index],
+                        serde_json::json!({"cpu":cpu,"package":package,"core":core})
+                    );
+                }
+            }
+            assert!(ids.iter().all(serde_json::Value::is_u64));
         }
         Ok(())
     }

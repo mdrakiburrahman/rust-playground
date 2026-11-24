@@ -48,6 +48,15 @@ fn verified_processes<'a>(
     Some(processes)
 }
 
+fn physical_pool_witness(effective: &Value) -> bool {
+    let pool = &effective["cpu_pool"];
+    let Some(workers) = pool["worker_topology"].as_array() else { return false };
+    !workers.is_empty()
+        && pool["workers_started"].as_u64() == Some(workers.len() as u64)
+        && pool["workers_started"] == effective["runtime"]["cpu_workers"]
+        && workers.iter().all(|worker| ["cpu", "core", "package"].iter().all(|&key| worker[key].is_u64()))
+}
+
 fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32) -> Result<()> {
     let Some(collectors) = verified_processes(config, processes, ComponentRole::Collector, replicas) else {
         return Ok(());
@@ -448,6 +457,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 let effective = &process["effective_config"];
                 matches!(effective["cpu_pool"]["scope"].as_str(), Some("runtime_initialization" | "lazy_pool_initialization"))
                     && effective["cpu_pool"].get(pool_field) == effective["runtime"].get(field)
+                    && (field != "cpu_placement" || effective["runtime"][field] != "physical_first" || physical_pool_witness(effective))
             }));
             if environment.contains_key(variable)
                 && collectors.iter().all(|process| process["effective_config"]["runtime"].get(field).is_some())
@@ -1643,6 +1653,26 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         }
         process["effective_config"]["batching"]["stage_file_concurrency"] = json!(1);
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &process["effective_config"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn physical_first_requires_each_workers_observed_topology() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"runtime":{"cpu_placement":"physical_first"}}}))?;
+        let mut process = json!({"component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"runtime":{"cpu_placement":"physical_first","cpu_workers":2},
+                "cpu_pool":{"scope":"runtime_initialization","workers_started":2,"cpu_placement":"physical_first"}}});
+        let worker = json!({"cpu":4,"core":1,"package":0});
+        for (workers, expected) in [(Value::Null,false), (json!([worker]),false),
+            (json!([worker,{"cpu":8,"core":null,"package":0}]),false), (json!([worker,worker]),true)] {
+            process["effective_config"]["cpu_pool"]["worker_topology"] = workers;
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+            assert_eq!(evidence["consumer_verified"].as_array().context("verified leaves")?.iter()
+                .any(|entry| entry["path"] == "collector.runtime.cpu_placement"), expected);
+        }
         Ok(())
     }
 

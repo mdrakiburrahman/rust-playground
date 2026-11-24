@@ -1,3 +1,22 @@
+// Per collector, assuming one active encoder per DFE worker. This is demand, not thread count.
+fn requested_column_concurrency(config: &OatConfig, workers: u32, quota_cores: Option<f64>, processes: Option<&Value>) -> Value {
+    let runtime = config.tunables.collector.as_ref().and_then(|collector| collector.runtime.as_ref());
+    let columns = runtime.and_then(|runtime| runtime.parquet_column_workers).unwrap_or(1);
+    let requested = u64::from(workers) * u64::from(columns);
+    let ratio = quota_cores.map(|cores| requested as f64 / cores);
+    let pools = processes.and_then(Value::as_array).into_iter().flatten()
+        .filter(|process| process["component"] == "collector")
+        .map(|process| {
+            let effective = &process["effective_config"];
+            json!({"cpu_pool_cap":effective["runtime"]["cpu_workers"],
+                "cpu_pool_threads_started":effective["cpu_pool"]["workers_started"]})
+        }).collect::<Vec<_>>();
+    json!({"dfe_workers":workers, "parquet_column_workers":columns, "requested_concurrency":requested,
+        "requested_quota_cores":quota_cores, "concurrency_per_quota_core":ratio,
+        "warning":ratio.filter(|value| *value > 1.0).map(|_| "DFE workers × parquet_column_workers exceeds collector CPU quota"),
+        "requested_cpu_pool_cap":runtime.and_then(|runtime| runtime.cpu_workers), "collector_pool_readbacks":pools})
+}
+
 async fn validate_local_collector_cpu_quota(config: &OatConfig) -> Result<()> {
     let Some(quota) = config.platform.local.collector_cpu_quota else {
         return Ok(());
@@ -152,6 +171,25 @@ fn local_cpu_quota_window(config: &OatConfig, start: u64, end: u64, before: Opti
 #[cfg(test)]
 mod local_cpu_quota_tests {
     use super::*;
+
+    #[test]
+    fn requested_concurrency_warns_on_fractional_quota_without_counting_pool_threads() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"runtime":{"cpu_workers":3,"parquet_column_workers":4}}}))?;
+        let processes = json!([{"component":"collector","effective_config":{"runtime":{"cpu_workers":3}}}]);
+        let result = requested_column_concurrency(&config, 2, Some(2.5), Some(&processes));
+        assert_eq!(result["requested_concurrency"], 8);
+        assert_eq!(result["concurrency_per_quota_core"], 3.2);
+        assert!(result["warning"].is_string());
+        assert_eq!(result["collector_pool_readbacks"][0]["cpu_pool_cap"], 3);
+        assert!(result["collector_pool_readbacks"][0]["cpu_pool_threads_started"].is_null());
+        for limit in [Some(8.0), None] {
+            let result = requested_column_concurrency(&config, 2, limit, None);
+            assert!(result["warning"].is_null());
+            assert_eq!(result["concurrency_per_quota_core"].is_null(), limit.is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn invalid_control_values_name_the_exact_oat_field() -> Result<()> {
