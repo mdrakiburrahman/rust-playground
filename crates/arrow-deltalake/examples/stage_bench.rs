@@ -102,11 +102,12 @@ fn batch(schema: &Arc<Schema>, rows: usize, seed: u64, width: usize, vary: bool)
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
-fn cpu_seconds() -> f64 {
+/// User seconds, system seconds and minor page faults of this process so far.
+fn process_usage() -> (f64, f64, f64) {
     let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
     let fields: Vec<&str> = stat[stat.rfind(')').expect("stat comm") + 2..].split_whitespace().collect();
-    let ticks = |index: usize| fields[index].parse::<f64>().expect("stat ticks");
-    (ticks(11) + ticks(12)) / 100.0
+    let field = |index: usize| fields[index].parse::<f64>().expect("stat field");
+    (field(11) / 100.0, field(12) / 100.0, field(7))
 }
 
 #[tokio::main]
@@ -158,7 +159,7 @@ async fn main() -> Result<()> {
     let mut build = Duration::ZERO;
     let mut encode = Duration::ZERO;
     let mut files = 0_usize;
-    let cpu_start = cpu_seconds();
+    let (user_start, sys_start, faults_start) = process_usage();
     let started = Instant::now();
     for group in 0..groups {
         let entries = (0..batches)
@@ -190,13 +191,16 @@ async fn main() -> Result<()> {
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
-    let cpu = cpu_seconds() - cpu_start;
+    let (user_end, sys_end, faults_end) = process_usage();
+    let (user, sys) = (user_end - user_start, sys_end - sys_start);
+    let cpu = user + sys;
     let rows = (rows_per_group * groups) as f64;
     println!(
         "rows={rows} files={files} wall={elapsed:.2}s rows/s={:.0} cpu={cpu:.2}s cpu_s/Mrow={:.3} \
-         plan_build={:.2}s file_encode_sum={:.2}s",
+         user={user:.2}s sys={sys:.2}s minflt={:.0} plan_build={:.2}s file_encode_sum={:.2}s",
         rows / elapsed,
         cpu / rows * 1e6,
+        faults_end - faults_start,
         build.as_secs_f64(),
         encode.as_secs_f64(),
     );
