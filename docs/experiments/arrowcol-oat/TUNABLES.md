@@ -88,6 +88,8 @@ Unknown OAT fields or invented environment pass-throughs remain rejected.
 
 These controls are rebuild-only. The canonical profile key is `allocator=<value>;lto=<value>;codegen_units=<value>;opt_level=<value>;target_cpu=<value>`; its SHA-256 selects the profile-specific image tag and isolated BuildKit target cache. OAT selects the matching local image or digest-pinned AKS image; a missing or mismatched image fails before the arm starts. Omitted build fields preserve the Cargo release defaults and existing image path.
 
+**CPU instruction set by role:** use `collector.target_cpu` for the collector and `client.build_profile.target_cpu` for the OAT client (`generic`, `x86-64-v2`, `x86-64-v3`, or `x86-64-v4`). These fields select compile-time targets, not runtime thread placement. There is no `build.<role>.cpu_isa` alias: accepting two names for one image-profile input would make conflicting requests ambiguous. Router, catalog and maintenance images do not have the corresponding role-specific target argument, profile selection and binary readback; a run must not label them ISA-tuned based on the host CPU or another role's image.
+
 `jemalloc` is rejected: the locked collector has no jemalloc dependency or global-allocator feature, and its image selects only system or mimalloc at compile time. Accepting a third label or setting `LD_PRELOAD` would not prove which allocator serves Rust allocations. A jemalloc arm needs a linked allocator feature, its own profile image, and a matching readback from that binary.
 
 | Setting | Type and range | Default | Apply boundary | Influence and interactions |
