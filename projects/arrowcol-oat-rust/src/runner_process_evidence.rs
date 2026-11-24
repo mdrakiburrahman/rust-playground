@@ -1153,7 +1153,8 @@ fn verify_collector_startup_source_revision(expected_source_revision: &str, logs
         bail!("collector startup source_revision readback is missing");
     }
     for log in collectors {
-        let observed = process_configurations(&log.text)?
+        let configuration = process_configurations(&log.text)?;
+        let observed = configuration
             .get("source_revision")
             .and_then(Value::as_str)
             .context("collector startup source_revision readback is missing")?;
