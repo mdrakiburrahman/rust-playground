@@ -603,6 +603,8 @@ http.createServer((request, response) => {
             router_yaml: None,
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
         };
         let script = script_path.clone();
         let mut command = || {
