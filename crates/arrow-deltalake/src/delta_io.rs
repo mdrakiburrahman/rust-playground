@@ -64,6 +64,9 @@ pub struct DeltaRuntimeConfig {
     pub upload_limit: usize,
     /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
     pub upload_mode: UploadMode,
+    /// File-backed staging by default; streaming is for remote multipart output.
+    #[serde(default)]
+    pub staging_mode: crate::StagingMode,
     /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 1..=64 MiB when multipart is enabled.
     pub upload_buffer_capacity_bytes: usize,
     /// In-flight multipart requests per upload: default 2; allowed 1..=16.
@@ -139,6 +142,7 @@ impl DeltaRuntimeConfig {
             layout_detach_ratio: default_detach_ratio(),
             upload_limit: 32,
             upload_mode: UploadMode::PutCreate,
+            staging_mode: Default::default(),
             upload_buffer_capacity_bytes: DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES,
             upload_request_concurrency: DEFAULT_UPLOAD_REQUEST_CONCURRENCY,
             task_limit: cores.saturating_mul(4).clamp(64, 256),
@@ -250,6 +254,12 @@ impl DeltaRuntimeConfig {
                 *value = Some(raw.parse().with_context(|| format!("parse {name}"))?);
             }
         }
+        let name = "ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE";
+        if let Some(raw) = lookup(name)? {
+            config.staging_mode = raw
+                .try_into()
+                .map_err(|message: &str| anyhow::anyhow!("{name}: {message}"))?;
+        }
         let mode_name = "ARROWCOL_COLLECTOR_UPLOAD_MODE";
         if let Some(raw) = lookup(mode_name)? {
             config.upload_mode = match raw.as_str() {
@@ -341,6 +351,12 @@ impl DeltaRuntimeConfig {
                     "ARROWCOL_COLLECTOR_{name} must be in {min}..={max}, got {value}"
                 );
             }
+        }
+        if self.staging_mode == crate::StagingMode::Streaming {
+            anyhow::ensure!(
+                self.upload_mode == UploadMode::BufferedMultipart && self.parquet_column_workers == 1,
+                "streaming staging requires buffered_multipart and parquet_column_workers=1"
+            );
         }
         if self.upload_mode == UploadMode::BufferedMultipart {
             anyhow::ensure!(

@@ -75,6 +75,36 @@ impl<'de> serde::Deserialize<'de> for TxnLookupMode {
     }
 }
 
+/// Remote Parquet staging strategy; local Delta tables always fsync their data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum StagingMode {
+    #[default]
+    LocalFsync,
+    Streaming,
+}
+
+impl StagingMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFsync => "local_fsync",
+            Self::Streaming => "streaming",
+        }
+    }
+}
+
+impl TryFrom<String> for StagingMode {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "local_fsync" => Ok(Self::LocalFsync),
+            "streaming" => Ok(Self::Streaming),
+            _ => Err("staging_mode must be local_fsync or streaming"),
+        }
+    }
+}
+
 /// Queue discipline for the dedicated CPU workers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]
@@ -228,6 +258,7 @@ pub struct CompletedFileObservation {
 /// A completed, durable Parquet file. It is not necessarily committed to Delta.
 #[derive(Debug)]
 pub struct CompletedFile {
+    /// Table-root-relative identity anchored at the staging root. Streamed remote objects have no local file here.
     pub path: PathBuf,
     pub rows: usize,
     /// Logical Arrow bytes accepted before Parquet encoding.
@@ -253,7 +284,7 @@ pub struct ParquetFileWriter {
     #[cfg(feature = "delta")]
     properties: WriterProperties,
     writer: Option<FileWriter>,
-    durable_handle: File,
+    durable_handle: Option<File>,
     path: PathBuf,
     rows: usize,
     input_bytes: u64,
@@ -263,6 +294,8 @@ enum FileWriter {
     Sequential(AsyncArrowWriter<tokio::fs::File>),
     #[cfg(feature = "delta")]
     Parallel(ParallelArrowWriter<File>),
+    #[cfg(feature = "delta")]
+    Streaming(AsyncArrowWriter<delta::streaming_sink::StreamingSink>),
 }
 
 impl ParquetFileWriter {
@@ -304,19 +337,31 @@ impl ParquetFileWriter {
         properties: Option<WriterProperties>,
         declare_levels: bool,
     ) -> Result<Self> {
+        let properties = Self::effective_properties(&schema, properties, declare_levels)?;
+        Self::open_local(path, schema, properties)
+    }
+
+    fn effective_properties(
+        schema: &SchemaRef,
+        properties: Option<WriterProperties>,
+        declare_levels: bool,
+    ) -> Result<WriterProperties> {
         let properties = writer::process_config()?.writer_properties(
-            &schema,
+            schema,
             properties.clone(),
-            &writer::sorting_from_properties(&schema, properties.as_ref())?,
+            &writer::sorting_from_properties(schema, properties.as_ref())?,
         )?;
-        let properties = if declare_levels {
+        if declare_levels {
             let physical = parquet::arrow::ArrowSchemaConverter::new()
                 .with_coerce_types(properties.coerce_types())
-                .convert(&schema)?;
-            footer::stamp(&physical, properties)?
+                .convert(schema)?;
+            footer::stamp(&physical, properties)
         } else {
-            properties
-        };
+            Ok(properties)
+        }
+    }
+
+    fn open_local(path: &Path, schema: SchemaRef, properties: WriterProperties) -> Result<Self> {
         let path = path.to_path_buf();
         let durable_handle = OpenOptions::new()
             .write(true)
@@ -349,7 +394,26 @@ impl ParquetFileWriter {
             writer: Some(writer),
             #[cfg(feature = "delta")]
             properties: effective,
-            durable_handle,
+            durable_handle: Some(durable_handle),
+            path,
+            rows: 0,
+            input_bytes: 0,
+        })
+    }
+
+    #[cfg(feature = "delta")]
+    fn streaming(
+        path: PathBuf,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+        sink: delta::streaming_sink::StreamingSink,
+    ) -> Result<Self> {
+        let properties = Self::effective_properties(&schema, properties, true)?;
+        let writer = AsyncArrowWriter::try_new(sink, schema, Some(properties.clone()))?;
+        Ok(Self {
+            properties,
+            writer: Some(FileWriter::Streaming(writer)),
+            durable_handle: None,
             path,
             rows: 0,
             input_bytes: 0,
@@ -400,6 +464,16 @@ impl ParquetFileWriter {
                     self.writer = Some(FileWriter::Sequential(writer));
                     result?;
                 }
+                FileWriter::Streaming(mut writer) => {
+                    let batch = batch.clone();
+                    let (writer, result) = delta_io::run_cpu_future(async move {
+                        let result = writer.write(&batch).await;
+                        (writer, result)
+                    })
+                    .await?;
+                    self.writer = Some(FileWriter::Streaming(writer));
+                    result?;
+                }
                 FileWriter::Parallel(mut writer) => {
                     let result = writer.write(batch).await;
                     self.writer = Some(FileWriter::Parallel(writer));
@@ -424,6 +498,10 @@ impl ParquetFileWriter {
     /// # Errors
     /// Returns close, metadata, or synchronization errors.
     pub async fn finish(self) -> Result<CompletedFile> {
+        Ok(self.finish_with_upload().await?.0)
+    }
+
+    async fn finish_with_upload(self) -> Result<(CompletedFile, Option<std::time::Duration>)> {
         let Self {
             writer,
             durable_handle,
@@ -440,11 +518,29 @@ impl ParquetFileWriter {
                 writer.close().await?;
             }
             #[cfg(feature = "delta")]
+            FileWriter::Streaming(mut writer) => {
+                let (bytes, duration) = delta_io::run_cpu_future(async move {
+                    writer.finish().await?;
+                    Ok::<_, anyhow::Error>(writer.into_inner().observation())
+                })
+                .await??;
+                return Ok((
+                    CompletedFile {
+                        path,
+                        rows,
+                        input_bytes,
+                        bytes,
+                    },
+                    Some(duration),
+                ));
+            }
+            #[cfg(feature = "delta")]
             FileWriter::Parallel(writer) => {
                 drop(writer.finish().await?);
             }
         }
-        let durable_handle = tokio::fs::File::from_std(durable_handle);
+        let durable_handle =
+            tokio::fs::File::from_std(durable_handle.context("local writer missing durability handle")?);
         durable_handle.sync_all().await?;
         let bytes = durable_handle.metadata().await?.len();
         let parent = path
@@ -452,12 +548,15 @@ impl ParquetFileWriter {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         tokio::fs::File::open(parent).await?.sync_all().await?;
-        Ok(CompletedFile {
-            path,
-            rows,
-            input_bytes,
-            bytes,
-        })
+        Ok((
+            CompletedFile {
+                path,
+                rows,
+                input_bytes,
+                bytes,
+            },
+            None,
+        ))
     }
 }
 

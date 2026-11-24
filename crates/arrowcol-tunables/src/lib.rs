@@ -990,6 +990,11 @@ pub struct ChannelCapacityTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorUploadTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_staging_mode"
+    )]
+    pub staging_mode: Option<arrow_deltalake::StagingMode>,
     pub mode: Option<CollectorUploadMode>,
     pub buffer_capacity_bytes: Option<usize>,
     pub request_concurrency: Option<usize>,
@@ -1346,6 +1351,12 @@ fn deserialize_cpu_dispatch<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::CpuDispatch>, D::Error> {
     deserialize_mode(d, "collector.runtime.cpu_dispatch")
+}
+
+fn deserialize_staging_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::StagingMode>, D::Error> {
+    deserialize_mode(d, "collector.upload.staging_mode")
 }
 
 fn deserialize_cpu_placement<'de, D: serde::Deserializer<'de>>(

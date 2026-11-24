@@ -1276,7 +1276,14 @@ impl GroupPublisher<'_> {
                     writer
                         .write(&partition_batch)
                         .await
-                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                        .map_err(|error| {
+                            if error.chain().any(|cause| cause.is::<arrow_deltalake::delta::StreamingUploadError>()) {
+                                worker_failed = true;
+                                ExportFailure::Transient(format!("{error:#}"))
+                            } else {
+                                ExportFailure::Permanent(format!("{error:#}"))
+                            }
+                        })?;
                     let append = writer
                         .stage()
                         .await

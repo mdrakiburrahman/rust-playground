@@ -470,7 +470,12 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "client.identity_builder" {
         input["client"] = json!({"data_profile": "realistic"});
     }
-    if path == "collector.upload.buffer_capacity_bytes" || path == "collector.upload.request_concurrency" {
+    if matches!(
+        path,
+        "collector.upload.buffer_capacity_bytes"
+            | "collector.upload.request_concurrency"
+            | "collector.upload.staging_mode"
+    ) {
         input["collector"] = json!({"upload": {"mode": "buffered_multipart"}});
     }
     if matches!(
@@ -516,6 +521,7 @@ fn fixture(path: &str, value: Value) -> Value {
 fn candidates(path: &str) -> Vec<Value> {
     match path {
         "collector.isolation_level" => return vec![json!("l2")],
+        "collector.upload.staging_mode" => return vec![json!("streaming")],
         "collector.allocator" => return vec![json!("system")],
         "collector.lto" => return vec![json!("off")],
         "collector.codegen_units" => return vec![json!(16)],
@@ -1250,6 +1256,19 @@ fn partition_grouping_only_accepts_explicit_enum_strings() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn streaming_staging_requires_a_named_mode_and_compatible_writer() {
+    for invalid in [Value::Null, json!(true), json!("Streaming"), json!({"streaming":null})] {
+        assert!(Tunables::parse_oat_json(fixture("collector.upload.staging_mode", invalid)).is_err());
+    }
+    for invalid in [
+        json!({"upload":{"staging_mode":"streaming"}}),
+        json!({"upload":{"staging_mode":"streaming","mode":"buffered_multipart"},"runtime":{"parquet_column_workers":2}}),
+    ] {
+        assert!(Tunables::parse_oat_json(json!({"collector":invalid})).is_err());
+    }
 }
 
 #[test]

@@ -860,6 +860,7 @@ fn verify_process_configuration_recording(
                     .to_ascii_lowercase()
             ),
             "ARROWCOL_COLLECTOR_RUNTIME_WORKERS" => "/runtime/runtime_workers".to_owned(),
+            "ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE" => "/runtime/staging_mode".to_owned(),
             variable if variable.starts_with("ARROWCOL_COLLECTOR_") => format!(
                 "/runtime/{}",
                 variable.trim_start_matches("ARROWCOL_COLLECTOR_").to_ascii_lowercase()
