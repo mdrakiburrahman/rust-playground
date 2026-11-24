@@ -545,10 +545,8 @@ fn promote_router_readback(config: &OatConfig, evidence: &mut Value, processes: 
     Ok(())
 }
 
-fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Option<&Vec<Value>>) -> Result<()> {
-    let Some(reports) = reports else {
-        return Ok(());
-    };
+fn verified_client_reports<'a>(config: &OatConfig, reports: Option<&'a Vec<Value>>) -> Option<&'a [Value]> {
+    let reports = reports?;
     let ids = reports.iter()
         .filter_map(|report| report["client_id"].as_str().filter(|id| !id.is_empty()))
         .collect::<std::collections::BTreeSet<_>>();
@@ -556,8 +554,37 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
         || reports.is_empty()
         || reports.iter().any(|report| verify_process_configuration(config, ComponentRole::Client, &report["consumer_effective_config"]).is_err())
     {
+        return None;
+    }
+    Some(reports)
+}
+
+fn promote_isolation_readback(
+    config: &OatConfig, evidence: &mut Value, processes: Option<&Value>, replicas: u32, reports: Option<&Vec<Value>>,
+) -> Result<()> {
+    let Some(level) = config.tunables.collector.as_ref().and_then(|collector| collector.isolation_level) else {
+        return Ok(());
+    };
+    if verified_processes(config, processes, ComponentRole::Collector, replicas).is_none()
+        || (level != arrowcol_tunables::IsolationLevel::L5 && verified_client_reports(config, reports).is_none())
+    {
         return Ok(());
     }
+    let path = "collector.isolation_level";
+    let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
+    if let Some(index) = projection.iter().position(|entry| entry["path"] == path) {
+        projection.remove(index);
+        evidence["consumer_verified"].as_array_mut().context("consumer_verified must be an array")?.push(json!({
+            "path": path, "value": level, "reason": if level == arrowcol_tunables::IsolationLevel::L5 {
+                "collector_startup_readback"
+            } else { "collector_and_client_startup_readback" }
+        }));
+    }
+    Ok(())
+}
+
+fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Option<&Vec<Value>>) -> Result<()> {
+    let Some(reports) = verified_client_reports(config, reports) else { return Ok(()) };
     let environment = role_environment(config, ComponentRole::Client)?;
     let projection = evidence["projection_only"].as_array_mut().context("projection_only must be an array")?;
     let mut promoted = Vec::new();
@@ -1079,6 +1106,42 @@ fn validate_collector_exporter_override(
 #[cfg(test)]
 mod tunable_injection_tests {
     use super::*;
+
+    #[test]
+    fn isolation_readback_requires_all_configured_consumers() -> Result<()> {
+        let mut config = config()?;
+        config.clients_per_table = 2;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"isolation_level":"l1"}}))?;
+        let process = json!({"component":"collector", "instance_id":"a", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":{"isolation_level":"l1"}});
+        let report = |id: &str, value: Value| json!({"client_id":id,"consumer_effective_config":value});
+        let good = vec![report("a", json!({"isolation_level":"l1"})), report("b", json!({"isolation_level":"l1"}))];
+        let initial = tunable_leaf_evidence(&config)?;
+        for (collectors, reports, promoted) in [
+            (json!([process]), good.clone(), true),
+            (json!([]), good.clone(), false),
+            (json!([process]), vec![good[0].clone(), good[0].clone()], false),
+            (json!([process]), vec![good[0].clone(), report("b", json!({"isolation_level":"l5"}))], false),
+            (json!([process]), vec![good[0].clone(), report("b", json!({}))], false),
+        ] {
+            let mut evidence = initial.clone();
+            promote_isolation_readback(&config, &mut evidence, Some(&collectors), 1, Some(&reports))?;
+            if promoted {
+                assert_eq!(evidence["consumer_verified"], json!([{"path":"collector.isolation_level", "value":"l1",
+                    "reason":"collector_and_client_startup_readback"}]));
+                assert_eq!(evidence["projection_only"], json!([]));
+            } else {
+                assert_eq!(evidence, initial);
+            }
+        }
+        config.tunables = Default::default();
+        for role in [ComponentRole::Collector, ComponentRole::Client] {
+            assert!(verify_process_configuration(&config, role, &json!({"isolation_level":"l1"})).is_err());
+            verify_process_configuration(&config, role, &json!({"isolation_level":"l5"}))?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn client_build_profile_selects_distinct_images_and_projects_build_args() -> Result<()> {

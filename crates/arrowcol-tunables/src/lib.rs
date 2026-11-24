@@ -9,6 +9,7 @@ pub use arrow_deltalake::writer::{
     Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
     Statistics as ParquetStatistics, ValueEncoding as ParquetValueEncoding, Version as ParquetWriterVersion,
 };
+pub use arrowcol_protocol::IsolationLevel;
 pub use arrowcol_routing::AdmissionPressureGauge;
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -386,6 +387,15 @@ pub struct CollectorTunables {
     pub opt_level: Option<CollectorOptLevel>,
     #[serde(deserialize_with = "deserialize_collector_target_cpu")]
     pub target_cpu: Option<CollectorTargetCpu>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_isolation_level"
+    )]
+    pub isolation_level: Option<IsolationLevel>,
+}
+
+fn deserialize_isolation_level<'de, D: Deserializer<'de>>(d: D) -> Result<Option<IsolationLevel>, D::Error> {
+    IsolationLevel::deserialize(d).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]

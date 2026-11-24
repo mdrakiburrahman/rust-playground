@@ -12,6 +12,50 @@ const TUNABLES_SOURCE: &str = include_str!("../src/lib.rs");
 const WRITER_SOURCE: &str = include_str!("../../arrow-deltalake/src/writer.rs");
 
 #[test]
+fn isolation_level_requires_an_exact_token_and_projects_to_the_consuming_roles() -> Result<()> {
+    const COLLECTOR: &str = "ARROWCOL_COLLECTOR_ISOLATION_LEVEL";
+    const CLIENT: &str = "ARROWCOL_CLIENT_ISOLATION_LEVEL";
+    let omitted = Tunables::parse_oat_json(json!({"collector": {}}))?;
+    assert!(!omitted.environment()?.contains_key(COLLECTOR));
+    assert!(!omitted.environment()?.contains_key(CLIENT));
+    assert!(
+        serde_json::to_value(&omitted)?["collector"]
+            .get("isolation_level")
+            .is_none()
+    );
+    for token in ["l0", "l1", "l2", "l3", "l4", "l5"] {
+        let input = json!({"collector": {"isolation_level": token}});
+        let tunables = Tunables::parse_oat_json(input)?;
+        assert_eq!(serde_json::to_value(&tunables)?["collector"]["isolation_level"], token);
+        assert_eq!(tunables.environment_for(ComponentRole::Collector)?[COLLECTOR], token);
+        let client_env = tunables.environment_for(ComponentRole::Client)?;
+        assert_eq!(
+            client_env.get(CLIENT).map(String::as_str),
+            (token != "l5").then_some(token)
+        );
+        assert!(!client_env.contains_key(COLLECTOR));
+    }
+    for bad in [
+        Value::Null,
+        json!(false),
+        json!(2),
+        json!({"l2": null}),
+        json!(["l2"]),
+        json!("L2"),
+        json!("l6"),
+        json!(" l2"),
+        json!("l2 "),
+        json!(""),
+    ] {
+        let error = Tunables::parse_oat_json(json!({"collector": {"isolation_level": bad}}))
+            .err()
+            .context("invalid isolation level accepted")?;
+        assert!(error.to_string().contains("collector.isolation_level"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
 fn delta_literal_properties_are_strict_and_match_initialization_bounds() -> Result<()> {
     use arrowcol_tunables::DeltaTunables;
     use std::collections::BTreeMap;
@@ -471,6 +515,7 @@ fn fixture(path: &str, value: Value) -> Value {
 
 fn candidates(path: &str) -> Vec<Value> {
     match path {
+        "collector.isolation_level" => return vec![json!("l2")],
         "collector.allocator" => return vec![json!("system")],
         "collector.lto" => return vec![json!("off")],
         "collector.codegen_units" => return vec![json!(16)],

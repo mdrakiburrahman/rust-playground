@@ -40,4 +40,6 @@ pub use lifecycle::{
     ShutdownCoordinator, StreamAbortReason, StreamContext, StreamLifecycle, StreamOutcome, StreamSummary,
 };
 pub use put_result::{CompletionMode, DeliveryGuarantee, PUT_RESULT_WIRE_VERSION, PutResultMetadata, StreamCompletion};
-pub use service::{ArrowColFlightService, FlightResponseStream};
+pub use service::{
+    ArrowColFlightService, DiagnosticBatchSink, DiagnosticReceipt, FlightResponseStream, isolation_ingress_snapshot,
+};

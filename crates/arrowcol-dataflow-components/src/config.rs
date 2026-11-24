@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
-use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
+use arrowcol_protocol::{IsolationLevel, PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use arrowcol_tunables::AgeFlushPolicy;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,29 @@ static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 mod override_tests {
     use super::*;
+
+    #[test]
+    fn receiver_isolation_defaults_to_full_path_and_reports_resolved_level() -> Result<(), serde_json::Error> {
+        let mut input = serde_json::json!({
+            "listening_addr":"127.0.0.1:8815", "admin_listening_addr":"127.0.0.1:8816",
+            "catalog":{"type":"memory"}, "routing":{"type":"memory"},
+            "registration":{"instance_key":"test", "flight_endpoint":"127.0.0.1:8815"}
+        });
+        let config: FlightReceiverConfig = serde_json::from_value(input.clone())?;
+        assert_eq!(config.effective_config_json()["isolation_level"], "l5");
+        input["isolation_level"] = serde_json::json!("l1");
+        let config: FlightReceiverConfig = serde_json::from_value(input.clone())?;
+        assert_eq!(config.effective_config_json()["isolation_level"], "l1");
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({"l1": null}),
+            serde_json::json!("L1"),
+        ] {
+            input["isolation_level"] = invalid;
+            assert!(serde_json::from_value::<FlightReceiverConfig>(input.clone()).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn receiver_compression_projects_typed_oat_json_into_actual_runtime_limits() -> Result<(), String> {
@@ -941,10 +964,17 @@ pub struct FlightReceiverConfig {
     /// Process CPU sampling for admission pressure; disabled by default.
     #[serde(default)]
     pub cpu_pressure: arrowcol_tunables::CpuPressureMode,
+    /// Last collector stage exercised; only the default L5 runs the normal publication path.
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
 }
 
 impl FlightReceiverConfig {
     pub(crate) fn apply_environment(&mut self) -> Result<(), String> {
+        const ISOLATION_ENV: &str = "ARROWCOL_COLLECTOR_ISOLATION_LEVEL";
+        if let Some(value) = environment_json(ISOLATION_ENV)? {
+            self.isolation_level = value.parse().map_err(|error| format!("{ISOLATION_ENV}: {error}"))?;
+        }
         const CPU_PRESSURE_ENV: &str = "ARROWCOL_COLLECTOR_CPU_PRESSURE";
         match std::env::var(CPU_PRESSURE_ENV) {
             Ok(value) => {
@@ -977,6 +1007,7 @@ impl FlightReceiverConfig {
 
     pub(crate) fn effective_config_json(&self) -> serde_json::Value {
         serde_json::json!({
+            "isolation_level": self.isolation_level,
             "cpu_pressure": self.cpu_pressure,
             "limits": self.limits,
             "socket": self.socket,

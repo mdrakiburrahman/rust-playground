@@ -40,6 +40,10 @@ use crate::{
     TrustedIdentityValidator, align_record_batch, lifecycle::DrainPermit,
 };
 
+mod isolation;
+use arrowcol_protocol::IsolationLevel;
+pub use isolation::{DiagnosticBatchSink, DiagnosticReceipt, isolation_ingress_snapshot};
+
 /// Boxed tonic response stream used by the reusable Flight service.
 pub type FlightResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -115,6 +119,8 @@ fn trusted_client_send_observation(
 /// Shared Arrow Flight service for direct and dataflow collector binaries.
 #[derive(Clone)]
 pub struct ArrowColFlightService {
+    isolation_level: IsolationLevel,
+    diagnostic_sink: Option<Arc<dyn DiagnosticBatchSink>>,
     implementation_pool: ImplementationPool,
     schema_validator: SchemaValidator,
     authenticator: Arc<dyn Authenticator>,
@@ -141,6 +147,8 @@ impl ArrowColFlightService {
     ) -> RuntimeResult<Self> {
         limits.validate()?;
         Ok(Self {
+            isolation_level: IsolationLevel::L5,
+            diagnostic_sink: None,
             implementation_pool,
             schema_validator: SchemaValidator::new(catalog),
             authenticator,
@@ -151,6 +159,23 @@ impl ArrowColFlightService {
             drain: DrainController::new(),
             limits,
         })
+    }
+
+    /// Selects a benchmark-only path. Both endpoints must select the same level.
+    ///
+    /// # Errors
+    /// Rejects missing or extraneous physical-stage sinks.
+    pub fn with_isolation(
+        mut self,
+        level: IsolationLevel,
+        sink: Option<Arc<dyn DiagnosticBatchSink>>,
+    ) -> RuntimeResult<Self> {
+        if matches!(level, IsolationLevel::L2 | IsolationLevel::L3 | IsolationLevel::L4) != sink.is_some() {
+            return Err(RuntimeError::internal());
+        }
+        self.isolation_level = level;
+        self.diagnostic_sink = sink;
+        Ok(self)
     }
 
     /// Installs the internal trusted-identity validation hook.
@@ -331,7 +356,8 @@ impl ArrowColFlightService {
         permit: DrainPermit,
         trusted_client_send_observation: Option<(String, u64)>,
     ) -> RuntimeResult<Response<FlightResponseStream<PutResult>>> {
-        let descriptor_version = validate_ingest_descriptor(first.flight_descriptor.as_ref(), &metadata)?;
+        let descriptor_version =
+            validate_ingest_descriptor(first.flight_descriptor.as_ref(), &metadata, self.isolation_level)?;
         let received_schema = decode_first_schema(&first, self.limits.max_schema_bytes)?;
         let actual_fingerprint = fingerprint_schema(received_schema.as_ref());
         let validated = run_until(deadline, async {
@@ -388,6 +414,42 @@ impl ArrowColFlightService {
             Err(_) => return Err(RuntimeError::not_admitted_deadline_exceeded()),
         };
         self.pressure.observe(PressureEvent::StreamStarted);
+
+        if self.isolation_level != IsolationLevel::L5 {
+            // Keep the drain and fenced admission permits for the entire diagnostic request.
+            // No production batch enters the downstream route or receives a durable receipt.
+            let mut lifecycle = lifecycle;
+            let result = tokio::select! {
+                _ = force_stop.cancelled() => Err(RuntimeError::shutdown_after_admission()),
+                result = run_until(deadline, isolation::consume(
+                    self.isolation_level, self.diagnostic_sink.as_deref(), first, stream, current_arrow,
+                    &context, self.limits.max_message_bytes,
+                )) => result,
+            };
+            let receipt = match result {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    lifecycle.abort(StreamAbortReason::AdmissionFailure).await;
+                    self.pressure.observe(PressureEvent::StreamFinished {
+                        summary: StreamSummary::default(),
+                        outcome: StreamOutcome::AdmissionFailed,
+                    });
+                    return Err(error);
+                }
+            };
+            let summary = StreamSummary::new(receipt.batches, receipt.rows, receipt.ipc_body_bytes);
+            run_until(deadline, lifecycle.complete(summary)).await?;
+            self.pressure.observe(PressureEvent::StreamFinished {
+                summary,
+                outcome: StreamOutcome::Completed,
+            });
+            let result = PutResult {
+                app_metadata: serde_json::to_vec(&receipt)
+                    .map_err(|_| RuntimeError::internal())?
+                    .into(),
+            };
+            return Ok(Response::new(Box::pin(stream::once(async move { Ok(result) }))));
+        }
 
         let pressure = Arc::clone(&self.pressure);
         let limits = self.limits.clone();
@@ -931,6 +993,7 @@ fn validate_followup_message(data: &FlightData, max_message_bytes: usize) -> Run
 fn validate_ingest_descriptor(
     descriptor: Option<&FlightDescriptor>,
     metadata: &IngestMetadata,
+    level: IsolationLevel,
 ) -> RuntimeResult<SchemaVersion> {
     let descriptor = descriptor.ok_or_else(|| {
         RuntimeError::new(
@@ -941,7 +1004,10 @@ fn validate_ingest_descriptor(
     })?;
     if descriptor.r#type() != DescriptorType::Path
         || !descriptor.cmd.is_empty()
-        || descriptor.path.len() != 4
+        || !match level {
+            IsolationLevel::L5 => descriptor.path.len() == 4,
+            _ => descriptor.path.len() == 5 && descriptor.path[4] == level.as_str(),
+        }
         || descriptor.path[0] != metadata.table().catalog().as_str()
         || descriptor.path[1] != metadata.table().schema().as_str()
         || descriptor.path[2] != metadata.table().table().as_str()

@@ -444,6 +444,16 @@ struct ArrowFlightReceiver {
     direct_topology: bool,
 }
 
+#[async_trait]
+impl arrowcol_flight::DiagnosticBatchSink for crate::isolation::IsolationSink {
+    async fn accept(&self, batch: RecordBatch) -> RuntimeResult<()> {
+        self.accept(batch).await.map_err(|error| {
+            tracing::error!(error = %error, "collector diagnostic stage failed");
+            RuntimeError::internal()
+        })
+    }
+}
+
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
     let mut config: FlightReceiverConfig = parse_config(value)?;
     config.apply_environment().map_err(config_error)?;
@@ -567,6 +577,17 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
         let admission_trait: Arc<dyn BatchAdmission> = Arc::clone(&admission) as Arc<dyn BatchAdmission>;
         let drain = DrainController::new();
         let ddl_handler: Arc<dyn FlightSqlDdlHandler> = ddl;
+        let level = self.config.isolation_level;
+        let sink: Option<Arc<dyn arrowcol_flight::DiagnosticBatchSink>> = match level {
+            arrowcol_protocol::IsolationLevel::L2
+            | arrowcol_protocol::IsolationLevel::L3
+            | arrowcol_protocol::IsolationLevel::L4 => {
+                Some(Arc::new(crate::isolation::IsolationSink::new(level).map_err(
+                    |error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error.to_string()),
+                )?))
+            }
+            _ => None,
+        };
         let service = ArrowColFlightService::new(
             ImplementationPool::Dataflow,
             catalog,
@@ -577,6 +598,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             admission_trait,
             limits.clone(),
         )
+        .and_then(|service| service.with_isolation(level, sink))
         .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error.to_string()))?
         .with_ddl_handler(ddl_handler)
         .with_drain_controller(drain.clone());
@@ -1018,7 +1040,17 @@ fn admin_router(state: AdminState) -> Router {
         .route("/v1/capabilities", get(admin_capabilities))
         .route("/v1/pressure", get(admin_pressure))
         .route("/metrics", get(admin_metrics))
+        .route("/v1/isolation", get(admin_isolation))
         .with_state(state)
+}
+
+async fn admin_isolation() -> Response {
+    let ingress = arrowcol_flight::isolation_ingress_snapshot();
+    let physical = crate::isolation::isolation_stage_snapshot();
+    if ingress.is_none() && physical.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(serde_json::json!({"ingress":ingress,"physical":physical})).into_response()
 }
 
 #[derive(Serialize)]

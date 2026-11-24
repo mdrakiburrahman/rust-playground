@@ -229,6 +229,8 @@ pub struct UploadReport {
     pub best_effort_streams: usize,
     /// Streams completed with a local durable-buffer acknowledgement.
     pub durable_streams: usize,
+    /// Streams discarded by an explicitly matched diagnostic collector.
+    pub diagnostic_streams: usize,
     /// Rows whose streams completed with a validated admission response.
     pub completed_rows: u64,
 }
@@ -367,6 +369,7 @@ async fn send_tables_report(
     .await?;
     Ok(UploadReport {
         tables: count,
+        diagnostic_streams: 0,
         completed_rows: rows as u64 * count as u64,
         best_effort_streams: admissions
             .iter()

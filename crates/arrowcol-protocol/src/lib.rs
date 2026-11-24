@@ -13,6 +13,7 @@ mod error;
 mod fingerprint;
 mod identity;
 mod ids;
+mod isolation;
 mod lease;
 mod lifecycle;
 mod measurement;
@@ -41,6 +42,7 @@ pub use identity::{
     TableIdentity, TableName,
 };
 pub use ids::{CollectorInstanceId, IdParseError, LeaseId, PublicationId};
+pub use isolation::IsolationLevel;
 pub use lease::{FencingToken, LeaseError, PublicationFence, TableLease, TableLeaseSuccessorError};
 pub use lifecycle::{CollectorInstanceStatus, InstanceLifecycleState, InstanceStatusError, InstanceTransitionError};
 pub use measurement::{

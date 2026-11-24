@@ -4807,8 +4807,13 @@ fn copy_local_delta_reconciliation(evidence: &mut Value, reconciliation: &Value)
         evidence["durable_commits"] = json!({});
     }
     evidence["durable_commits"]["delta_log_reconciliation"] = reconciliation.clone();
-    evidence["screen_v1"] = reconciliation["csv"].clone();
-    evidence["screen_v1_csv_reason"] = reconciliation["csv_reason"].clone();
+    if evidence["evidence_class"] == "collector_isolation_diagnostic" {
+        evidence["screen_v1"] = Value::Null;
+        evidence["screen_v1_csv_reason"] = json!("diagnostic_isolation");
+    } else {
+        evidence["screen_v1"] = reconciliation["csv"].clone();
+        evidence["screen_v1_csv_reason"] = reconciliation["csv_reason"].clone();
+    }
 }
 
 fn attach_local_delta_reconciliation(
@@ -5829,6 +5834,16 @@ fn result_rows(
         tunables["evidence_class"] = json!("d53_exploratory");
         tunables["qualification"] = json!("not_qualifying");
     }
+    let diagnostic_isolation = config
+        .tunables
+        .collector
+        .as_ref()
+        .and_then(|collector| collector.isolation_level)
+        .filter(|&level| level != arrowcol_tunables::IsolationLevel::L5);
+    if diagnostic_isolation.is_some() {
+        tunables["evidence_class"] = json!("collector_isolation_diagnostic");
+        tunables["qualification"] = json!("not_qualifying");
+    }
     let details = [
         client_run.failure.clone(),
         client_run
@@ -5907,6 +5922,13 @@ fn result_rows(
         promote_client_readback(
             config,
             &mut table_leaf_evidence,
+            client_run.evidence.client_reports.get(&table),
+        )?;
+        promote_isolation_readback(
+            config,
+            &mut table_leaf_evidence,
+            client_run.evidence.processes.as_ref(),
+            replicas,
             client_run.evidence.client_reports.get(&table),
         )?;
         verify_literal_delta_consumers(
@@ -6050,6 +6072,16 @@ fn result_rows(
                         })
                     };
                 }
+                if let Some(level) = diagnostic_isolation {
+                    evidence["requested_isolation_level"] = json!(level);
+                    evidence["diagnostic_client_rows_per_second"] = json!(client.map(|client| client.rows_per_second));
+                    evidence["evidence_class"] = json!("collector_isolation_diagnostic");
+                    evidence["qualification"] = json!("not_qualifying");
+                    evidence["ranking_eligible"] = json!(false);
+                    evidence["ranking_ineligible_reason"] = json!("diagnostic_isolation");
+                    evidence["ranking_metrics"] = Value::Null;
+                    evidence["commit_window_output_usage"] = json!("diagnostic_only");
+                }
                 if let Some(resource_evidence) = &resource_evidence {
                     evidence["aks_resources"] = resource_evidence.clone();
                 }
@@ -6060,7 +6092,7 @@ fn result_rows(
             table,
             rows: client.map(|client| client.rows),
             duration_ms: client.map(|client| client.duration_ms),
-            rows_per_second: if table_failure.is_some() || client_run.pinning.violation.is_some() {
+            rows_per_second: if diagnostic_isolation.is_some() || table_failure.is_some() || client_run.pinning.violation.is_some() {
                 None
             } else {
                 client.map(|client| client.rows_per_second)
@@ -21742,6 +21774,59 @@ mod tests {
             result["ownership_samples"][0]["owners_by_table"][&canonical_table_key(&table)][0],
             "collector"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_isolation_retains_client_rate_but_cannot_qualify() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.truncate(1);
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"isolation_level":"l1"}}))?;
+        let table = config.tables[0].clone();
+        let clients = ClientRun {
+            metrics: HashMap::from([(
+                table.clone(),
+                ClientMetrics {
+                    rows: 100,
+                    duration_ms: 1000,
+                    rows_per_second: 100.0,
+                    completions: Vec::new(),
+                },
+            )]),
+            pinning: PinningReport {
+                owners: HashMap::from([(canonical_table_key(&table), "owner".into())]),
+                ..Default::default()
+            },
+            qap_tables: Vec::new(),
+            failure: None,
+            evidence: CellEvidence::default(),
+        };
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            "c0ffee00-0000-4000-8000-000000000001",
+            1,
+            1,
+            CellMeasurements {
+                clients,
+                started_at_ms: 1,
+                qap: QapMetrics::default(),
+                resources: None,
+                resource_evidence: None,
+            },
+        )?;
+        assert!(rows[0].rows_per_second.is_none());
+        let mut evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(evidence["diagnostic_client_rows_per_second"], 100.0);
+        assert_eq!(evidence["qualification"], "not_qualifying");
+        assert_eq!(evidence["ranking_eligible"], false);
+        assert!(evidence["ranking_metrics"].is_null());
+        let original = json!({"status":"mismatch", "csv":{"committed_rows_per_second":0}});
+        copy_local_delta_reconciliation(&mut evidence, &original);
+        assert_eq!(evidence["durable_commits"]["delta_log_reconciliation"], original);
+        assert!(evidence["screen_v1"].is_null());
         Ok(())
     }
 

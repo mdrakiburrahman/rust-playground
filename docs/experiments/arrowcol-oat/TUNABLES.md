@@ -524,3 +524,36 @@ percentiles separately from admission. The v3 verdict requires complete
 collector image/log/capability evidence and consistent output timing/counters.
 Known zero commits pass without a delivery claim; unavailable telemetry does
 not. Legacy v2 admission results remain readable, with no durable backfill.
+
+## Collector stage isolation
+
+| `tunables.collector.isolation_level` | Last stage exercised | What the result can show |
+| --- | --- | --- |
+| `l0` | Drain Flight payloads without decoding | Transport ceiling |
+| `l1` | Decode Arrow batches | Transport plus decode |
+| `l2` | Encode Parquet | Encode cost without local sync or object upload |
+| `l3` | Write and fsync Parquet locally | Local storage cost |
+| `l4` | Upload Parquet to diagnostic object storage | Upload cost without Delta publication |
+| `l5` (default) | Normal collector and Delta path | Committed output still requires ordinary Delta evidence |
+
+The setting accepts only the six lowercase strings. Omission sets no environment
+override. An explicit level sets `ARROWCOL_COLLECTOR_ISOLATION_LEVEL`; levels
+`l0`–`l4` also set `ARROWCOL_CLIENT_ISOLATION_LEVEL`. For example,
+`{"tunables":{"collector":{"isolation_level":"l1"}}}` selects decode-only.
+
+For `l3` and `l4` the collector deployment must provide
+`ARROWCOL_ISOLATION_SCRATCH_DIR`: an existing absolute, canonical directory
+named `arrowcol-isolation` outside any Delta table. For `l4` also set
+`ARROWCOL_ISOLATION_OBJECT_STORE` to `local` (local filesystem, not a cloud
+upload measurement) or
+`abfss://arrowcol-isolation@<account>.dfs.core.windows.net/arrowcol-isolation`.
+Use a dedicated Azure container with lifecycle cleanup: successful diagnostic
+uploads remain there, never in a Delta table. The tunable does not provision storage.
+
+**Use `l0`–`l4` only for disposable diagnostic traffic.** A successful stage
+does not admit or publish those rows. OAT verifies the requested level against
+collector startup and, for a diagnostic level, against each client for the
+table. Without matching readbacks the request is not consumer-verified.
+Diagnostic rows/s are reported as `diagnostic_client_rows_per_second`; the
+ordinary result rate and ranking metrics remain null, and Delta reconciliation
+continues to use actual commit evidence. A failed reconciliation is still a failure.

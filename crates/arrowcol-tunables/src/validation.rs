@@ -545,6 +545,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.operation_max_active_files", "1000000"),
     capability!("maintenance.discovery_max_log_files", "100000"),
     capability!("maintenance.discovery_max_log_file_bytes", "67108864"),
+    capability!("collector.isolation_level", "l5"),
 ];
 
 #[must_use]
@@ -1386,6 +1387,15 @@ impl Tunables {
                         if let Some(value) = value {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
+                    }
+                }
+                if let Some(level) = collector.isolation_level {
+                    output.insert(
+                        "ARROWCOL_COLLECTOR_ISOLATION_LEVEL".to_owned(),
+                        level.as_str().to_owned(),
+                    );
+                    if level != IsolationLevel::L5 {
+                        output.insert("ARROWCOL_CLIENT_ISOLATION_LEVEL".to_owned(), level.as_str().to_owned());
                     }
                 }
                 if let Some(value) = collector.cpu_pressure {

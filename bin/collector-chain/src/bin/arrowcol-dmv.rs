@@ -196,13 +196,15 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
         preflight_table_count
     };
     let (best_effort_streams, durable_streams) = client.admission_counts();
+    let diagnostic_streams = client.diagnostic_count();
     let terminal_metrics = client.completed_terminal_metrics()?;
     println!(
         "OAT_COLLECTOR_COMPLETION {}",
         serde_json::json!({
             "best_effort_streams": best_effort_streams,
             "durable_streams": durable_streams,
-            "admission_accounting_complete": true,
+            "diagnostic_discard_streams": diagnostic_streams,
+            "admission_accounting_complete": diagnostic_streams == 0,
             "completed_at_unix_ms": unix_time_ms()?,
         })
     );
