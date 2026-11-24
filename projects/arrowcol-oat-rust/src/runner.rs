@@ -3854,7 +3854,11 @@ async fn run_isolated_cell(
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
         && let Ok(rows) = &mut result
     {
-        attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, cleanup_succeeded).await;
+        if config.platform.kind == crate::config::OatMode::Local {
+            attach_final_local_delta_reconciliation(&config, &run_id, rows, cleanup_succeeded);
+        } else {
+            attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, cleanup_succeeded).await;
+        }
     }
     if !cancelled
         && config.platform.kind == crate::config::OatMode::Local
@@ -3991,6 +3995,28 @@ async fn attach_final_aks_delta_reconciliation(
         } else {
             None
         };
+        if let Err(error) = apply_final_aks_delta_reconciliation(config, row, delta.as_ref(), cleanup_succeeded) {
+            row.status = "failed".to_owned();
+            row.failure = Some(format!("final AKS Delta reconciliation failed: {error:#}"));
+        }
+    }
+}
+
+/// Local final reconciliation reads the verified stopped snapshot's Delta log, the same source as
+/// [`attach_local_delta_reconciliation`]; an unset root or failed verification stays unavailable.
+fn attach_final_local_delta_reconciliation(
+    config: &OatConfig,
+    run_id: &str,
+    rows: &mut [OatResult],
+    cleanup_succeeded: bool,
+) {
+    let root = config.platform.local.snapshot_root.as_deref().map(Path::new);
+    let verified = cleanup_succeeded
+        && root.is_some_and(|root| crate::local::stopped_snapshot_references(root, run_id, &config.tables).is_ok());
+    for row in rows {
+        let delta = root.filter(|_| verified).and_then(|root| {
+            read_local_delta_log_commits(&root.join(run_id).join(&row.table).join("table").join("_delta_log")).ok()
+        });
         if let Err(error) = apply_final_aks_delta_reconciliation(config, row, delta.as_ref(), cleanup_succeeded) {
             row.status = "failed".to_owned();
             row.failure = Some(format!("final AKS Delta reconciliation failed: {error:#}"));

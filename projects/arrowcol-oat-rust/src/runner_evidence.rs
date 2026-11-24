@@ -423,6 +423,71 @@ mod official_cell_measurement_tests {
         Ok(())
     }
 
+    #[test]
+    fn local_final_reconciliation_reads_the_verified_stopped_snapshot() -> Result<()> {
+        let (mut config, _, mut rows) = original_measurement()?;
+        config.clients_per_table = 1;
+        rows[0].status = "succeeded".to_owned();
+        rows[0].failure = None;
+        rows[0].evidence_json = Some(json!({
+            "client_phase_reports": [{"phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}}],
+            "durable_commits": {
+                "collector_teardown_admissions": {"status": "clear", "cancelled_ambiguous": 0},
+                "run_cumulative_output": {"rows": 10, "settled": true, "commits_by_version": [{"delta_version": 1, "rows": 10, "files": 1, "parquet_bytes": 50}]},
+                "output_throughput": {"rows": 10}, "complete_30_second_commit_windows": [{"rows": 10}]
+            }
+        }).to_string());
+        let run_id = "c0ffee00-0000-4000-8000-0000000000aa";
+        let table = rows[0].table.clone();
+        let root = std::env::temp_dir().join(format!("oat-final-local-{}", uuid::Uuid::new_v4()));
+        let write_snapshot = |rows_in_log: u64, digest_matches: bool| -> Result<()> {
+            let _ = fs::remove_dir_all(&root);
+            let log = root.join(run_id).join(&table).join("table").join("_delta_log");
+            fs::create_dir_all(&log)?;
+            fs::write(log.join(format!("{:020}.json", 0)), "{\"commitInfo\":{}}\n")?;
+            let add = json!({"add": {"path": "part-1.parquet", "size": 50, "dataChange": true,
+                "stats": json!({"numRecords": rows_in_log}).to_string()}});
+            fs::write(log.join(format!("{:020}.json", 1)), format!("{add}\n"))?;
+            let manifest = root.join(run_id).join(&table).join("manifest.json");
+            fs::write(&manifest, json!({"run_id": run_id, "table": table, "latestVersion": 1, "rowCount": rows_in_log}).to_string())?;
+            let (size, sha256) = crate::local::file_digest(&manifest)?;
+            let sha256 = if digest_matches { sha256 } else { "0".repeat(64) };
+            fs::write(root.join(run_id).join("complete.json"), json!({"run_id": run_id, "tables": [table],
+                "manifests": [{"path": format!("{table}/manifest.json"), "size": size, "sha256": sha256}]}).to_string())?;
+            Ok(())
+        };
+        let reconcile = |config: &OatConfig| -> Result<(OatResult, Value)> {
+            let mut candidate = rows.clone();
+            attach_final_local_delta_reconciliation(config, run_id, &mut candidate, true);
+            let evidence: Value = serde_json::from_str(candidate[0].evidence_json.as_deref().context("missing evidence")?)?;
+            Ok((candidate.remove(0), evidence))
+        };
+        let reason = "final_aks_delta_reconciliation_unavailable_or_mismatched";
+
+        let (row, evidence) = reconcile(&config)?;
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.failure.as_deref(), Some(reason));
+        assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["unavailable_reason"], "final_delta_log_unavailable");
+
+        config.platform.local.snapshot_root = Some(root.to_string_lossy().into_owned());
+        write_snapshot(10, true)?;
+        let (row, evidence) = reconcile(&config)?;
+        assert_eq!(row.status, "succeeded");
+        assert_eq!(row.failure, None);
+        assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["post_teardown_verification"], "matched_final_delta_log");
+        assert_eq!(evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"], "matched");
+
+        for (rows_in_log, digest_matches) in [(10, false), (9, true)] {
+            write_snapshot(rows_in_log, digest_matches)?;
+            let (row, evidence) = reconcile(&config)?;
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.failure.as_deref(), Some(reason));
+            assert_eq!(evidence["durable_commits"]["run_cumulative_output"]["post_teardown_verification"], "unavailable_or_mismatched");
+        }
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn official_publication_is_create_only_and_never_adopts_different_bytes() -> Result<()> {
         let (config, inventory, rows) = original_measurement()?;

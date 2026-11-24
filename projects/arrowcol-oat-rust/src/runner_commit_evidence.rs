@@ -763,6 +763,54 @@ async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> 
         parse_delta_log_adds(version, &contents, &mut adds)?;
     }
     validate_delta_log_version_history(&versions_seen, &checkpoint_tips)?;
+    summarize_delta_log_adds(adds)
+}
+
+/// Read a verified stopped local snapshot's `_delta_log` into the same shape as
+/// [`read_delta_log_commits`], so Local final reconciliation applies the AKS gates unchanged.
+fn read_local_delta_log_commits(delta_log: &Path) -> Result<Value> {
+    let mut adds = BTreeMap::new();
+    let mut log_files = 0_usize;
+    let mut versions_seen = BTreeSet::new();
+    let mut checkpoint_tips = BTreeSet::new();
+    for entry in fs::read_dir(delta_log).context("read stopped snapshot Delta log")? {
+        let entry = entry.context("read stopped snapshot Delta log entry")?;
+        let metadata = fs::symlink_metadata(entry.path()).context("inspect stopped snapshot Delta log entry")?;
+        if metadata.file_type().is_dir() {
+            continue;
+        }
+        ensure!(metadata.file_type().is_file(), "stopped snapshot Delta log entry is not a regular file");
+        let name = entry.file_name();
+        let filename = name.to_str().context("Delta log filename is not UTF-8")?;
+        if filename == "_last_checkpoint" {
+            ensure!(metadata.len() <= 64 * 1024, "Delta _last_checkpoint exceeds the 64 KiB evidence bound");
+            checkpoint_tips.insert(parse_last_checkpoint_version(&fs::read(entry.path())?)?);
+            continue;
+        }
+        if filename.contains(".checkpoint") {
+            let version = parse_delta_checkpoint_version(filename)?
+                .context("Delta checkpoint filename is malformed")?;
+            checkpoint_tips.insert(version);
+            continue;
+        }
+        let Some(version_text) = filename.strip_suffix(".json") else {
+            continue;
+        };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Delta log JSON filename is not a canonical version");
+        }
+        let version = version_text.parse::<u64>().context("Delta log version is invalid")?;
+        ensure!(versions_seen.insert(version), "duplicate Delta log version file");
+        ensure!(metadata.len() <= 16 * 1024 * 1024, "Delta log JSON exceeds the 16 MiB evidence bound");
+        log_files = log_files.checked_add(1).context("Delta log file count overflow")?;
+        ensure!(log_files <= 10_000, "Delta log exceeds the 10,000-file evidence bound");
+        parse_delta_log_adds(version, &fs::read(entry.path())?, &mut adds)?;
+    }
+    validate_delta_log_version_history(&versions_seen, &checkpoint_tips)?;
+    summarize_delta_log_adds(adds)
+}
+
+fn summarize_delta_log_adds(adds: BTreeMap<(u64, String), DeltaLogAdd>) -> Result<Value> {
     let mut versions: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
     for ((version, _), add) in adds {
         let totals = versions.entry(version).or_default();
