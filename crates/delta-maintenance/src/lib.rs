@@ -1082,6 +1082,8 @@ fn configuration_evidence(
             "apply": startup.apply,
             "anchor_ms": startup.anchor_ms,
             "operations": startup.operations,
+            "checkpoint_every_commits": startup.checkpoint_every_commits,
+            "optimize_target_file_bytes": startup.optimize.target_file_bytes,
             "interval_secs": startup.interval.map(|value| value.as_secs()),
             "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
             "max_cycles": startup.max_cycles,
@@ -1112,6 +1114,10 @@ fn configuration_evidence(
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
             "max_consecutive_stale_plans": settings.max_consecutive_stale_plans,
+            "checkpoint_every_commits": settings.operations.contains(&Operation::Checkpoint)
+                .then_some(settings.checkpoint_every_commits),
+            "optimize_target_file_bytes": settings.operations.contains(&Operation::Optimize)
+                .then_some(settings.optimize.target_file_bytes),
             "sealed_partitions_only": !settings.optimize.sealed_final,
             "layout_mode": layout_mode,
             "vacuum_retention_ms": settings.vacuum_retention_ms,
