@@ -198,6 +198,145 @@ impl PublicationCache {
     }
 }
 
+/// Every transaction of one snapshot lineage at `version`, so misses are authoritative.
+/// Snapshots of one lineage extend one certified history; later snapshots only add the
+/// commits after `version`, which are read directly instead of replaying the log.
+pub(crate) struct TxnIndex {
+    table: String,
+    lineage: u64,
+    version: u64,
+    transactions: HashMap<Box<str>, i64>,
+}
+
+impl TxnIndex {
+    pub(crate) fn lookup<'a>(
+        slot: &mut Option<Self>,
+        snapshot: &Snapshot,
+        lineage: Option<u64>,
+        engine: &dyn Engine,
+        ids: &[&'a str],
+    ) -> DeltaResult<HashMap<&'a str, Option<i64>>> {
+        // Expiry is wall-clock dependent, so expiring tables always replay.
+        let Some(lineage) =
+            lineage.filter(|_| snapshot.table_properties().set_transaction_retention_duration.is_none())
+        else {
+            return get_app_id_versions(snapshot, engine, ids.iter().copied());
+        };
+        let table = snapshot.table_configuration().metadata().id();
+        let version = snapshot.version();
+        let current = slot
+            .as_mut()
+            .filter(|index| index.table == table && index.lineage == lineage);
+        if current.as_ref().is_some_and(|index| index.version > version) {
+            return get_app_id_versions(snapshot, engine, ids.iter().copied());
+        }
+        let advanced = match current {
+            Some(index) => index.advance(snapshot, engine)?,
+            None => false,
+        };
+        if !advanced {
+            *slot = Some(Self::seed(snapshot, engine, table, lineage)?);
+        }
+        let index = slot
+            .as_ref()
+            .ok_or_else(|| Error::internal_error("transaction index missing after seed"))?;
+        Ok(ids
+            .iter()
+            .map(|&id| (id, index.transactions.get(id).copied()))
+            .collect())
+    }
+
+    /// Apply this writer's own commit, which carries exactly `submitted` transactions.
+    pub(crate) fn record_commit<'a>(
+        slot: &mut Option<Self>,
+        table: &str,
+        lineage: Option<u64>,
+        read_version: u64,
+        commit_version: u64,
+        submitted: impl IntoIterator<Item = (&'a str, i64)>,
+    ) {
+        if let Some(index) = slot.as_mut()
+            && Some(index.lineage) == lineage
+            && index.table == table
+            && index.version == read_version
+            && read_version.checked_add(1) == Some(commit_version)
+        {
+            index
+                .transactions
+                .extend(submitted.into_iter().map(|(id, version)| (id.into(), version)));
+            index.version = commit_version;
+        }
+    }
+
+    fn seed(snapshot: &Snapshot, engine: &dyn Engine, table: &str, lineage: u64) -> DeltaResult<Self> {
+        let mut visitor = AllTransactions::default();
+        for batch in snapshot.log_segment().read_actions(engine, LOG_TXN_SCHEMA.clone())? {
+            visitor.visit_rows_of(batch?.actions.as_ref())?;
+        }
+        Ok(Self {
+            table: table.to_owned(),
+            lineage,
+            version: snapshot.version(),
+            transactions: visitor.transactions,
+        })
+    }
+
+    /// Read only the published commits after the index; any other tail shape reseeds.
+    fn advance(&mut self, snapshot: &Snapshot, engine: &dyn Engine) -> DeltaResult<bool> {
+        let target = snapshot.version();
+        if self.version == target {
+            return Ok(true);
+        }
+        let tail = snapshot
+            .log_segment()
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|commit| commit.version > self.version)
+            .collect::<Vec<_>>();
+        let contiguous = tail.len() as u64 == target - self.version
+            && tail.iter().zip(self.version + 1..).all(|(commit, version)| {
+                commit.version == version && commit.file_type == delta_kernel::path::LogPathFileType::Commit
+            });
+        if !contiguous {
+            return Ok(false);
+        }
+        let files = tail.iter().rev().map(|commit| commit.location.clone()).collect::<Vec<_>>();
+        let mut visitor = AllTransactions::default();
+        for batch in engine.json_handler().read_json_files(&files, LOG_TXN_SCHEMA.clone(), None)? {
+            visitor.visit_rows_of(batch?.as_ref())?;
+        }
+        self.transactions.extend(visitor.transactions);
+        self.version = target;
+        Ok(true)
+    }
+}
+
+/// Newest-first transactions: callers supply reverse log order, so the first action wins.
+#[derive(Default)]
+struct AllTransactions {
+    transactions: HashMap<Box<str>, i64>,
+}
+
+impl RowVisitor for AllTransactions {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        SetTransactionVisitor::default().selected_column_names_and_types()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for row in 0..row_count {
+            let Some(id) = getters[0].get_str(row, "txn.appId")? else {
+                continue;
+            };
+            if !self.transactions.contains_key(id) {
+                let version: i64 = getters[1].get(row, "txn.version")?;
+                self.transactions.insert(id.into(), version);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) use tests::LOOKUPS;
 

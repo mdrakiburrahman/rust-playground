@@ -3187,8 +3187,11 @@ pub struct DeltaTable {
     session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
     pub(crate) txn_lookup_mode: crate::TxnLookupMode,
+    pub(crate) snapshot_cache_mode: crate::SnapshotCacheMode,
     pub(crate) publication_cache: Mutex<crate::publication_lookup::PublicationCache>,
+    txn_index: Mutex<Option<crate::publication_lookup::TxnIndex>>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
+    snapshot_lineages: std::sync::atomic::AtomicU64,
     layout_readback: Mutex<Option<serde_json::Value>>,
     stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
     reuse_snapshots: bool,
@@ -3362,11 +3365,51 @@ impl Drop for WriterLock {
     }
 }
 
-type LogFingerprints = BTreeMap<u64, LogFingerprint>;
+type LogFingerprints = BTreeMap<(u64, LogEntry), LogFingerprint>;
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LogEntry {
+    Commit,
+    /// Checkpoint parts and compacted commits, which Kernel may adopt but never rewrites.
+    Auxiliary(Box<str>),
+}
 
 struct CachedSnapshot {
     snapshot: SnapshotRef,
     files: LogFingerprints,
+    lineage: u64,
+}
+
+/// Classify a `_delta_log` entry: `None` is an unrecognized layout, `Some(None)` is
+/// metadata the snapshot never depends on.
+fn log_entry(name: &str, checkpoint_aware: bool) -> Option<Option<(u64, LogEntry)>> {
+    let parse = |digits: &str| {
+        (digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    };
+    if let Some(version) = name.strip_suffix(".json").and_then(parse) {
+        return Some(Some((version, LogEntry::Commit)));
+    }
+    if !checkpoint_aware {
+        return None;
+    }
+    if name == "_last_checkpoint" || name.starts_with('.') || name.contains('#') || name.ends_with(".crc") {
+        return Some(None);
+    }
+    let (digits, rest) = name.split_at_checked(20)?;
+    let version = parse(digits)?;
+    let rest = rest.strip_prefix('.')?;
+    (rest.starts_with("checkpoint.")
+        || (rest.ends_with(".compacted.json") && rest.split('.').next().and_then(parse).is_some()))
+    .then(|| Some((version, LogEntry::Auxiliary(rest.into()))))
+}
+
+fn retained_log_entry((version, entry): &(u64, LogEntry), floor: Option<u64>) -> bool {
+    floor.is_none_or(|floor| match entry {
+        LogEntry::Commit => *version > floor,
+        LogEntry::Auxiliary(_) => *version >= floor,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3926,8 +3969,11 @@ impl DeltaTable {
             _lock: None,
             commit_lock: Mutex::new(()),
             txn_lookup_mode: Default::default(),
+            snapshot_cache_mode: Default::default(),
             publication_cache: Default::default(),
+            txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
+            snapshot_lineages: Default::default(),
             layout_readback: Mutex::new(None),
             stats_readback: Mutex::new(None),
             reuse_snapshots: false,
@@ -4217,8 +4263,11 @@ impl DeltaTable {
             },
             commit_lock: Mutex::new(()),
             txn_lookup_mode: Default::default(),
+            snapshot_cache_mode: Default::default(),
             publication_cache: Default::default(),
+            txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
+            snapshot_lineages: Default::default(),
             layout_readback: Mutex::new(None),
             stats_readback: Mutex::new(None),
             reuse_snapshots,
@@ -4287,73 +4336,145 @@ impl DeltaTable {
     }
 
     pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
+        self.snapshot_with_lineage().map(|(snapshot, _)| snapshot)
+    }
+
+    /// The latest snapshot and, when it extends the cached chain, the lineage shared by
+    /// every snapshot derived from one certified full build.
+    pub(crate) fn snapshot_with_lineage(&self) -> Result<(SnapshotRef, Option<u64>)> {
         let full_build = || {
             Snapshot::builder_for(self.url.as_str())
                 .build(&self.engine)
                 .map_err(anyhow::Error::new)
         };
+        let checkpoint_aware = self.snapshot_cache_mode == crate::SnapshotCacheMode::CheckpointAware;
+        if checkpoint_aware && self.url.scheme() != "file" {
+            return self.object_store_snapshot(full_build);
+        }
         // Injected stores need not reflect filesystem metadata faithfully.
         if !self.reuse_snapshots || !cfg!(unix) {
-            return full_build();
+            return Ok((full_build()?, None));
         }
         let mut cache = self
             .snapshot_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta snapshot cache lock poisoned"))?;
         let previous = cache.take();
-        let before = self.log_fingerprints()?;
+        let mut floor = previous
+            .as_ref()
+            .filter(|_| checkpoint_aware)
+            .and_then(|previous| previous.snapshot.log_segment().checkpoint_version);
+        let mut before = self.log_fingerprints(checkpoint_aware, floor)?;
         let base = previous.filter(|previous| {
             before.as_ref().is_some_and(|files| {
                 previous
                     .files
                     .iter()
-                    .all(|(version, fingerprint)| files.get(version) == Some(fingerprint))
+                    .all(|(key, fingerprint)| files.get(key) == Some(fingerprint))
             })
         });
+        if base.is_none() && floor.is_some() {
+            floor = None;
+            before = self.log_fingerprints(checkpoint_aware, None)?;
+        }
         // JSON-only bases need only the new listing tail. Both integrity scans
         // still cover all history; a newly appearing checkpoint forces full loading.
+        // Checkpoint-aware bases adopt new checkpoints and scan only past the adopted one.
         // No pinned version or connector-supplied freshness is used.
         let snapshot = match &base {
+            Some(base) if checkpoint_aware => Snapshot::builder_from(Arc::clone(&base.snapshot)).build(&self.engine)?,
             Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot))
                 .skip_new_checkpoints()
                 .build(&self.engine)?,
             None => full_build()?,
         };
-        let after = self.log_fingerprints()?;
+        let after = self.log_fingerprints(checkpoint_aware, floor)?;
         if let (Some(before), Some(mut after)) = (before, after) {
-            after.retain(|version, _| *version <= snapshot.version());
-            if before.range(..=snapshot.version()).eq(after.iter()) {
+            let version = snapshot.version();
+            after.retain(|(entry_version, _), _| *entry_version <= version);
+            let stable = if checkpoint_aware {
+                // Checkpoints appear by atomic rename and Kernel validates any it adopts;
+                // commits must match exactly.
+                before
+                    .iter()
+                    .filter(|((entry_version, _), _)| *entry_version <= version)
+                    .all(|(key, fingerprint)| after.get(key) == Some(fingerprint))
+                    && after
+                        .keys()
+                        .all(|key| key.1 != LogEntry::Commit || before.contains_key(key))
+            } else {
+                before
+                    .iter()
+                    .take_while(|((entry_version, _), _)| *entry_version <= version)
+                    .eq(after.iter())
+            };
+            if stable {
+                if checkpoint_aware {
+                    let floor = snapshot.log_segment().checkpoint_version;
+                    after.retain(|key, _| retained_log_entry(key, floor));
+                }
+                let lineage = base.as_ref().map_or_else(
+                    || self.snapshot_lineages.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    |base| base.lineage,
+                );
                 *cache = Some(CachedSnapshot {
                     snapshot: Arc::clone(&snapshot),
                     files: after,
+                    lineage,
                 });
-                return Ok(snapshot);
+                return Ok((snapshot, Some(lineage)));
             }
         }
         // Mutation during an incremental load invalidates its historical baseline.
         // Never retain a snapshot with fingerprints captured after that mutation.
         if base.is_some() {
-            return full_build();
+            return Ok((full_build()?, None));
         }
-        Ok(snapshot)
+        Ok((snapshot, None))
     }
 
-    fn log_fingerprints(&self) -> Result<Option<LogFingerprints>> {
+    /// Object-store commits are put-if-absent and the publisher session fences ownership,
+    /// so the previous snapshot is a sound base for the listing tail.
+    fn object_store_snapshot(
+        &self,
+        full_build: impl Fn() -> Result<SnapshotRef>,
+    ) -> Result<(SnapshotRef, Option<u64>)> {
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Delta snapshot cache lock poisoned"))?;
+        let (snapshot, lineage) = match cache.take().and_then(|previous| {
+            Snapshot::builder_from(Arc::clone(&previous.snapshot))
+                .build(&self.engine)
+                .ok()
+                .map(|snapshot| (snapshot, previous.lineage))
+        }) {
+            Some(extended) => extended,
+            None => (
+                full_build()?,
+                self.snapshot_lineages.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
+        };
+        *cache = Some(CachedSnapshot {
+            snapshot: Arc::clone(&snapshot),
+            files: BTreeMap::new(),
+            lineage,
+        });
+        Ok((snapshot, Some(lineage)))
+    }
+
+    fn log_fingerprints(&self, checkpoint_aware: bool, floor: Option<u64>) -> Result<Option<LogFingerprints>> {
         let mut files = BTreeMap::new();
         for entry in fs::read_dir(self.root.join("_delta_log"))? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(version) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".json"))
-                .filter(|version| version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit()))
-            else {
-                // Checkpoints, CRCs, and nonstandard log layouts keep the existing
-                // full-build behavior rather than adding cache rules for them.
+            let Some(key) = name.to_str().and_then(|name| log_entry(name, checkpoint_aware)) else {
+                // Unrecognized layouts keep the full-build behavior; without checkpoint
+                // awareness that includes checkpoints and CRCs.
                 return Ok(None);
             };
-            let Ok(version) = version.parse::<u64>() else {
-                return Ok(None);
+            let Some(key) = key.filter(|key| retained_log_entry(key, floor)) else {
+                continue;
             };
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
@@ -4369,7 +4490,7 @@ impl DeltaTable {
                 (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
             };
             files.insert(
-                version,
+                key,
                 LogFingerprint {
                     length: metadata.len(),
                     modified: metadata.modified()?,
@@ -5593,6 +5714,7 @@ impl DeltaTable {
     fn publication_versions<'a>(
         &self,
         snapshot: &SnapshotRef,
+        lineage: Option<u64>,
         ids: &[&'a str],
     ) -> Result<std::collections::HashMap<&'a str, Option<i64>>> {
         match self.txn_lookup_mode {
@@ -5610,6 +5732,16 @@ impl DeltaTable {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("publication cache poisoned"))?
                 .lookup(snapshot, &self.engine, ids)?),
+            TxnLookupMode::Incremental => Ok(crate::publication_lookup::TxnIndex::lookup(
+                &mut self
+                    .txn_index
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("transaction index poisoned"))?,
+                snapshot,
+                lineage,
+                &self.engine,
+                ids,
+            )?),
         }
     }
 
@@ -5639,9 +5771,9 @@ impl DeltaTable {
             }
             observation.event("attempt");
             self.check_publication()?;
-            let snapshot = self.snapshot()?;
+            let (snapshot, lineage) = self.snapshot_with_lineage()?;
             Self::validate_retention(&snapshot)?;
-            let versions = self.publication_versions(&snapshot, ids)?;
+            let versions = self.publication_versions(&snapshot, lineage, ids)?;
             let replay = |id: &str, v: i64, evidence: &mut PublicationEvidence| {
                 evidence.mark(PublicationReason::Deduplicated);
                 let proven = self
@@ -5891,8 +6023,8 @@ impl DeltaTable {
                 .chain(identity)
                 .collect::<Vec<_>>();
             let reconcile = |evidence: &mut PublicationEvidence| -> Result<Option<u64>> {
-                let latest = self
-                    .snapshot()
+                let (latest, latest_lineage) = self
+                    .snapshot_with_lineage()
                     .context("unknown publication outcome; reconciliation failed")?;
                 Self::validate_retention(&latest)?;
                 let mut ids = pending
@@ -5915,8 +6047,11 @@ impl DeltaTable {
                 let mut group_committed = 0;
                 let group_total = group_transaction_ids.len();
                 let mut all_committed = true;
-                let versions =
-                    self.publication_versions(&latest, &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>())?;
+                let versions = self.publication_versions(
+                    &latest,
+                    latest_lineage,
+                    &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )?;
                 for (id, version, is_group) in ids {
                     match versions[id] {
                         Some(previous) if previous > version => {
@@ -5965,6 +6100,18 @@ impl DeltaTable {
                         evidence
                             .outcomes
                             .insert((id.to_owned(), v), PublicationOutcome::CommittedNow(version));
+                    }
+                    if self.txn_lookup_mode == TxnLookupMode::Incremental
+                        && let Ok(mut index) = self.txn_index.lock()
+                    {
+                        crate::publication_lookup::TxnIndex::record_commit(
+                            &mut index,
+                            &table_uuid,
+                            lineage,
+                            read_version,
+                            version,
+                            submitted.iter().copied(),
+                        );
                     }
                     if let Ok(mut cache) = self.publication_cache.lock() {
                         cache.remember(table_uuid, version, submitted.iter().map(|&(id, v)| (id.to_owned(), v)));
