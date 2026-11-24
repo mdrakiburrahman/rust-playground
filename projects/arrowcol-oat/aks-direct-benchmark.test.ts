@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { ROOT } from '../../infra/azure/bootstrap.js';
-import { assertRenderedManifest, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
+import { assertRenderedManifest, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry, verifyBenchmarkPlacement } from './aks-direct-benchmark.js';
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));
@@ -63,7 +63,26 @@ test('rendered benchmark manifest enforces ownership, stage, image, and timed-wi
     assert.throws(() => assertRenderedManifest(rendered.replace('benchmark-stage: load', 'benchmark-stage: unknown'), runId, owner, 'arrowcollector68590.azurecr.io'), /stage label/);
     assert.throws(() => assertRenderedManifest(rendered.replace('@sha256:', ':latest'), runId, owner, 'arrowcollector68590.azurecr.io'), /pinned SHA-256 digest/);
     assert.throws(() => assertRenderedManifest(rendered.replace('arrowcol-oat/owner-token: ' + owner, 'arrowcol-oat/owner-token: ' + 'b'.repeat(48)), runId, owner, 'arrowcollector68590.azurecr.io'), /ownership markers/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('kubernetes.azure.com/agentpool: benche64', 'kubernetes.azure.com/agentpool: arrowe192'), runId, owner, 'arrowcollector68590.azurecr.io'), /must select agent pool benche64/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('        kubernetes.azure.com/agentpool: benche64\n', ''), runId, owner, 'arrowcollector68590.azurecr.io'), /must select agent pool benche64/);
   }
+});
+
+test('pre-load placement rejects an escaped collector stack or unknown node', () => {
+  const nodes = [
+    { metadata: { name: 'collector-node', labels: { 'kubernetes.azure.com/agentpool': 'benche64' } } },
+    { metadata: { name: 'client-node', labels: { 'kubernetes.azure.com/agentpool': 'benchd64' } } },
+    { metadata: { name: 'other-node', labels: { 'kubernetes.azure.com/agentpool': 'arrowe192' } } },
+  ];
+  const collector = { metadata: { name: 'collector' }, spec: { nodeName: 'collector-node' } };
+  const client = {
+    metadata: { name: 'client', labels: { 'batch.kubernetes.io/job-name': 'direct-load-confirmwide' } },
+    spec: { nodeName: 'client-node' },
+  };
+  assert.deepEqual(verifyBenchmarkPlacement([collector, client], nodes).map(pod => pod.pool), ['benche64', 'benchd64']);
+  assert.throws(() => verifyBenchmarkPlacement([{ ...collector, spec: { nodeName: 'other-node' } }, client], nodes), /on arrowe192, expected benche64/);
+  assert.throws(() => verifyBenchmarkPlacement([collector, { ...client, spec: { nodeName: 'collector-node' } }], nodes), /expected benchd64/);
+  assert.throws(() => verifyBenchmarkPlacement([collector], []), /on unknown/);
 });
 
 test('rendered Kubernetes env values remain strings for YAML 1.1 consumers', async () => {
