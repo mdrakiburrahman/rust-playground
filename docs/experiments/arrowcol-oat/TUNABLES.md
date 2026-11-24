@@ -198,8 +198,10 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
 | `collector.commit.txn_lookup_mode` | `per_id` checks each publication identity individually; `batched` (default) groups lookups; `batched_cached` reuses eligible lookup results; `incremental` indexes every distinct application ID in a certified snapshot and reads new transactions from its log tail. Its memory usage grows with the number of identities, not just the number in the current batch. Uncertified history still uses batched replay. |
 | `collector.commit.snapshot_cache_mode` | `json_only` (default) reuses eligible local snapshots for JSON-only logs. `checkpoint_aware` also certifies classic checkpoints and object-store files with version or ETag evidence. Unrecognized log layouts fall back to Kernel replay. Neither mode disables transaction checks. |
+| `collector.commit.preflight_lookup_mode` | `per_entry` (default) asks Kernel for each entry's prior transaction while preparing a coalesced group, replaying the log once per entry. `grouped` resolves every entry in one lookup through `collector.commit.txn_lookup_mode`, so `batched` replays once per group and `incremental` reads only the new log tail. Tables with custom partitions keep per-entry lookups because their identities are per partition. Fences and replay skips are unchanged. |
 | `collector.commit.checkpoint_mode` | `external` (default) leaves checkpoints to maintenance. `inline` writes on the commit thread; `async` coalesces requests on one separate thread per active table. OAT rejects concurrent in-process and maintenance checkpoint writers. Failed checkpoint writes are reported separately and never turn a durable data commit into a failed receipt. |
 | `collector.commit.checkpoint_interval` | Integer number of commits, `1..=100000` (default `10`). Controls the collector's `inline` or `async` cadence; accepted but unused in `external` mode. Does not change the `delta.checkpoint_interval` table property or maintenance settings. Collector startup reports all four effective options under `commit`; this readback is evidence of configuration, not of a written checkpoint. |
+| `collector.commit.trigger` | When a partially filled Delta batch commits: `window` (default) waits up to `batch_window` unless forced, draining or full; `eager` commits the already queued cohort as soon as the commit worker is idle, so groups that arrive during a commit form the next version. Both still honour `max_files_per_commit` and split overlapping identities. Composes with `collector.batching.max_pending_commit_bytes`: the budget releases capacity at queue handoff and eager drains that queue without waiting for the window. Strict enum; other values fail validation. Projected in `ARROWCOL_COLLECTOR_COMMIT_CONFIG`; collector startup reports the effective value under `commit.trigger`. |
 | `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
 | `collector.runtime.timestamp_kernel` | `reference` (default) or `fused_checked`. The latter writes UTC microseconds and exact epoch nanoseconds in one checked pass per timestamp column, including nested fields. Negative timestamps round down; nulls remain null and unrepresentable nanoseconds fail the batch. |
 | `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
@@ -220,6 +222,8 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.runtime.thread_stack_size` | Integer bytes `65536..=67108864`; unset uses platform default. Startup only. Configures Delta I/O worker and blocking thread stack size; the OS may round the allocation. Readback is the builder value, not an OS stack measurement. |
 | `collector.runtime.thread_keep_alive_ms` | Integer milliseconds `1..=86400000`; unset uses Tokio default 10000. Startup only. Controls idle Delta I/O blocking worker lifetime and thread churn. |
 | `collector.runtime.cpu_thread_stack_size` | Integer bytes `65536..=67108864`; unset uses platform default. Startup only. Configures dedicated Delta CPU worker stacks; the OS may round the allocation. Readback is the builder value, not an OS stack measurement, and consumer evidence requires the lazy CPU pool on every collector. |
+| `collector.runtime.parquet_encode_mode` | Strict enum `column_waves` (unchanged default) or `column_pipeline`, via `ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE`. Pipeline requires `parquet_column_workers > 1`, retains a bounded window of Arrow slices, and removes per-batch wave barriers while preserving row-group and column order. It rejects `parquet_writer.max_row_group_bytes` and API-supplied content-defined chunking. Queued slices can retain their parent allocations; this is not a hard RSS cap. Pipeline also extends the streaming staging contract above to multiple column workers: `buffered_multipart` remains required, and at most two 64 KiB bridge chunks plus one each in the producer and consumer are retained before the existing upload pipe. Completion still requires a finished footer and successful guarded upload before Delta commit. |
+| `collector.batching.stage_files_per_group` | Integer `1..=16`, default `1`. For coalesced unsorted publications, split each nonempty partition into up to this many contiguous balanced files without copying Arrow buffers. Sorted layouts reject values above `1` and retain their existing row/byte splitting. Actual staging fanout is independently bounded by `stage_file_concurrency`. The aggregate must fit `max_files_per_commit`; every split retains the original replay identities and one atomic commit, and no empty files are added. Projected in `ARROWCOL_COLLECTOR_BATCHING_CONFIG`; readback is `batching.stage_files_per_group`. More files trade compression and file-count overhead for encode parallelism. |
 | `collector.socket.recv_buffer_bytes` / `send_buffer_bytes` | Integer bytes `1..=1073741823`; unset preserves the OS listener default. Linux startup only. Sets `SO_RCVBUF` / `SO_SNDBUF` on each Flight listener after bind/listen; accepted sockets inherit them. Linux reports doubled values for bookkeeping; startup fails if the kernel-reported listener size is not exactly twice the request, rejecting both upward and downward clamping. Readback records the kernel-reported listener bytes. The listener already accepts handshakes during the brief interval before configuration, so these settings are not pre-bind controls. |
 | `collector.socket.tcp_nodelay` | Boolean; unset leaves the OS default unchanged. Startup only. Sets `TCP_NODELAY` on every accepted Flight connection, changing server-side Nagle buffering. Consumer evidence requires an accepted socket on every collector. |
 | `collector.thp_disabled` | Boolean; unset preserves the inherited Linux process flag. Startup only. `true` disables transparent huge pages for the process; `false` clears that flag but does not override system THP policy. Readback is the kernel flag, not proof of actual huge-page use. Non-Linux collectors reject the setting. |
@@ -562,3 +566,26 @@ table. Without matching readbacks the request is not consumer-verified.
 Diagnostic rows/s are reported as `diagnostic_client_rows_per_second`; the
 ordinary result rate and ranking metrics remain null, and Delta reconciliation
 continues to use actual commit evidence. A failed reconciliation is still a failure.
+
+### Client offered load
+
+Each continuous client's `measurement_window` and its 30-second `windows`
+report `offered_rows` (first `DoPut` attempts) and `retry_offered_rows`
+(actual resubmissions, excluding backoffs that expire before send). These
+use the fresh send timestamp in the half-open window. `completed_rows` uses
+the observed admission ACK timestamp instead. Divide each count by the same
+window duration; do not add retries to fresh offers or count ACKs as Delta
+commits. A closed-loop sender can remain near one offer per ACK even with
+CPU headroom: measure spare sending capacity against an independent sink.
+
+### Collector Flight HTTP/2 receive settings
+
+| `collector.socket` field | Accepted bytes | Effect |
+| --- | --- | --- |
+| `h2_stream_window_bytes` | 65,535–67,108,864 | Initial receive credit per stream. |
+| `h2_connection_window_bytes` | 65,535–268,435,456 | Initial receive credit shared by streams on a connection. |
+| `h2_max_frame_bytes` | 16,384–1,048,576 | Maximum HTTP/2 frame size advertised to the sender. |
+
+All three are optional startup settings. Omitted values preserve the underlying
+tonic defaults. They do not change gRPC message limits, collector admission or
+commit acknowledgements. A configured value alone is not wire-level evidence.

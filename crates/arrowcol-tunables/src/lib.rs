@@ -1018,6 +1018,25 @@ pub struct CollectorSocketTunables {
         deserialize_with = "deserialize_present_bool"
     )]
     pub tcp_nodelay: Option<bool>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_stream_window_bytes: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_connection_window_bytes: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_max_frame_bytes: Option<u32>,
+}
+
+fn deserialize_present_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
 }
 
 impl CollectorSocketTunables {
@@ -1034,6 +1053,20 @@ impl CollectorSocketTunables {
                 && !(1..=1_073_741_823).contains(&value)
             {
                 return Err(format!("{name} must be in 1..=1073741823"));
+            }
+        }
+        for (name, value, min, max) in [
+            ("h2_stream_window_bytes", self.h2_stream_window_bytes, 65_535, 64 << 20),
+            (
+                "h2_connection_window_bytes",
+                self.h2_connection_window_bytes,
+                65_535,
+                256 << 20,
+            ),
+            ("h2_max_frame_bytes", self.h2_max_frame_bytes, 16_384, 1 << 20),
+        ] {
+            if value.is_some_and(|bytes| !(min..=max).contains(&bytes)) {
+                return Err(format!("collector.socket.{name} must be in {min}..={max}"));
             }
         }
         Ok(())
@@ -1126,6 +1159,11 @@ pub struct BatchingTunables {
         deserialize_with = "deserialize_stage_file_concurrency"
     )]
     pub stage_file_concurrency: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stage_files_per_group"
+    )]
+    pub stage_files_per_group: Option<usize>,
     pub adaptive_file: Option<AdaptiveFileTunables>,
 }
 
@@ -1137,6 +1175,11 @@ pub struct CommitTunables {
         deserialize_with = "deserialize_txn_lookup_mode"
     )]
     pub txn_lookup_mode: Option<arrow_deltalake::TxnLookupMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_commit_trigger"
+    )]
+    pub trigger: Option<arrow_deltalake::CommitTrigger>,
     pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
@@ -1147,6 +1190,8 @@ pub struct CommitTunables {
     pub delta_stats_columns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub snapshot_cache_mode: Option<arrow_deltalake::SnapshotCacheMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub preflight_lookup_mode: Option<arrow_deltalake::PreflightLookupMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub checkpoint_mode: Option<arrow_deltalake::CheckpointMode>,
     #[serde(
@@ -1164,6 +1209,12 @@ fn deserialize_txn_lookup_mode<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::TxnLookupMode>, D::Error> {
     arrow_deltalake::TxnLookupMode::deserialize(d).map(Some)
+}
+
+fn deserialize_commit_trigger<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CommitTrigger>, D::Error> {
+    arrow_deltalake::CommitTrigger::deserialize(d).map(Some)
 }
 
 fn deserialize_delta_stats_columns<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -1293,6 +1344,11 @@ pub struct RuntimeTunables {
     pub parquet_column_workers: Option<u8>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_parquet_encode_mode"
+    )]
+    pub parquet_encode_mode: Option<arrow_deltalake::ParquetEncodeMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_usize"
     )]
     pub cpu_queue_jobs: Option<usize>,
@@ -1371,6 +1427,12 @@ fn deserialize_cpu_dispatch<'de, D: serde::Deserializer<'de>>(
     deserialize_mode(d, "collector.runtime.cpu_dispatch")
 }
 
+fn deserialize_parquet_encode_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::ParquetEncodeMode>, D::Error> {
+    deserialize_mode(d, "collector.runtime.parquet_encode_mode")
+}
+
 fn deserialize_staging_mode<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::StagingMode>, D::Error> {
@@ -1393,6 +1455,12 @@ fn deserialize_stage_file_concurrency<'de, D: serde::Deserializer<'de>>(d: D) ->
     usize::deserialize(d)
         .map(Some)
         .map_err(|_| serde::de::Error::custom("collector.batching.stage_file_concurrency must be an integer in 1..=16"))
+}
+
+fn deserialize_stage_files_per_group<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.batching.stage_files_per_group must be an integer in 1..=16"))
 }
 
 fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(

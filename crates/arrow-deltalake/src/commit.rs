@@ -17,14 +17,18 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+pub use crate::CommitTrigger;
+
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitOptions {
     pub txn_lookup_mode: crate::TxnLookupMode,
+    pub trigger: CommitTrigger,
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
     pub snapshot_cache_mode: crate::SnapshotCacheMode,
+    pub preflight_lookup_mode: crate::PreflightLookupMode,
     pub checkpoint_mode: crate::CheckpointMode,
     pub checkpoint_interval: u64,
 }
@@ -37,8 +41,10 @@ impl Default for CommitOptions {
             max_pending_files: 256,
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
+            preflight_lookup_mode: Default::default(),
             checkpoint_mode: Default::default(),
             checkpoint_interval: 10,
+            trigger: CommitTrigger::default(),
         }
     }
 }
@@ -609,9 +615,29 @@ impl BatchedTable {
         entries: Vec<(RecordBatch, String, i64, i64)>,
         stage_file_concurrency: usize,
     ) -> Result<PreparedPublicationGroup> {
+        self.stage_coalesced_publications_with_file_policy(entries, stage_file_concurrency, 1)
+            .await
+    }
+
+    /// Split each unsorted partition into up to `stage_files_per_group` balanced files,
+    /// stage at the requested concurrency, and retain one atomic commit and replay identity set.
+    ///
+    /// # Errors
+    /// Rejects widths outside 1..=16, sorted layouts with splitting, file-cap overflow and staging failures.
+    pub async fn stage_coalesced_publications_with_file_policy(
+        &self,
+        entries: Vec<(RecordBatch, String, i64, i64)>,
+        stage_file_concurrency: usize,
+        stage_files_per_group: usize,
+    ) -> Result<PreparedPublicationGroup> {
         let table = Arc::clone(self.preparation.get().context("Delta owner is not initialized")?);
         let (appends, identities, committed_identities, preparation_build, preparation_sort) = table
-            .stage_coalesced_publications(entries, self.options.max_files_per_commit, stage_file_concurrency)
+            .stage_coalesced_publications(
+                entries,
+                self.options.max_files_per_commit,
+                stage_file_concurrency,
+                stage_files_per_group,
+            )
             .await
             .map_err(CommitReceiptError::from_anyhow)?;
         Ok(PreparedPublicationGroup {
@@ -846,6 +872,7 @@ fn run_worker(
             let owner = Arc::get_mut(&mut table).context("new Delta worker table is already shared")?;
             owner.txn_lookup_mode = options.txn_lookup_mode;
             owner.snapshot_cache_mode = options.snapshot_cache_mode;
+            owner.preflight_lookup_mode = options.preflight_lookup_mode;
             checkpoints = CheckpointSchedule::new(&table, &options)?;
             Ok(table)
         });
@@ -998,6 +1025,10 @@ fn run_worker(
                         if force || draining.load(Ordering::Acquire) || file_count >= options.max_files_per_commit {
                             publish(&mut batch, &mut failure);
                             deadline = None;
+                        } else if options.trigger == CommitTrigger::Eager && !flushing {
+                            // Group-commit the queued cohort; later arrivals form the next batch.
+                            flushing = true;
+                            flush_remaining = receiver.len();
                         }
                     }
                     None => {
@@ -1240,6 +1271,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_coalesced_files_preserve_partition_rows_and_atomic_replay() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let (table, batch) = partitioned_stage_fixture(&root).await?;
+        let entries = vec![(batch.clone(), "first".into(), 0, 10), (batch, "second".into(), 0, 10)];
+        let group = table
+            .stage_coalesced_publications_with_file_policy(entries.clone(), 3, 3)
+            .await?;
+        assert_eq!(
+            group.appends.iter().map(|append| append.file.rows).collect::<Vec<_>>(),
+            [1, 1, 2, 1, 1]
+        );
+        let identities = group.identities.clone();
+        let mut rows = Vec::new();
+        for append in &group.appends {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(
+                &append.file.path,
+            )?)?;
+            for decoded in reader.build()? {
+                let decoded = decoded?;
+                let ids = decoded
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .context("id array")?;
+                rows.extend_from_slice(ids.values());
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, [1, 1, 2, 2, 3, 3]);
+        let result = table.submit_prepared_group(group, true).await?.wait().await?;
+        assert_eq!(result.version, 1);
+        assert_eq!(result.files.len(), 5);
+        let actions = std::fs::read_to_string(root.join("_delta_log/00000000000000000001.json"))?;
+        assert_eq!(actions.lines().filter(|line| line.contains("\"add\":")).count(), 5);
+        let replay = table
+            .stage_coalesced_publications_with_file_policy(entries, 3, 3)
+            .await?;
+        assert!(replay.appends.is_empty());
+        assert!(replay.identities.is_empty());
+        assert_eq!(replay.committed_identities, identities);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_coalesced_files_reject_cap_before_staging() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let schema = input()?.schema();
+        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid test path"))?;
+        DeltaTable::open_catalog(url)?.commit_catalog(
+            None,
+            Arc::clone(&schema),
+            Vec::new(),
+            Default::default(),
+            None,
+        )?;
+        let table = BatchedTable::open(
+            &root,
+            CommitOptions {
+                max_files_per_commit: 2,
+                ..CommitOptions::default()
+            },
+        )
+        .await?;
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))])?;
+        let error = table
+            .stage_coalesced_publications_with_file_policy(vec![(batch, "split".into(), 0, 10)], 2, 3)
+            .await
+            .err()
+            .context("file cap must reject the split")?;
+        assert!(matches!(
+            error.downcast_ref::<CommitReceiptError>(),
+            Some(CommitReceiptError::GroupCapacityExceeded {
+                required_files: 3,
+                max_files: 2
+            })
+        ));
+        assert!(
+            !std::fs::read_dir(&root)?
+                .any(|entry| entry.is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet")))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn saturated_coalesced_publish_and_reclaim() -> Result<()> {
         const CHILD: &str = "ARROWCOL_TEST_SATURATED_STAGE";
         if std::env::var_os(CHILD).is_none() {
@@ -1405,6 +1522,93 @@ mod tests {
             table.submit_prepared_group(prepared, true).await?.wait().await?.version,
             2
         );
+        Ok(())
+    }
+
+    /// Scenario: unforced groups reach the worker while an earlier commit is blocked.
+    /// Guarantees: eager commits the first group without its window and group-commits the
+    /// queued cohort as the next version; window mode still holds a lone group until flushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_trigger_group_commits_queued_cohort_without_waiting_for_window() -> Result<()> {
+        type Gates = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+        struct Gate(Mutex<Option<Gates>>);
+        impl PublicationFence for Gate {
+            fn check_before_commit(
+                &self,
+                context: &crate::delta::PublicationFenceContext<'_>,
+            ) -> std::result::Result<(), PublicationFenceError> {
+                if context.file_count() > 0
+                    && let Some((entered, release)) = self
+                        .0
+                        .lock()
+                        .map_err(|_| PublicationFenceError::check_failed("test gate poisoned"))?
+                        .take()
+                {
+                    let _ = entered.send(());
+                    release
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|_| PublicationFenceError::check_failed("test gate was not released"))?;
+                }
+                Ok(())
+            }
+        }
+        let bound = Duration::from_secs(3);
+        let options = CommitOptions {
+            trigger: CommitTrigger::Eager,
+            batch_window: Duration::from_secs(60),
+            max_files_per_commit: 8,
+            max_pending_files: 8,
+            ..Default::default()
+        };
+        let directory = tempfile::tempdir()?;
+        let (entered, observed) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let fence = Arc::new(Gate(Mutex::new(Some((entered, wait)))));
+        let table = BatchedTable::open_with_fence(directory.path(), options.clone(), fence).await?;
+        let mut groups = Vec::new();
+        for (stamp, name) in [(10, "first"), (20, "second"), (30, "third")] {
+            groups.push(
+                table
+                    .stage_coalesced_publications(vec![(input()?, name.into(), 0, stamp)])
+                    .await?,
+            );
+        }
+        let mut groups = groups.into_iter();
+        let first = table
+            .submit_prepared_group(groups.next().context("first group")?, false)
+            .await?;
+        tokio::time::timeout(bound, observed)
+            .await
+            .context("eager commit waited for the window")??;
+        let mut queued = Vec::new();
+        for group in groups {
+            queued.push(table.submit_prepared_group(group, false).await?);
+        }
+        release.send(())?;
+        assert_eq!(tokio::time::timeout(bound, first.wait()).await??.version, 1);
+        for receipt in queued {
+            assert_eq!(tokio::time::timeout(bound, receipt.wait()).await??.version, 2);
+        }
+        let log = std::fs::read_to_string(directory.path().join("_delta_log/00000000000000000002.json"))?;
+        assert_eq!(log.lines().filter(|line| line.starts_with(r#"{"add""#)).count(), 2);
+
+        let directory = tempfile::tempdir()?;
+        let windowed = CommitOptions {
+            trigger: CommitTrigger::Window,
+            ..options
+        };
+        let table = BatchedTable::open(directory.path(), windowed).await?;
+        let group = table
+            .stage_coalesced_publications(vec![(input()?, "window".into(), 0, 10)])
+            .await?;
+        let receipt = tokio::spawn(table.submit_prepared_group(group, false).await?.wait());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !receipt.is_finished(),
+            "window trigger committed before its window or a flush"
+        );
+        table.flush_pending();
+        assert_eq!(tokio::time::timeout(bound, receipt).await???.version, 1);
         Ok(())
     }
 

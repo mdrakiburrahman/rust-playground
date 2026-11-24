@@ -54,5 +54,13 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber.workspace = true
 tokio = { version = "1", features = ["macros"] }
 
+[[example]]
+name = "stage_bench"
+required-features = ["delta"]
+
+[[example]]
+name = "commit_bench"
+required-features = ["delta"]
+
 [lints]
 workspace = true

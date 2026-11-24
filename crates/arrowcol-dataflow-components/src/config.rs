@@ -41,7 +41,7 @@ mod override_tests {
 
     #[test]
     fn commit_projection_preserves_yaml_and_reaches_table_options() -> Result<(), String> {
-        use arrow_deltalake::{CheckpointMode, SnapshotCacheMode, TxnLookupMode};
+        use arrow_deltalake::{CheckpointMode, PreflightLookupMode, SnapshotCacheMode, TxnLookupMode};
 
         let yaml: CommitConfig = serde_json::from_value(serde_json::json!({"snapshot_cache_mode":"checkpoint_aware"}))
             .map_err(|error| error.to_string())?;
@@ -51,7 +51,8 @@ mod override_tests {
             ("async", CheckpointMode::Async),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
-                "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental"}}
+                "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental",
+                    "preflight_lookup_mode":"grouped"}}
             }))
             .map_err(|error| error.to_string())?;
             let environment = settings
@@ -63,6 +64,7 @@ mod override_tests {
             assert_eq!(options.checkpoint_mode, mode);
             assert_eq!(options.checkpoint_interval, 17);
             assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
+            assert_eq!(options.preflight_lookup_mode, PreflightLookupMode::Grouped);
         }
         for invalid in [0, 100_001] {
             let raw = serde_json::json!({"checkpoint_interval": invalid}).to_string();
@@ -217,19 +219,21 @@ mod override_tests {
                 .and_then(|merged| merged.validate())
                 .is_ok()
         );
-        for (raw, valid) in [
-            ("1", true),
-            ("16", false),
-            ("0", false),
-            ("17", false),
-            ("-1", false),
-            ("1.5", false),
-            ("\"2\"", false),
-            ("null", false),
-        ] {
-            let json = format!(r#"{{"stage_file_concurrency":{raw}}}"#);
-            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
-            assert_eq!(result.is_ok(), valid, "{json}");
+        for field in ["stage_file_concurrency", "stage_files_per_group"] {
+            for (raw, valid) in [
+                ("1", true),
+                ("16", false),
+                ("0", false),
+                ("17", false),
+                ("-1", false),
+                ("1.5", false),
+                ("\"2\"", false),
+                ("null", false),
+            ] {
+                let json = format!(r#"{{"{field}":{raw}}}"#);
+                let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+                assert_eq!(result.is_ok(), valid, "{json}");
+            }
         }
     }
 
@@ -1104,6 +1108,8 @@ impl FlightReceiverConfig {
 pub struct CommitConfig {
     /// Strategy used to resolve prior Delta transactions.
     pub txn_lookup_mode: arrow_deltalake::TxnLookupMode,
+    /// When a partially filled commit batch is published: after `batch_window` or as soon as the worker is idle.
+    pub trigger: arrow_deltalake::CommitTrigger,
     /// Maximum batching delay.
     #[serde(with = "humantime_serde")]
     pub batch_window: Duration,
@@ -1113,6 +1119,8 @@ pub struct CommitConfig {
     pub max_pending_files: usize,
     /// How the table owner reuses its Delta snapshot.
     pub snapshot_cache_mode: arrow_deltalake::SnapshotCacheMode,
+    /// How coalesced preparation resolves prior Delta transactions.
+    pub preflight_lookup_mode: arrow_deltalake::PreflightLookupMode,
     /// Whether the collector or an external service writes checkpoints.
     pub checkpoint_mode: arrow_deltalake::CheckpointMode,
     /// Commit interval for collector-owned checkpoints.
@@ -1124,10 +1132,12 @@ impl Default for CommitConfig {
         let options = arrow_deltalake::commit::CommitOptions::default();
         Self {
             txn_lookup_mode: options.txn_lookup_mode,
+            trigger: options.trigger,
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
             snapshot_cache_mode: options.snapshot_cache_mode,
+            preflight_lookup_mode: options.preflight_lookup_mode,
             checkpoint_mode: options.checkpoint_mode,
             checkpoint_interval: options.checkpoint_interval,
         }
@@ -1138,10 +1148,12 @@ impl CommitConfig {
     pub(crate) fn build(&self) -> Result<arrow_deltalake::commit::CommitOptions, String> {
         let options = arrow_deltalake::commit::CommitOptions {
             txn_lookup_mode: self.txn_lookup_mode,
+            trigger: self.trigger,
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
             snapshot_cache_mode: self.snapshot_cache_mode,
+            preflight_lookup_mode: self.preflight_lookup_mode,
             checkpoint_mode: self.checkpoint_mode,
             checkpoint_interval: self.checkpoint_interval,
         };
@@ -1243,6 +1255,8 @@ pub struct FileBatchConfig {
     pub max_concurrent_flushes: usize,
     /// Maximum sibling files staged concurrently within one coalesced publication.
     pub stage_file_concurrency: usize,
+    /// Balanced sibling files per unsorted partition in a coalesced group.
+    pub stage_files_per_group: usize,
     /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
     pub pipeline_depth: usize,
     /// Backend-wide logical bytes allowed to release Arrow and flush capacity after queue handoff.
@@ -1273,6 +1287,7 @@ impl Default for FileBatchConfig {
             max_age: Duration::from_secs(30),
             max_concurrent_flushes: 4,
             stage_file_concurrency: 1,
+            stage_files_per_group: 1,
             pipeline_depth: 1,
             max_pending_commit_bytes: 0,
             adaptive_file: AdaptiveFileConfig::default(),
@@ -1292,6 +1307,12 @@ impl FileBatchConfig {
         }
         if self.stage_file_concurrency > 1 && !self.coalesce_publications {
             return Err("stage_file_concurrency > 1 requires coalesce_publications=true".to_owned());
+        }
+        if !(1..=16).contains(&self.stage_files_per_group) {
+            return Err("stage_files_per_group must be in 1..=16".to_owned());
+        }
+        if self.stage_files_per_group > 1 && !self.coalesce_publications {
+            return Err("stage_files_per_group > 1 requires coalesce_publications=true".to_owned());
         }
         if [global.rows, global.batches, table.rows, table.batches].contains(&0)
             || global.bytes == 0

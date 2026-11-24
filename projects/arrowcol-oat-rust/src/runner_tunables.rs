@@ -441,6 +441,9 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.parquet_column_workers" => {
                 Some(("parquet_column_workers", "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS"))
             }
+            "collector.runtime.parquet_encode_mode" => {
+                Some(("parquet_encode_mode", "ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE"))
+            }
             "collector.runtime.cpu_queue_jobs" => Some(("cpu_queue_jobs", "ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS")),
             "collector.runtime.event_interval" => Some(("event_interval", "ARROWCOL_COLLECTOR_EVENT_INTERVAL")),
             "collector.runtime.global_queue_interval" => Some(("global_queue_interval", "ARROWCOL_COLLECTOR_GLOBAL_QUEUE_INTERVAL")),
@@ -489,7 +492,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
                 | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
                 | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
-                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency" | "max_pending_commit_bytes")
+                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency" | "stage_files_per_group" | "max_pending_commit_bytes")
         {
             let pointer = format!("/{}", field.replace('.', "/"));
             if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
@@ -504,8 +507,9 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode"
-            | "collector.commit.snapshot_cache_mode" | "collector.commit.checkpoint_mode"
-            | "collector.commit.checkpoint_interval" =>
+            | "collector.commit.snapshot_cache_mode" | "collector.commit.preflight_lookup_mode"
+            | "collector.commit.checkpoint_mode" | "collector.commit.checkpoint_interval"
+            | "collector.commit.trigger" =>
                 ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
@@ -1542,6 +1546,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
              json!({"event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000,"cpu_thread_stack_size":2097152})),
             (json!({"collector":{"runtime":{"parquet_column_workers":4}}}),
              json!({"parquet_column_workers":4})),
+            (json!({"collector":{"runtime":{"parquet_column_workers":4,"parquet_encode_mode":"column_pipeline"},
+                "upload":{"mode":"buffered_multipart","staging_mode":"streaming"}}}),
+             json!({"parquet_column_workers":4,"parquet_encode_mode":"column_pipeline","staging_mode":"streaming"})),
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
@@ -1760,7 +1767,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     fn commit_modes_require_matching_startup_readback_from_every_collector() -> Result<()> {
         let mut config = config()?;
         let commit = json!({"snapshot_cache_mode":"checkpoint_aware","checkpoint_mode":"async",
-            "checkpoint_interval":17,"txn_lookup_mode":"incremental"});
+            "checkpoint_interval":17,"txn_lookup_mode":"incremental","preflight_lookup_mode":"grouped"});
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"commit":commit}}))?;
         let first = json!({
             "component":"collector","instance_id":"collector-1","log_complete":true,
@@ -1773,7 +1780,13 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let mut matching = initial.clone();
         promote_collector_readback(&config, &mut matching, Some(&json!([first, second])), 2)?;
         let verified = matching["consumer_verified"].as_array().context("consumer_verified array")?;
-        for field in ["snapshot_cache_mode", "checkpoint_mode", "checkpoint_interval", "txn_lookup_mode"] {
+        for field in [
+            "snapshot_cache_mode",
+            "preflight_lookup_mode",
+            "checkpoint_mode",
+            "checkpoint_interval",
+            "txn_lookup_mode",
+        ] {
             let path = format!("collector.commit.{field}");
             assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
             let mut missing = second.clone();
@@ -1789,8 +1802,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     #[test]
     fn cpu_modes_need_pool_readback_and_stage_concurrency_needs_batching_readback() -> Result<()> {
         let mut config = config()?;
-        let runtime = json!({"cpu_dispatch":"bounded_shards", "cpu_placement":"compact_allowed"});
-        let batching = json!({"coalesce_publications":true,"stage_file_concurrency":8,"max_pending_commit_bytes":4096});
+        let runtime = json!({"cpu_dispatch":"bounded_shards", "cpu_placement":"compact_allowed",
+            "parquet_encode_mode":"column_pipeline","parquet_column_workers":4});
+        let batching = json!({"coalesce_publications":true,"stage_file_concurrency":8,"stage_files_per_group":4,"max_pending_commit_bytes":4096});
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "collector":{"runtime":runtime,"batching":batching}
         }))?;
@@ -1813,6 +1827,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
                 ("collector.runtime.cpu_placement", expected_modes[1]),
                 ("collector.batching.stage_file_concurrency", true),
                 ("collector.batching.max_pending_commit_bytes", true),
+                ("collector.batching.stage_files_per_group", true),
+                ("collector.runtime.parquet_encode_mode", true),
             ] {
                 assert_eq!(verified.iter().any(|entry| entry["path"] == path), expected, "{path}");
             }

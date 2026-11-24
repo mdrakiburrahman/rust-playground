@@ -267,6 +267,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.pipeline_depth", "1"),
     capability!("collector.batching.max_pending_commit_bytes", "0"),
     capability!("collector.batching.stage_file_concurrency", "1"),
+    capability!("collector.batching.stage_files_per_group", "1"),
     capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
     capability!(
         "collector.batching.adaptive_file.min_input_bytes",
@@ -303,6 +304,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.batch_window", "2s in OAT YAML; 10s component default"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.txn_lookup_mode", "batched"),
+    capability!("collector.commit.trigger", "window"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!(
         "collector.commit.delta_stats_columns",
@@ -358,6 +360,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.cpu_dispatch", "shared_fifo"),
     capability!("collector.runtime.cpu_placement", "os"),
     capability!("collector.runtime.parquet_column_workers", "1"),
+    capability!("collector.runtime.parquet_encode_mode", "column_waves"),
     capability!("collector.runtime.cpu_queue_jobs", "resolved cpu_workers"),
     capability!("collector.runtime.partition_grouping", "scalar_map"),
     capability!("collector.runtime.event_interval", "Tokio default (61)"),
@@ -549,8 +552,12 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.discovery_max_log_file_bytes", "67108864"),
     capability!("collector.isolation_level", "l5"),
     capability!("collector.commit.snapshot_cache_mode", "json_only"),
+    capability!("collector.commit.preflight_lookup_mode", "per_entry"),
     capability!("collector.commit.checkpoint_mode", "external"),
     capability!("collector.commit.checkpoint_interval", "10"),
+    capability!("collector.socket.h2_stream_window_bytes", "tonic default"),
+    capability!("collector.socket.h2_connection_window_bytes", "tonic default"),
+    capability!("collector.socket.h2_max_frame_bytes", "tonic default"),
 ];
 
 #[must_use]
@@ -1048,6 +1055,33 @@ impl Tunables {
             validate_pressure(collector.pressure.as_ref(), oat_collector_defaults)?;
             validate_runtime(collector.runtime.as_ref())?;
             validate_collector_upload(collector)?;
+            if collector
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.parquet_encode_mode)
+                == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
+                && self
+                    .parquet_writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.max_row_group_bytes.is_some())
+            {
+                bail!(
+                    "collector.runtime.parquet_encode_mode=column_pipeline does not support parquet_writer.max_row_group_bytes"
+                );
+            }
+            if collector
+                .batching
+                .as_ref()
+                .and_then(|batching| batching.stage_files_per_group)
+                .unwrap_or(1)
+                > 1
+                && collector
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.enabled != Some(false))
+            {
+                bail!("collector.batching.stage_files_per_group > 1 requires unsorted collector layout");
+            }
         }
         if let Some(writer) = &self.parquet_writer {
             writer.validate()?;
@@ -1333,6 +1367,9 @@ impl Tunables {
                     }
                 }
                 if let Some(runtime) = &collector.runtime {
+                    if let Some(mode) = runtime.parquet_encode_mode {
+                        output.insert("ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE".into(), mode.as_str().into());
+                    }
                     if let Some(dispatch) = runtime.cpu_dispatch {
                         output.insert("ARROWCOL_COLLECTOR_CPU_DISPATCH".into(), dispatch.as_str().into());
                     }
@@ -1950,6 +1987,12 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
     if batching.stage_file_concurrency.unwrap_or(1) > 1 && batching.coalesce_publications != Some(true) {
         bail!("collector.batching.stage_file_concurrency > 1 requires coalesce_publications=true");
     }
+    if !(1..=16).contains(&batching.stage_files_per_group.unwrap_or(1)) {
+        bail!("collector.batching.stage_files_per_group must be an integer in 1..=16");
+    }
+    if batching.stage_files_per_group.unwrap_or(1) > 1 && batching.coalesce_publications != Some(true) {
+        bail!("collector.batching.stage_files_per_group > 1 requires coalesce_publications=true");
+    }
     if !(1..=64).contains(&depth) {
         bail!("collector.batching.pipeline_depth must be in 1..=64");
     }
@@ -2027,6 +2070,7 @@ fn commit_modes_reject_invalid_inputs_by_field_name() -> Result<()> {
     for (field, misspelled) in [
         ("txn_lookup_mode", "Incremental"),
         ("snapshot_cache_mode", "checkpoint-aware"),
+        ("preflight_lookup_mode", "Grouped"),
         ("checkpoint_mode", "Async"),
     ] {
         for value in [
@@ -2080,6 +2124,31 @@ fn checkpoint_interval_is_a_bounded_integer_even_in_external_mode() -> Result<()
         });
         assert!(Tunables::parse_oat_json(config).is_err());
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn commit_trigger_is_strict_and_projected() -> Result<()> {
+    for value in [
+        serde_json::json!("Eager"),
+        serde_json::json!("immediate"),
+        serde_json::json!(42),
+        Value::Null,
+    ] {
+        let Err(error) = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"trigger": value}}
+        })) else {
+            bail!("invalid commit trigger accepted");
+        };
+        assert!(format!("{error:#}").contains("collector.commit.trigger"));
+    }
+    let environment = Tunables::parse_oat_json(serde_json::json!({
+        "collector": {"commit": {"trigger": "eager"}}
+    }))?
+    .environment_for(ComponentRole::Collector)?;
+    let commit: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"])?;
+    assert_eq!(commit, serde_json::json!({"trigger": "eager"}));
     Ok(())
 }
 
@@ -2243,9 +2312,13 @@ fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
                 .as_ref()
                 .and_then(|r| r.parquet_column_workers)
                 .unwrap_or(1)
-                != 1)
+                != 1
+                && collector.runtime.as_ref().and_then(|r| r.parquet_encode_mode)
+                    != Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline))
     {
-        bail!("collector.upload.staging_mode=streaming requires buffered_multipart and parquet_column_workers=1");
+        bail!(
+            "collector.upload.staging_mode=streaming requires buffered_multipart and either parquet_column_workers=1 or parquet_encode_mode=column_pipeline"
+        );
     }
     if upload.mode.unwrap_or_default() == CollectorUploadMode::PutCreate {
         if upload.buffer_capacity_bytes.is_some() || upload.request_concurrency.is_some() {
@@ -2266,9 +2339,21 @@ fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
         .as_ref()
         .and_then(|runtime| runtime.upload_limit)
         .unwrap_or(32);
+    let bridge_bytes = if upload.staging_mode == Some(arrow_deltalake::StagingMode::Streaming)
+        && collector
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.parquet_encode_mode)
+            == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
+    {
+        4 * 65_536
+    } else {
+        0
+    };
     let bytes = capacity
         .checked_mul(concurrency + 1)
         .and_then(|bytes| bytes.checked_add(65_536))
+        .and_then(|bytes| bytes.checked_add(bridge_bytes))
         .and_then(|bytes| bytes.checked_mul(limit))
         .context("aggregate collector upload buffering size overflow")?;
     if bytes > 1_073_741_824 {
@@ -2317,6 +2402,11 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
         if reserve >= workers {
             bail!("collector.runtime.blocking_fs_reserve must be less than blocking_workers (minimum default 32)");
         }
+    }
+    if runtime.parquet_encode_mode == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
+        && runtime.parquet_column_workers.unwrap_or(1) <= 1
+    {
+        bail!("collector.runtime.parquet_encode_mode=column_pipeline requires parquet_column_workers > 1");
     }
     Ok(())
 }
@@ -3182,6 +3272,36 @@ mod tests {
                 assert!(error.contains(&format!("collector.socket.{field}")), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn receiver_http2_controls_reject_invalid_settings_and_project_valid_bounds() -> Result<()> {
+        for (field, min, max) in [
+            ("h2_stream_window_bytes", 65_535_u32, 64 << 20),
+            ("h2_connection_window_bytes", 65_535, 256 << 20),
+            ("h2_max_frame_bytes", 16_384, 1 << 20),
+        ] {
+            for value in [
+                serde_json::json!(min - 1),
+                serde_json::json!(max + 1),
+                serde_json::Value::Null,
+            ] {
+                let error = error_text(Tunables::parse_oat_json(
+                    serde_json::json!({"collector":{"socket":{field:value}}}),
+                ));
+                assert!(error.contains(field), "{error}");
+            }
+            for bytes in [min, max] {
+                let socket = serde_json::json!({field:bytes});
+                let tunables = Tunables::parse_oat_json(serde_json::json!({"collector":{"socket":socket}}))?;
+                let env = tunables.environment_for(ComponentRole::Collector)?;
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&env["ARROWCOL_COLLECTOR_SOCKET_CONFIG"])?,
+                    socket
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
