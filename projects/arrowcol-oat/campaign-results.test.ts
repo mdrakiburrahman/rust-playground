@@ -1650,6 +1650,14 @@ test('reads producer screen evidence and fails closed on unavailable and failed 
   });
   assert.match(renderCampaignResults(missing, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
 
+  const zeroCommits = comparisonCandidate();
+  updateRunEvidence(zeroCommits[0]!.officialRuns[0]!, evidence => {
+    const empty = { ...unavailable, window_commit_count: 0 };
+    evidence.durable_commits.delta_log_reconciliation = { csv: structuredClone(empty) };
+    evidence.screen_v1 = structuredClone(empty);
+  });
+  assert.match(renderCampaignResults(zeroCommits, 'C1'), /provisional: reconciled ranked rate or resolution unavailable/);
+
   const failed = comparisonCandidate();
   updateRunEvidence(failed[0]!.officialRuns[0]!, evidence => {
     Object.assign(evidence, { screen_v1: null, screen_v1_csv_reason: 'cell_failed' });
@@ -1687,6 +1695,12 @@ test('requires resolution and matching A/A for paired comparisons', () => {
 
   const candidate = comparisonCandidate();
   assert.match(renderCampaignResults(candidate, 'C1'), /comparison \(3\/3\)/);
+  const nullSlope = comparisonCandidate();
+  updateRunEvidence(nullSlope[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.delta_log_reconciliation.csv.slope_rows_per_second = null;
+    evidence.screen_v1.slope_rows_per_second = null;
+  });
+  assert.match(renderCampaignResults(nullSlope, 'C1'), /comparison \(3\/3\)/);
   updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
     delete evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second;
   });
@@ -1707,6 +1721,14 @@ test('requires resolution and matching A/A for paired comparisons', () => {
     }
   });
   assert.match(renderCampaignResults(unresolved, 'C1'), /unresolved: difference is smaller than commit-rate resolution/);
+  const exactResolution = comparisonCandidate();
+  updateRunEvidence(exactResolution[0]!.officialRuns[0]!, evidence => {
+    for (const observed of [evidence.durable_commits.delta_log_reconciliation.csv, evidence.screen_v1]) {
+      observed.max_commit_rows = 1500;
+      observed.rate_resolution_rows_per_second = 10;
+    }
+  });
+  assert.match(renderCampaignResults(exactResolution, 'C1'), /comparison \(3\/3\)/);
   const drift = renderCampaignResults(comparisonCandidate(106), 'C1');
   assert.match(drift, /invalid A\/A: adjacent baselines differ by more than 5%/);
   assert.match(drift, /normalized 1\.07/);
