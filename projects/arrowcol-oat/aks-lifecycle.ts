@@ -10,7 +10,15 @@ import { captureTerminalData } from './aks-data-safety.js';
 
 type LifecycleField = 'stop_admission' | 'bounded_drain' | 'evidence_capture' | 'stop_maintenance' | 'terminal_capture';
 export type LifecycleActions = Pick<ExternalCleanupActions, 'stopAdmission' | 'boundedDrain' | 'preserveEvidence' |
-  'stopMaintenanceIfUidAndOwnerMatch' | 'captureTerminalState' | 'recoverLifecycle'>;
+  'stopMaintenanceIfUidAndOwnerMatch' | 'captureTerminalState' | 'recoverLifecycle'> & {
+    readShutdownLogs?: (inventory: RunInventory, member: { pod_name: string; pod_uid: string; container: string;
+      restart_count: number }, authority: CleanupMutationAuthority) =>
+      Promise<{ text: string; body_sha256: string; bytes: number }>;
+    observeShutdownMembership?: (inventory: RunInventory, scheduleName: string, authority: CleanupMutationAuthority) =>
+      Promise<{ schedule: { name: string; uid: string; resource_version: string; body_sha256: string };
+        members: Array<{ kind: 'collector' | 'client'; workload: ReturnType<typeof identity>; pod_name: string;
+          pod_uid: string; container: string; restart_count: number }> }>;
+  };
 interface PodProof { name: string; uid: string; resource_version: string;
   containers: Array<{ name: string; exit_code: number | null; finished_at: string | null; oom_killed: boolean; restart_count?: number }>; }
 interface LogProof {
@@ -114,7 +122,7 @@ function validatePods(value: unknown): asserts value is PodProof[] {
     }
   }
 }
-function parseStop(value: unknown, inventory: RunInventory, field: LifecycleField, resource: RunInventoryResource): StopRecord {
+export function parseStop(value: unknown, inventory: RunInventory, field: LifecycleField, resource: RunInventoryResource): StopRecord {
   const record = object(value);
   if (Object.keys(record).sort().join() !== ['schema_version', 'origin', 'field', 'resource', 'phase', 'deadline_unix_ms',
     'initial_desired', 'initial_pods', 'terminal_pods', 'response', 'observed_at_unix_ms', 'logs', 'expected_resource_version'].sort().join() ||
@@ -277,7 +285,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
         return target.apiVersion === resource.api_version && target.kind === resource.kind && target.name === resource.name;
       })) throw new Error('An autoscaler can recreate this exact workload; no unowned autoscaler mutation is authorized.');
     }
-    return { value, spec, pods, plan, deployment };
+    return { value, spec, pods, podObjects: list.items, plan, deployment };
   };
   const stop = async (inventory: RunInventory, resource: RunInventoryResource, field: LifecycleField,
     authority: CleanupMutationAuthority, recoveryOnly = false): Promise<CleanupActionResult> => {
@@ -354,14 +362,22 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       if (observation.pods.some(pod => !active.initial_pods.some(initial => initial.uid === pod.uid)))
         throw new Error('The original workload recreated or replaced a pod after its stop intent.');
       const stopped: boolean = physicallyStopped(observation);
+      const logs: LogProof[] = [...record.logs, ...await captureLogs(observation.plan.server, inventory, newlyTerminal, 'terminal', evidence)];
       const cleanDrain: boolean = field !== 'bounded_drain' || active.initial_pods.length === 0 && active.initial_desired === 0 ||
         active.initial_pods.length > 0 && active.initial_pods.every(pod => {
           const ended = terminal.get(pod.uid);
-          return ended && ended.containers.length === pod.containers.length &&
-            ended.containers.every(container => container.exit_code === 0 && !container.oom_killed);
+          return ended && ended.name === pod.name && ended.containers.length === pod.containers.length &&
+            pod.containers.every(initial => {
+              const container = ended.containers.find(value => value.name === initial.name);
+              if (!container || container.oom_killed) return false;
+              if (container.exit_code === 0) return true;
+              return container.exit_code === 143 && initial.restart_count !== undefined && container.restart_count === initial.restart_count &&
+                logs.some(log => log.phase === 'terminal' && log.pod_uid === pod.uid && log.pod_name === pod.name &&
+                  log.container === initial.name && log.drain_complete_marker === true);
+            });
         });
       record = { ...record, terminal_pods: [...terminal.values()], observed_at_unix_ms: Date.now(),
-        logs: [...record.logs, ...await captureLogs(observation.plan.server, inventory, newlyTerminal, 'terminal', evidence)],
+        logs,
         phase: stopped && cleanDrain && Date.now() < active.deadline_unix_ms ? 'complete' : 'responded' };
       saved = { value: record, etag: await write(blob, record, evidence, saved!.etag) };
       if (record.phase === 'complete') return 'complete';
@@ -506,6 +522,73 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     await captureTerminalData(store, azure, authority, () => assertWritersStopped(inventory, authority));
   };
   return {
+    readShutdownLogs: async (inventory, member, authority) => {
+      const { plan } = await current(inventory, authority);
+      const observed = async () => {
+        const value = await observeExactKubernetes(plan.server,
+          ['pod', member.pod_name, '--namespace', inventory.namespace.name], authority, run);
+        const pod = podProof(value, inventory);
+        const container = pod.containers.find(value => value.name === member.container);
+        if (pod.uid !== member.pod_uid || container?.restart_count !== member.restart_count ||
+            container.exit_code === null || container.oom_killed)
+          throw new Error('Shutdown receipt original instance is not positively terminal.');
+        return pod;
+      };
+      const before = await observed();
+      await authority.assertCurrent();
+      const response = await run(['kubectl', '--server', plan.server, '--insecure-skip-tls-verify=false',
+        '--request-timeout', '15000ms', 'logs', member.pod_name, '--namespace', inventory.namespace.name,
+        '--container', member.container, '--timestamps=true', '--limit-bytes=16777217'], 20);
+      await authority.assertCurrent();
+      if (response.returncode !== 0 || Buffer.byteLength(response.stdout) > 16_777_216 ||
+          Buffer.byteLength(response.stdout) === 0 || !response.stdout.endsWith('\n') ||
+          canonical_json(before) !== canonical_json(await observed()))
+        throw new Error('Complete original terminal log response is unavailable or changed.');
+      return { text: response.stdout, body_sha256: hash(response.stdout), bytes: Buffer.byteLength(response.stdout) };
+    },
+    observeShutdownMembership: async (inventory, scheduleName, authority) => {
+      const { plan } = await current(inventory, authority);
+      const schedule = async () => {
+        const value = await observeExactKubernetes(plan.server,
+          ['configmap', scheduleName, '--namespace', inventory.namespace.name], authority, run);
+        if (!value || value.apiVersion !== 'v1' || value.kind !== 'ConfigMap' ||
+            object(value.metadata).namespace !== inventory.namespace.name || object(value.metadata).name !== scheduleName ||
+            object(value.data).schedule !== 'pending')
+          throw new Error('Shutdown membership schedule is armed, unavailable, or a different instance.');
+        marker(object(value.metadata), inventory);
+        return { name: scheduleName, uid: text(object(value.metadata).uid),
+          resource_version: text(object(value.metadata).resourceVersion), body_sha256: hash(canonical_json(value)) };
+      };
+      const before = await schedule();
+      const members: Array<{ kind: 'collector' | 'client'; workload: ReturnType<typeof identity>; pod_name: string;
+        pod_uid: string; container: string; restart_count: number }> = [];
+      for (const resource of inventory.resources.filter(value => ['collector', 'client'].includes(value.role) && ['Deployment', 'Job'].includes(value.kind) && value.state !== 'absent')) {
+        const observed = await observe(inventory, resource, authority);
+        for (const value of observed.podObjects) {
+          const status = object(object(value).status);
+          if (status.phase !== 'Running' || !Array.isArray(status.containerStatuses) ||
+              status.containerStatuses.some(value => {
+                const container = object(value);
+                return container.ready !== true || !object(container.state).running;
+              })) throw new Error('Shutdown membership instances are not ready and running before arm.');
+        }
+        const desired = integer(observed.deployment ? observed.spec.replicas : observed.spec.parallelism);
+        if (!desired || observed.pods.length !== desired)
+          throw new Error('Shutdown membership lacks the exact original expected pod cardinality.');
+        for (const pod of observed.pods) for (const container of pod.containers) {
+          if (container.restart_count !== 0 || container.exit_code !== null)
+            throw new Error('Shutdown membership requires original running non-restarted instances.');
+          members.push({ kind: resource.role as 'collector' | 'client', workload: identity(resource), pod_name: pod.name,
+            pod_uid: pod.uid, container: container.name, restart_count: 0 });
+        }
+      }
+      if (!members.some(value => value.kind === 'collector') || !members.some(value => value.kind === 'client') ||
+          new Set(members.map(value => value.pod_uid + ':' + value.container)).size !== members.length)
+        throw new Error('Shutdown membership is missing or duplicates original instances.');
+      if (canonical_json(before) !== canonical_json(await schedule()))
+        throw new Error('Shutdown membership schedule changed while collecting instances.');
+      return { schedule: before, members: members.sort((a, b) => canonical_json(a).localeCompare(canonical_json(b))) };
+    },
     stopAdmission: (inventory, _deadline, _key, authority) => stopRoles(inventory, ['client', 'router'], 'stop_admission', authority),
     boundedDrain: async (inventory, _deadline, _key, authority) => {
       if (await capture(inventory, 'pre_stop_capture', authority) !== 'complete') return 'pending';

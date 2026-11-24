@@ -417,6 +417,77 @@ export async function readDeltaReference(azure: Azure, relativePath: string,
   return (await capture(azure, relativePath, assertCurrent)).reference;
 }
 
+
+export interface DeltaVersionAdds { delta_version: number; rows: number; files: number; parquet_bytes: number }
+
+export async function readDeltaTerminalReference(azure: Azure, baseline: DeltaReplayReference,
+  assertCurrent: () => Promise<void>): Promise<DeltaReplayReference> {
+  return (await capture(azure, baseline.table_root, assertCurrent, baseline.version ?? -1)).reference;
+}
+
+/** Read only the original version-pinned JSON sources, never a newer listing or aggregate preservation verdict. */
+export async function readFrozenDeltaAdds(azure: Azure, baseline: DeltaReplayReference, terminal: DeltaReplayReference,
+  assertCurrent: () => Promise<void>): Promise<DeltaVersionAdds[]> {
+  requireThat(terminal.observation === 'table' && terminal.row_count !== null, 'frozen Delta table/rows unavailable');
+  requireThat(same(binding(azure, baseline.table_root), binding(azure, terminal.table_root)), 'frozen Delta binding differs');
+  requireThat(baseline.observation === 'observed_absent' || baseline.table_id === terminal.table_id &&
+    baseline.version <= terminal.version && baseline.row_count !== null, 'frozen Delta baseline identity or rows differ');
+  const first = (baseline.version ?? -1) + 1;
+  requireThat(terminal.version - first < MAX_VERSIONS, 'frozen Delta version range exceeds bound');
+  const prefix = terminal.table_root + '/_delta_log/';
+  const sources = new Map(terminal.provenance.source_objects.map(source => [source.name, source]));
+  if (baseline.observation === 'table') for (const before of baseline.provenance.source_objects) {
+    const after = sources.get(before.name);
+    if (after) requireThat(same(before, after), 'frozen Delta original source changed');
+  }
+  const result: DeltaVersionAdds[] = [];
+  let totalBytes = 0, totalActions = 0;
+  for (let version = first; version <= terminal.version; version++) {
+    const source = sources.get(prefix + versionName(version));
+    requireThat(source && source.bytes > 0 && source.bytes <= MAX_OBJECT_BYTES, 'frozen Delta JSON history unavailable');
+    await assertCurrent();
+    let receipt: HttpReceipt | undefined;
+    const [bytes, headers] = await azure.blob('GET', azure.c.data, source.name, undefined, undefined,
+      { 'If-Match': source.etag, Range: `bytes=0-${MAX_OBJECT_BYTES}` }, false, true, value => { receipt = value; });
+    await assertCurrent();
+    requireThat(receipt && [200, 206].includes(receipt.status) && bytes && headers.etag === source.etag &&
+      bytes.length === source.bytes && hash(bytes) === source.sha256, 'frozen Delta source readback differs');
+    if (receipt.status === 206) requireThat(headers['content-range'] === `bytes 0-${bytes.length - 1}/${bytes.length}`,
+      'frozen Delta source is partial');
+    totalBytes += bytes.length;
+    requireThat(totalBytes <= MAX_TOTAL_BYTES, 'frozen Delta byte bound exceeded');
+    const lines = bytes.toString('utf8').trim().split('\n');
+    totalActions += lines.length;
+    requireThat(totalActions <= MAX_ACTIONS, 'frozen Delta action bound exceeded');
+    const paths = new Set<string>();
+    let rows = 0, files = 0, parquetBytes = 0;
+    for (const line of lines) {
+      const action = object(JSON.parse(line), 'frozen Delta action');
+      const keys = Object.keys(action).filter(key => action[key] !== null && action[key] !== undefined);
+      requireThat(keys.length === 1 && ['add', 'remove', 'metaData', 'protocol', 'txn', 'commitInfo'].includes(keys[0]),
+        'unsupported frozen Delta action');
+      if (keys[0] === 'metaData') requireThat(metadata(action.metaData).id === terminal.table_id, 'frozen Delta metadata differs');
+      if (keys[0] === 'remove') {
+        const remove = object(action.remove, 'frozen remove');
+        requireThat(remove.dataChange === false, 'data-changing removal is not exact append reconciliation');
+      }
+      if (keys[0] !== 'add') continue;
+      const add = object(action.add, 'frozen add'), file = addFile(add);
+      requireThat(!paths.has(file.path), 'duplicate frozen Delta Add path');
+      paths.add(file.path);
+      if (add.dataChange !== true) continue;
+      requireThat(file.num_records !== null, 'frozen Delta Add row statistics unavailable');
+      rows = sum([rows, file.num_records], 'frozen version rows');
+      files = sum([files, 1], 'frozen version files');
+      parquetBytes = sum([parquetBytes, file.size], 'frozen version bytes');
+    }
+    if (files > 0) result.push({ delta_version: version, rows, files, parquet_bytes: parquetBytes });
+  }
+  requireThat(sum([baseline.row_count ?? 0, ...result.map(value => value.rows)], 'frozen final rows') === terminal.row_count,
+    'frozen append rows differ from active snapshot');
+  return result;
+}
+
 export interface DeltaAddWindow {
   total_rows: number;
   total_files: number;

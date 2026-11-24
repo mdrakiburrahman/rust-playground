@@ -1183,6 +1183,9 @@ trait Platform: Send + Sync {
         Ok(())
     }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
+    async fn finish_cleanup(&mut self, _config: &OatConfig, _rows: &[OatResult], _frozen: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct AksPlatform {
@@ -1216,6 +1219,8 @@ struct AksPlatform {
     campaign_cli_paths: Option<OwnedAksCampaignConfigPaths>,
     maintenance_cell_baseline: Vec<ProcessLog>,
     stopped_collector_logs: Option<Vec<ProcessLog>>,
+    custody_followers: Vec<CustodyFollower>,
+    shutdown_membership: Option<ShutdownSourceReference>,
 }
 
 struct OwnedKubectlProcess {
@@ -1452,6 +1457,11 @@ impl Platform for AksPlatform {
         self.cpu_throttling_start = None;
         self.cpu_throttling_evidence = None;
         let quota_targets = aks_collector_quota_targets(&self.resource_readback, usize::try_from(replicas)?)?;
+        ensure!(
+            self.custody_followers.is_empty(),
+            "collector custody followers already started"
+        );
+        start_custody_followers(config, &quota_targets, &mut self.custody_followers).await?;
         let readback = capture_aks_collector_cpu_quota(config, &quota_targets).await?;
         self.cpu_throttling_start = Some(AksCpuResourceMeasurement {
             throttling_start: Vec::new(),
@@ -1867,6 +1877,9 @@ impl Platform for AksPlatform {
     }
 
     async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            self.shutdown_membership = Some(capture_shutdown_membership(self, config).await?);
+        }
         let legacy_start = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
         let measurement = self
             .cpu_throttling_start
@@ -2012,6 +2025,35 @@ impl Platform for AksPlatform {
                 Some(json!({"status":"unavailable", "reason":"ordered_aks_shutdown_not_completed"}));
         }
         result
+    }
+
+    async fn finish_cleanup(&mut self, config: &OatConfig, rows: &[OatResult], frozen: bool) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        if !frozen {
+            bail!("campaign shutdown freeze was not confirmed; finalization and handoff remain unavailable");
+        }
+        let (receipt, source_evidence) = finalize_campaign_shutdown(self, config).await?;
+        let frozen_evidence = self.shutdown_drain_evidence.take();
+        self.shutdown_drain_evidence = Some(json!({
+            "status": "finalized",
+            "freeze": frozen_evidence,
+            "finalization": receipt,
+            "source_evidence": source_evidence,
+        }));
+        let expected_replicas = rows.first().map(|row| row.replicas as usize);
+        if rows.iter().any(|row| Some(row.replicas as usize) != expected_replicas) {
+            bail!("campaign finalization does not cover the expected original collector replicas");
+        }
+        ensure_shutdown_release(&receipt, expected_replicas)?;
+        let release = cleanup_campaign_aks_platform(config, self, CampaignCleanupPhase::Release).await?;
+        self.qap_cleanup_confirmed = true;
+        require_aks_cleanup_confirmation(self)?;
+        if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+            evidence["release"] = release;
+        }
+        Ok(())
     }
 
     fn shutdown_drain_evidence(&self) -> Option<Value> {
@@ -3333,6 +3375,12 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
         bail!("AKS DMV client Job {job_name} was not complete at finish");
     }
     let provenance = aks_client_image_evidence(config, job_name).await?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(format!(
+            "{}\nOAT_CLIENT_IMAGE_PROVENANCE {provenance}\n",
+            progress.output
+        ));
+    }
     kubectl(
         config,
         vec![
@@ -3397,6 +3445,9 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
             _ => tokio::time::sleep(Duration::from_millis(200)).await,
         }
     };
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        return logs;
+    }
     let deletion = kubectl(
         config,
         vec![
@@ -3898,18 +3949,7 @@ async fn run_isolated_cell(
     }
     let shutdown_started = unix_time_ms_u64();
     let cleanup = platform.cleanup(&config).await;
-    let shutdown_drain_evidence = platform.shutdown_drain_evidence().map(|mut evidence| {
-        match shutdown_started {
-            Ok(timestamp) => evidence["ordered_shutdown_started_at_unix_ms"] = json!(timestamp),
-            Err(error) => {
-                evidence["ordered_shutdown_started_at_unix_ms"] = Value::Null;
-                evidence["ordered_shutdown_timestamp_unavailable_reason"] = json!(format!("{error:#}"));
-            }
-        }
-        evidence
-    });
-    let cleanup_succeeded = cleanup.is_ok();
-    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    let frozen = cleanup.is_ok();
     let stopped_logs = platform.stopped_commit_logs();
     if let Ok(rows) = &mut result
         && let Some((logs, baseline)) = &stopped_logs
@@ -3925,11 +3965,8 @@ async fn run_isolated_cell(
         }
     }
     if let Ok(rows) = &mut result
-        && let Err(error) = attach_collector_teardown_admissions(
-            rows,
-            stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()),
-            cleanup_succeeded,
-        )
+        && let Err(error) =
+            attach_collector_teardown_admissions(rows, stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()), frozen)
     {
         for row in rows {
             row.status = "failed".to_owned();
@@ -3939,7 +3976,7 @@ async fn run_isolated_cell(
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
         && let Ok(rows) = &mut result
     {
-        attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, cleanup_succeeded).await;
+        attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, frozen).await;
     }
     if !cancelled
         && config.platform.kind == crate::config::OatMode::Local
@@ -3955,6 +3992,26 @@ async fn run_isolated_cell(
             });
         }
     }
+    let finalization = platform
+        .finish_cleanup(&config, result.as_deref().unwrap_or(&[]), frozen)
+        .await;
+    let cleanup = match (cleanup, finalization) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(final_error)) => Err(error.context(format!("finalize cleanup: {final_error:#}"))),
+    };
+    let cleanup_succeeded = cleanup.is_ok();
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    let shutdown_drain_evidence = platform.shutdown_drain_evidence().map(|mut evidence| {
+        match shutdown_started {
+            Ok(timestamp) => evidence["ordered_shutdown_started_at_unix_ms"] = json!(timestamp),
+            Err(error) => {
+                evidence["ordered_shutdown_started_at_unix_ms"] = Value::Null;
+                evidence["ordered_shutdown_timestamp_unavailable_reason"] = json!(format!("{error:#}"));
+            }
+        }
+        evidence
+    });
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
@@ -4651,6 +4708,8 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             campaign_cli_paths: None,
             maintenance_cell_baseline: Vec::new(),
             stopped_collector_logs: None,
+            custody_followers: Vec::new(),
+            shutdown_membership: None,
         })),
     }
 }
@@ -10883,6 +10942,32 @@ enum CampaignCleanupAction {
     Handoff,
 }
 
+#[derive(Clone, Copy)]
+enum CampaignCleanupPhase {
+    Freeze,
+    Release,
+}
+
+impl CampaignCleanupPhase {
+    fn actions(self) -> &'static [CampaignCleanupAction] {
+        match self {
+            Self::Freeze => &[
+                CampaignCleanupAction::StopAdmission,
+                CampaignCleanupAction::BoundedDrain,
+                CampaignCleanupAction::EvidenceCapture,
+                CampaignCleanupAction::StopMaintenance,
+                CampaignCleanupAction::TerminalCapture,
+            ],
+            Self::Release => &[
+                CampaignCleanupAction::RemoveNamespace,
+                CampaignCleanupAction::RemoveQap,
+                CampaignCleanupAction::RemoveFic,
+                CampaignCleanupAction::Handoff,
+            ],
+        }
+    }
+}
+
 impl CampaignCleanupAction {
     fn selector(&self) -> &'static str {
         match self {
@@ -11007,6 +11092,248 @@ struct CampaignInventoryReadResponse {
     ok: bool,
     inventory: RunInventory,
     etag: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownSourceReference {
+    blob: String,
+    etag: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputsRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputs {
+    schema_version: u8,
+    inventory_etag: String,
+    terminal_capture: ShutdownSourceReference,
+    delta_before: ShutdownSourceReference,
+    delta_terminal: ShutdownSourceReference,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputsResponse {
+    ok: bool,
+    receipt: ShutdownFinalizationInputs,
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+    terminal_capture: &'a ShutdownSourceReference,
+    delta_before: &'a ShutdownSourceReference,
+    delta_terminal: &'a ShutdownSourceReference,
+    reconciliation: ShutdownReconciliationRequest,
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownReconciliationRequest {
+    profile: &'static str,
+    proof: Option<Value>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationOrigin {
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    namespace: InventoryNamespace,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalVerdict {
+    pod_name: String,
+    pod_uid: String,
+    container: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    restart_count: Option<u64>,
+    classification: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationReceipt {
+    schema_version: u8,
+    blob: String,
+    etag: String,
+    sha256: String,
+    inventory_etag: String,
+    actor: CampaignCleanupActor,
+    origin: ShutdownFinalizationOrigin,
+    terminal_capture: ShutdownSourceReference,
+    delta_before: ShutdownSourceReference,
+    delta_terminal: ShutdownSourceReference,
+    verdicts: Vec<ShutdownFinalVerdict>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationResponse {
+    ok: bool,
+    receipt: ShutdownFinalizationReceipt,
+}
+
+fn validate_shutdown_source(source: &ShutdownSourceReference, expected_blob: &str) -> Result<()> {
+    validate_campaign_etag(&source.etag)?;
+    if source.blob != expected_blob
+        || source.sha256.len() != 64
+        || !source
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("shutdown source does not match the exact original blob identity or SHA-256");
+    }
+    Ok(())
+}
+
+fn validate_shutdown_inputs(inputs: &ShutdownFinalizationInputs, inventory: &RunInventory, etag: &str) -> Result<()> {
+    inventory.validate()?;
+    validate_campaign_etag(etag)?;
+    if inputs.schema_version != 1 || inputs.inventory_etag != etag || inventory.namespace.uid.is_none() {
+        bail!("shutdown source lacks the exact frozen inventory ETag or namespace UID");
+    }
+    let destination = inventory
+        .evidence_destination
+        .as_ref()
+        .context("missing shutdown evidence destination")?;
+    let capture = format!(
+        "{}/custody/{}/terminal_capture.json",
+        destination.blob_prefix.trim_end_matches('/'),
+        inventory.cell_run_id
+    );
+    let root = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}",
+        inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+    );
+    validate_shutdown_source(&inputs.terminal_capture, &capture)?;
+    validate_shutdown_source(&inputs.delta_before, &format!("{root}/delta-before.json"))?;
+    validate_shutdown_source(&inputs.delta_terminal, &format!("{root}/delta-terminal.json"))?;
+    Ok(())
+}
+
+fn validate_shutdown_finalization(
+    receipt: &ShutdownFinalizationReceipt,
+    inventory: &RunInventory,
+    etag: &str,
+    actor: &CampaignCleanupActor,
+    inputs: &ShutdownFinalizationInputs,
+) -> Result<()> {
+    validate_shutdown_inputs(inputs, inventory, etag)?;
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}/shutdown-finalization.json",
+        inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+    );
+    if receipt.schema_version != 1
+        || receipt.blob != expected_blob
+        || receipt.inventory_etag != etag
+        || receipt.actor != *actor
+        || receipt.terminal_capture != inputs.terminal_capture
+        || receipt.delta_before != inputs.delta_before
+        || receipt.delta_terminal != inputs.delta_terminal
+        || receipt.origin
+            != (ShutdownFinalizationOrigin {
+                campaign_id: inventory.campaign_id.clone(),
+                owner_id: inventory.owner_id.clone(),
+                fencing_token: inventory.fencing_token,
+                orchestration_run_id: inventory.orchestration_run_id.clone(),
+                cell_run_id: inventory.cell_run_id.clone(),
+                namespace: inventory.namespace.clone(),
+            })
+        || receipt.sha256.len() != 64
+        || !receipt
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("shutdown finalization does not bind the exact frozen source and actor");
+    }
+    let mut identities = BTreeSet::new();
+    for verdict in &receipt.verdicts {
+        if [&verdict.pod_name, &verdict.pod_uid, &verdict.container]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 253 || value.bytes().any(|byte| byte.is_ascii_control()))
+            || !identities.insert((&verdict.pod_uid, &verdict.container, verdict.restart_count))
+            || !matches!(
+                verdict.classification.as_str(),
+                "exit_0"
+                    | "clean_sigterm_after_drain"
+                    | "exit_143_terminal_reconciliation_failed"
+                    | "exit_143_terminal_reconciliation_unavailable"
+                    | "exit_143_without_drain_marker"
+                    | "exit_oom_killed"
+                    | "exit_nonzero"
+                    | "terminal_status_unavailable"
+            )
+        {
+            bail!("shutdown finalization has duplicate, malformed, or provisional collector verdicts");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_shutdown_release(receipt: &ShutdownFinalizationReceipt, expected_replicas: Option<usize>) -> Result<()> {
+    let pods = receipt
+        .verdicts
+        .iter()
+        .map(|verdict| &verdict.pod_uid)
+        .collect::<BTreeSet<_>>();
+    if expected_replicas.is_none_or(|expected| expected == 0 || pods.len() != expected)
+        || receipt.verdicts.is_empty()
+        || receipt
+            .verdicts
+            .iter()
+            .any(|verdict| verdict.classification != "exit_0")
+    {
+        bail!(
+            "campaign collector final verdict is failed, unavailable, or lacks authenticated reconciliation; handoff is withheld"
+        );
+    }
+    Ok(())
+}
+
+async fn submit_shutdown_finalization_once<T, F, Fut, C>(mut call: F, confirm: C) -> Result<T>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    C: Fn(&[u8]) -> Result<T>,
+{
+    match call("shutdown-finalize").await.and_then(|output| confirm(&output)) {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let output = call("shutdown-finalization-read")
+                .await
+                .context("shutdown finalization outcome UNKNOWN; fenced readback failed, never retry write")?;
+            confirm(&output).context(format!(
+                "shutdown finalization readback did not confirm the original write: {error:#}"
+            ))
+        }
+    }
 }
 
 fn deserialize_present_campaign_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -11141,7 +11468,7 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
     .await
     {
         Ok(result) => result?,
-        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline" | "capture-baseline") => {
+        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline" | "capture-baseline" | "shutdown-membership-capture" | "shutdown-receipt-capture" | "shutdown-follower-publish" | "shutdown-finalize") => {
             bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
         }
         Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
@@ -11696,7 +12023,334 @@ async fn persist_campaign_inventory_snapshot(
     Ok(())
 }
 
-async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownSourceResponse {
+    ok: bool,
+    receipt: ShutdownSourceReference,
+}
+
+fn shutdown_source_root(inventory: &RunInventory) -> String {
+    format!("_arrowcol-custody/campaigns/{}/runs/{}/cells/{}", inventory.campaign_id,
+        inventory.orchestration_run_id, inventory.cell_run_id)
+}
+
+async fn capture_shutdown_membership(platform: &AksPlatform, config: &OatConfig) -> Result<ShutdownSourceReference> {
+    let cached = campaign_inventory_for_setup(platform).await?;
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let (inventory, etag) = read_authoritative_campaign_inventory(
+        platform, &identity, &cached.orchestration_run_id, Duration::from_secs(30),
+    ).await?;
+    ensure!(cached == inventory, "campaign inventory changed before pre-arm membership capture");
+    let [table] = config.tables.as_slice() else { bail!("shutdown membership requires exactly one hot table"); };
+    let relative_root = platform.qap_relative_data_root.as_deref().context("missing run Delta root")?;
+    let table_root = aks_qap_relative_path(relative_root, table)?;
+    ensure!(inventory.qap.as_ref().is_some_and(|qap| qap.bindings.iter().filter(|binding|
+        binding.relative_path == table_root).count() == 1), "shutdown membership table differs from original QAP binding");
+    let mut table_url = Url::parse(platform.delta_root.as_deref().context("missing run Delta URL")?)?;
+    ensure!(table_url.scheme() == "abfss" && table_url.query().is_none() && table_url.fragment().is_none()
+        && table_url.password().is_none(), "shutdown membership requires the original plain Delta URL");
+    table_url.set_path(&format!("/{table_root}/"));
+    let collector_table_id = fixture_sha256(table_url.as_str().as_bytes());
+    let collector_table_name = canonical_dmv_table_name(table)?;
+    let actor = CampaignCleanupActor { mode: CampaignActorMode::Producer, owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token };
+    let request = json!({"schema_version":1,"campaign_id":inventory.campaign_id,
+        "orchestration_run_id":inventory.orchestration_run_id,"cell_run_id":inventory.cell_run_id,
+        "expected_etag":etag,"actor":actor,"schedule_name":platform.schedule_configmap_name,
+        "table_root":table_root,"collector_table_id":collector_table_id,"collector_table_name":collector_table_name});
+    let bytes = run_campaign_custody_json(platform, "shutdown-membership-capture", None, &request,
+        Duration::from_secs(30)).await?;
+    let response: ShutdownSourceResponse = serde_json::from_slice(&bytes).context("parse guarded shutdown membership")?;
+    ensure!(response.ok, "shutdown membership was not positively confirmed");
+    validate_shutdown_source(&response.receipt, &format!("{}/shutdown-membership.json", shutdown_source_root(&inventory)))?;
+    Ok(response.receipt)
+}
+
+async fn capture_shutdown_receipts(
+    platform: &AksPlatform, inventory: &RunInventory, etag: &str, actor: &CampaignCleanupActor,
+) -> (Option<Value>, Value) {
+    let Some(membership) = platform.shutdown_membership.as_ref() else {
+        return (None, json!({"status":"unavailable","reason":"membership_unavailable"}));
+    };
+    let Ok(targets) = aks_resource_pod_targets(&platform.resource_readback) else {
+        return (None, json!({"status":"unavailable","reason":"original_targets_unavailable"}));
+    };
+    let selected = targets.into_iter().filter(|target| target.role == "collector" || target.role == "client").collect::<Vec<_>>();
+    let mut keys = BTreeSet::new();
+    if selected.is_empty() || selected.len() > 64 || !selected.iter().any(|target| target.role == "collector")
+        || !selected.iter().any(|target| target.role == "client") || selected.iter().any(|target|
+            uuid::Uuid::parse_str(&target.uid).is_err() || !keys.insert((target.uid.clone(), target.container.clone()))) {
+        return (None, json!({"status":"unavailable","reason":"original_targets_incomplete_or_ambiguous"}));
+    }
+    let root = shutdown_source_root(inventory);
+    let captures = join_all(selected.iter().map(|target| {
+        let request = json!({"schema_version":1,"campaign_id":inventory.campaign_id,
+            "orchestration_run_id":inventory.orchestration_run_id,"cell_run_id":inventory.cell_run_id,
+            "expected_etag":etag,"actor":actor,"membership":membership,"kind":target.role,
+            "pod_uid":target.uid,"container":target.container,"restart_count":0});
+        let expected = format!("{root}/{}-receipts/{}-{}-0.json", target.role, target.uid, target.container);
+        async move {
+            let bytes = run_campaign_custody_json(platform, "shutdown-receipt-capture", None, &request,
+                Duration::from_secs(30)).await?;
+            let response: ShutdownSourceResponse = serde_json::from_slice(&bytes).context("parse numeric source receipt")?;
+            ensure!(response.ok, "numeric source capture was not positively confirmed");
+            validate_shutdown_source(&response.receipt, &expected)?;
+            Ok::<_, anyhow::Error>(response.receipt)
+        }
+    }));
+    let Ok(results) = tokio::time::timeout(Duration::from_secs(35), captures).await else {
+        return (None, json!({"status":"unavailable","reason":"source_capture_timeout_outcome_unknown"}));
+    };
+    let mut collectors = Vec::new();
+    let mut clients = Vec::new();
+    let mut missing = 0;
+    for (target, result) in selected.iter().zip(results) {
+        match result {
+            Ok(reference) if target.role == "collector" => collectors.push(reference),
+            Ok(reference) => clients.push(reference),
+            Err(_) => missing += 1,
+        }
+    }
+    let evidence = json!({"status":if missing == 0 {"captured_but_continuity_unproven"} else {"unavailable"},
+        "membership":membership,"collector_receipts":collectors,"client_receipts":clients,"missing_receipts":missing});
+    let proof = (missing == 0).then(|| json!({"schema_version":1,"membership":membership,
+        "collector_receipts":collectors,"client_receipts":clients}));
+    (proof, evidence)
+}
+
+#[cfg(unix)]
+async fn follower_diagnostic_projection(
+    summary: &Value, target: &AksResourcePodTarget, table_id: &str, table_name: &str,
+) -> Result<Value> {
+    use std::os::unix::fs::PermissionsExt;
+    ensure!(summary["pod_name"].as_str() == Some(&target.pod) && summary["pod_uid"].as_str() == Some(&target.uid)
+        && summary["container"].as_str() == Some(&target.container) && summary["complete"] == false,
+        "follower summary identity differs from original target");
+    let relative = Path::new(summary["relative_path"].as_str().context("missing private follower path")?);
+    let segments = relative.components().collect::<Vec<_>>();
+    ensure!(segments.len() == 2 && segments.iter().all(|segment| matches!(segment, std::path::Component::Normal(_))),
+        "invalid private follower path");
+    let directory = segments[0].as_os_str().to_str().context("invalid follower directory")?;
+    let filename = segments[1].as_os_str().to_str().context("invalid follower filename")?;
+    let directory_id = directory.strip_prefix(".oat-custody-").context("invalid follower directory")?;
+    let file_id = filename.strip_suffix(".jsonl").context("invalid follower filename")?;
+    ensure!(uuid::Uuid::parse_str(directory_id).is_ok() && uuid::Uuid::parse_str(file_id).is_ok(), "invalid follower path IDs");
+    let parent = tokio::fs::symlink_metadata(directory).await?;
+    let metadata = tokio::fs::symlink_metadata(relative).await?;
+    ensure!(parent.is_dir() && !parent.file_type().is_symlink() && parent.permissions().mode() & 0o077 == 0
+        && metadata.is_file() && !metadata.file_type().is_symlink() && metadata.permissions().mode() & 0o077 == 0,
+        "follower projection is not a private regular file");
+    let bytes = read_native_file(relative, CUSTODY_FOLLOWER_MAX_BYTES as usize).await?;
+    let lines = bytes.iter().filter(|byte| **byte == b'\n').count();
+    ensure!(bytes.ends_with(b"\n") && summary["bytes"].as_u64() == Some(u64::try_from(bytes.len())?)
+        && summary["lines"].as_u64() == Some(u64::try_from(lines)?)
+        && summary["sha256"].as_str() == Some(fixture_sha256(&bytes).as_str()), "follower redacted bytes changed");
+    let mut commits = BTreeMap::<u64, Value>::new();
+    let mut gaps = BTreeSet::from(["continuity_unproven"]);
+    let mut saw_identity = false;
+    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let value: Value = serde_json::from_slice(line).context("invalid redacted follower record")?;
+        match value["kind"].as_str() {
+            Some("identity") => {
+                ensure!(!saw_identity && value["pod_name"].as_str() == Some(&target.pod)
+                    && value["pod_uid"].as_str() == Some(&target.uid) && value["container"].as_str() == Some(&target.container)
+                    && value["restart_count"] == 0, "follower file original identity differs");
+                saw_identity = true;
+            }
+            Some("commit") => {
+                ensure!(value["table_id"].as_str() == Some(table_id) && value["table_name"].as_str() == Some(table_name),
+                    "follower commit table differs from original membership");
+                let version = value["delta_version"].as_u64().context("missing follower commit version")?;
+                let rows = value["rows"].as_u64().context("missing follower commit rows")?;
+                let files = value["files"].as_u64().context("missing follower commit files")?;
+                let parquet_bytes = value["parquet_bytes"].as_u64().context("missing follower commit bytes")?;
+                ensure!([version, rows, files, parquet_bytes].iter().all(|number| *number <= 9_007_199_254_740_991),
+                    "follower numeric value exceeds interoperable range");
+                let commit = json!({"delta_version":version,"rows":rows,"files":files,"parquet_bytes":parquet_bytes});
+                if let Some(previous) = commits.insert(version, commit.clone()) { ensure!(previous == commit, "conflicting follower commits"); }
+                ensure!(commits.len() <= 10_000, "follower diagnostic commit count exceeds bound");
+            }
+            Some("gap") => {
+                let mapped = match value["reason"].as_str() {
+                    Some("continuity_unprovable") => "continuity_unproven",
+                    Some("stream_interrupted" | "stream_read_failed") => "interrupted",
+                    Some("pod_gone") => "pod_gone",
+                    Some("pod_replaced" | "restart_or_status_unavailable" | "pod_status_unavailable") => "identity_unavailable",
+                    Some("terminal_identity_unverified") => "terminal_unbound",
+                    Some("truncated_line" | "dedupe_limit") => "truncated",
+                    Some("cancelled_admissions_ambiguous") => "ambiguous_admission",
+                    Some("malformed_commit" | "invalid_utf8" | "missing_timestamp" | "invalid_timestamp" |
+                        "unattributed_commit" | "timestamp_regressed") => "malformed",
+                    _ => bail!("unknown typed follower gap"),
+                };
+                gaps.insert(mapped);
+            }
+            Some("capability" | "drain_complete") => {}
+            _ => bail!("invalid redacted follower record kind"),
+        }
+    }
+    ensure!(saw_identity, "follower source identity unavailable");
+    Ok(json!({"source":{"sha256":summary["sha256"],"bytes":bytes.len(),"lines":lines},
+        "commits":commits.into_values().collect::<Vec<_>>(),"gaps":gaps}))
+}
+
+#[cfg(not(unix))]
+async fn follower_diagnostic_projection(
+    _summary: &Value, _target: &AksResourcePodTarget, _table_id: &str, _table_name: &str,
+) -> Result<Value> { bail!("private follower projection requires Unix permissions") }
+
+async fn publish_shutdown_follower_diagnostics(
+    platform: &AksPlatform, config: &OatConfig, inventory: &RunInventory, etag: &str, actor: &CampaignCleanupActor,
+) -> Value {
+    let result: Result<Vec<ShutdownSourceReference>> = async {
+        let membership = platform.shutdown_membership.as_ref().context("membership unavailable")?;
+        let summaries = platform.shutdown_drain_evidence.as_ref()
+            .and_then(|value| value.pointer("/collector_followers/replicas"))
+            .and_then(Value::as_array).context("follower summaries unavailable")?;
+        let targets = aks_resource_pod_targets(&platform.resource_readback)?.into_iter()
+            .filter(|target| target.role == "collector").collect::<Vec<_>>();
+        ensure!(!targets.is_empty() && targets.len() <= 64 && summaries.len() == targets.len(), "follower coverage differs");
+        let [table] = config.tables.as_slice() else { bail!("follower diagnostics require one table"); };
+        let table_root = aks_qap_relative_path(platform.qap_relative_data_root.as_deref().context("missing Delta root")?, table)?;
+        let mut table_url = Url::parse(platform.delta_root.as_deref().context("missing Delta URL")?)?;
+        table_url.set_path(&format!("/{table_root}/"));
+        let table_id = fixture_sha256(table_url.as_str().as_bytes());
+        let table_name = canonical_dmv_table_name(table)?;
+        let root = shutdown_source_root(inventory);
+        let mut futures = Vec::new();
+        for target in &targets {
+            let matches = summaries.iter().filter(|item| item["pod_uid"].as_str() == Some(&target.uid)
+                && item["container"].as_str() == Some(&target.container)).collect::<Vec<_>>();
+            let [summary] = matches.as_slice() else { bail!("follower source identity is missing or ambiguous"); };
+            let projection = follower_diagnostic_projection(summary, target, &table_id, &table_name).await?;
+            let request = json!({"schema_version":1,"campaign_id":inventory.campaign_id,
+                "orchestration_run_id":inventory.orchestration_run_id,"cell_run_id":inventory.cell_run_id,
+                "expected_etag":etag,"actor":actor,"membership":membership,"pod_uid":target.uid,
+                "container":target.container,"restart_count":0,"source":projection["source"],
+                "commits":projection["commits"],"gaps":projection["gaps"]});
+            let expected = format!("{root}/collector-followers/{}-{}-0.json", target.uid, target.container);
+            futures.push(async move {
+                let bytes = run_campaign_custody_json(platform, "shutdown-follower-publish", None, &request,
+                    Duration::from_secs(30)).await?;
+                let response: ShutdownSourceResponse = serde_json::from_slice(&bytes)?;
+                ensure!(response.ok, "follower diagnostic publication was not confirmed");
+                validate_shutdown_source(&response.receipt, &expected)?;
+                Ok::<_, anyhow::Error>(response.receipt)
+            });
+        }
+        let results = tokio::time::timeout(Duration::from_secs(35), join_all(futures)).await
+            .context("follower diagnostic publication outcome unknown")?;
+        results.into_iter().collect()
+    }.await;
+    match result {
+        Ok(receipts) => json!({"status":"diagnostic_only","continuity":"unproven","receipts":receipts}),
+        Err(_) => json!({"status":"unavailable","reason":"follower_diagnostic_publication_unconfirmed"}),
+    }
+}
+
+async fn finalize_campaign_shutdown(platform: &AksPlatform, config: &OatConfig) -> Result<(ShutdownFinalizationReceipt, Value)> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let cached: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read frozen campaign inventory")?,
+    )
+    .context("parse frozen campaign inventory")?;
+    let cached_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read frozen campaign inventory ETag")?;
+    let cached_etag = cached_etag.trim();
+    validate_campaign_etag(cached_etag)?;
+    let (inventory, etag) = read_authoritative_campaign_inventory(
+        platform,
+        &identity,
+        &cached.orchestration_run_id,
+        Duration::from_secs(30),
+    )
+    .await?;
+    cached.validate_successor(&inventory)?;
+    if etag != cached_etag || inventory != cached {
+        bail!("frozen campaign inventory changed before shutdown finalization");
+    }
+    campaign_cleanup_step_complete(&CampaignCleanupAction::TerminalCapture, &inventory)?;
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let input_request = ShutdownFinalizationInputsRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+    };
+    let input_output = run_campaign_custody_json(
+        platform,
+        "shutdown-finalization-inputs",
+        None,
+        &input_request,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let input_response: ShutdownFinalizationInputsResponse =
+        serde_json::from_slice(&input_output).context("parse guarded shutdown source references")?;
+    if !input_response.ok {
+        bail!("shutdown source references were not positively confirmed");
+    }
+    let inputs = input_response.receipt;
+    validate_shutdown_inputs(&inputs, &inventory, &etag)?;
+    let follower_diagnostics = publish_shutdown_follower_diagnostics(platform, config, &inventory, &etag, &actor).await;
+    let (source_proof, mut source_evidence) = capture_shutdown_receipts(platform, &inventory, &etag, &actor).await;
+    source_evidence["follower_diagnostics"] = follower_diagnostics;
+    let request = ShutdownFinalizationRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+        terminal_capture: &inputs.terminal_capture,
+        delta_before: &inputs.delta_before,
+        delta_terminal: &inputs.delta_terminal,
+        reconciliation: ShutdownReconciliationRequest {
+            profile: "single_hot_table",
+            proof: source_proof,
+        },
+    };
+    let confirm = |output: &[u8]| -> Result<ShutdownFinalizationReceipt> {
+        let response: ShutdownFinalizationResponse =
+            serde_json::from_slice(output).context("parse guarded shutdown finalization")?;
+        if !response.ok {
+            bail!("shutdown finalization was not positively confirmed");
+        }
+        validate_shutdown_finalization(&response.receipt, &inventory, &etag, &actor, &inputs)?;
+        Ok(response.receipt)
+    };
+    let write = serde_json::to_value(&request)?;
+    let read = serde_json::to_value(&input_request)?;
+    let receipt = submit_shutdown_finalization_once(
+        |action| {
+            let payload = if action == "shutdown-finalize" { &write } else { &read };
+            async move { run_campaign_custody_json(platform, action, None, payload, Duration::from_secs(30)).await }
+        },
+        confirm,
+    )
+    .await?;
+    Ok((receipt, source_evidence))
+}
+
+async fn cleanup_campaign_aks_platform(
+    config: &OatConfig,
+    platform: &AksPlatform,
+    phase: CampaignCleanupPhase,
+) -> Result<Value> {
     let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
     let campaign_baseline = load_campaign_baseline_receipt(platform, &identity).await?;
     let runtime_dir = platform
@@ -11730,27 +12384,20 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
             .await?;
     cached.validate_successor(&inventory)?;
     persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
-    let actions = [
-        CampaignCleanupAction::StopAdmission,
-        CampaignCleanupAction::BoundedDrain,
-        CampaignCleanupAction::EvidenceCapture,
-        CampaignCleanupAction::StopMaintenance,
-        CampaignCleanupAction::TerminalCapture,
-        CampaignCleanupAction::RemoveNamespace,
-        CampaignCleanupAction::RemoveQap,
-        CampaignCleanupAction::RemoveFic,
-        CampaignCleanupAction::Handoff,
-    ];
+    if matches!(phase, CampaignCleanupPhase::Release) {
+        campaign_cleanup_step_complete(&CampaignCleanupAction::TerminalCapture, &inventory)?;
+    }
+    let actions = phase.actions();
     let mut receipts = Vec::with_capacity(actions.len());
     for action in actions {
-        if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
+        if !campaign_cleanup_action_needs_execution(action, &inventory)? {
             receipts.push(
                 json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
             );
             continue;
         }
         let (next_inventory, next_etag, receipt) =
-            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
+            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, action, &inventory, &etag)
                 .await
                 .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
         inventory = next_inventory;
@@ -14245,6 +14892,7 @@ fn aks_shutdown_exit_outcome(
     let outcome = shutdown_exit_outcome(role, was_running, exit_code, oom_killed)?;
     if role == ComponentRole::Collector && exit_code == Some(143) {
         return Ok(json!({"status": "unavailable", "exit_code": 143,
+            "classification": "exit_143_terminal_reconciliation_unavailable",
             "reason": "drain_complete_and_exact_delta_reconciliation_unverified"}));
     }
     if role == ComponentRole::Collector && exit_code.is_none() {
@@ -14373,23 +15021,23 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         platform.router_metrics_url = None;
     }
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
-        match cleanup_campaign_aks_platform(config, platform).await {
-            Ok(evidence) => {
+        let frozen = cleanup_campaign_aks_platform(config, platform, CampaignCleanupPhase::Freeze).await;
+        let custody = stop_custody_followers(&mut platform.custody_followers).await;
+        match frozen {
+            Ok(mut evidence) => {
+                evidence["collector_followers"] = custody;
                 platform.shutdown_drain_evidence = Some(evidence);
-                platform.qap_cleanup_confirmed = true;
             }
             Err(error) => {
                 let detail = format!("{error:#}");
                 platform.shutdown_drain_evidence = Some(json!({
                     "status": "unavailable",
                     "reason": "custody_cleanup_failed_or_uncertain",
+                    "collector_followers": custody,
                     "failure": detail,
                 }));
                 failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
             }
-        }
-        if let Err(error) = require_aks_cleanup_confirmation(platform) {
-            failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
         }
         if failures.is_empty() {
             return Ok(());
@@ -14419,6 +15067,11 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                         )
                         .await;
                         platform.stopped_collector_logs = Some(collector_logs);
+                        let custody = stop_custody_followers(&mut platform.custody_followers).await;
+                        let stopped = stopped.map(|mut evidence| {
+                            evidence["collector_followers"] = custody.clone();
+                            evidence
+                        });
                         let cleanup = async {
                             timed_aks_cleanup_step(
                                 "delete run-owned AKS namespace",
@@ -14525,6 +15178,14 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             }
         } else {
             failures.push("workload identity cleanup has no durable run record path".to_owned());
+        }
+    }
+    if !platform.custody_followers.is_empty() {
+        let custody = stop_custody_followers(&mut platform.custody_followers).await;
+        if let Some(evidence) = platform.shutdown_drain_evidence.as_mut() {
+            evidence["collector_followers"] = custody;
+        } else {
+            platform.shutdown_drain_evidence = Some(json!({"status":"unavailable","collector_followers":custody}));
         }
     }
     if let Err(error) = require_aks_cleanup_confirmation(platform) {
@@ -17165,6 +17826,173 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_finalization_binds_frozen_sources_and_never_promotes_unproved_143() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let mut inventory = initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
+            "oat-00000000000000000000000000000004",
+            "campaignstorage",
+            "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
+            },
+        )?;
+        inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let root = format!(
+            "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}",
+            inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+        );
+        let reference = |blob: String| ShutdownSourceReference {
+            blob,
+            etag: "\"source\"".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let inputs = ShutdownFinalizationInputs {
+            schema_version: 1,
+            inventory_etag: "\"inventory\"".to_owned(),
+            terminal_capture: reference(format!(
+                "{}/custody/{}/terminal_capture.json",
+                inventory
+                    .evidence_destination
+                    .as_ref()
+                    .context("destination")?
+                    .blob_prefix,
+                inventory.cell_run_id
+            )),
+            delta_before: reference(format!("{root}/delta-before.json")),
+            delta_terminal: reference(format!("{root}/delta-terminal.json")),
+        };
+        let mut receipt = ShutdownFinalizationReceipt {
+            schema_version: 1,
+            blob: format!("{root}/shutdown-finalization.json"),
+            etag: "\"final\"".to_owned(),
+            sha256: "b".repeat(64),
+            inventory_etag: inputs.inventory_etag.clone(),
+            actor: actor.clone(),
+            origin: ShutdownFinalizationOrigin {
+                campaign_id: inventory.campaign_id.clone(),
+                owner_id: inventory.owner_id.clone(),
+                fencing_token: inventory.fencing_token,
+                orchestration_run_id: inventory.orchestration_run_id.clone(),
+                cell_run_id: inventory.cell_run_id.clone(),
+                namespace: inventory.namespace.clone(),
+            },
+            terminal_capture: inputs.terminal_capture.clone(),
+            delta_before: inputs.delta_before.clone(),
+            delta_terminal: inputs.delta_terminal.clone(),
+            verdicts: vec![ShutdownFinalVerdict {
+                pod_name: "collector-0".to_owned(),
+                pod_uid: "pod-uid-0".to_owned(),
+                container: "dataflow".to_owned(),
+                restart_count: Some(0),
+                classification: "exit_0".to_owned(),
+            }],
+        };
+        validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs)?;
+        ensure_shutdown_release(&receipt, Some(1))?;
+        assert!(ensure_shutdown_release(&receipt, None).is_err());
+        assert!(ensure_shutdown_release(&receipt, Some(2)).is_err());
+        for classification in [
+            "clean_sigterm_after_drain",
+            "exit_143_terminal_reconciliation_failed",
+            "exit_143_terminal_reconciliation_unavailable",
+            "exit_143_without_drain_marker",
+        ] {
+            receipt.verdicts[0].classification = classification.to_owned();
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs)?;
+            assert!(ensure_shutdown_release(&receipt, Some(1)).is_err());
+        }
+        receipt.verdicts[0].classification = "sigterm_after_drain_pending_reconciliation".to_owned();
+        assert!(validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs).is_err());
+        receipt.verdicts[0].classification = "exit_0".to_owned();
+        receipt.verdicts.push(receipt.verdicts[0].clone());
+        assert!(validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs).is_err());
+        receipt.verdicts.pop();
+        receipt.delta_terminal.sha256 = "c".repeat(64);
+        assert!(validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs).is_err());
+        receipt.delta_terminal = inputs.delta_terminal.clone();
+        receipt.actor.fencing_token += 1;
+        assert!(validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs).is_err());
+        receipt.actor.fencing_token -= 1;
+        receipt.origin.namespace.uid = None;
+        assert!(validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs).is_err());
+        assert!(validate_shutdown_inputs(&inputs, &inventory, "\"changed\"").is_err());
+        let mut wrong = inputs.clone();
+        wrong.delta_before.blob.push_str(".other");
+        assert!(validate_shutdown_inputs(&wrong, &inventory, "\"inventory\"").is_err());
+        assert_eq!(
+            CampaignCleanupPhase::Freeze
+                .actions()
+                .last()
+                .map(CampaignCleanupAction::selector),
+            Some("terminal_capture")
+        );
+        assert_eq!(
+            CampaignCleanupPhase::Release
+                .actions()
+                .last()
+                .map(CampaignCleanupAction::selector),
+            Some("handoff")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalization_unknown_write_uses_readback_without_replay() -> Result<()> {
+        for readback_available in [true, false] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let result = submit_shutdown_finalization_once(
+                move |action| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.lock().expect("calls lock").push(action);
+                        if action == "shutdown-finalization-read" && readback_available {
+                            Ok(b"confirmed".to_vec())
+                        } else {
+                            Err(anyhow::anyhow!("unknown outcome"))
+                        }
+                    }
+                },
+                |bytes| {
+                    if bytes == b"confirmed" {
+                        Ok(())
+                    } else {
+                        bail!("mismatched finalization")
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), readback_available);
+            assert_eq!(
+                *calls.lock().expect("calls lock"),
+                ["shutdown-finalize", "shutdown-finalization-read"]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn campaign_cli_actions_always_receive_the_selected_private_env_and_stamp_paths() -> Result<()> {
         let paths = AksHelperConfigPaths {
             stamp_config_path: Path::new("/workspace/selected-stamp.yaml"),
@@ -17483,19 +18311,14 @@ mod tests {
 
     #[test]
     fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
-        let actions = [
-            CampaignCleanupAction::StopAdmission,
-            CampaignCleanupAction::BoundedDrain,
-            CampaignCleanupAction::EvidenceCapture,
-            CampaignCleanupAction::StopMaintenance,
-            CampaignCleanupAction::TerminalCapture,
-            CampaignCleanupAction::RemoveNamespace,
-            CampaignCleanupAction::RemoveQap,
-            CampaignCleanupAction::RemoveFic,
-            CampaignCleanupAction::Handoff,
-        ];
+        let actions = CampaignCleanupPhase::Freeze
+            .actions()
+            .iter()
+            .chain(CampaignCleanupPhase::Release.actions())
+            .map(CampaignCleanupAction::selector)
+            .collect::<Vec<_>>();
         assert_eq!(
-            actions.map(|action| action.selector()),
+            actions,
             [
                 "stop_admission",
                 "bounded_drain",
@@ -18176,6 +18999,8 @@ mod tests {
             campaign_cli_paths: None,
             maintenance_cell_baseline: Vec::new(),
             stopped_collector_logs: None,
+            custody_followers: Vec::new(),
+            shutdown_membership: None,
         };
         platform.run_table_initialization_attempted = true;
         assert!(require_aks_cleanup_confirmation(&platform).is_err());

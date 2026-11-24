@@ -1217,6 +1217,16 @@ export async function campaignMain(args: string[], dependencies: {
     console.log(JSON.stringify({ ok: true, receipt: { status: 'ready', campaign_id: state.campaignId,
       owner_id: state.ownerId, fencing_token: state.fencingToken, orchestration_run_id: state.runInventory!.orchestration_run_id,
       cell_run_id: state.runInventory!.cell_run_id, namespace_uid: state.runInventory!.namespace.uid } }));
+  } else if (['shutdown-finalization-inputs', 'shutdown-finalize', 'shutdown-finalization-read', 'shutdown-membership-capture', 'shutdown-receipt-capture', 'shutdown-follower-publish'].includes(action ?? '') && args.length === 1) {
+    const finalization = await import('./aks-shutdown-finalization.js');
+    const input = await readRunInventoryStdin();
+    const receipt = action === 'shutdown-follower-publish' ? await finalization.shutdownFollowerPublish(store, azure, input, env) :
+      action === 'shutdown-membership-capture' ? await finalization.shutdownMembershipCapture(store, azure, input, env) :
+      action === 'shutdown-receipt-capture' ? await finalization.shutdownReceiptCapture(store, azure, input, env) :
+      action === 'shutdown-finalization-inputs' ? await finalization.shutdownFinalizationInputs(store, azure, input, env) :
+      action === 'shutdown-finalize' ? await finalization.shutdownFinalize(store, azure, input, env) :
+        await finalization.shutdownFinalizationRead(store, azure, input, env);
+    console.log(JSON.stringify({ ok: true, receipt }));
   } else if (action === 'status' && args.length === 1) {
     console.log(JSON.stringify((await store.read())?.state ?? { status: 'idle' }));
   } else if (action === 'read-inventory' && args.length === 1) {
@@ -1276,7 +1286,7 @@ export async function campaignMain(args: string[], dependencies: {
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {
   campaignMain(process.argv.slice(2)).catch((error: unknown) => {
-    const jsonActions = ['publish-inventory', 'assert-ready', 'cleanup-step', 'read-inventory', 'capture-cell-baseline', 'capture-baseline'];
+    const jsonActions = ['publish-inventory', 'assert-ready', 'cleanup-step', 'read-inventory', 'capture-cell-baseline', 'capture-baseline', 'shutdown-finalization-inputs', 'shutdown-finalize', 'shutdown-finalization-read', 'shutdown-membership-capture', 'shutdown-receipt-capture', 'shutdown-follower-publish'];
     if (process.argv.slice(2).some(action => jsonActions.includes(action))) {
       console.log(JSON.stringify(cleanupFailureResponse(error)));
     } else console.error(error instanceof Error ? error.message : 'Campaign custody failed');

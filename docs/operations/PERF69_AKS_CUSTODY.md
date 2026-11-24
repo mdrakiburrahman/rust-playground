@@ -192,6 +192,15 @@ PATCH can recover only from positive exact physically stopped state, labelled as
 response; it is never blindly reissued. Late responses remain evidence, not successful budget completion.
 Terminal Delta is frozen only after collector and maintenance writers are physically stopped with recreation disabled.
 
+A collector exit 143 with an exact same-instance drain marker is provisional, not clean. Finalization reads
+the immutable terminal capture and Delta baseline/terminal references under the current fence and inventory ETag,
+then writes a create-only shutdown-finalization receipt; uncertain writes are resolved only by guarded exact readback.
+Handoff also requires that matching receipt for exit 0; later cleanup may advance the inventory ETag without
+changing the receipt's originally guarded ETag. Reads must observe a stable current inventory and fence.
+Current receipts cannot independently authenticate the collector commits and client acknowledgments used by Rust
+reconciliation, so exit 143 is recorded as reconciliation unavailable and prevents handoff or replacement.
+Data-final preservation is not reconciliation, and neither the terminal capture nor Delta terminal is rewritten.
+
 ## Campaign-terminal providers
 
 | API | Safety boundary |

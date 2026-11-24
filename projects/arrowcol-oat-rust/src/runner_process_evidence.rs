@@ -3708,3 +3708,508 @@ groups:
         Ok(())
     }
 }
+
+const CUSTODY_FOLLOWER_MAX_LINE: u64 = 256 * 1024;
+const CUSTODY_FOLLOWER_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CUSTODY_FOLLOWER_MAX_KEYS: usize = 100_000;
+
+struct CustodyFollower {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<Result<Value>>,
+    relative_path: PathBuf,
+}
+
+impl Drop for CustodyFollower {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.task.abort();
+    }
+}
+
+struct CustodyProjection {
+    file: std::fs::File,
+    digest: Sha256,
+    bytes: u64,
+    lines: u64,
+    keys: HashSet<(String, String)>,
+    last_timestamp: Option<String>,
+    gaps: BTreeSet<&'static str>,
+    tables: BTreeSet<String>,
+}
+
+impl CustodyProjection {
+    fn write(&mut self, value: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        let total = self
+            .bytes
+            .checked_add(u64::try_from(bytes.len())?)
+            .context("custody evidence size overflow")?;
+        if total > CUSTODY_FOLLOWER_MAX_BYTES {
+            bail!("collector custody projection exceeded its bound");
+        }
+        self.file.write_all(&bytes)?;
+        self.file.sync_data()?;
+        self.digest.update(&bytes);
+        self.bytes = total;
+        self.lines += 1;
+        Ok(())
+    }
+
+    fn gap(&mut self, reason: &'static str) -> Result<()> {
+        if self.gaps.insert(reason) {
+            self.write(&json!({"kind":"gap","reason":reason}))?;
+        }
+        Ok(())
+    }
+
+    fn line(&mut self, bytes: &[u8]) -> Result<()> {
+        let Ok(line) = std::str::from_utf8(bytes) else {
+            return self.gap("invalid_utf8");
+        };
+        let Some((timestamp, payload)) = line.trim_end_matches(['\r', '\n']).split_once(' ') else {
+            return self.gap("missing_timestamp");
+        };
+        let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) else {
+            return self.gap("invalid_timestamp");
+        };
+        if parsed.offset().local_minus_utc() != 0 || timestamp.len() > 40 {
+            return self.gap("invalid_timestamp");
+        }
+        let key = (timestamp.to_owned(), fixture_sha256(payload.as_bytes()));
+        if self.keys.contains(&key) {
+            return Ok(());
+        }
+        if self.keys.len() >= CUSTODY_FOLLOWER_MAX_KEYS {
+            return self.gap("dedupe_limit");
+        }
+        self.keys.insert(key);
+        if let Some(last) = &self.last_timestamp {
+            let last = DateTime::parse_from_rfc3339(last).context("saved follower timestamp invalid")?;
+            if parsed < last {
+                self.gap("timestamp_regressed")?;
+            } else {
+                self.last_timestamp = Some(timestamp.to_owned());
+            }
+        } else {
+            self.last_timestamp = Some(timestamp.to_owned());
+        }
+        if let Some(raw) = payload.strip_prefix("arrowcol_data_commit ") {
+            let Ok(event) = serde_json::from_str::<CommitEvent>(raw) else {
+                return self.gap("malformed_commit");
+            };
+            let (Some(table_id), Some(table_name), Some(version), Some(rows), Some(files), Some(parquet_bytes)) = (
+                event.table_id,
+                event.table_name,
+                event.delta_version,
+                event.rows,
+                event.files,
+                event.parquet_bytes,
+            ) else {
+                return self.gap("unattributed_commit");
+            };
+            if event.schema_version != 1
+                || event.outcome != "committed"
+                || table_id.len() != 64
+                || !table_id.bytes().all(|b| b.is_ascii_hexdigit())
+                || !self.tables.contains(&table_name)
+                || [version, rows, files, parquet_bytes]
+                    .iter()
+                    .any(|v| *v > 9_007_199_254_740_991)
+            {
+                return self.gap("unattributed_commit");
+            }
+            self.write(&json!({"kind":"commit","timestamp":timestamp,"table_id":table_id,
+                "table_name":table_name,"delta_version":version,"rows":rows,"files":files,"parquet_bytes":parquet_bytes}))?;
+        } else if let Some(raw) = payload.strip_prefix("arrowcol_effective_config ") {
+            if let Ok(value) = serde_json::from_str::<Value>(raw)
+                && value["commit_telemetry"]
+                    == json!({"schema_version":1,"scope":"new_ingestion_addfiles_after_sync","clock":"system_unix_ms"})
+            {
+                self.write(&json!({"kind":"capability","timestamp":timestamp,"ingestion_only":true}))?;
+            }
+        } else if let Some(raw) = payload.strip_prefix("arrowcol_shutdown ") {
+            if let Ok(value) = serde_json::from_str::<Value>(raw)
+                && value == json!({"event":"drain_complete"})
+            {
+                self.write(&json!({"kind":"drain_complete","timestamp":timestamp}))?;
+            }
+        } else if payload.contains("cancelled admissions had no observed publication outcome") {
+            self.gap("cancelled_admissions_ambiguous")?;
+        }
+        Ok(())
+    }
+}
+
+fn custody_log_command(
+    binary: &str,
+    config: &OatConfig,
+    target: &AksResourcePodTarget,
+    since: Option<&str>,
+) -> Command {
+    let mut command = Command::new(binary);
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command.args([
+        "logs",
+        &target.pod,
+        "--namespace",
+        &config.namespace,
+        "--container",
+        &target.container,
+        "--follow",
+        "--timestamps",
+    ]);
+    if let Some(since) = since {
+        command.arg(format!("--since-time={since}"));
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+async fn custody_pod_observation(binary: &str, config: &OatConfig, target: &AksResourcePodTarget) -> Result<Option<Value>> {
+    let mut command = Command::new(binary);
+    if let Some(context) = &config.kubectl_context { command.args(["--context", context]); }
+    command.args(["get", "pod", &target.pod, "--namespace", &config.namespace, "--ignore-not-found", "-o", "json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let child = command.spawn().context("start bounded collector identity read")?;
+    let output = tokio::time::timeout(Duration::from_secs(5), bounded_native_child_output(child, 1024 * 1024))
+        .await.context("collector identity read timed out")??;
+    ensure!(output.status.success(), "collector identity read failed");
+    if output.stdout.iter().all(u8::is_ascii_whitespace) { return Ok(None); }
+    Ok(Some(serde_json::from_slice(&output.stdout).context("parse collector identity read")?))
+}
+
+async fn run_custody_follower(
+    binary: &str,
+    config: OatConfig,
+    target: AksResourcePodTarget,
+    mut projection: CustodyProjection,
+    mut stop: watch::Receiver<bool>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<Value> {
+    projection.gap("continuity_unprovable")?;
+    let mut ready = Some(ready);
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        let mut child = custody_log_command(binary, &config, &target, projection.last_timestamp.as_deref())
+            .spawn()
+            .context("start collector custody follower")?;
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .context("collector custody follower has no stdout")?;
+        let mut reader = BufReader::new(stdout);
+        let interrupted = loop {
+            let mut line = Vec::new();
+            let mut limited = (&mut reader).take(CUSTODY_FOLLOWER_MAX_LINE + 1);
+            let read = tokio::select! {
+                _ = stop.changed() => break false,
+                read = limited.read_until(b'\n', &mut line) => read,
+            };
+            match read {
+                Ok(0) => break true,
+                Ok(n) if u64::try_from(n)? <= CUSTODY_FOLLOWER_MAX_LINE && line.ends_with(b"\n") => {
+                    projection.line(&line)?
+                }
+                Ok(_) => {
+                    projection.gap("truncated_line")?;
+                    break true;
+                }
+                Err(_) => {
+                    projection.gap("stream_read_failed")?;
+                    break true;
+                }
+            }
+        };
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        if !interrupted {
+            break;
+        }
+        projection.gap("stream_interrupted")?;
+        match custody_pod_observation(binary, &config, &target).await {
+            Ok(None) => { projection.gap("pod_gone")?; break; }
+            Ok(Some(pod)) if pod.pointer("/metadata/uid").and_then(Value::as_str) != Some(&target.uid) => {
+                projection.gap("pod_replaced")?; break;
+            }
+            Ok(Some(pod)) => {
+                let statuses = pod.pointer("/status/containerStatuses").and_then(Value::as_array);
+                let matching = statuses.map(|items| items.iter().filter(|value| value["name"].as_str() == Some(&target.container)).collect::<Vec<_>>());
+                let Some([status]) = matching.as_deref() else { projection.gap("pod_status_unavailable")?; break; };
+                if status["restartCount"].as_u64() != Some(0) || status["containerID"].as_str() != target.container_id.as_deref() {
+                    projection.gap("restart_or_status_unavailable")?; break;
+                }
+            }
+            Err(_) => { projection.gap("pod_status_unavailable")?; break; }
+        }
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
+    projection.gap("terminal_identity_unverified")?;
+    Ok(
+        json!({"pod_name":target.pod,"pod_uid":target.uid,"container":target.container,
+        "sha256":format!("{:x}", projection.digest.finalize()),"bytes":projection.bytes,"lines":projection.lines,
+        "gaps":projection.gaps,"complete":false}),
+    )
+}
+
+#[cfg(unix)]
+async fn start_custody_followers(config: &OatConfig, targets: &[AksResourcePodTarget], followers: &mut Vec<CustodyFollower>) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    ensure!(
+        !targets.is_empty() && targets.len() <= 64,
+        "collector custody replica count is invalid"
+    );
+    let tables = config
+        .tables
+        .iter()
+        .map(|table| canonical_dmv_table_name(table))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let directory = std::env::current_dir()?.join(format!(".oat-custody-{}", uuid::Uuid::new_v4()));
+    let mut builder = fs::DirBuilder::new();
+    builder
+        .mode(0o700)
+        .create(&directory)
+        .context("create private collector custody directory")?;
+    for target in targets {
+        ensure!(
+            uuid::Uuid::parse_str(&target.uid).is_ok()
+                && [&target.pod, &target.container].iter().all(|value| !value.is_empty()
+                    && value.len() <= 253
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))),
+            "collector custody identity has invalid characters"
+        );
+        let output = kubectl(
+            config,
+            vec![
+                "get",
+                "pod",
+                &target.pod,
+                "--namespace",
+                &config.namespace,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await?;
+        let pod: Value = serde_json::from_str(&output).context("parse collector custody pod identity")?;
+        let statuses = pod
+            .pointer("/status/containerStatuses")
+            .and_then(Value::as_array)
+            .context("collector status missing")?;
+        let matching = statuses
+            .iter()
+            .filter(|status| status["name"].as_str() == Some(&target.container))
+            .collect::<Vec<_>>();
+        let [status] = matching.as_slice() else {
+            bail!("collector custody container identity is ambiguous");
+        };
+        ensure!(
+            pod.pointer("/metadata/name").and_then(Value::as_str) == Some(&target.pod)
+                && pod.pointer("/metadata/uid").and_then(Value::as_str) == Some(&target.uid)
+                && status["restartCount"].as_u64() == Some(0)
+                && status["ready"].as_bool() == Some(true)
+                && status.pointer("/state/running").is_some()
+                && status["containerID"].as_str() == target.container_id.as_deref(),
+            "collector custody original pod/container identity is not ready and unique"
+        );
+        let filename = format!("{}.jsonl", uuid::Uuid::new_v4());
+        let path = directory.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .context("create private collector custody projection")?;
+        let mut projection = CustodyProjection {
+            file,
+            digest: Sha256::new(),
+            bytes: 0,
+            lines: 0,
+            keys: HashSet::new(),
+            last_timestamp: None,
+            gaps: BTreeSet::new(),
+            tables: tables.clone(),
+        };
+        projection.write(&json!({"kind":"identity","pod_name":target.pod,"pod_uid":target.uid,
+            "container":target.container,"restart_count":0}))?;
+        let (stop, receiver) = watch::channel(false);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_custody_follower(
+            "kubectl",
+            config.clone(),
+            target.clone(),
+            projection,
+            receiver,
+            ready,
+        ));
+        let relative_path = path.strip_prefix(std::env::current_dir()?)?.to_owned();
+        let follower = CustodyFollower {
+            stop,
+            task,
+            relative_path,
+        };
+        followers.push(follower);
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .context("collector custody follower startup timed out")?
+            .context("collector custody follower exited before startup")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn start_custody_followers(
+    _config: &OatConfig,
+    _targets: &[AksResourcePodTarget],
+    _followers: &mut Vec<CustodyFollower>,
+) -> Result<()> {
+    bail!("private collector custody requires Unix file permissions")
+}
+
+async fn stop_custody_followers(followers: &mut Vec<CustodyFollower>) -> Value {
+    for follower in followers.iter() {
+        let _ = follower.stop.send(true);
+    }
+    let mut receipts = Vec::new();
+    for mut follower in followers.drain(..) {
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut follower.task).await;
+        receipts.push(match result {
+            Ok(Ok(Ok(mut value))) => {
+                value["relative_path"] = json!(follower.relative_path);
+                value
+            }
+            _ => json!({"complete":false,"gaps":["follower_result_unavailable"]}),
+        });
+    }
+    json!({"status":"incomplete","reason":"source_continuity_and_terminal_identity_unverified","replicas":receipts})
+}
+
+#[cfg(all(test, unix))]
+mod custody_follower_tests {
+    use super::*;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    #[tokio::test]
+    async fn follows_reconnect_deduplicates_and_only_writes_allowlisted_projection() -> Result<()> {
+        let root = PathBuf::from(format!(".oat-follower-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let file_path = root.join("projection.jsonl");
+        let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file_path)?;
+        let script = root.join("kubectl");
+        let calls = std::env::current_dir()?.join(root.join("calls"));
+        let uid = "00000000-0000-0000-0000-000000000001";
+        let table_id = "a".repeat(64);
+        let event = |version| json!({"schema_version":1,"outcome":"committed","table_id":table_id,
+            "table_name":"telemetry.sqlserver.sqlserver_wait_stats","delta_version":version,
+            "rows":3,"files":1,"parquet_bytes":8,"password":"never-persist-this"}).to_string();
+        let first = format!("2025-01-01T00:00:00Z arrowcol_data_commit {}", event(1));
+        let second = format!("2025-01-01T00:00:01Z arrowcol_data_commit {}", event(2));
+        let script_body = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *' logs '*|logs*)\n    case \"$*\" in\n      *--since-time=*) printf '%s\\n' '{}' '{}'; exec sleep 30;;\n      *) printf '%s\\n' '{}';;\n    esac;;\n  *) printf '%s\\n' '{}' ;;\nesac\n",
+            calls.display(), first, second, first,
+            json!({"metadata":{"uid":uid},"status":{"containerStatuses":[{"name":"collector","restartCount":0,"containerID":"runtime://original"}]}}));
+        fs::write(&script, script_body)?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+        let mut config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        config.namespace = "fixture".to_owned();
+        config.kubectl_context = None;
+        let target = AksResourcePodTarget { role:"collector".into(), pod:"collector-a".into(), uid:uid.into(),
+            container:"collector".into(), node:"node-a".into(), container_id:Some("runtime://original".into()) };
+        let projection = CustodyProjection { file, digest:Sha256::new(), bytes:0, lines:0, keys:HashSet::new(),
+            last_timestamp:None, gaps:BTreeSet::new(), tables:BTreeSet::from(["telemetry.sqlserver.sqlserver_wait_stats".into()]) };
+        let (stop, receiver) = watch::channel(false);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let binary = std::env::current_dir()?.join(&script).to_string_lossy().to_string();
+        let task = tokio::spawn(async move { run_custody_follower(&binary, config, target, projection, receiver, ready).await });
+        tokio::time::timeout(Duration::from_secs(5), started).await??;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fs::read_to_string(&file_path).is_ok_and(|text| text.contains("\"delta_version\":2")) { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.context("fake follower did not reconnect")?;
+        stop.send(true)?;
+        let summary = tokio::time::timeout(Duration::from_secs(5), task).await???;
+        let bytes = fs::read(&file_path)?;
+        let text = std::str::from_utf8(&bytes)?;
+        let records = text.lines().map(serde_json::from_str::<Value>).collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(records.iter().filter(|item| item["kind"] == "commit").count(), 2);
+        assert!(!text.contains("never-persist-this") && !text.contains("password"));
+        assert_eq!(summary["sha256"], fixture_sha256(&bytes));
+        assert_eq!(summary["bytes"], bytes.len());
+        assert_eq!(summary["lines"], text.lines().count());
+        assert_eq!(summary["complete"], false);
+        assert!(summary["gaps"].as_array().context("missing gaps")?.contains(&json!("stream_interrupted")));
+        assert!(fs::read_to_string(&calls)?.contains("--since-time=2025-01-01T00:00:00Z"));
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct ClientCommands {
+        commands: std::sync::Mutex<Vec<Vec<String>>>,
+        cancelled: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl FixtureCommandTransport for ClientCommands {
+        async fn exchange(&self, request: &FixtureCommandRequest) -> Result<FixtureCommandResponse> {
+            let args = &request.argv;
+            self.commands.lock().map_err(|error| anyhow::anyhow!("{error}"))?.push(args.clone());
+            let output = if args.windows(2).any(|pair| pair == ["get", "job"]) {
+                if self.cancelled { json!({"status":{"failed":1}}).to_string() }
+                else { json!({"status":{"succeeded":1}}).to_string() }
+            } else if args.windows(2).any(|pair| pair == ["get", "pods"]) {
+                json!({"items":[{"status":{"containerStatuses":[{"name":"client","image":"test","imageID":"test"}]}}]}).to_string()
+            } else if args.iter().any(|arg| arg == "logs") { "OAT_CLIENT_METRICS fixture".to_owned() }
+            else { String::new() };
+            Ok(FixtureCommandResponse { schema_version:1, kind:"command_response".into(), request_id:request.request_id,
+                request_sha256:request.request_sha256.clone(), exit_code:0, stdout:output, stderr:String::new(), truncated:false })
+        }
+    }
+
+    #[tokio::test]
+    async fn campaign_retains_completed_and_cancelled_jobs_for_fenced_cleanup() -> Result<()> {
+        for campaign in [true, false] {
+            for cancelled in [true, false] {
+                let mut config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+                config.namespace = "fixture".into();
+                config.kubectl_context = None;
+                config.campaign_profile = campaign.then_some(crate::config::CampaignProfile::SingleHotTable);
+                let transport = Arc::new(ClientCommands { cancelled, ..Default::default() });
+                let authority = FixtureAuthority { campaign_id:"fixture".into(), cell_run_id:"fixture".into(),
+                    owner_id:"fixture".into(), fencing_token:1, namespace:"fixture".into(),
+                    server:"https://offline.invalid".into(), context:"fixture".into() };
+                let boundary = FixtureBoundary { authority, deadline_unix_ms:unix_time_ms_u64()? + 30_000,
+                    sequence:std::sync::atomic::AtomicU64::new(1), transport:transport.clone(), responses:tokio::sync::Mutex::new(Vec::new()) };
+                let handle = ClientHandle { client_id:"fixture".into(), table:"fixture".into(),
+                    process:ClientProcess::Aks { job_name:"fixture-job".into() } };
+                FIXTURE_BOUNDARY.scope(boundary, async {
+                    let output = if cancelled { cancel_aks_client_job(&config, &handle).await? }
+                        else { finish_aks_client_job(&config, handle).await? };
+                    ensure!(output.contains("OAT_CLIENT_METRICS fixture"), "terminal output missing");
+                    Ok::<_, anyhow::Error>(())
+                }).await?;
+                let commands = transport.commands.lock().map_err(|error| anyhow::anyhow!("{error}"))?;
+                assert_eq!(commands.iter().any(|args| args.windows(2).any(|pair| pair == ["delete", "job"])), !campaign);
+            }
+        }
+        Ok(())
+    }
+}

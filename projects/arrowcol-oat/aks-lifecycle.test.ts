@@ -259,7 +259,8 @@ test('terminal collector exit classification requires the exact container drain 
     if (!marker) f.setLogText('secret=must-not-be-persisted\n');
     const deadline = Date.now() + 150;
     f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
-    assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), 'pending');
+    assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), exitCode === 143 && marker ? 'complete' : 'pending');
+    now = deadline;
     const current = await f.controller(deadline);
     assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
     const evidence = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
@@ -488,4 +489,95 @@ test('controller executor pins inventory ETag across residual stop intent even w
     { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
   await assert.rejects(execute('record-terminal-state', f.state, `${campaignId}:2:record-terminal-state`), /fencing changed/);
   assert.equal(f.patchCount, 0);
+});
+
+test('production membership observes exact owned ready instances while schedule stays pending', async t => {
+  for (const defect of ['none', 'armed', 'schedule-race', 'wrong-owner', 'wrong-cardinality', 'restart', 'not-ready'] as const) {
+    await t.test(defect, async t => {
+      const f = await fixture(t);
+      const collector = { ...f.inventory.resources[0]!, name: 'collector', role: 'collector' as const };
+      const client = { ...collector, name: 'client', role: 'client' as const, uid: campaignId };
+      f.inventory.resources = [collector, client];
+      f.state.runInventory = f.inventory;
+      const markers = { 'arrowcol-oat/run-id': cellId, 'arrowcol-oat/owner-token': ownerId };
+      const metadata = (name: string, uid: string) => ({ name, namespace: f.inventory.namespace.name, uid,
+        resourceVersion: '1', labels: markers, annotations: markers });
+      let scheduleReads = 0;
+      t.mock.method(runtime, 'run_tree', async (args: string[]) => {
+        assert.ok(!args.includes('patch') && !args.includes('delete') && !args.includes('apply'));
+        const kind = args[args.indexOf('get') + 1];
+        let value: unknown;
+        if (kind === 'namespace') value = { apiVersion: 'v1', kind: 'Namespace', metadata: metadata(f.inventory.namespace.name, cellId) };
+        else if (kind === 'configmap') {
+          scheduleReads++;
+          value = { apiVersion: 'v1', kind: 'ConfigMap', metadata: metadata('oat-schedule', ownerId),
+            data: { schedule: defect === 'armed' || defect === 'schedule-race' && scheduleReads > 1 ? '12345' : 'pending' } };
+        } else if (kind === 'job.batch') {
+          const name = args[args.indexOf('get') + 2], resource = name === 'collector' ? collector : client;
+          value = { apiVersion: 'batch/v1', kind: 'Job', metadata: metadata(resource.name, resource.uid!),
+            spec: { parallelism: 1, selector: { matchLabels: { job: resource.name } } }, status: {} };
+        } else if (kind === 'pods') {
+          const name = args[args.indexOf('--selector') + 1]!.split('=')[1], resource = name === 'collector' ? collector : client;
+          const pod = { apiVersion: 'v1', kind: 'Pod', metadata: { ...metadata(resource.name + '-pod', resource.uid!),
+            ownerReferences: [{ uid: defect === 'wrong-owner' ? cellId : resource.uid, kind: 'Job', controller: true }] },
+          spec: { containers: [{ name: 'main' }] }, status: { phase: 'Running',
+            containerStatuses: [{ name: 'main', ready: defect !== 'not-ready', restartCount: defect === 'restart' ? 1 : 0,
+              state: { running: {} } }] } };
+          value = { kind: 'PodList', metadata: { resourceVersion: '1' }, items: defect === 'wrong-cardinality' ? [] : [pod] };
+        } else throw new Error('Unexpected fake membership command.');
+        return { returncode: 0, stdout: JSON.stringify(value), stderr: '' };
+      });
+      const actions = createDefaultLifecycleActions(f.store, f.azure);
+      const capture = () => actions.observeShutdownMembership!(f.inventory, 'oat-schedule', f.authority);
+      if (defect === 'none') {
+        const observation = await capture();
+        assert.equal(observation.members.length, 2);
+        assert.deepEqual(observation.members.map(member => member.kind).sort(), ['client', 'collector']);
+        assert.equal(observation.schedule.uid, ownerId);
+        assert.equal(scheduleReads, 2);
+      } else await assert.rejects(capture());
+    });
+  }
+});
+
+test('production terminal log capture pins the original pod and never uses a truncated tail', async t => {
+  for (const defect of ['none', 'pod-replaced', 'restart', 'partial-line', 'changed-pod'] as const) {
+    await t.test(defect, async t => {
+      const f = await fixture(t);
+      const markers = { 'arrowcol-oat/run-id': cellId, 'arrowcol-oat/owner-token': ownerId };
+      let podReads = 0;
+      t.mock.method(runtime, 'run_tree', async (args: string[]) => {
+        if (args.includes('logs')) {
+          assert.ok(!args.some(arg => arg.startsWith('--tail')));
+          assert.ok(!args.includes('--previous'));
+          return { returncode: 0, stdout: '2026-01-01T00:00:00Z arrowcol_shutdown {"event":"drain_complete"}' +
+            (defect === 'partial-line' ? '' : '\n'), stderr: '' };
+        }
+        const kind = args[args.indexOf('get') + 1];
+        const metadata = { name: 'maintenance-pod', namespace: f.inventory.namespace.name, uid: ownerId, resourceVersion: '1',
+          labels: markers, annotations: markers };
+        let value: unknown;
+        if (kind === 'namespace') value = { apiVersion: 'v1', kind: 'Namespace',
+          metadata: { ...metadata, name: f.inventory.namespace.name, uid: cellId } };
+        else if (kind === 'pod') {
+          podReads++;
+          value = { apiVersion: 'v1', kind: 'Pod',
+            metadata: { ...metadata, uid: defect === 'pod-replaced' || defect === 'changed-pod' && podReads > 1 ? cellId : ownerId },
+            spec: { containers: [{ name: 'main' }] }, status: {
+              containerStatuses: [{ name: 'main', restartCount: defect === 'restart' ? 1 : 0,
+                state: { terminated: { exitCode: 143, finishedAt: '2026-01-01T00:00:00Z' } } }] } };
+        } else throw new Error('Unexpected fake terminal source command.');
+        return { returncode: 0, stdout: JSON.stringify(value), stderr: '' };
+      });
+      const actions = createDefaultLifecycleActions(f.store, f.azure);
+      const capture = () => actions.readShutdownLogs!(f.inventory,
+        { pod_name: 'maintenance-pod', pod_uid: ownerId, container: 'main', restart_count: 0 }, f.authority);
+      if (defect === 'none') {
+        const observed = await capture();
+        assert.ok(observed.bytes > 0);
+        assert.match(observed.body_sha256, /^[a-f0-9]{64}$/);
+        assert.equal(podReads, 2);
+      } else await assert.rejects(capture());
+    });
+  }
 });

@@ -5,7 +5,7 @@ import { Bool, Field, Int32, Int64, List, Struct, Table, Utf8, tableToIPC, vecto
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import type { Azure, HttpReceipt } from '../../infra/azure/bootstrap.js';
 import {
-  parseDeltaReplayReference, readDeltaAddWindow, readDeltaReference, verifyDeltaPreservation,
+  parseDeltaReplayReference, readDeltaAddWindow, readDeltaReference, readDeltaTerminalReference, readFrozenDeltaAdds, verifyDeltaPreservation,
   type DeltaReplayReference, type DeltaRetentionPolicy,
 } from './aks-delta-preservation.js';
 
@@ -475,4 +475,34 @@ test('an absent baseline does not waive unexplained removal, missing stats or un
   s.put(0, { protocol: legacyProtocol }, { metaData: meta() }, info('RESTORE'), add('restored.parquet'));
   const unknownCreation = await s.read();
   assert.equal((await result(s, baseline, unknownCreation)).status, 'unknown');
+});
+
+test('frozen Add reconciliation excludes baseline and later commits and pins original source ETags', async () => {
+  const s = new Storage().seed(add('baseline.parquet', 7)), baseline = await s.read();
+  s.put(1, info('INSERT'), add('new.parquet', 13));
+  s.put(2, info('OPTIMIZE'), remove('baseline.parquet', false), remove('new.parquet', false), add('compact.parquet', 20, false));
+  const terminal = await readDeltaTerminalReference(s.azure, baseline, guard);
+  s.put(3, info('INSERT'), add('later.parquet', 99));
+  const lists = s.listCount;
+  assert.deepEqual(await readFrozenDeltaAdds(s.azure, baseline, terminal, guard),
+    [{ delta_version: 1, rows: 13, files: 1, parquet_bytes: 100 }]);
+  assert.equal(s.listCount, lists, 'never substitute a newer live snapshot');
+  s.put(1, info('INSERT'), add('changed.parquet', 13));
+  await assert.rejects(readFrozenDeltaAdds(s.azure, baseline, terminal, guard));
+});
+
+test('frozen per-version proof fails closed on missing history, data-changing removal and numeric overflow', async () => {
+  const s = new Storage().seed(add('baseline.parquet', 7)), baseline = await s.read();
+  s.put(1, info('INSERT'), add('new.parquet', 13));
+  const terminal = await readDeltaTerminalReference(s.azure, baseline, guard);
+  if (terminal.observation !== 'table') throw new Error('fixture table unavailable');
+  const missing = structuredClone(terminal);
+  missing.provenance.source_objects = missing.provenance.source_objects.filter(source => !source.name.endsWith('00000000000000000001.json'));
+  await assert.rejects(readFrozenDeltaAdds(s.azure, baseline, missing, guard), /history unavailable/);
+  s.put(2, info('DELETE'), remove('new.parquet'));
+  const removed = await readDeltaTerminalReference(s.azure, baseline, guard);
+  await assert.rejects(readFrozenDeltaAdds(s.azure, baseline, removed, guard), /data-changing removal/);
+  const overflow = new Storage().seed();
+  overflow.put(1, info('INSERT'), add('huge.parquet', Number.MAX_SAFE_INTEGER), add('one.parquet', 1));
+  await assert.rejects(readDeltaTerminalReference(overflow.azure, await new Storage().seed().observe(), guard), /safe integer/);
 });

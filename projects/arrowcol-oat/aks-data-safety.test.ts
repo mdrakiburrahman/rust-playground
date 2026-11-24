@@ -40,7 +40,7 @@ function fixture(t: TestContext) {
   const blobs = new Map<string, { bytes: Buffer; etag: string }>([
     [`_arrowcol-custody/campaigns/${campaignId}/baseline.json`, { bytes: Buffer.from(JSON.stringify(baseline)), etag: '"campaign-baseline"' }],
   ]);
-  let requests = 0, denyStorage = false, loseWrite = false;
+  let requests = 0, checkpointPuts = 0, denyStorage = false, loseWrite = false, onLostWrite: (() => void) | undefined;
   t.mock.method(azure, 'blob', async (method: string, container: string, name: string, query?: Record<string, string>,
     body?: string | Buffer | null, headers?: Record<string, string>, _missing?: boolean, _idempotent?: boolean, capture?: (receipt: HttpReceipt) => void) => {
     if (container === c.data) {
@@ -61,16 +61,17 @@ function fixture(t: TestContext) {
     const previous = blobs.get(name);
     if (method === 'GET') return [previous?.bytes ?? null, previous ? { etag: previous.etag } : {}];
     assert.equal(method, 'PUT'); assert.equal(headers?.['If-None-Match'], '*'); assert.equal(previous, undefined);
+    checkpointPuts++;
     const etag = `"data-${blobs.size + 1}"`;
     blobs.set(name, { bytes: Buffer.from(String(body)), etag });
-    if (loseWrite) throw new Error('response lost after storage applied write');
+    if (loseWrite) { onLostWrite?.(); throw new Error('response lost after storage applied write'); }
     return [null, { ':status': '201', etag }];
   });
   const input = { schema_version: 1, campaign_id: campaignId, orchestration_run_id: campaignId, cell_run_id: cellId,
     expected_etag: '"inventory-1"', hot_delta_relative_path: hot, actor: { mode: 'producer', owner_id: ownerId, fencing_token: 1 } };
-  return { azure, store, input, blobs, get requests() { return requests; }, get state() { return structuredClone(state); },
+  return { azure, store, input, blobs, get requests() { return requests; }, get checkpointPuts() { return checkpointPuts; }, get state() { return structuredClone(state); },
     change: (update: Partial<CampaignState>) => { state = { ...state, ...update }; },
-    inventory, deny: () => { denyStorage = true; }, lose: () => { loseWrite = true; } };
+    inventory, deny: () => { denyStorage = true; }, lose: (callback?: () => void) => { loseWrite = true; onLostWrite = callback; } };
 }
 test('capture-cell-baseline freezes positive exact absence, not zero rows, and reuses the original version', async t => {
   const f = fixture(t), receipt = await captureCellBaseline(f.store, f.azure, f.input);
@@ -211,4 +212,278 @@ test('terminal and independent final replay preserve explicit absence without ma
   baseline.bytes = originalBaseline;
   f.blobs.delete([...f.blobs.keys()].find(name => name.endsWith('/delta-terminal.json'))!);
   await assert.rejects(defaults.verifySafeIdle(f.state, 'verify'), /absent or unversioned/);
+});
+
+async function shutdownFixture(t: TestContext, exitCode: number, marker = true, terminalRestart = 0) {
+  const f = fixture(t);
+  await captureCellBaseline(f.store, f.azure, f.input);
+  const step = { state: 'complete' as const, deadline_unix_ms: null, reason_code: null };
+  const drain = { state: 'complete' as const, deadline_unix_ms: Date.now() + 60_000, reason_code: null };
+  const inventory = { ...f.inventory, load_admission: 'authorized' as const, evidence_destination: {
+    account: f.azure.c.account, container: f.azure.c.checkpoints, blob_prefix: 'evidence/' + cellId },
+    cleanup: { ...f.inventory.cleanup, stop_admission: step, bounded_drain: drain, evidence_capture: step, stop_maintenance: step } };
+  f.change({ runInventory: inventory });
+  const authority: CleanupMutationAuthority = { mode: 'producer', campaignId, ownerId, fencingToken: 1, assertCurrent: async () => {} };
+  await captureTerminalData(f.store, f.azure, authority, async () => {});
+  const resource = { api_version: 'apps/v1', kind: 'Deployment', namespace: inventory.namespace.name, name: 'collector', uid: campaignId,
+    absence: null, role: 'collector' as const, state: 'observed' as const };
+  inventory.resources = [resource]; inventory.cleanup.terminal_capture = step;
+  f.change({ runInventory: inventory });
+  const origin = { campaign_id: campaignId, owner_id: ownerId, fencing_token: 1, orchestration_run_id: campaignId,
+    cell_run_id: cellId, namespace: inventory.namespace };
+  const identity = { api_version: resource.api_version, kind: resource.kind, name: resource.name, namespace: resource.namespace, uid: resource.uid };
+  const pod = { name: 'collector-pod', uid: ownerId, resource_version: '1', containers: [{ name: 'main', exit_code: null,
+    finished_at: null, oom_killed: false, restart_count: 0 }] };
+  const ended = { ...pod, containers: [{ name: 'main', exit_code: exitCode, finished_at: '2026-01-01T00:00:00Z',
+    oom_killed: false, restart_count: terminalRestart }] };
+  const stop = { schema_version: 1, origin, field: 'bounded_drain', resource: identity, phase: 'complete',
+    deadline_unix_ms: drain.deadline_unix_ms, expected_resource_version: '1', initial_desired: 1,
+    initial_pods: [pod], terminal_pods: [ended], response: { source: 'patch_response', uid: campaignId,
+      resource_version: '2', generation: 2, body_sha256: 'a'.repeat(64) }, observed_at_unix_ms: Date.now(),
+    logs: [{ pod_name: pod.name, pod_uid: pod.uid, container: 'main', phase: 'terminal', observed_at_unix_ms: Date.now(),
+      body_sha256: 'b'.repeat(64), bytes: 42, numeric_samples: [], redacted_lines: 0, drain_complete_marker: marker }] };
+  const terminal = { schema_version: 1, origin, field: 'terminal_capture', scope: 'exact_kubernetes_status_and_sanitized_log_receipts',
+    workloads: [{ identity, original_stop: stop }] };
+  const captureName = `evidence/${cellId}/custody/${cellId}/terminal_capture.json`;
+  f.blobs.set(captureName, { bytes: Buffer.from(JSON.stringify(terminal)), etag: '"terminal-capture"' });
+  const input = { schema_version: 1, campaign_id: campaignId, orchestration_run_id: campaignId, cell_run_id: cellId,
+    expected_etag: '"inventory-1"', actor: { mode: 'producer' as const, owner_id: ownerId, fencing_token: 1 } };
+  const env = { CAMPAIGN_ID: campaignId, CAMPAIGN_OWNER_ID: ownerId, CAMPAIGN_FENCING_TOKEN: '1' };
+  return { ...f, get checkpointPuts() { return f.checkpointPuts; }, inventory, authority, input, env, terminal, captureName };
+}
+
+test('guarded shutdown finalization never accepts a caller matched claim as 143 reconciliation proof', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize, shutdownFinalizationRead, requireFinalizedCollectorStop } = await import('./aks-shutdown-finalization.js');
+  const f = await shutdownFixture(t, 143);
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  const request = { ...f.input, terminal_capture: inputs.terminal_capture, delta_before: inputs.delta_before,
+    delta_terminal: inputs.delta_terminal, reconciliation: { profile: 'single_hot_table', proof: { status: 'matched' } } };
+  const before = [...f.blobs.entries()].map(([key, value]) => [key, value.bytes.toString()] as const);
+  const result = await shutdownFinalize(f.store, f.azure, request, f.env);
+  assert.equal(result.verdicts[0]?.classification, 'exit_143_terminal_reconciliation_unavailable');
+  assert.equal(result.blob, `_arrowcol-custody/campaigns/${campaignId}/runs/${campaignId}/cells/${cellId}/shutdown-finalization.json`);
+  assert.deepEqual(await shutdownFinalizationRead(f.store, f.azure, f.input, f.env), result);
+  const puts = f.checkpointPuts;
+  assert.deepEqual(await shutdownFinalize(f.store, f.azure, request, f.env), result);
+  assert.equal(f.checkpointPuts, puts, 'read existing finalization before considering another create');
+  for (const [key, value] of before) assert.equal(f.blobs.get(key)?.bytes.toString(), value);
+  await assert.rejects(requireFinalizedCollectorStop(f.store, f.azure, f.inventory, f.authority), /do not hand off/);
+});
+
+test('shutdown finalization resolves a lost create by guarded readback and rejects changed identity', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize, shutdownFinalizationRead, requireFinalizedCollectorStop } = await import('./aks-shutdown-finalization.js');
+  const f = await shutdownFixture(t, 0);
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  const request = { ...f.input, terminal_capture: inputs.terminal_capture, delta_before: inputs.delta_before,
+    delta_terminal: inputs.delta_terminal, reconciliation: { profile: 'single_hot_table', proof: null } };
+  await assert.rejects(shutdownFinalize(f.store, f.azure, { ...request, delta_before: { ...inputs.delta_before, etag: '"wrong"' } }, f.env), /reference changed/);
+  f.lose();
+  const result = await shutdownFinalize(f.store, f.azure, request, f.env);
+  assert.equal(result.verdicts[0]?.classification, 'exit_0');
+  assert.deepEqual(await shutdownFinalizationRead(f.store, f.azure, f.input, f.env), result);
+  await requireFinalizedCollectorStop(f.store, f.azure, f.inventory, f.authority);
+  await assert.rejects(shutdownFinalizationRead(f.store, f.azure, { ...f.input, expected_etag: '"stale"' }, f.env), CampaignConflictError);
+  await assert.rejects(shutdownFinalizationRead(f.store, f.azure, { ...f.input, actor: { ...f.input.actor, fencing_token: 2 } }, f.env));
+});
+
+test('shutdown finalization cannot use a different instance or an unrelated marker', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize } = await import('./aks-shutdown-finalization.js');
+  for (const [marker, restart, expected] of [[false, 0, 'exit_143_without_drain_marker'], [true, 1, 'terminal_status_unavailable']] as const) {
+    const f = await shutdownFixture(t, 143, marker, restart);
+    const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+    const result = await shutdownFinalize(f.store, f.azure, { ...f.input, terminal_capture: inputs.terminal_capture,
+      delta_before: inputs.delta_before, delta_terminal: inputs.delta_terminal,
+      reconciliation: { profile: 'other', proof: null } }, f.env);
+    assert.equal(result.verdicts[0]?.classification, expected);
+  }
+});
+
+test('shutdown finalization reads conflicts first and rejects fenced lost-write recovery', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize } = await import('./aks-shutdown-finalization.js');
+  const f = await shutdownFixture(t, 0);
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  const request = { ...f.input, terminal_capture: inputs.terminal_capture, delta_before: inputs.delta_before,
+    delta_terminal: inputs.delta_terminal, reconciliation: { profile: 'single_hot_table', proof: null } };
+  const name = `_arrowcol-custody/campaigns/${campaignId}/runs/${campaignId}/cells/${cellId}/shutdown-finalization.json`;
+  f.blobs.set(name, { bytes: Buffer.from(JSON.stringify({ conflicting: true })), etag: '"conflict"' });
+  const puts = f.checkpointPuts;
+  await assert.rejects(shutdownFinalize(f.store, f.azure, request, f.env));
+  assert.equal(f.checkpointPuts, puts);
+  assert.equal(f.blobs.get(name)?.bytes.toString(), '{"conflicting":true}');
+  f.blobs.delete(name);
+  f.lose(() => f.change({ fencingToken: 2, status: 'fenced', fencedAtMs: Date.now(), fenceReason: 'heartbeat-expired' }));
+  await assert.rejects(shutdownFinalize(f.store, f.azure, request, f.env));
+  assert.ok(f.blobs.has(name), 'unknown write may have persisted even though fenced readback cannot establish success');
+  assert.equal(f.checkpointPuts, puts + 1);
+});
+
+test('shutdown inputs require each immutable source', async t => {
+  const { shutdownFinalizationInputs } = await import('./aks-shutdown-finalization.js');
+  for (const suffix of ['/terminal_capture.json', '/delta-before.json', '/delta-terminal.json']) {
+    const f = await shutdownFixture(t, 143);
+    const name = [...f.blobs.keys()].find(key => key.endsWith(suffix))!;
+    assert.ok(name);
+    f.blobs.delete(name);
+    await assert.rejects(shutdownFinalizationInputs(f.store, f.azure, f.input, f.env));
+  }
+});
+
+test('exit 0 and legacy cleanup do not acquire a new finalization dependency', async t => {
+  const { requireFinalizedCollectorStop } = await import('./aks-shutdown-finalization.js');
+  const f = await shutdownFixture(t, 0);
+  await requireFinalizedCollectorStop(f.store, f.azure, f.inventory, f.authority);
+  assert.ok(![...f.blobs.keys()].some(name => name.endsWith('/shutdown-finalization.json')));
+  const legacy: RunInventory = structuredClone(f.inventory);
+  legacy.evidence_destination = null;
+  f.change({ runInventory: legacy });
+  await requireFinalizedCollectorStop(f.store, f.azure, legacy, f.authority);
+});
+
+test('handoff rejects an inventory version race while reading terminal evidence', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize, requireFinalizedCollectorStop } = await import('./aks-shutdown-finalization.js');
+  const f = await shutdownFixture(t, 0);
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  await shutdownFinalize(f.store, f.azure, { ...f.input, terminal_capture: inputs.terminal_capture,
+    delta_before: inputs.delta_before, delta_terminal: inputs.delta_terminal,
+    reconciliation: { profile: 'single_hot_table', proof: null } }, f.env);
+  const read = f.store.read.bind(f.store);
+  let calls = 0;
+  t.mock.method(f.store, 'read', async () => ({ ...(await read())!, etag: ++calls < 3 ? '"inventory-1"' : '"inventory-2"' }));
+  await assert.rejects(requireFinalizedCollectorStop(f.store, f.azure, f.inventory, f.authority), CampaignConflictError);
+});
+
+test('finalization readback cannot succeed after its authority changes during the read', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize, shutdownFinalizationRead } = await import('./aks-shutdown-finalization.js');
+  for (const action of ['read', 'existing'] as const) {
+    await t.test(action, async t => {
+      const f = await shutdownFixture(t, 0);
+      const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+      const request = { ...f.input, terminal_capture: inputs.terminal_capture, delta_before: inputs.delta_before,
+        delta_terminal: inputs.delta_terminal, reconciliation: { profile: 'single_hot_table', proof: null } };
+      await shutdownFinalize(f.store, f.azure, request, f.env);
+      const read = f.azure.blob.bind(f.azure);
+      t.mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+        const result = await read(...args);
+        if (args[0] === 'GET' && args[2]?.endsWith('/shutdown-finalization.json'))
+          f.change({ fencingToken: 2, status: 'fenced', fencedAtMs: Date.now(), fenceReason: 'heartbeat-expired' });
+        return result;
+      });
+      await assert.rejects(action === 'read' ? shutdownFinalizationRead(f.store, f.azure, f.input, f.env) :
+        shutdownFinalize(f.store, f.azure, request, f.env));
+    });
+  }
+});
+
+test('guarded numeric captures bind pre-arm membership, preserve sources and never infer lossless continuity', async t => {
+  const { shutdownMembershipCapture, shutdownReceiptCapture, shutdownFollowerPublish, shutdownFinalizationInputs, shutdownFinalize,
+    shutdownFinalizationRead, requireFinalizedCollectorStop } = await import('./aks-shutdown-finalization.js');
+  const { createDefaultLifecycleActions } = await import('./aks-lifecycle.js');
+  const f = await shutdownFixture(t, 143);
+  const clientUid = '44444444-4444-4444-8444-444444444444';
+  const clientPodUid = '55555555-5555-4555-8555-555555555555';
+  const client = { api_version: 'batch/v1', kind: 'Job', namespace: f.inventory.namespace.name, name: 'client-job',
+    uid: clientUid, absence: null, role: 'client' as const, state: 'observed' as const };
+  const schedule = { api_version: 'v1', kind: 'ConfigMap', namespace: f.inventory.namespace.name, name: 'oat-schedule',
+    uid: cellId, absence: null, role: 'router' as const, state: 'observed' as const };
+  f.inventory.resources.push(client);
+  f.change({ runInventory: f.inventory });
+  const original = f.terminal.workloads[0].original_stop;
+  const clientIdentity = { api_version: client.api_version, kind: client.kind, namespace: client.namespace, name: client.name, uid: client.uid };
+  const initialClient = { ...original.initial_pods[0], name: 'client-pod', uid: clientPodUid };
+  const terminalClient = { ...initialClient, containers: [{ ...initialClient.containers[0], exit_code: 0,
+    finished_at: '2026-01-01T00:00:00Z' }] };
+  f.blobs.get(f.captureName)!.bytes = Buffer.from(JSON.stringify({ ...f.terminal, workloads: [
+    ...f.terminal.workloads, { identity: clientIdentity, original_stop: { ...original, resource: clientIdentity,
+      field: 'stop_admission', deadline_unix_ms: null, initial_pods: [initialClient], terminal_pods: [terminalClient] } },
+  ] }));
+  const collectorIdentity = f.terminal.workloads[0].identity;
+  const members = [
+    { kind: 'collector' as const, workload: collectorIdentity, pod_name: 'collector-pod', pod_uid: ownerId, container: 'main', restart_count: 0 },
+    { kind: 'client' as const, workload: clientIdentity, pod_name: 'client-pod', pod_uid: clientPodUid, container: 'main', restart_count: 0 },
+  ];
+  const lines = (value: string) => '2026-01-01T00:00:00Z ' + value + '\n';
+  const collectorLogs = lines('arrowcol_effective_config ' + JSON.stringify({ commit_telemetry:
+    { schema_version: 1, scope: 'new_ingestion_addfiles_after_sync', clock: 'system_unix_ms' } })) +
+    lines('arrowcol_data_commit ' + JSON.stringify({ schema_version: 1, outcome: 'committed', table_id: 'a'.repeat(64),
+      table_name: 'telemetry.sqlserver.hot_table', delta_version: 1, rows: 13, files: 1, parquet_bytes: 100 })) +
+    lines('arrowcol_shutdown {"event":"drain_complete","cancelled_ambiguous":0}') +
+    lines('never-retain-this-secret=hidden');
+  const clientLogs = lines('OAT_CLIENT_METRICS ' + JSON.stringify({ version: 1, scope: 'process_cumulative',
+    phase: 'measurement_start', workers: [{ worker: 0, completed_rows: 0, ambiguous_rows: 0 }] })) +
+    lines('OAT_CLIENT_METRICS ' + JSON.stringify({ version: 1, scope: 'process_cumulative',
+      phase: 'completed', workers: [{ worker: 0, completed_rows: 13, ambiguous_rows: 0 }] }));
+  let observations = 0;
+  const lifecycle = { ...createDefaultLifecycleActions(f.store, f.azure),
+    observeShutdownMembership: async () => { observations++; return { schedule: { name: schedule.name, uid: schedule.uid,
+      resource_version: '1', body_sha256: 'b'.repeat(64) }, members }; },
+    readShutdownLogs: async (_inventory: RunInventory, member: { pod_uid: string }) => {
+      const text = member.pod_uid === ownerId ? collectorLogs : clientLogs;
+      return { text, body_sha256: createHash('sha256').update(text).digest('hex'), bytes: Buffer.byteLength(text) };
+    } };
+  const membershipRequest = { ...f.input, schedule_name: schedule.name, table_root: f.inventory.qap!.bindings[0].relative_path,
+    collector_table_id: 'a'.repeat(64), collector_table_name: 'telemetry.sqlserver.hot_table' };
+  const membership = await shutdownMembershipCapture(f.store, f.azure, membershipRequest, f.env, lifecycle);
+  assert.deepEqual(await shutdownMembershipCapture(f.store, f.azure, membershipRequest, f.env, lifecycle), membership);
+  assert.equal(observations, 1, 'retry reads the immutable pre-arm observation');
+  const diagnosticRequest = { ...f.input, membership, pod_uid: ownerId, container: 'main', restart_count: 0,
+    source: { sha256: 'c'.repeat(64), bytes: 20, lines: 1 }, commits: [{ delta_version: 1, rows: 13, files: 1, parquet_bytes: 100 }],
+    gaps: ['terminal_unbound'] };
+  f.lose();
+  const diagnostic = await shutdownFollowerPublish(f.store, f.azure, diagnosticRequest, f.env);
+  const diagnosticValue = JSON.parse(f.blobs.get(diagnostic.blob)!.bytes.toString());
+  assert.equal(diagnosticValue.status, 'diagnostic_only');
+  assert.equal(diagnosticValue.continuity, 'unproven');
+  assert.deepEqual(diagnosticValue.gaps, ['continuity_unproven', 'terminal_unbound']);
+  const diagnosticPuts = f.checkpointPuts;
+  assert.deepEqual(await shutdownFollowerPublish(f.store, f.azure, diagnosticRequest, f.env), diagnostic);
+  assert.equal(f.checkpointPuts, diagnosticPuts, 'diagnostic unknown write resolved by readback without replay');
+  await assert.rejects(shutdownFollowerPublish(f.store, f.azure,
+    { ...diagnosticRequest, commits: [{ ...diagnosticRequest.commits[0], raw: 'secret' }] }, f.env), /unsupported fields/);
+  await assert.rejects(shutdownFollowerPublish(f.store, f.azure,
+    { ...diagnosticRequest, expected_etag: '"stale"' }, f.env), CampaignConflictError);
+
+  const refs = [];
+  for (const member of members) {
+    const request = { ...f.input, membership, kind: member.kind, pod_uid: member.pod_uid,
+      container: member.container, restart_count: member.restart_count };
+    const ref = await shutdownReceiptCapture(f.store, f.azure, request, f.env, lifecycle);
+    refs.push(ref);
+    const puts = f.checkpointPuts;
+    assert.deepEqual(await shutdownReceiptCapture(f.store, f.azure, request, f.env, lifecycle), ref);
+    assert.equal(f.checkpointPuts, puts);
+    const bytes = f.blobs.get(ref.blob)!.bytes.toString();
+    assert.ok(!bytes.includes('never-retain-this-secret'));
+    assert.equal(JSON.parse(bytes).projection.continuity, 'unproven');
+  }
+  const proof = { schema_version: 1, membership, collector_receipts: [refs[0]], client_receipts: [refs[1]] };
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  const result = await shutdownFinalize(f.store, f.azure, { ...f.input, terminal_capture: inputs.terminal_capture,
+    delta_before: inputs.delta_before, delta_terminal: inputs.delta_terminal,
+    reconciliation: { profile: 'single_hot_table', proof } }, f.env);
+  assert.equal(result.verdicts[0].classification, 'exit_143_terminal_reconciliation_unavailable');
+  const puts = f.checkpointPuts;
+  assert.deepEqual(await shutdownFinalizationRead(f.store, f.azure, f.input, f.env), result);
+  assert.equal(f.checkpointPuts, puts, 'read-only reconciliation cannot publish or retry a source');
+  await assert.rejects(requireFinalizedCollectorStop(f.store, f.azure, f.inventory, f.authority), /do not hand off/);
+  await assert.rejects(shutdownReceiptCapture(f.store, f.azure, { ...f.input, membership, kind: 'client', pod_uid: clientPodUid,
+    container: 'main', restart_count: 1 }, f.env, lifecycle), /instance unavailable/);
+  await assert.rejects(shutdownMembershipCapture(f.store, f.azure,
+    { ...membershipRequest, expected_etag: '"stale"' }, f.env, lifecycle), CampaignConflictError);
+});
+
+test('numeric reconciliation distinguishes exact, per-version mismatch and unavailable counter bounds', async () => {
+  const { compareShutdownNumbers, projectShutdownLogs, parseShutdownProof } = await import('./aks-shutdown-proof.js');
+  const version = { delta_version: 7, rows: 13, files: 1, parquet_bytes: 100 };
+  assert.equal(compareShutdownNumbers([version], [[version]], [{ completed_rows: 13, ambiguous_rows: 0 }]), 'exact');
+  assert.equal(compareShutdownNumbers([version], [[{ ...version, parquet_bytes: 101 }]],
+    [{ completed_rows: 13, ambiguous_rows: 0 }]), 'mismatch');
+  assert.equal(compareShutdownNumbers([version], [[version]], [{ completed_rows: 13, ambiguous_rows: 1 }]), 'mismatch');
+  assert.equal(compareShutdownNumbers([version], [[version]], [{ completed_rows: Number.MAX_SAFE_INTEGER, ambiguous_rows: 0 },
+    { completed_rows: 1, ambiguous_rows: 0 }]), 'unavailable');
+  assert.throws(() => parseShutdownProof({ matched: true }));
+  const projection = projectShutdownLogs('client',
+    '2026-01-01T00:00:00Z OAT_CLIENT_METRICS {"version":1,"scope":"process_cumulative","phase":"completed","workers":[{"worker":0,"completed_rows":13}]}\n',
+    'a'.repeat(64), 'telemetry.sqlserver.hot_table');
+  assert.equal(projection.ambiguous_rows, null, 'missing ambiguity is not zero');
+  assert.equal(projection.continuity, 'unproven');
 });

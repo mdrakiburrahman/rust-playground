@@ -9,6 +9,7 @@ import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, 
 import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
 import { captureStampKustoBaseline, observeDataPreservation, validateStampKustoBaseline, type DataPreservationReceipt } from './aks-data-safety.js';
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
+import { requireFinalizedCollectorStop } from './aks-shutdown-finalization.js';
 import { createCellCleanupProviders, type CellStepProviders } from './aks-cell-cleanup.js';
 import { createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
 import { withCleanupDeadline } from './aks-cleanup-budget.js';
@@ -279,6 +280,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       await authority.assertCurrent();
       const state = (await store.read())?.state;
       if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Final cell data inventory changed.');
+      await requireFinalizedCollectorStop(store, azure, inventory, authority);
       const result = await observeDataPreservation(store, azure, state, authority);
       if (result.status !== 'preserved') throw new Error('Final cell data preservation is ' + result.status + ': ' + result.reason);
       return 'complete';
@@ -342,6 +344,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       await authority.assertCurrent();
       const capacity = await observe_custody_idle_capacity(azure), health = await readHealth(azure, state, authority, options.runCommand);
       if (capacity.status !== 'capacity_idle') return 'pending';
+      if (state.runInventory) await requireFinalizedCollectorStop(store, azure, state.runInventory, authority);
       const data = await readDataSafety(state, authority);
       if (data.campaign_id !== state.campaignId || data.cell_run_id !== state.runInventory?.cell_run_id ||
           !Number.isSafeInteger(data.observed_at_unix_ms) || data.observed_at_unix_ms < state.fencedAtMs! ||
