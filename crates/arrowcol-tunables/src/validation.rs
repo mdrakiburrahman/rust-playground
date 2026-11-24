@@ -547,6 +547,9 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.operation_max_active_files", "1000000"),
     capability!("maintenance.discovery_max_log_files", "100000"),
     capability!("maintenance.discovery_max_log_file_bytes", "67108864"),
+    capability!("collector.socket.h2_stream_window_bytes", "tonic default"),
+    capability!("collector.socket.h2_connection_window_bytes", "tonic default"),
+    capability!("collector.socket.h2_max_frame_bytes", "tonic default"),
 ];
 
 #[must_use]
@@ -3097,6 +3100,36 @@ mod tests {
                     "collector":{"socket":{field:value}}
                 })));
                 assert!(error.contains(&format!("collector.socket.{field}")), "{error}");
+            }
+
+            #[test]
+            fn receiver_http2_controls_reject_invalid_settings_and_project_valid_bounds() -> Result<()> {
+                for (field, min, max) in [
+                    ("h2_stream_window_bytes", 65_535_u32, 64 << 20),
+                    ("h2_connection_window_bytes", 65_535, 256 << 20),
+                    ("h2_max_frame_bytes", 16_384, 1 << 20),
+                ] {
+                    for value in [
+                        serde_json::json!(min - 1),
+                        serde_json::json!(max + 1),
+                        serde_json::Value::Null,
+                    ] {
+                        let error = error_text(Tunables::parse_oat_json(
+                            serde_json::json!({"collector":{"socket":{field:value}}}),
+                        ));
+                        assert!(error.contains(field), "{error}");
+                    }
+                    for bytes in [min, max] {
+                        let socket = serde_json::json!({field:bytes});
+                        let tunables = Tunables::parse_oat_json(serde_json::json!({"collector":{"socket":socket}}))?;
+                        let env = tunables.environment_for(ComponentRole::Collector)?;
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&env["ARROWCOL_COLLECTOR_SOCKET_CONFIG"])?,
+                            socket
+                        );
+                    }
+                }
+                Ok(())
             }
         }
     }
