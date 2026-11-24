@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { ChildProcess, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { closeSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, symlink, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { createServer, request as createHttpRequest } from 'node:http';
 import { connect as createTcpConnection } from 'node:net';
 import os from 'node:os';
@@ -19,7 +19,7 @@ import { localDispositionSuffix } from './local-failed-disposition.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  aksDispositionMessage, assertCanonicalAksLaunchWorkspace, isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  aksDispositionMessage, isExactExitedLegacyServer, recordLegacyAksDisposition, resolveAksReceiptLedger, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
@@ -1232,20 +1232,90 @@ test('owned controller crash requires exact current custody without inventing te
   }
 });
 
-test('AKS benchmark rejects a linked worktree with an empty launcher ledger', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-checkout-'));
+async function linkedWorktreeFixture() {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'oat-aks-checkout-')));
   const canonical = path.join(root, 'canonical');
   const linked = path.join(root, 'linked');
-  const git = (...args: string[]) => execFileSync('git', args, { stdio: 'pipe' });
+  const ledger = path.join(canonical, 'out', 'arrowcol-oat', 'deadline-receipts');
+  const git = (...args: string[]) => execFileSync('git', args, { encoding: 'utf8', stdio: 'pipe' }).trim();
+  const commit = (workspace: string, message: string) => git('-C', workspace, '-c', 'user.name=OAT fixture',
+    '-c', 'user.email=oat@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', message);
+  git('init', canonical);
+  commit(canonical, 'fixture');
+  git('-C', canonical, 'worktree', 'add', '--detach', linked);
+  await mkdir(ledger, { recursive: true });
+  return { root, canonical, linked, ledger, git, commit };
+}
+
+test('AKS linked worktrees resolve the primary ledger, whose pending receipt blocks them, and keep their own source SHA', async () => {
+  const fixture = await linkedWorktreeFixture();
+  const worktreeLedger = path.join(fixture.linked, 'out', 'arrowcol-oat', 'deadline-receipts');
+  let deadline: OatLauncherDeadline | undefined;
   try {
-    git('init', canonical);
-    git('-C', canonical, '-c', 'user.name=OAT fixture', '-c', 'user.email=oat@example.invalid',
-      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'fixture');
-    git('-C', canonical, 'worktree', 'add', '--detach', linked);
-    await assertCanonicalAksLaunchWorkspace(canonical);
-    await assert.rejects(assertCanonicalAksLaunchWorkspace(linked), /primary checkout that owns the launcher receipt ledger/);
+    assert.deepEqual(await resolveAksReceiptLedger(fixture.canonical), { root: fixture.ledger });
+    const ledger = await resolveAksReceiptLedger(fixture.linked);
+    assert.deepEqual(ledger, { root: fixture.ledger, worktreeRoot: worktreeLedger });
+    deadline = await OatLauncherDeadline.create(undefined, performance.now(), ledger.root);
+    const submitted_config_body = '{"platform":{"kind":"aks"}}';
+    await deadline.setSubmissionBinding({
+      submitted_config_body, source_config_sha256: 'a'.repeat(64),
+      submitted_config_sha256: createHash('sha256').update(submitted_config_body).digest('hex'),
+    });
+    await deadline.markCreationPending('http://127.0.0.1:8088/');
+    assert.equal(path.dirname(deadline.receiptPath), fixture.ledger);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(ledger.root), /Unsettled AKS launcher receipt/);
+    await assert.rejects(stat(worktreeLedger), { code: 'ENOENT' });
+    await assertNoUnsettledDeadlineReceipts(worktreeLedger);
+
+    fixture.commit(fixture.linked, 'candidate');
+    const candidate = fixture.git('-C', fixture.linked, 'rev-parse', 'HEAD');
+    assert.notEqual(candidate, fixture.git('-C', fixture.canonical, 'rev-parse', 'HEAD'));
+    const build = await buildOwnedServer(fixture.linked, async (command: string[], _timeout: number, cwd?: string) => command[0] === 'git'
+      ? { returncode: 0, stdout: execFileSync('git', command.slice(1), { cwd, encoding: 'utf8' }), stderr: '' }
+      : { returncode: 0, stderr: '', stdout: JSON.stringify({
+        reason: 'compiler-artifact', manifest_path: path.join(fixture.linked, 'projects/arrowcol-oat-rust/Cargo.toml'),
+        target: { name: 'arrowcol-oat-rust', kind: ['bin'] }, executable: process.execPath,
+      }) });
+    assert.equal(build.gitSha, candidate);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    deadline?.dispose();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('AKS receipt ledger binding rejects unverifiable worktree ownership', async () => {
+  const fixture = await linkedWorktreeFixture();
+  const rejects = (workspace: string, reason: RegExp) => assert.rejects(resolveAksReceiptLedger(workspace),
+    (error: Error) => /verified linked worktree of it/.test(error.message) && reason.test(error.message));
+  try {
+    const plain = path.join(fixture.root, 'plain');
+    await mkdir(plain);
+    await rejects(plain, /neither a checkout directory nor a worktree file/);
+
+    const forged = path.join(fixture.root, 'forged');
+    await mkdir(forged);
+    await writeFile(path.join(forged, '.git'), `gitdir: ${path.join(fixture.canonical, '.git', 'worktrees', 'linked')}\n`);
+    await rejects(forged, /back-pointer/);
+
+    const bare = path.join(fixture.root, 'bare', '.git');
+    fixture.git('clone', '--bare', fixture.canonical, bare);
+    const bareLinked = path.join(fixture.root, 'bare-linked');
+    fixture.git('-C', bare, 'worktree', 'add', '--detach', bareLinked);
+    await rejects(bareLinked, /Git (metadata could not be read|does not report)/);
+
+    const unregistered = path.join(fixture.root, 'unregistered');
+    fixture.git('-C', fixture.canonical, 'worktree', 'add', '--detach', unregistered);
+    await rm(path.join(fixture.canonical, '.git', 'worktrees', 'unregistered'), { recursive: true });
+    await rejects(unregistered, /worktrees.unregistered is not a directory/);
+
+    await rm(fixture.ledger, { recursive: true });
+    await rejects(fixture.linked, /deadline-receipts is not a directory/);
+    const replacement = path.join(fixture.root, 'replacement-ledger');
+    await mkdir(replacement);
+    await symlink(replacement, fixture.ledger);
+    await rejects(fixture.linked, /deadline-receipts is not a directory/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
