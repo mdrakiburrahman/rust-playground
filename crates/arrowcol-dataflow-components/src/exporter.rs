@@ -1218,6 +1218,7 @@ impl GroupPublisher<'_> {
                                     let _ = submitted.send(());
                                 }
                             }
+                            let _receipt_wait = self.metrics.exporter_occupancy.group(ExporterGroupState::ReceiptWait);
                             receipt.wait().await.map_err(|error| {
                                 worker_failed = true;
                                 ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
@@ -1308,7 +1309,10 @@ impl GroupPublisher<'_> {
             }
             let mut version = 0;
             for receipt in receipts {
-                let committed = receipt.wait_typed().await.map_err(|error| {
+                let wait = self.metrics.exporter_occupancy.group(ExporterGroupState::ReceiptWait);
+                let result = receipt.wait_typed().await;
+                drop(wait);
+                let committed = result.map_err(|error| {
                     worker_failed = true;
                     map_receipt_error(error)
                 })?;
