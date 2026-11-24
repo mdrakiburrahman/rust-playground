@@ -2166,7 +2166,7 @@ fn retry_stale_purge(
     control: &MaintenanceControl,
     mut apply: impl FnMut(&MaintenanceControl) -> Result<MaintenanceReport>,
 ) -> Result<MaintenanceReport> {
-    let started = Instant::now();
+    let started = control.now();
     let max_attempts = max_attempts.max(1);
     let mut retries = 0;
     let mut replan_pending = false;
@@ -2175,7 +2175,7 @@ fn retry_stale_purge(
         control
             .check()
             .map_err(|error| with_purge_retry_counts(error, counters))?;
-        let remaining_budget = budget.saturating_sub(started.elapsed());
+        let remaining_budget = budget.saturating_sub(control.now().saturating_duration_since(started));
         let remaining_attempts = max_attempts.saturating_sub(counters.attempts);
         if remaining_attempts == 0 {
             return Err(purge_retry_budget_error(
@@ -2217,7 +2217,7 @@ fn retry_stale_purge(
                 if counters.attempts >= max_attempts {
                     return Err(with_purge_retry_counts(error, counters));
                 }
-                if started.elapsed().saturating_add(backoff) >= budget {
+                if control.now().saturating_duration_since(started).saturating_add(backoff) >= budget {
                     return Err(purge_retry_budget_error(
                         counters,
                         MaintenanceErrorKind::DeadlineExceeded,
@@ -2291,6 +2291,16 @@ mod purge_replan_tests {
             reader_features: None,
             writer_features: None,
         }
+    }
+
+    /// A control whose deadline clock only moves when the test advances it.
+    fn manual_clock() -> (MaintenanceControl, Arc<std::sync::atomic::AtomicU64>) {
+        let base = Instant::now();
+        let elapsed_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = Arc::clone(&elapsed_us);
+        let control = MaintenanceControl::default()
+            .with_clock(move || base + Duration::from_micros(clock.load(std::sync::atomic::Ordering::SeqCst)));
+        (control, elapsed_us)
     }
 
     fn report(attempts: u32) -> MaintenanceReport {
@@ -2390,8 +2400,9 @@ mod purge_replan_tests {
     #[test]
     fn purge_deadline_includes_membership_backoff() -> Result<()> {
         let calls = std::cell::Cell::new(0);
+        let (control, _) = manual_clock();
         let error = require_error(
-            retry_stale_purge(4, Duration::from_millis(1), &MaintenanceControl::default(), |_| {
+            retry_stale_purge(4, Duration::from_millis(1), &control, |_| {
                 calls.set(calls.get() + 1);
                 Err(membership_stale(report(1)))
             }),
@@ -2447,18 +2458,14 @@ mod purge_replan_tests {
     #[test]
     fn purge_preparation_consumes_the_shared_retry_deadline() -> Result<()> {
         let calls = std::cell::Cell::new(0);
+        let (control, elapsed_us) = manual_clock();
         let error = require_error(
-            retry_stale_purge(
-                4,
-                Duration::from_millis(1),
-                &MaintenanceControl::default(),
-                |attempt_control| {
-                    calls.set(calls.get() + 1);
-                    std::thread::sleep(Duration::from_millis(2));
-                    attempt_control.check()?;
-                    Ok(report(1))
-                },
-            ),
+            retry_stale_purge(4, Duration::from_millis(1), &control, |attempt_control| {
+                calls.set(calls.get() + 1);
+                elapsed_us.fetch_add(2_000, std::sync::atomic::Ordering::SeqCst);
+                attempt_control.check()?;
+                Ok(report(1))
+            }),
             "slow preparation must consume the shared deadline",
         )?;
 
