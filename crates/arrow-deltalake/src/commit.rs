@@ -24,6 +24,9 @@ pub struct CommitOptions {
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
+    pub snapshot_cache_mode: crate::SnapshotCacheMode,
+    pub checkpoint_mode: crate::CheckpointMode,
+    pub checkpoint_interval: u64,
 }
 
 impl Default for CommitOptions {
@@ -33,6 +36,9 @@ impl Default for CommitOptions {
             max_files_per_commit: 64,
             max_pending_files: 256,
             txn_lookup_mode: Default::default(),
+            snapshot_cache_mode: Default::default(),
+            checkpoint_mode: Default::default(),
+            checkpoint_interval: 10,
         }
     }
 }
@@ -43,6 +49,9 @@ impl CommitOptions {
     /// # Errors
     /// Rejects zero, inconsistent, or unrepresentable capacities/windows.
     pub fn validate(&self) -> Result<()> {
+        if !(1..=100_000).contains(&self.checkpoint_interval) {
+            bail!("collector.commit.checkpoint_interval must be in 1..=100000");
+        }
         if self.batch_window.is_zero()
             || Instant::now().checked_add(self.batch_window).is_none()
             || self.max_files_per_commit == 0
@@ -743,6 +752,77 @@ fn same_publication_fence(left: &Option<Arc<dyn PublicationFence>>, right: &Opti
     }
 }
 
+struct CheckpointSchedule {
+    interval: u64,
+    remaining: u64,
+    background: Option<(std::sync::mpsc::SyncSender<()>, std::thread::JoinHandle<()>)>,
+}
+
+impl CheckpointSchedule {
+    fn new(table: &Arc<DeltaTable>, options: &CommitOptions) -> Result<Option<Self>> {
+        let background = match options.checkpoint_mode {
+            crate::CheckpointMode::External => return Ok(None),
+            crate::CheckpointMode::Inline => None,
+            crate::CheckpointMode::Async => {
+                let (signal, requests) = std::sync::mpsc::sync_channel(1);
+                let table = Arc::clone(table);
+                let thread = std::thread::Builder::new()
+                    .name("delta-checkpoint".into())
+                    .spawn(move || {
+                        let mut last = None;
+                        while requests.recv().is_ok() {
+                            match crate::telemetry::publication_phase("checkpoint_async", || {
+                                table.checkpoint_detached(last)
+                            }) {
+                                Ok(version) => last = Some(version),
+                                Err(error) => Self::report_failure(&error),
+                            }
+                        }
+                    })?;
+                Some((signal, thread))
+            }
+        };
+        Ok(Some(Self {
+            interval: options.checkpoint_interval,
+            remaining: options.checkpoint_interval,
+            background,
+        }))
+    }
+
+    fn after_commit(&mut self, table: &DeltaTable) {
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            return;
+        }
+        self.remaining = self.interval;
+        if let Some((signal, _)) = &self.background {
+            // A queued request builds the latest snapshot, covering intervening commits.
+            if let Err(std::sync::mpsc::TrySendError::Disconnected(())) = signal.try_send(()) {
+                Self::report_failure(&anyhow::anyhow!("Delta checkpoint worker stopped"));
+            }
+        } else if let Err(error) = crate::telemetry::publication_phase("checkpoint_inline", || table.checkpoint()) {
+            Self::report_failure(&error);
+        }
+    }
+
+    fn report_failure(error: &anyhow::Error) {
+        crate::telemetry::publication_event("checkpoint_failed");
+        tracing::warn!(error = %format!("{error:#}"), "Delta checkpoint failed after durable data publication");
+    }
+}
+
+impl Drop for CheckpointSchedule {
+    fn drop(&mut self) {
+        if let Some((signal, thread)) = self.background.take() {
+            // Drain and relinquish this publisher before its registry entry can be replaced.
+            drop(signal);
+            if thread.join().is_err() {
+                Self::report_failure(&anyhow::anyhow!("Delta checkpoint worker panicked"));
+            }
+        }
+    }
+}
+
 fn run_worker(
     root: &Path,
     options: CommitOptions,
@@ -752,6 +832,7 @@ fn run_worker(
     publication_fence: Option<Arc<dyn PublicationFence>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let mut checkpoints = None;
     let table = publication_fence
         .map_or_else(
             || DeltaTable::open(root),
@@ -762,9 +843,10 @@ fn run_worker(
             },
         )
         .and_then(|mut table| {
-            Arc::get_mut(&mut table)
-                .context("new Delta worker table is already shared")?
-                .txn_lookup_mode = options.txn_lookup_mode;
+            let owner = Arc::get_mut(&mut table).context("new Delta worker table is already shared")?;
+            owner.txn_lookup_mode = options.txn_lookup_mode;
+            owner.snapshot_cache_mode = options.snapshot_cache_mode;
+            checkpoints = CheckpointSchedule::new(&table, &options)?;
             Ok(table)
         });
     let mut failure = table
@@ -773,6 +855,9 @@ fn run_worker(
         .map(|error| CommitReceiptError::commit_failed(format!("{error:#}")));
     match runtime {
         Ok(runtime) => runtime.block_on(async {
+            let mut publish = |batch: &mut Vec<Publication>, failure: &mut Option<CommitReceiptError>| {
+                publish_batch(&table, batch, failure, checkpoints.as_mut());
+            };
             let mut batch = Vec::new();
             let mut deadline = None;
             let mut flush_open = true;
@@ -784,7 +869,7 @@ fn run_worker(
                 // publishing the partial batch, so the wakeup cannot be lost.
                 let request = if flushing {
                     if flush_remaining == 0 {
-                        publish_batch(&table, &mut batch, &mut failure);
+                        publish(&mut batch, &mut failure);
                         deadline = None;
                         flushing = false;
                         continue;
@@ -795,7 +880,7 @@ fn run_worker(
                             Some(request)
                         }
                         Err(mpsc::error::TryRecvError::Empty) => {
-                            publish_batch(&table, &mut batch, &mut failure);
+                            publish(&mut batch, &mut failure);
                             deadline = None;
                             flushing = false;
                             continue;
@@ -812,7 +897,7 @@ fn run_worker(
                                 std::future::pending::<()>().await;
                             }
                         } => {
-                            publish_batch(&table, &mut batch, &mut failure);
+                            publish(&mut batch, &mut failure);
                             deadline = None;
                             continue;
                         }
@@ -846,7 +931,7 @@ fn run_worker(
                         };
                         if let Err(error) = &result {
                             failure = Some(error.clone());
-                            publish_batch(&table, &mut batch, &mut failure);
+                            publish(&mut batch, &mut failure);
                             deadline = None;
                         }
                         let _ = reply.send(result);
@@ -901,7 +986,7 @@ fn run_worker(
                         if !batch.is_empty()
                             && (file_count + publication.appends.len() > options.max_files_per_commit || overlaps)
                         {
-                            publish_batch(&table, &mut batch, &mut failure);
+                            publish(&mut batch, &mut failure);
                             deadline = None;
                         }
                         let force = publication.force;
@@ -911,12 +996,12 @@ fn run_worker(
                         }
                         let file_count = batch.iter().map(|publication| publication.appends.len()).sum::<usize>();
                         if force || draining.load(Ordering::Acquire) || file_count >= options.max_files_per_commit {
-                            publish_batch(&table, &mut batch, &mut failure);
+                            publish(&mut batch, &mut failure);
                             deadline = None;
                         }
                     }
                     None => {
-                        publish_batch(&table, &mut batch, &mut failure);
+                        publish(&mut batch, &mut failure);
                         break;
                     }
                 }
@@ -951,6 +1036,7 @@ fn publish_batch(
     table: &Result<Arc<DeltaTable>>,
     batch: &mut Vec<Publication>,
     failure: &mut Option<CommitReceiptError>,
+    checkpoints: Option<&mut CheckpointSchedule>,
 ) {
     if batch.is_empty() {
         return;
@@ -986,6 +1072,11 @@ fn publish_batch(
     };
     let result =
         result.map(|(head, duration, observations, evidence)| (head, duration, observations, Arc::new(evidence)));
+    if let (Some(schedule), Ok(table), Ok((_, Some(_), _, evidence))) = (checkpoints, table, &result)
+        && !evidence.reasons.contains(&crate::PublicationReason::Reconciled)
+    {
+        schedule.after_commit(table);
+    }
     if let Err(error) = &result
         && !error.error.is_retryable()
     {
@@ -1039,6 +1130,46 @@ mod tests {
         let mut writer = table.new_file(input.schema()).await?;
         writer.write(input).await?;
         writer.stage().await
+    }
+
+    #[tokio::test]
+    async fn background_checkpoint_does_not_hold_durable_receipts() -> Result<()> {
+        for mode in [crate::CheckpointMode::Inline, crate::CheckpointMode::Async] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path().canonicalize()?;
+            let options = CommitOptions {
+                checkpoint_mode: mode,
+                checkpoint_interval: 2,
+                ..Default::default()
+            };
+            let table = BatchedTable::open(&root, options).await?;
+            let first = table
+                .submit(staged_file(&table, &input()?).await?, true)
+                .await?
+                .wait()
+                .await?;
+            let hint = root.join("_delta_log").join("_last_checkpoint");
+            assert!(!hint.exists());
+            let (entered, release) = crate::sync_hook::pause_next(hint.clone());
+            let second = table.submit(staged_file(&table, &input()?).await?, true).await?;
+            let mut receipt = Box::pin(second.wait());
+            tokio::time::timeout(Duration::from_secs(20), entered).await??;
+            let second = if mode == crate::CheckpointMode::Async {
+                let result = tokio::time::timeout(Duration::from_secs(5), receipt).await??;
+                release.send(())?;
+                result
+            } else {
+                assert!(futures::poll!(&mut receipt).is_pending());
+                release.send(())?;
+                receipt.await?
+            };
+            assert_eq!(second.version, first.version + 1);
+            let hint: serde_json::Value = serde_json::from_slice(&std::fs::read(hint)?)?;
+            assert_eq!(hint["version"], second.version);
+            drop(table);
+            let _reopened = BatchedTable::open(&root, CommitOptions::default()).await?;
+        }
+        Ok(())
     }
 
     async fn partitioned_stage_fixture(root: &Path) -> Result<(Arc<BatchedTable>, RecordBatch)> {

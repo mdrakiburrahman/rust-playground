@@ -260,6 +260,7 @@ The `arrow-deltalake` meter exports these actual instruments:
 | `delta.publication.events` | counter | `outcome` |
 | `delta.publication.duration` | s, histogram | `outcome` |
 | `delta.publication.commit_lock.duration` | s, histogram | `phase=wait` before acquisition; `phase=hold` through release, including retries and durability barriers |
+| `delta.publication.phase.duration` | s, histogram | `phase=snapshot`, `lookup`, `commit`, `sync` (post-commit or replay barrier), `checkpoint_inline`, or `checkpoint_async` (off the publication thread) |
 
 Kernel event coverage includes log-segment and protocol loading, snapshot,
 transaction prepare/committer/total timings and file counts/bytes, domain and
