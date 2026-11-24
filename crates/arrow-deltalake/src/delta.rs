@@ -2533,7 +2533,6 @@ mod io_tests {
                 }
                 assert_eq!(table.version()?, version);
             }
-            #[cfg(target_os = "linux")]
             crate::delta_io::assert_worker_bound()?;
             drop(tables);
             tables = Vec::new();
@@ -2560,7 +2559,6 @@ mod io_tests {
                 tables.push(table);
             }
             assert_eq!(tables.len(), 13);
-            #[cfg(target_os = "linux")]
             crate::delta_io::assert_worker_bound()?;
         }
         Ok(())
@@ -2614,7 +2612,6 @@ mod io_tests {
         let results = tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(operations)).await?;
         let tables = results.into_iter().collect::<Result<Vec<_>>>()?;
         assert_eq!(tables.len(), 13);
-        #[cfg(target_os = "linux")]
         crate::delta_io::assert_worker_bound()?;
         for index in 0..13 {
             let log = directory.path().join(index.to_string()).join("_delta_log");

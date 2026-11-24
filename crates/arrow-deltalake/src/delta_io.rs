@@ -782,7 +782,8 @@ static EXECUTOR: OnceLock<std::result::Result<Arc<SharedExecutor>, String>> = On
 /// needed by other tables, or drops a runtime inside an async call context.
 pub(crate) fn shared_executor() -> Result<Arc<SharedExecutor>> {
     match EXECUTOR.get_or_init(|| {
-        SharedExecutor::new()
+        runtime_config()
+            .and_then(SharedExecutor::new)
             .map(Arc::new)
             .map_err(|error| format!("{error:#}"))
     }) {
@@ -811,6 +812,8 @@ where
 #[derive(Debug)]
 pub(crate) struct SharedExecutor {
     runtime: Runtime,
+    #[cfg(test)]
+    live_threads: Arc<AtomicUsize>,
     admission: Arc<Admission>,
     blocking_admission: Arc<tokio::sync::Semaphore>,
     upload_admission: Arc<tokio::sync::Semaphore>,
@@ -886,8 +889,7 @@ fn configured_io_builder(config: &DeltaRuntimeConfig) -> tokio::runtime::Builder
 }
 
 impl SharedExecutor {
-    fn new() -> Result<Self> {
-        let config = runtime_config()?;
+    fn new(config: &DeltaRuntimeConfig) -> Result<Self> {
         let blocking_capacity = config
             .blocking_workers
             .checked_sub(config.blocking_fs_reserve)
@@ -898,9 +900,21 @@ impl SharedExecutor {
                     "blocking filesystem reserve must be smaller than the blocking worker count",
                 )
             })?;
-        let runtime = configured_io_builder(config)
-            .build()
-            .context("create shared Delta I/O runtime")?;
+        let mut builder = configured_io_builder(config);
+        #[cfg(test)]
+        let live_threads = {
+            let live = Arc::new(AtomicUsize::new(0));
+            let started = Arc::clone(&live);
+            let stopped = Arc::clone(&live);
+            builder.on_thread_start(move || {
+                started.fetch_add(1, AtomicOrdering::Relaxed);
+            });
+            builder.on_thread_stop(move || {
+                stopped.fetch_sub(1, AtomicOrdering::Relaxed);
+            });
+            live
+        };
+        let runtime = builder.build().context("create shared Delta I/O runtime")?;
         eprintln!(
             "ARROWCOL_DELTA_IO_RUNTIME_BUILT {}",
             serde_json::json!({
@@ -915,6 +929,8 @@ impl SharedExecutor {
         );
         Ok(Self {
             runtime,
+            #[cfg(test)]
+            live_threads,
             admission: Arc::new(Admission::new(config.task_limit)),
             // Admitted synchronous jobs may wait on tokio::fs, which uses this
             // same blocking pool. Keep the configured slots free for filesystem work.
@@ -922,6 +938,11 @@ impl SharedExecutor {
             upload_admission: Arc::new(tokio::sync::Semaphore::new(config.upload_limit)),
             background_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn live_thread_count(&self) -> usize {
+        self.live_threads.load(AtomicOrdering::Relaxed)
     }
 
     pub(crate) async fn upload_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
@@ -1024,32 +1045,15 @@ impl TaskExecutor for SharedExecutor {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-fn is_vanished_task_error(error: &std::io::Error) -> bool {
-    // Linux ESRCH is not mapped to a dedicated std::io::ErrorKind.
-    const ESRCH: i32 = 3;
-    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
-}
-
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 pub(crate) fn assert_worker_bound() -> Result<()> {
-    let mut threads = 0;
-    for entry in std::fs::read_dir("/proc/self/task")? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if is_vanished_task_error(&error) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        // A completed, unrelated test thread may exit during enumeration.
-        match std::fs::read_to_string(entry.path().join("comm")) {
-            Ok(name) if name.trim() == "delta-io" => threads += 1,
-            Ok(_) => {}
-            Err(error) if is_vanished_task_error(&error) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let threads = shared_executor()?.live_thread_count();
     let config = runtime_config()?;
-    assert!((config.runtime_workers..=config.runtime_workers + config.blocking_workers).contains(&threads));
+    let bound = config.runtime_workers..=config.runtime_workers + config.blocking_workers;
+    assert!(
+        bound.contains(&threads),
+        "shared executor owns {threads} threads; expected {bound:?}"
+    );
     Ok(())
 }
 
@@ -1116,18 +1120,6 @@ mod tests {
             assert!(DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned()))).is_err());
         }
         Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_task_observation_ignores_only_vanished_tasks() {
-        assert!(is_vanished_task_error(&std::io::Error::from_raw_os_error(3)));
-        assert!(is_vanished_task_error(&std::io::Error::from(
-            std::io::ErrorKind::NotFound
-        )));
-        assert!(!is_vanished_task_error(&std::io::Error::from(
-            std::io::ErrorKind::PermissionDenied
-        )));
     }
 
     #[test]
@@ -1774,7 +1766,6 @@ mod tests {
             }
             Ok::<(), anyhow::Error>(())
         })?;
-        #[cfg(target_os = "linux")]
         assert_worker_bound()?;
         Ok(())
     }
@@ -1784,17 +1775,36 @@ mod tests {
     #[test]
     fn blocking_concurrency_and_threads_are_bounded() -> Result<()> {
         let executor = shared_executor()?;
+        let config = runtime_config()?;
+        let capacity = config.blocking_workers - config.blocking_fs_reserve;
+        // Keep another delta-io worker alive throughout the measurement.
+        let mut other_config = config.clone();
+        other_config.runtime_workers = 1;
+        let other = SharedExecutor::new(&other_config)?;
+        other.block_on(async { assert_eq!(std::thread::current().name(), Some("delta-io")) });
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let io_executor = Arc::clone(&executor);
         let observed_peak = Arc::clone(&peak);
         executor.block_on(async move {
-            let tasks = (0..96).map(|_| {
+            // Rendezvous the first two jobs so a serial executor cannot pass.
+            let (left, from_left) = mpsc::channel();
+            let (right, from_right) = mpsc::channel();
+            let mut peers = [(left, from_right), (right, from_left)]
+                .into_iter()
+                .take(if capacity > 1 { 2 } else { 0 });
+            let tasks = (0..(2 * capacity)).map(|_| {
+                let peer = peers.next();
                 let active = Arc::clone(&active);
                 let peak = Arc::clone(&peak);
                 io_executor.spawn_blocking(move || {
                     let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(count, Ordering::SeqCst);
+                    if let Some((started, peer)) = peer {
+                        started.send(()).expect("peer must be live");
+                        peer.recv_timeout(Duration::from_secs(10))
+                            .expect("blocking jobs must overlap");
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                     active.fetch_sub(1, Ordering::SeqCst);
                 })
@@ -1804,8 +1814,8 @@ mod tests {
             }
             Ok::<(), Error>(())
         })?;
-        assert!((1..=runtime_config()?.blocking_workers).contains(&observed_peak.load(Ordering::SeqCst)));
-        #[cfg(target_os = "linux")]
+        assert!((capacity.min(2)..=capacity).contains(&observed_peak.load(Ordering::SeqCst)));
+        assert_eq!(other.live_thread_count(), 1);
         assert_worker_bound()?;
         Ok(())
     }
