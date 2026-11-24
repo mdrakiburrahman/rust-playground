@@ -836,3 +836,218 @@ mod qap_helper_lifetime_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod offline_finalization_tests {
+    use super::*;
+
+    const ROOT: &str = "abfss://data@example.dfs.core.windows.net/campaign/run/dataflow";
+    const CAMPAIGN: &str = "c0ffee00-0000-4000-8000-000000000001";
+    const OWNER: &str = "c0ffee00-0000-4000-8000-000000000002";
+    const CELL: &str = "c0ffee00-0000-4000-8000-000000000003";
+    const RUN: &str = "c0ffee00-0000-4000-8000-000000000004";
+
+    struct TestDirectory(PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                eprintln!("could not remove offline Delta fixture: {error}");
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        Missing,
+        WrongPod,
+    }
+
+    struct FixturePlatform {
+        inventory: RunInventory,
+        inputs: ShutdownFinalizationInputs,
+        fault: Fault,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Platform for FixturePlatform {
+        fn kind(&self) -> crate::config::OatMode { crate::config::OatMode::Aks }
+        fn workload_endpoint(&self, _: &OatConfig) -> String { unreachable!() }
+        fn router_metrics_endpoint(&self, _: &OatConfig) -> Result<String> { unreachable!() }
+        fn qap_endpoint(&self, _: &OatConfig) -> String { unreachable!() }
+        fn delta_root(&self) -> Option<&str> { Some(ROOT) }
+        async fn ensure_stack(&mut self, _: &OatConfig, _: &str, _: u32) -> Result<()> { unreachable!() }
+        async fn scale_arrowcols(&mut self, _: &OatConfig, _: u32, _: u32) -> Result<()> { unreachable!() }
+        async fn initialize_run_table_pins(&mut self, _: &OatConfig, _: &str, _: &str, _: u64, _: u64) -> Result<()> { unreachable!() }
+        fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode { unreachable!() }
+        fn qap_database(&self, _: &OatConfig) -> Result<String> { unreachable!() }
+        async fn initialize_qap(&mut self, _: &OatConfig, _: &str, _: &[String]) -> Result<Vec<String>> { unreachable!() }
+        async fn prepare_client_fleet(&mut self, _: &OatConfig, _: &str) -> Result<()> { unreachable!() }
+        async fn start_client(&mut self, _: &OatConfig, _: &str, _: &str, _: usize, _: &[String]) -> Result<ClientHandle> { unreachable!() }
+        async fn poll_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<ClientProgress> { unreachable!() }
+        async fn arm_clients(&mut self, _: &OatConfig, _: &str, _: u64) -> Result<()> { unreachable!() }
+        async fn finish_client(&self, _: &OatConfig, _: ClientHandle) -> Result<String> { unreachable!() }
+        async fn cancel_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<()> { unreachable!() }
+        async fn cleanup(&mut self, _: &OatConfig) -> Result<()> {
+            self.events.lock().unwrap().push("freeze");
+            Ok(())
+        }
+        async fn capture_shutdown_inputs(&mut self) -> Option<ShutdownFinalizationInputs> {
+            self.events.lock().unwrap().push("capture");
+            Some(self.inputs.clone())
+        }
+        async fn finish_cleanup(&mut self, _: &OatConfig, rows: &[OatResult], frozen: bool) -> Result<()> {
+            self.events.lock().unwrap().push("finish_cleanup_attempted");
+            ensure!(frozen, "freeze not confirmed");
+            let actor = CampaignCleanupActor { mode: CampaignActorMode::Producer, owner_id: OWNER.into(), fencing_token: 1 };
+            let reconciliation = shutdown_reconciliation_request(rows);
+            let receipt = ShutdownFinalizationReceipt {
+                schema_version: 1,
+                blob: format!("_arrowcol-custody/campaigns/{CAMPAIGN}/runs/{RUN}/cells/{CELL}/shutdown-finalization.json"),
+                etag: "\"receipt\"".into(), sha256: "a".repeat(64), inventory_etag: "\"inventory\"".into(),
+                actor: actor.clone(),
+                origin: ShutdownFinalizationOrigin { campaign_id: CAMPAIGN.into(), owner_id: OWNER.into(), fencing_token: 1,
+                    orchestration_run_id: RUN.into(), cell_run_id: CELL.into(), namespace: self.inventory.namespace.clone() },
+                terminal_capture: self.inputs.terminal_capture.clone(), delta_before: self.inputs.delta_before.clone(),
+                delta_terminal: self.inputs.delta_terminal.clone(),
+                verdicts: vec![ShutdownFinalVerdict { pod_name: "collector-0".into(), pod_uid: "original-pod".into(),
+                    container: "collector".into(), restart_count: Some(0), classification: "exit_0".into() }],
+                status: match self.fault { Fault::Missing => "unavailable", Fault::WrongPod => "validated" }.into(),
+                reason_code: matches!(self.fault, Fault::Missing).then(|| "terminal_identity_unavailable".into()),
+                release_allowed: matches!(self.fault, Fault::WrongPod), reconciliation: reconciliation.clone(),
+            };
+            validate_shutdown_finalization(&receipt, &self.inventory, "\"inventory\"", &actor, &self.inputs, &reconciliation)?;
+            ensure_shutdown_release(&receipt, rows)?;
+            self.events.lock().unwrap().push("release");
+            Ok(())
+        }
+        fn shutdown_drain_evidence(&self) -> Option<Value> {
+            Some(json!({"status":"unavailable","cleanup_attempted":true,"cleanup_confirmed":false}))
+        }
+    }
+
+    struct LocalDeltaReader {
+        delta: Value,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait::async_trait]
+    impl FinalAksReconciler for LocalDeltaReader {
+        async fn attach(&self, config: &OatConfig, _: Option<&str>, rows: &mut [OatResult], frozen: bool) {
+            self.events.lock().unwrap().push("delta_reconciliation");
+            for row in rows {
+                apply_final_aks_delta_reconciliation(config, row, Some(&self.delta), frozen).unwrap();
+            }
+        }
+    }
+
+    fn setup(fault: Fault, config: &OatConfig) -> Result<FixturePlatform> {
+        let identity = CampaignIdentity { campaign_id: CAMPAIGN.into(), owner_id: OWNER.into(), fencing_token: 1 };
+        let inventory = initial_campaign_inventory(&identity, RUN, CELL, &format!("oat-{}", CELL.replace('-', "")),
+            "arrowcollector12345", "checkpoints", CampaignCellBudget {
+                effective_stop_budgets: config.maintenance_stop_budget()?,
+                planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+                drain_budget: InventoryDrainBudget { budget_ms: config.platform.aks_drain_budget_ms,
+                    collector_grace_ms: config.collector_stop_grace_seconds * 1_000,
+                    pre_stop_capture_margin_ms: crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS },
+            })?;
+        let reference = |blob: String| ShutdownSourceReference { blob, etag: "\"source\"".into(), sha256: "a".repeat(64) };
+        let prefix = format!("_arrowcol-custody/campaigns/{CAMPAIGN}/runs/{RUN}/cells/{CELL}");
+        let capture = format!("{}/custody/{CELL}/terminal_capture.json", inventory.evidence_destination.as_ref().unwrap().blob_prefix);
+        let summary = ShutdownTerminalPodSummary { pod_name: "collector-0".into(), pod_uid: "replacement-pod".into(),
+            container: config.dfe_container.clone(), restart_count: 0, exit_code: 0,
+            summary: ShutdownTerminalSummary { schema_version: 1, admitted: 1, committed: 1, failed: 0,
+                cancelled_ambiguous: 0, pending: 0, committed_rows: 300, incomplete: 0,
+                commits: vec![ShutdownTerminalCommit { table_id: fixture_sha256(format!("{ROOT}/telemetry/sqlserver/{}/", config.tables[0]).as_bytes()),
+                    version: 0, rows: 300, files: 1, parquet_bytes: 900 }] } };
+        let inputs = ShutdownFinalizationInputs { schema_version: 1, inventory_etag: "\"inventory\"".into(),
+            terminal_capture: Some(reference(capture)), delta_before: Some(reference(format!("{prefix}/delta-before.json"))),
+            delta_terminal: Some(reference(format!("{prefix}/delta-terminal.json"))),
+            unavailable_reason: matches!(fault, Fault::Missing).then(|| "terminal_identity_unavailable".into()),
+            terminal_summaries: matches!(fault, Fault::WrongPod).then(|| vec![summary]) };
+        Ok(FixturePlatform { inventory, inputs, fault, events: Arc::new(std::sync::Mutex::new(Vec::new())) })
+    }
+
+    #[tokio::test]
+    async fn insufficient_original_pod_evidence_withholds_release_but_keeps_verified_window() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        config.tables = vec!["sqlserver_wait_stats".into()];
+        config.clients_per_table = 1;
+        config.dfe_container = "collector".into();
+        config.platform.kind = crate::config::OatMode::Aks;
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        let directory = TestDirectory(std::env::temp_dir().join(format!("oat-offline-finalize-{}", uuid::Uuid::new_v4())));
+        fs::create_dir(&directory.0)?;
+        let add = json!({"add":{"path":"part.parquet","size":900,"dataChange":true,"stats":json!({"numRecords":300}).to_string()}});
+        let info = json!({"commitInfo":{"timestamp":2_000,"operation":"WRITE"}});
+        fs::write(directory.0.join("00000000000000000000.json"), format!("{info}\n{add}\n"))?;
+        let receipt = json!({"delta_version":0,"rows":300,"files":1,"input_bytes":1200,"parquet_bytes":900,
+            "min_ingested_at_ms":1_500,"max_ingested_at_ms":1_900,"finished_at_unix_ms":2_000});
+        let durable = json!({"output_throughput":{"measurement_start_unix_ms":1_000,"measurement_end_unix_ms":31_000,
+            "rows":300,"files":1,"input_bytes":1200,"parquet_bytes":900},
+            "run_cumulative_output":{"rows":300,"commits_by_version":[receipt],"settled":true}});
+        let measured = reconcile_local_delta_log(&directory.0, &durable);
+        assert_eq!(measured["status"], "matched");
+        assert_eq!(measured["observed"]["durable_rows_per_s"], 10.0);
+        assert_eq!(measured["observed"]["bytes_per_row"], 3.0);
+        let mut zero_durable = durable.clone();
+        zero_durable["output_throughput"] = json!({"measurement_start_unix_ms":5_000,
+            "measurement_end_unix_ms":35_000,"rows":0,"files":0,"input_bytes":0,"parquet_bytes":0});
+        let zero = reconcile_local_delta_log(&directory.0, &zero_durable);
+        assert_eq!(zero["status"], "matched");
+        assert_eq!(zero["observed"]["durable_rows"], 0);
+        assert_eq!(zero["observed"]["durable_rows_per_s"], 0.0);
+        let delta = read_local_delta_log_commits(&directory.0)?;
+        for (fault, window) in [(Fault::Missing, 1), (Fault::WrongPod, 1), (Fault::Missing, 0), (Fault::Missing, 2)] {
+            let mut rows = result_rows(&config, RUN, CELL, 1, 1, CellMeasurements {
+                clients: ClientRun { metrics: HashMap::from([(config.tables[0].clone(), ClientMetrics {
+                    rows: 300, duration_ms: 30_000, rows_per_second: 10.0, completions: Vec::new(),
+                })]), pinning: PinningReport::default(), qap_tables: Vec::new(),
+                    failure: None, evidence: CellEvidence::default() }, started_at_ms: 1_000,
+                qap: QapMetrics::default(), resources: None, resource_evidence: None,
+            })?;
+            assert_eq!(rows[0].status, "succeeded");
+            let mut input = if window == 2 { zero_durable.clone() } else { durable.clone() };
+            let observation = if window == 2 { &zero["observed"] } else { &measured["observed"] };
+            input["output_throughput"]["rows_per_second"] = observation["durable_rows_per_s"].clone();
+            input["output_throughput"]["bytes_per_row"] = observation["bytes_per_row"].clone();
+            if window == 0 {
+                input.as_object_mut().unwrap().remove("output_throughput");
+            }
+            rows[0].evidence_json = Some(json!({"client_phase_reports":[{"phase_counters":{"process_cumulative":{
+                "completed_rows":300,"ambiguous_rows":0}}}],"durable_commits":input}).to_string());
+            let mut platform = setup(fault, &config)?;
+            let events = Arc::clone(&platform.events);
+            let reader = LocalDeltaReader { delta: delta.clone(), events: Arc::clone(&events) };
+            let (outcome, confirmed) = finalize_isolated_cell(&config, RUN, CELL, (1,1), (Ok(rows), false), &mut platform, &reader).await;
+            assert!(!confirmed);
+            assert!(!outcome.aks_cleanup_confirmed);
+            assert_eq!(*events.lock().unwrap(), ["freeze","capture","delta_reconciliation","finish_cleanup_attempted"]);
+            let row = &outcome.rows[0];
+            assert_eq!(row.status, "failed");
+            assert!(row.failure.as_deref().unwrap().contains("clean up isolated matrix-cell platform"));
+            let failure = row.failure.as_deref().unwrap();
+            match fault {
+                Fault::Missing => assert!(failure.contains("finalization is unavailable or failed")),
+                Fault::WrongPod => assert!(failure.contains("validated collector verdicts differ from terminal summary identities")),
+            }
+            let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().unwrap())?;
+            assert_eq!(evidence["teardown_outcome"], "failed");
+            assert_eq!(evidence["commit_window_output_usage"], "diagnostic_only");
+            if window != 0 {
+                assert_eq!(evidence["commit_window_output_throughput"]["rows"], observation["durable_rows"]);
+                assert_eq!(evidence["commit_window_output_throughput"]["rows_per_second"], observation["durable_rows_per_s"]);
+                assert_eq!(evidence["commit_window_output_throughput"]["bytes_per_row"], observation["bytes_per_row"]);
+            } else {
+                assert!(evidence["commit_window_output_throughput"]["rows"].is_null());
+                assert!(evidence["commit_window_output_throughput"]["rows_per_second"].is_null());
+                assert!(evidence["commit_window_output_throughput"]["bytes_per_row"].is_null());
+                assert_eq!(evidence["commit_window_output_throughput"]["unavailable_reason"], "measurement_window_evidence_unavailable");
+            }
+            assert!(evidence["screen_v1"].is_null());
+            if matches!(fault, Fault::Missing) {
+                assert!(evidence["durable_commits"]["collector_teardown_admissions"]["cancelled_ambiguous"].is_null());
+            }
+        }
+        Ok(())
+    }
+}
