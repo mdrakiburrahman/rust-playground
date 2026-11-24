@@ -1059,6 +1059,15 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             }
             policy.insert(field.to_owned(), actual.clone());
         }
+        if let Some(options) = value["config"].get("sort_options").filter(|v| !v.is_null()) {
+            let options: Vec<arrow_deltalake::layout::SortKeyOptions> =
+                serde_json::from_value(options.clone()).context("invalid effective collector.layout.sort_options")?;
+            anyhow::ensure!(
+                enabled && json!(options.iter().map(|key| &key.column).collect::<Vec<_>>()) == policy["sort_columns"],
+                "effective collector.layout.sort_options must match sort_columns in order"
+            );
+            policy.insert("sort_options".to_owned(), json!(options));
+        }
         if let Some(ratio) = value["config"].get("detach_ratio") {
             anyhow::ensure!(enabled && ratio.as_u64().is_some_and(|ratio| (1..=8).contains(&ratio)), "invalid effective collector.layout.detach_ratio");
             policy.insert("detach_ratio".to_owned(), ratio.clone());
@@ -2146,7 +2155,8 @@ mod startup_readback_tests {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
-        let policy = json!({"enabled":true,"sort_execution":"verify_order","sort_columns":["customer_id"],"bloom_columns":[],
+        let policy = json!({"enabled":true,"sort_execution":"verify_order","sort_columns":["customer_id"],
+            "sort_options":[{"column":"customer_id","direction":"descending","nulls":"first"}],"bloom_columns":[],
             "max_rows":777,"max_input_bytes":1_048_576,"row_group_rows":123,"page_rows":17});
         config.tunables = serde_json::from_value(json!({"collector":{"layout":policy}}))?;
         let startup = format!(

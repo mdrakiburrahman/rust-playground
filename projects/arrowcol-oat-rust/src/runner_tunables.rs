@@ -142,6 +142,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 "enabled"
                     | "sort_execution"
                     | "sort_columns"
+                    | "sort_options"
                     | "bloom_columns"
                     | "max_rows"
                     | "max_input_bytes"
