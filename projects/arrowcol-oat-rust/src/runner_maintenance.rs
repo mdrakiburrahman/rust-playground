@@ -481,6 +481,37 @@ fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<(
     {
         bail!("maintenance did not confirm its effective stale-plan health limit");
     }
+    for (enabled, requested, startup_path, effective_path, policy_path) in [
+        (
+            settings.operations.contains(&arrowcol_tunables::MaintenanceOperation::Checkpoint),
+            settings.checkpoint_every_commits,
+            "/startup/checkpoint_every_commits",
+            "/operation_settings/checkpoint_every_commits",
+            "/table_policy/delta.checkpointInterval",
+        ),
+        (
+            settings.operations.contains(&arrowcol_tunables::MaintenanceOperation::Optimize),
+            settings
+                .target_file_mib
+                .map(|value| value.checked_mul(1024 * 1024).context("maintenance target file size overflow"))
+                .transpose()?,
+            "/startup/optimize_target_file_bytes",
+            "/operation_settings/optimize_target_file_bytes",
+            "/table_policy/arrowcol.optimize.targetFileSize",
+        ),
+    ] {
+        if enabled && let Some(requested) = requested {
+            let effective = observed
+                .pointer(effective_path)
+                .filter(|value| value.as_u64().is_some_and(|number| number > 0))
+                .with_context(|| format!("maintenance effective {effective_path} missing"))?;
+            if observed.pointer(startup_path) != Some(&json!(requested))
+                || observed.pointer(policy_path) != Some(effective)
+            {
+                bail!("maintenance {effective_path} requested or effective setting does not match readback");
+            }
+        }
+    }
     if let Some(requested) = settings.sealed_partitions_only {
         if observed.pointer("/startup/sealed_partitions_only") != Some(&json!(requested)) {
             bail!("maintenance did not confirm its requested sealed-partition preference");
@@ -1293,6 +1324,30 @@ mod maintenance_topology_tests {
                 maintenance_readback_value(&observed, &format!("ARROWCOL_MAINT_{variable}"), expected)?;
             assert_eq!(actual, requested);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_checkpoint_and_target_readbacks_match_effective_table_policy() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"operations":["checkpoint","optimize"],
+                "checkpoint_every_commits":42,"target_file_mib":17}
+        }))?;
+        let mut observed = json!({
+            "startup":{"apply":false,"operations":["checkpoint","optimize"],"interval_secs":60,
+                "checkpoint_every_commits":42,"optimize_target_file_bytes":17825792},
+            "operation_settings":{"checkpoint_every_commits":55,"optimize_target_file_bytes":33554432},
+            "table_policy":{"delta.checkpointInterval":55,"arrowcol.optimize.targetFileSize":33554432}
+        });
+        verify_maintenance_controls(&config, &observed)?;
+        observed["operation_settings"]["checkpoint_every_commits"] = json!(42);
+        assert!(verify_maintenance_controls(&config, &observed).is_err());
+        observed["operation_settings"]["checkpoint_every_commits"] = json!(55);
+        observed["operation_settings"]["optimize_target_file_bytes"] = Value::Null;
+        assert!(verify_maintenance_controls(&config, &observed).is_err());
         Ok(())
     }
 
