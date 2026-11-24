@@ -1492,7 +1492,7 @@ test('an active cell retains its committed rate after Kustainer death', () => {
   assert.match(svg, />800\*?<\/text>/);
 });
 
-function comparisonCandidate(afterRate = 100) {
+function comparisonCandidate(afterRate = 100, rates = [110, 111, 109]) {
   const makeRun = (sequence: number, rate: number, start: number) => {
     const run = sourceShapedRun(sequence, [rate, rate, rate, rate, rate], start);
     attachMaintenanceDueWork(run, start, start + 150_000);
@@ -1517,7 +1517,7 @@ function comparisonCandidate(afterRate = 100) {
     run.rows[0]!.evidence_json = JSON.stringify(evidence);
     return run;
   };
-  return [110, 111, 109].map((rate, index) => {
+  return rates.map((rate, index) => {
     const start = 1_000_000 + index * 500_000;
     return {
       cohort: 'C1', candidate: 'comparison', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
@@ -1533,7 +1533,8 @@ function comparisonCandidate(afterRate = 100) {
 
 type MutableEvidence = Record<string, unknown> & {
   reconciliation: Record<string, unknown>;
-  durable_commits: { complete_30_second_commit_windows: Array<Record<string, unknown>> };
+  durable_commits: { complete_30_second_commit_windows: Array<Record<string, unknown>>; output_throughput: Record<string, unknown> };
+  commit_window_output_throughput: Record<string, unknown>;
 };
 
 function updateRunEvidence(run: ReturnType<typeof sourceShapedRun>, mutate: (evidence: MutableEvidence) => void) {
@@ -1577,6 +1578,7 @@ test('rejects unsettled, failed and typed quarantined cells regardless of launch
   assert.match(renderCampaignResults(failedResult, 'C1'), /result status is failed/);
   const failedOutcome = comparisonCandidate();
   assert.match(renderCampaignResults(failedOutcome.map((row, index) => index ? row : { ...row, outcome: 'build-failed', comment: 'build failed' }), 'C1'), /build failed/);
+  assert.throws(() => validateCampaignMeasurements([{ ...failedOutcome[0], status: null }]), /result 0 status/);
 });
 
 test('preserves exactly reconciled ArrowCol observations when QAP is unavailable', () => {
@@ -1633,6 +1635,37 @@ test('requires resolution and matching A/A for paired comparisons', () => {
   assert.match(renderCampaignResults(boundary, 'C1'), /comparison \(3\/3\)/);
   const wrongOrder = comparisonCandidate().map(row => ({ ...row, pairOrder: 'AB' }));
   assert.match(renderCampaignResults(wrongOrder, 'C1'), /AB\/BA\/AB pair order missing/);
+});
+
+test('requires effect, paired t and physical bytes-per-row thresholds', () => {
+  for (const rates of [[104, 104, 104], [106, 107, 130]]) {
+    const svg = renderCampaignResults(comparisonCandidate(100, rates), 'C1');
+    assert.match(svg, /paired winner thresholds not met/);
+    assert.doesNotMatch(svg, /comparison \(3\/3\)/);
+    assert.match(svg, /Welch t \(reference\)/);
+  }
+  const oversized = comparisonCandidate();
+  for (const row of oversized) {
+    updateRunEvidence(row.officialRuns[0]!, evidence => {
+      const output = evidence.durable_commits.output_throughput;
+      output.parquet_bytes = Number(output.rows) * 6;
+      output.bytes_per_row = 6;
+      output.parquet_bytes_per_second = Number(output.parquet_bytes) / Number(output.window_seconds);
+      output.compression_ratio = 10 / 6;
+      evidence.commit_window_output_throughput.parquet_bytes = output.parquet_bytes;
+      evidence.commit_window_output_throughput.bytes_per_row = 6;
+      evidence.commit_window_output_throughput.parquet_bytes_per_second = output.parquet_bytes_per_second;
+      evidence.commit_window_output_throughput.compression_ratio = output.compression_ratio;
+      for (const window of evidence.durable_commits.complete_30_second_commit_windows) {
+        window.parquet_bytes = Number(window.rows) * 6;
+        window.parquet_bytes_per_second = Number(window.parquet_bytes) / 30;
+        window.bytes_per_row = 6;
+        window.compression_ratio = 10 / 6;
+      }
+    });
+  }
+  assert.match(renderCampaignResults(oversized, 'C1'), /bytes\/row B\/A 1\.2/);
+  assert.doesNotMatch(renderCampaignResults(oversized, 'C1'), /comparison \(3\/3\)/);
 });
 
 test('reports separate CPU estimates and preserves null concurrency', () => {
