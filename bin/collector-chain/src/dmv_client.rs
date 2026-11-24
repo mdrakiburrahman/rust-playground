@@ -4,6 +4,7 @@ use super::*;
 use arrow_array::Array;
 use arrow_flight::encode::DictionaryHandling;
 use arrow_ipc::writer::IpcWriteOptions;
+use arrowcol_protocol::IsolationLevel;
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
@@ -22,6 +23,33 @@ const PAYLOAD_HASH_VERSION: u64 = 2;
 const PAYLOAD_HASH_DOMAIN: &[u8] = b"arrowcol.payload_corpus.logical.v2\0";
 const HASH_FIELD: u8 = 0x11;
 const HASH_ROW: u8 = 0x21;
+
+#[derive(Clone, Copy)]
+enum StreamAck {
+    Admission(DeliveryGuarantee),
+    Diagnostic,
+}
+
+async fn matched_ack(
+    level: IsolationLevel,
+    rows: u64,
+    mut results: tonic::Streaming<arrow_flight::PutResult>,
+) -> Result<StreamAck> {
+    if level == IsolationLevel::L5 {
+        return completed_admission(results).await.map(StreamAck::Admission);
+    }
+    let result = results.message().await?.context("missing diagnostic receipt")?;
+    let receipt: arrowcol_flight::DiagnosticReceipt = serde_json::from_slice(&result.app_metadata)?;
+    anyhow::ensure!(
+        receipt.diagnostic_discard == level && receipt.rows == rows,
+        "mismatched diagnostic receipt"
+    );
+    anyhow::ensure!(
+        results.message().await?.is_none(),
+        "unexpected second diagnostic receipt"
+    );
+    Ok(StreamAck::Diagnostic)
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +173,9 @@ pub enum GuidUniqueness {
 /// All settings are resolved and validated before allocation, registration, or connection.
 #[derive(Args, Clone, Debug, Serialize)]
 pub struct Options {
+    /// Only l5 uses normal admission; l0 through l4 require a matching diagnostic collector.
+    #[arg(long, env = "ARROWCOL_CLIENT_ISOLATION_LEVEL", default_value = "l5")]
+    pub isolation_level: IsolationLevel,
     #[arg(long, env = "ARROWCOL_CLIENT_PAYLOAD_CUSTOMER_ID")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_customer_id: Option<String>,
@@ -1003,6 +1034,7 @@ struct Counters {
     cancelled_rows: AtomicU64,
     cancelled_bytes: AtomicU64,
     best_effort_streams: AtomicU64,
+    diagnostic_streams: AtomicU64,
     durable_streams: AtomicU64,
     rejected_streams: AtomicU64,
     rejected_rows: AtomicU64,
@@ -1027,6 +1059,7 @@ impl Default for Counters {
             cancelled_rows: AtomicU64::new(0),
             cancelled_bytes: AtomicU64::new(0),
             best_effort_streams: AtomicU64::new(0),
+            diagnostic_streams: AtomicU64::new(0),
             durable_streams: AtomicU64::new(0),
             rejected_streams: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
@@ -1072,6 +1105,7 @@ impl Counters {
             "cancelled_rows": self.cancelled_rows.load(Ordering::Relaxed),
             "cancelled_bytes": self.cancelled_bytes.load(Ordering::Relaxed),
             "best_effort_streams": self.best_effort_streams.load(Ordering::Relaxed),
+            "diagnostic_streams": self.diagnostic_streams.load(Ordering::Relaxed),
             "durable_streams": self.durable_streams.load(Ordering::Relaxed),
             "rejected_streams": self.rejected_streams.load(Ordering::Relaxed),
             "rejected_rows": self.rejected_rows.load(Ordering::Relaxed),
@@ -2286,6 +2320,15 @@ impl PreparedClient {
         })
     }
 
+    /// Number of explicit diagnostic discards, excluded from admission counts.
+    #[must_use]
+    pub fn diagnostic_count(&self) -> u64 {
+        self.counters
+            .iter()
+            .map(|worker| worker.diagnostic_streams.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Send independently scheduled streams on all workers; dropping this future aborts every owned task.
     ///
     /// # Errors
@@ -2357,8 +2400,9 @@ impl PreparedClient {
                 let (guarantee, rows) = admission;
                 report.completed_rows += rows;
                 match guarantee {
-                    DeliveryGuarantee::BestEffort => report.best_effort_streams += 1,
-                    DeliveryGuarantee::DurableAdmission => report.durable_streams += 1,
+                    StreamAck::Admission(DeliveryGuarantee::BestEffort) => report.best_effort_streams += 1,
+                    StreamAck::Admission(DeliveryGuarantee::DurableAdmission) => report.durable_streams += 1,
+                    StreamAck::Diagnostic => report.diagnostic_streams += 1,
                 }
             }
         }
@@ -2371,7 +2415,7 @@ impl PreparedClient {
         channel: Channel,
         template: &EncodedBatch,
         measurement: Option<&Measurement>,
-    ) -> Result<Option<(DeliveryGuarantee, u64)>> {
+    ) -> Result<Option<(StreamAck, u64)>> {
         if measurement.is_none()
             && self.options.max_rows > 0
             && self
@@ -2394,7 +2438,7 @@ impl PreparedClient {
         channel: Channel,
         logical: &LogicalBatch,
         measurement: Option<&Measurement>,
-    ) -> Result<Option<(DeliveryGuarantee, u64)>> {
+    ) -> Result<Option<(StreamAck, u64)>> {
         if let Some(measurement) = measurement
             && (measurement.stopped() || unix_ms()? >= measurement.end_unix_ms)
         {
@@ -2435,9 +2479,13 @@ impl PreparedClient {
                 .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
             attempt.send_started = true;
             attempt.send_unix_ns = observation.send_unix_ns;
-            completed_admission(self.options.client(channel).do_put(request).await?.into_inner())
-                .await
-                .map(Some)
+            matched_ack(
+                self.options.isolation_level,
+                batch.rows,
+                self.options.client(channel).do_put(request).await?.into_inner(),
+            )
+            .await
+            .map(Some)
         })
         .await;
         let timed_out = result.is_err();
@@ -2510,8 +2558,9 @@ impl PreparedClient {
                     .completed_bytes
                     .fetch_add(batch.encoded_bytes, Ordering::Relaxed);
                 match guarantee {
-                    DeliveryGuarantee::BestEffort => &counters.best_effort_streams,
-                    DeliveryGuarantee::DurableAdmission => &counters.durable_streams,
+                    StreamAck::Admission(DeliveryGuarantee::BestEffort) => &counters.best_effort_streams,
+                    StreamAck::Admission(DeliveryGuarantee::DurableAdmission) => &counters.durable_streams,
+                    StreamAck::Diagnostic => &counters.diagnostic_streams,
                 }
                 .fetch_add(1, Ordering::Relaxed);
                 Ok(Some((guarantee, batch.rows)))
@@ -3497,7 +3546,7 @@ async fn encode(table: &DmvTable, version: &str, batch: RecordBatch, options: &O
         IpcCompression::Lz4Frame => Some(arrow_ipc::CompressionType::LZ4_FRAME),
         IpcCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
     };
-    let descriptor = FlightDescriptor {
+    let mut descriptor = FlightDescriptor {
         r#type: DescriptorType::Path as i32,
         cmd: Default::default(),
         path: vec![
@@ -3507,6 +3556,10 @@ async fn encode(table: &DmvTable, version: &str, batch: RecordBatch, options: &O
             version.to_owned(),
         ],
     };
+    let level = options.isolation_level;
+    if level != IsolationLevel::L5 {
+        descriptor.path.push(level.as_str().to_string());
+    }
     let data = FlightDataEncoderBuilder::new()
         .with_schema(Arc::clone(&table.schema))
         .with_flight_descriptor(Some(descriptor))

@@ -242,6 +242,26 @@ pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option
     publication_layout(schema, &properties)
 }
 
+/// Process-level ingestion properties for a diagnostic file containing one unsorted input batch.
+/// No table is opened and no sort order is asserted for data that did not pass the layout sorter.
+///
+/// # Errors
+/// Returns invalid layout, Parquet configuration or physical schema errors.
+pub fn diagnostic_writer_properties(schema: &SchemaRef) -> Result<WriterProperties> {
+    let base = configured_publication_layout(schema)?
+        .map(|mut layout| {
+            layout.sort_columns.clear();
+            layout.sort_options = None;
+            layout.writer_properties(schema)
+        })
+        .transpose()?;
+    let properties = crate::writer::process_config()?.writer_properties(schema, base, &[])?;
+    let physical = parquet::arrow::ArrowSchemaConverter::new()
+        .with_coerce_types(properties.coerce_types())
+        .convert(schema)?;
+    crate::footer::stamp(&physical, properties)
+}
+
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
     Ok(object_store::azure::MicrosoftAzureBuilder::from_env()
         .with_url(url.as_str())

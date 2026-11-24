@@ -750,6 +750,18 @@ fn verify_process_configuration_recording(
     if matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config) {
         verify_maintenance_controls(config, observed)?;
     }
+    if matches!(role, ComponentRole::Collector | ComponentRole::Client)
+        && config.tunables.collector.as_ref().and_then(|collector| collector.isolation_level).unwrap_or_default()
+            == arrowcol_tunables::IsolationLevel::L5
+        && let Some(actual) = observed.get("isolation_level")
+        && actual != "l5"
+    {
+        let name = if matches!(role, ComponentRole::Collector) {
+            "ARROWCOL_COLLECTOR_ISOLATION_LEVEL"
+        } else { "ARROWCOL_CLIENT_ISOLATION_LEVEL" };
+        *diff = Some(startup_mismatch(role, name, &json!("l5"), Some(actual)));
+        bail!("{} startup readback conflicts with normal l5 operation", role_name(role));
+    }
     for (name, expected) in role_environment(config, role)? {
         if name.starts_with("ARROWCOL_WAL_") || name == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS" {
             continue;
@@ -797,6 +809,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_THP_DISABLED" => "/process/thp_disabled".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
+            "ARROWCOL_COLLECTOR_ISOLATION_LEVEL" => "/isolation_level".to_owned(),
             "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE" => {
                 "/engine/channel_capacity/control_node".to_owned()
             }

@@ -862,10 +862,28 @@ pub struct PublicationBacklogSnapshot {
     pub logical_bytes: Option<u64>,
     pub oldest_age: Option<Duration>,
     pub unknown_reason: Option<&'static str>,
+    settled_bytes: Option<u64>,
+    settled_byte_seconds: Option<f64>,
 }
 
 impl PublicationBacklogSnapshot {
     fn write(&self, output: &mut String) {
+        for (name, value) in [
+            (
+                "arrowcol_publication_settled_bytes_total",
+                self.settled_bytes.map(|v| v.to_string()),
+            ),
+            (
+                "arrowcol_publication_settled_byte_seconds_total",
+                self.settled_byte_seconds.map(|v| v.to_string()),
+            ),
+        ] {
+            let _ = writeln!(
+                output,
+                "# TYPE {name} counter\n{name} {}",
+                value.as_deref().unwrap_or("NaN")
+            );
+        }
         output.push_str(
             "# HELP arrowcol_publication_backlog_available Complete queue-admission-to-durable-commit accounting is available.\n\
              # TYPE arrowcol_publication_backlog_available gauge\n",
@@ -953,6 +971,9 @@ struct PublicationBacklog {
     settled_tokens: HashMap<u64, u64>,
     rows: u64,
     logical_bytes: u64,
+    settled_bytes: u64,
+    settled_byte_seconds: f64,
+    settlement_timing_unavailable: bool,
     unknown_reason: Option<&'static str>,
 }
 
@@ -1131,6 +1152,15 @@ impl PublicationBacklog {
             let Some(logical_bytes) = self.logical_bytes.checked_sub(entry.logical_bytes) else {
                 return Err(self.fail("tracker_inconsistent"));
             };
+            if let (Some(bytes), Some(residence)) = (
+                self.settled_bytes.checked_add(entry.logical_bytes),
+                Instant::now().checked_duration_since(entry.accepted_at),
+            ) {
+                self.settled_bytes = bytes;
+                self.settled_byte_seconds += residence.as_secs_f64() * entry.logical_bytes as f64;
+            } else {
+                self.settlement_timing_unavailable = true;
+            }
             self.entries.remove(&id);
             self.active_tokens.remove(&token.0);
             self.rows = rows;
@@ -1172,6 +1202,9 @@ impl PublicationBacklog {
             rows: available.then_some(self.rows),
             logical_bytes: available.then_some(self.logical_bytes),
             oldest_age: if available { age } else { None },
+            settled_bytes: (available && !self.settlement_timing_unavailable).then_some(self.settled_bytes),
+            settled_byte_seconds: (available && !self.settlement_timing_unavailable)
+                .then_some(self.settled_byte_seconds),
             unknown_reason,
         }
     }
