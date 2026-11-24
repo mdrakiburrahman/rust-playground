@@ -1307,7 +1307,6 @@ mod local_delta_reconciliation_tests {
                 assert!(result["csv"]["slope_rows_per_second"].is_null());
             } else {
                 assert_eq!(result["csv"]["slope_rows_per_second"], 25.0);
-                println!("resolution_fixture={}", json!({"screen_v1": output["screen_v1"], "observed": result["observed"]}));
             }
         }
         Ok(())
@@ -1935,7 +1934,7 @@ mod commit_evidence_tests {
         let config = config()?;
         let mut events = Vec::new();
         for index in 0..3 {
-            let mut commit = event(&config, 1000, 1001)?;
+            let mut commit = event(&config, 900, 999)?;
             commit["delta_version"] = json!(index + 1);
             commit["finished_at_unix_ms"] = json!(1_000 + index * 1_000);
             commit["rows"] = json!((index + 1) * 10);
@@ -1962,6 +1961,28 @@ mod commit_evidence_tests {
         }
         let coincident = commit_rate_resolution(vec![(1000, 1, 10), (1000, 2, 20), (1000, 3, 30)], 30.0)?;
         assert!(coincident["slope_rows_per_second"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_commit_windows_have_null_resolution_for_each_early_return() -> Result<()> {
+        let config = config()?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let mut valid = event(&config, 1_000, 1_001)?;
+        valid["finished_at_unix_ms"] = json!(2_000);
+        for case in 0..4 {
+            let mut event = valid.clone();
+            if case == 1 { event["finished_at_unix_ms"] = Value::Null; }
+            if case == 2 { event["min_ingested_at_ms"] = Value::Null; }
+            if case == 3 { event["min_ingested_at_ms"] = json!(900); }
+            let events = BTreeMap::from([(("test".to_owned(), 7), serde_json::from_value(event)?)]);
+            let value = commit_window_output(&events, &table, 1_000, 31_000,
+                (case == 0).then_some("unavailable"), Some(1_000))?;
+            assert!(value["unavailable_reason"].is_string());
+            for field in ["window_commit_count", "max_commit_rows", "rate_resolution_rows_per_second", "slope_rows_per_second"] {
+                assert!(value.get(field).context("missing resolution field")?.is_null(), "{field} in case {case}");
+            }
+        }
         Ok(())
     }
 }
