@@ -1126,6 +1126,11 @@ pub struct BatchingTunables {
         deserialize_with = "deserialize_stage_file_concurrency"
     )]
     pub stage_file_concurrency: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stage_files_per_group"
+    )]
+    pub stage_files_per_group: Option<usize>,
     pub adaptive_file: Option<AdaptiveFileTunables>,
 }
 
@@ -1293,6 +1298,11 @@ pub struct RuntimeTunables {
     pub parquet_column_workers: Option<u8>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_parquet_encode_mode"
+    )]
+    pub parquet_encode_mode: Option<arrow_deltalake::ParquetEncodeMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_usize"
     )]
     pub cpu_queue_jobs: Option<usize>,
@@ -1371,6 +1381,12 @@ fn deserialize_cpu_dispatch<'de, D: serde::Deserializer<'de>>(
     deserialize_mode(d, "collector.runtime.cpu_dispatch")
 }
 
+fn deserialize_parquet_encode_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::ParquetEncodeMode>, D::Error> {
+    deserialize_mode(d, "collector.runtime.parquet_encode_mode")
+}
+
 fn deserialize_staging_mode<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::StagingMode>, D::Error> {
@@ -1393,6 +1409,12 @@ fn deserialize_stage_file_concurrency<'de, D: serde::Deserializer<'de>>(d: D) ->
     usize::deserialize(d)
         .map(Some)
         .map_err(|_| serde::de::Error::custom("collector.batching.stage_file_concurrency must be an integer in 1..=16"))
+}
+
+fn deserialize_stage_files_per_group<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.batching.stage_files_per_group must be an integer in 1..=16"))
 }
 
 fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(

@@ -13,7 +13,7 @@ use tokio::{io::AsyncWriteExt, sync::oneshot};
 
 /// An upload failure may surface while encoding a row group. Its delivery must remain retryable.
 #[derive(Debug)]
-pub struct StreamingUploadError(anyhow::Error);
+pub struct StreamingUploadError(pub(crate) anyhow::Error);
 
 impl std::fmt::Display for StreamingUploadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
