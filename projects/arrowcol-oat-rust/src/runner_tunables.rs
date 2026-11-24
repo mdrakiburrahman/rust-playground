@@ -333,6 +333,22 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             }
             return true;
         }
+        if let Some(field) = path.strip_prefix("collector.malloc.") {
+            let requested = environment.get("ARROWCOL_COLLECTOR_MALLOC_CONFIG")
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .and_then(|value| value.get(field).cloned());
+            if let Some(requested) = requested
+                && collectors.iter().all(|process| {
+                    let process = &process["effective_config"]["process"];
+                    process["glibc_malloc_scope"] == "glibc_tunables_startup"
+                        && process["glibc_malloc"][field] == requested
+                })
+            {
+                promoted.push(json!({"path": path, "reason": "consumer_glibc_tunables_startup_readback"}));
+                return false;
+            }
+            return true;
+        }
         if let Some(field) = path.strip_prefix("collector.socket.")
             && matches!(field, "recv_buffer_bytes" | "send_buffer_bytes")
         {
@@ -1697,6 +1713,35 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     }
 
     #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust without allocator-mimalloc"]
+    fn glibc_malloc_reaches_actual_collector_with_thp_readback() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arrowcol-dataflow-rust");
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"thp_disabled":true,"malloc":{"arena_max":1,"mmap_threshold":33554432,"hugetlb":"disabled"}}
+        }))?;
+        let output = std::process::Command::new(binary).arg("--help").env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?).output()?;
+        anyhow::ensure!(output.status.success(), "collector failed: {}", String::from_utf8_lossy(&output.stderr));
+        let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+        assert_eq!(observed["process"]["scope"], "linux_thp_disable_flag");
+        assert_eq!(observed["process"]["glibc_malloc_scope"], "glibc_tunables_startup");
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":observed
+        });
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+        let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+        for path in ["collector.thp_disabled", "collector.malloc.arena_max", "collector.malloc.mmap_threshold", "collector.malloc.hugetlb"] {
+            assert!(verified.iter().any(|entry| entry["path"] == path), "{path} not consumer verified");
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires built arrowcol-dataflow-rust"]
     fn timestamp_kernel_reaches_actual_collector_startup() -> Result<()> {
         let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arrowcol-dataflow-rust");
@@ -1891,6 +1936,35 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             let verified = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
             assert_eq!(verified.iter().any(|entry| entry["path"] == "collector.socket.tcp_nodelay"),
                 observed == Some(true));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glibc_malloc_evidence_requires_startup_readback() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"malloc":{"arena_max":1,"hugetlb":"transparent"}}
+        }))?;
+        for (observed, verified) in [
+            (json!({}), false),
+            (json!({"glibc_malloc":{"arena_max":1,"hugetlb":"transparent"}}), false),
+            (json!({"glibc_malloc":{"arena_max":2,"hugetlb":"transparent"},
+                "glibc_malloc_scope":"glibc_tunables_startup"}), false),
+            (json!({"glibc_malloc":{"arena_max":1,"hugetlb":"transparent"},
+                "glibc_malloc_scope":"glibc_tunables_startup"}), true),
+        ] {
+            let process = json!({
+                "component":"collector", "instance_id":"collector-1", "log_complete":true,
+                "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+                "effective_config":{"process":observed}
+            });
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+            let promoted = evidence["consumer_verified"].as_array().context("consumer_verified array")?;
+            for path in ["collector.malloc.arena_max", "collector.malloc.hugetlb"] {
+                assert_eq!(promoted.iter().any(|entry| entry["path"] == path), verified, "{path}");
+            }
         }
         Ok(())
     }

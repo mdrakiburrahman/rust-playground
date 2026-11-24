@@ -8,6 +8,15 @@ use arrowcol_dataflow_components as _;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(malloc) = configure_malloc()? {
+        eprintln!(
+            "arrowcol_effective_config {}",
+            serde_json::json!({"process":{
+                "glibc_malloc": serde_json::to_value(&malloc)?,
+                "glibc_malloc_scope": "glibc_tunables_startup",
+            }})
+        );
+    }
     ensure_target_cpu()?;
     if let Some(disabled) = configure_thp()? {
         eprintln!(
@@ -116,6 +125,74 @@ fn configure_thp() -> Result<Option<bool>, Box<dyn std::error::Error>> {
     }
 }
 
+const MALLOC_CONFIG: &str = "ARROWCOL_COLLECTOR_MALLOC_CONFIG";
+const MALLOC_REEXEC: &str = "ARROWCOL_COLLECTOR_MALLOC_REEXEC";
+
+/// glibc reads `GLIBC_TUNABLES` only while the process starts, so the collector re-executes itself
+/// once with the requested malloc tunables and then confirms it was started with exactly them.
+fn configure_malloc() -> Result<Option<arrowcol_tunables::CollectorMallocTunables>, Box<dyn std::error::Error>> {
+    let raw = match std::env::var(MALLOC_CONFIG) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(format!("{MALLOC_CONFIG}: {error}").into()),
+    };
+    let tunables: arrowcol_tunables::CollectorMallocTunables =
+        serde_json::from_str(&raw).map_err(|error| format!("{MALLOC_CONFIG}: {error}"))?;
+    tunables
+        .validate()
+        .map_err(|error| format!("{MALLOC_CONFIG}: {error}"))?;
+    if cfg!(feature = "allocator-mimalloc") {
+        return Err(format!("{MALLOC_CONFIG} tunes glibc malloc but this collector was built with mimalloc").into());
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let inherited = match std::env::var("GLIBC_TUNABLES") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(error) => return Err(format!("GLIBC_TUNABLES: {error}").into()),
+        };
+        let requested = tunables.glibc_tunables();
+        let mut wanted: Vec<&str> = requested.iter().map(String::as_str).collect();
+        wanted.sort_unstable();
+        let mut applied: Vec<&str> = inherited
+            .split(':')
+            .filter(|entry| entry.starts_with("glibc.malloc."))
+            .collect();
+        applied.sort_unstable();
+        if applied == wanted {
+            return Ok(Some(tunables));
+        }
+        if !applied.is_empty() || std::env::var_os(MALLOC_REEXEC).is_some() {
+            return Err(format!(
+                "{MALLOC_CONFIG}: GLIBC_TUNABLES malloc entries {applied:?} do not match the requested {wanted:?}"
+            )
+            .into());
+        }
+        let glibc_tunables = if inherited.is_empty() {
+            requested.join(":")
+        } else {
+            format!("{inherited}:{}", requested.join(":"))
+        };
+        let mut arguments = std::env::args_os();
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        if let Some(program) = arguments.next() {
+            command.arg0(program);
+        }
+        let error = command
+            .args(arguments)
+            .env("GLIBC_TUNABLES", glibc_tunables)
+            .env(MALLOC_REEXEC, "1")
+            .exec();
+        Err(format!("{MALLOC_CONFIG}: re-executing with GLIBC_TUNABLES: {error}").into())
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        Err(format!("{MALLOC_CONFIG} is supported only on Linux glibc").into())
+    }
+}
+
 /// Keeps the engine's own error (for example `IncompatiblePdataWiring`) as the process error
 /// and fails a run that otherwise succeeded when its shutdown hook failed.
 fn propagate(
@@ -203,6 +280,61 @@ mod tests {
                 .into());
             }
         }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "allocator-mimalloc")))]
+    #[test]
+    fn malloc_tunables_reach_glibc_at_startup() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("ARROWCOL_TEST_MALLOC_CHILD").is_some() {
+            let configured = configure_malloc()?.is_some();
+            let allocation = vec![1_u8; 8 << 20];
+            let address = allocation.as_ptr().addr();
+            let in_main_heap = std::fs::read_to_string("/proc/self/maps")?
+                .lines()
+                .filter(|line| line.ends_with("[heap]"))
+                .filter_map(|line| line.split_once(' ')?.0.split_once('-'))
+                .filter_map(|(start, end)| {
+                    Some(usize::from_str_radix(start, 16).ok()?..usize::from_str_radix(end, 16).ok()?)
+                })
+                .any(|range| range.contains(&address));
+            assert_eq!(in_main_heap, configured);
+            assert_eq!(std::env::var_os(MALLOC_REEXEC).is_some(), configured);
+            return Ok(());
+        }
+        for config in [Some(r#"{"arena_max":1,"mmap_threshold":33554432}"#), None] {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", "tests::malloc_tunables_reach_glibc_at_startup"])
+                .env_clear()
+                .env("ARROWCOL_TEST_MALLOC_CHILD", "1");
+            if let Some(config) = config {
+                command.env(MALLOC_CONFIG, config);
+            }
+            let child = command.output()?;
+            if !child.status.success() || !String::from_utf8_lossy(&child.stdout).contains("1 passed;") {
+                return Err(format!(
+                    "malloc child {config:?} failed: {}\n{}",
+                    String::from_utf8_lossy(&child.stdout),
+                    String::from_utf8_lossy(&child.stderr)
+                )
+                .into());
+            }
+        }
+        let mismatched = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "tests::malloc_tunables_reach_glibc_at_startup"])
+            .env_clear()
+            .env("ARROWCOL_TEST_MALLOC_CHILD", "1")
+            .env(MALLOC_CONFIG, r#"{"arena_max":1}"#)
+            .env("GLIBC_TUNABLES", "glibc.malloc.arena_max=2")
+            .output()?;
+        assert!(!mismatched.status.success());
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&mismatched.stdout),
+            String::from_utf8_lossy(&mismatched.stderr)
+        );
+        assert!(output.contains("do not match the requested"), "{output}");
         Ok(())
     }
 
