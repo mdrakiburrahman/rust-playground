@@ -144,20 +144,20 @@ mod override_tests {
                 .is_ok()
         );
         for field in ["stage_file_concurrency", "stage_files_per_group"] {
-        for (raw, valid) in [
-            ("1", true),
-            ("16", false),
-            ("0", false),
-            ("17", false),
-            ("-1", false),
-            ("1.5", false),
-            ("\"2\"", false),
-            ("null", false),
-        ] {
-            let json = format!(r#"{{"{field}":{raw}}}"#);
-            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
-            assert_eq!(result.is_ok(), valid, "{json}");
-        }
+            for (raw, valid) in [
+                ("1", true),
+                ("16", false),
+                ("0", false),
+                ("17", false),
+                ("-1", false),
+                ("1.5", false),
+                ("\"2\"", false),
+                ("null", false),
+            ] {
+                let json = format!(r#"{{"{field}":{raw}}}"#);
+                let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+                assert_eq!(result.is_ok(), valid, "{json}");
+            }
         }
     }
 

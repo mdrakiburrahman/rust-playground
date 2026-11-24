@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 const CHUNK_BYTES: usize = 64 * 1024;
 const QUEUED_CHUNKS: usize = 2;
+pub(crate) const BRIDGE_BUFFER_BYTES: usize = CHUNK_BYTES * (QUEUED_CHUNKS + 2);
 
 enum Message {
     Data(Bytes),
@@ -68,9 +69,7 @@ impl StreamingColumnWriter {
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
         let writer = PipelinedArrowWriter::try_new(ColumnSink(sender), schema, properties, column_workers)?;
-        let upload = crate::delta_io::spawn_shared_io(async move {
-            Ok(consume(sink, receiver).await?.observation())
-        })?;
+        let upload = crate::delta_io::spawn_shared_io(async move { Ok(consume(sink, receiver).await?.observation()) })?;
         Ok(Self { writer, upload })
     }
 
@@ -118,14 +117,16 @@ mod tests {
                 }
                 self.bytes.extend_from_slice(&bytes);
                 Ok(())
-            }.boxed()
+            }
+            .boxed()
         }
 
         fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
             async {
                 self.completed.store(true, Ordering::SeqCst);
                 Ok(())
-            }.boxed()
+            }
+            .boxed()
         }
     }
 
@@ -133,7 +134,11 @@ mod tests {
     async fn bounded_bridge_preserves_bytes_and_requires_footer_confirmation() -> Result<()> {
         for complete in [false, true] {
             let completed = Arc::new(AtomicBool::new(false));
-            let sink = Sink { bytes: Vec::new(), completed: Arc::clone(&completed), fail: false };
+            let sink = Sink {
+                bytes: Vec::new(),
+                completed: Arc::clone(&completed),
+                fail: false,
+            };
             let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
             let mut writer = ColumnSink(sender);
             writer.write_all(b"PAR1")?;
@@ -165,16 +170,19 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let completed = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
-            let sink = Sink { bytes: Vec::new(), completed: Arc::clone(&completed), fail: true };
-            let producer = tokio::task::spawn_blocking(move || {
-                ColumnSink(sender).write_all(&vec![0; CHUNK_BYTES * 8])
-            });
+            let sink = Sink {
+                bytes: Vec::new(),
+                completed: Arc::clone(&completed),
+                fail: true,
+            };
+            let producer = tokio::task::spawn_blocking(move || ColumnSink(sender).write_all(&vec![0; CHUNK_BYTES * 8]));
             assert!(consume(sink, receiver).await.is_err());
             let error = anyhow::Error::new(producer.await?.expect_err("consumer failed"));
             assert!(error.chain().any(|cause| cause.is::<StreamingUploadError>()));
             assert!(!completed.load(Ordering::SeqCst));
             Ok::<_, anyhow::Error>(())
-        }).await??;
+        })
+        .await??;
         Ok(())
     }
 }

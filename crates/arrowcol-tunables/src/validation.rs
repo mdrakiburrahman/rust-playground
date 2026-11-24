@@ -1045,14 +1045,30 @@ impl Tunables {
             validate_pressure(collector.pressure.as_ref(), oat_collector_defaults)?;
             validate_runtime(collector.runtime.as_ref())?;
             validate_collector_upload(collector)?;
-            if collector.runtime.as_ref().and_then(|runtime| runtime.parquet_encode_mode)
+            if collector
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.parquet_encode_mode)
                 == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
-                && self.parquet_writer.as_ref().is_some_and(|writer| writer.max_row_group_bytes.is_some())
+                && self
+                    .parquet_writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.max_row_group_bytes.is_some())
             {
-                bail!("collector.runtime.parquet_encode_mode=column_pipeline does not support parquet_writer.max_row_group_bytes");
+                bail!(
+                    "collector.runtime.parquet_encode_mode=column_pipeline does not support parquet_writer.max_row_group_bytes"
+                );
             }
-            if collector.batching.as_ref().and_then(|batching| batching.stage_files_per_group).unwrap_or(1) > 1
-                && collector.layout.as_ref().is_some_and(|layout| layout.enabled != Some(false))
+            if collector
+                .batching
+                .as_ref()
+                .and_then(|batching| batching.stage_files_per_group)
+                .unwrap_or(1)
+                > 1
+                && collector
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.enabled != Some(false))
             {
                 bail!("collector.batching.stage_files_per_group > 1 requires unsorted collector layout");
             }
@@ -2182,7 +2198,9 @@ fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
                 && collector.runtime.as_ref().and_then(|r| r.parquet_encode_mode)
                     != Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline))
     {
-        bail!("collector.upload.staging_mode=streaming requires buffered_multipart and either parquet_column_workers=1 or parquet_encode_mode=column_pipeline");
+        bail!(
+            "collector.upload.staging_mode=streaming requires buffered_multipart and either parquet_column_workers=1 or parquet_encode_mode=column_pipeline"
+        );
     }
     if upload.mode.unwrap_or_default() == CollectorUploadMode::PutCreate {
         if upload.buffer_capacity_bytes.is_some() || upload.request_concurrency.is_some() {
@@ -2203,9 +2221,21 @@ fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
         .as_ref()
         .and_then(|runtime| runtime.upload_limit)
         .unwrap_or(32);
+    let bridge_bytes = if upload.staging_mode == Some(arrow_deltalake::StagingMode::Streaming)
+        && collector
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.parquet_encode_mode)
+            == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
+    {
+        4 * 65_536
+    } else {
+        0
+    };
     let bytes = capacity
         .checked_mul(concurrency + 1)
         .and_then(|bytes| bytes.checked_add(65_536))
+        .and_then(|bytes| bytes.checked_add(bridge_bytes))
         .and_then(|bytes| bytes.checked_mul(limit))
         .context("aggregate collector upload buffering size overflow")?;
     if bytes > 1_073_741_824 {

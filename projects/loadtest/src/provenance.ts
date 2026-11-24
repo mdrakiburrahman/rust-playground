@@ -92,6 +92,7 @@ export function safeComposeSettings(compose: Document): Document {
       environment: pick(environment, [
         'TOKIO_WORKER_THREADS', 'ARROWCOL_MAX_MESSAGE_BYTES', 'MSSQL_MEMORY_LIMIT_MB', 'ACCEPT_EULA',
         'ARROWCOL_COLLECTOR_CPU_DISPATCH', 'ARROWCOL_COLLECTOR_CPU_PLACEMENT',
+        'ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE', 'ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS',
       ]),
       numCores: name === 'dataflow-1' && service.command?.includes('--num-cores')
         ? service.command[service.command.indexOf('--num-cores') + 1] : undefined,

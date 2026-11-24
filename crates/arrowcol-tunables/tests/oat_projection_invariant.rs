@@ -417,7 +417,10 @@ fn fixture(path: &str, value: Value) -> Value {
         input["maintenance"] =
             json!({"enabled": true, "operations": ["optimize", "purge", "vacuum", "checkpoint", "prune_log"]});
     }
-    if matches!(path, "collector.batching.stage_file_concurrency" | "collector.batching.stage_files_per_group") {
+    if matches!(
+        path,
+        "collector.batching.stage_file_concurrency" | "collector.batching.stage_files_per_group"
+    ) {
         input["collector"] = json!({"batching":{"coalesce_publications":true}});
     }
     if path == "collector.runtime.parquet_encode_mode" {
@@ -1259,21 +1262,35 @@ fn upload_settings_project_without_a_runtime_section() -> Result<()> {
 
         #[test]
         fn column_pipeline_and_file_splits_are_strict_and_projected() -> Result<()> {
-            for invalid in [Value::Null, json!(true), json!(1), json!("ColumnPipeline"), json!("pipeline")] {
+            for invalid in [
+                Value::Null,
+                json!(true),
+                json!(1),
+                json!("ColumnPipeline"),
+                json!("pipeline"),
+            ] {
                 assert!(Tunables::parse_oat_json(fixture("collector.runtime.parquet_encode_mode", invalid)).is_err());
             }
             for workers in [Value::Null, json!(0), json!(1), json!(17)] {
-                assert!(Tunables::parse_oat_json(json!({"collector":{"runtime":{
-                    "parquet_encode_mode":"column_pipeline", "parquet_column_workers":workers
-                }}})).is_err());
+                assert!(
+                    Tunables::parse_oat_json(json!({"collector":{"runtime":{
+                        "parquet_encode_mode":"column_pipeline", "parquet_column_workers":workers
+                    }}}))
+                    .is_err()
+                );
             }
             for invalid in [Value::Null, json!("4"), json!(1.5), json!(0), json!(17)] {
-                assert!(Tunables::parse_oat_json(fixture("collector.batching.stage_files_per_group", invalid)).is_err());
+                assert!(
+                    Tunables::parse_oat_json(fixture("collector.batching.stage_files_per_group", invalid)).is_err()
+                );
             }
             assert!(Tunables::parse_oat_json(json!({"collector":{"batching":{"stage_files_per_group":2}}})).is_err());
-            assert!(Tunables::parse_oat_json(json!({"collector":{
+            assert!(
+                Tunables::parse_oat_json(json!({"collector":{
                 "runtime":{"parquet_encode_mode":"column_pipeline","parquet_column_workers":4}
-            },"parquet_writer":{"max_row_group_bytes":2048}})).is_err());
+            },"parquet_writer":{"max_row_group_bytes":2048}}))
+                .is_err()
+            );
             let tunables = Tunables::parse_oat_json(json!({"collector":{
                 "runtime":{"parquet_encode_mode":"column_pipeline","parquet_column_workers":4},
                 "batching":{"coalesce_publications":true,"stage_files_per_group":4,"stage_file_concurrency":2},

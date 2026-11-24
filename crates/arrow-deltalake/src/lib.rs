@@ -37,15 +37,15 @@ pub mod normalize;
 #[cfg(feature = "delta")]
 mod parallel_writer;
 #[cfg(feature = "delta")]
-mod pipelined_writer;
-#[cfg(feature = "delta")]
-mod streaming_columns;
-#[cfg(feature = "delta")]
 mod partition;
+#[cfg(feature = "delta")]
+mod pipelined_writer;
 #[cfg(feature = "delta")]
 mod publication_evidence;
 #[cfg(feature = "delta")]
 mod publication_lookup;
+#[cfg(feature = "delta")]
+mod streaming_columns;
 #[cfg(feature = "delta")]
 pub use publication_evidence::{PublicationEvidence, PublicationOutcome, PublicationReason};
 #[cfg(feature = "delta")]
@@ -616,7 +616,15 @@ impl ParquetFileWriter {
             #[cfg(feature = "delta")]
             FileWriter::StreamingColumns(writer) => {
                 let (bytes, duration) = writer.finish().await?;
-                return Ok((CompletedFile { path, rows, input_bytes, bytes }, Some(duration)));
+                return Ok((
+                    CompletedFile {
+                        path,
+                        rows,
+                        input_bytes,
+                        bytes,
+                    },
+                    Some(duration),
+                ));
             }
         }
         let durable_handle =

@@ -783,23 +783,27 @@ mod io_tests {
     async fn streaming_publication_commits_without_a_local_file_and_fences_replay() -> Result<()> {
         const CHILD: &str = "ARROWCOL_TEST_STREAMING_STAGE";
         if std::env::var_os(CHILD).is_none() {
-            let run = std::process::Command::new(std::env::current_exe()?)
-                .args([
-                    "--exact",
-                    "delta::io_tests::streaming_publication_commits_without_a_local_file_and_fences_replay",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE", "streaming")
-                .env("ARROWCOL_COLLECTOR_UPLOAD_MODE", "buffered_multipart")
-                .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", "1")
-                .output()?;
-            anyhow::ensure!(
-                run.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&run.stdout),
-                String::from_utf8_lossy(&run.stderr)
-            );
+            for (mode, workers) in [("column_waves", "1"), ("column_pipeline", "4")] {
+                let run = std::process::Command::new(std::env::current_exe()?)
+                    .args([
+                        "--exact",
+                        "delta::io_tests::streaming_publication_commits_without_a_local_file_and_fences_replay",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE", "streaming")
+                    .env("ARROWCOL_COLLECTOR_UPLOAD_MODE", "buffered_multipart")
+                    .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", workers)
+                    .env("ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE", mode)
+                    .env("ARROWCOL_PARQUET_CONFIG", r#"{"max_row_group_rows":1}"#)
+                    .output()?;
+                anyhow::ensure!(
+                    run.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&run.stdout),
+                    String::from_utf8_lossy(&run.stderr)
+                );
+            }
             return Ok(());
         }
         let (control, session) = ready_stage_session().await?;
@@ -5177,9 +5181,12 @@ impl DeltaTable {
         }
         let schema = schema.context("coalesced publication has no input schema")?;
         if files_per_group > 1 {
-            planned_files = output.values().try_fold(0_usize, |total, partition| {
-                total.checked_add(partition.file_rows[0].min(files_per_group))
-            }).context("coalesced output file count overflow")?;
+            planned_files = output
+                .values()
+                .try_fold(0_usize, |total, partition| {
+                    total.checked_add(partition.file_rows[0].min(files_per_group))
+                })
+                .context("coalesced output file count overflow")?;
             if planned_files > max_files {
                 return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
                     required_files: planned_files,

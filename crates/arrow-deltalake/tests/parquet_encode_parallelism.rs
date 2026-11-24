@@ -26,9 +26,13 @@ fn schema() -> Arc<Schema> {
         .map(|column| Field::new(format!("s{column}"), DataType::Utf8, true))
         .collect();
     fields.push(Field::new("i0", DataType::Int32, true));
-    fields.extend(
-        (0..4).map(|column| Field::new(format!("t{column}"), DataType::Timestamp(TimeUnit::Microsecond, None), true)),
-    );
+    fields.extend((0..4).map(|column| {
+        Field::new(
+            format!("t{column}"),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )
+    }));
     Arc::new(Schema::new(fields))
 }
 
@@ -75,9 +79,9 @@ fn batch(schema: &Arc<Schema>, index: usize, rows: usize, width: usize, random: 
         (0..rows).map(|row| (mix(base + row as u64) % 100_000) as i32),
     )));
     for column in 0..4 {
-        columns.push(Arc::new(TimestampMicrosecondArray::from_iter_values(
-            (0..rows).map(|row| 1_700_000_000_000_000 + ((base as i64 >> 8) + row as i64) * 1_000 + column),
-        )));
+        columns.push(Arc::new(TimestampMicrosecondArray::from_iter_values((0..rows).map(
+            |row| 1_700_000_000_000_000 + ((base as i64 >> 8) + row as i64) * 1_000 + column,
+        ))));
     }
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
@@ -106,12 +110,20 @@ fn corpus(batches: usize, rows: usize, width: usize, random: bool) -> Result<Vec
         }
         Ok(())
     })?;
-    slots.into_iter().map(|slot| slot.context("missing corpus batch")).collect()
+    slots
+        .into_iter()
+        .map(|slot| slot.context("missing corpus batch"))
+        .collect()
 }
 
 fn process_usage() -> Result<(f64, f64, u64)> {
     let stat = std::fs::read_to_string("/proc/self/stat")?;
-    let fields: Vec<_> = stat.rsplit_once(") ").context("invalid /proc/self/stat")?.1.split_whitespace().collect();
+    let fields: Vec<_> = stat
+        .rsplit_once(") ")
+        .context("invalid /proc/self/stat")?
+        .1
+        .split_whitespace()
+        .collect();
     let user: u64 = fields.get(11).context("missing user ticks")?.parse()?;
     let system: u64 = fields.get(12).context("missing system ticks")?.parse()?;
     let minor_faults: u64 = fields.get(7).context("missing minor faults")?.parse()?;
@@ -136,8 +148,12 @@ async fn parquet_encode_parallelism() -> Result<()> {
         _ => anyhow::bail!("BENCH_DATA must be random or loadgen"),
     };
     ensure!(
-        files > 0 && rows > 0 && batch_rows > 0
-            && batch_rows.checked_mul(files).is_some_and(|divisor| rows.is_multiple_of(divisor)),
+        files > 0
+            && rows > 0
+            && batch_rows > 0
+            && batch_rows
+                .checked_mul(files)
+                .is_some_and(|divisor| rows.is_multiple_of(divisor)),
         "rows must divide into whole batches per file"
     );
 
@@ -230,7 +246,10 @@ async fn parquet_encode_parallelism() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual release-mode L5 benchmark; configure with BENCH_* and ARROWCOL_* variables"]
 async fn parquet_commit_parallelism() -> Result<()> {
-    use arrow_deltalake::{commit::{BatchedTable, CommitOptions}, delta::DeltaTable};
+    use arrow_deltalake::{
+        commit::{BatchedTable, CommitOptions},
+        delta::DeltaTable,
+    };
     let rows = env_usize("BENCH_ROWS", 1_048_576)?;
     let batch_rows = env_usize("BENCH_BATCH_ROWS", 8_192)?;
     let files = env_usize("BENCH_FILES", 1)?;
@@ -241,8 +260,14 @@ async fn parquet_commit_parallelism() -> Result<()> {
         Ok("loadgen") => false,
         _ => anyhow::bail!("BENCH_DATA must be random or loadgen"),
     };
-    ensure!(rows > 0 && batch_rows > 0 && rows.is_multiple_of(batch_rows), "rows must divide into whole batches");
-    ensure!((1..=16).contains(&files) && (1..=16).contains(&concurrency), "file widths must be in 1..=16");
+    ensure!(
+        rows > 0 && batch_rows > 0 && rows.is_multiple_of(batch_rows),
+        "rows must divide into whole batches"
+    );
+    ensure!(
+        (1..=16).contains(&files) && (1..=16).contains(&concurrency),
+        "file widths must be in 1..=16"
+    );
     let batches = corpus(rows / batch_rows, batch_rows, width, random)?;
     let schema = batches[0].schema();
     let dir = match std::env::var_os("BENCH_DIR") {
@@ -256,11 +281,16 @@ async fn parquet_commit_parallelism() -> Result<()> {
     let input_bytes = batches.iter().try_fold(0_u64, |total, batch| {
         Ok::<_, anyhow::Error>(total + arrow_deltalake::record_batch_logical_bytes(batch)?)
     })?;
-    let entries = batches.into_iter().enumerate()
-        .map(|(index, batch)| (batch, format!("bench-{index}"), 0, 1_700_000_000_000)).collect();
+    let entries = batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, batch)| (batch, format!("bench-{index}"), 0, 1_700_000_000_000))
+        .collect();
     let usage_started = process_usage()?;
     let started = Instant::now();
-    let group = table.stage_coalesced_publications_with_file_policy(entries, concurrency, files).await?;
+    let group = table
+        .stage_coalesced_publications_with_file_policy(entries, concurrency, files)
+        .await?;
     let stage_s = started.elapsed().as_secs_f64();
     let result = table.submit_prepared_group(group, true).await?.wait().await?;
     let wall_s = started.elapsed().as_secs_f64();
@@ -270,7 +300,8 @@ async fn parquet_commit_parallelism() -> Result<()> {
     for line in log.lines() {
         let action: serde_json::Value = serde_json::from_str(line)?;
         if let Some(add) = action.get("add") {
-            let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().context("missing add statistics")?)?;
+            let stats: serde_json::Value =
+                serde_json::from_str(add["stats"].as_str().context("missing add statistics")?)?;
             committed_rows += stats["numRecords"].as_u64().context("missing committed row count")?;
         }
     }
@@ -278,21 +309,24 @@ async fn parquet_commit_parallelism() -> Result<()> {
     let user_s = usage_finished.0 - usage_started.0;
     let system_s = usage_finished.1 - usage_started.1;
     let parquet_bytes: u64 = result.files.iter().map(|file| file.bytes).sum();
-    println!("BW_COMMIT_RESULT={}", json!({
-        "level":"L5_local_fsync", "rows":committed_rows, "files":result.files.len(),
-        "stage_file_concurrency":concurrency, "requested_files":files,
-        "batch_rows":batch_rows, "data":if random {"random"} else {"loadgen"},
-        "string_bytes":width, "wall_s":wall_s, "stage_s":stage_s,
-        "commit_s":wall_s-stage_s, "committed_rows_per_s":committed_rows as f64 / wall_s,
-        "arrow_bytes_per_row":input_bytes as f64 / committed_rows as f64,
-        "parquet_bytes_per_row":parquet_bytes as f64 / committed_rows as f64,
-        "user_cpu_s":user_s, "system_cpu_s":system_s,
-        "minor_faults":usage_finished.2-usage_started.2,
-        "cpu_s_per_mrow":(user_s+system_s) / committed_rows as f64 * 1e6,
-        "cores_busy":(user_s+system_s) / wall_s,
-        "allocator":"system", "glibc_tunables":std::env::var("GLIBC_TUNABLES").ok(),
-        "runtime":arrow_deltalake::runtime_config()?,
-        "parquet_config":std::env::var("ARROWCOL_PARQUET_CONFIG").ok(),
-    }));
+    println!(
+        "BW_COMMIT_RESULT={}",
+        json!({
+            "level":"L5_local_fsync", "rows":committed_rows, "files":result.files.len(),
+            "stage_file_concurrency":concurrency, "requested_files":files,
+            "batch_rows":batch_rows, "data":if random {"random"} else {"loadgen"},
+            "string_bytes":width, "wall_s":wall_s, "stage_s":stage_s,
+            "commit_s":wall_s-stage_s, "committed_rows_per_s":committed_rows as f64 / wall_s,
+            "arrow_bytes_per_row":input_bytes as f64 / committed_rows as f64,
+            "parquet_bytes_per_row":parquet_bytes as f64 / committed_rows as f64,
+            "user_cpu_s":user_s, "system_cpu_s":system_s,
+            "minor_faults":usage_finished.2-usage_started.2,
+            "cpu_s_per_mrow":(user_s+system_s) / committed_rows as f64 * 1e6,
+            "cores_busy":(user_s+system_s) / wall_s,
+            "allocator":"system", "glibc_tunables":std::env::var("GLIBC_TUNABLES").ok(),
+            "runtime":arrow_deltalake::runtime_config()?,
+            "parquet_config":std::env::var("ARROWCOL_PARQUET_CONFIG").ok(),
+        })
+    );
     Ok(())
 }
