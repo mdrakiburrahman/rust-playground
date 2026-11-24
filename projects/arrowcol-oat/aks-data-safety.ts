@@ -167,14 +167,14 @@ async function verifyPriorCells(azure: Azure, state: CampaignState, authority: C
     if (verified.status !== 'preserved') throw new Error('Prior-cell fresh preservation is ' + verified.status + ': ' + verified.reason);
   }
 }
-async function readBlob(azure: Azure, blob: string, guard: () => Promise<void>) {
+export async function readBlob(azure: Azure, blob: string, guard: () => Promise<void>) {
   await guard();
   const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, blob, undefined, undefined, {}, true, true);
   if (bytes === null) return undefined;
   if (bytes.length > 16_777_216 || !strong(headers.etag)) throw new Error('Preservation Blob is unbounded or lacks a strong version.');
   return { value: object(JSON.parse(bytes.toString()) as unknown), etag: headers.etag };
 }
-async function immutableBlob(azure: Azure, blob: string, value: unknown, guard: () => Promise<void>) {
+export async function immutableBlob(azure: Azure, blob: string, value: unknown, guard: () => Promise<void>) {
   await guard();
   try {
     const [, headers] = await azure.blob('PUT', azure.c.checkpoints, blob, undefined, canonical_json(value),
@@ -269,7 +269,7 @@ function validateOrigin(value: Record<string, unknown>, inventory: RunInventory)
   if (value.schema_version !== 1 || canonical_json(value.origin) !== canonical_json(origin(inventory)))
     throw new Error('Preservation reference belongs to another immutable original run/namespace.');
 }
-function baselineDelta(value: Record<string, unknown>, inventory: RunInventory, azure: Azure,
+export function baselineDelta(value: Record<string, unknown>, inventory: RunInventory, azure: Azure,
   phase: 'pre_load' | 'terminal_after_writers_stopped' = 'pre_load') {
   validateOrigin(value, inventory);
   if (value.observed_phase !== phase || phase === 'pre_load' &&
@@ -341,7 +341,7 @@ export async function captureTerminalData(store: CampaignStore, azure: Azure, au
       inventory.cleanup.stop_maintenance.state !== 'complete') throw new Error('Freeze terminal Delta only after writer and maintenance stops.');
   await assertWritersStopped();
   const before = await readBlob(azure, cellBlob(inventory, 'delta-before'), authority.assertCurrent);
-  if (!before) throw new Error('The exact original pre-load Delta reference is absent.');
+  if (!before) { await authority.assertCurrent(); return; }
   const initial = baselineDelta(before.value, inventory, azure), blob = cellBlob(inventory, 'delta-terminal');
   const existing = await readBlob(azure, blob, authority.assertCurrent);
   if (existing) {

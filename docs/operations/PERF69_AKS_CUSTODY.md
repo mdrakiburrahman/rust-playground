@@ -192,6 +192,36 @@ PATCH can recover only from positive exact physically stopped state, labelled as
 response; it is never blindly reissued. Late responses remain evidence, not successful budget completion.
 Terminal Delta is frozen only after collector and maintenance writers are physically stopped with recreation disabled.
 
+## Shutdown finalization
+
+| Boundary | Behavior |
+| --- | --- |
+| Required order | Stop admission → bounded drain → evidence capture → maintenance stop → freeze → attach final AKS Delta reconciliation → guarded create-only finalization → validation → namespace, QAP and FIC removal → handoff. The bounded pre-drain snapshot remains diagnostic. |
+| Exit 0 | Requires the actual measured post-teardown reconciliation, settled zero ambiguity, clear teardown admissions and matching independently read frozen Delta row counts. A zero exit alone never authorizes release. |
+| Exit 143 | Always unavailable; an exact marker permits only provisional physical stop/freeze. Release and handoff stay withheld. |
+| Early failure | Stop/freeze checks still apply. Authoritatively missing pre-load Blob gives `no_baseline`, nullable missing references and an immutable unavailable record; never invented zero rows, namespace UID or terminal observations. Release stays withheld. |
+| Missing measurements | An existing baseline with missing reconciliation rows is `reconciliation_unavailable`, not `no_baseline`. Storage/authentication errors are not missing-baseline observations. |
+| Unknown write | Pre-read existing artifact; guarded canonical-equality readback only. Never repeat a conflicting or uncertain PUT. Finalization cannot settle or replay a running/UNKNOWN removal journal. |
+
+The three CLI actions are `shutdown-finalization-inputs`, `shutdown-finalize` and
+`shutdown-finalization-read`. Inputs/read require exactly
+`schema_version:1,campaign_id,orchestration_run_id,cell_run_id,expected_etag,actor`.
+Inputs return `schema_version,inventory_etag,terminal_capture,delta_before,delta_terminal,unavailable_reason`;
+source references are `{blob,etag,sha256}` or explicit null, with canonical-JSON hashes.
+Finalize additionally accepts those exact nullable references and
+`reconciliation:{profile:"single_hot_table"|"other",proof:null|{status,post_teardown_verification,
+expected_rows,observed_rows,settled_zero_ambiguity,teardown_admissions_clear}}`.
+Proof is the authenticated producer's actual measured reconciliation, not a client-supplied match flag.
+TS also checks frozen row-count differences; this is not positive exit-143 continuity proof.
+
+Final/read receipts retain immutable origin, actor, creation inventory ETag, source references and verdict identities,
+plus `status:"validated"|"unavailable"|"failed",reason_code,release_allowed,reconciliation` and the final artifact reference.
+All fields remain present, including nulls. Finalization journal I/O has its own bounded 30-second action window;
+it never extends or restarts physical stop/freeze deadlines. Read-only recovery preserves the creation ETag after later
+inventory progress. Current actor/fence and inventory version are checked throughout.
+Known non-143 failures retain only the existing validated controller unsettled-cleanup exception; never a successful cell.
+No membership, follower, per-version comparator or positive exit-143 API is installed.
+
 ## Campaign-terminal providers
 
 | API | Safety boundary |
