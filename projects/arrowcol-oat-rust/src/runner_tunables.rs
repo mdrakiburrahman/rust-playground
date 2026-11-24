@@ -901,7 +901,6 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
             client["image"] = json!(image);
             client["build"]["args"] = json!({
-                "VCS_REF": "${GIT_SHA:-local}",
                 "OAT_CLIENT_BUILD_PROFILE_HASH": profile_hash,
                 "OAT_CLIENT_BUILD_LTO": profile.lto.as_str(),
                 "OAT_CLIENT_BUILD_CODEGEN_UNITS": profile.codegen_units.to_string(),
@@ -910,6 +909,10 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
             });
             let pin_init = services.entry("oat-pin-init".to_owned()).or_insert_with(|| json!({}));
             pin_init["image"] = json!(image);
+    }
+    if config.platform.kind == crate::config::OatMode::Local {
+        let client = services.entry("oat-client".to_owned()).or_insert_with(|| json!({}));
+        client["build"]["args"]["VCS_REF"] = json!("${GIT_SHA:-local}");
     }
     compose_maintenance(config, &mut services)?;
     Ok(json!({ "services": services }))
@@ -2066,6 +2069,10 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let mut config = config()?;
         config.tunables = serde_json::from_value(json!({ "client": { "batch_rows": 257 } }))?;
         let compose = compose_tunables(&config)?;
+        assert_eq!(
+            compose["services"]["oat-client"]["build"]["args"]["VCS_REF"],
+            "${GIT_SHA:-local}"
+        );
         assert_eq!(
             compose["services"]["oat-client"]["environment"]["ARROWCOL_CLIENT_BATCH_ROWS"],
             "257"
