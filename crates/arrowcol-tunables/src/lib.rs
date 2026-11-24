@@ -372,6 +372,11 @@ pub struct CollectorTunables {
     pub socket: Option<CollectorSocketTunables>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_malloc"
+    )]
+    pub malloc: Option<CollectorMallocTunables>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_bool"
     )]
     pub thp_disabled: Option<bool>,
@@ -1078,6 +1083,157 @@ where
     D: serde::Deserializer<'de>,
 {
     bool::deserialize(deserializer).map(Some)
+}
+
+/// `glibc.malloc.hugetlb` modes. glibc's explicit huge-page-size values are not exposed.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GlibcMallocHugetlb {
+    Disabled,
+    Transparent,
+    Hugetlbfs,
+}
+
+impl GlibcMallocHugetlb {
+    #[must_use]
+    pub const fn glibc_value(self) -> u64 {
+        match self {
+            Self::Disabled => 0,
+            Self::Transparent => 1,
+            Self::Hugetlbfs => 2,
+        }
+    }
+}
+
+/// glibc malloc tunables applied through `GLIBC_TUNABLES` at collector process startup.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorMallocTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub arena_max: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub arena_test: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub mmap_threshold: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub mmap_max: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub trim_threshold: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub top_pad: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub mxfast: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub tcache_count: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub tcache_max: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub tcache_unsorted_limit: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_hugetlb"
+    )]
+    pub hugetlb: Option<GlibcMallocHugetlb>,
+}
+
+impl CollectorMallocTunables {
+    /// Rejects values glibc would silently ignore. The bounds are glibc's own limits for 64-bit
+    /// targets, except `arena_max`, `arena_test` and `top_pad`, which are capped to keep a typo from
+    /// reaching the allocator.
+    ///
+    /// # Errors
+    /// Returns an error for an empty section or an out-of-range value.
+    pub fn validate(&self) -> Result<(), String> {
+        if self == &Self::default() {
+            return Err("collector.malloc must set at least one glibc malloc tunable".to_owned());
+        }
+        for (name, value, range) in [
+            ("arena_max", self.arena_max, 1..=4_096),
+            ("arena_test", self.arena_test, 1..=4_096),
+            ("mmap_threshold", self.mmap_threshold, 0..=33_554_432),
+            ("mmap_max", self.mmap_max, 0..=2_147_483_647),
+            ("top_pad", self.top_pad, 0..=1_073_741_824),
+            ("mxfast", self.mxfast, 0..=160),
+            ("tcache_count", self.tcache_count, 0..=65_535),
+            ("tcache_max", self.tcache_max, 0..=1_032),
+        ] {
+            if let Some(value) = value
+                && !range.contains(&value)
+            {
+                return Err(format!(
+                    "collector.malloc.{name} must be in {}..={}",
+                    range.start(),
+                    range.end()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Renders the configured fields as `glibc.malloc.<name>=<value>` entries in a fixed order.
+    #[must_use]
+    pub fn glibc_tunables(&self) -> Vec<String> {
+        [
+            ("arena_max", self.arena_max),
+            ("arena_test", self.arena_test),
+            ("mmap_threshold", self.mmap_threshold),
+            ("mmap_max", self.mmap_max),
+            ("trim_threshold", self.trim_threshold),
+            ("top_pad", self.top_pad),
+            ("mxfast", self.mxfast),
+            ("tcache_count", self.tcache_count),
+            ("tcache_max", self.tcache_max),
+            ("tcache_unsorted_limit", self.tcache_unsorted_limit),
+            ("hugetlb", self.hugetlb.map(GlibcMallocHugetlb::glibc_value)),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| format!("glibc.malloc.{name}={value}")))
+        .collect()
+    }
+}
+
+fn deserialize_present_malloc<'de, D>(deserializer: D) -> Result<Option<CollectorMallocTunables>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CollectorMallocTunables::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_hugetlb<'de, D>(deserializer: D) -> Result<Option<GlibcMallocHugetlb>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    GlibcMallocHugetlb::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

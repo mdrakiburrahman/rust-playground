@@ -339,6 +339,20 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.socket.send_buffer_bytes", "OS default"),
     capability!("collector.socket.tcp_nodelay", "OS default"),
     capability!("collector.thp_disabled", "inherited process flag"),
+    capability!("collector.malloc.arena_max", "glibc default: 8 per core"),
+    capability!("collector.malloc.arena_test", "glibc default: 8"),
+    capability!(
+        "collector.malloc.mmap_threshold",
+        "glibc dynamic: 128 KiB rising to 32 MiB"
+    ),
+    capability!("collector.malloc.mmap_max", "glibc default: 65536"),
+    capability!("collector.malloc.trim_threshold", "glibc dynamic: 128 KiB"),
+    capability!("collector.malloc.top_pad", "glibc default: 128 KiB"),
+    capability!("collector.malloc.mxfast", "glibc default: 128"),
+    capability!("collector.malloc.tcache_count", "glibc default: 7"),
+    capability!("collector.malloc.tcache_max", "glibc default: 1032"),
+    capability!("collector.malloc.tcache_unsorted_limit", "glibc default: 0 (unlimited)"),
+    capability!("collector.malloc.hugetlb", "glibc default: disabled"),
     capability!("collector.pressure.buffered_rows_limit", "10000000"),
     capability!("collector.pressure.buffered_batches_limit", "4096"),
     capability!("collector.pressure.pressure_interval", "2s"),
@@ -1310,6 +1324,9 @@ impl Tunables {
                 if let Some(value) = &collector.socket {
                     insert_json_config("ARROWCOL_COLLECTOR_SOCKET_CONFIG", value, &mut output)?;
                 }
+                if let Some(value) = &collector.malloc {
+                    insert_json_config("ARROWCOL_COLLECTOR_MALLOC_CONFIG", value, &mut output)?;
+                }
                 if let Some(value) = collector.thp_disabled {
                     output.insert("ARROWCOL_COLLECTOR_THP_DISABLED".to_owned(), value.to_string());
                 }
@@ -1887,6 +1904,15 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
 fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
     if let Some(socket) = &collector.socket {
         socket.validate().map_err(anyhow::Error::msg)?;
+    }
+    if let Some(malloc) = &collector.malloc {
+        malloc.validate().map_err(anyhow::Error::msg)?;
+        if collector.allocator == Some(CollectorAllocator::Mimalloc) {
+            bail!("collector.malloc tunes glibc malloc and cannot be combined with collector.allocator mimalloc");
+        }
+        if malloc.hugetlb == Some(GlibcMallocHugetlb::Transparent) && collector.thp_disabled == Some(true) {
+            bail!("collector.malloc.hugetlb transparent cannot take effect with collector.thp_disabled true");
+        }
     }
     if collector.codegen_units.is_some_and(|units| !(1..=256).contains(&units)) {
         bail!("collector.codegen_units must be in 1..=256");
@@ -3308,6 +3334,85 @@ mod tests {
                     socket
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glibc_malloc_tunables_are_strict_and_project_to_the_collector() -> Result<()> {
+        for (malloc, expected) in [
+            (serde_json::json!({}), "collector.malloc"),
+            (serde_json::json!(null), "collector.malloc"),
+            (serde_json::json!({"arena_max":0}), "collector.malloc.arena_max"),
+            (serde_json::json!({"arena_test":4_097}), "collector.malloc.arena_test"),
+            (
+                serde_json::json!({"mmap_threshold":33_554_433}),
+                "collector.malloc.mmap_threshold",
+            ),
+            (
+                serde_json::json!({"mmap_max":2_147_483_648_u64}),
+                "collector.malloc.mmap_max",
+            ),
+            (serde_json::json!({"top_pad":1_073_741_825}), "collector.malloc.top_pad"),
+            (serde_json::json!({"mxfast":161}), "collector.malloc.mxfast"),
+            (
+                serde_json::json!({"tcache_count":65_536}),
+                "collector.malloc.tcache_count",
+            ),
+            (serde_json::json!({"tcache_max":1_033}), "collector.malloc.tcache_max"),
+            (
+                serde_json::json!({"trim_threshold":-1}),
+                "collector.malloc.trim_threshold",
+            ),
+            (
+                serde_json::json!({"tcache_unsorted_limit":"0"}),
+                "collector.malloc.tcache_unsorted_limit",
+            ),
+            (serde_json::json!({"arena_max":null}), "collector.malloc.arena_max"),
+            (serde_json::json!({"hugetlb":"madvise"}), "collector.malloc.hugetlb"),
+            (serde_json::json!({"hugetlb":1}), "collector.malloc.hugetlb"),
+            (serde_json::json!({"perturb":1}), "perturb"),
+        ] {
+            let error = error_text(Tunables::parse_oat_json(
+                serde_json::json!({"collector":{"malloc":malloc}}),
+            ));
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"allocator":"mimalloc","malloc":{"arena_max":1}}
+        })));
+        assert!(error.contains("mimalloc"), "{error}");
+        let error = error_text(Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"thp_disabled":true,"malloc":{"hugetlb":"transparent"}}
+        })));
+        assert!(error.contains("collector.malloc.hugetlb"), "{error}");
+
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"malloc":{
+            "hugetlb":"hugetlbfs","arena_max":1,"mmap_threshold":33_554_432,"trim_threshold":4_294_967_295_u64,
+            "top_pad":268_435_456,"tcache_unsorted_limit":0
+        }}}))?;
+        let malloc = valid
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.malloc.as_ref())
+            .context("malloc")?;
+        assert_eq!(
+            malloc.glibc_tunables().join(":"),
+            "glibc.malloc.arena_max=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.trim_threshold=4294967295:\
+             glibc.malloc.top_pad=268435456:glibc.malloc.tcache_unsorted_limit=0:glibc.malloc.hugetlb=2"
+        );
+        let environment = valid.environment_for(ComponentRole::Collector)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&environment["ARROWCOL_COLLECTOR_MALLOC_CONFIG"])?,
+            serde_json::json!({"arena_max":1,"mmap_threshold":33_554_432,"trim_threshold":4_294_967_295_u64,
+                "top_pad":268_435_456,"tcache_unsorted_limit":0,"hugetlb":"hugetlbfs"})
+        );
+        for role in [ComponentRole::Client, ComponentRole::Router, ComponentRole::Maintenance] {
+            assert!(
+                !valid
+                    .environment_for(role)?
+                    .contains_key("ARROWCOL_COLLECTOR_MALLOC_CONFIG")
+            );
         }
         Ok(())
     }

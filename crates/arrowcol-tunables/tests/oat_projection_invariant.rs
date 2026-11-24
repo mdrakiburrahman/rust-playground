@@ -529,6 +529,7 @@ fn candidates(path: &str) -> Vec<Value> {
         "collector.upload.staging_mode" => return vec![json!("streaming")],
         "collector.isolation_level" => return vec![json!("l2")],
         "collector.allocator" => return vec![json!("system")],
+        "collector.malloc.hugetlb" => return vec![json!("transparent")],
         "collector.lto" => return vec![json!("off")],
         "collector.codegen_units" => return vec![json!(16)],
         "collector.opt_level" => return vec![json!(3)],
@@ -705,7 +706,7 @@ fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Opti
         ),
         "collector"
             if [
-                "batching", "catalog", "commit", "exporter", "limits", "pressure", "routing", "socket",
+                "batching", "catalog", "commit", "exporter", "limits", "malloc", "pressure", "routing", "socket",
             ]
             .contains(&parts[1]) =>
         {
