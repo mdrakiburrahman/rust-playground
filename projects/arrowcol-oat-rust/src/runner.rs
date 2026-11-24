@@ -42,6 +42,7 @@ include!("runner_pin_init_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
 include!("runner_cpu_quota.rs");
+include!("runner_aks_cpu_quota.rs");
 include!("runner_process_evidence.rs");
 include!("runner_parity_evidence.rs");
 include!("runner_commit_evidence.rs");
@@ -1135,6 +1136,9 @@ trait Platform: Send + Sync {
     fn resource_evidence(&self) -> Option<Value> {
         None
     }
+    async fn poll_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
+    }
     async fn finish_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
         Ok(())
     }
@@ -1144,7 +1148,7 @@ trait Platform: Send + Sync {
 struct AksPlatform {
     run_id: String,
     resource_readback: Vec<Value>,
-    cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
+    cpu_throttling_start: Option<AksCpuResourceMeasurement>,
     cpu_throttling_evidence: Option<Value>,
     namespace_created: bool,
     namespace_create_attempted: bool,
@@ -1301,15 +1305,42 @@ impl Platform for AksPlatform {
         Some(json!({
             "readbacks": self.resource_readback,
             "cpu_throttling": self.cpu_throttling_evidence,
+            "cpu_quota": self.cpu_throttling_evidence.as_ref().and_then(|evidence| evidence.get("cpu_quota"))
+                .or_else(|| self.cpu_throttling_start.as_ref().map(|measurement| &measurement.quota_evidence)),
         }))
+    }
+
+    async fn poll_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
+        if let Some(measurement) = self.cpu_throttling_start.as_mut()
+            && let Some(window) = measurement.quota_window.as_mut()
+        {
+            window.poll(config, &measurement.quota_targets).await;
+        }
+        Ok(())
     }
 
     async fn finish_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
         let end = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
-        self.cpu_throttling_evidence = Some(compare_cpu_throttling(
-            self.cpu_throttling_start.take().as_deref().unwrap_or_default(),
-            &end,
-        ));
+        let mut measurement = self
+            .cpu_throttling_start
+            .take()
+            .context("AKS CPU quota preflight was not captured")?;
+        let mut legacy = compare_cpu_throttling(&measurement.throttling_start, &end);
+        let evidence = if let Some(window) = measurement.quota_window.take() {
+            window
+                .finish(config, &measurement.quota_targets, &measurement.quota_evidence)
+                .await
+        } else {
+            measurement.quota_evidence
+        };
+        let verified = evidence["verification_status"] == "verified";
+        let reason = evidence["throttling"]["reason"].clone();
+        legacy["cpu_quota"] = evidence;
+        self.cpu_throttling_evidence = Some(legacy);
+        ensure!(
+            verified,
+            "AKS effective collector CPU quota measurement could not be established: {reason}"
+        );
         Ok(())
     }
 
@@ -1358,6 +1389,22 @@ impl Platform for AksPlatform {
             rollout(config, name).await?;
         }
         self.resource_readback = aks_deployment_resource_evidence(config).await?;
+        self.cpu_throttling_start = None;
+        self.cpu_throttling_evidence = None;
+        let quota_targets = aks_collector_quota_targets(&self.resource_readback, usize::try_from(replicas)?)?;
+        let readback = capture_aks_collector_cpu_quota(config, &quota_targets).await?;
+        self.cpu_throttling_start = Some(AksCpuResourceMeasurement {
+            throttling_start: Vec::new(),
+            quota_targets,
+            quota_window: None,
+            quota_evidence: json!({
+                "verification_status": "unavailable",
+                "collector": {"source": "platform.resources.collector.limits.cpu",
+                    "requested_quota": config.effective_aks_resources().collector.limits.cpu.unwrap_or_else(|| "max".to_owned()),
+                    "readback": readback},
+                "throttling": {"status": "unavailable", "reason": "measurement boundaries not yet sampled"},
+            }),
+        });
         Ok(())
     }
 
@@ -1760,7 +1807,34 @@ impl Platform for AksPlatform {
     }
 
     async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
-        self.cpu_throttling_start = Some(capture_aks_cpu_throttling(config, &self.resource_readback).await?);
+        let legacy_start = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
+        let measurement = self
+            .cpu_throttling_start
+            .as_mut()
+            .context("AKS CPU quota preflight was not captured")?;
+        measurement.throttling_start = legacy_start;
+        let start = run_start_unix_ms
+            .checked_add(
+                config
+                    .warmup_seconds
+                    .checked_mul(1000)
+                    .context("AKS CPU quota warmup duration overflow")?,
+            )
+            .context("AKS CPU quota start overflow")?;
+        let end = start
+            .checked_add(
+                config
+                    .measure_seconds
+                    .checked_mul(1000)
+                    .context("AKS CPU quota measurement duration overflow")?,
+            )
+            .context("AKS CPU quota end overflow")?;
+        measurement.quota_window = Some(start_aks_cpu_quota_window(
+            config.clone(),
+            measurement.quota_targets.clone(),
+            start,
+            end,
+        ));
         let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -1871,6 +1945,7 @@ impl Platform for AksPlatform {
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
+        self.cpu_throttling_start = None;
         let result = cleanup_aks_platform(config, self).await;
         if self.shutdown_drain_evidence.is_none() {
             self.shutdown_drain_evidence =
@@ -5114,22 +5189,27 @@ fn result_rows(
                     "reason": "AKS cAdvisor throttling evidence is unavailable"
                 })
             });
-        Some(json!({
-            "collector": {
-                "requested_workers": concurrency,
-                "limit_cpu": requested.collector.limits.cpu,
-                "limit_millicores": collector_limit_millicores,
-                "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
-            },
-            "client": {
-                "requested_concurrency_per_process": config.dmv_concurrency,
-                "requested_concurrency_per_worker": config.dmv_concurrency,
-                "limit_cpu": requested.client.limits.cpu,
-                "limit_millicores": client_limit_millicores,
-                "concurrency_per_cpu_core": config.dmv_concurrency.map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
-            },
-            "throttling": throttling,
-        }))
+        Some(merge_aks_cpu_quota_evidence(
+            json!({
+                "collector": {
+                    "requested_workers": concurrency,
+                    "limit_cpu": requested.collector.limits.cpu,
+                    "limit_millicores": collector_limit_millicores,
+                    "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
+                },
+                "client": {
+                    "requested_concurrency_per_process": config.dmv_concurrency,
+                    "requested_concurrency_per_worker": config.dmv_concurrency,
+                    "limit_cpu": requested.client.limits.cpu,
+                    "limit_millicores": client_limit_millicores,
+                    "concurrency_per_cpu_core": config.dmv_concurrency.map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
+                },
+                "throttling": throttling,
+            }),
+            resource_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.get("cpu_quota")),
+        ))
     } else {
         client_run.evidence.cpu_quota.clone()
     };
@@ -6055,6 +6135,9 @@ async fn run_clients_inner(
         }};
     }
     while completed_clients.len() < handles.len() {
+        if let Err(error) = platform.poll_resource_measurement(config).await {
+            retain_armed_client_failure!(error);
+        }
         let pending_indices = handles
             .iter()
             .enumerate()
