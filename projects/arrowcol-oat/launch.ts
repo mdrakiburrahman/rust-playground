@@ -1268,8 +1268,9 @@ async function assertOperatorQuarantineRecords(receiptRoot: string, activeReceip
 
 export async function assertNoUnsettledDeadlineReceipts(
   root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
-  requiredLocalDisposition?: string, reconcileLocal = true,
+  requiredLocalDisposition?: string, reconcileLocal = true, readOnlyRefusal = 'diagnostic transition',
 ): Promise<void> {
+  if (!reconcileLocal) writeReceipt = async () => {};
   const names: string[] = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
     throw error;
@@ -1308,7 +1309,7 @@ export async function assertNoUnsettledDeadlineReceipts(
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
     if (!reconcileLocal) {
-      throw new Error(`Unsettled launcher receipt ${path}; refusing diagnostic transition without modifying it`);
+      throw new Error(`Unsettled launcher receipt ${path}; refusing ${readOnlyRefusal} without modifying it`);
     }
     if (deadline.submittedPlatform === 'aks') {
       throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
@@ -1331,6 +1332,83 @@ export async function assertNoUnsettledDeadlineReceipts(
       throw new Error(`Launcher deadline receipt ${path} remains unsettled; refusing another run`);
     }
   }
+}
+
+// A linked-worktree AKS launch and a diagnostic transition only check ledgers: any unsettled receipt in either
+// ledger refuses the launch without writing a receipt or cancelling the run it describes.
+export async function assertLaunchLedgersSettled(
+  receiptRoot: string, worktreeReceiptRoot?: string, transitionRoot?: string,
+): Promise<void> {
+  const readOnly = transitionRoot !== undefined || worktreeReceiptRoot !== undefined;
+  const refusal = transitionRoot !== undefined ? 'diagnostic transition' : 'AKS launch from a linked worktree';
+  if (worktreeReceiptRoot !== undefined) {
+    await assertNoUnsettledDeadlineReceipts(worktreeReceiptRoot, undefined, undefined, undefined, false, refusal);
+  }
+  await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
+    transitionRoot !== undefined ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !readOnly, refusal);
+}
+
+export interface AksSubmitterLock {
+  readonly path: string;
+  assertHeld(): void;
+  release(): Promise<void>;
+}
+
+// Serializes AKS launchers that share one canonical ledger, from the ledger scan through receipt publication and
+// the rest of the launcher's lifetime. The kernel lock is held by a flock(1) child in its own session whose stdin
+// is this process's pipe, so terminal signals do not release it, while launcher exit or kill does.
+export async function acquireAksSubmitterLock(receiptRoot: string): Promise<AksSubmitterLock> {
+  const path = `${resolve(receiptRoot)}.aks-submitter.lock`;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const existing = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (existing && !existing.isFile()) throw new Error(`AKS submitter lock ${path} is not a regular file; refusing to launch`);
+  const child = spawn('flock', ['--nonblock', '--conflict-exit-code', '75', path, 'sh', '-c', 'echo held && exec cat >/dev/null'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
+  });
+  let stderr = '';
+  child.stdin.on('error', () => {});
+  child.stderr.setEncoding('utf8').on('data', (chunk: string) => { if (stderr.length < 4096) stderr += chunk; });
+  let exited = false;
+  let released = false;
+  const exit = new Promise<void>((resolveExit) => child.once('close', () => { exited = true; resolveExit(); }));
+  await new Promise<void>((resolveHeld, reject) => {
+    let stdout = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk;
+      if (stdout.includes('held')) resolveHeld();
+    });
+    child.once('error', (error: NodeJS.ErrnoException) => {
+      reject(error.code === 'ENOENT'
+        ? new Error('AKS launch requires util-linux flock for the submitter lock; refusing to launch')
+        : new Error(`Could not take the AKS submitter lock ${path}; refusing to launch`, { cause: error }));
+    });
+    child.once('exit', (code, signal) => {
+      reject(code === 75
+        ? new Error(`Another AKS launcher holds the submitter lock ${path}; refusing to launch`)
+        : new Error(`AKS submitter lock ${path} failed (exit ${code ?? signal}): ${stderr.trim()}; refusing to launch`));
+    });
+  });
+  child.unref();
+  for (const stream of [child.stdin, child.stdout, child.stderr]) (stream as unknown as { unref(): void }).unref();
+  return {
+    path,
+    assertHeld() {
+      if (released || exited || child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(`AKS submitter lock ${path} is no longer held; refusing to publish a launcher receipt`);
+      }
+    },
+    async release() {
+      released = true;
+      child.ref();
+      for (const stream of [child.stdin, child.stdout, child.stderr]) (stream as unknown as { ref(): void }).ref();
+      child.stdin.end();
+      await exit;
+    },
+  };
 }
 
 
@@ -1884,6 +1962,7 @@ export async function launchOat(
   onRunFinished?: (status: OatRunStatus) => void | Promise<void>,
   deadline?: OatLauncherDeadline,
   submission?: SubmittedOatConfig,
+  submitterLock?: Pick<AksSubmitterLock, 'assertHeld'>,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -1901,6 +1980,14 @@ export async function launchOat(
   if (!isRecord(config)) throw new Error('OAT config must be a JSON object');
   const binding = submission ?? bindSubmittedConfig(config, sourceBytes!);
   if (deadline) await deadline.setSubmissionBinding(binding);
+  const assertSubmitterLock = async (published: boolean): Promise<void> => {
+    try {
+      submitterLock?.assertHeld();
+    } catch (error) {
+      if (deadline) await (published ? deadline.markCreationRejected(error) : deadline.markNoRun(error));
+      throw error;
+    }
+  };
 
   if (deadline) {
     if (deadline.isExpired()) {
@@ -1908,6 +1995,7 @@ export async function launchOat(
       await deadline.markNoRun(new Error('launcher-start deadline expired before run creation'));
       throw new Error(`Launcher-start deadline expired before OAT run creation; receipt: ${deadline.receiptPath}`);
     }
+    await assertSubmitterLock(false);
     await deadline.markCreationPending(server.href);
     if (deadline.isExpired()) {
       await deadline.markOverrun();
@@ -1916,6 +2004,7 @@ export async function launchOat(
       throw error;
     }
   }
+  await assertSubmitterLock(deadline !== undefined);
 
   let startResponse: Response;
   try {
@@ -2273,6 +2362,7 @@ export async function main(
     throw new Error('Diagnostic transition runtime cannot launch AKS from a linked worktree of another checkout');
   }
   if (transitionRoot) receiptRoot = transitionRoot;
+  const submitterLock = mode === 'aks' ? await acquireAksSubmitterLock(receiptRoot) : undefined;
   if (diagnosticParity && mode === 'local' && !transitionRoot) {
     const names = await readdir(receiptRoot).catch((error: unknown) => {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
@@ -2280,14 +2370,13 @@ export async function main(
     });
     if (names.length !== 0) throw new Error('Fresh diagnostic requires an empty launcher receipt ledger');
   } else {
-    if (aksWorktreeReceiptRoot) await assertNoUnsettledDeadlineReceipts(aksWorktreeReceiptRoot);
-    await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
-      transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !transitionRoot);
+    await assertLaunchLedgersSettled(receiptRoot, aksWorktreeReceiptRoot, transitionRoot);
   }
   if (prelaunchOnly) {
     console.log('Diagnostic ledger prelaunch gate passed; no workload started.');
     return;
   }
+  submitterLock?.assertHeld();
   const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
     if (deadline.isExpired()) {
@@ -2305,7 +2394,7 @@ export async function main(
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, undefined, undefined, deadline, submission),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, undefined, undefined, deadline, submission, submitterLock),
           config, mode, undefined, runner, network, warnings, collect,
         );
         if (interrupt?.signal) {
@@ -2451,7 +2540,7 @@ export async function main(
         runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };
       const code = await reportDataFlowRun(
-        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, onRunStarted, onRunFinished, deadline, submission),
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, onRunStarted, onRunFinished, deadline, submission, submitterLock),
         config, mode, server.gitSha, runner, network, warnings, collect,
       );
       if (interrupt?.signal) {
