@@ -559,3 +559,14 @@ table. Without matching readbacks the request is not consumer-verified.
 Diagnostic rows/s are reported as `diagnostic_client_rows_per_second`; the
 ordinary result rate and ranking metrics remain null, and Delta reconciliation
 continues to use actual commit evidence. A failed reconciliation is still a failure.
+
+### Client offered load
+
+Each continuous client's `measurement_window` and its 30-second `windows`
+report `offered_rows` (first `DoPut` attempts) and `retry_offered_rows`
+(actual resubmissions, excluding backoffs that expire before send). These
+use the fresh send timestamp in the half-open window. `completed_rows` uses
+the observed admission ACK timestamp instead. Divide each count by the same
+window duration; do not add retries to fresh offers or count ACKs as Delta
+commits. A closed-loop sender can remain near one offer per ACK even with
+CPU headroom: measure spare sending capacity against an independent sink.
