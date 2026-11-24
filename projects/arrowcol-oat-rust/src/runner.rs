@@ -5213,6 +5213,20 @@ fn result_rows(
     } else {
         client_run.evidence.cpu_quota.clone()
     };
+    let quota_cores = if config.platform.kind == crate::config::OatMode::Aks {
+        cpu_quota_evidence
+            .as_ref()
+            .and_then(|v| v["collector"]["limit_millicores"].as_f64())
+            .map(|v| v / 1000.0)
+    } else {
+        let nano_cpus = config
+            .platform
+            .local
+            .collector_cpu_quota
+            .map_or(Ok(u64::from(concurrency) * 1_000_000_000), |quota| quota.nano_cpus())
+            .map_err(anyhow::Error::msg)?;
+        (nano_cpus != 0).then_some(nano_cpus as f64 / 1_000_000_000.0)
+    };
     let mut leaf_evidence = tunable_leaf_evidence(config)?;
     promote_collector_readback(
         config,
@@ -5259,6 +5273,7 @@ fn result_rows(
         "consumer_verified": leaf_evidence["consumer_verified"],
         "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
         "cpu_quota": cpu_quota_evidence,
+        "column_concurrency": requested_column_concurrency(config, concurrency, quota_cores, client_run.evidence.processes.as_ref()),
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });

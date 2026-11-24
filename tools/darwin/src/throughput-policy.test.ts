@@ -45,7 +45,7 @@ const grid: ReadonlyArray<[ThroughputGroup, string, readonly (number | string)[]
   ["commit", "tunables.collector.commit.max_files_per_commit", [1, 4, 16]],
   ["runtime", "tunables.collector.runtime.cpu_workers", [1, 2, 4]],
   ["runtime", "tunables.collector.runtime.cpu_dispatch", ["shared_fifo", "bounded_shards"]],
-  ["runtime", "tunables.collector.runtime.cpu_placement", ["os", "compact_allowed", "scatter_allowed"]],
+  ["runtime", "tunables.collector.runtime.cpu_placement", ["os", "compact_allowed", "scatter_allowed", "physical_first"]],
   ["runtime", "tunables.collector.runtime.upload_limit", [1, 2, 4]],
   ["router", "tunables.router.sql_pool_max_size", [1, 2, 4, 8]],
 ];

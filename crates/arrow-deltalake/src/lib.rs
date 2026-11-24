@@ -85,6 +85,7 @@ pub enum CpuPlacement {
     Os,
     CompactAllowed,
     ScatterAllowed,
+    PhysicalFirst,
 }
 
 impl CpuPlacement {
@@ -94,6 +95,7 @@ impl CpuPlacement {
             Self::Os => "os",
             Self::CompactAllowed => "compact_allowed",
             Self::ScatterAllowed => "scatter_allowed",
+            Self::PhysicalFirst => "physical_first",
         }
     }
 }
@@ -106,7 +108,8 @@ impl TryFrom<String> for CpuPlacement {
             "os" => Ok(Self::Os),
             "compact_allowed" => Ok(Self::CompactAllowed),
             "scatter_allowed" => Ok(Self::ScatterAllowed),
-            _ => Err("expected os, compact_allowed or scatter_allowed"),
+            "physical_first" => Ok(Self::PhysicalFirst),
+            _ => Err("expected os, compact_allowed, scatter_allowed or physical_first"),
         }
     }
 }
