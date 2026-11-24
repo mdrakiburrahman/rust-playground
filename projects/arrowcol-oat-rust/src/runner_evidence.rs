@@ -955,7 +955,11 @@ impl CellEvidence {
         };
         json!({
             "status": status,
-            "reason": (status == "unsettled").then_some("delta_commit_drain_timeout"),
+            "reason": if status == "unsettled" {
+                Some("delta_commit_drain_timeout")
+            } else {
+                (status == "outside_bound" && ambiguous_rows == 0).then_some("delta_exact_match_failed")
+            },
             "settle_seconds": settle,
             "settle_timeout_seconds": delta_evidence.and_then(|value| value.get("settle_timeout_seconds")),
             "settled": settled,
