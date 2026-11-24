@@ -289,6 +289,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.layout.page_rows", "2048"),
     capability!("collector.commit.batch_window", "2s in OAT YAML; 10s component default"),
     capability!("collector.commit.max_files_per_commit", "64"),
+    capability!("collector.commit.txn_lookup_mode", "batched"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!(
         "collector.commit.delta_stats_columns",
@@ -1905,6 +1906,18 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
         bail!("collector.commit requires 0 < max_files_per_commit <= max_pending_files <= Semaphore::MAX_PERMITS");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn txn_lookup_mode_rejects_invalid_inputs_by_field_name() {
+    for value in [serde_json::json!("cached"), serde_json::json!(42), Value::Null] {
+        let error = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"txn_lookup_mode": value}}
+        }))
+        .expect_err("invalid txn lookup mode accepted");
+        assert!(format!("{error:#}").contains("collector.commit.txn_lookup_mode"));
+    }
 }
 
 #[cfg(test)]
