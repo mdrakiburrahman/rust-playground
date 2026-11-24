@@ -200,7 +200,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: sqlserver
-          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:bb8f334a5287326345be56fb5722c28c6995051b8ee5aff4426bc3e38acd5b97
+          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:6f14069d48ba46952f97bebb7161cd29f58e17d241a4697fbdf17117aa7277e8
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -296,7 +296,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: migrate
-          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:bb8f334a5287326345be56fb5722c28c6995051b8ee5aff4426bc3e38acd5b97
+          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:6f14069d48ba46952f97bebb7161cd29f58e17d241a4697fbdf17117aa7277e8
           command:
             - /usr/local/bin/arrowcol-migrate
           securityContext:
@@ -339,7 +339,7 @@ spec:
       restartPolicy: Never
       initContainers:
         - name: bootstrap
-          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:bb8f334a5287326345be56fb5722c28c6995051b8ee5aff4426bc3e38acd5b97
+          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:6f14069d48ba46952f97bebb7161cd29f58e17d241a4697fbdf17117aa7277e8
           command:
             - /usr/local/bin/database-bootstrap
           securityContext:
@@ -464,6 +464,7 @@ data:
                       connect_timeout: 15s
                       command_timeout: 30s
                   commit:
+                    txn_lookup_mode: per_id
                     batch_window: 2s
                     max_files_per_commit: 128
                     max_pending_files: 512
@@ -624,7 +625,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: catalog
-          image: BENCHREGISTRY/arrowcol-catalog-rust@sha256:7c9030311da40ed3098574ff87bc47fb87bd596525d02fe654645ca555cdf300
+          image: BENCHREGISTRY/arrowcol-catalog-rust@sha256:399d1135dea8f2a529b0ed283595e2995413e8d45775c1389a4778aff0a0be01
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -752,7 +753,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: router
-          image: BENCHREGISTRY/arrowcol-router-rust@sha256:f2d41fe2c672f8ad8d932acef9c41102899af353b873a92a62ac1c2c84e1be70
+          image: BENCHREGISTRY/arrowcol-router-rust@sha256:0c2210ec6ad4e84a48fb9173b8be8ba6ab094b1575e4c083a97d337e7462dddf
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -934,7 +935,7 @@ spec:
       terminationGracePeriodSeconds: 4800
       containers:
         - name: maintenance
-          image: BENCHREGISTRY/delta-maintenance@sha256:93969473da125879ffdb4a66d235e946799497959eafb8190adf61e040205cf5
+          image: BENCHREGISTRY/delta-maintenance@sha256:4c4e091ed8d67281a003ea6212d61a80d2b2ce3896b1ab9b8e5229ab7f729f79
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -1069,7 +1070,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: dataflow
-          image: BENCHREGISTRY/arrowcol-dataflow-rust@sha256:427eeba2b2eb1b90d0d88f48b3b6463d88f5bdbca619a26328d881f5c326d8c0
+          image: BENCHREGISTRY/arrowcol-dataflow-rust@sha256:a36dc433985fd25c54cb36e6eca915c352f3207214a4030dbebc7ea7ec0bd7de
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -1084,6 +1085,10 @@ spec:
             - --num-cores
             - "48"
           env:
+            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+              value: http://direct-otlp:4318/v1/metrics
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "2000"
             - name: ARROWCOL_DELTA_ROOT
               value: BENCHDELTA_ROOT
             - name: ARROWCOL_AZURE_MODE
@@ -1235,7 +1240,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pin-init
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:9dac20b0f8297410525f5c91a48a00487a8f8e276fab8130490008ea0fceb0f0
           command:
             - /usr/local/bin/arrowcol-oat-pin-init
           args:
@@ -1348,7 +1353,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: register
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:f84be43a9fcf0c1c98071477ae9f20159caf4d294ac6b06986634093611dd892
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:9dac20b0f8297410525f5c91a48a00487a8f8e276fab8130490008ea0fceb0f0
           args:
             - --register-only-config
             - /run/arrowcol-oat/register.json
@@ -1442,7 +1447,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: generator
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:9dac20b0f8297410525f5c91a48a00487a8f8e276fab8130490008ea0fceb0f0
           args:
             - --endpoint
             - http://arrowcol-router:50050
@@ -1511,3 +1516,120 @@ spec:
         - name: schedule
           configMap:
             name: direct-schedule-confirmwide
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: direct-otlp
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+    exporters:
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        metric_expiration: 45m
+        resource_to_telemetry_conversion:
+          enabled: true
+    service:
+      pipelines:
+        metrics:
+          receivers: [otlp]
+          exporters: [prometheus]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: direct-otlp
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: direct-otlp
+  template:
+    metadata:
+      labels:
+        app: direct-otlp
+        app.kubernetes.io/part-of: arrowcol-oat
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.azure.com/agentpool: benche64
+        arrow-collector/role: arrowcol
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: arrowcol
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: BENCHREGISTRY/otlp-relay@sha256:95a573e7c336d42b4fd161ec5c964c03cea5e3136863aa3d58e4a09978fadb29
+          args: ["--config=/etc/direct-otlp/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          ports:
+            - name: otlp
+              containerPort: 4318
+            - name: metrics
+              containerPort: 8889
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+          volumeMounts:
+            - name: config
+              mountPath: /etc/direct-otlp
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: direct-otlp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: direct-otlp
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  selector:
+    app: direct-otlp
+  ports:
+    - name: otlp
+      port: 4318
+      targetPort: otlp
+    - name: metrics
+      port: 8889
+      targetPort: metrics
