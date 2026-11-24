@@ -956,13 +956,11 @@ mod tests {
         writer.stage().await
     }
 
-    #[tokio::test]
-    async fn parallel_partition_stages_remain_ordered_atomic_and_reclaimable() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let root = directory.path().canonicalize()?;
-        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid test path"))?;
+    async fn partitioned_stage_fixture(root: &Path) -> Result<(Arc<BatchedTable>, RecordBatch)> {
+        let url = url::Url::from_directory_path(root).map_err(|()| anyhow::anyhow!("invalid test path"))?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
             Field::new("bucket", DataType::Utf8, false),
         ]));
         DeltaTable::open_catalog(url)?.commit_catalog(
@@ -976,10 +974,19 @@ mod tests {
             schema,
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![11, 12, 13])),
                 Arc::new(arrow::array::StringArray::from(vec!["b", "a", "b"])),
             ],
         )?;
-        let table = BatchedTable::open(&root, CommitOptions::default()).await?;
+        let table = BatchedTable::open(root, CommitOptions::default()).await?;
+        Ok((table, batch))
+    }
+
+    #[tokio::test]
+    async fn parallel_partition_stages_remain_ordered_atomic_and_reclaimable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let (table, batch) = partitioned_stage_fixture(&root).await?;
         let entries = vec![(batch, "logical".to_owned(), 0, 10)];
         let group = table
             .stage_coalesced_publications_with_concurrency(entries.clone(), 2)
@@ -1016,6 +1023,116 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn saturated_coalesced_publish_and_reclaim() -> Result<()> {
+        const CHILD: &str = "ARROWCOL_TEST_SATURATED_STAGE";
+        if std::env::var_os(CHILD).is_none() {
+            // Runtime configuration is process-wide. Bound the child as well as its operations.
+            let child = tokio::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "commit::tests::saturated_coalesced_publish_and_reclaim",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ARROWCOL_COLLECTOR_CPU_WORKERS", "2")
+                .env("ARROWCOL_COLLECTOR_CPU_QUEUE_JOBS", "1")
+                .env("ARROWCOL_COLLECTOR_CPU_DISPATCH", "bounded_shards")
+                .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", "2")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(Duration::from_secs(30), child).await??;
+            anyhow::ensure!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return Ok(());
+        }
+        tokio::time::timeout(Duration::from_secs(15), exercise_saturated_staging()).await?
+    }
+
+    async fn exercise_saturated_staging() -> Result<()> {
+        for cancel in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path().canonicalize()?;
+            let (table, batch) = partitioned_stage_fixture(&root).await?;
+            let entries = vec![(batch, "logical".to_owned(), 0, 10)];
+            let log = root.join("_delta_log/00000000000000000001.json");
+            // Stop both real files in the directory fsync at the end of staging. Both
+            // CPU workers must be available *before* we unblock those I/O operations.
+            let (a, release_a) = crate::sync_hook::pause_next(root.join("bucket=a"));
+            let (b, release_b) = crate::sync_hook::pause_next(root.join("bucket=b"));
+            let mut stage = Box::pin(table.stage_coalesced_publications_with_concurrency(entries, 16));
+            tokio::select! {
+                result = &mut stage => anyhow::bail!("staging finished before sync gates: {:?}", result.err()),
+                gates = async { tokio::try_join!(a, b) } => { gates?; }
+            }
+            let mut releases = Vec::new();
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let (entered, ready) = oneshot::channel();
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                releases.push(release);
+                workers.push(tokio::spawn(crate::delta_io::run_cpu_async(move || {
+                    let _ = entered.send(());
+                    let _ = wait.recv();
+                })));
+                ready.await?;
+            }
+            let mut queued = Box::pin(crate::delta_io::run_cpu_async(|| ()));
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            let paths = ["bucket=a", "bucket=b"].map(|bucket| -> Result<_> {
+                let files = std::fs::read_dir(root.join(bucket))?.collect::<std::io::Result<Vec<_>>>()?;
+                anyhow::ensure!(files.len() == 1, "expected one staged file per partition");
+                Ok(files[0].path())
+            });
+            let [a, b] = paths;
+            let paths = [a?, b?];
+            if cancel {
+                // Drop the caller before the file tasks have registered their outputs.
+                drop(stage);
+                drop((release_a, release_b));
+                while paths.iter().any(|p| p.exists()) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert!(!log.exists());
+            } else {
+                drop((release_a, release_b));
+                let group = stage.await?;
+                assert_eq!(group.appends.len(), 2);
+                for ((append, path), expected) in group.appends.iter().zip(&paths).zip([vec![2], vec![1, 3]]) {
+                    assert_eq!(&append.file.path, path);
+                    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                        std::fs::File::open(path)?,
+                    )?
+                    .build()?;
+                    let mut ids = Vec::new();
+                    for batch in reader {
+                        let batch = batch?;
+                        ids.extend_from_slice(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .context("id column")?
+                                .values(),
+                        );
+                    }
+                    assert_eq!(ids, expected);
+                }
+                let result = table.submit_prepared_group(group, true).await?.wait().await?;
+                assert_eq!(result.version, 1);
+                assert_eq!(result.files.len(), 2);
+                let actions = std::fs::read_to_string(&log)?;
+                assert_eq!(actions.lines().filter(|line| line.contains("\"add\":")).count(), 2);
+            }
+            drop(releases);
+            for worker in workers {
+                worker.await??;
+            }
+            queued.await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn coalesced_preparation_progresses_while_prior_commit_is_fenced() -> Result<()> {
         struct Gate {
@@ -1046,7 +1163,7 @@ mod tests {
         }
         let directory = tempfile::tempdir()?;
         let (entered, observed) = oneshot::channel();
-        let (release, wait) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
         let fence = Arc::new(Gate {
             entered: Mutex::new(Some(entered)),
             release: Mutex::new(wait),

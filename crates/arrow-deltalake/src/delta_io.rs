@@ -696,12 +696,9 @@ where
 
 /// Poll an owned encoding/I/O future on a CPU worker, with shared Tokio I/O.
 ///
-/// Unlike spawning the future onto Tokio, its synchronous encoding work stays
-/// on the CPU pool. I/O drivers run independently, so waiting for uploads cannot
-/// exhaust the I/O runtime's blocking pool. A worker remains occupied until the
-/// future completes: upload concurrency is also bounded by the CPU worker count.
-/// Move the writer and batch into an `async move` block and return the writer
-/// to continue writing. For a fallible future use `run_cpu_future(future).await??`.
+/// Synchronous encoding runs on the CPU pool. A pending I/O poll returns its
+/// worker to the pool; the next poll is admitted only after a wakeup and may
+/// run on a different worker. For fallible work use `run_cpu_future(future).await??`.
 ///
 /// # Errors
 /// Returns configuration or CPU/I/O runtime initialization failure.
@@ -710,12 +707,32 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    run_cpu_async(move || {
-        let executor = shared_executor()?;
-        let _guard = executor.enter();
-        Ok::<_, anyhow::Error>(futures::executor::block_on(future))
-    })
-    .await?
+    struct Wake(tokio::sync::Notify);
+    impl futures::task::ArcWake for Wake {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.notify_one();
+        }
+    }
+
+    let wake = Arc::new(Wake(tokio::sync::Notify::new()));
+    let executor = shared_executor()?;
+    let mut future = Box::pin(future);
+    loop {
+        let waker = futures::task::waker(Arc::clone(&wake));
+        let io = Arc::clone(&executor);
+        let (next, result) = run_cpu_async(move || {
+            let _guard = io.enter();
+            let result = future.as_mut().poll(&mut std::task::Context::from_waker(&waker));
+            (future, result)
+        })
+        .await?;
+        if let std::task::Poll::Ready(output) = result {
+            return Ok(output);
+        }
+        future = next;
+        // Notify retains an early wake between poll and registration.
+        wake.0.notified().await;
+    }
 }
 
 static EXECUTOR: OnceLock<std::result::Result<Arc<SharedExecutor>, String>> = OnceLock::new();
@@ -1526,7 +1543,7 @@ mod tests {
             assert_ne!(worker, caller);
             tokio::time::sleep(Duration::from_millis(1)).await;
             assert!(tokio::fs::metadata(std::env::current_exe()?).await?.is_file());
-            assert_eq!(worker, std::thread::current().id());
+            assert!(CPU_WORKER.get());
             run_cpu(|| 42)
         })
         .await??;

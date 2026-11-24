@@ -2834,6 +2834,14 @@ struct CoalescedPartitionOutput {
     file_bytes: Vec<usize>,
 }
 
+struct PreparedWrite {
+    encode: Option<RecordBatch>,
+    batch_rows: usize,
+    input_bytes: u64,
+    rows: usize,
+    bytes: u64,
+}
+
 struct CoalescedStagePolicy {
     schema: SchemaRef,
     table_properties: BTreeMap<String, String>,
@@ -2853,8 +2861,8 @@ struct CoalescedPlan {
     sort: Duration,
 }
 
-// A CPU job survives cancellation of its awaiting future. Each admitted job
-// therefore owns this guard until it has finished writing and registered its file.
+// Each admitted file task owns this guard until it has finished registering its output,
+// even if the group caller drops its join handle.
 #[derive(Default)]
 struct UnpublishedStages(Mutex<BTreeMap<usize, StagedAppend>>);
 
@@ -2889,9 +2897,11 @@ impl UnpublishedStages {
             .collect()
     }
 
-    fn reclaim(files: &[StagedAppend]) {
-        if let Some(first) = files.first() {
-            first.table.reclaim_unsubmitted(files);
+    async fn reclaim(files: Vec<StagedAppend>) {
+        for append in files {
+            if let Some(relative) = append.claim_reclaim_for(&append.table) {
+                DeltaTable::report_reclaim(append.table.remove_unsubmitted(&append.file.path, &relative).await);
+            }
         }
     }
 }
@@ -2904,12 +2914,7 @@ impl Drop for UnpublishedStages {
 
 pub(crate) fn reclaim_abandoned_group(files: Vec<StagedAppend>) {
     if !files.is_empty() {
-        // Cancellation may drop the last reference on the shared I/O runtime.
-        // Cleanup calls synchronous Kernel APIs; keep it off the I/O threads.
-        let _cleanup =
-            spawn_shared_io(
-                async move { crate::delta_io::run_cpu_async(move || UnpublishedStages::reclaim(&files)).await },
-            );
+        let _cleanup = spawn_shared_io(UnpublishedStages::reclaim(files));
     }
 }
 
@@ -4590,29 +4595,21 @@ impl DeltaTable {
             let table = Arc::clone(self);
             let policy = Arc::clone(&policy);
             async move {
-                crate::delta_io::run_cpu_async(move || {
-                    let executor = shared_executor()?;
-                    let _guard = executor.enter();
-                    // Kernel snapshot reads may themselves enter futures::block_on.
-                    let append = tokio::runtime::Handle::current().block_on(table.stage_coalesced_file(
-                        &policy,
-                        values,
-                        batches,
-                        index == 0,
-                    ))?;
+                spawn_shared_io(async move {
+                    let append = table.stage_coalesced_file(policy, values, batches, index == 0).await?;
                     staged
                         .0
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(index, append);
                     Ok(())
-                })
+                })?
                 .await?
             }
         })
         .await;
         if let Err(error) = result {
-            crate::delta_io::run_cpu_async(move || UnpublishedStages::reclaim(&staged.take())).await?;
+            spawn_shared_io(UnpublishedStages::reclaim(staged.take()))?.await?;
             return Err(error);
         }
         Ok((
@@ -4926,38 +4923,59 @@ impl DeltaTable {
 
     async fn stage_coalesced_file(
         self: &Arc<Self>,
-        policy: &CoalescedStagePolicy,
+        policy: Arc<CoalescedStagePolicy>,
         values: crate::partition::PartitionValues,
         batches: Vec<(RecordBatch, Option<GeneratedIngestion>)>,
         first: bool,
     ) -> Result<StagedAppend> {
-        let properties = policy
-            .layout
-            .as_ref()
-            .map(|layout| layout.writer_properties(&physical_writer_schema(&policy.schema, &values)))
-            .transpose()?;
-        let mut writer = self.new_file_bound(Arc::clone(&policy.schema), values, properties, true)?;
+        let table = Arc::clone(self);
+        let writer = crate::delta_io::run_cpu_async(move || {
+            let executor = shared_executor()?;
+            let _guard = executor.enter();
+            let properties = policy
+                .layout
+                .as_ref()
+                .map(|layout| layout.writer_properties(&physical_writer_schema(&policy.schema, &values)))
+                .transpose()?;
+            let mut writer = table.new_file_bound(Arc::clone(&policy.schema), values, properties, true)?;
+            let configured = (|| -> Result<()> {
+                anyhow::ensure!(
+                    writer.table_properties == policy.table_properties,
+                    "table properties changed while preparing coalesced publication; retry"
+                );
+                if let Some(layout) = &policy.layout {
+                    let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                    writer.sorter = Some(PublicationSorter::new(physical, layout.clone(), policy.mode)?);
+                }
+                if first {
+                    table.record_layout_readback(
+                        &writer,
+                        &policy.resolved,
+                        &policy.table_properties,
+                        policy.layout.is_some(),
+                        policy.mode,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = configured {
+                writer.discard_empty()?;
+                return Err(error);
+            }
+            Ok(writer)
+        })
+        .await??;
         let local = writer.parquet.path.clone();
         let result = async {
-            anyhow::ensure!(
-                writer.table_properties == policy.table_properties,
-                "table properties changed while preparing coalesced publication; retry"
-            );
-            if let Some(layout) = &policy.layout {
-                let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                writer.sorter = Some(PublicationSorter::new(physical, layout.clone(), policy.mode)?);
-            }
-            if first {
-                self.record_layout_readback(
-                    &writer,
-                    &policy.resolved,
-                    &policy.table_properties,
-                    policy.layout.is_some(),
-                    policy.mode,
-                )?;
-            }
-            for (batch, proof) in &batches {
-                writer.write_bound(batch, proof.as_ref()).await?;
+            let mut writer = writer;
+            for (batch, proof) in batches {
+                let (mut prepared_writer, prepared) = crate::delta_io::run_cpu_async(move || {
+                    let prepared = writer.prepare_batch(&batch, proof.as_ref());
+                    (writer, prepared)
+                })
+                .await?;
+                prepared_writer.encode_batch(prepared?).await?;
+                writer = prepared_writer;
             }
             writer.stage().await
         }
@@ -4965,7 +4983,7 @@ impl DeltaTable {
         if result.is_err() {
             // No transaction ever received this writer. Don't assume ownership
             // of a remote object on an ambiguous upload failure.
-            if let Err(error) = self.discard_output(&local, &self.url, false) {
+            if let Err(error) = self.remove_stage_local(&local).await {
                 tracing::warn!(
                     failure = cleanup_failure_class(&error),
                     "failed to reclaim incomplete stage"
@@ -5193,45 +5211,60 @@ impl DeltaTable {
     /// and counted as `orphan_cleanup_failed`, and the file stays on disk.
     fn reclaim_unsubmitted(&self, files: &[StagedAppend]) {
         for append in files {
-            // Only this table's own stages fall under its cleanup guard: a foreign stage
-            // (another table, possibly nested under this root) keeps its state and file.
-            if append.table.url != self.url {
-                continue;
+            if let Some(relative) = append.claim_reclaim_for(self) {
+                let table = Arc::clone(&append.table);
+                let path = append.file.path.clone();
+                Self::report_reclaim(
+                    shared_executor()
+                        .and_then(|io| io.block_on(async move { table.remove_unsubmitted(&path, &relative).await })),
+                );
             }
-            let Some(relative) = append
-                .file
-                .path
-                .strip_prefix(&self.root)
-                .ok()
-                .and_then(Path::to_str)
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if !append.claim_reclaim() {
-                continue;
+        }
+    }
+
+    async fn remove_stage_local(&self, path: &Path) -> Result<()> {
+        if self.url.scheme() == "file" {
+            self.check_publication_async().await?;
+        }
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn remove_unsubmitted(&self, local: &Path, relative: &str) -> Result<()> {
+        let url = self.staged_url(relative)?;
+        self.remove_stage_local(local).await?;
+        if self.url.scheme() == "file" {
+            if let Some(parent) = local.parent() {
+                let parent = parent.to_path_buf();
+                shared_executor()?
+                    .spawn_blocking(move || sync_directory(&parent))
+                    .await??;
             }
-            let reclaimed = (|| -> Result<()> {
-                let url = self.staged_url(&relative)?;
-                self.discard_output(&append.file.path, &url, self.url.scheme() != "file")?;
-                if self.url.scheme() == "file"
-                    && let Some(parent) = append.file.path.parent()
-                {
-                    sync_directory(parent)?;
-                }
-                Ok(())
-            })();
-            match reclaimed {
-                Ok(()) => crate::telemetry::publication_event("orphan_reclaimed"),
-                Err(error) => {
-                    crate::telemetry::publication_event("orphan_cleanup_failed");
-                    // Paths and error text can carry storage URLs or service responses;
-                    // only a fixed failure class leaves this boundary.
-                    tracing::warn!(
-                        failure = cleanup_failure_class(&error),
-                        "deduplicated staged file retained: cleanup failed"
-                    );
-                }
+        } else {
+            let path = object_store::path::Path::from_url_path(url.path())?;
+            self.check_publication_async().await?;
+            match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn report_reclaim(reclaimed: Result<()>) {
+        match reclaimed {
+            Ok(()) => crate::telemetry::publication_event("orphan_reclaimed"),
+            Err(error) => {
+                crate::telemetry::publication_event("orphan_cleanup_failed");
+                // Paths and error text can carry storage URLs or service responses;
+                // only a fixed failure class leaves this boundary.
+                tracing::warn!(
+                    failure = cleanup_failure_class(&error),
+                    "deduplicated staged file retained: cleanup failed"
+                );
             }
         }
     }
@@ -5697,6 +5730,14 @@ impl StagedAppend {
         }
     }
 
+    fn claim_reclaim_for(&self, table: &DeltaTable) -> Option<String> {
+        if self.table.url != table.url {
+            return None;
+        }
+        let relative = self.file.path.strip_prefix(&table.root).ok()?.to_str()?;
+        self.claim_reclaim().then(|| relative.to_owned())
+    }
+
     /// Claim a never-submitted file for deletion. False keeps the file.
     fn claim_reclaim(&self) -> bool {
         self.stage_state
@@ -5916,7 +5957,10 @@ impl DeltaFileWriter {
         if self.failed {
             bail!("Delta file previously failed; refusing further writes");
         }
-        let result = self.write_batch(batch, proof).await;
+        let result = match self.prepare_batch(batch, proof) {
+            Ok(prepared) => self.encode_batch(prepared).await,
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.failed = true;
         }
@@ -5935,7 +5979,7 @@ impl DeltaFileWriter {
         self.accepted_input_bytes
     }
 
-    async fn write_batch(&mut self, batch: &RecordBatch, proof: Option<&GeneratedIngestion>) -> Result<()> {
+    fn prepare_batch(&mut self, batch: &RecordBatch, proof: Option<&GeneratedIngestion>) -> Result<PreparedWrite> {
         let build_started = Instant::now();
         let input_bytes = record_batch_logical_bytes(batch)?;
         let mut batch = if self.canonical_input {
@@ -6030,12 +6074,26 @@ impl DeltaFileWriter {
         } else {
             Some(physical)
         };
+        Ok(PreparedWrite {
+            encode,
+            batch_rows: batch.num_rows(),
+            input_bytes,
+            rows,
+            bytes,
+        })
+    }
+
+    async fn encode_batch(&mut self, prepared: PreparedWrite) -> Result<()> {
+        let PreparedWrite {
+            encode,
+            batch_rows,
+            input_bytes,
+            rows,
+            bytes,
+        } = prepared;
         if let Some(physical) = encode {
             let encode_started = Instant::now();
-            let result = self
-                .parquet
-                .write_accounted(&physical, batch.num_rows(), input_bytes)
-                .await;
+            let result = self.parquet.write_accounted(&physical, batch_rows, input_bytes).await;
             self.stage_timings.encode += encode_started.elapsed();
             result?;
         }
@@ -6054,7 +6112,7 @@ impl DeltaFileWriter {
         }
         if let Some(sorter) = self.sorter.take().and_then(PublicationSorter::into_buffer) {
             let sort_started = Instant::now();
-            let sorted = sorter.finish();
+            let sorted = crate::delta_io::run_cpu_async(move || sorter.finish()).await?;
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
             let sorted = sorted?;
             let encode_started = Instant::now();
