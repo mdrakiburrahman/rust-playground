@@ -1,0 +1,11 @@
+{
+  "duration": 10,
+  "warmup": 5,
+  "common": {
+    "BWA_CORES": "24",
+    "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS": "1"
+  },
+  "cells": [
+    { "id": "r3-smoke", "grid": "smoke", "x": "control", "y": "1", "env": {} }
+  ]
+}
