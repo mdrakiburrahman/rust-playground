@@ -117,7 +117,8 @@ export async function buildLocalImages({ revision, maintenance = false, profile 
       '--label', 'org.opencontainers.image.profile=' + profileHash,
     ] : [];
     const result = await runner(['docker', 'buildx', 'build', '--pull', '--platform', 'linux/amd64', '--load',
-      '--tag', image, '--label', revisionLabel + '=' + source, ...profileArgs, '--file', dockerfile, context], 3600, ROOT);
+      '--tag', image, '--label', revisionLabel + '=' + source, '--build-arg', 'VCS_REF=' + source,
+      ...profileArgs, '--file', dockerfile, context], 3600, ROOT);
     if (result.returncode) throw new Error('Docker build failed for ' + role + ' (' + result.returncode + '): ' + (result.stderr.trim() || 'no diagnostic output'));
   }
 }

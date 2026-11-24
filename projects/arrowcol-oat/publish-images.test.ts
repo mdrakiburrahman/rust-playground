@@ -243,6 +243,25 @@ test('builds all five local images for linux/amd64 with the full revision label'
   await assert.rejects(buildLocalImages({ revision }, dirtyRunner), /Commit the source changes/);
 });
 
+test('passes the source revision as a build argument for every local image', async () => {
+  for (const profile of [undefined, {
+    allocator: 'mimalloc', lto: 'thin', codegen_units: 8, opt_level: 2, target_cpu: 'generic',
+  } as const]) {
+    const calls: string[][] = [];
+    const runner: typeof run_tree = async command => {
+      if (command[0] === 'git') return { returncode: 0, stdout: command[1] === 'rev-parse' ? revision : '', stderr: '' };
+      calls.push(command);
+      return { returncode: 0, stdout: '', stderr: '' };
+    };
+    await buildLocalImages({ revision, profile, maintenance: true }, runner);
+    assert.equal(calls.length, 6);
+    for (const command of calls) {
+      const index = command.indexOf(`VCS_REF=${revision}`);
+      assert.ok(index > 0 && command[index - 1] === '--build-arg');
+    }
+  }
+});
+
 test('publishes the revision-proven client image as a digest-pinned ACR reference', async t => {
   const options = fixture(t);
   const m = mock(options.registry);
