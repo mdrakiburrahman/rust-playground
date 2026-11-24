@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -21,7 +21,104 @@ pub struct RoutingShutdown {
     failed: AtomicBool,
     next_publication_generation: AtomicU64,
     pending: Mutex<HashMap<PublicationId, PendingPublication>>,
+    evidence: Mutex<AdmissionEvidence>,
     workers: Mutex<HashMap<PathBuf, Arc<AtomicBool>>>,
+}
+
+const MAX_TERMINAL_ADMISSIONS: usize = 1_000_000;
+const MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvidencePhase {
+    Sending,
+    Awaiting,
+    Committed,
+    Failed,
+    Cancelled,
+}
+
+struct EvidenceAdmission {
+    phase: EvidencePhase,
+    staged: bool,
+}
+
+#[derive(Default)]
+struct AdmissionEvidence {
+    admissions: HashMap<PublicationId, EvidenceAdmission>,
+    incomplete: bool,
+    overflow: bool,
+}
+
+impl AdmissionEvidence {
+    fn begin(&mut self, id: PublicationId) {
+        if self.admissions.contains_key(&id) {
+            self.incomplete = true;
+        } else if self.admissions.len() == MAX_TERMINAL_ADMISSIONS {
+            self.incomplete = true;
+            self.overflow = true;
+        } else if !self.overflow {
+            self.admissions.insert(
+                id,
+                EvidenceAdmission {
+                    phase: EvidencePhase::Sending,
+                    staged: false,
+                },
+            );
+        }
+    }
+
+    fn sent(&mut self, id: PublicationId, success: bool) {
+        let Some(entry) = self.admissions.get_mut(&id) else {
+            self.incomplete = true;
+            return;
+        };
+        if entry.phase != EvidencePhase::Sending {
+            self.incomplete = true;
+        } else {
+            entry.phase = if success {
+                EvidencePhase::Awaiting
+            } else {
+                EvidencePhase::Failed
+            };
+        }
+    }
+
+    fn cancelled(&mut self, id: PublicationId) {
+        self.incomplete = true;
+        if let Some(entry) = self.admissions.get_mut(&id)
+            && entry.phase == EvidencePhase::Sending
+        {
+            entry.phase = EvidencePhase::Cancelled;
+        }
+    }
+
+    fn staged(&mut self, id: PublicationId) {
+        let Some(entry) = self.admissions.get_mut(&id) else {
+            self.incomplete = true;
+            return;
+        };
+        if entry.staged || entry.phase != EvidencePhase::Awaiting {
+            self.incomplete = true;
+        }
+        entry.staged = true;
+    }
+
+    fn finished(&mut self, id: PublicationId, published: bool) {
+        let Some(entry) = self.admissions.get_mut(&id) else {
+            self.incomplete = true;
+            return;
+        };
+        if !entry.staged || entry.phase != EvidencePhase::Awaiting {
+            self.incomplete = true;
+        }
+        if entry.phase == EvidencePhase::Awaiting {
+            entry.phase = if published {
+                EvidencePhase::Committed
+            } else {
+                EvidencePhase::Failed
+            };
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +156,9 @@ impl Drop for AdmissionGuard<'_> {
     fn drop(&mut self) {
         if !self.armed {
             return;
+        }
+        if let Ok(mut evidence) = self.shutdown.evidence.lock() {
+            evidence.cancelled(self.publication_id);
         }
         let Ok(mut pending) = self.shutdown.pending.lock() else {
             self.shutdown.record_failure();
@@ -157,6 +257,9 @@ impl RoutingShutdown {
     /// # Errors
     /// Reports poisoned publication accounting rather than assuming the batch was published.
     pub fn publication_finished(&self, publication_id: PublicationId, published: bool) -> Result<()> {
+        if let Ok(mut evidence) = self.evidence.lock() {
+            evidence.finished(publication_id, published);
+        }
         let mut pending = self
             .pending
             .lock()
@@ -184,6 +287,9 @@ impl RoutingShutdown {
     }
 
     pub(crate) fn publication_staged(&self, publication_id: PublicationId) -> Result<()> {
+        if let Ok(mut evidence) = self.evidence.lock() {
+            evidence.staged(publication_id);
+        }
         let mut pending = self
             .pending
             .lock()
@@ -224,6 +330,9 @@ impl RoutingShutdown {
         publication_id: PublicationId,
         send: impl Future<Output = Result<(), E>>,
     ) -> Result<Result<(), E>> {
+        if let Ok(mut evidence) = self.evidence.lock() {
+            evidence.begin(publication_id);
+        }
         let (generation, is_owner) = {
             let mut pending = self
                 .pending
@@ -287,7 +396,66 @@ impl RoutingShutdown {
             pending.remove(&publication_id);
         }
         guard.armed = false;
+        drop(pending);
+        if let Ok(mut evidence) = self.evidence.lock() {
+            evidence.sent(publication_id, result.is_ok());
+        }
         Ok(result)
+    }
+
+    fn terminal_evidence(&self) -> Option<serde_json::Value> {
+        let evidence = self.evidence.lock().ok()?;
+        if evidence.overflow {
+            return None;
+        }
+        let (mut committed, mut failed, mut cancelled_ambiguous, mut pending) = (0_u64, 0_u64, 0_u64, 0_u64);
+        let mut incomplete = evidence.incomplete;
+        for entry in evidence.admissions.values() {
+            match entry.phase {
+                EvidencePhase::Committed => committed += 1,
+                EvidencePhase::Failed => failed += 1,
+                EvidencePhase::Cancelled => cancelled_ambiguous += 1,
+                EvidencePhase::Sending | EvidencePhase::Awaiting => {
+                    pending += 1;
+                    incomplete = true;
+                }
+            }
+        }
+        let admitted = u64::try_from(evidence.admissions.len()).ok()?;
+        let (commit_incomplete, commits) = arrow_deltalake::telemetry::terminal_commit_snapshot()?;
+        incomplete |= commit_incomplete;
+        let mut versions = HashSet::new();
+        let mut committed_rows = 0_u64;
+        for commit in &commits {
+            if !versions.insert((&commit.table_id, commit.version)) {
+                incomplete = true;
+            }
+            committed_rows = committed_rows.checked_add(commit.rows)?;
+            if [commit.version, commit.rows, commit.files, commit.parquet_bytes]
+                .into_iter()
+                .any(|n| n > MAX_EXACT_JSON_INTEGER)
+            {
+                return None;
+            }
+        }
+        if [
+            admitted,
+            committed,
+            failed,
+            cancelled_ambiguous,
+            pending,
+            committed_rows,
+        ]
+        .into_iter()
+        .any(|n| n > MAX_EXACT_JSON_INTEGER)
+        {
+            return None;
+        }
+        Some(serde_json::json!({
+            "schema_version": 1, "admitted": admitted, "committed": committed,
+            "failed": failed, "cancelled_ambiguous": cancelled_ambiguous, "pending": pending,
+            "committed_rows": committed_rows, "incomplete": u8::from(incomplete), "commits": commits
+        }))
     }
 
     pub(crate) fn track_worker(&self, root: PathBuf, retired: Arc<AtomicBool>) -> Result<()> {
@@ -419,6 +587,12 @@ fn terminal_state(clean: bool, failed: bool) -> CollectorState {
     }
 }
 
+/// Returns process-lifetime evidence after the terminal shutdown hook, if complete accounting is available.
+#[must_use]
+pub fn terminal_publication_evidence() -> Option<serde_json::Value> {
+    PROCESS_ROUTING_SHUTDOWN.terminal_evidence()
+}
+
 /// Finalizes this process's receivers from the post-controller, post-publisher main-thread hook.
 ///
 /// # Errors
@@ -437,6 +611,95 @@ pub fn finish_routing_shutdown(clean: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_evidence_conserves_success_failed_and_cancelled_admissions() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let success = PublicationId::new();
+        let failed = PublicationId::new();
+        let cancelled = PublicationId::new();
+        assert!(
+            shutdown
+                .admit_publication(success, async { Ok::<_, ()>(()) })
+                .await?
+                .is_ok()
+        );
+        shutdown.publication_staged(success)?;
+        shutdown.publication_finished(success, true)?;
+        assert!(
+            shutdown
+                .admit_publication(failed, async { Err::<(), _>(()) })
+                .await?
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                shutdown.admit_publication(cancelled, std::future::pending::<Result<(), ()>>())
+            )
+            .await
+            .is_err()
+        );
+        shutdown.finish(true).await?;
+        let result = shutdown
+            .terminal_evidence()
+            .ok_or_else(|| anyhow::anyhow!("missing evidence"))?;
+        assert_eq!(result["admitted"], 3);
+        assert_eq!(result["committed"], 1);
+        assert_eq!(result["failed"], 1);
+        assert_eq!(result["cancelled_ambiguous"], 1);
+        assert_eq!(result["pending"], 0);
+        assert_eq!(result["incomplete"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_admission_and_publication_are_complete() {
+        let mut evidence = AdmissionEvidence::default();
+        let id = PublicationId::new();
+        evidence.begin(id);
+        evidence.sent(id, true);
+        evidence.staged(id);
+        evidence.finished(id, true);
+        assert!(!evidence.incomplete);
+        assert!(evidence.admissions[&id].phase == EvidencePhase::Committed);
+    }
+
+    #[tokio::test]
+    async fn outcome_before_send_settles_makes_terminal_evidence_incomplete() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let id = PublicationId::new();
+        shutdown
+            .admit_publication(id, async {
+                shutdown.publication_staged(id)?;
+                shutdown.publication_finished(id, true)?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+        let evidence = shutdown
+            .terminal_evidence()
+            .ok_or_else(|| anyhow::anyhow!("missing evidence"))?;
+        assert_eq!(evidence["incomplete"], 1);
+        assert_eq!(evidence["pending"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn fast_outcome_and_duplicate_identities_make_evidence_incomplete() {
+        let mut evidence = AdmissionEvidence::default();
+        let id = PublicationId::new();
+        evidence.begin(id);
+        evidence.staged(id);
+        evidence.finished(id, true);
+        evidence.sent(id, true);
+        assert!(evidence.incomplete);
+        assert!(evidence.admissions[&id].phase == EvidencePhase::Awaiting);
+        let mut duplicate = AdmissionEvidence::default();
+        duplicate.begin(id);
+        duplicate.sent(id, true);
+        duplicate.begin(id);
+        assert!(duplicate.incomplete);
+    }
 
     #[test]
     fn only_clean_publication_and_drain_can_stop() {

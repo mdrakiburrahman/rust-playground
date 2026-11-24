@@ -532,6 +532,69 @@ test('matched measured reconciliation validates only zero exits and permits guar
   await requireFinalizedCollectorStop(f.store, f.azure, f.inventory, f.authority);
 });
 
+test('fenced terminal summary inputs cross-check every version, row, file and byte against frozen Delta', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize } = await import('./aks-shutdown-finalization.js');
+  const { COLLECTOR_TERMINAL_LOG_MAX_BYTES, terminalTableDigest } = await import('./aks-terminal-evidence.js');
+  const f = await shutdownFixture(t, 0), matched = await installMatchedFinalization(t, f);
+  f.blobs.delete(matched.receipt.blob);
+  const summary = { schema_version: 1, admitted: 1, committed: 1, failed: 0, cancelled_ambiguous: 0, pending: 0,
+    committed_rows: 7, incomplete: 0, commits: [{ table_id: terminalTableDigest(f.azure.c.account, f.azure.c.data,
+      f.inventory.qap!.bindings[0]!.relative_path), version: 0, rows: 7, files: 1, parquet_bytes: 100 }] };
+  const log = f.terminal.workloads[0]!.original_stop.logs[0]!;
+  const publish = (value: unknown) => {
+    Object.assign(log, { full_log_read: true, restart_count: 0, terminal_summary: value, terminal_summary_status: 0,
+      collector_startup_observed: true });
+    f.blobs.set(f.captureName, { bytes: Buffer.from(JSON.stringify(f.terminal)), etag: '"summary-capture"' });
+  };
+  publish(summary);
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  assert.deepEqual(inputs.terminal_summaries, [{ pod_name: 'collector-pod', pod_uid: ownerId, container: 'main',
+    restart_count: 0, exit_code: 0, summary }]);
+  const receipt = await shutdownFinalize(f.store, f.azure, { ...matched.request,
+    terminal_capture: inputs.terminal_capture }, f.env);
+  assert.equal(receipt.status, 'validated');
+  f.blobs.delete(receipt.blob);
+  for (const invalid of [
+    { ...summary, incomplete: 1 },
+    { ...summary, commits: [{ ...summary.commits[0]!, parquet_bytes: 101 }] },
+    { ...summary, commits: [{ ...summary.commits[0]!, table_id: 'f'.repeat(64) }] },
+    { ...summary, committed_rows: 14, commits: [summary.commits[0]!, summary.commits[0]!] },
+  ]) {
+    publish(invalid);
+    assert.equal((await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env)).terminal_summaries, null);
+  }
+  for (const invalid of [{ collector_startup_observed: false }, { bytes: COLLECTOR_TERMINAL_LOG_MAX_BYTES }, { restart_count: 1 }]) {
+    publish(summary);
+    Object.assign(log, invalid);
+    f.blobs.set(f.captureName, { bytes: Buffer.from(JSON.stringify(f.terminal)), etag: '"incomplete-summary-source"' });
+    assert.equal((await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env)).terminal_summaries, null);
+    Object.assign(log, { bytes: 42 });
+  }
+  publish(summary);
+  f.terminal.workloads[0]!.original_stop.logs.push({ ...log });
+  f.blobs.set(f.captureName, { bytes: Buffer.from(JSON.stringify(f.terminal)), etag: '"duplicate-summary-source"' });
+  assert.equal((await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env)).terminal_summaries, null);
+  const unavailableInputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  const refused = await shutdownFinalize(f.store, f.azure, { ...matched.request,
+    terminal_capture: unavailableInputs.terminal_capture }, f.env);
+  assert.equal(refused.status, 'unavailable');
+  assert.equal(refused.release_allowed, false);
+});
+
+test('new terminal-evidence journals cannot use legacy acceptance when the summary or original lifetime is unavailable', async t => {
+  const { shutdownFinalizationInputs, shutdownFinalize } = await import('./aks-shutdown-finalization.js');
+  const f = await shutdownFixture(t, 0), matched = await installMatchedFinalization(t, f);
+  f.blobs.delete(matched.receipt.blob);
+  Object.assign(f.terminal.workloads[0]!.original_stop, { terminal_evidence_version: 1 });
+  f.blobs.set(f.captureName, { bytes: Buffer.from(JSON.stringify(f.terminal)), etag: '"missing-new-summary"' });
+  const inputs = await shutdownFinalizationInputs(f.store, f.azure, f.input, f.env);
+  assert.equal(inputs.terminal_summaries, null);
+  const receipt = await shutdownFinalize(f.store, f.azure, { ...matched.request, terminal_capture: inputs.terminal_capture }, f.env);
+  assert.equal(receipt.status, 'unavailable');
+  assert.equal(receipt.reason_code, 'reconciliation_unavailable');
+  assert.equal(receipt.release_allowed, false);
+});
+
 test('matched reconciliation never promotes 143 or mismatched frozen row counts', async t => {
   const { shutdownFinalize } = await import('./aks-shutdown-finalization.js');
   const signalled = await shutdownFixture(t, 143), retained = await installMatchedFinalization(t, signalled);

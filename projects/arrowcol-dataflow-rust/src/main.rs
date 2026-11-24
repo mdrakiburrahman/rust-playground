@@ -66,6 +66,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             drop(metrics);
             if clean && observed_startup.get() && result.is_ok() {
+                if let Some(evidence) = arrowcol_dataflow_components::terminal_publication_evidence() {
+                    eprintln!("arrowcol_terminal_evidence {evidence}");
+                }
                 eprintln!("arrowcol_shutdown {{\"event\":\"drain_complete\"}}");
             }
             if let Err(error) = result {
