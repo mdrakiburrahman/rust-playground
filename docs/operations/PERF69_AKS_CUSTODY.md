@@ -196,7 +196,7 @@ Terminal Delta is frozen only after collector and maintenance writers are physic
 
 | Boundary | Behavior |
 | --- | --- |
-| Required order | Stop admission → bounded drain → evidence capture → maintenance stop → freeze → attach final AKS Delta reconciliation → guarded create-only finalization → validation → namespace, QAP and FIC removal → handoff. The bounded pre-drain snapshot remains diagnostic. |
+| Required order | Stop admission → bounded drain → evidence capture → maintenance stop → freeze → fenced terminal-summary inputs → attach final AKS Delta reconciliation → guarded create-only finalization → validation → namespace, QAP and FIC removal → handoff. The bounded pre-drain snapshot remains diagnostic. |
 | Exit 0 | Requires the actual measured post-teardown reconciliation, settled zero ambiguity, clear teardown admissions and matching independently read frozen Delta row counts. A zero exit alone never authorizes release. |
 | Exit 143 | Always unavailable; an exact marker permits only provisional physical stop/freeze. Release and handoff stay withheld. |
 | Early failure | Stop/freeze checks still apply. Authoritatively missing pre-load Blob gives `no_baseline`, nullable missing references and an immutable unavailable record; never invented zero rows, namespace UID or terminal observations. Release stays withheld. |
@@ -206,7 +206,7 @@ Terminal Delta is frozen only after collector and maintenance writers are physic
 The three CLI actions are `shutdown-finalization-inputs`, `shutdown-finalize` and
 `shutdown-finalization-read`. Inputs/read require exactly
 `schema_version:1,campaign_id,orchestration_run_id,cell_run_id,expected_etag,actor`.
-Inputs return `schema_version,inventory_etag,terminal_capture,delta_before,delta_terminal,unavailable_reason`;
+Inputs return `schema_version,inventory_etag,terminal_capture,delta_before,delta_terminal,unavailable_reason,terminal_summaries`;
 source references are `{blob,etag,sha256}` or explicit null, with canonical-JSON hashes.
 Finalize additionally accepts those exact nullable references and
 `reconciliation:{profile:"single_hot_table"|"other",proof:null|{status,post_teardown_verification,
@@ -220,7 +220,28 @@ All fields remain present, including nulls. Finalization journal I/O has its own
 it never extends or restarts physical stop/freeze deadlines. Read-only recovery preserves the creation ETag after later
 inventory progress. Current actor/fence and inventory version are checked throughout.
 Known non-143 failures retain only the existing validated controller unsettled-cleanup exception; never a successful cell.
-No membership, follower, per-version comparator or positive exit-143 API is installed.
+No membership, follower or positive exit-143 API is installed.
+
+### Exit-zero terminal summary
+
+`terminal_summaries` is required-present and nullable, from the same fenced terminal-capture reference:
+`[{pod_name,pod_uid,container,restart_count:0,exit_code:0,summary}] | null`.
+
+| Contract | Requirement |
+| --- | --- |
+| Producer record | Exactly one `arrowcol_terminal_evidence` JSON record per original collector container, emitted only after drain/final acknowledgement. Summary keys: `schema_version:1,admitted,committed,failed,cancelled_ambiguous,pending,committed_rows,incomplete,commits`. |
+| Units | Distinct publication IDs offered downstream, including rejected sends. `admitted = committed + failed + cancelled_ambiguous + pending`; every counter is a nonnegative JS-safe integer. |
+| Positive accounting | `failed=cancelled_ambiguous=pending=incomplete=0`; `incomplete` is numeric `0|1`. Unknown/replayed attribution, races, overflow and missing summaries are never fabricated as zero. |
+| Commit entries | Exact `{table_id,version,rows,files,parquet_bytes}`; table ID is the existing lowercase SHA256 of the writer's normalized URL, not raw table data. Numeric totals and every unique version/row/file/byte tuple must match independently replayed frozen Delta. Entire-lifetime/pre-baseline or duplicate tuples refuse validation. |
+| Source completeness | Full log read without `--tail`/`--limit-bytes`, below the established native 64 MiB log cap (`COLLECTOR_TERMINAL_LOG_MAX_BYTES`), receiver startup preceding terminal record, complete final line, and exact fenced pod UID/container with zero restarts observed before and after read. Missing/rotated/partial/duplicate/malformed or inconsistent evidence yields null. Existing custody-Blob/Delta history bounds still apply; oversized workloads are refused, not truncated. |
+| Capture timing | Read original pods while draining, before deletion, and recheck at terminal observation. Persist only typed accounting, hashes and existing identity provenance, never raw logs or configuration. New stop journals mark `terminal_evidence_version:1`, preventing a missing new summary from falling back to legacy acceptance. |
+| Table binding | Only the independently configured ABFSS account/container/root URL with the writer's trailing slash is supported. Scheme aliases or normalization uncertainty are not equated; unequal hashes withhold release. |
+
+Delta JSON history reads use one named `DELTA_READ_CONCURRENCY=4` cap, with ordered replay after concurrent
+fetches. One absolute 35-second read deadline covers listing, all batches and retries; terminal capture takes the
+earlier persisted physical deadline. Finalization rereads share the stricter existing 30-second journal action deadline,
+not a fresh budget per replay. Expiry is unavailable/UNKNOWN, never empty/zero evidence or a restarted budget.
+CPU quota, QAP validation, mandatory process/commit capture and immutable journal fencing remain mandatory.
 
 ## Campaign-terminal providers
 

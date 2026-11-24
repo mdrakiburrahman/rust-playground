@@ -1169,6 +1169,9 @@ trait Platform: Send + Sync {
     fn stopped_commit_logs(&self) -> Option<(Vec<ProcessLog>, Vec<ProcessLog>)> {
         None
     }
+    async fn capture_shutdown_inputs(&mut self) -> Option<ShutdownFinalizationInputs> {
+        None
+    }
     fn local_lifecycle_timing(&self) -> Option<Value> {
         None
     }
@@ -1219,6 +1222,7 @@ struct AksPlatform {
     campaign_cli_paths: Option<OwnedAksCampaignConfigPaths>,
     maintenance_cell_baseline: Vec<ProcessLog>,
     stopped_collector_logs: Option<Vec<ProcessLog>>,
+    shutdown_inputs: Option<ShutdownFinalizationInputs>,
 }
 
 struct OwnedKubectlProcess {
@@ -1350,6 +1354,19 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    async fn capture_shutdown_inputs(&mut self) -> Option<ShutdownFinalizationInputs> {
+        match read_campaign_shutdown_inputs(self).await {
+            Ok((_, _, _, inputs)) => {
+                self.shutdown_inputs = Some(inputs.clone());
+                Some(inputs)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "frozen shutdown inputs unavailable; retaining fail-closed reconciliation");
+                None
+            }
+        }
+    }
+
     fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
         self.maintenance_cell_baseline = logs.to_vec();
     }
@@ -3934,6 +3951,25 @@ async fn run_isolated_cell(
     let cleanup = platform.cleanup(&config).await;
     let frozen = cleanup.is_ok();
     let stopped_logs = platform.stopped_commit_logs();
+    let summary_inputs = if frozen
+        && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+        && result.is_ok()
+    {
+        platform.capture_shutdown_inputs().await
+    } else {
+        None
+    };
+    let summary_attached = if let (Ok(rows), Some(inputs)) = (&mut result, summary_inputs.as_ref()) {
+        match attach_terminal_summary_commits(&config, platform.delta_root(), rows, inputs) {
+            Ok(attached) => attached,
+            Err(error) => {
+                tracing::warn!(%error, "terminal collector summary unavailable; release remains withheld");
+                false
+            }
+        }
+    } else {
+        false
+    };
     if let Ok(rows) = &mut result
         && let Some((logs, baseline)) = &stopped_logs
         && let Err(error) = attach_stopped_commit_evidence(&config, rows, logs, baseline)
@@ -3947,7 +3983,8 @@ async fn run_isolated_cell(
             });
         }
     }
-    if let Ok(rows) = &mut result
+    if !summary_attached
+        && let Ok(rows) = &mut result
         && let Err(error) =
             attach_collector_teardown_admissions(rows, stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()), frozen)
     {
@@ -4186,6 +4223,154 @@ fn apply_final_aks_delta_reconciliation(
     }
     row.evidence_json = Some(serde_json::to_string(&evidence)?);
     Ok(())
+}
+
+fn attach_terminal_summary_commits(
+    config: &OatConfig,
+    root: Option<&str>,
+    rows: &mut [OatResult],
+    inputs: &ShutdownFinalizationInputs,
+) -> Result<bool> {
+    let Some(summaries) = &inputs.terminal_summaries else {
+        return Ok(false);
+    };
+    ensure!(
+        inputs.unavailable_reason.is_none() && inputs.terminal_capture.is_some(),
+        "terminal source unavailable"
+    );
+    let [row] = rows else {
+        bail!("terminal summary requires one original result")
+    };
+    ensure!(
+        config.tables.as_slice() == std::slice::from_ref(&row.table),
+        "terminal summary table differs from original configuration"
+    );
+    ensure!(
+        row.replicas > 0 && summaries.len() == usize::try_from(row.replicas)?,
+        "terminal replica coverage differs"
+    );
+    let mut url = Url::parse(root.context("terminal summary has no original Delta root")?)?;
+    ensure!(
+        url.scheme() == "abfss" && url.query().is_none() && url.fragment().is_none(),
+        "invalid original Delta root"
+    );
+    ensure!(
+        !row.table.is_empty()
+            && row
+                .table
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "invalid original table"
+    );
+    url.set_path(&format!(
+        "{}/telemetry/sqlserver/{}/",
+        url.path().trim_end_matches('/'),
+        row.table
+    ));
+    let expected_table = fixture_sha256(url.as_str().as_bytes());
+    let mut pod_uids = BTreeSet::new();
+    let mut pod_names = BTreeSet::new();
+    let mut versions = BTreeMap::new();
+    let mut total_rows = 0_u64;
+    const MAX_SAFE: u64 = 9_007_199_254_740_991;
+    for pod in summaries {
+        ensure!(
+            [&pod.pod_name, &pod.pod_uid, &pod.container]
+                .iter()
+                .all(|s| !s.is_empty() && s.len() <= 253 && !s.bytes().any(|b| b.is_ascii_control())),
+            "invalid terminal collector identity"
+        );
+        ensure!(
+            pod_uids.insert(&pod.pod_uid)
+                && pod_names.insert(&pod.pod_name)
+                && pod.container == config.dfe_container
+                && pod.restart_count == 0
+                && pod.exit_code == 0,
+            "terminal collector identity or exit differs"
+        );
+        let summary = &pod.summary;
+        ensure!(
+            summary.schema_version == 1
+                && summary.incomplete == 0
+                && summary.failed == 0
+                && summary.cancelled_ambiguous == 0
+                && summary.pending == 0
+                && summary.admitted == summary.committed,
+            "terminal admission accounting incomplete"
+        );
+        ensure!(
+            [
+                summary.admitted,
+                summary.committed,
+                summary.failed,
+                summary.cancelled_ambiguous,
+                summary.pending,
+                summary.committed_rows
+            ]
+            .iter()
+            .all(|value| *value <= MAX_SAFE),
+            "terminal admission count exceeds safe range"
+        );
+        let mut pod_rows = 0_u64;
+        for commit in &summary.commits {
+            ensure!(
+                commit.table_id == expected_table
+                    && [commit.version, commit.rows, commit.files, commit.parquet_bytes]
+                        .iter()
+                        .all(|value| *value <= MAX_SAFE)
+                    && commit.rows > 0
+                    && commit.files > 0
+                    && commit.parquet_bytes > 0,
+                "terminal commit identity or counts invalid"
+            );
+            ensure!(versions.insert(commit.version, json!({"delta_version":commit.version,"rows":commit.rows,"files":commit.files,"parquet_bytes":commit.parquet_bytes})).is_none(), "duplicate terminal Delta version");
+            ensure!(versions.len() <= 10_000, "terminal commit evidence exceeds bound");
+            pod_rows = pod_rows
+                .checked_add(commit.rows)
+                .context("terminal commit row overflow")?;
+        }
+        ensure!(
+            pod_rows == summary.committed_rows,
+            "terminal commit rows do not match admission summary"
+        );
+        total_rows = total_rows
+            .checked_add(pod_rows)
+            .filter(|rows| *rows <= MAX_SAFE)
+            .context("terminal total exceeds safe range")?;
+    }
+    let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+    ensure!(
+        evidence["durable_commits"].is_object(),
+        "original commit evidence unavailable"
+    );
+    let mut cell = CellEvidence::default();
+    let reports = evidence["client_phase_reports"]
+        .as_array()
+        .context("missing client phase reports")?;
+    ensure!(
+        reports.len() == config.clients_per_table,
+        "client phase coverage differs"
+    );
+    cell.client_reports.insert(row.table.clone(), reports.clone());
+    let acknowledged = cell
+        .client_cumulative_total(&row.table, "completed_rows")
+        .context("client acknowledgement unavailable")?;
+    let cumulative = &mut evidence["durable_commits"]["run_cumulative_output"];
+    ensure!(cumulative.is_object(), "original cumulative evidence unavailable");
+    cumulative["rows"] = json!(total_rows);
+    cumulative["commits"] = json!(versions.len());
+    cumulative["scope"] = json!("fenced_collector_process_lifetime_terminal_summary");
+    cumulative["commits_by_version"] = json!(versions.into_values().collect::<Vec<_>>());
+    cumulative["client_completed_rows"] = json!(acknowledged);
+    cumulative["settled"] = json!(total_rows >= acknowledged);
+    cumulative["settle_gap_rows"] = json!(acknowledged.saturating_sub(total_rows));
+    cumulative["cell_scope"] = json!("fenced_collector_process_lifetime_terminal_summary");
+    cumulative["unavailable_reason"] = Value::Null;
+    evidence["durable_commits"]["collector_teardown_admissions"] =
+        json!({"status":"clear", "cancelled_ambiguous":0, "source":"fenced_terminal_summaries"});
+    evidence["reconciliation"] = cell.reconciliation(&row.table, evidence.get("durable_commits"));
+    row.evidence_json = Some(serde_json::to_string(&evidence)?);
+    Ok(true)
 }
 
 fn attach_collector_teardown_admissions(
@@ -4716,6 +4901,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             campaign_cli_paths: None,
             maintenance_cell_baseline: Vec::new(),
             stopped_collector_logs: None,
+            shutdown_inputs: None,
         })),
     }
 }
@@ -11157,7 +11343,7 @@ struct ShutdownFinalizationInputsRequest<'a> {
     actor: &'a CampaignCleanupActor,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ShutdownFinalizationInputs {
     schema_version: u8,
@@ -11170,6 +11356,43 @@ struct ShutdownFinalizationInputs {
     delta_terminal: Option<ShutdownSourceReference>,
     #[serde(deserialize_with = "deserialize_present_campaign_option")]
     unavailable_reason: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    terminal_summaries: Option<Vec<ShutdownTerminalPodSummary>>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalPodSummary {
+    pod_name: String,
+    pod_uid: String,
+    container: String,
+    restart_count: u64,
+    exit_code: i64,
+    summary: ShutdownTerminalSummary,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalSummary {
+    schema_version: u8,
+    admitted: u64,
+    committed: u64,
+    failed: u64,
+    cancelled_ambiguous: u64,
+    pending: u64,
+    committed_rows: u64,
+    incomplete: u8,
+    commits: Vec<ShutdownTerminalCommit>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalCommit {
+    table_id: String,
+    version: u64,
+    rows: u64,
+    files: u64,
+    parquet_bytes: u64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -11406,6 +11629,23 @@ fn validate_shutdown_finalization(
         {
             bail!("shutdown finalization has duplicate, malformed, or provisional collector verdicts");
         }
+    }
+    if receipt.status == "validated"
+        && let Some(summaries) = &inputs.terminal_summaries
+        && (summaries.len() != receipt.verdicts.len()
+            || summaries.iter().any(|summary| {
+                summary.restart_count != 0
+                    || summary.exit_code != 0
+                    || !receipt.verdicts.iter().any(|verdict| {
+                        verdict.pod_name == summary.pod_name
+                            && verdict.pod_uid == summary.pod_uid
+                            && verdict.container == summary.container
+                            && verdict.restart_count == Some(0)
+                            && verdict.classification == "exit_0"
+                    })
+            }))
+    {
+        bail!("validated collector verdicts differ from terminal summary identities");
     }
     if receipt.status == "validated"
         && (receipt.verdicts.is_empty()
@@ -12240,10 +12480,9 @@ async fn persist_campaign_inventory_snapshot(
     Ok(())
 }
 
-async fn finalize_campaign_shutdown(
+async fn read_campaign_shutdown_inputs(
     platform: &AksPlatform,
-    reconciliation: &ShutdownReconciliationRequest,
-) -> Result<ShutdownFinalizationReceipt> {
+) -> Result<(RunInventory, String, CampaignCleanupActor, ShutdownFinalizationInputs)> {
     let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
     let runtime_dir = platform
         .runtime_dir
@@ -12290,7 +12529,7 @@ async fn finalize_campaign_shutdown(
         "shutdown-finalization-inputs",
         None,
         &input_request,
-        Duration::from_secs(30),
+        Duration::from_secs(40),
     )
     .await?;
     let input_response: ShutdownFinalizationInputsResponse =
@@ -12300,6 +12539,27 @@ async fn finalize_campaign_shutdown(
     }
     let inputs = input_response.receipt;
     validate_shutdown_inputs(&inputs, &inventory, &etag)?;
+    Ok((inventory, etag, actor, inputs))
+}
+
+async fn finalize_campaign_shutdown(
+    platform: &AksPlatform,
+    reconciliation: &ShutdownReconciliationRequest,
+) -> Result<ShutdownFinalizationReceipt> {
+    let (inventory, etag, actor, inputs) = read_campaign_shutdown_inputs(platform).await?;
+    if let Some(previous) = &platform.shutdown_inputs
+        && previous != &inputs
+    {
+        bail!("frozen shutdown sources changed after reconciliation; release withheld");
+    }
+    let input_request = ShutdownFinalizationInputsRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+    };
     let request = ShutdownFinalizationRequest {
         schema_version: 1,
         campaign_id: &inventory.campaign_id,
@@ -12326,7 +12586,7 @@ async fn finalize_campaign_shutdown(
     let receipt = submit_shutdown_finalization_once(
         |action| {
             let payload = if action == "shutdown-finalize" { &write } else { &read };
-            async move { run_campaign_custody_json(platform, action, None, payload, Duration::from_secs(30)).await }
+            async move { run_campaign_custody_json(platform, action, None, payload, Duration::from_secs(40)).await }
         },
         confirm,
     )
@@ -17976,6 +18236,7 @@ mod tests {
             delta_before: Some(reference(format!("{root}/delta-before.json"))),
             delta_terminal: Some(reference(format!("{root}/delta-terminal.json"))),
             unavailable_reason: None,
+            terminal_summaries: None,
         };
         let mut row = sample_result("run", "table", 7);
         row.evidence_json = Some(json!({
@@ -18136,16 +18397,144 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn shutdown_terminal_summary_requires_complete_identity_and_exact_delta_versions() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.clients_per_table = 1;
+        let table = "sqlserver_availability_replica_states";
+        config.tables = vec![table.to_owned()];
+        let root = "abfss://data@example.dfs.core.windows.net/campaign/run/dataflow";
+        let table_id = fixture_sha256(format!("{root}/telemetry/sqlserver/{table}/").as_bytes());
+        let source = ShutdownSourceReference {
+            blob: "terminal".to_owned(),
+            etag: "\"etag\"".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let pod = |index: u64| ShutdownTerminalPodSummary {
+            pod_name: format!("collector-{index}"),
+            pod_uid: format!("uid-{index}"),
+            container: config.dfe_container.clone(),
+            restart_count: 0,
+            exit_code: 0,
+            summary: ShutdownTerminalSummary {
+                schema_version: 1,
+                admitted: 1,
+                committed: 1,
+                failed: 0,
+                cancelled_ambiguous: 0,
+                pending: 0,
+                committed_rows: 5,
+                incomplete: 0,
+                commits: vec![ShutdownTerminalCommit {
+                    table_id: table_id.clone(),
+                    version: index + 1,
+                    rows: 5,
+                    files: 1,
+                    parquet_bytes: 50,
+                }],
+            },
+        };
+        let mut inputs = ShutdownFinalizationInputs {
+            schema_version: 1,
+            inventory_etag: "\"inventory\"".to_owned(),
+            terminal_capture: Some(source.clone()),
+            delta_before: Some(source.clone()),
+            delta_terminal: Some(source),
+            unavailable_reason: None,
+            terminal_summaries: Some(vec![pod(0), pod(1)]),
+        };
+        let mut row = sample_result("run", table, 10);
+        row.replicas = 2;
+        row.evidence_json = Some(json!({
+            "client_phase_reports":[{"phase_counters":{"process_cumulative":{"completed_rows":10,"ambiguous_rows":0}}}],
+            "durable_commits":{"run_cumulative_output":{"settle_seconds":1.0,"settle_timeout_seconds":2}}
+        }).to_string());
+        let original = row.clone();
+        assert!(attach_terminal_summary_commits(
+            &config,
+            Some(root),
+            std::slice::from_mut(&mut row),
+            &inputs
+        )?);
+        let delta = json!({"rows":10,"versions":[{"delta_version":1,"rows":5,"files":1,"parquet_bytes":50},
+            {"delta_version":2,"rows":5,"files":1,"parquet_bytes":50}]});
+        apply_final_aks_delta_reconciliation(&config, &mut row, Some(&delta), true)?;
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(
+            evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"],
+            "matched"
+        );
+        assert_eq!(
+            evidence["durable_commits"]["collector_teardown_admissions"]["status"],
+            "clear"
+        );
+        let mut mismatched = delta.clone();
+        mismatched["versions"][0]["parquet_bytes"] = json!(51);
+        apply_final_aks_delta_reconciliation(&config, &mut row, Some(&mismatched), true)?;
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(
+            evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"],
+            "mismatch"
+        );
+        for fault in 0..10 {
+            let mut bad = inputs.clone();
+            let summaries = bad.terminal_summaries.as_mut().context("missing summaries")?;
+            match fault {
+                0 => summaries[0].restart_count = 1,
+                1 => summaries[0].exit_code = 143,
+                2 => summaries[0].summary.incomplete = 1,
+                3 => summaries[0].summary.cancelled_ambiguous = 1,
+                4 => summaries[0].summary.commits[0].table_id = "b".repeat(64),
+                5 => summaries[1].summary.commits[0].version = summaries[0].summary.commits[0].version,
+                6 => {
+                    let _ = summaries.pop();
+                }
+                7 => summaries[0].summary.admitted += 1,
+                8 => summaries[0].summary.pending = 1,
+                9 => summaries[1].pod_uid = summaries[0].pod_uid.clone(),
+                _ => bail!("invalid summary test case"),
+            }
+            let mut candidate = original.clone();
+            assert!(
+                attach_terminal_summary_commits(&config, Some(root), std::slice::from_mut(&mut candidate), &bad)
+                    .is_err()
+            );
+            assert_eq!(candidate.evidence_json, original.evidence_json);
+        }
+        let mut wire = json!({"schema_version":1,"inventory_etag":"\"inventory\"", "terminal_capture":null,
+            "delta_before":null,"delta_terminal":null,"unavailable_reason":"no_baseline"});
+        assert!(serde_json::from_value::<ShutdownFinalizationInputs>(wire.clone()).is_err());
+        wire["terminal_summaries"] = Value::Null;
+        assert!(
+            serde_json::from_value::<ShutdownFinalizationInputs>(wire)?
+                .terminal_summaries
+                .is_none()
+        );
+        inputs.terminal_summaries = None;
+        assert!(!attach_terminal_summary_commits(
+            &config,
+            Some(root),
+            std::slice::from_mut(&mut row),
+            &inputs
+        )?);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn shutdown_finalization_unknown_write_uses_readback_without_replay() -> Result<()> {
         for readback_available in [true, false] {
             let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let observed = calls.clone();
+            let observed = std::sync::Arc::clone(&calls);
             let result = submit_shutdown_finalization_once(
                 move |action| {
-                    let observed = observed.clone();
+                    let observed = std::sync::Arc::clone(&observed);
                     async move {
-                        observed.lock().expect("calls lock").push(action);
+                        observed
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("calls lock poisoned"))?
+                            .push(action);
                         if action == "shutdown-finalization-read" && readback_available {
                             Ok(b"confirmed".to_vec())
                         } else {
@@ -18164,7 +18553,7 @@ mod tests {
             .await;
             assert_eq!(result.is_ok(), readback_available);
             assert_eq!(
-                *calls.lock().expect("calls lock"),
+                *calls.lock().map_err(|_| anyhow::anyhow!("calls lock poisoned"))?,
                 ["shutdown-finalize", "shutdown-finalization-read"]
             );
         }
@@ -19054,6 +19443,7 @@ mod tests {
             campaign_cli_paths: None,
             maintenance_cell_baseline: Vec::new(),
             stopped_collector_logs: None,
+            shutdown_inputs: None,
         };
         platform.run_table_initialization_attempted = true;
         assert!(require_aks_cleanup_confirmation(&platform).is_err());

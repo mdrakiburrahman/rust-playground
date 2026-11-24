@@ -77,6 +77,7 @@ mod pin_init_tests {
             campaign_cli_paths: None,
             maintenance_cell_baseline: Vec::new(),
             stopped_collector_logs: None,
+            shutdown_inputs: None,
         };
         Ok((config, platform, runtime))
     }

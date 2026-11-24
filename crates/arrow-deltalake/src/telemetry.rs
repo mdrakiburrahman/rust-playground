@@ -3,7 +3,7 @@
 use delta_kernel::metrics::{CommitFailureReason, MetricEvent, MetricsReporter};
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Attach this reporter using Kernel's `WithMetricsReporterLayer` to the process's
@@ -223,6 +223,70 @@ pub(crate) fn partition_binding(path: &'static str) {
     publications().binding_batches.add(1, &[KeyValue::new("path", path)]);
 }
 
+const MAX_TERMINAL_COMMITS: usize = 100_000;
+
+#[derive(Clone, Debug, serde::Serialize)]
+/// A directly observed physical Delta commit for terminal reconciliation.
+pub struct TerminalCommit {
+    /// SHA-256 of the writer's normalized table URL.
+    pub table_id: String,
+    /// Exact committed Delta version.
+    pub version: u64,
+    /// Number of rows added by this commit.
+    pub rows: u64,
+    /// Number of files added by this commit.
+    pub files: u64,
+    /// Total Parquet bytes added by this commit.
+    pub parquet_bytes: u64,
+}
+
+#[derive(Default)]
+struct TerminalCommits {
+    commits: Vec<TerminalCommit>,
+    incomplete: bool,
+    overflow: bool,
+}
+
+static TERMINAL_COMMITS: OnceLock<Mutex<TerminalCommits>> = OnceLock::new();
+
+fn terminal_commits() -> &'static Mutex<TerminalCommits> {
+    TERMINAL_COMMITS.get_or_init(|| Mutex::new(TerminalCommits::default()))
+}
+
+/// Marks process-lifetime commit attribution as unsuitable for a completeness proof.
+pub fn mark_terminal_commit_incomplete() {
+    if let Ok(mut evidence) = terminal_commits().lock() {
+        evidence.incomplete = true;
+    }
+}
+
+/// Returns the retained process-lifetime commit facts, or none if they cannot be complete.
+#[must_use]
+pub fn terminal_commit_snapshot() -> Option<(bool, Vec<TerminalCommit>)> {
+    let evidence = terminal_commits().lock().ok()?;
+    if evidence.overflow {
+        return None;
+    }
+    Some((evidence.incomplete, evidence.commits.clone()))
+}
+
+pub(crate) fn record_terminal_commit(table_id: &str, version: u64, rows: u64, files: u64, parquet_bytes: u64) {
+    if let Ok(mut evidence) = terminal_commits().lock() {
+        if evidence.commits.len() == MAX_TERMINAL_COMMITS {
+            evidence.incomplete = true;
+            evidence.overflow = true;
+        } else if !evidence.overflow {
+            evidence.commits.push(TerminalCommit {
+                table_id: table_id.to_owned(),
+                version,
+                rows,
+                files,
+                parquet_bytes,
+            });
+        }
+    }
+}
+
 /// Counts only newly committed AddFiles after the local durability barrier.
 /// These process counters are not a per-cell measurement without boundary evidence.
 #[allow(clippy::too_many_arguments)]
@@ -263,6 +327,7 @@ pub(crate) fn data_commit(
 }
 
 pub(crate) fn ambiguous_commit_reconciled(table_id: &str, table_name: Option<&str>, elapsed: Duration) {
+    mark_terminal_commit_incomplete();
     publication_event("commit_attribution_uncertain");
     let event = ambiguous_commit_event(table_id, table_name, elapsed);
     eprintln!("arrowcol_data_commit {event}");

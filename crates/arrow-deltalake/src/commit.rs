@@ -1076,6 +1076,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_evidence_records_direct_commit_and_marks_prepared_replay() -> Result<()> {
+        use sha2::Digest;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table URL"))?;
+        let table_id = format!("{:x}", sha2::Sha256::digest(url.as_str().as_bytes()));
+        let table = BatchedTable::open(&root, CommitOptions::default()).await?;
+        let group = table
+            .stage_coalesced_publications(vec![(input()?, "logical".into(), 0, 10)])
+            .await?;
+        let commit = table.submit_prepared_group(group, true).await?.wait().await?;
+        let (_, commits) = crate::telemetry::terminal_commit_snapshot().context("missing terminal commit evidence")?;
+        let event = commits
+            .iter()
+            .find(|event| event.table_id == table_id)
+            .context("missing direct commit")?;
+        assert_eq!((event.version, event.rows, event.files), (commit.version, 1, 1));
+        assert!(event.parquet_bytes > 0);
+        let replay = table
+            .stage_coalesced_publications(vec![(input()?, "logical".into(), 0, 10)])
+            .await?;
+        assert!(!replay.committed_identities.is_empty());
+        assert!(
+            crate::telemetry::terminal_commit_snapshot()
+                .context("missing replay evidence")?
+                .0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn coalesced_groups_share_versions_without_replaying_overlapping_identities() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let table = BatchedTable::open(

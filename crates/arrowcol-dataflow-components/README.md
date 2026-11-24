@@ -43,6 +43,14 @@ client resubmission ID does not prove recovery of the original publication.
 An interrupted or failed DFE send with no proven publication remains incomplete;
 the send-error abstraction does not prove that no downstream delivery occurred.
 
+| Terminal evidence | Meaning |
+| --- | --- |
+| `arrowcol_terminal_evidence` schema 1 | Emitted after clean close and terminal routing writes when bounded process-lifetime accounting is available. |
+| Admission counts | Distinct receiver publication IDs offered downstream, including rejected sends; committed, failed, cancelled-ambiguous and pending partition these IDs. |
+| Commit tuples | Normalized table-URL SHA-256, exact version, rows, files and Parquet bytes for directly observed first-attempt commits; `committed_rows` sums these tuples. |
+| Completeness | Replay, retry, cancellation, admission race or uncertain attribution sets `incomplete=1`; overflow suppresses the summary. Missing or incomplete evidence cannot prove delivery. |
+| Reconciliation | The summary alone is not proof of client delivery or agreement with Delta. |
+
 `arrowcol-dataflow-components` links three external OTAP Dataflow Engine (DFE)
 nodes:
 
