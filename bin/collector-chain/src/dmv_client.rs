@@ -220,6 +220,14 @@ pub struct Options {
     pub max_flight_data_bytes: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES", default_value_t = 16_777_216)]
     pub max_message_bytes: usize,
+    #[arg(long, env = "ARROWCOL_CLIENT_GRPC_MAX_ENCODE_BYTES")]
+    pub grpc_max_encode_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_CLIENT_GRPC_MAX_DECODE_BYTES")]
+    pub grpc_max_decode_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_CLIENT_SOCKET_SEND_BUFFER_BYTES")]
+    pub socket_send_buffer_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_CLIENT_SOCKET_RECV_BUFFER_BYTES")]
+    pub socket_recv_buffer_bytes: Option<usize>,
     #[arg(long, env = "ARROWCOL_CLIENT_STREAM_WINDOW_BYTES", default_value_t = 1_048_576)]
     pub stream_window_bytes: u32,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTION_WINDOW_BYTES", default_value_t = 16_777_216)]
@@ -265,7 +273,144 @@ pub struct Options {
     pub rate_limit_period_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct SocketReadback {
+    generation: u64,
+    requested_send_buffer_bytes: Option<usize>,
+    requested_recv_buffer_bytes: Option<usize>,
+    send_buffer_bytes: usize,
+    recv_buffer_bytes: usize,
+    send_buffer_kernel_clamp_observed: Option<bool>,
+    recv_buffer_kernel_clamp_observed: Option<bool>,
+}
+
+#[derive(Default)]
+struct SocketState {
+    generation: u64,
+    current: Option<SocketReadback>,
+    socket: Option<socket2::Socket>,
+}
+
+type SocketObservation = Arc<Mutex<SocketState>>;
+
+struct ObservedSocket {
+    stream: tokio::net::TcpStream,
+    observation: SocketObservation,
+    generation: u64,
+}
+
+impl ObservedSocket {
+    fn invalidate(&self) {
+        if let Ok(mut state) = self.observation.lock()
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|readback| readback.generation == self.generation)
+        {
+            state.current = None;
+            state.socket = None;
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ObservedSocket {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let has_capacity = buf.remaining() > 0;
+        let result = std::pin::Pin::new(&mut self.stream).poll_read(cx, buf);
+        if matches!(&result, std::task::Poll::Ready(Err(_)))
+            || (has_capacity && matches!(&result, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before)
+        {
+            self.invalidate();
+        }
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedSocket {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
+        if matches!(&result, std::task::Poll::Ready(Err(_)))
+            || (!buf.is_empty() && matches!(result, std::task::Poll::Ready(Ok(0))))
+        {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        tokio::io::AsyncWrite::is_write_vectored(&self.stream)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_write_vectored(cx, bufs);
+        if matches!(&result, std::task::Poll::Ready(Err(_))) {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_flush(cx);
+        if matches!(&result, std::task::Poll::Ready(Err(_))) {
+            self.invalidate();
+        }
+        result
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_shutdown(cx);
+        if result.is_ready() {
+            self.invalidate();
+        }
+        result
+    }
+}
+
+impl Drop for ObservedSocket {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
+#[derive(Serialize)]
+struct AppliedTransport {
+    max_frame_bytes: u32,
+    keepalive_interval_ms: u64,
+    keepalive_timeout_ms: u64,
+    grpc_max_encode_bytes: usize,
+    grpc_max_decode_bytes: usize,
+}
+
 impl Options {
+    fn applied_transport(&self) -> AppliedTransport {
+        AppliedTransport {
+            max_frame_bytes: self.max_frame_bytes,
+            keepalive_interval_ms: self.keepalive_interval_ms,
+            keepalive_timeout_ms: self.keepalive_timeout_ms,
+            grpc_max_encode_bytes: self.grpc_max_encode_bytes.unwrap_or(self.max_message_bytes),
+            grpc_max_decode_bytes: self.grpc_max_decode_bytes.unwrap_or(self.max_message_bytes),
+        }
+    }
+
     /// Resolve legacy aliases and reject invalid or unbounded resource requests.
     ///
     /// # Errors
@@ -402,6 +547,26 @@ impl Options {
             "require 1024 <= max-flight-data-bytes <= max-message-bytes <= 2147483647"
         );
         anyhow::ensure!(
+            (self.max_flight_data_bytes..=i32::MAX as usize)
+                .contains(&self.grpc_max_encode_bytes.unwrap_or(self.max_message_bytes))
+                && (1..=i32::MAX as usize).contains(&self.grpc_max_decode_bytes.unwrap_or(self.max_message_bytes)),
+            "gRPC encode limit must fit max-flight-data-bytes; decode limit must be positive; both must be <= 2147483647"
+        );
+        for value in [self.socket_send_buffer_bytes, self.socket_recv_buffer_bytes]
+            .into_iter()
+            .flatten()
+        {
+            anyhow::ensure!(
+                (1..=1_073_741_823).contains(&value),
+                "socket buffer bytes must be in 1..=1073741823"
+            );
+        }
+        anyhow::ensure!(
+            cfg!(target_os = "linux")
+                || (self.socket_send_buffer_bytes.is_none() && self.socket_recv_buffer_bytes.is_none()),
+            "client socket buffer settings are supported only on Linux"
+        );
+        anyhow::ensure!(
             (1..=i32::MAX as u32).contains(&self.stream_window_bytes)
                 && (1..=i32::MAX as u32).contains(&self.connection_window_bytes),
             "HTTP/2 windows must be 1..=2147483647 bytes"
@@ -470,16 +635,17 @@ impl Options {
     }
 
     fn endpoint(&self, address: &str) -> Result<Endpoint> {
+        let applied = self.applied_transport();
         let mut endpoint = Endpoint::from_shared(address.to_owned())?
             .connect_timeout(Duration::from_millis(self.connect_timeout_ms))
             .timeout(Duration::from_millis(self.request_timeout_ms))
             .initial_stream_window_size(self.stream_window_bytes)
             .initial_connection_window_size(self.connection_window_bytes)
-            .max_frame_size(self.max_frame_bytes)
+            .max_frame_size(applied.max_frame_bytes)
             .http2_header_table_size(self.header_table_bytes)
             .http2_max_header_list_size(self.max_header_list_bytes)
             .http2_adaptive_window(self.adaptive_window)
-            .keep_alive_timeout(Duration::from_millis(self.keepalive_timeout_ms))
+            .keep_alive_timeout(Duration::from_millis(applied.keepalive_timeout_ms))
             .keep_alive_while_idle(self.keepalive_while_idle)
             .tcp_nodelay(self.tcp_nodelay)
             .tcp_keepalive((self.tcp_keepalive_ms > 0).then(|| Duration::from_millis(self.tcp_keepalive_ms)))
@@ -489,8 +655,8 @@ impl Options {
             .tcp_keepalive_retries((self.tcp_keepalive_retries > 0).then_some(self.tcp_keepalive_retries))
             .concurrency_limit(self.endpoint_concurrency_limit)
             .buffer_size(self.endpoint_buffer_size);
-        if self.keepalive_interval_ms > 0 {
-            endpoint = endpoint.http2_keep_alive_interval(Duration::from_millis(self.keepalive_interval_ms));
+        if applied.keepalive_interval_ms > 0 {
+            endpoint = endpoint.http2_keep_alive_interval(Duration::from_millis(applied.keepalive_interval_ms));
         }
         if self.rate_limit_rps > 0 {
             endpoint = endpoint.rate_limit(self.rate_limit_rps, Duration::from_millis(self.rate_limit_period_ms));
@@ -498,11 +664,84 @@ impl Options {
         Ok(endpoint)
     }
 
-    async fn connect(&self, address: &str) -> Result<Channel> {
+    async fn connect(&self, address: &str) -> Result<(Channel, Option<SocketObservation>)> {
         let endpoint = self.endpoint(address)?;
+        let observation = (self.socket_send_buffer_bytes.is_some() || self.socket_recv_buffer_bytes.is_some())
+            .then(|| Arc::new(Mutex::new(SocketState::default())));
         for attempt in 0..=self.connect_retries {
-            match endpoint.connect().await {
-                Ok(channel) => return Ok(channel),
+            let result = if let Some(observation) = &observation {
+                let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+                connector.enforce_http(false);
+                connector.set_nodelay(self.tcp_nodelay);
+                connector
+                    .set_keepalive((self.tcp_keepalive_ms > 0).then(|| Duration::from_millis(self.tcp_keepalive_ms)));
+                connector.set_keepalive_interval(
+                    (self.tcp_keepalive_interval_ms > 0).then(|| Duration::from_millis(self.tcp_keepalive_interval_ms)),
+                );
+                connector.set_keepalive_retries((self.tcp_keepalive_retries > 0).then_some(self.tcp_keepalive_retries));
+                connector.set_connect_timeout(Some(Duration::from_millis(self.connect_timeout_ms)));
+                connector.set_send_buffer_size(self.socket_send_buffer_bytes);
+                connector.set_recv_buffer_size(self.socket_recv_buffer_bytes);
+                let send = self.socket_send_buffer_bytes;
+                let recv = self.socket_recv_buffer_bytes;
+                let observation = Arc::clone(observation);
+                let connector = tower::service_fn(move |uri: http::Uri| {
+                    use tower::ServiceExt;
+                    let connector = connector.clone();
+                    let observation = Arc::clone(&observation);
+                    async move {
+                        {
+                            let mut state = observation
+                                .lock()
+                                .map_err(|_| std::io::Error::other("socket observation lock poisoned"))?;
+                            state.current = None;
+                            state.socket = None;
+                        }
+                        let stream = connector.oneshot(uri).await.map_err(std::io::Error::other)?;
+                        let socket = socket2::SockRef::from(stream.inner());
+                        if let Some(size) = send {
+                            socket.set_send_buffer_size(size)?;
+                        }
+                        if let Some(size) = recv {
+                            socket.set_recv_buffer_size(size)?;
+                        }
+                        let send_buffer_bytes = socket.send_buffer_size()?;
+                        let recv_buffer_bytes = socket.recv_buffer_size()?;
+                        let readback_socket = socket.try_clone()?;
+                        let mut state = observation
+                            .lock()
+                            .map_err(|_| std::io::Error::other("socket observation lock poisoned"))?;
+                        let generation = state
+                            .generation
+                            .checked_add(1)
+                            .ok_or_else(|| std::io::Error::other("socket generation overflow"))?;
+                        state.generation = generation;
+                        state.socket = Some(readback_socket);
+                        state.current = Some(SocketReadback {
+                            generation,
+                            requested_send_buffer_bytes: send,
+                            requested_recv_buffer_bytes: recv,
+                            send_buffer_bytes,
+                            recv_buffer_bytes,
+                            // Linux reports twice the accepted request, subject to kernel minimums.
+                            send_buffer_kernel_clamp_observed: send.map(|requested| send_buffer_bytes / 2 < requested),
+                            recv_buffer_kernel_clamp_observed: recv.map(|requested| recv_buffer_bytes / 2 < requested),
+                        });
+                        drop(state);
+                        let stream = ObservedSocket {
+                            stream: stream.into_inner(),
+                            observation,
+                            generation,
+                        };
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                });
+                endpoint.connect_with_connector(connector).await
+            } else {
+                endpoint.connect().await
+            };
+            match result {
+                Ok(channel) => return Ok((channel, observation)),
                 Err(error) if attempt == self.connect_retries => return Err(error).context("connect Flight endpoint"),
                 Err(error) => {
                     eprintln!("Flight connection attempt {} failed: {error}", attempt + 1);
@@ -514,9 +753,10 @@ impl Options {
     }
 
     fn client(&self, channel: Channel) -> FlightServiceClient<Channel> {
+        let applied = self.applied_transport();
         let mut client = FlightServiceClient::new(channel)
-            .max_encoding_message_size(self.max_message_bytes)
-            .max_decoding_message_size(self.max_message_bytes);
+            .max_encoding_message_size(applied.grpc_max_encode_bytes)
+            .max_decoding_message_size(applied.grpc_max_decode_bytes);
         for (send, compression) in [
             (true, self.grpc_send_compression),
             (false, self.grpc_accept_compression),
@@ -1162,6 +1402,7 @@ pub struct PreparedClient {
     pub options: Options,
     corpus: Vec<Arc<Vec<EncodedBatch>>>,
     channels: Vec<Vec<Channel>>,
+    socket_observations: Vec<SocketObservation>,
     live_batch_slots: Arc<tokio::sync::Semaphore>,
     signer: Option<EdgeRequestSigner>,
     counters: Vec<Counters>,
@@ -1245,7 +1486,8 @@ impl PreparedClient {
             }
         }
         let signer = edge_secret_file.map(edge_signer_from_file).transpose()?;
-        let mut registration = options.client(options.connect(endpoint).await?);
+        let (registration_channel, _) = options.connect(endpoint).await?;
+        let mut registration = options.client(registration_channel);
         let mut versions = Vec::new();
         for table in &tables {
             versions.push(
@@ -1326,10 +1568,15 @@ impl PreparedClient {
         }
         let generator_applicability = generator_corpus_evidence(&corpus, &options)?;
         let mut channels = Vec::new();
+        let mut socket_observations = Vec::new();
         for _ in 0..options.workers {
             let mut worker = Vec::new();
             for _ in 0..options.connections_per_worker {
-                worker.push(options.connect(endpoint).await?);
+                let (channel, observation) = options.connect(endpoint).await?;
+                worker.push(channel);
+                if let Some(observation) = observation {
+                    socket_observations.push(observation);
+                }
             }
             channels.push(worker);
         }
@@ -1369,6 +1616,7 @@ impl PreparedClient {
             options,
             corpus,
             channels,
+            socket_observations,
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(memory.admitted_live_slots)),
             signer,
             next: AtomicU64::new(0),
@@ -1383,6 +1631,47 @@ impl PreparedClient {
             preparation,
             started: Instant::now(),
         }))
+    }
+
+    /// Settings supplied to the connected HTTP/2 endpoint and Flight client.
+    ///
+    /// # Errors
+    /// Returns an error if socket readback is unavailable or serialization fails.
+    pub fn applied_transport_json(&self) -> Result<String> {
+        let mut applied = serde_json::to_value(self.options.applied_transport())?;
+        let sockets = self
+            .socket_observations
+            .iter()
+            .map(|observation| {
+                let state = observation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("socket observation lock poisoned"))?;
+                let mut readback = state
+                    .current
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing connected socket readback"))?;
+                let socket = state
+                    .socket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing live socket"))?;
+                readback.send_buffer_bytes = socket.send_buffer_size()?;
+                readback.recv_buffer_bytes = socket.recv_buffer_size()?;
+                readback.send_buffer_kernel_clamp_observed = readback
+                    .requested_send_buffer_bytes
+                    .map(|requested| readback.send_buffer_bytes / 2 < requested);
+                readback.recv_buffer_kernel_clamp_observed = readback
+                    .requested_recv_buffer_bytes
+                    .map(|requested| readback.recv_buffer_bytes / 2 < requested);
+                Ok(readback)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        applied["socket_buffer_accounting"] = serde_json::json!(if cfg!(target_os = "linux") {
+            "linux_doubled"
+        } else {
+            "unsupported"
+        });
+        applied["socket_connections"] = serde_json::to_value(sockets)?;
+        Ok(serde_json::to_string(&applied)?)
     }
 
     fn next_batch(&self, worker: usize) -> &EncodedBatch {
@@ -3669,6 +3958,56 @@ mod tests {
             .resolve(100, 1)
     }
 
+    #[tokio::test]
+    async fn http2_frame_and_keepalive_reach_the_wire() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut preface = [0; 24];
+            socket.read_exact(&mut preface).await?;
+            anyhow::ensure!(&preface == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "bad HTTP/2 preface");
+            socket.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+            let mut max_frame = None;
+            loop {
+                let mut header = [0; 9];
+                socket.read_exact(&mut header).await?;
+                let len = (usize::from(header[0]) << 16) | (usize::from(header[1]) << 8) | usize::from(header[2]);
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await?;
+                if header[3] == 4 && header[4] == 0 {
+                    for entry in body.chunks_exact(6) {
+                        if entry[0..2] == [0, 5] {
+                            max_frame = Some(u32::from_be_bytes(entry[2..6].try_into()?));
+                        }
+                    }
+                }
+                if header[3] == 6 && header[4] == 0 {
+                    break;
+                }
+            }
+            let ping_at = Instant::now();
+            let mut byte = [0];
+            let end = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut byte)).await??;
+            anyhow::ensure!(end == 0, "client did not close after an unanswered ping");
+            Ok::<_, anyhow::Error>((max_frame, ping_at.elapsed()))
+        });
+        let mut options = options()?;
+        options.max_frame_bytes = 32_768;
+        options.keepalive_interval_ms = 25;
+        options.keepalive_timeout_ms = 150;
+        let (channel, _) = options.connect(&address).await?;
+        let (frame, elapsed) = tokio::time::timeout(Duration::from_secs(5), server).await???;
+        assert_eq!(frame, Some(32_768));
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "keepalive timed out prematurely: {elapsed:?}"
+        );
+        drop(channel);
+        Ok(())
+    }
+
     #[test]
     fn tcp_tunables_reach_tonic_endpoint() -> Result<()> {
         let mut options = options()?;
@@ -3896,6 +4235,7 @@ mod tests {
         Ok(PreparedClient {
             corpus: Vec::new(),
             channels: Vec::new(),
+            socket_observations: Vec::new(),
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             signer: None,
             counters: (0..workers).map(|_| Counters::default()).collect(),
@@ -5117,6 +5457,7 @@ mod tests {
                 encoded_bytes,
             }])],
             channels: vec![vec![channel]],
+            socket_observations: Vec::new(),
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             signer: None,
             counters: vec![Counters::default()],
@@ -5318,6 +5659,7 @@ mod tests {
         let client = PreparedClient {
             corpus: vec![corpus(), corpus()],
             channels: vec![],
+            socket_observations: Vec::new(),
             live_batch_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             signer: None,
             counters: vec![],
@@ -5401,6 +5743,18 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     )> {
+        gated_quiesce_client_with_buffers(None, None).await
+    }
+
+    async fn gated_quiesce_client_with_buffers(
+        send: Option<usize>,
+        recv: Option<usize>,
+    ) -> Result<(
+        Arc<PreparedClient>,
+        Arc<QuiesceFlightState>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    )> {
         use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
         use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
         use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
@@ -5442,6 +5796,8 @@ mod tests {
         options.streams_per_worker = 1;
         options.request_timeout_ms = 3000;
         options.quiesce_timeout_ms = Some(3000);
+        options.socket_send_buffer_bytes = send;
+        options.socket_recv_buffer_bytes = recv;
         let client = PreparedClient::prepare(
             &endpoint,
             "quiesce-test",
@@ -5451,6 +5807,196 @@ mod tests {
         )
         .await?;
         Ok((client, state, shutdown, server))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_buffer_readback_is_from_connected_kernel_socket() -> Result<()> {
+        let (client, _, shutdown, server) = gated_quiesce_client_with_buffers(Some(4096), Some(4096)).await?;
+        let applied: serde_json::Value = serde_json::from_str(&client.applied_transport_json()?)?;
+        let sockets = applied["socket_connections"].as_array().context("missing sockets")?;
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0]["requested_send_buffer_bytes"], 4096);
+        assert_eq!(sockets[0]["requested_recv_buffer_bytes"], 4096);
+        assert_eq!(sockets[0]["generation"], 1);
+        assert_eq!(sockets[0]["send_buffer_kernel_clamp_observed"], false);
+        assert_eq!(sockets[0]["recv_buffer_kernel_clamp_observed"], false);
+        for field in ["send_buffer_bytes", "recv_buffer_bytes"] {
+            let effective = sockets[0][field].as_u64().context("missing buffer readback")?;
+            assert!(
+                effective >= 8192,
+                "kernel readback must reflect Linux buffer accounting: {effective}"
+            );
+            assert_ne!(effective, 4096);
+        }
+        let kernel_now = {
+            let state = client.socket_observations[0]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let socket = state.socket.as_ref().context("missing socket")?;
+            socket.set_send_buffer_size(8192)?;
+            socket.send_buffer_size()?
+        };
+        let updated: serde_json::Value = serde_json::from_str(&client.applied_transport_json()?)?;
+        assert_eq!(updated["socket_connections"][0]["send_buffer_bytes"], kernel_now);
+        drop(client);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_changes_live_socket_generation() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let (close_first, close_rx) = tokio::sync::oneshot::channel();
+        let (close_second, close_second_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            for close in [close_rx, close_second_rx] {
+                let (mut socket, _) = listener.accept().await?;
+                let mut preface = [0; 24];
+                socket.read_exact(&mut preface).await?;
+                socket.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+                let _ = close.await;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let mut options = options()?;
+        options.socket_send_buffer_bytes = Some(4096);
+        let (channel, observation) = options.connect(&address).await?;
+        let observation = observation.context("missing socket observation")?;
+        assert_eq!(
+            observation.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.generation,
+            1
+        );
+        close_first
+            .send(())
+            .map_err(|_| anyhow::anyhow!("first server stopped"))?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if observation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .current
+                    .is_none()
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        let mut client = options.client(channel.clone());
+        let request = tokio::spawn(async move {
+            loop {
+                let _ = client.get_flight_info(FlightDescriptor::default()).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if observation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .current
+                    .as_ref()
+                    .is_some_and(|readback| readback.generation == 2)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        request.abort();
+        let _ = close_second.send(());
+        drop(channel);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_socket_drop_cannot_invalidate_reconnected_socket() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let first = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (_peer1, _) = listener.accept().await?;
+        let second = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (_peer2, _) = listener.accept().await?;
+        let readback = SocketReadback {
+            generation: 2,
+            requested_send_buffer_bytes: Some(4096),
+            requested_recv_buffer_bytes: None,
+            send_buffer_bytes: 8192,
+            recv_buffer_bytes: 8192,
+            send_buffer_kernel_clamp_observed: Some(false),
+            recv_buffer_kernel_clamp_observed: None,
+        };
+        let state = Arc::new(Mutex::new(SocketState {
+            generation: 2,
+            current: Some(readback),
+            socket: None,
+        }));
+        let old = ObservedSocket {
+            stream: first,
+            observation: Arc::clone(&state),
+            generation: 1,
+        };
+        let new = ObservedSocket {
+            stream: second,
+            observation: Arc::clone(&state),
+            generation: 2,
+        };
+        drop(old);
+        assert_eq!(
+            state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .current
+                .as_ref()
+                .map(|value| value.generation),
+            Some(2)
+        );
+        drop(new);
+        assert!(state.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.current.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grpc_encode_and_decode_limits_are_independent() -> Result<()> {
+        let (prepared, state, shutdown, server) = gated_quiesce_client().await?;
+        let applied: serde_json::Value = serde_json::from_str(&prepared.applied_transport_json()?)?;
+        assert_eq!(applied["socket_connections"], serde_json::json!([]));
+        assert_eq!(applied["grpc_max_encode_bytes"], prepared.options.max_message_bytes);
+        assert_eq!(applied["grpc_max_decode_bytes"], prepared.options.max_message_bytes);
+        let channel = prepared.channels[0][0].clone();
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let mut options = prepared.options.clone();
+        options.grpc_max_encode_bytes = Some(1);
+        assert!(
+            register(&mut options.client(channel.clone()), &table, None)
+                .await
+                .is_err()
+        );
+        options.grpc_max_encode_bytes = None;
+        register(&mut options.client(channel.clone()), &table, None).await?;
+        options.grpc_max_decode_bytes = Some(1);
+        let batch = &prepared.corpus[0][0];
+        let mut request = Request::new(stream::iter(send_frames(&batch.data, options.send_iter)));
+        request_metadata(&mut request, &batch.table, None, None)?;
+        let mut response = options.client(channel).do_put(request).await?.into_inner();
+        state.release.add_permits(1);
+        let Err(error) = response.message().await else {
+            anyhow::bail!("expected a decode limit error");
+        };
+        assert!(
+            format!("{error:#}").contains("decoded message length too large"),
+            "{error:#}"
+        );
+        drop(prepared);
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
     }
 
     async fn wait_for_gated_send(state: &QuiesceFlightState) -> Result<()> {

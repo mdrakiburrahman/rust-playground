@@ -121,10 +121,13 @@ async fn run(args: Args) -> Result<()> {
         options,
     )
     .await?;
+    println!("OAT_CLIENT_APPLIED_TRANSPORT {}", client.applied_transport_json()?);
     println!("OAT_CLIENT_METRICS {}", client.metrics("prepared")?);
     let result = run_prepared(&args, &client).await;
     if result.is_err() {
         eprintln!("OAT_CLIENT_METRICS {}", client.failed_terminal_metrics()?);
+    } else if let Ok(final_transport) = client.applied_transport_json() {
+        println!("OAT_CLIENT_FINAL_TRANSPORT {final_transport}");
     }
     result
 }

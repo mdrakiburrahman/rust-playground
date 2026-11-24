@@ -156,6 +156,30 @@ pub struct TransportTunables {
     pub dictionary_handling: Option<DictionaryHandling>,
     pub max_flight_data_bytes: Option<u64>,
     pub max_message_bytes: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub grpc_max_encode_bytes: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub grpc_max_decode_bytes: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub socket_send_buffer_bytes: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub socket_recv_buffer_bytes: Option<usize>,
     pub grpc_send_compression: Option<GrpcCompression>,
     pub grpc_accept_compression: Option<GrpcCompression>,
     pub max_frame_bytes: Option<u32>,

@@ -131,6 +131,16 @@ const CAPABILITIES: &[Capability] = &[
         "OAT DMV=2097152; standalone=32505856"
     ),
     capability!("transport.max_message_bytes", "OAT DMV=16777216; standalone=33554432"),
+    capability!("transport.socket_send_buffer_bytes", "OS default"),
+    capability!("transport.socket_recv_buffer_bytes", "OS default"),
+    capability!(
+        "transport.grpc_max_encode_bytes",
+        "inherits transport.max_message_bytes"
+    ),
+    capability!(
+        "transport.grpc_max_decode_bytes",
+        "inherits transport.max_message_bytes"
+    ),
     capability!("transport.grpc_send_compression", "disabled"),
     capability!("transport.grpc_accept_compression", "disabled"),
     capability!("transport.max_frame_bytes", "16384"),
@@ -897,6 +907,26 @@ impl Tunables {
             }
             if flight_bytes < 1_024 || flight_bytes > message_bytes {
                 bail!("transport.max_flight_data_bytes must be at least 1024 and no greater than max_message_bytes");
+            }
+            let encode_bytes = transport
+                .grpc_max_encode_bytes
+                .map_or(message_bytes, |value| value as u64);
+            let decode_bytes = transport
+                .grpc_max_decode_bytes
+                .map_or(message_bytes, |value| value as u64);
+            for (name, value) in [
+                ("socket_send_buffer_bytes", transport.socket_send_buffer_bytes),
+                ("socket_recv_buffer_bytes", transport.socket_recv_buffer_bytes),
+            ] {
+                if value.is_some_and(|value| !(1..=1_073_741_823).contains(&value)) {
+                    bail!("transport.{name} must be in 1..=1073741823");
+                }
+            }
+            if encode_bytes < flight_bytes || encode_bytes > i32::MAX as u64 {
+                bail!("transport.grpc_max_encode_bytes must be at least max_flight_data_bytes and at most i32::MAX");
+            }
+            if decode_bytes == 0 || decode_bytes > i32::MAX as u64 {
+                bail!("transport.grpc_max_decode_bytes must be between 1 and i32::MAX");
             }
             let frame_bytes = transport.max_frame_bytes.unwrap_or(16_384);
             if !(16_384..=16_777_215).contains(&frame_bytes) || u64::from(frame_bytes) > message_bytes {
@@ -2743,6 +2773,39 @@ fn flatten_environment(value: &Value, prefix: &str, output: &mut BTreeMap<String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transport_limits_are_strict_and_projected() -> anyhow::Result<()> {
+        let config = Tunables::parse_oat_json(serde_json::json!({"transport":{
+            "socket_send_buffer_bytes":4096, "socket_recv_buffer_bytes":8192,
+            "grpc_max_encode_bytes":4194304, "grpc_max_decode_bytes":1024,
+            "max_frame_bytes":32768, "keepalive_interval_ms":2000, "keepalive_timeout_ms":3000
+        }}))?;
+        let env = config.environment_for(ComponentRole::Client)?;
+        for (name, value) in [
+            ("SOCKET_SEND_BUFFER_BYTES", "4096"),
+            ("SOCKET_RECV_BUFFER_BYTES", "8192"),
+            ("GRPC_MAX_ENCODE_BYTES", "4194304"),
+            ("GRPC_MAX_DECODE_BYTES", "1024"),
+            ("MAX_FRAME_BYTES", "32768"),
+            ("KEEPALIVE_INTERVAL_MS", "2000"),
+            ("KEEPALIVE_TIMEOUT_MS", "3000"),
+        ] {
+            assert_eq!(env[&format!("ARROWCOL_CLIENT_{name}")], value);
+        }
+        for (field, bad) in [
+            ("socket_send_buffer_bytes", serde_json::json!(0)),
+            ("socket_recv_buffer_bytes", serde_json::json!(null)),
+            ("grpc_max_encode_bytes", serde_json::json!(1024)),
+            ("grpc_max_decode_bytes", serde_json::json!(0)),
+            ("grpc_max_decode_bytes", serde_json::json!("100")),
+        ] {
+            let mut input = serde_json::json!({"transport":{}});
+            input["transport"][field] = bad;
+            assert!(Tunables::parse_oat_json(input).is_err(), "accepted invalid {field}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn log_retention_below_table_default_fails_before_projection() -> anyhow::Result<()> {
         let candidate = |seconds| {
