@@ -3969,7 +3969,7 @@ async fn run_isolated_cell(
             return outcome;
         }
     };
-    let (mut result, cancelled) = tokio::select! {
+    let (result, cancelled) = tokio::select! {
         result = async {
             platform.prebuild(&config).await.context("untimed prebuild of local OAT images and initializer")?;
             let lifecycle_started_at = tokio::time::Instant::now();
@@ -4016,8 +4016,75 @@ async fn run_isolated_cell(
     {
         publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
     }
+    let (mut outcome, cleanup_succeeded) = finalize_isolated_cell(
+        &config,
+        orchestration_id,
+        &run_id,
+        dimensions,
+        (result, cancelled),
+        platform.as_mut(),
+        &LiveAksReconciler,
+    )
+    .await;
+    if cancelled && cleanup_succeeded {
+        return outcome;
+    }
+    {
+        let publication_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(
+                OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS + OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS + 1,
+            );
+        let publication = platform
+            .publish_official_measurement(&config, &outcome.rows, submitted_config.as_ref(), publication_deadline)
+            .await;
+        let published = publication.is_ok();
+        if let Err(error) = publication {
+            for row in &mut outcome.rows {
+                row.status = "failed".to_owned();
+                row.failure = Some(match row.failure.take() {
+                    Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                    None => "official_measurement_publication_failed".to_owned(),
+                });
+            }
+            let _ = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" });
+            outcome.error = Some(error.context("official cell measurement publication failed"));
+        }
+        if let Err(error) = platform
+            .finish_official_publication(published && cleanup_succeeded)
+            .await
+        {
+            outcome.error = Some(error.context("finalize official measurement runtime evidence"));
+        }
+    }
+    outcome
+}
+
+#[async_trait::async_trait]
+trait FinalAksReconciler: Sync {
+    async fn attach(&self, config: &OatConfig, root: Option<&str>, rows: &mut [OatResult], frozen: bool);
+}
+
+struct LiveAksReconciler;
+
+#[async_trait::async_trait]
+impl FinalAksReconciler for LiveAksReconciler {
+    async fn attach(&self, config: &OatConfig, root: Option<&str>, rows: &mut [OatResult], frozen: bool) {
+        attach_final_aks_delta_reconciliation(config, root, rows, frozen).await;
+    }
+}
+
+async fn finalize_isolated_cell(
+    config: &OatConfig,
+    orchestration_id: &str,
+    run_id: &str,
+    dimensions: (u32, u32),
+    (mut result, cancelled): (Result<Vec<OatResult>>, bool),
+    platform: &mut dyn Platform,
+    reconciler: &dyn FinalAksReconciler,
+) -> (MatrixOutcome, bool) {
+    let (replicas, concurrency) = dimensions;
     let shutdown_started = unix_time_ms_u64();
-    let cleanup = platform.cleanup(&config).await;
+    let cleanup = platform.cleanup(config).await;
     let frozen = cleanup.is_ok();
     let stopped_logs = platform.stopped_commit_logs();
     let summary_inputs = if frozen
@@ -4029,7 +4096,7 @@ async fn run_isolated_cell(
         None
     };
     let summary_attached = if let (Ok(rows), Some(inputs)) = (&mut result, summary_inputs.as_ref()) {
-        match attach_terminal_summary_commits(&config, platform.delta_root(), rows, inputs) {
+        match attach_terminal_summary_commits(config, platform.delta_root(), rows, inputs) {
             Ok(attached) => attached,
             Err(error) => {
                 tracing::warn!(%error, "terminal collector summary unavailable; release remains withheld");
@@ -4041,7 +4108,7 @@ async fn run_isolated_cell(
     };
     if let Ok(rows) = &mut result
         && let Some((logs, baseline)) = &stopped_logs
-        && let Err(error) = attach_stopped_commit_evidence(&config, rows, logs, baseline)
+        && let Err(error) = attach_stopped_commit_evidence(config, rows, logs, baseline)
     {
         for row in rows {
             row.status = "failed".to_owned();
@@ -4066,15 +4133,15 @@ async fn run_isolated_cell(
         && let Ok(rows) = &mut result
     {
         if config.platform.kind == crate::config::OatMode::Local {
-            attach_final_local_delta_reconciliation(&config, &run_id, rows, frozen);
+            attach_final_local_delta_reconciliation(config, run_id, rows, frozen);
         } else {
-            attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, frozen).await;
+            reconciler.attach(config, platform.delta_root(), rows, frozen).await;
         }
     }
     if !cancelled
         && config.platform.kind == crate::config::OatMode::Local
         && let Ok(rows) = &mut result
-        && let Err(error) = attach_local_delta_reconciliation(&config, &run_id, rows, cleanup.is_ok())
+        && let Err(error) = attach_local_delta_reconciliation(config, run_id, rows, cleanup.is_ok())
     {
         for row in rows {
             row.status = "failed".to_owned();
@@ -4086,7 +4153,7 @@ async fn run_isolated_cell(
         }
     }
     let finalization = platform
-        .finish_cleanup(&config, result.as_deref().unwrap_or(&[]), frozen)
+        .finish_cleanup(config, result.as_deref().unwrap_or(&[]), frozen)
         .await;
     let cleanup = match (cleanup, finalization) {
         (Ok(()), result) => result,
@@ -4106,26 +4173,21 @@ async fn run_isolated_cell(
         evidence
     });
     if cancelled && cleanup.is_ok() {
-        return MatrixOutcome {
-            rows: Vec::new(),
-            error: None,
-            cancelled: true,
-            aks_cleanup_confirmed,
-        };
+        return (
+            MatrixOutcome {
+                rows: Vec::new(),
+                error: None,
+                cancelled: true,
+                aks_cleanup_confirmed,
+            },
+            cleanup_succeeded,
+        );
     }
     let failed_before_teardown = result.is_err();
-    let mut outcome = finish_matrix_cell(
-        &config,
-        orchestration_id,
-        &run_id,
-        replicas,
-        concurrency,
-        result,
-        cleanup,
-    );
+    let mut outcome = finish_matrix_cell(config, orchestration_id, run_id, replicas, concurrency, result, cleanup);
     if failed_before_teardown
         && let Some((logs, baseline)) = &stopped_logs
-        && let Err(error) = attach_stopped_commit_evidence(&config, &mut outcome.rows, logs, baseline)
+        && let Err(error) = attach_stopped_commit_evidence(config, &mut outcome.rows, logs, baseline)
     {
         outcome.error = Some(match outcome.error.take() {
             Some(previous) => previous.context(format!("capture stopped collector commits: {error:#}")),
@@ -4185,34 +4247,7 @@ async fn run_isolated_cell(
     if let Err(error) = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" }) {
         outcome.error = Some(error.context("attach teardown outcome"));
     }
-    {
-        let publication_deadline = tokio::time::Instant::now()
-            + Duration::from_secs(
-                OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS + OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS + 1,
-            );
-        let publication = platform
-            .publish_official_measurement(&config, &outcome.rows, submitted_config.as_ref(), publication_deadline)
-            .await;
-        let published = publication.is_ok();
-        if let Err(error) = publication {
-            for row in &mut outcome.rows {
-                row.status = "failed".to_owned();
-                row.failure = Some(match row.failure.take() {
-                    Some(prior) => format!("{prior}; official_measurement_publication_failed"),
-                    None => "official_measurement_publication_failed".to_owned(),
-                });
-            }
-            let _ = attach_teardown_outcome(&mut outcome, if cleanup_succeeded { "succeeded" } else { "failed" });
-            outcome.error = Some(error.context("official cell measurement publication failed"));
-        }
-        if let Err(error) = platform
-            .finish_official_publication(published && cleanup_succeeded)
-            .await
-        {
-            outcome.error = Some(error.context("finalize official measurement runtime evidence"));
-        }
-    }
-    outcome
+    (outcome, cleanup_succeeded)
 }
 
 async fn attach_final_aks_delta_reconciliation(
