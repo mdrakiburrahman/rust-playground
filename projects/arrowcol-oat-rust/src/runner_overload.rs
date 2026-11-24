@@ -1903,6 +1903,7 @@ mod overload_guard_tests {
             assert_eq!(collector_metrics_url, platform.collector_metrics_url);
 
             state["scaled"] = json!(true);
+            state["noNanoCpus"] = json!(true);
             state["fail"] = json!("dataflow-1");
             fs::write(root.join("state.json"), state.to_string())?;
             platform.scale_arrowcols(&config, 1, 1).await?;

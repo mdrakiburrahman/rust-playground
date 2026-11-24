@@ -178,6 +178,8 @@ mod local_cpu_quota_tests {
             let parsed = serde_json::from_value::<arrowcol_tunables::CollectorCpuQuota>(invalid);
             assert!(parsed.is_err() || parsed.is_ok_and(|quota| quota.nano_cpus().is_err()));
         }
+        let under_min = arrowcol_tunables::CollectorCpuQuota::Cores(0.009).nano_cpus().err().context("under-minimum quota accepted")?;
+        assert!(under_min.contains("platform.local.collector_cpu_quota"));
         for (requested, expected) in [(json!(0.01), 0.01), (json!(3.5), 3.5), (json!(1.001), 1.001), (json!("unlimited"), 0.0)] {
             config.platform.local.collector_cpu_quota = Some(serde_json::from_value(requested)?);
             config.validate()?;
