@@ -138,6 +138,12 @@ pub struct InitializeLocalArgs {
     /// Absolute, existing, writable run-owned local Dataflow root.
     #[arg(long, required = true)]
     pub dataflow_root: PathBuf,
+    /// Literal delta.targetFileSize in fresh version-zero metadata.
+    #[arg(long)]
+    pub delta_target_file_size_bytes: Option<u64>,
+    /// Literal delta.checkpointInterval in fresh version-zero metadata.
+    #[arg(long)]
+    pub delta_checkpoint_interval: Option<u64>,
 }
 
 /// One fresh zero-row table; never the all-table bootstrap.

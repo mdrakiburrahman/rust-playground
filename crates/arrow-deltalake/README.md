@@ -4,6 +4,14 @@ Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux and ADLS Gen2.
 No OTEL or Flight dependency. Writes use pinned Delta Kernel 0.29.0;
 delta-rs is only the independent loadtest reader.
 
+| Fresh version-zero initialization | Contract |
+| --- | --- |
+| API | `DeltaTable::initialize_fresh_url_with_session_and_properties(..., &InitialDeltaProperties)`; existing wrapper keeps empty defaults |
+| Literal properties | Optional positive `target_file_size_bytes` → `delta.targetFileSize`; `checkpoint_interval` → `delta.checkpointInterval` |
+| Local setup | `arrowcol-loadgen initialize-local ... --delta-target-file-size-bytes 67108864 --delta-checkpoint-interval 17` |
+| AKS pin-init input | Optional `run_table.delta_properties`: `{"target_file_size_bytes":67108864,"checkpoint_interval":17}` |
+| Safety/readback | Existing contents are refused, not adopted or altered. Properties join the atomic initial commit and the actual committed configuration is returned in `FreshTableReceipt.properties`; setup emits success only after publisher drain. |
+
 ## Data path
 
 ```text
