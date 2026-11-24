@@ -548,6 +548,7 @@ fn candidates(path: &str) -> Vec<Value> {
         "collector.commit.snapshot_cache_mode" => return vec![json!("checkpoint_aware"), json!("json_only")],
         "collector.commit.checkpoint_mode" => return vec![json!("async"), json!("inline"), json!("external")],
         "collector.commit.checkpoint_interval" => return vec![json!(17)],
+        "collector.commit.trigger" => return vec![json!("eager"), json!("window")],
         "collector.runtime.cpu_dispatch" => return vec![json!("bounded_shards")],
         "collector.runtime.parquet_encode_mode" => return vec![json!("column_pipeline"), json!("column_waves")],
         "collector.runtime.cpu_placement" => return vec![json!("scatter_allowed")],

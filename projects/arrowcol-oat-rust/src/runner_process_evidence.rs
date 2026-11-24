@@ -2994,7 +2994,7 @@ mod consumer_startup_projection_tests {
                     "max_batches_per_flush":333,"max_age":"12s","max_concurrent_flushes":2},
                 "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13,
                     "txn_lookup_mode":"incremental","snapshot_cache_mode":"checkpoint_aware",
-                    "checkpoint_mode":"async","checkpoint_interval":17},
+                    "checkpoint_mode":"async","checkpoint_interval":17,"trigger":"eager"},
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
@@ -3123,6 +3123,7 @@ groups:
         assert_eq!(observed["commit"]["snapshot_cache_mode"], "checkpoint_aware");
         assert_eq!(observed["commit"]["checkpoint_mode"], "async");
         assert_eq!(observed["commit"]["checkpoint_interval"], 17);
+        assert_eq!(observed["commit"]["trigger"], "eager");
         assert_eq!(observed["dfe_worker_concurrency"], 2);
         assert_eq!(observed["socket_effective"]["tcp_nodelay"], true);
         if cfg!(target_os = "linux") {
@@ -3158,6 +3159,7 @@ groups:
             "collector.commit.snapshot_cache_mode",
             "collector.commit.checkpoint_mode",
             "collector.commit.checkpoint_interval",
+            "collector.commit.trigger",
             "collector.socket.tcp_nodelay",
             "collector.runtime.file_mapping_cache",
             "collector.runtime.partition_grouping",

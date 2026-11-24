@@ -130,6 +130,29 @@ impl<'de> serde::Deserialize<'de> for CheckpointMode {
     }
 }
 
+/// When the Delta commit worker publishes a partially filled batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitTrigger {
+    /// Wait up to `batch_window` for more files unless forced or full.
+    #[default]
+    Window,
+    /// Commit everything already queued as soon as the worker is idle.
+    Eager,
+}
+
+impl<'de> serde::Deserialize<'de> for CommitTrigger {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer).as_deref() {
+            Ok("window") => Ok(Self::Window),
+            Ok("eager") => Ok(Self::Eager),
+            _ => Err(serde::de::Error::custom(
+                "collector.commit.trigger must be window or eager",
+            )),
+        }
+    }
+}
+
 /// Remote Parquet staging strategy; local Delta tables always fsync their data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]
