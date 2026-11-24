@@ -526,3 +526,14 @@ percentiles separately from admission. The v3 verdict requires complete
 collector image/log/capability evidence and consistent output timing/counters.
 Known zero commits pass without a delivery claim; unavailable telemetry does
 not. Legacy v2 admission results remain readable, with no durable backfill.
+
+### Client offered load
+
+Each continuous client's `measurement_window` and its 30-second `windows`
+report `offered_rows` (first `DoPut` attempts) and `retry_offered_rows`
+(actual resubmissions, excluding backoffs that expire before send). These
+use the fresh send timestamp in the half-open window. `completed_rows` uses
+the observed admission ACK timestamp instead. Divide each count by the same
+window duration; do not add retries to fresh offers or count ACKs as Delta
+commits. A closed-loop sender can remain near one offer per ACK even with
+CPU headroom: measure spare sending capacity against an independent sink.
