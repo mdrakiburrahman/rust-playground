@@ -1742,6 +1742,17 @@ mod overload_guard_tests {
         Ok(())
     }
 
+    #[test]
+    fn working_set_uses_inactive_file_and_rejects_ambiguous_counters() -> Result<()> {
+        let metric = arrowcol_tunables::ContainerMemoryMetric::WorkingSet;
+        let sample = guard_container_memory_metric("0::/\n100\n1000\ninactive_file 300\n", None, metric)?;
+        assert_eq!(sample.metric, "container_working_set_bytes");
+        assert_eq!(sample.observed_value, 0);
+        assert!(guard_container_memory_metric("0::/\n100\n1000\ninactive_file 1\ninactive_file 2\n", None, metric).is_err());
+        assert!(guard_container_memory_metric("0::/\n100\n1000\ninactive_file invalid\n", None, metric).is_err());
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_docker_guard_rejects_stale_stats_and_changed_identity() -> Result<()> {
@@ -1855,6 +1866,14 @@ mod overload_guard_tests {
                 maintenance_cell_baseline: Vec::new(),
                 stopped_collector_logs: std::sync::Mutex::new(None),
             };
+            let mut preflight_config = config.clone();
+            preflight_config.platform.compose_file = Some("base.yaml".to_owned());
+            preflight_config.platform.compose_override_file = Some("override.yaml".to_owned());
+            platform.environment.insert(
+                "OAT_EXPECTED_COMPOSE_FILES".to_owned(),
+                format!("base.yaml|override.yaml|{}", root.join("tunables.compose.json").display()),
+            );
+            preflight_local_container_memory_guard(&preflight_config, &platform).await?;
             platform.router_metrics_url =
                 Some(local_compose_endpoint(&config, &platform, "router", "50050", "/metrics").await?);
             platform.collector_metrics_url =

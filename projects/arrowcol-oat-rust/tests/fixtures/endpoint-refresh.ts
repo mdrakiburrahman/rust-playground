@@ -19,6 +19,13 @@ if (args[0] === 'inspect') {
   console.log('fixture router failed');
 } else if (args.includes('ps')) {
   console.log('a'.repeat(64));
+} else if (args.includes('config')) {
+  const files = args.flatMap((arg, index) => arg === '--file' ? [args[index + 1]] : []);
+  const expected = process.env.OAT_EXPECTED_COMPOSE_FILES?.split('|');
+  if (!expected || JSON.stringify(files) !== JSON.stringify(expected)) {
+    throw new Error('preflight did not render all Compose layers in order');
+  }
+  console.log(JSON.stringify({ services: { 'dataflow-1': { mem_limit: 8388608 } } }));
 } else if (args.includes('up')) {
   state.scaled = true;
   writeFileSync(join(root, 'state.json'), JSON.stringify(state));

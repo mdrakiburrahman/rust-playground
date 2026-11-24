@@ -14,7 +14,7 @@
 
 | Setting | Type and range | Default | Apply boundary | Influence and interactions |
 | --- | --- | --- | --- | --- |
-| `platform.local.collector_cpu_quota` | Positive JSON decimal, nanocore precision, at most the Docker host's logical CPUs (maximum 4096), or `"unlimited"` | Unset: `coupled_to_dfe_worker_concurrency` | Per-cell container creation | Overrides only the collector Docker CPU quota. Does not change `dfe_worker_concurrency` / `--num-cores` or the independent `collector_cpus` cpuset. `"unlimited"` removes the container quota, not ancestor cgroup limits. |
+| `platform.local.collector_cpu_quota` | JSON decimal at least 0.01 CPU, nanocore precision, at most the Docker host's logical CPUs (maximum 4096), or `"unlimited"` | Unset: `coupled_to_dfe_worker_concurrency` | Per-cell container creation | Overrides only the collector Docker CPU quota. Does not change `dfe_worker_concurrency` / `--num-cores` or the independent `collector_cpus` cpuset. `"unlimited"` removes the container quota, not ancestor cgroup limits. |
 
 `cpu_quota.collector` records the source, requested quota, Docker `NanoCpus`,
 and effective cgroup-v2 `cpu.max`. Startup rejects a quota mismatch before load.

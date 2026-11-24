@@ -52,11 +52,11 @@ impl ContainerMemoryMetric {
 
 impl CollectorCpuQuota {
     /// # Errors
-    /// Rejects nonpositive, nonfinite, oversized or sub-nanocore quotas.
+    /// Rejects quotas below 0.01 CPU, nonfinite, oversized or sub-nanocore quotas.
     pub fn nano_cpus(self) -> Result<u64, &'static str> {
         match self {
             Self::Unlimited(_) => Ok(0),
-            Self::Cores(cores) if cores.is_finite() && (0.000_000_001..=4096.0).contains(&cores) => {
+            Self::Cores(cores) if cores.is_finite() && (0.01..=4096.0).contains(&cores) => {
                 let decimal = cores.to_string();
                 let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
                 if fraction.len() > 9 {
@@ -71,7 +71,7 @@ impl CollectorCpuQuota {
                 Ok(whole * 1_000_000_000 + fraction)
             }
             Self::Cores(_) => Err(
-                "platform.local.collector_cpu_quota must be a positive decimal (nanocore precision, at most 4096) or \"unlimited\"",
+                "platform.local.collector_cpu_quota must be a decimal from 0.01 to 4096 (nanocore precision) or \"unlimited\"",
             ),
         }
     }
