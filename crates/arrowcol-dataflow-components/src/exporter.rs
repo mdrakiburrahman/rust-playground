@@ -2080,11 +2080,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_handoff_releases_capacity_but_not_delivery_or_ownership() {
-        for (fence, cancel_waiter, undersized) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
+        for (fence, cancel_waiter, undersized, return_data) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
         ] {
             let directory = tempfile::tempdir().expect("directory");
             let store = Arc::new(MemoryRoutingStore::default());
@@ -2132,17 +2133,25 @@ mod tests {
                 let records = encode_record_batch(envelope_for(&lease), batch).expect("records");
                 let mut feedback =
                     OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records));
+                if return_data {
+                    feedback = feedback.test_subscribe_to(
+                        otel_arrow_dfe_engine::Interests::ACKS | otel_arrow_dfe_engine::Interests::RETURN_DATA,
+                        otel_arrow_dfe_engine::control::CallData::new(),
+                        1,
+                    );
+                }
                 let publication = exporter.stage(feedback.clone()).await.expect("admission");
-                assert!(publication.compact_feedback(&mut feedback).is_some());
-                assert!(feedback.is_empty());
+                assert_eq!(publication.compact_feedback(&mut feedback).is_some(), !return_data);
+                assert_eq!(feedback.is_empty(), !return_data);
                 submitted.await.expect("final queue handoff");
-                (publication, column)
+                (publication, column, feedback)
             };
             let bound = std::time::Duration::from_secs(5);
-            let (mut first, first_column) = tokio::time::timeout(bound, stage())
+            let (mut first, first_column, first_feedback) = tokio::time::timeout(bound, stage())
                 .await
                 .expect("handoff without waiting for commit");
-            assert_eq!(first_column.upgrade().is_none(), !undersized);
+            let release_early = !undersized && !return_data;
+            assert_eq!(first_column.upgrade().is_none(), release_early);
             let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("table owner"));
             let available = || {
                 exporter
@@ -2153,12 +2162,12 @@ mod tests {
                     .expect("enabled")
                     .load(Ordering::Relaxed)
             };
-            let released = usize::from(!undersized);
+            let released = usize::from(release_early);
             assert_eq!(owner.capacity.batches.available_permits(), released);
             assert_eq!(owner.capacity.bytes.available_permits(), released * bytes as usize);
             assert_eq!(exporter.backend.flush_slots.available_permits(), released);
             assert_eq!(exporter.backend.capacity.batches.available_permits(), 1);
-            assert_eq!(available(), if undersized { limit } else { 0 });
+            assert_eq!(available(), if release_early { 0 } else { limit });
             assert!(matches!(
                 first.receipt.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)
@@ -2172,8 +2181,8 @@ mod tests {
             } else {
                 receipts.push(first);
             }
-            if !undersized {
-                let (mut second, second_column) = tokio::time::timeout(bound, stage())
+            if release_early {
+                let (mut second, second_column, _second_feedback) = tokio::time::timeout(bound, stage())
                     .await
                     .expect("second group reused table and flush slot");
                 assert!(second_column.upgrade().is_some());
@@ -2210,6 +2219,9 @@ mod tests {
             assert_eq!(owner.capacity.bytes.available_permits(), bytes as usize);
             assert_eq!(exporter.backend.capacity.batches.available_permits(), 2);
             assert_eq!(exporter.backend.flush_slots.available_permits(), 1);
+            assert_eq!(first_feedback.is_empty(), !return_data);
+            drop(first_feedback);
+            assert!(first_column.upgrade().is_none());
         }
     }
 
@@ -2415,6 +2427,7 @@ mod tests {
         directory: &std::path::Path,
         store: &Arc<MemoryRoutingStore>,
         holder: CollectorInstanceId,
+        max_pending_commit_bytes: u64,
     ) -> GenericDeltaExporter {
         GenericDeltaExporter::with_batching(
             directory.to_path_buf(),
@@ -2426,6 +2439,7 @@ mod tests {
             },
             FileBatchConfig {
                 coalesce_publications: true,
+                max_pending_commit_bytes,
                 max_batches_per_flush: 16,
                 max_age: std::time::Duration::from_secs(60),
                 ..Default::default()
@@ -2437,38 +2451,43 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn coalesced_publications_split_over_commit_cap_at_identity_boundaries_and_replay() {
-        let directory = tempfile::tempdir().expect("directory");
-        let root = directory.path().join("demo/generated/events");
-        initialize_region_partition(&root);
-        let store = Arc::new(MemoryRoutingStore::default());
-        let holder = CollectorInstanceId::new();
-        let lease = lease(&store, holder).await;
-        let exporter = coalescing_exporter(directory.path(), &store, holder);
-        let first = partitioned_envelope_pdata(envelope_for(&lease), &["north".to_owned()]);
-        let second = partitioned_envelope_pdata(envelope_for(&lease), &["south".to_owned()]);
-        let first_receipt = exporter.stage(first.clone()).await.expect("first publication");
-        let second_receipt = exporter.stage(second.clone()).await.expect("second publication");
-        exporter.backend.flush_pending().await.expect("flush");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            first_receipt.wait().await?;
-            second_receipt.wait().await
-        })
-        .await
-        .expect("split group commits")
-        .expect("both publications commit");
-        assert_eq!(add_file_count(&root), 2);
+        for budget in [0, 64 * 1024 * 1024] {
+            let directory = tempfile::tempdir().expect("directory");
+            let root = directory.path().join("demo/generated/events");
+            initialize_region_partition(&root);
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let exporter = coalescing_exporter(directory.path(), &store, holder, budget);
+            let first = partitioned_envelope_pdata(envelope_for(&lease), &["north".to_owned()]);
+            let second = partitioned_envelope_pdata(envelope_for(&lease), &["south".to_owned()]);
+            let first_receipt = exporter.stage(first.clone()).await.expect("first publication");
+            let second_receipt = exporter.stage(second.clone()).await.expect("second publication");
+            exporter.backend.flush_pending().await.expect("flush");
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                first_receipt.wait().await?;
+                second_receipt.wait().await
+            })
+            .await
+            .expect("split group commits")
+            .expect("both publications commit");
+            assert_eq!(add_file_count(&root), 2);
 
-        let first_replay = exporter.stage(first).await.expect("first replay");
-        let second_replay = exporter.stage(second).await.expect("second replay");
-        exporter.backend.flush_pending().await.expect("replay flush");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            first_replay.wait().await?;
-            second_replay.wait().await
-        })
-        .await
-        .expect("replay resolves")
-        .expect("replays deduplicate");
-        assert_eq!(add_file_count(&root), 2);
+            let first_replay = exporter.stage(first).await.expect("first replay");
+            let second_replay = exporter.stage(second).await.expect("second replay");
+            exporter.backend.flush_pending().await.expect("replay flush");
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                first_replay.wait().await?;
+                second_replay.wait().await
+            })
+            .await
+            .expect("replay resolves")
+            .expect("replays deduplicate");
+            assert_eq!(add_file_count(&root), 2);
+            if let Some(remaining) = &exporter.backend.pending_commit_budget.0 {
+                assert_eq!(remaining.load(Ordering::Relaxed), budget);
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2479,7 +2498,7 @@ mod tests {
         let store = Arc::new(MemoryRoutingStore::default());
         let holder = CollectorInstanceId::new();
         let lease = lease(&store, holder).await;
-        let exporter = coalescing_exporter(directory.path(), &store, holder);
+        let exporter = coalescing_exporter(directory.path(), &store, holder, 64 * 1024 * 1024);
         let regions = (0..256).map(|value| format!("region-{value}")).collect::<Vec<_>>();
         let receipt = exporter
             .stage(partitioned_envelope_pdata(envelope_for(&lease), &regions))
@@ -2893,7 +2912,12 @@ mod tests {
     /// when opt-in coalescing shares the physical file.
     #[tokio::test]
     async fn replay_identity_is_independent_of_flush_grouping() {
-        for coalesce_publications in [false, true] {
+        for (coalesce_publications, max_pending_commit_bytes) in [
+            (false, 0),
+            (false, 64 * 1024 * 1024),
+            (true, 0),
+            (true, 64 * 1024 * 1024),
+        ] {
             let directory = tempfile::tempdir().expect("directory");
             let store = Arc::new(MemoryRoutingStore::default());
             let holder = CollectorInstanceId::new();
@@ -2926,6 +2950,7 @@ mod tests {
                 },
                 FileBatchConfig {
                     coalesce_publications,
+                    max_pending_commit_bytes,
                     max_age: std::time::Duration::from_secs(60),
                     ..Default::default()
                 },

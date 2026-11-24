@@ -50,6 +50,7 @@ tracing.workspace = true
 flume = "0.12"
 otel-arrow-dfe-core-nodes = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/core-nodes", default-features = false, features = ["durable-buffer"] }
 otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine", features = ["test-utils"] }
+otel-arrow-dfe-otap = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/otap", default-features = false, features = ["crypto-ring", "test-utils"] }
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
