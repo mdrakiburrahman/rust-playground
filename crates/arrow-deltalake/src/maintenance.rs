@@ -362,6 +362,16 @@ pub fn error_kind(error: &anyhow::Error) -> Option<MaintenanceErrorKind> {
     error_details(error).map(|details| details.kind)
 }
 
+/// Monotonic time source for deadlines; `Instant::now` unless injected.
+#[derive(Clone, Default)]
+struct DeadlineClock(Option<Arc<dyn Fn() -> Instant + Send + Sync>>);
+
+impl std::fmt::Debug for DeadlineClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "injected" } else { "system" })
+    }
+}
+
 /// Cooperative cancellation and deadline shared with the caller.
 #[derive(Clone, Debug)]
 pub struct MaintenanceControl {
@@ -369,6 +379,7 @@ pub struct MaintenanceControl {
     deadline: Option<Instant>,
     commit_attempts: u32,
     commit_budget: Duration,
+    clock: DeadlineClock,
 }
 
 impl Default for MaintenanceControl {
@@ -385,7 +396,21 @@ impl MaintenanceControl {
             deadline,
             commit_attempts: MAX_COMMIT_ATTEMPTS,
             commit_budget: COMMIT_BUDGET,
+            clock: DeadlineClock(None),
         }
+    }
+
+    /// Read deadlines from `now` instead of the system monotonic clock.
+    #[must_use]
+    pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = DeadlineClock(Some(Arc::new(now)));
+        self
+    }
+
+    /// The current instant on this control's deadline clock.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        self.clock.0.as_ref().map_or_else(Instant::now, |now| now())
     }
 
     /// Add a hard deadline without extending an existing operation deadline.
@@ -414,7 +439,7 @@ impl MaintenanceControl {
     /// True once cancellation was requested or the deadline passed.
     #[must_use]
     pub fn interrupted(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst) || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        self.cancel.load(Ordering::SeqCst) || self.deadline.is_some_and(|deadline| self.now() >= deadline)
     }
 
     /// Fail with a distinct error when the signal or deadline interrupts work.
@@ -422,7 +447,7 @@ impl MaintenanceControl {
     /// # Errors
     /// Returns a cancellation error after signal cancellation or a deadline error after expiry.
     pub fn check(&self) -> Result<()> {
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if self.deadline.is_some_and(|deadline| self.now() >= deadline) {
             return Err(fail(
                 MaintenanceErrorKind::DeadlineExceeded,
                 "maintenance operation deadline exceeded",
