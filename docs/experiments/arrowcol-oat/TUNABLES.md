@@ -101,7 +101,7 @@ The OAT client release profile is rebuild-only and defaults to `lto=off`, `codeg
 
 | Setting | Type and range | Default | Apply boundary | Influence and interactions |
 | --- | --- | --- | --- | --- |
-| `client.build_profile.lto` | `off`, `thin-local`, `thin`, or `fat` | `off` | OAT client image rebuild | `off` disables LTO; `thin-local` selects Cargo's local-only LTO mode and is effectively `off` with one codegen unit; `thin` and `fat` select their corresponding modes. |
+| `client.build_profile.lto` | `off`, `thin-local`, `thin`, or `fat` | `off` | OAT client image rebuild | Maps to Cargo `off`, `false`, `thin`, or `fat`, respectively; `thin-local` is effectively no LTO with one codegen unit or opt level zero. OAT accepts opt levels 2 and 3. |
 | `client.build_profile.codegen_units` | Integer `1..=256` | `16` | OAT client image rebuild | Parallel code generation and optimization scope; interacts with LTO. |
 | `client.build_profile.opt_level` | Integer `2` or `3` | `3` | OAT client image rebuild | Must match Cargo's effective `OPT_LEVEL`; a mismatch fails the image build. |
 | `client.build_profile.target_cpu` | `generic`, `x86-64-v2`, `x86-64-v3`, or `x86-64-v4`; `native` is forbidden | `generic` | OAT client image rebuild and CPU preflight | Local preflight checks host flags; image build checks rustc target features, including F16C for v3/v4. |

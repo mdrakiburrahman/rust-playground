@@ -1444,8 +1444,6 @@ spec:
             - sqlserver_availability_replica_states
             - --rows
             - "8192"
-            - --concurrency
-            - "32"
             - --edge-secret-file
             - /run/secrets/edge-hmac
             - --warmup-secs

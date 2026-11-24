@@ -1027,6 +1027,7 @@ mod tunable_injection_tests {
         assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_CODEGEN_UNITS"], "8");
         assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_OPT_LEVEL"], "2");
         assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["OAT_CLIENT_BUILD_TARGET_CPU"], "x86-64-v3");
+        assert_eq!(overlay["services"]["oat-client"]["build"]["args"]["VCS_REF"], "${GIT_SHA:-local}");
 
         let mut alternate = config()?;
         alternate.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
@@ -1035,6 +1036,24 @@ mod tunable_injection_tests {
             }}
         }))?;
         assert_ne!(profile_hash, alternate.client_build_profile_hash().context("alternate client profile hash missing")?);
+        Ok(())
+    }
+
+    #[test]
+    fn client_build_profile_emits_each_lto_mode_with_all_profile_args() -> Result<()> {
+        for lto in ["off", "thin-local", "thin", "fat"] {
+            let mut config = config()?;
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "client":{"build_profile":{
+                    "lto":lto,"codegen_units":1,"opt_level":2,"target_cpu":"generic"
+                }}
+            }))?;
+            let args = compose_tunables(&config)?["services"]["oat-client"]["build"]["args"].clone();
+            assert_eq!(args["OAT_CLIENT_BUILD_LTO"], lto);
+            assert_eq!(args["OAT_CLIENT_BUILD_CODEGEN_UNITS"], "1");
+            assert_eq!(args["OAT_CLIENT_BUILD_OPT_LEVEL"], "2");
+            assert_eq!(args["OAT_CLIENT_BUILD_TARGET_CPU"], "generic");
+        }
         Ok(())
     }
 

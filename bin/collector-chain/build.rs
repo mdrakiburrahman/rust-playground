@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::env;
 
+#[path = "src/client_build_profile.rs"]
+mod client_build_profile;
+
 fn main() {
     const PROFILE_VARIABLES: [&str; 4] = [
         "ARROWCOL_OAT_CLIENT_BUILD_LTO",
@@ -13,6 +16,11 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
+    println!("cargo:rerun-if-env-changed=PROFILE");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_DEV_LTO");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_RELEASE_LTO");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_DEV_CODEGEN_UNITS");
+    println!("cargo:rerun-if-env-changed=CARGO_PROFILE_RELEASE_CODEGEN_UNITS");
 
     let values = PROFILE_VARIABLES.map(|name| env::var(name).ok());
     if values.iter().all(Option::is_none) {
@@ -35,11 +43,33 @@ fn main() {
     if !matches!(lto.as_str(), "off" | "thin-local" | "thin" | "fat") {
         panic!("ARROWCOL_OAT_CLIENT_BUILD_LTO has unsupported value {lto}");
     }
+    let profile = env::var("PROFILE").unwrap_or_else(|_| panic!("Cargo did not provide PROFILE"));
+    let (cargo_lto_variable, cargo_codegen_units_variable) = match profile.as_str() {
+        "debug" => ("CARGO_PROFILE_DEV_LTO", "CARGO_PROFILE_DEV_CODEGEN_UNITS"),
+        "release" => ("CARGO_PROFILE_RELEASE_LTO", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS"),
+        _ => panic!("unsupported Cargo PROFILE for OAT client build profile: {profile}"),
+    };
+    let expected_cargo_lto = client_build_profile::cargo_lto_setting(&lto)
+        .unwrap_or_else(|| panic!("ARROWCOL_OAT_CLIENT_BUILD_LTO has unsupported value {lto}"));
+    let cargo_lto = env::var(cargo_lto_variable)
+        .unwrap_or_else(|_| panic!("{cargo_lto_variable} must be set for OAT client build-profile readback"));
+    if cargo_lto != expected_cargo_lto {
+        panic!(
+            "ARROWCOL_OAT_CLIENT_BUILD_LTO={lto} requires {cargo_lto_variable}={expected_cargo_lto}, got {cargo_lto}"
+        );
+    }
     let codegen_units = codegen_units
         .parse::<u16>()
         .unwrap_or_else(|_| panic!("ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS must be an integer in 1..=256"));
     if !(1..=256).contains(&codegen_units) {
         panic!("ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS must be an integer in 1..=256");
+    }
+    let cargo_codegen_units = env::var(cargo_codegen_units_variable)
+        .unwrap_or_else(|_| panic!("{cargo_codegen_units_variable} must be set for OAT client build-profile readback"));
+    if cargo_codegen_units != codegen_units.to_string() {
+        panic!(
+            "ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS={codegen_units} does not match {cargo_codegen_units_variable}={cargo_codegen_units}"
+        );
     }
     if !matches!(opt_level.as_str(), "2" | "3") {
         panic!("ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL must be 2 or 3");

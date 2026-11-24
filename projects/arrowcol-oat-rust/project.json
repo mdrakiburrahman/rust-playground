@@ -27,7 +27,7 @@
       "options": {
         "parallel": false,
         "commands": [
-          "ARROWCOL_OAT_CLIENT_BUILD_LTO=off ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS=16 ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL=3 ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU=generic CARGO_PROFILE_DEV_LTO=false CARGO_PROFILE_DEV_CODEGEN_UNITS=16 CARGO_PROFILE_DEV_OPT_LEVEL=3 cargo build --locked --package collector-chain --bin arrowcol-dmv",
+          "ARROWCOL_OAT_CLIENT_BUILD_LTO=off ARROWCOL_OAT_CLIENT_BUILD_CODEGEN_UNITS=16 ARROWCOL_OAT_CLIENT_BUILD_OPT_LEVEL=3 ARROWCOL_OAT_CLIENT_BUILD_TARGET_CPU=generic CARGO_PROFILE_DEV_LTO=off CARGO_PROFILE_DEV_CODEGEN_UNITS=16 CARGO_PROFILE_DEV_OPT_LEVEL=3 cargo build --locked --package collector-chain --bin arrowcol-dmv",
           "cargo build --locked --package arrowcol-router-rust",
           "cargo build --locked --package arrowcol-dataflow-rust",
           "cargo test --locked --package arrowcol-oat-rust --lib client_leaf_adapters_use_actual_consumer_startup -- --ignored",
