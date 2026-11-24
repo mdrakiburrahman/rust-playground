@@ -54,6 +54,23 @@ function isRecord(value: unknown): value is RecordValue {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+export function parseLocalCollectorCpuQuota(value: unknown, hostCpus?: number): {
+  source: 'platform.local.collector_cpu_quota' | 'coupled_to_dfe_worker_concurrency';
+  requested_quota: number | 'unlimited' | null;
+} {
+  const field = 'platform.local.collector_cpu_quota';
+  if (value == null) return { source: 'coupled_to_dfe_worker_concurrency', requested_quota: null };
+  if (value !== 'unlimited' && (typeof value !== 'number' || !Number.isFinite(value) || value < 0.01 || value > 4096 ||
+      (String(value).split('.')[1]?.length ?? 0) > 9)) {
+    throw new Error(`${field} must be a finite CPU quota from 0.01 to 4096 with at most nanocore precision, or "unlimited"`);
+  }
+  if (hostCpus !== undefined && (!Number.isSafeInteger(hostCpus) || hostCpus < 1 ||
+      (typeof value === 'number' && value > hostCpus))) {
+    throw new Error(`${field} exceeds or cannot validate Docker host logical CPUs (${hostCpus})`);
+  }
+  return { source: field, requested_quota: value as number | 'unlimited' };
+}
+
 function requiredText(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.trim() === '') throw new Error(field + ' must be a non-empty string');
   return value;
@@ -83,6 +100,11 @@ function parseOfficialRun(value: unknown, field: string): OfficialRun {
     return row;
   });
   if (value.mode !== 'local' && value.mode !== 'aks') throw new Error(field + ' mode must be local or aks');
+  if (value.mode === 'local') {
+    const platform = isRecord(value.config.platform) ? value.config.platform : undefined;
+    const local = platform && isRecord(platform.local) ? platform.local : undefined;
+    parseLocalCollectorCpuQuota(local?.collector_cpu_quota);
+  }
   return {
     status: { id: status.id, config_sha256: typeof status.config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(status.config_sha256) ? status.config_sha256 : null,
       state, progress: status.progress, result_count: Number(status.result_count), error: status.error },
@@ -697,14 +719,41 @@ export function publicationBacklogIssue(value: unknown, start: number, end: numb
   return undefined;
 }
 
-const guardCapMetrics = ['container_memory_bytes', 'collector_rss_bytes',
+export function guardContainerMemoryMetric(config: RecordValue): 'container_memory_bytes' | 'container_working_set_bytes' | undefined {
+  if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return undefined;
+  const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const selection = requested.container_memory_metric === undefined ? 'usage' : requested.container_memory_metric;
+  if (selection === 'usage') return 'container_memory_bytes';
+  if (selection === 'working_set') return 'container_working_set_bytes';
+  return undefined;
+}
+
+export function guardContainerMemoryMatches(config: RecordValue, guard: RecordValue): boolean {
+  const metric = guardContainerMemoryMetric(config);
+  if (!metric) return false;
+  const selection = metric === 'container_memory_bytes' ? 'usage' : 'working_set';
+  if (guard.settings !== undefined && (!isRecord(guard.settings) ||
+      (guard.settings.container_memory_metric === undefined ? 'usage' : guard.settings.container_memory_metric) !== selection)) return false;
+  if (guard.settings === undefined && selection !== 'usage') return false;
+  if (guard.container_memory_metric !== undefined && guard.container_memory_metric !== selection) return false;
+  if (guard.last_caps !== undefined && (!Array.isArray(guard.last_caps) || guard.last_caps.some(cap =>
+      isRecord(cap) && (cap.metric === 'container_memory_bytes' || cap.metric === 'container_working_set_bytes') && cap.metric !== metric))) return false;
+  return true;
+}
+
+const guardCapMetrics = ['container_memory_bytes', 'container_working_set_bytes', 'collector_rss_bytes',
   'collector_cgroup_memory_bytes', 'collector_buffered_bytes'];
 
-function overloadStopIssue(evidence: RecordValue): string | undefined {
+function overloadStopIssue(evidence: RecordValue, config: RecordValue): string | undefined {
   const stop = evidence.overload_stop;
   if (stop === undefined || stop === null) return undefined;
   if (!isRecord(stop) || nonNegativeInteger(stop.timestamp_ms) === undefined ||
       nonNegativeInteger(stop.window_index) === undefined) return 'overload_stop evidence is invalid';
+  const selectedMetric = guardContainerMemoryMetric(config);
+  if (!selectedMetric || ((stop.metric === 'container_memory_bytes' || stop.metric === 'container_working_set_bytes') &&
+      stop.metric !== selectedMetric) || (isRecord(evidence.overload_guard) && !guardContainerMemoryMatches(config, evidence.overload_guard))) {
+    return 'overload_stop evidence is invalid';
+  }
   const hardCap = stop.reason === 'hard_cap_fraction' && guardCapMetrics.includes(String(stop.metric)) &&
     nonNegativeInteger(stop.observed_value) !== undefined && nonNegativeInteger(stop.cap) !== undefined &&
     Number(stop.cap) > 0 && typeof stop.fraction === 'number' && Number.isFinite(stop.fraction) &&
@@ -724,14 +773,16 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
   const zeroWindows = requested.zero_progress_windows === undefined ? 2 : requested.zero_progress_windows;
   const memorySignal = requested.memory_signal === undefined ? 'process_rss' : requested.memory_signal;
   if (memorySignal !== 'process_rss' && memorySignal !== 'cgroup_memory') return invalid;
-  const metrics = ['container_memory_bytes', memorySignal === 'cgroup_memory' ?
+  const selectedMetric = guardContainerMemoryMetric(config);
+  if (!selectedMetric) return invalid;
+  const metrics = [selectedMetric, memorySignal === 'cgroup_memory' ?
     'collector_cgroup_memory_bytes' : 'collector_rss_bytes', 'collector_buffered_bytes'];
   const warmup = nonNegativeInteger(config.warmup_seconds);
   if (enabled !== true || typeof fraction !== 'number' || !Number.isFinite(fraction) || fraction <= 0 || fraction > 0.9 ||
       nonNegativeInteger(zeroWindows) === undefined || Number(zeroWindows) < 1 || Number(zeroWindows) > 2 ||
       warmup === undefined || start < warmup * 1000) return invalid;
   const guard = evidence.overload_guard;
-  if (!isRecord(guard)) return invalid;
+  if (!isRecord(guard) || !guardContainerMemoryMatches(config, guard)) return invalid;
   const caps = guard.last_caps;
   const platform = isRecord(config.platform) ? config.platform : undefined;
   const local = platform && isRecord(platform.local) ? platform.local : undefined;
@@ -758,7 +809,7 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
       typeof guard.peak_cap_fraction !== 'number' || !Number.isFinite(guard.peak_cap_fraction) ||
       guard.peak_cap_fraction < 0 || guard.peak_cap_fraction >= fraction ||
       !Array.isArray(caps) || caps.length !== metrics.length ||
-      requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === 'container_memory_bytes' && cap.cap === requestedCap) ||
+      requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === selectedMetric && cap.cap === requestedCap) ||
       memorySignal === 'cgroup_memory' && !caps.some(cap => isRecord(cap) && cap.metric === 'collector_cgroup_memory_bytes' &&
         cap.cap === requestedRssCap && typeof cap.observed_value === 'number' && cap.observed_value > 0) ||
       !metrics.every(metric =>
@@ -783,7 +834,7 @@ function officialOverloadStop(run: OfficialRun): string | undefined {
     let evidence: unknown;
     try { evidence = JSON.parse(row.evidence_json); } catch { continue; }
     if (isRecord(evidence)) {
-      const reason = overloadStopIssue(evidence);
+      const reason = overloadStopIssue(evidence, run.config);
       if (reason) return reason;
     }
   }

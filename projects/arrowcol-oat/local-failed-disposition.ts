@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readdir, rename, rm, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { guardContainerMemoryMatches, guardContainerMemoryMetric, parseLocalCollectorCpuQuota } from './campaign-results.js';
 
 export const localDispositionSuffix = '.failed-local-disposition';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -164,10 +165,23 @@ async function inspect(
   }
   const config = object(JSON.parse(body), 'configuration');
   const platform = object(config.platform, 'platform');
+  if (!guardContainerMemoryMetric(config)) throw new Error('Invalid overload_guard.container_memory_metric');
   if (platform.kind !== 'local' || !Array.isArray(config.tables) || config.tables.length !== 1 ||
       !Array.isArray(config.replica_counts) || config.replica_counts.length !== 1 ||
       !Array.isArray(config.dfe_worker_concurrency) || config.dfe_worker_concurrency.length !== 1) {
     throw new Error('Local disposition requires exactly one configured cell');
+  }
+  const localConfig = isRecord(platform.local) ? platform.local : undefined;
+  const quota = parseLocalCollectorCpuQuota(localConfig?.collector_cpu_quota);
+  if (quota.requested_quota !== null) {
+    let hostCpus: number;
+    try {
+      const output = env.docker(['info', '--format', '{{.NCPU}}']).trim();
+      hostCpus = /^\d+$/.test(output) ? Number(output) : NaN;
+    } catch (error) {
+      throw new Error('platform.local.collector_cpu_quota cannot read Docker host logical CPUs', { cause: error });
+    }
+    parseLocalCollectorCpuQuota(quota.requested_quota, hostCpus);
   }
   if (preload && ((config.clients_per_table_sweep !== undefined && config.clients_per_table_sweep !== null) ||
       config.replica_counts[0] !== 1 || config.dfe_worker_concurrency[0] !== 32 ||
@@ -221,6 +235,9 @@ async function inspect(
       evidence.client_schedule === null && evidence.client_phase_reports === null &&
       evidence.durable_commits === null && evidence.durable_bytes === null && rows?.delta_committed === null;
     const guard = preMeasurementFailure ? undefined : object(evidence.overload_guard, 'overload evidence');
+    if (guard && !guardContainerMemoryMatches(config, guard)) {
+      throw new Error('Invalid overload_guard.container_memory_metric guard evidence');
+    }
     const failedCell = row.status === 'failed' ||
       (row.status === 'pinning_violation' && row.pinning_ok === false && status.error.includes('pinning_violation'));
     if (!rows || !uuid.test(cell) || row.mode !== 'local' || !failedCell || row.table !== config.tables[0] ||
@@ -271,6 +288,7 @@ async function inspect(
     marker_path: markerPath, marker_sha256: sha256(markerBytes), result_path: resultPath,
     result_sha256: sha256(resultBytes), log_path: logPath, log_sha256: sha256(logBytes),
     state_root: stateRoot, owner_pid: marker.ownerPid, owner_start_ticks: marker.ownerStartTicks,
+    collector_cpu_quota: quota,
     server_pid: marker.serverPid, server_start_ticks: marker.serverStartTicks,
     measurement_produced: evidence.overload_guard !== null || evidence.durable_commits !== null || evidence.client_schedule !== null,
     port: Number(serverUrl.port), listener_output: listenerOutput,
@@ -320,6 +338,7 @@ export async function assertLocalFailedDisposition(
     throw new Error('Local disposition timestamp is invalid');
   }
   const expected = await dispositionProof(receiptPath, markerPath, env);
+  if (!Object.hasOwn(recordedProof, 'collector_cpu_quota')) delete expected.collector_cpu_quota;
   if (JSON.stringify(recordedProof) !== JSON.stringify(expected)) throw new Error('Local failure disposition or evidence changed');
 }
 

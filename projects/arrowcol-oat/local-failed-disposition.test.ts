@@ -125,7 +125,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     const moduleRoot = await mkdtemp(path.join(path.dirname(sourcePath), '.preload-fixture-'));
     t.after(() => rm(moduleRoot, { recursive: true, force: true }));
     const modulePath = path.join(moduleRoot, 'local-failed-disposition.ts');
-    await writeFile(modulePath, fixtureSource);
+    await writeFile(modulePath, fixtureSource.replace("from './campaign-results.js'", "from '../campaign-results.js'"));
     const fixture: typeof import('./local-failed-disposition.js') = await import(pathToFileURL(modulePath).href);
     const readonlyCommands: string[][] = [];
     const recordingEnv = { ...env, bootId: process.platform === 'linux'
@@ -345,6 +345,68 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
     bootId: async () => '123e4567-e89b-42d3-a456-426614174004',
       listeningSockets: (_port: number) => '',
   };
+  if (resultStatus === 'failed') {
+    const dispositionPath = receiptPath + localDispositionSuffix;
+    for (const quota of [0.01, 2, 'unlimited', 2.000000001, 0.0100000001]) {
+      const config = JSON.parse(body);
+      config.platform.local = { collector_cpu_quota: quota };
+      const submitted = JSON.stringify(config);
+      const digest = createHash('sha256').update(submitted).digest('hex');
+      await writeFile(markerPath, JSON.stringify({ ...marker, submitted_config_body: submitted, submitted_config_sha256: digest }));
+      await writeFile(receiptPath, JSON.stringify({ ...receipt, submitted_config_body: submitted, submitted_config_sha256: digest,
+        terminal_observation: { ...receipt.terminal_observation,
+          status: { ...receipt.terminal_observation.status, config_sha256: digest } } }));
+      const quotaEnv = { ...env, docker: (args: string[]) => args[0] === 'info' ? '2\n' : '' };
+      if (quota === 2) {
+        for (const host of ['', '0', 'invalid']) {
+          await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath,
+            { ...env, docker: () => host }), /platform\.local\.collector_cpu_quota/);
+        }
+        await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath,
+          { ...env, docker: () => { throw new Error('docker failed'); } }), /platform\.local\.collector_cpu_quota/);
+      }
+      if (quota === 2.000000001 || quota === 0.0100000001) {
+        await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, quotaEnv), /platform\.local\.collector_cpu_quota/);
+      } else {
+        await recordLocalFailedDisposition(receiptRoot, invocation, markerPath, quotaEnv);
+        const proof = JSON.parse(await readFile(dispositionPath, 'utf8'));
+        assert.deepEqual(proof.collector_cpu_quota, { source: 'platform.local.collector_cpu_quota', requested_quota: quota });
+        await assertLocalFailedDisposition(receiptPath, dispositionPath, quotaEnv);
+        await unlink(dispositionPath);
+      }
+    }
+    for (const [selection, settings, metric, valid] of [
+      ['working_set', 'working_set', 'container_working_set_bytes', true],
+      ['working_set', 'usage', 'container_working_set_bytes', false],
+      ['working_set', 'working_set', 'container_memory_bytes', false],
+      ['working-set', 'working-set', 'container_working_set_bytes', false],
+      ['usage', 'usage', 'container_memory_bytes', true],
+    ] as const) {
+      const config = JSON.parse(body);
+      config.overload_guard = { container_memory_metric: selection };
+      const submitted = JSON.stringify(config);
+      const digest = createHash('sha256').update(submitted).digest('hex');
+      await writeFile(markerPath, JSON.stringify({ ...marker, submitted_config_body: submitted, submitted_config_sha256: digest }));
+      await writeFile(receiptPath, JSON.stringify({ ...receipt, submitted_config_body: submitted, submitted_config_sha256: digest,
+        terminal_observation: { ...receipt.terminal_observation,
+          status: { ...receipt.terminal_observation.status, config_sha256: digest } } }));
+      const guard = { run_id: cell, settings: { container_memory_metric: settings },
+        container_memory_metric: settings, last_caps: [{ metric }] };
+      const metricTable = tableFromArrays({ run_id: [cell], mode: ['local'], status: [resultStatus], pinning_ok: [false],
+        table: ['test_table'], evidence_json: [JSON.stringify({ overload_guard: guard, rows: { delta_committed: null } })] });
+      await writeFile(resultPath, writeParquet(WasmTable.fromIPCStream(tableToIPC(metricTable, 'stream'))));
+      if (valid) {
+        await recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env);
+        await assertLocalFailedDisposition(receiptPath, dispositionPath, env);
+        await unlink(dispositionPath);
+      } else {
+        await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env), /overload_guard\.container_memory_metric/);
+      }
+    }
+    await writeFile(receiptPath, originals[0]!);
+    await writeFile(markerPath, originals[1]!);
+    await writeFile(resultPath, originals[2]!);
+  }
   if (resultStatus === 'pinning_violation') {
     await writeFile(receiptPath, JSON.stringify({
       ...receipt, terminal_observation: { ...receipt.terminal_observation,
@@ -363,6 +425,14 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
   await recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env);
   const dispositionPath = receiptPath + localDispositionSuffix;
   await assertLocalFailedDisposition(receiptPath, dispositionPath, env);
+  assert.deepEqual(JSON.parse(await readFile(dispositionPath, 'utf8')).collector_cpu_quota,
+    { source: 'coupled_to_dfe_worker_concurrency', requested_quota: null });
+  const currentProof = await readFile(dispositionPath);
+  const legacyProof = JSON.parse(currentProof.toString('utf8'));
+  delete legacyProof.collector_cpu_quota;
+  await writeFile(dispositionPath, JSON.stringify(legacyProof));
+  await assertLocalFailedDisposition(receiptPath, dispositionPath, env);
+  await writeFile(dispositionPath, currentProof);
   assert.deepEqual(await Promise.all([receiptPath, markerPath, resultPath, logPath].map(file => readFile(file))), originals);
   await assert.rejects(recordLocalFailedDisposition(receiptRoot, invocation, markerPath, env), { code: 'EEXIST' });
   await assert.rejects(assertLocalFailedDisposition(receiptPath, dispositionPath, {
