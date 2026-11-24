@@ -4378,6 +4378,8 @@ fn attach_terminal_summary_commits(
     let mut pod_uids = BTreeSet::new();
     let mut pod_names = BTreeSet::new();
     let mut versions = BTreeMap::new();
+    let mut publication_identities = BTreeSet::new();
+    let mut publication_delta_versions = Vec::new();
     let mut total_rows = 0_u64;
     const MAX_SAFE: u64 = 9_007_199_254_740_991;
     for pod in summaries {
@@ -4397,7 +4399,7 @@ fn attach_terminal_summary_commits(
         );
         let summary = &pod.summary;
         ensure!(
-            summary.schema_version == 1
+            summary.schema_version == 2
                 && summary.incomplete == 0
                 && summary.failed == 0
                 && summary.cancelled_ambiguous == 0
@@ -4418,6 +4420,44 @@ fn attach_terminal_summary_commits(
             .all(|value| *value <= MAX_SAFE),
             "terminal admission count exceeds safe range"
         );
+        for call in &summary.publication_evidence {
+            ensure!(
+                call.clean && call.reasons.is_empty() && !call.outcomes.is_empty(),
+                "terminal publication call evidence is incomplete"
+            );
+            for outcome in &call.outcomes {
+                ensure!(
+                    !outcome.app_id.is_empty()
+                        && outcome.app_id.len() <= 253
+                        && !outcome.app_id.bytes().any(|byte| byte.is_ascii_control())
+                        && outcome.app_version >= 0
+                        && u64::try_from(outcome.app_version).is_ok_and(|version| version <= MAX_SAFE),
+                    "terminal publication identity is invalid"
+                );
+                ensure!(
+                    publication_identities.insert((outcome.app_id.clone(), outcome.app_version)),
+                    "duplicate terminal app identity and version"
+                );
+                let delta_version = match outcome.status.as_str() {
+                    "committed_now" | "already_committed" if outcome.reason.is_none() => outcome
+                        .delta_version
+                        .context("terminal publication outcome has no exact Delta version")?,
+                    "unknown" => {
+                        ensure!(
+                            outcome.delta_version.is_none() && outcome.reason.is_some(),
+                            "unknown terminal publication outcome is malformed"
+                        );
+                        bail!("terminal publication outcome is unknown")
+                    }
+                    _ => bail!("terminal publication outcome is malformed"),
+                };
+                ensure!(
+                    delta_version <= MAX_SAFE,
+                    "terminal publication Delta version exceeds safe range"
+                );
+                publication_delta_versions.push(delta_version);
+            }
+        }
         let mut pod_rows = 0_u64;
         for commit in &summary.commits {
             ensure!(
@@ -4445,6 +4485,16 @@ fn attach_terminal_summary_commits(
             .filter(|rows| *rows <= MAX_SAFE)
             .context("terminal total exceeds safe range")?;
     }
+    let publication_delta_versions = publication_delta_versions.into_iter().collect::<BTreeSet<_>>();
+    ensure!(
+        publication_delta_versions
+            .iter()
+            .all(|version| versions.contains_key(version))
+            && versions
+                .keys()
+                .all(|version| publication_delta_versions.contains(version)),
+        "terminal app identity evidence does not bind every physical Delta version"
+    );
     let mut evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
     ensure!(
         evidence["durable_commits"].is_object(),
@@ -11962,6 +12012,27 @@ struct ShutdownTerminalSummary {
     committed_rows: u64,
     incomplete: u8,
     commits: Vec<ShutdownTerminalCommit>,
+    publication_evidence: Vec<ShutdownTerminalPublicationCall>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalPublicationCall {
+    clean: bool,
+    reasons: Vec<String>,
+    outcomes: Vec<ShutdownTerminalPublicationOutcome>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownTerminalPublicationOutcome {
+    app_id: String,
+    app_version: i64,
+    status: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_version: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
@@ -18999,7 +19070,7 @@ mod tests {
             restart_count: 0,
             exit_code: 0,
             summary: ShutdownTerminalSummary {
-                schema_version: 1,
+                schema_version: 2,
                 admitted: 1,
                 committed: 1,
                 failed: 0,
@@ -19013,6 +19084,17 @@ mod tests {
                     rows: 5,
                     files: 1,
                     parquet_bytes: 50,
+                }],
+                publication_evidence: vec![ShutdownTerminalPublicationCall {
+                    clean: true,
+                    reasons: Vec::new(),
+                    outcomes: vec![ShutdownTerminalPublicationOutcome {
+                        app_id: format!("client-{index}"),
+                        app_version: 42,
+                        status: "committed_now".to_owned(),
+                        delta_version: Some(index + 1),
+                        reason: None,
+                    }],
                 }],
             },
         };
@@ -19058,7 +19140,7 @@ mod tests {
             evidence["durable_commits"]["post_teardown_delta_reconciliation"]["status"],
             "mismatch"
         );
-        for fault in 0..10 {
+        for fault in 0..13 {
             let mut bad = inputs.clone();
             let summaries = bad.terminal_summaries.as_mut().context("missing summaries")?;
             match fault {
@@ -19074,6 +19156,14 @@ mod tests {
                 7 => summaries[0].summary.admitted += 1,
                 8 => summaries[0].summary.pending = 1,
                 9 => summaries[1].pod_uid = summaries[0].pod_uid.clone(),
+                10 => summaries[0].summary.publication_evidence[0].clean = false,
+                11 => {
+                    let outcome = &mut summaries[0].summary.publication_evidence[0].outcomes[0];
+                    outcome.status = "unknown".to_owned();
+                    outcome.delta_version = None;
+                    outcome.reason = Some("not_submitted".to_owned());
+                }
+                12 => summaries[0].summary.publication_evidence[0].outcomes[0].delta_version = Some(42),
                 _ => bail!("invalid summary test case"),
             }
             let mut candidate = original.clone();

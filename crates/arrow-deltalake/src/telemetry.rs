@@ -3,6 +3,7 @@
 use delta_kernel::metrics::{CommitFailureReason, MetricEvent, MetricsReporter};
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -229,6 +230,7 @@ pub(crate) fn partition_binding(path: &'static str) {
 }
 
 const MAX_TERMINAL_COMMITS: usize = 100_000;
+const MAX_TERMINAL_PUBLICATIONS: usize = 100_000;
 
 #[derive(Clone, Debug, serde::Serialize)]
 /// A directly observed physical Delta commit for terminal reconciliation.
@@ -248,6 +250,8 @@ pub struct TerminalCommit {
 #[derive(Default)]
 struct TerminalCommits {
     commits: Vec<TerminalCommit>,
+    publications: Vec<Arc<crate::PublicationEvidence>>,
+    publication_ids: HashSet<usize>,
     incomplete: bool,
     overflow: bool,
 }
@@ -263,6 +267,77 @@ pub fn mark_terminal_commit_incomplete() {
     if let Ok(mut evidence) = terminal_commits().lock() {
         evidence.incomplete = true;
     }
+}
+
+pub(crate) fn record_terminal_publication_evidence(publication: Arc<crate::PublicationEvidence>) {
+    if let Ok(mut evidence) = terminal_commits().lock() {
+        let has_unknown = publication
+            .outcomes
+            .values()
+            .any(|outcome| matches!(outcome, crate::PublicationOutcome::Unknown(_)));
+        if !publication.clean || publication.outcomes.is_empty() || has_unknown {
+            evidence.incomplete = true;
+        }
+        let identity = Arc::as_ptr(&publication) as usize;
+        if !evidence.publication_ids.insert(identity) {
+            return;
+        }
+        if evidence.publications.len() == MAX_TERMINAL_PUBLICATIONS {
+            evidence.incomplete = true;
+            evidence.overflow = true;
+        } else if !evidence.overflow {
+            evidence.publications.push(publication);
+        }
+    }
+}
+
+/// Returns exact app identities and whole-call outcomes, or none if they cannot be complete.
+#[must_use]
+pub fn terminal_publication_snapshot() -> Option<(bool, Vec<serde_json::Value>)> {
+    let evidence = terminal_commits().lock().ok()?;
+    if evidence.overflow {
+        return None;
+    }
+    let mut incomplete = evidence.incomplete;
+    let publications = evidence
+        .publications
+        .iter()
+        .map(|publication| {
+            let outcomes = publication
+                .outcomes
+                .iter()
+                .map(|((app_id, app_version), outcome)| {
+                    let (status, delta_version, reason) = match outcome {
+                        crate::PublicationOutcome::CommittedNow(version) => ("committed_now", Some(*version), None),
+                        crate::PublicationOutcome::AlreadyCommitted(version) => {
+                            ("already_committed", Some(*version), None)
+                        }
+                        crate::PublicationOutcome::Unknown(reason) => ("unknown", None, Some(*reason)),
+                    };
+                    serde_json::json!({
+                        "app_id": app_id,
+                        "app_version": app_version,
+                        "status": status,
+                        "delta_version": delta_version,
+                        "reason": reason
+                    })
+                })
+                .collect::<Vec<_>>();
+            let has_unknown = publication
+                .outcomes
+                .values()
+                .any(|outcome| matches!(outcome, crate::PublicationOutcome::Unknown(_)));
+            if !publication.clean || outcomes.is_empty() || has_unknown {
+                incomplete = true;
+            }
+            serde_json::json!({
+                "clean": publication.clean,
+                "reasons": publication.reasons.iter().collect::<Vec<_>>(),
+                "outcomes": outcomes
+            })
+        })
+        .collect();
+    Some((incomplete, publications))
 }
 
 /// Returns the retained process-lifetime commit facts, or none if they cannot be complete.

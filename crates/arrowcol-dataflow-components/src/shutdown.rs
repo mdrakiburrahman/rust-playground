@@ -423,7 +423,9 @@ impl RoutingShutdown {
         }
         let admitted = u64::try_from(evidence.admissions.len()).ok()?;
         let (commit_incomplete, commits) = arrow_deltalake::telemetry::terminal_commit_snapshot()?;
-        incomplete |= commit_incomplete;
+        let (publication_incomplete, publication_evidence) =
+            arrow_deltalake::telemetry::terminal_publication_snapshot()?;
+        incomplete |= commit_incomplete || publication_incomplete;
         let mut versions = HashSet::new();
         let mut committed_rows = 0_u64;
         for commit in &commits {
@@ -452,9 +454,10 @@ impl RoutingShutdown {
             return None;
         }
         Some(serde_json::json!({
-            "schema_version": 1, "admitted": admitted, "committed": committed,
+            "schema_version": 2, "admitted": admitted, "committed": committed,
             "failed": failed, "cancelled_ambiguous": cancelled_ambiguous, "pending": pending,
-            "committed_rows": committed_rows, "incomplete": u8::from(incomplete), "commits": commits
+            "committed_rows": committed_rows, "incomplete": u8::from(incomplete), "commits": commits,
+            "publication_evidence": publication_evidence
         }))
     }
 

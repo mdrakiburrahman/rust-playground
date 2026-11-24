@@ -282,10 +282,23 @@ impl CommitReceipt {
     /// # Errors
     /// Returns both the original worker error classification and any publication evidence.
     pub async fn wait_with_evidence(self) -> std::result::Result<AppendResult, PublicationFailure> {
-        let result = self
-            .0
-            .await
-            .unwrap_or_else(|_| Err(CommitReceiptError::WorkerStopped.into()))?;
+        let result = match self.0.await {
+            Ok(Ok(result)) => {
+                crate::telemetry::record_terminal_publication_evidence(Arc::clone(&result.evidence));
+                result
+            }
+            Ok(Err(failure)) => {
+                if let Some(evidence) = &failure.evidence {
+                    crate::telemetry::record_terminal_publication_evidence(Arc::clone(evidence));
+                }
+                crate::telemetry::mark_terminal_commit_incomplete();
+                return Err(failure);
+            }
+            Err(_) => {
+                crate::telemetry::mark_terminal_commit_incomplete();
+                return Err(CommitReceiptError::WorkerStopped.into());
+            }
+        };
         let mut files = result.files.into_iter();
         let file = files
             .next()
@@ -323,9 +336,23 @@ impl GroupCommitReceipt {
     /// # Errors
     /// Returns both the original worker error classification and any publication evidence.
     pub async fn wait_with_evidence(self) -> std::result::Result<GroupAppendResult, PublicationFailure> {
-        self.0
-            .await
-            .unwrap_or_else(|_| Err(CommitReceiptError::WorkerStopped.into()))
+        match self.0.await {
+            Ok(Ok(result)) => {
+                crate::telemetry::record_terminal_publication_evidence(Arc::clone(&result.evidence));
+                Ok(result)
+            }
+            Ok(Err(failure)) => {
+                if let Some(evidence) = &failure.evidence {
+                    crate::telemetry::record_terminal_publication_evidence(Arc::clone(evidence));
+                }
+                crate::telemetry::mark_terminal_commit_incomplete();
+                Err(failure)
+            }
+            Err(_) => {
+                crate::telemetry::mark_terminal_commit_incomplete();
+                Err(CommitReceiptError::WorkerStopped.into())
+            }
+        }
     }
 }
 
@@ -1257,9 +1284,10 @@ mod tests {
         let root = directory.path().canonicalize()?;
         let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table URL"))?;
         let table_id = format!("{:x}", sha2::Sha256::digest(url.as_str().as_bytes()));
+        let app_id = format!("terminal-evidence-{table_id}");
         let table = BatchedTable::open(&root, CommitOptions::default()).await?;
         let group = table
-            .stage_coalesced_publications(vec![(input()?, "logical".into(), 0, 10)])
+            .stage_coalesced_publications(vec![(input()?, app_id.clone(), 0, 10)])
             .await?;
         let commit = table.submit_prepared_group(group, true).await?.wait().await?;
         let (_, commits) = crate::telemetry::terminal_commit_snapshot().context("missing terminal commit evidence")?;
@@ -1269,8 +1297,19 @@ mod tests {
             .context("missing direct commit")?;
         assert_eq!((event.version, event.rows, event.files), (commit.version, 1, 1));
         assert!(event.parquet_bytes > 0);
+        let (_, publications) =
+            crate::telemetry::terminal_publication_snapshot().context("missing terminal publication evidence")?;
+        let outcome = publications
+            .iter()
+            .filter_map(|call| call["outcomes"].as_array())
+            .flatten()
+            .find(|outcome| outcome["app_id"] == app_id && outcome["app_version"] == 0)
+            .context("missing exact app identity outcome")?;
+        assert_eq!(outcome["status"], "committed_now");
+        assert_eq!(outcome["delta_version"].as_u64(), Some(commit.version));
+        assert_eq!(outcome["reason"], serde_json::Value::Null);
         let replay = table
-            .stage_coalesced_publications(vec![(input()?, "logical".into(), 0, 10)])
+            .stage_coalesced_publications(vec![(input()?, app_id.clone(), 0, 10)])
             .await?;
         assert!(!replay.committed_identities.is_empty());
         assert!(

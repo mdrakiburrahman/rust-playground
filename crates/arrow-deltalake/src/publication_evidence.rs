@@ -10,7 +10,8 @@ pub enum PublicationOutcome {
     Unknown(PublicationReason),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PublicationReason {
     NotSubmitted,
     NoCommitProvenance,

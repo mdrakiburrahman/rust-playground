@@ -5817,13 +5817,7 @@ impl DeltaTable {
                         crate::telemetry::mark_terminal_commit_incomplete();
                     })?;
                     let version = commit.commit_version();
-                    crate::telemetry::record_terminal_commit(
-                        &table_id,
-                        version,
-                        rows,
-                        files_count,
-                        parquet_bytes,
-                    );
+                    crate::telemetry::record_terminal_commit(&table_id, version, rows, files_count, parquet_bytes);
                     for &(id, v) in &submitted {
                         evidence
                             .outcomes
