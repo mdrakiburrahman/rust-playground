@@ -96,9 +96,9 @@ impl IsolationSink {
                 pool.metrics.rejected.fetch_add(1, Relaxed);
                 anyhow::anyhow!("diagnostic waiting-input byte limit reached")
             })?;
+        let slot = Arc::clone(&pool.workers).acquire_owned().await?;
         let bytes = Arc::clone(&pool.bytes).acquire_many_owned(units).await?;
         drop(queued);
-        let slot = Arc::clone(&pool.workers).acquire_owned().await?;
         pool.metrics.admission_wait_ns.fetch_add(ns(start.elapsed()), Relaxed);
         let pool = Arc::clone(pool);
         // The worker (including any acknowledged-create cleanup) retains both permits even if
@@ -733,8 +733,10 @@ mod tests {
         let slots = sink.0.workers.acquire_many(WORKERS as u32).await?;
         let mut waiting = Box::pin(sink.accept(batch()?));
         assert!(futures::poll!(waiting.as_mut()).is_pending());
-        assert!(sink.0.bytes.available_permits() < BUDGET / UNIT);
+        assert!(sink.0.waiting.available_permits() < BUDGET / UNIT);
+        assert_eq!(sink.0.bytes.available_permits(), BUDGET / UNIT);
         drop(waiting);
+        assert_eq!(sink.0.waiting.available_permits(), BUDGET / UNIT);
         assert_eq!(sink.0.bytes.available_permits(), BUDGET / UNIT);
         drop(slots);
         assert_eq!(sink.0.metrics.snapshot()["encode"]["batches"], 0);

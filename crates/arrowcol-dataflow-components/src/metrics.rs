@@ -1261,15 +1261,17 @@ pub(crate) enum ExporterGroupState {
     FlushSlot,
     Preparing,
     CommitWait,
+    ReceiptWait,
 }
 
 impl ExporterGroupState {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Pipeline,
         Self::FlushWait,
         Self::FlushSlot,
         Self::Preparing,
         Self::CommitWait,
+        Self::ReceiptWait,
     ];
 
     const fn index(self) -> usize {
@@ -1283,6 +1285,7 @@ impl ExporterGroupState {
             Self::FlushSlot => "flush_slot",
             Self::Preparing => "preparing",
             Self::CommitWait => "commit_wait",
+            Self::ReceiptWait => "receipt_wait",
         }
     }
 }
@@ -1304,7 +1307,7 @@ struct GroupObservation {
 #[derive(Default)]
 pub(crate) struct ExporterOccupancy {
     capacity: [[CapacityObservation; 3]; 2],
-    groups: [GroupObservation; 5],
+    groups: [GroupObservation; ExporterGroupState::ALL.len()],
 }
 
 impl ExporterOccupancy {
