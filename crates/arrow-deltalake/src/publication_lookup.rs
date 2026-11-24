@@ -216,56 +216,33 @@ impl TxnIndex {
         engine: &dyn Engine,
         ids: &[&'a str],
     ) -> DeltaResult<HashMap<&'a str, Option<i64>>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         // Expiry is wall-clock dependent, so expiring tables always replay.
         let Some(lineage) =
             lineage.filter(|_| snapshot.table_properties().set_transaction_retention_duration.is_none())
         else {
             return get_app_id_versions(snapshot, engine, ids.iter().copied());
         };
-        let table = snapshot.table_configuration().metadata().id();
+        let table: &str = snapshot.table_configuration().metadata().id();
         let version = snapshot.version();
-        let current = slot
-            .as_mut()
-            .filter(|index| index.table == table && index.lineage == lineage);
-        if current.as_ref().is_some_and(|index| index.version > version) {
-            return get_app_id_versions(snapshot, engine, ids.iter().copied());
-        }
-        let advanced = match current {
-            Some(index) => index.advance(snapshot, engine)?,
-            None => false,
+        let index = match slot {
+            Some(index) if index.table == table && index.lineage == lineage => {
+                if index.version > version {
+                    return get_app_id_versions(snapshot, engine, ids.iter().copied());
+                }
+                if !index.advance(snapshot, engine)? {
+                    *index = Self::seed(snapshot, engine, table, lineage)?;
+                }
+                index
+            }
+            _ => slot.insert(Self::seed(snapshot, engine, table, lineage)?),
         };
-        if !advanced {
-            *slot = Some(Self::seed(snapshot, engine, table, lineage)?);
-        }
-        let index = slot
-            .as_ref()
-            .ok_or_else(|| Error::internal_error("transaction index missing after seed"))?;
         Ok(ids
             .iter()
             .map(|&id| (id, index.transactions.get(id).copied()))
             .collect())
-    }
-
-    /// Apply this writer's own commit, which carries exactly `submitted` transactions.
-    pub(crate) fn record_commit<'a>(
-        slot: &mut Option<Self>,
-        table: &str,
-        lineage: Option<u64>,
-        read_version: u64,
-        commit_version: u64,
-        submitted: impl IntoIterator<Item = (&'a str, i64)>,
-    ) {
-        if let Some(index) = slot.as_mut()
-            && Some(index.lineage) == lineage
-            && index.table == table
-            && index.version == read_version
-            && read_version.checked_add(1) == Some(commit_version)
-        {
-            index
-                .transactions
-                .extend(submitted.into_iter().map(|(id, version)| (id.into(), version)));
-            index.version = commit_version;
-        }
     }
 
     fn seed(snapshot: &Snapshot, engine: &dyn Engine, table: &str, lineage: u64) -> DeltaResult<Self> {
@@ -287,13 +264,10 @@ impl TxnIndex {
         if self.version == target {
             return Ok(true);
         }
-        let tail = snapshot
-            .log_segment()
-            .listed
-            .ascending_commit_files
-            .iter()
-            .filter(|commit| commit.version > self.version)
-            .collect::<Vec<_>>();
+        // Even our own last receipt is not proof that the newly listed file still
+        // contains those transactions. Advance only from the certified snapshot.
+        let commits = &snapshot.log_segment().listed.ascending_commit_files;
+        let tail = &commits[commits.partition_point(|commit| commit.version <= self.version)..];
         let contiguous = tail.len() as u64 == target - self.version
             && tail.iter().zip(self.version + 1..).all(|(commit, version)| {
                 commit.version == version && commit.file_type == delta_kernel::path::LogPathFileType::Commit
@@ -301,9 +275,16 @@ impl TxnIndex {
         if !contiguous {
             return Ok(false);
         }
-        let files = tail.iter().rev().map(|commit| commit.location.clone()).collect::<Vec<_>>();
+        let files = tail
+            .iter()
+            .rev()
+            .map(|commit| commit.location.clone())
+            .collect::<Vec<_>>();
         let mut visitor = AllTransactions::default();
-        for batch in engine.json_handler().read_json_files(&files, LOG_TXN_SCHEMA.clone(), None)? {
+        for batch in engine
+            .json_handler()
+            .read_json_files(&files, LOG_TXN_SCHEMA.clone(), None)?
+        {
             visitor.visit_rows_of(batch?.as_ref())?;
         }
         self.transactions.extend(visitor.transactions);
@@ -586,6 +567,35 @@ mod tests {
             get_app_id_versions(&after, &fixture.engine, ["external"])?["external"],
             Some(3)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_index_reads_only_the_tail_and_never_answers_history_from_the_future() -> Result<()> {
+        let fixture = Fixture::new(false)?;
+        fixture.append(1, &[txn("first", 7, None)])?;
+        let before = fixture.snapshot()?;
+        let engine = CountingEngine::new(&fixture.engine);
+        let ids = ["first", "foreign"];
+        let mut index = None;
+        let old = TxnIndex::lookup(&mut index, &before, Some(1), &engine, &ids)?;
+        assert_eq!(old["first"], Some(7));
+        assert_eq!(old["foreign"], None);
+        fixture.append(2, &[txn("first", 9, None), txn("foreign", 4, None)])?;
+        fixture.append(3, &[txn("first", 2, None)])?;
+        let after = fixture.snapshot()?;
+        let seed_reads = engine.files();
+        let new = TxnIndex::lookup(&mut index, &after, Some(1), &engine, &ids)?;
+        assert_eq!(new["first"], Some(2));
+        assert_eq!(new["foreign"], Some(4));
+        assert_eq!(engine.files() - seed_reads, 2);
+        assert_eq!(TxnIndex::lookup(&mut index, &after, Some(1), &engine, &ids)?, new);
+        assert_eq!(engine.files() - seed_reads, 2);
+        assert_eq!(TxnIndex::lookup(&mut index, &before, Some(1), &engine, &ids)?, old);
+        fixture.append(4, &[txn("first", 6, None), json!({"txn":{"appId":"broken"}})])?;
+        let broken = fixture.snapshot()?;
+        assert!(TxnIndex::lookup(&mut index, &broken, Some(1), &engine, &ids).is_err());
+        assert_eq!(TxnIndex::lookup(&mut index, &after, Some(1), &engine, &ids)?, new);
         Ok(())
     }
 

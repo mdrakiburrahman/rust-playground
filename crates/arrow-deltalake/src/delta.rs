@@ -2560,6 +2560,151 @@ mod io_tests {
         Ok(())
     }
 
+    fn enable_checkpoint_index(table: &mut Arc<DeltaTable>) -> Result<()> {
+        let table = Arc::get_mut(table).context("unique table owner")?;
+        table.snapshot_cache_mode = crate::SnapshotCacheMode::CheckpointAware;
+        table.txn_lookup_mode = TxnLookupMode::Incremental;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_aware_preflight_never_deduplicates_a_replaced_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        let ids = [("mine".into(), 7), ("peer".into(), 7)];
+        assert_eq!(table.lookup_publications(&ids)?, [false, false]);
+        let version = table.commit_files_with_transaction(&[], "mine", 7)?;
+        let path = directory.path().join(format!("_delta_log/{version:020}.json"));
+        let log = fs::read_to_string(&path)?;
+        let replace = |old: &str, new: &str| -> Result<()> {
+            let contents = log.replace(old, new);
+            anyhow::ensure!(contents != log);
+            let replacement = directory.path().join("replacement");
+            fs::write(&replacement, contents)?;
+            let times = std::fs::FileTimes::new().set_modified(fs::metadata(&path)?.modified()?);
+            File::open(&replacement)?.set_times(times)?;
+            fs::rename(replacement, &path)?;
+            Ok(())
+        };
+        // Same table UUID, log version, length and mtime. No refresh has yet seen our commit.
+        replace("\"mine\"", "\"peer\"")?;
+        assert_eq!(table.lookup_publications(&ids)?, [false, true]);
+        let (_, first) = table.snapshot_with_lineage()?;
+        replace("\"mine\"", "\"next\"")?;
+        assert_eq!(table.lookup_publications(&ids)?, [false, false]);
+        let (_, second) = table.snapshot_with_lineage()?;
+        assert!(first.is_some() && second.is_some() && first != second);
+        assert_eq!(table.commit_files_with_transaction(&[], "mine", 7)?, version + 1);
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_preflight_propagates_transaction_index_poison() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        std::thread::scope(|scope| {
+            let panicked = scope.spawn(|| {
+                let _index = table.txn_index.lock();
+                panic!("interrupted index update");
+            });
+            assert!(panicked.join().is_err());
+        });
+        let error = table
+            .lookup_publications(&[("id".into(), 1)])
+            .err()
+            .context("preflight bypassed a poisoned transaction index")?;
+        assert!(error.to_string().contains("transaction index poisoned"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_aware_index_tracks_foreign_transactions_across_checkpoint_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        let ids = [("own".into(), 7), ("foreign".into(), 9)];
+        let own = table.commit_files_with_transaction(&[], "own", 7)?;
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        let log = directory.path().join("_delta_log");
+        let foreign = own + 1;
+        fs::write(
+            log.join(format!("{foreign:020}.json")),
+            r#"{"txn":{"appId":"foreign","version":9}}"#,
+        )?;
+        let checkpoint = foreign + 1;
+        fs::write(
+            log.join(format!("{checkpoint:020}.json")),
+            r#"{"txn":{"appId":"another","version":1}}"#,
+        )?;
+        assert_eq!(table.checkpoint()?, checkpoint);
+        let (adopted, lineage) = table.snapshot_with_lineage()?;
+        assert_eq!(adopted.log_segment().checkpoint_version, Some(checkpoint));
+        assert!(lineage.is_some());
+        for v in 0..checkpoint {
+            fs::remove_file(log.join(format!("{v:020}.json")))?;
+        }
+        let (pruned, pruned_lineage) = table.snapshot_with_lineage()?;
+        assert!(Arc::ptr_eq(&adopted, &pruned));
+        assert_eq!(pruned_lineage, lineage);
+        assert_eq!(table.lookup_publications(&ids)?, [true, true]);
+        assert_eq!(table.commit_files_with_transaction(&[], "foreign", 9)?, checkpoint);
+        assert!(table.lookup_publications(&[("foreign".into(), 8)]).is_err());
+        let next = checkpoint + 1;
+        fs::write(
+            log.join(format!("{next:020}.json")),
+            r#"{"txn":{"appId":"foreign","version":3}}"#,
+        )?;
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        assert_eq!(table.lookup_publications(&[("foreign".into(), 3)])?, [true]);
+        assert_eq!(table.snapshot_with_lineage()?.1, lineage);
+        fs::write(
+            log.join(format!("{checkpoint:020}.checkpoint.parquet")),
+            b"bad checkpoint",
+        )?;
+        assert!(table.lookup_publications(&ids).is_err());
+        assert!(table.commit_files_with_transaction(&[], "own", 7).is_err());
+        assert!(!log.join(format!("{:020}.json", next + 1)).exists());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_aware_object_index_invalidates_same_version_replacement() -> Result<()> {
+        let (_, session) = ready_stage_session().await?;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let mut table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            vec![],
+            None,
+            Some(Arc::clone(&session)),
+            Some(Arc::<object_store::memory::InMemory>::clone(&store)),
+        )?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        let path = table.object_path("_delta_log/00000000000000000001.json")?;
+        store
+            .put(&path, br#"{"txn":{"appId":"old","version":4}}"#.to_vec().into())
+            .await?;
+        let ids = [("old".into(), 4), ("new".into(), 4)];
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        let old = table.snapshot_with_lineage()?.1.context("certified object snapshot")?;
+        store
+            .put(&path, br#"{"txn":{"appId":"new","version":4}}"#.to_vec().into())
+            .await?;
+        assert_eq!(table.lookup_publications(&ids)?, [false, true]);
+        assert_ne!(table.snapshot_with_lineage()?.1, Some(old));
+        drop(table);
+        session.close_after_drain_async().await?;
+        Ok(())
+    }
+
     /// Scenario: historical JSON is corrupted without changing its length or modification time.
     /// Guarantees: Unix identity/change-time checks invalidate the base and corruption remains visible.
     #[cfg(unix)]
@@ -3370,8 +3515,8 @@ type LogFingerprints = BTreeMap<(u64, LogEntry), LogFingerprint>;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum LogEntry {
     Commit,
-    /// Checkpoint parts and compacted commits, which Kernel may adopt but never rewrites.
-    Auxiliary(Box<str>),
+    Checkpoint,
+    Hint,
 }
 
 struct CachedSnapshot {
@@ -3380,44 +3525,43 @@ struct CachedSnapshot {
     lineage: u64,
 }
 
-/// Classify a `_delta_log` entry: `None` is an unrecognized layout, `Some(None)` is
-/// metadata the snapshot never depends on.
-fn log_entry(name: &str, checkpoint_aware: bool) -> Option<Option<(u64, LogEntry)>> {
-    let parse = |digits: &str| {
-        (digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| digits.parse::<u64>().ok())
-            .flatten()
-    };
-    if let Some(version) = name.strip_suffix(".json").and_then(parse) {
-        return Some(Some((version, LogEntry::Commit)));
+fn log_entry(name: &str, checkpoint_aware: bool) -> Option<(u64, LogEntry)> {
+    if checkpoint_aware && name == "_last_checkpoint" {
+        return Some((0, LogEntry::Hint));
     }
-    if !checkpoint_aware {
+    let (digits, suffix) = name.split_at_checked(20)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    if name == "_last_checkpoint" || name.starts_with('.') || name.contains('#') || name.ends_with(".crc") {
-        return Some(None);
-    }
-    let (digits, rest) = name.split_at_checked(20)?;
-    let version = parse(digits)?;
-    let rest = rest.strip_prefix('.')?;
-    (rest.starts_with("checkpoint.")
-        || (rest.ends_with(".compacted.json") && rest.split('.').next().and_then(parse).is_some()))
-    .then(|| Some((version, LogEntry::Auxiliary(rest.into()))))
+    let entry = match suffix {
+        ".json" => LogEntry::Commit,
+        ".checkpoint.parquet" if checkpoint_aware => LogEntry::Checkpoint,
+        // CRCs, compacted commits and sidecars can change what Kernel replays.
+        // Never certify a layout whose complete set of dependencies we don't track.
+        _ => return None,
+    };
+    Some((digits.parse().ok()?, entry))
 }
 
 fn retained_log_entry((version, entry): &(u64, LogEntry), floor: Option<u64>) -> bool {
     floor.is_none_or(|floor| match entry {
-        LogEntry::Commit => *version > floor,
-        LogEntry::Auxiliary(_) => *version >= floor,
+        LogEntry::Commit | LogEntry::Checkpoint => *version >= floor,
+        LogEntry::Hint => true,
     })
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct LogFingerprint {
-    length: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
+enum LogFingerprint {
+    Local {
+        length: u64,
+        modified: std::time::SystemTime,
+        #[cfg(unix)]
+        identity: (u64, u64, i64, i64),
+    },
+    Object {
+        etag: Option<String>,
+        version: Option<String>,
+    },
 }
 
 pub(crate) struct DurableCommitter;
@@ -4019,17 +4163,28 @@ impl DeltaTable {
     /// # Errors
     /// Rejects invalid IDs, newer committed versions, expired transaction history, or read failures.
     pub fn lookup_publications(&self, publications: &[(String, i64)]) -> Result<Vec<bool>> {
-        let snapshot = self.snapshot()?;
+        let (snapshot, lineage) = self.snapshot_with_lineage()?;
         Self::validate_retention(&snapshot)?;
         let mut unique = std::collections::HashSet::with_capacity(publications.len());
+        for (app_id, version) in publications {
+            validate_transaction_id(app_id, *version)?;
+            if !unique.insert(app_id.as_str()) {
+                bail!("duplicate application identity in publication lookup");
+            }
+        }
+        let indexed = if self.txn_lookup_mode == TxnLookupMode::Incremental {
+            Some(self.publication_versions(&snapshot, lineage, &unique.into_iter().collect::<Vec<_>>())?)
+        } else {
+            None
+        };
         publications
             .iter()
             .map(|(app_id, version)| {
-                validate_transaction_id(app_id, *version)?;
-                if !unique.insert(app_id.as_str()) {
-                    bail!("duplicate application identity in publication lookup");
-                }
-                match snapshot.get_app_id_version(app_id, &self.engine)? {
+                let previous = match &indexed {
+                    Some(versions) => versions[app_id.as_str()],
+                    None => snapshot.get_app_id_version(app_id, &self.engine)?,
+                };
+                match previous {
                     Some(previous) if previous > *version => {
                         bail!("publication transaction fenced by newer application version")
                     }
@@ -4362,11 +4517,13 @@ impl DeltaTable {
                 .map_err(anyhow::Error::new)
         };
         let checkpoint_aware = self.snapshot_cache_mode == crate::SnapshotCacheMode::CheckpointAware;
-        if checkpoint_aware && self.url.scheme() != "file" {
-            return self.object_store_snapshot(full_build);
-        }
-        // Injected stores need not reflect filesystem metadata faithfully.
-        if !self.reuse_snapshots || !cfg!(unix) {
+        // Injected local stores need not reflect filesystem metadata faithfully.
+        let can_certify = if self.url.scheme() == "file" {
+            self.reuse_snapshots && cfg!(unix)
+        } else {
+            checkpoint_aware
+        };
+        if !can_certify {
             return Ok((full_build()?, None));
         }
         let mut cache = self
@@ -4376,120 +4533,117 @@ impl DeltaTable {
         let previous = cache.take();
         let mut floor = previous
             .as_ref()
-            .filter(|_| checkpoint_aware)
-            .and_then(|previous| previous.snapshot.log_segment().checkpoint_version);
-        let mut before = self.log_fingerprints(checkpoint_aware, floor)?;
-        let base = previous.filter(|previous| {
-            before.as_ref().is_some_and(|files| {
-                previous
-                    .files
-                    .iter()
-                    .all(|(key, fingerprint)| files.get(key) == Some(fingerprint))
-            })
+            .and_then(|p| p.snapshot.log_segment().checkpoint_version);
+        let Some(mut before) = self.log_fingerprints(checkpoint_aware, floor)? else {
+            return Ok((full_build()?, None));
+        };
+        if let Some(base) = &previous
+            && checkpoint_aware
+            && before == base.files
+        {
+            let latest = (Arc::clone(&base.snapshot), Some(base.lineage));
+            *cache = previous;
+            return Ok(latest);
+        }
+        // Only plain JSON strictly past the certified version can extend the lineage.
+        // A checkpoint (even at the same version) can replace the replay baseline.
+        let base = previous.filter(|p| {
+            before
+                .iter()
+                .filter(|((v, entry), _)| *v <= p.snapshot.version() || *entry != LogEntry::Commit)
+                .eq(p.files.iter())
         });
         if base.is_none() && floor.is_some() {
             floor = None;
-            before = self.log_fingerprints(checkpoint_aware, None)?;
+            let Some(all) = self.log_fingerprints(checkpoint_aware, None)? else {
+                return Ok((full_build()?, None));
+            };
+            before = all;
         }
-        // JSON-only bases need only the new listing tail. Both integrity scans
-        // still cover all history; a newly appearing checkpoint forces full loading.
-        // Checkpoint-aware bases adopt new checkpoints and scan only past the adopted one.
-        // No pinned version or connector-supplied freshness is used.
         let snapshot = match &base {
-            Some(base) if checkpoint_aware => Snapshot::builder_from(Arc::clone(&base.snapshot)).build(&self.engine)?,
             Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot))
                 .skip_new_checkpoints()
                 .build(&self.engine)?,
             None => full_build()?,
         };
-        let after = self.log_fingerprints(checkpoint_aware, floor)?;
-        if let (Some(before), Some(mut after)) = (before, after) {
-            let version = snapshot.version();
-            after.retain(|(entry_version, _), _| *entry_version <= version);
-            let stable = if checkpoint_aware {
-                // Checkpoints appear by atomic rename and Kernel validates any it adopts;
-                // commits must match exactly.
-                before
-                    .iter()
-                    .filter(|((entry_version, _), _)| *entry_version <= version)
-                    .all(|(key, fingerprint)| after.get(key) == Some(fingerprint))
-                    && after
-                        .keys()
-                        .all(|key| key.1 != LogEntry::Commit || before.contains_key(key))
-            } else {
-                before
-                    .iter()
-                    .take_while(|((entry_version, _), _)| *entry_version <= version)
-                    .eq(after.iter())
-            };
-            if stable {
-                if checkpoint_aware {
-                    let floor = snapshot.log_segment().checkpoint_version;
-                    after.retain(|key, _| retained_log_entry(key, floor));
-                }
-                let lineage = base.as_ref().map_or_else(
-                    || self.snapshot_lineages.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    |base| base.lineage,
-                );
-                *cache = Some(CachedSnapshot {
-                    snapshot: Arc::clone(&snapshot),
-                    files: after,
-                    lineage,
-                });
-                return Ok((snapshot, Some(lineage)));
-            }
-        }
-        // Mutation during an incremental load invalidates its historical baseline.
-        // Never retain a snapshot with fingerprints captured after that mutation.
-        if base.is_some() {
+        if self.log_fingerprints(checkpoint_aware, floor)?.as_ref() != Some(&before) {
+            // Mutation during either a full or incremental load: do not publish a
+            // lineage assembled from different generations of the same log.
             return Ok((full_build()?, None));
         }
-        Ok((snapshot, None))
-    }
-
-    /// Object-store commits are put-if-absent and the publisher session fences ownership,
-    /// so the previous snapshot is a sound base for the listing tail.
-    fn object_store_snapshot(
-        &self,
-        full_build: impl Fn() -> Result<SnapshotRef>,
-    ) -> Result<(SnapshotRef, Option<u64>)> {
-        let mut cache = self
-            .snapshot_cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Delta snapshot cache lock poisoned"))?;
-        let (snapshot, lineage) = match cache.take().and_then(|previous| {
-            Snapshot::builder_from(Arc::clone(&previous.snapshot))
-                .build(&self.engine)
-                .ok()
-                .map(|snapshot| (snapshot, previous.lineage))
-        }) {
-            Some(extended) => extended,
-            None => (
-                full_build()?,
-                self.snapshot_lineages.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            ),
-        };
+        let adopted = snapshot.log_segment().checkpoint_version;
+        let version = snapshot.version();
+        let mut commits = 0_u64;
+        before.retain(|key, _| {
+            let retain = key.0 <= version && retained_log_entry(key, adopted);
+            if retain && key.1 == LogEntry::Commit && Some(key.0) != adopted {
+                commits += 1;
+            }
+            retain
+        });
+        // A file seen only by Kernel between the two scans must not become a
+        // permanent phantom head. Require the checkpoint and every subsequent JSON.
+        if adopted.is_some_and(|v| !before.contains_key(&(v, LogEntry::Checkpoint)))
+            || Some(commits) != adopted.map_or_else(|| version.checked_add(1), |v| version.checked_sub(v))
+        {
+            return Ok((full_build()?, None));
+        }
+        let lineage = base.as_ref().map_or_else(
+            || {
+                self.snapshot_lineages
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            |p| p.lineage,
+        );
         *cache = Some(CachedSnapshot {
             snapshot: Arc::clone(&snapshot),
-            files: BTreeMap::new(),
+            files: before,
             lineage,
         });
         Ok((snapshot, Some(lineage)))
     }
 
     fn log_fingerprints(&self, checkpoint_aware: bool, floor: Option<u64>) -> Result<Option<LogFingerprints>> {
+        if self.url.scheme() != "file" {
+            let store = Arc::clone(&self.store);
+            let prefix = self.object_path("_delta_log/")?;
+            return shared_executor()?.block_on(async move {
+                use futures::TryStreamExt;
+                let mut files = BTreeMap::new();
+                let mut entries = store.list(Some(&prefix));
+                while let Some(meta) = entries.try_next().await? {
+                    let Some(name) = meta.location.filename().filter(|_| {
+                        meta.location
+                            .prefix_match(&prefix)
+                            .is_some_and(|mut parts| parts.nth(1).is_none())
+                    }) else {
+                        return Ok(None);
+                    };
+                    let Some(key) = log_entry(name, checkpoint_aware) else {
+                        return Ok(None);
+                    };
+                    if retained_log_entry(&key, floor) {
+                        let etag = meta.e_tag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/"));
+                        let version = meta.version.filter(|version| !version.is_empty());
+                        if etag.is_none() && version.is_none() {
+                            return Ok(None);
+                        }
+                        files.insert(key, LogFingerprint::Object { etag, version });
+                    }
+                }
+                Ok(Some(files))
+            });
+        }
         let mut files = BTreeMap::new();
         for entry in fs::read_dir(self.root.join("_delta_log"))? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(key) = name.to_str().and_then(|name| log_entry(name, checkpoint_aware)) else {
-                // Unrecognized layouts keep the full-build behavior; without checkpoint
-                // awareness that includes checkpoints and CRCs.
                 return Ok(None);
             };
-            let Some(key) = key.filter(|key| retained_log_entry(key, floor)) else {
+            if !retained_log_entry(&key, floor) {
                 continue;
-            };
+            }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -4505,7 +4659,7 @@ impl DeltaTable {
             };
             files.insert(
                 key,
-                LogFingerprint {
+                LogFingerprint::Local {
                     length: metadata.len(),
                     modified: metadata.modified()?,
                     #[cfg(unix)]
@@ -5746,16 +5900,19 @@ impl DeltaTable {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("publication cache poisoned"))?
                 .lookup(snapshot, &self.engine, ids)?),
-            TxnLookupMode::Incremental => Ok(crate::publication_lookup::TxnIndex::lookup(
-                &mut self
+            TxnLookupMode::Incremental => {
+                let mut index = self
                     .txn_index
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("transaction index poisoned"))?,
-                snapshot,
-                lineage,
-                &self.engine,
-                ids,
-            )?),
+                    .map_err(|_| anyhow::anyhow!("transaction index poisoned"))?;
+                Ok(crate::publication_lookup::TxnIndex::lookup(
+                    &mut index,
+                    snapshot,
+                    lineage,
+                    &self.engine,
+                    ids,
+                )?)
+            }
         }
     }
 
@@ -5787,7 +5944,8 @@ impl DeltaTable {
             self.check_publication()?;
             let (snapshot, lineage) = crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())?;
             Self::validate_retention(&snapshot)?;
-            let versions = crate::telemetry::publication_phase("lookup", || self.publication_versions(&snapshot, lineage, ids))?;
+            let versions =
+                crate::telemetry::publication_phase("lookup", || self.publication_versions(&snapshot, lineage, ids))?;
             let replay = |id: &str, v: i64, evidence: &mut PublicationEvidence| {
                 evidence.mark(PublicationReason::Deduplicated);
                 let proven = self
@@ -6037,8 +6195,9 @@ impl DeltaTable {
                 .chain(identity)
                 .collect::<Vec<_>>();
             let reconcile = |evidence: &mut PublicationEvidence| -> Result<Option<u64>> {
-                let (latest, latest_lineage) = crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())
-                    .context("unknown publication outcome; reconciliation failed")?;
+                let (latest, latest_lineage) =
+                    crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())
+                        .context("unknown publication outcome; reconciliation failed")?;
                 Self::validate_retention(&latest)?;
                 let mut ids = pending
                     .iter()
@@ -6060,11 +6219,13 @@ impl DeltaTable {
                 let mut group_committed = 0;
                 let group_total = group_transaction_ids.len();
                 let mut all_committed = true;
-                let versions = crate::telemetry::publication_phase("lookup", || self.publication_versions(
-                    &latest,
-                    latest_lineage,
-                    &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-                ))?;
+                let versions = crate::telemetry::publication_phase("lookup", || {
+                    self.publication_versions(
+                        &latest,
+                        latest_lineage,
+                        &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                    )
+                })?;
                 for (id, version, is_group) in ids {
                     match versions[id] {
                         Some(previous) if previous > version => {
@@ -6113,18 +6274,6 @@ impl DeltaTable {
                         evidence
                             .outcomes
                             .insert((id.to_owned(), v), PublicationOutcome::CommittedNow(version));
-                    }
-                    if self.txn_lookup_mode == TxnLookupMode::Incremental
-                        && let Ok(mut index) = self.txn_index.lock()
-                    {
-                        crate::publication_lookup::TxnIndex::record_commit(
-                            &mut index,
-                            &table_uuid,
-                            lineage,
-                            read_version,
-                            version,
-                            submitted.iter().copied(),
-                        );
                     }
                     if let Ok(mut cache) = self.publication_cache.lock() {
                         cache.remember(table_uuid, version, submitted.iter().map(|&(id, v)| (id.to_owned(), v)));

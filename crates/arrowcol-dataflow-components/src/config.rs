@@ -40,6 +40,38 @@ mod override_tests {
     }
 
     #[test]
+    fn commit_projection_preserves_yaml_and_reaches_table_options() -> Result<(), String> {
+        use arrow_deltalake::{CheckpointMode, SnapshotCacheMode, TxnLookupMode};
+
+        let yaml: CommitConfig = serde_json::from_value(serde_json::json!({"snapshot_cache_mode":"checkpoint_aware"}))
+            .map_err(|error| error.to_string())?;
+        for (name, mode) in [
+            ("external", CheckpointMode::External),
+            ("inline", CheckpointMode::Inline),
+            ("async", CheckpointMode::Async),
+        ] {
+            let settings = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental"}}
+            }))
+            .map_err(|error| error.to_string())?;
+            let environment = settings
+                .environment_for(arrowcol_tunables::ComponentRole::Collector)
+                .map_err(|error| error.to_string())?;
+            let merged = merge_config(&yaml, &environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"], None)?;
+            let options = merged.build()?;
+            assert_eq!(options.snapshot_cache_mode, SnapshotCacheMode::CheckpointAware);
+            assert_eq!(options.checkpoint_mode, mode);
+            assert_eq!(options.checkpoint_interval, 17);
+            assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
+        }
+        for invalid in [0, 100_001] {
+            let raw = serde_json::json!({"checkpoint_interval": invalid}).to_string();
+            assert!(merge_config(&yaml, &raw, None)?.build().is_err(), "{raw}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn receiver_compression_projects_typed_oat_json_into_actual_runtime_limits() -> Result<(), String> {
         let defaults = RuntimeLimitsConfig::default()
             .build()
@@ -1079,6 +1111,12 @@ pub struct CommitConfig {
     pub max_files_per_commit: usize,
     /// Maximum queued and committing files per table.
     pub max_pending_files: usize,
+    /// How the table owner reuses its Delta snapshot.
+    pub snapshot_cache_mode: arrow_deltalake::SnapshotCacheMode,
+    /// Whether the collector or an external service writes checkpoints.
+    pub checkpoint_mode: arrow_deltalake::CheckpointMode,
+    /// Commit interval for collector-owned checkpoints.
+    pub checkpoint_interval: u64,
 }
 
 impl Default for CommitConfig {
@@ -1089,6 +1127,9 @@ impl Default for CommitConfig {
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
+            snapshot_cache_mode: options.snapshot_cache_mode,
+            checkpoint_mode: options.checkpoint_mode,
+            checkpoint_interval: options.checkpoint_interval,
         }
     }
 }
@@ -1100,6 +1141,9 @@ impl CommitConfig {
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
+            snapshot_cache_mode: self.snapshot_cache_mode,
+            checkpoint_mode: self.checkpoint_mode,
+            checkpoint_interval: self.checkpoint_interval,
         };
         options.validate().map_err(|error| error.to_string())?;
         Ok(options)

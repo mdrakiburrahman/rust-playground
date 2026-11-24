@@ -2992,7 +2992,9 @@ mod consumer_startup_projection_tests {
                     "per_table_capacity":{"bytes":268435456,"rows":1000000,"batches":512},
                     "max_arrow_memory_per_flush":134217728,"max_rows_per_flush":777777,
                     "max_batches_per_flush":333,"max_age":"12s","max_concurrent_flushes":2},
-                "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13,"txn_lookup_mode":"per_id"},
+                "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13,
+                    "txn_lookup_mode":"incremental","snapshot_cache_mode":"checkpoint_aware",
+                    "checkpoint_mode":"async","checkpoint_interval":17},
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
@@ -3117,7 +3119,10 @@ groups:
             }
         }
         let observed = process_configurations(&text.context("collector did not produce readback")?)?;
-        assert_eq!(observed["commit"]["txn_lookup_mode"], "per_id");
+        assert_eq!(observed["commit"]["txn_lookup_mode"], "incremental");
+        assert_eq!(observed["commit"]["snapshot_cache_mode"], "checkpoint_aware");
+        assert_eq!(observed["commit"]["checkpoint_mode"], "async");
+        assert_eq!(observed["commit"]["checkpoint_interval"], 17);
         assert_eq!(observed["dfe_worker_concurrency"], 2);
         assert_eq!(observed["socket_effective"]["tcp_nodelay"], true);
         if cfg!(target_os = "linux") {
@@ -3147,9 +3152,12 @@ groups:
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
         let verified = covered["consumer_verified"].as_array().context("consumer_verified array")?;
-        assert_eq!(verified.len(), if cfg!(target_os = "linux") { 53 } else { 51 });
+        assert_eq!(verified.len(), initial["projection_only"].as_array().context("projection_only array")?.len());
         for path in [
             "collector.commit.txn_lookup_mode",
+            "collector.commit.snapshot_cache_mode",
+            "collector.commit.checkpoint_mode",
+            "collector.commit.checkpoint_interval",
             "collector.socket.tcp_nodelay",
             "collector.runtime.file_mapping_cache",
             "collector.runtime.partition_grouping",
@@ -3240,7 +3248,15 @@ groups:
             ),
             (
                 "commit",
-                &["batch_window", "max_files_per_commit", "max_pending_files"][..],
+                &[
+                    "batch_window",
+                    "max_files_per_commit",
+                    "max_pending_files",
+                    "txn_lookup_mode",
+                    "snapshot_cache_mode",
+                    "checkpoint_mode",
+                    "checkpoint_interval",
+                ][..],
             ),
             (
                 "pressure",
