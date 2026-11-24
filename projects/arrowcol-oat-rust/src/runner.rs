@@ -9816,7 +9816,7 @@ fn local_prebuild_image_sources(
         (
             "client".to_owned(),
             client,
-            client_profile_hash.as_ref().map(|_| source_revision.to_owned()),
+            Some(source_revision.to_owned()),
             client_profile_hash,
         ),
         (

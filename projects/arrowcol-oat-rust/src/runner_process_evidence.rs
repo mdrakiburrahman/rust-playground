@@ -226,6 +226,33 @@ fn filter_process_evidence_text(text: &str) -> Result<String> {
     Ok(filtered)
 }
 
+fn verify_run_image_source_revision(
+    role: &str,
+    expected_source_revision: Option<&str>,
+    observed_source_revision: Option<&str>,
+) -> Result<()> {
+    let Some(expected) = expected_source_revision else {
+        return Ok(());
+    };
+    let observed = observed_source_revision
+        .with_context(|| format!("{role} run image source revision label is missing"))?;
+    if observed != expected {
+        bail!("{role} run image source revision does not match the requested source revision");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn run_image_source_revision_readback_rejects_missing_or_mismatched_labels() {
+    let expected = "a".repeat(40);
+    let mismatched = "b".repeat(40);
+    assert!(verify_run_image_source_revision("client", Some(&expected), Some(&expected)).is_ok());
+    assert!(verify_run_image_source_revision("client", Some(&expected), Some(&mismatched)).is_err());
+    assert!(verify_run_image_source_revision("client", Some(&expected), None).is_err());
+    assert!(verify_run_image_source_revision("external", None, None).is_ok());
+}
+
 async fn local_client_image_evidence(id: &str) -> Result<Value> {
     let mut command = Command::new("docker");
     command.args(["inspect", id]);
@@ -235,10 +262,15 @@ async fn local_client_image_evidence(id: &str) -> Result<Value> {
         bail!("client container identity is ambiguous");
     }
     let container = &values[0];
+    let expected_source_revision = local_build_source_revision()?;
+    let source_revision = container
+        .pointer("/Config/Labels/org.opencontainers.image.revision")
+        .and_then(Value::as_str);
+    verify_run_image_source_revision("client", Some(&expected_source_revision), source_revision)?;
     Ok(json!({
         "image": container.pointer("/Config/Image").and_then(Value::as_str),
         "image_id": container["Image"].as_str(),
-        "source_revision": container.pointer("/Config/Labels/org.opencontainers.image.revision").and_then(Value::as_str),
+        "source_revision": source_revision,
         "source": "docker_container_inspect",
     }))
 }
@@ -1719,6 +1751,8 @@ async fn local_process_logs_for_role(
     let inspected: Vec<Value> =
         serde_json::from_slice(&run_command(inspect, "read actual local image identities").await?.stdout)?;
     let mut logs = Vec::new();
+    let source_revision = local_build_source_revision()?;
+    let image_sources = local_prebuild_image_sources(config, &source_revision);
     for container in inspected {
         let role = match container
             .pointer("/Config/Labels/com.docker.compose.service")
@@ -1729,6 +1763,18 @@ async fn local_process_logs_for_role(
             Some("delta-maintenance") => ComponentRole::Maintenance,
             _ => continue,
         };
+        let image_role = match role {
+            ComponentRole::Client => "client",
+            ComponentRole::Router => "router",
+            ComponentRole::Collector => "collector",
+            ComponentRole::Maintenance => "maintenance",
+        };
+        let expected_source_revision = image_sources
+            .iter()
+            .find(|(candidate_role, _, _, _)| candidate_role == image_role)
+            .and_then(|(_, _, revision, _)| revision.as_deref());
+        let observed_source_revision = container.pointer("/Config/Labels/org.opencontainers.image.revision").and_then(Value::as_str);
+        verify_run_image_source_revision(image_role, expected_source_revision, observed_source_revision)?;
         if role_filter.is_some_and(|filter| filter != role) {
             continue;
         }
