@@ -3599,9 +3599,13 @@ mod tests {
             input["maintenance"]["input_prefetch_files"] = invalid;
             assert!(error_text(Tunables::parse_oat_json(input)).contains("input_prefetch_files"));
         }
-        let mut spool = valid.clone();
-        spool["maintenance"]["input_read_strategy"] = serde_json::json!("spool");
-        assert!(error_text(Tunables::parse_oat_json(spool)).contains("input_prefetch_files"));
+        for strategy in ["spool", "range"] {
+            let mut input = valid.clone();
+            input["maintenance"]["input_read_strategy"] = serde_json::json!(strategy);
+            assert!(error_text(Tunables::parse_oat_json(input.clone())).contains("input_prefetch_files"));
+            input["maintenance"]["input_prefetch_files"] = serde_json::json!(1);
+            Tunables::parse_oat_json(input)?;
+        }
         let mut large = valid;
         large["maintenance"]["max_concurrent_tables"] = serde_json::json!(5);
         assert!(error_text(Tunables::parse_oat_json(large)).contains("input_prefetch_files"));

@@ -23,6 +23,11 @@ reports its overrides; schema compatibility is checked when rewriting files.
 of buffering its compressed bytes in memory; disk space and I/O must be available.
 `--input-read-strategy range` streams Parquet ranges and requires a strong
 object ETag for every conditional request; unsupported or changed objects fail.
+`--input-prefetch-files` defaults to `1` (serial reads with any strategy). With
+`memory`, set it to 2–8 to overlap reads within each bin without changing file
+order. `spool` and `range` reject values above 1 rather than falling back to
+whole-file buffering. The small-file threshold times the prefetch count, bin
+concurrency and table concurrency must fit within 512 MiB when prefetching.
 
 | Operation | Effect |
 | --- | --- |
