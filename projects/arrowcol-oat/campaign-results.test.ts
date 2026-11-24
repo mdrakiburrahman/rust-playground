@@ -684,7 +684,7 @@ test('preserves retries without failures but refuses missing records or growing 
     factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
     officialRuns: [{ ...run, rows: [{ ...run.rows[0]!, evidence_json: JSON.stringify(evidence) }] }],
   });
-  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
   for (const classification of ['classified_retries_only', 'nonzero_health_exit', 'unhealthy', 'no_operation_failures']) {
     evidence.shutdown_drain.maintenance[0].exit_code = 1;
     evidence.shutdown_drain.maintenance[0].exit_classification = classification;
@@ -702,7 +702,7 @@ test('preserves retries without failures but refuses missing records or growing 
   assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /unavailable or invalid/);
 });
 
-test('requires live guard coverage and confirmed caps and renders actual overload stops above the ceiling', () => {
+test('requires live guard coverage and confirmed caps and nulls actual overload stops', () => {
   const run = sourceShapedRun(92, [1, 1, 1, 1, 1], 1_000_000);
   attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
   const original = JSON.parse(String(run.rows[0]!.evidence_json));
@@ -714,7 +714,7 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
     officialRuns: [run],
   });
   run.rows[0]!.evidence_json = JSON.stringify(original);
-  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
   for (const change of [
     (evidence: typeof original) => { evidence.overload_guard = null; },
     (evidence: typeof original) => { evidence.overload_guard.status = 'unavailable'; },
@@ -737,7 +737,7 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
   working.overload_guard.last_caps[0].metric = 'container_working_set_bytes';
   working.overload_guard.last_caps[0].cap = 8388608;
   run.rows[0]!.evidence_json = JSON.stringify(working);
-  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
   for (const change of [
     (evidence: typeof working) => { evidence.overload_guard.settings.container_memory_metric = 'usage'; },
     (evidence: typeof working) => { evidence.overload_guard.settings.container_memory_metric = null; },
@@ -772,7 +772,7 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
   cgroup.overload_guard.settings.memory_signal = 'cgroup_memory';
   cgroup.overload_guard.last_caps[1].metric = 'collector_cgroup_memory_bytes';
   run.rows[0]!.evidence_json = JSON.stringify(cgroup);
-  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
   for (const change of [
     (evidence: typeof cgroup) => { evidence.overload_guard.settings.memory_signal = 'process_rss'; },
     (evidence: typeof cgroup) => { evidence.overload_guard.last_caps[1].metric = 'collector_rss_bytes'; },
@@ -875,7 +875,8 @@ test('does not combine separate cold runs or accept gapped buckets as a sustaine
   const coldRuns = Array.from({ length: 5 }, (_, index) => sourceShapedRun(index + 1, [1], 1_000_000 + index * 60_000));
   const coldSvg = renderCampaignResults([{ ...common, officialRuns: coldRuns }], 'C1');
   assert.match(coldSvg, /each repeat must contain exactly one official sustained run/);
-  const gapSvg = renderCampaignResults([{ ...common, officialRuns: [sourceShapedRun(10, [1, 1, 1, 1, 1], 1_000_000, 2)] }], 'C1');
+  const gapRun = sourceShapedRun(10, [1, 1, 1, 1, 1], 1_000_000, 2);
+  const gapSvg = renderCampaignResults([{ ...common, committedRowsPerSecond: gapRun.rows[0]!.rows_per_second, officialRuns: [gapRun] }], 'C1');
   assert.match(gapSvg, /official commit buckets must be positive, complete, contiguous 30-second windows/);
 });
 
@@ -970,7 +971,7 @@ function mutateFactorEvidence(
   row.evidence_json = JSON.stringify(evidence);
 }
 
-test('qualifies fully covered runner-control factors', () => {
+test('plots covered runner-control factors but does not rank without resolution', () => {
   const candidate = coveredCandidate('runner', 100, 220).map(row => ({
     ...row, factorConfigPaths: ['maintenance.enabled', 'maintenance.apply'],
   }));
@@ -983,7 +984,7 @@ test('qualifies fully covered runner-control factors', () => {
       ];
     });
   }
-  assert.match(renderCampaignResults(candidate, 'C1'), /runner \(3\/3\)/);
+  assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
 });
 
 test('nulls a duration-based run when the varied factor is a one-shot row limit', () => {
@@ -1140,7 +1141,7 @@ function generatorCandidate(candidate: string, rate: number, sequence: number, f
   return results;
 }
 
-test('ranks prepared-corpus factors with unrelated Rust generator classifications', () => {
+test('plots prepared-corpus factors with unrelated Rust generator classifications', () => {
   const cases = [
     ['null_fraction', 'no_nullable_generated_columns', {}],
     ['pod_ordinal', 'no_eligible_generated_rows', {}],
@@ -1160,7 +1161,7 @@ test('ranks prepared-corpus factors with unrelated Rust generator classification
         evidence.projection_only = [{ path: 'client.entropy', reason: 'consumer_startup_proof_unverified' }];
       });
     }
-    assert.match(renderCampaignResults(candidate, 'C1'), /generator-active \(3\/3\)/);
+    assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
   }
 });
 
@@ -1233,7 +1234,7 @@ test('accepts committed table metadata proof for a stats factor and unrelated fa
         ];
       });
     }
-    assert.match(renderCampaignResults(candidate, 'C1'), /metadata-active \(3\/3\)/);
+    assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
     mutateFactorEvidence(candidate[1]!, evidence => {
       evidence.consumer_verified = [
         { path: 'client.string_width', reason: 'consumer_startup_and_prepared_corpus' },
@@ -1274,7 +1275,7 @@ test('accepts G2a readback only for its producer paths, including unrelated fact
           ];
         });
       }
-      assert.match(renderCampaignResults(candidate, 'C1'), /socket-proof \(3\/3\)/);
+      assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
       const wrongPath = path === 'collector.thp_disabled' ? 'collector.socket.tcp_nodelay' : 'collector.thp_disabled';
       for (const row of candidate) {
         if (varied) row.factorConfigPaths = [wrongPath, 'client.guid_uniqueness'];
@@ -1470,6 +1471,13 @@ test('an active cell retains its committed rate after Kustainer death', () => {
         { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
         { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
       ];
+      const reconciliation = evidence.reconciliation as Record<string, unknown>;
+      reconciliation.completed_rows = reconciliation.delta_rows;
+      reconciliation.minimum_delta_rows = reconciliation.delta_rows;
+      reconciliation.maximum_delta_rows = reconciliation.delta_rows;
+      reconciliation.ambiguous_rows = 0;
+      reconciliation.exact_match_required = true;
+      reconciliation.exact_match = true;
     });
   }
   const results = candidate.map(row => row.repeat === 2 ?
@@ -1484,7 +1492,166 @@ test('an active cell retains its committed rate after Kustainer death', () => {
   assert.match(svg, />800\*?<\/text>/);
 });
 
-test('ranks a source-shaped receipt with G2a and G7 consumer readback reasons', () => {
+function comparisonCandidate(afterRate = 100) {
+  const makeRun = (sequence: number, rate: number, start: number) => {
+    const run = sourceShapedRun(sequence, [rate, rate, rate, rate, rate], start);
+    attachMaintenanceDueWork(run, start, start + 150_000);
+    const evidence = JSON.parse(run.rows[0]!.evidence_json);
+    const backlog = syntheticBacklog();
+    const offset = start - 1_000_000;
+    backlog.measurement_window.start_unix_ms += offset;
+    backlog.measurement_window.end_unix_ms += offset;
+    for (const sample of backlog.samples) {
+      sample.request_start_unix_ms += offset;
+      sample.request_end_unix_ms += offset;
+    }
+    evidence.backlog = backlog;
+    for (const window of evidence.durable_commits.complete_30_second_commit_windows) {
+      window.rate_resolution_rows_per_second = 0.5;
+    }
+    evidence.projection_only = [];
+    evidence.consumer_verified = [
+      { path: 'parquet_writer.defaults.compression', reason: 'consumer_startup_readback' },
+      { path: 'parquet_writer.defaults.compression_level', reason: 'consumer_startup_readback' },
+    ];
+    run.rows[0]!.evidence_json = JSON.stringify(evidence);
+    return run;
+  };
+  return [110, 111, 109].map((rate, index) => {
+    const start = 1_000_000 + index * 500_000;
+    return {
+      cohort: 'C1', candidate: 'comparison', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+      repeat: index + 1, expectedRepeats: 3, committedRowsPerSecond: rate,
+      factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+      officialRuns: [makeRun(700 + index * 3, rate, start + 160_000)],
+      baselineBefore: makeRun(701 + index * 3, 100, start),
+      baselineAfter: makeRun(702 + index * 3, afterRate, start + 320_000),
+      pairOrder: index === 1 ? 'BA' : 'AB', evidenceState: 'physically-observed',
+    };
+  });
+}
+
+type MutableEvidence = Record<string, unknown> & {
+  reconciliation: Record<string, unknown>;
+  durable_commits: { complete_30_second_commit_windows: Array<Record<string, unknown>> };
+};
+
+function updateRunEvidence(run: ReturnType<typeof sourceShapedRun>, mutate: (evidence: MutableEvidence) => void) {
+  const result = run.rows[0]!;
+  const evidence = JSON.parse(result.evidence_json);
+  mutate(evidence);
+  result.evidence_json = JSON.stringify(evidence);
+}
+
+test('rejects unsettled, failed and typed quarantined cells regardless of launcher success', () => {
+  for (const change of [
+    (row: ReturnType<typeof comparisonCandidate>[number]) => updateRunEvidence(row.officialRuns[0]!, evidence => {
+      evidence.pre_teardown_reconciliation = { exact_match_required: true, exact_match: false, reason: 'delta_commit_drain_timeout' };
+    }),
+    (row: ReturnType<typeof comparisonCandidate>[number]) => updateRunEvidence(row.officialRuns[0]!, evidence => {
+      evidence.reconciliation.exact_match_required = true;
+      evidence.reconciliation.exact_match = false;
+      evidence.reconciliation.reason = 'delta_exact_match_failed';
+    }),
+    (row: ReturnType<typeof comparisonCandidate>[number]) => updateRunEvidence(row.officialRuns[0]!, evidence => {
+      evidence.teardown_failures = [{ kind: 'dataflow_drain_incomplete', triggers: ['retired_workers'], collector_instance_id: 'collector' }];
+    }),
+  ]) {
+    const candidate = comparisonCandidate();
+    change(candidate[0]!);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /delta_commit_drain_timeout|delta_exact_match_failed|dataflow_drain_incomplete/);
+    assert.doesNotMatch(svg, /comparison \(3\/3\)|>110<\/text>/);
+  }
+  for (const disposition of ['failed_incomplete_delivery_quarantined_not_settled', 'failed_teardown_drain_quarantined_not_settled']) {
+    const candidate = comparisonCandidate();
+    const svg = renderCampaignResults(candidate.map((row, index) => index ? row : { ...row, disposition, comment: 'infrastructure failure' }), 'C1');
+    assert.match(svg, /infrastructure failure/);
+    assert.doesNotMatch(svg, /comparison \(3\/3\)|performance failure/);
+  }
+  const candidate = comparisonCandidate();
+  candidate[0]!.officialRuns[0]!.status.state = 'failed' as 'succeeded';
+  assert.match(renderCampaignResults(candidate, 'C1'), /run state is failed/);
+  const failedResult = comparisonCandidate();
+  failedResult[0]!.officialRuns[0]!.rows[0]!.status = 'failed';
+  assert.match(renderCampaignResults(failedResult, 'C1'), /result status is failed/);
+  const failedOutcome = comparisonCandidate();
+  assert.match(renderCampaignResults(failedOutcome.map((row, index) => index ? row : { ...row, outcome: 'build-failed', comment: 'build failed' }), 'C1'), /build failed/);
+});
+
+test('preserves exactly reconciled ArrowCol observations when QAP is unavailable', () => {
+  for (const reason of ['local_qap_initialization_unavailable', 'local_qap_observation_unavailable']) {
+    const candidate = comparisonCandidate();
+    const run = candidate[0]!.officialRuns[0]!;
+    updateRunEvidence(run, evidence => {
+      Object.assign(evidence.reconciliation, {
+        completed_rows: evidence.reconciliation.delta_rows, minimum_delta_rows: evidence.reconciliation.delta_rows,
+        maximum_delta_rows: evidence.reconciliation.delta_rows, ambiguous_rows: 0,
+        exact_match_required: true, exact_match: true,
+      });
+      evidence.downstream_status = 'unavailable';
+      evidence.downstream_reason = reason;
+      evidence.downstream_comment = 'Kustainer unavailable';
+    });
+    const [validated] = validateCampaignMeasurements([{ ...candidate[0], qapCompletionPercent: 100 }]);
+    assert.equal(validated!.qapCompletionPercent, null);
+    assert.equal(validated!.collectorOnly, true);
+    assert.equal(validated!.officialRuns![0]!.rows[0]!.qap_observation_complete, 0);
+    assert.equal(validated!.officialRuns![0]!.rows[0]!.qap_cached_bytes, null);
+    const svg = renderCampaignResults(candidate, 'C1');
+    assert.match(svg, /Kustainer unavailable/);
+    assert.match(svg, />110<\/text>/);
+  }
+});
+
+test('requires resolution and matching A/A for paired comparisons', () => {
+  const candidate = comparisonCandidate();
+  assert.match(renderCampaignResults(candidate, 'C1'), /comparison \(3\/3\)/);
+  updateRunEvidence(candidate[0]!.officialRuns[0]!, evidence => {
+    delete evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second;
+  });
+  assert.match(renderCampaignResults(candidate, 'C1'), /provisional: commit-rate resolution unavailable/);
+  const badResolution = comparisonCandidate();
+  updateRunEvidence(badResolution[0]!.baselineBefore, evidence => {
+    evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second = 1.01;
+  });
+  assert.match(renderCampaignResults(badResolution, 'C1'), /invalid A\/A: commit-rate resolution exceeds 1%/);
+  const unresolved = comparisonCandidate();
+  updateRunEvidence(unresolved[0]!.officialRuns[0]!, evidence => {
+    evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second = 11;
+  });
+  assert.match(renderCampaignResults(unresolved, 'C1'), /unresolved: difference is smaller than commit-rate resolution/);
+  const drift = renderCampaignResults(comparisonCandidate(106), 'C1');
+  assert.match(drift, /invalid A\/A: adjacent baselines differ by more than 5%/);
+  assert.match(drift, /normalized 1\.07/);
+  assert.doesNotMatch(drift, /comparison \(3\/3\)/);
+  assert.doesNotMatch(renderCampaignResults(comparisonCandidate(105), 'C1'), /invalid A\/A: adjacent baselines/);
+  const boundary = comparisonCandidate();
+  updateRunEvidence(boundary[0]!.baselineBefore, evidence => {
+    evidence.durable_commits.complete_30_second_commit_windows[0]!.rate_resolution_rows_per_second = 1;
+  });
+  assert.match(renderCampaignResults(boundary, 'C1'), /comparison \(3\/3\)/);
+  const wrongOrder = comparisonCandidate().map(row => ({ ...row, pairOrder: 'AB' }));
+  assert.match(renderCampaignResults(wrongOrder, 'C1'), /AB\/BA\/AB pair order missing/);
+});
+
+test('reports separate CPU estimates and preserves null concurrency', () => {
+  const candidate = comparisonCandidate();
+  const run = candidate[0]!.officialRuns[0]!;
+  Object.assign(run.rows[0]!, { cpu_millicores: 2000, tunables_json: JSON.stringify({
+    orchestration_run_id: run.status.id, cpu_quota: { client: { concurrency_per_cpu_core: null } },
+  }) });
+  updateRunEvidence(run, evidence => {
+    evidence.client_phase_reports = [
+      { phase_counters: { measurement_window: { client_resources: { cpu_core_equivalents: 3 } } } },
+    ];
+  });
+  const svg = renderCampaignResults(candidate, 'C1');
+  assert.match(svg, /concurrency\/core null; CPU s\/M rows \(estimated\): collector 18,181\.82, DFE null, client 27,272\.73/);
+  assert.doesNotMatch(svg, /concurrency\/core 0/);
+});
+
+test('plots a source-shaped receipt with G2a and G7 consumer readback reasons', () => {
   const evidenceCases = [
     { path: 'collector.thp_disabled', reason: 'consumer_linux_thp_flag_readback' },
     { path: 'collector.socket.recv_buffer_bytes', reason: 'consumer_linux_listener_buffer_readback' },
@@ -1534,7 +1701,7 @@ test('ranks a source-shaped receipt with G2a and G7 consumer readback reasons', 
     });
   }
   const svg = renderCampaignResults(candidate, 'C1');
-  assert.ok(svg.includes('runtime-readbacks (3/3'));
+  assert.match(svg, /provisional: commit-rate resolution unavailable/);
 });
 
 test('fails closed on missing or malformed coverage and does not infer a legacy factor path', () => {
