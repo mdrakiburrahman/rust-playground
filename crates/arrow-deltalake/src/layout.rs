@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, ensure};
 use arrow::array::RecordBatch;
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
+use arrow::compute::{SortColumn, SortOptions, concat, concat_batches, interleave, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use parquet::basic::Compression;
 use parquet::file::metadata::SortingColumn;
@@ -417,6 +417,12 @@ impl FileSortBuffer {
     /// # Errors
     /// Returns Arrow concatenation, ordering, or permutation errors.
     pub fn finish(self) -> Result<RecordBatch> {
+        if self.batches.len() > 1
+            && !self.policy.sort_columns.is_empty()
+            && self.schema.fields().iter().all(|field| gatherable(field.data_type()))
+        {
+            return self.finish_interleaved();
+        }
         let batch = concat_batches(&self.schema, &self.batches)?;
         if batch.num_rows() == 0 {
             return Ok(batch);
@@ -433,6 +439,69 @@ impl FileSortBuffer {
             .collect::<arrow::error::Result<Vec<_>>>()?;
         Ok(RecordBatch::try_new(self.schema, arrays)?)
     }
+
+    /// Gather the sorted rows straight from the retained batches, so only the key columns are
+    /// concatenated and every other column is copied once instead of twice.
+    fn finish_interleaved(self) -> Result<RecordBatch> {
+        let keys = self
+            .policy
+            .sort_columns
+            .iter()
+            .enumerate()
+            .map(|(position, name)| {
+                let index = self.schema.index_of(name)?;
+                let parts = self
+                    .batches
+                    .iter()
+                    .map(|batch| batch.column(index).as_ref())
+                    .collect::<Vec<_>>();
+                Ok(SortColumn {
+                    values: concat(&parts)?,
+                    options: Some(self.sort_options(position)),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indices = lexsort_to_indices(&keys, None)?;
+        drop(keys);
+        let origin = self
+            .batches
+            .iter()
+            .enumerate()
+            .flat_map(|(batch, retained)| (0..retained.num_rows()).map(move |row| (batch, row)))
+            .collect::<Vec<_>>();
+        let order = indices
+            .values()
+            .iter()
+            .map(|index| origin[*index as usize])
+            .collect::<Vec<_>>();
+        let arrays = (0..self.schema.fields().len())
+            .map(|column| {
+                let parts = self
+                    .batches
+                    .iter()
+                    .map(|batch| batch.column(column).as_ref())
+                    .collect::<Vec<_>>();
+                interleave(&parts, &order)
+            })
+            .collect::<arrow::error::Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(self.schema, arrays)?)
+    }
+
+    fn sort_options(&self, position: usize) -> SortOptions {
+        SortOptions {
+            descending: self
+                .policy
+                .sort_options
+                .as_ref()
+                .is_some_and(|options| options[position].direction == SortDirection::Descending),
+            nulls_first: self
+                .policy
+                .sort_options
+                .as_ref()
+                .is_some_and(|options| options[position].nulls == NullPlacement::First),
+        }
+    }
+
     fn sort_columns(&self, batch: &RecordBatch) -> Result<Vec<SortColumn>> {
         self.policy
             .sort_columns
@@ -441,22 +510,21 @@ impl FileSortBuffer {
             .map(|(position, name)| {
                 Ok(SortColumn {
                     values: Arc::clone(batch.column(self.schema.index_of(name)?)),
-                    options: Some(SortOptions {
-                        descending: self
-                            .policy
-                            .sort_options
-                            .as_ref()
-                            .is_some_and(|options| options[position].direction == SortDirection::Descending),
-                        nulls_first: self
-                            .policy
-                            .sort_options
-                            .as_ref()
-                            .is_some_and(|options| options[position].nulls == NullPlacement::First),
-                    }),
+                    options: Some(self.sort_options(position)),
                 })
             })
             .collect()
     }
+}
+
+/// Types whose concatenate-then-take and direct interleave results hold identical values.
+fn gatherable(data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    data_type.primitive_width().is_some()
+        || matches!(
+            data_type,
+            DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        )
 }
 
 #[cfg(feature = "delta")]
@@ -575,6 +643,71 @@ mod tests {
         assert_eq!(sorted.schema(), a.schema());
         assert_eq!(sorted.column(0).as_ref(), &StringArray::from(vec!["a", "a", "z", "z"]));
         assert_eq!(sorted.column(1).as_ref(), &Int32Array::from(vec![1, 2, 3, 4]));
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_finish_matches_concat_then_take() -> Result<()> {
+        use arrow::array::{ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("payload", DataType::Binary, true),
+        ]));
+        let make = |seed: i64| -> Result<RecordBatch> {
+            let rows = usize::try_from(5 + seed)?;
+            let ids = (0..rows).map(|row| (row % 3 != 2).then(|| ((row + usize::try_from(seed).unwrap_or(0)) % 4).to_string()));
+            let values = (0..rows).map(|row| (row % 4 != 1).then_some(i64::try_from(row).unwrap_or(0) * seed % 5));
+            let scores = (0..rows).map(|row| (row % 5 != 0).then_some(f64::from(u8::try_from(row).unwrap_or(0)) / 3.0));
+            let flags = (0..rows).map(|row| (row % 6 != 4).then_some(row % 2 == 0));
+            let payloads = (0..rows).map(|row| (row % 7 != 3).then(|| vec![u8::try_from(row).unwrap_or(0); row % 3]));
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from_iter(ids)) as ArrayRef,
+                    Arc::new(Int64Array::from_iter(values)),
+                    Arc::new(Float64Array::from_iter(scores)),
+                    Arc::new(BooleanArray::from_iter(flags)),
+                    Arc::new(BinaryArray::from_iter(payloads)),
+                ],
+            )?)
+        };
+        let batches = (1..=4).map(make).collect::<Result<Vec<_>>>()?;
+        let option = |column: &str, direction, nulls| SortKeyOptions {
+            column: column.into(),
+            direction,
+            nulls,
+        };
+        for options in [
+            None,
+            Some(vec![
+                option("customer_id", SortDirection::Descending, NullPlacement::First),
+                option("value", SortDirection::Ascending, NullPlacement::Last),
+            ]),
+        ] {
+            let policy = LayoutPolicy {
+                sort_columns: vec!["customer_id".into(), "value".into()],
+                sort_options: options,
+                ..LayoutPolicy::default()
+            };
+            let mut buffer = FileSortBuffer::new(Arc::clone(&schema), policy.clone())?;
+            for batch in &batches {
+                assert!(buffer.try_push(batch)?);
+            }
+            let expected = {
+                let concatenated = concat_batches(&schema, &batches)?;
+                let indices = lexsort_to_indices(&buffer.sort_columns(&concatenated)?, None)?;
+                let columns = concatenated
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None))
+                    .collect::<arrow::error::Result<Vec<_>>>()?;
+                RecordBatch::try_new(Arc::clone(&schema), columns)?
+            };
+            assert_eq!(buffer.finish()?, expected);
+        }
         Ok(())
     }
 
