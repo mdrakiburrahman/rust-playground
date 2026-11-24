@@ -29,6 +29,10 @@ binary directory. `BWA_CCPUS` and `BWA_KCPUS` default to `0-23` and `24-31`.
 `BWA_CLIENT_WORKERS`, `BWA_CLIENT_SPW`, `BWA_CLIENT_THREADS`,
 `BWA_CLIENT_BATCH_ROWS`, `BWA_CLIENT_CORPUS_ROWS` and `BWA_CLIENT_STRING_WIDTH`
 configure the load. Runtime knobs use `ARROWCOL_COLLECTOR_*`.
+`BWA_CHECKPOINT_EVERY_COMMITS` optionally runs the separately built
+`delta-maintenance` binary in checkpoint-only mode at a one-second cadence.
+The output reports actual checkpoint files and maintenance CPU/fault counters;
+other maintenance operations remain disabled.
 
 Use the same binary, allocator and payload in every comparison arm. The output
 records binary/config hashes and startup settings. Completed cell IDs are skipped

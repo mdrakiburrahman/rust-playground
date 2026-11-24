@@ -5,6 +5,7 @@ type Cell = { id: string; grid: string; x: string; y: string; env: Record<string
 const cells: Cell[] = [];
 const common: Record<string, string> = {
   BWA_CORES: '24', BWA_NCLIENTS: '2', BWA_PD: '16', BWA_MCF: '24',
+  BWA_CLIENT_SPW: '1',
   BWA_BUF_BYTES: '17200000000', BWA_GCAP_BYTES: '17200000000', BWA_TCAP_BYTES: '16000000000',
   BWA_BUF_ROWS: '100000000', BWA_GCAP_ROWS: '100000000', BWA_TCAP_ROWS: '100000000',
   ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS: '1',
@@ -44,7 +45,12 @@ if (kind === 'control') {
   grid('streams-clients', [32, 128, 256], [1, 2, 4], (x, y) => ({ BWA_STREAMS: x, BWA_NCLIENTS: y }));
   grid('txn-pending', ['per_id', 'batched', 'batched_cached'], [128, 512, 1024],
     (x, y) => ({ BWA_TXN: x, BWA_MPF: y }));
+} else if (kind === 'checkpoint') {
+  grid('txn-checkpoint', ['per_id', 'batched', 'batched_cached'], ['off', '1', '5'],
+    (x, y): Record<string, string> => y === 'off' ? { BWA_TXN: x } : { BWA_TXN: x, BWA_CHECKPOINT_EVERY_COMMITS: y });
+} else if (kind === 'capacity') {
+  grid('capacity-sink', ['l0', 'l1'], [1, 2, 4], (x, y) => ({ BWA_ISOLATION: x, BWA_NCLIENTS: y }));
 } else {
-  throw new Error('Expected plan kind: control or screen');
+  throw new Error('Expected plan kind: control, screen, checkpoint or capacity');
 }
-fs.writeFileSync(process.argv[3], JSON.stringify({ duration: kind === 'control' ? 60 : 40, warmup: 20, common, cells }, null, 2) + '\n');
+fs.writeFileSync(process.argv[3], JSON.stringify({ duration: kind === 'screen' ? 40 : 60, warmup: 20, common, cells }, null, 2) + '\n');
