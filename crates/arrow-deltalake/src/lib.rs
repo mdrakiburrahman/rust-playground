@@ -39,6 +39,12 @@ mod parallel_writer;
 #[cfg(feature = "delta")]
 mod partition;
 #[cfg(feature = "delta")]
+mod publication_lookup;
+#[cfg(feature = "delta")]
+mod publication_evidence;
+#[cfg(feature = "delta")]
+pub use publication_evidence::{PublicationEvidence, PublicationOutcome, PublicationReason};
+#[cfg(feature = "delta")]
 pub mod publisher;
 #[cfg(feature = "delta")]
 pub mod qap_http;
@@ -46,6 +52,28 @@ pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;
 pub mod writer;
+
+/// Strategy for resolving transaction identities before Delta publication.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxnLookupMode {
+    PerId,
+    #[default]
+    Batched,
+    BatchedCached,
+}
+
+impl<'de> serde::Deserialize<'de> for TxnLookupMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.txn_lookup_mode must be per_id, batched, or batched_cached";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_id") => Ok(Self::PerId),
+            Ok("batched") => Ok(Self::Batched),
+            Ok("batched_cached") => Ok(Self::BatchedCached),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
 
 /// Queue discipline for the dedicated CPU workers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
