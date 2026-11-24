@@ -59,7 +59,7 @@ Try running 'az acr check-health -n arrowcollector99999 --yes' to diagnose this 
 `;
 
 type Fault = 'identity' | 'digest' | 'architecture' | 'missing-tag' | 'missing-digest' | 'older-tags' | 'tag-still-present' | 'unknown-not-found' | 'empty-registry' |
-  'registry-absent' | 'auth' | 'dns' | 'timeout' | 'throttle' | 'server' | 'provenance' | 'local-provenance' | 'published-missing';
+  'registry-absent' | 'auth' | 'dns' | 'timeout' | 'throttle' | 'server' | 'provenance' | 'client-provenance' | 'dataflow-provenance' | 'local-provenance' | 'published-missing';
 
 function mock(registry: string, fault?: Fault) {
   const calls: string[][] = [];
@@ -79,7 +79,9 @@ function mock(registry: string, fault?: Fault) {
         const repo = reference.startsWith(`${registry}.azurecr.io/`) ? reference.split('/').at(-1)!.split(':')[0] : '';
         stdout = JSON.stringify({
           Os: 'linux', Architecture: fault === 'architecture' ? 'arm64' : 'amd64',
-          Config: { Labels: { 'org.opencontainers.image.revision': fault === 'provenance' || (fault === 'local-provenance' && !repo) ? subscription : revision } },
+          Config: { Labels: { 'org.opencontainers.image.revision': fault === 'provenance' || (fault === 'local-provenance' && !repo) ||
+            (fault === 'client-provenance' && repo === 'arrowcol-oat-client') ||
+            (fault === 'dataflow-provenance' && repo === 'arrowcol-dataflow-rust') ? subscription : revision } },
           ...(repo ? { RepoDigests: [`${registry}.azurecr.io/${repo}@${digest}`] } : {}),
         });
       } else stdout = fault === 'architecture' ? 'linux/arm64' : 'linux/amd64';
@@ -342,6 +344,15 @@ test('published image provenance mismatch fails without building or pushing', as
   const m = mock(options.registry, 'provenance');
   await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), /revision provenance does not match/);
   assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+});
+test('client and collector revisions are independently checked against the source revision', async t => {
+  const options = fixture(t);
+  for (const [fault, role] of [['client-provenance', 'client'], ['dataflow-provenance', 'dataflow']] as const) {
+    const m = mock(options.registry, fault);
+    await assert.rejects(readPublishedImages({ ...options, revision }, m.runner),
+      new RegExp(`Published ${role} image revision provenance does not match`));
+    assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+  }
 });
 
 test('existing repositories with only older revision tags return exactly the missing roles before metadata lookup', async t => {

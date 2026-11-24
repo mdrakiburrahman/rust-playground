@@ -12,11 +12,12 @@ type LifecycleField = 'stop_admission' | 'bounded_drain' | 'evidence_capture' | 
 export type LifecycleActions = Pick<ExternalCleanupActions, 'stopAdmission' | 'boundedDrain' | 'preserveEvidence' |
   'stopMaintenanceIfUidAndOwnerMatch' | 'captureTerminalState' | 'recoverLifecycle'>;
 interface PodProof { name: string; uid: string; resource_version: string;
-  containers: Array<{ name: string; exit_code: number | null; finished_at: string | null; oom_killed: boolean }>; }
+  containers: Array<{ name: string; exit_code: number | null; finished_at: string | null; oom_killed: boolean; restart_count?: number }>; }
 interface LogProof {
-  pod_name: string; pod_uid: string; container: string; phase: 'pre_stop' | 'terminal' | 'evidence';
+  pod_name: string; pod_uid: string; container: string; phase: 'pre_stop' | 'terminal' | 'evidence' | 'previous';
   observed_at_unix_ms: number; body_sha256: string; bytes: number;
   numeric_samples: Array<Record<string, number>>; redacted_lines: number;
+  drain_complete_marker?: boolean;
 }
 interface StopRecord {
   schema_version: 1; origin: ReturnType<typeof origin>; field: LifecycleField; resource: ReturnType<typeof identity>;
@@ -85,7 +86,8 @@ function podProof(value: unknown, inventory: RunInventory): PodProof {
       if (terminal && (typeof terminal.exitCode !== 'number' || !Number.isSafeInteger(terminal.exitCode) || typeof terminal.finishedAt !== 'string' ||
           !Number.isFinite(Date.parse(terminal.finishedAt)))) throw new Error('Actual container termination receipt is UNKNOWN.');
       containers.push({ name, exit_code: terminal ? Number(terminal.exitCode) : null,
-        finished_at: terminal ? String(terminal.finishedAt) : null, oom_killed: terminal?.reason === 'OOMKilled' });
+        finished_at: terminal ? String(terminal.finishedAt) : null, oom_killed: terminal?.reason === 'OOMKilled',
+        restart_count: integer(container.restartCount) });
     }
   }
   if (containers.length > 32) throw new Error('Lifecycle container observation is unbounded.');
@@ -102,6 +104,8 @@ function validatePods(value: unknown): asserts value is PodProof[] {
     for (const item of pod.containers) {
       const container = object(item);
       text(container.name);
+      if (container.restart_count !== undefined) integer(container.restart_count);
+
       if (typeof container.oom_killed !== 'boolean' || !(container.exit_code === null ||
           typeof container.exit_code === 'number' && Number.isSafeInteger(container.exit_code)) ||
           !(container.finished_at === null || typeof container.finished_at === 'string' && Number.isFinite(Date.parse(container.finished_at))) ||
@@ -126,9 +130,11 @@ function parseStop(value: unknown, inventory: RunInventory, field: LifecycleFiel
   for (const item of record.logs) {
     const log = object(item);
     text(log.pod_name); text(log.pod_uid); text(log.container); integer(log.observed_at_unix_ms); integer(log.bytes);
-    if (!/^[a-f0-9]{64}$/.test(String(log.body_sha256)) || !['pre_stop', 'terminal', 'evidence'].includes(String(log.phase)) ||
+    if (!/^[a-f0-9]{64}$/.test(String(log.body_sha256)) || !['pre_stop', 'terminal', 'evidence', 'previous'].includes(String(log.phase)) ||
         !Array.isArray(log.numeric_samples) || !Number.isSafeInteger(log.redacted_lines))
       throw new Error('Lifecycle sanitized log proof is malformed.');
+    if (log.drain_complete_marker !== undefined && typeof log.drain_complete_marker !== 'boolean')
+      throw new Error('Lifecycle drain marker proof is malformed.');
     for (const sample of log.numeric_samples) {
       const values = object(sample);
       if (Object.keys(values).length === 0 || Object.entries(values).some(([key, value]) =>
@@ -157,18 +163,21 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
   const captureLogs = async (server: string, inventory: RunInventory, pods: PodProof[], phase: LogProof['phase'],
     authority: CleanupMutationAuthority): Promise<LogProof[]> => {
     const proofs: LogProof[] = [];
-    for (const pod of pods) for (const container of pod.containers) {
+    for (const pod of pods) for (const container of pod.containers)
+      for (const previous of container.restart_count ? [false, true] : [false]) {
       await authority.assertCurrent();
       const budget = cleanupBudget(authority), remaining = budget ? budget.deadlineUnixMs - Date.now() : 20_000;
       if (remaining <= 0) throw new Error('Log capture deadline expired before command admission.');
       const response = await run(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
         '--request-timeout', `${Math.max(1, Math.floor(Math.min(15_000, remaining)))}ms`, 'logs', pod.name,
-        '--namespace', inventory.namespace.name, '--container', container.name, '--timestamps=true', '--tail=500', '--limit-bytes=262144'],
+        '--namespace', inventory.namespace.name, '--container', container.name, '--timestamps=true', '--tail=500', '--limit-bytes=262144',
+        ...(previous ? ['--previous'] : [])],
         Math.min(20, remaining / 1000));
       if (response.returncode !== 0 || Buffer.byteLength(response.stdout) > 262_144)
         throw new Error('Exact pod log response is unavailable; never substitute successful empty logs.');
       const samples: LogProof['numeric_samples'] = [];
       let redacted = 0;
+      let drainCompleteMarker = false;
       for (const line of response.stdout.split('\n').filter(Boolean)) {
         const start = line.indexOf('{');
         if (start < 0) { redacted++; continue; }
@@ -176,12 +185,16 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
         try { value = JSON.parse(line.slice(start)) as unknown; } catch { redacted++; continue; }
         const allowed = ['rows', 'committed_rows', 'committed_bytes', 'pending_rows', 'pending_bytes', 'duration_ms', 'elapsed_ms'];
         const record = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+        if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z arrowcol_shutdown $/.test(line.slice(0, start)) &&
+            Object.keys(record).length === 1 && record.event === 'drain_complete')
+          drainCompleteMarker = true;
         const safe = Object.fromEntries(allowed.filter(key => typeof record[key] === 'number' && Number.isFinite(record[key]) &&
           Number(record[key]) >= 0).map(key => [key, Number(record[key])]));
         if (Object.keys(safe).length) samples.push(safe); else redacted++;
       }
-      proofs.push({ pod_name: pod.name, pod_uid: pod.uid, container: container.name, phase, observed_at_unix_ms: Date.now(),
-        body_sha256: hash(response.stdout), bytes: Buffer.byteLength(response.stdout), numeric_samples: samples, redacted_lines: redacted });
+      proofs.push({ pod_name: pod.name, pod_uid: pod.uid, container: container.name, phase: previous ? 'previous' : phase, observed_at_unix_ms: Date.now(),
+        body_sha256: hash(response.stdout), bytes: Buffer.byteLength(response.stdout), numeric_samples: samples, redacted_lines: redacted,
+        drain_complete_marker: drainCompleteMarker });
     }
     return proofs;
   };
@@ -374,8 +387,9 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     }
     return 'complete';
   };
-  const capture = async (supplied: RunInventory, field: 'evidence_capture' | 'terminal_capture', authority: CleanupMutationAuthority,
+  const capture = async (supplied: RunInventory, field: 'pre_stop_capture' | 'evidence_capture' | 'terminal_capture', authority: CleanupMutationAuthority,
     recoveryOnly = false) => {
+    if (field === 'pre_stop_capture') authority = withCleanupDeadline(authority, supplied.cleanup.bounded_drain.deadline_unix_ms);
     if (field === 'terminal_capture') authority = withCleanupDeadline(authority, supplied.cleanup.terminal_capture.deadline_unix_ms);
     const { inventory, state } = await current(supplied, authority), destination = inventory.evidence_destination;
     if (!destination || destination.account !== azure.c.account || destination.container !== azure.c.checkpoints)
@@ -413,6 +427,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     }
     const workloads = [];
     for (const resource of inventory.resources) {
+      if (field === 'pre_stop_capture' && resource.role !== 'collector') continue;
       if (resource.state === 'absent') continue;
       if (resource.state !== 'observed' || !resource.uid) throw new Error('Evidence workload identity is unresolved.');
       const observed = await observe(inventory, resource, authority);
@@ -421,9 +436,19 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       const savedStop = await read(stopBlob(inventory, stopField, resource), authority);
       const stop = savedStop ? parseStop(savedStop.value, inventory, stopField, resource) : null;
       const logs = await captureLogs(observed.plan.server, inventory, observed.pods, field === 'terminal_capture' ? 'terminal' : 'evidence', authority);
+      const terminalSamples = field === 'terminal_capture' && resource.role === 'collector' && stop ?
+        stop.initial_pods.map(pod => ({
+          pod_name: pod.name, pod_uid: pod.uid,
+          terminal_sample: stop.terminal_pods.some(ended => ended.uid === pod.uid) ? 'observed' :
+            observed.pods.some(current => current.uid === pod.uid) ? 'unobserved' : 'pod_gone',
+        })) : null;
+      const podGone = terminalSamples?.some(sample => sample.terminal_sample === 'pod_gone') ?? false;
       workloads.push({ identity: identity(resource), resource_version: text(metadata.resourceVersion),
         desired_instances: integer(observed.deployment ? observed.spec.replicas : observed.spec.parallelism), pods: observed.pods,
-        current_logs: logs, original_stop: stop, missing_terminal_reason: !stop ? 'no_positive_original_stop_record' :
+        current_logs: logs, original_stop: stop, terminal_samples: terminalSamples,
+        log_custody: podGone ? 'incomplete' : 'unavailable',
+        log_metrics: podGone ? 'provisional' : 'unavailable',
+        missing_terminal_reason: !stop ? 'no_positive_original_stop_record' :
           stop.initial_pods.some(pod => !stop.terminal_pods.some(terminal => terminal.uid === pod.uid)) ?
             'original_pod_disappeared_before_terminal_observation' : null });
     }
@@ -454,7 +479,10 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
   };
   return {
     stopAdmission: (inventory, _deadline, _key, authority) => stopRoles(inventory, ['client', 'router'], 'stop_admission', authority),
-    boundedDrain: (inventory, _deadline, _key, authority) => stopRoles(inventory, ['collector'], 'bounded_drain', authority),
+    boundedDrain: async (inventory, _deadline, _key, authority) => {
+      if (await capture(inventory, 'pre_stop_capture', authority) !== 'complete') return 'pending';
+      return stopRoles(inventory, ['collector'], 'bounded_drain', authority);
+    },
     stopMaintenanceIfUidAndOwnerMatch: async (resource, owner, _key, authority) => {
       const inventory = await assertRunCleanupActor(store, authority);
       if (owner !== inventory.namespace.owner_token || !inventory.resources.some(value =>

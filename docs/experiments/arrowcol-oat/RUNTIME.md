@@ -43,6 +43,12 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 | Local screen evidence | After stopped-snapshot export, local OAT reads `<snapshot_root>/<run_id>/<table>/table/_delta_log`, selects collector receipts by `finished_at` in `[start,end)`, matches window totals and each receipted version's data-change Adds, and checks unreceipted in-span versions. Only a reconciled result populates `evidence_json.durable_commits.delta_log_reconciliation.csv` and `screen_v1`; mismatches fail the row, while unavailable evidence leaves screen metrics null with a reason. |
 | Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
 
+Client quiescence is capped at 86,400,000 ms and must be at least the request
+timeout and strictly less than collector stop grace. The client stop grace is
+the quiesce timeout rounded up to seconds plus 10 seconds. Separately, campaign
+cleanup bounds its collector drain step to 120 seconds; increasing the pod's
+termination grace does not increase that custody deadline.
+
 Local teardown includes the maintenance Compose profile only when maintenance
 was enabled for the cell; other profiles remain excluded.
 After a successful measurement, `local_teardown` identifies the cell and its
