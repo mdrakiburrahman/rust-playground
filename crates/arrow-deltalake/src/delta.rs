@@ -515,6 +515,49 @@ mod io_tests {
     use std::collections::HashSet;
 
     #[test]
+    fn grouped_preflight_resolves_a_group_with_one_lookup_and_keeps_fences() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )?;
+        let entries = |old: i64| {
+            vec![
+                (batch.clone(), "old".to_owned(), old, 0),
+                (batch.clone(), "new".to_owned(), 1, 0),
+            ]
+        };
+        for (mode, lookups) in [
+            (crate::PreflightLookupMode::PerEntry, 0),
+            (crate::PreflightLookupMode::Grouped, 1),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let mut table = DeltaTable::open(dir.path())?;
+            Arc::get_mut(&mut table)
+                .context("new table is shared")?
+                .preflight_lookup_mode = mode;
+            table.new_file(Arc::clone(&schema))?;
+            table.commit_files_with_transaction_evidence(&[], "old", 711)?;
+            let executor = shared_executor()?;
+            let _guard = executor.enter();
+            crate::publication_lookup::LOOKUPS.set(0);
+            let plan = table.plan_coalesced_publications(entries(711), 8, 1)?;
+            assert_eq!(crate::publication_lookup::LOOKUPS.get(), lookups, "{mode:?}");
+            assert_eq!(plan.committed_identities, vec![("old".to_owned(), 711, 0)]);
+            assert_eq!(plan.identities, vec![("new".to_owned(), 1, 0)]);
+            let fenced = table
+                .plan_coalesced_publications(entries(710), 8, 1)
+                .err()
+                .context("expected fence")?;
+            assert!(
+                format!("{fenced:#}").contains("fenced by newer application version"),
+                "{mode:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mixed_publication_one_lookup_preserves_exact_versions_and_partial_group_fence() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let table = DeltaTable::open(dir.path())?;
@@ -3370,6 +3413,7 @@ pub struct DeltaTable {
     bootstrap_only: bool,
     pub(crate) txn_lookup_mode: crate::TxnLookupMode,
     pub(crate) snapshot_cache_mode: crate::SnapshotCacheMode,
+    pub(crate) preflight_lookup_mode: crate::PreflightLookupMode,
     pub(crate) publication_cache: Mutex<crate::publication_lookup::PublicationCache>,
     txn_index: Mutex<Option<crate::publication_lookup::TxnIndex>>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
@@ -4151,6 +4195,7 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
+            preflight_lookup_mode: Default::default(),
             publication_cache: Default::default(),
             txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
@@ -4470,6 +4515,7 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
+            preflight_lookup_mode: Default::default(),
             publication_cache: Default::default(),
             txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
@@ -4523,6 +4569,10 @@ impl DeltaTable {
     }
 
     fn existing_snapshot(&self) -> Result<Option<SnapshotRef>> {
+        Ok(self.existing_snapshot_with_lineage()?.map(|(snapshot, _)| snapshot))
+    }
+
+    fn existing_snapshot_with_lineage(&self) -> Result<Option<(SnapshotRef, Option<u64>)>> {
         let exists = if self.url.scheme() == "file" {
             self.root.join("_delta_log").exists()
         } else {
@@ -4538,7 +4588,11 @@ impl DeltaTable {
                     .map(|entry| entry.is_some())
             })?
         };
-        if exists { Ok(Some(self.snapshot()?)) } else { Ok(None) }
+        if exists {
+            Ok(Some(self.snapshot_with_lineage()?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
@@ -5235,7 +5289,9 @@ impl DeltaTable {
         let Some((first_batch, _, _, _)) = entries.first() else {
             bail!("coalesced publication group requires at least one entry");
         };
-        let snapshot = self.existing_snapshot()?;
+        let (snapshot, lineage) = self
+            .existing_snapshot_with_lineage()?
+            .map_or((None, None), |(snapshot, lineage)| (Some(snapshot), lineage));
         let partitions = snapshot.as_ref().map_or_else(
             || self.partition_columns.clone(),
             |snapshot| snapshot.table_configuration().metadata().partition_columns().to_vec(),
@@ -5267,6 +5323,28 @@ impl DeltaTable {
         let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
         let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
         let runtime = runtime_config()?;
+        // Entry identities are their application IDs here, so one lookup serves the group.
+        let prefetched = match &snapshot {
+            Some(snapshot)
+                if self.preflight_lookup_mode == crate::PreflightLookupMode::Grouped
+                    && (partitions.is_empty() || partitions == [INGESTION_PARTITION]) =>
+            {
+                let mut ids = entries
+                    .iter()
+                    .map(|(_, app_id, _, _)| app_id.as_str())
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids.dedup();
+                let found = self.publication_versions(snapshot, lineage, &ids)?;
+                Some(
+                    found
+                        .into_iter()
+                        .map(|(id, version)| (id.to_owned(), version))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+            }
+            _ => None,
+        };
         let mut identities = Vec::with_capacity(entries.len());
         let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
@@ -5333,11 +5411,14 @@ impl DeltaTable {
                     } else {
                         crate::partition::publication_id(&app_id, values, identity_schema.as_ref())?
                     };
-                    let previous = snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
-                        .transpose()?
-                        .flatten();
+                    let previous = match prefetched.as_ref().and_then(|found| found.get(&identity)) {
+                        Some(&found) => found,
+                        None => snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
+                            .transpose()?
+                            .flatten(),
+                    };
                     if let Some(previous) = previous
                         && previous > version
                     {

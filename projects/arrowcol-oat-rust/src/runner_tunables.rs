@@ -507,8 +507,9 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode"
-            | "collector.commit.snapshot_cache_mode" | "collector.commit.checkpoint_mode"
-            | "collector.commit.checkpoint_interval" | "collector.commit.trigger" =>
+            | "collector.commit.snapshot_cache_mode" | "collector.commit.preflight_lookup_mode"
+            | "collector.commit.checkpoint_mode" | "collector.commit.checkpoint_interval"
+            | "collector.commit.trigger" =>
                 ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
             | "collector.pressure.buffered_bytes_limit" | "collector.pressure.buffered_rows_limit"
@@ -1766,7 +1767,7 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     fn commit_modes_require_matching_startup_readback_from_every_collector() -> Result<()> {
         let mut config = config()?;
         let commit = json!({"snapshot_cache_mode":"checkpoint_aware","checkpoint_mode":"async",
-            "checkpoint_interval":17,"txn_lookup_mode":"incremental"});
+            "checkpoint_interval":17,"txn_lookup_mode":"incremental","preflight_lookup_mode":"grouped"});
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"commit":commit}}))?;
         let first = json!({
             "component":"collector","instance_id":"collector-1","log_complete":true,
@@ -1779,7 +1780,13 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let mut matching = initial.clone();
         promote_collector_readback(&config, &mut matching, Some(&json!([first, second])), 2)?;
         let verified = matching["consumer_verified"].as_array().context("consumer_verified array")?;
-        for field in ["snapshot_cache_mode", "checkpoint_mode", "checkpoint_interval", "txn_lookup_mode"] {
+        for field in [
+            "snapshot_cache_mode",
+            "preflight_lookup_mode",
+            "checkpoint_mode",
+            "checkpoint_interval",
+            "txn_lookup_mode",
+        ] {
             let path = format!("collector.commit.{field}");
             assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
             let mut missing = second.clone();
