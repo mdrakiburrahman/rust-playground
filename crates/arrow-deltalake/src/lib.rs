@@ -218,6 +218,8 @@ impl CompletedFile {
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
 pub struct ParquetFileWriter {
+    #[cfg(feature = "delta")]
+    properties: WriterProperties,
     writer: Option<FileWriter>,
     durable_handle: File,
     path: PathBuf,
@@ -261,6 +263,8 @@ impl ParquetFileWriter {
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
         #[cfg(feature = "delta")]
+        let effective = properties.clone();
+        #[cfg(feature = "delta")]
         let writer = {
             let column_workers = delta_io::runtime_config()?.parquet_column_workers;
             if column_workers > 1 {
@@ -282,6 +286,8 @@ impl ParquetFileWriter {
         };
         Ok(Self {
             writer: Some(writer),
+            #[cfg(feature = "delta")]
+            properties: effective,
             durable_handle,
             path,
             rows: 0,
@@ -363,6 +369,7 @@ impl ParquetFileWriter {
             path,
             rows,
             input_bytes,
+            ..
         } = self;
         match writer.context("Parquet writer unavailable after interrupted write")? {
             FileWriter::Sequential(writer) => {
