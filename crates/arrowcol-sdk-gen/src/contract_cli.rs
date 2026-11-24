@@ -160,11 +160,18 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
                 )?)
                 .await?
                 .into_inner();
+            let receipt = if committed.native_receipt_json.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_slice::<serde_json::Value>(
+                    &committed.native_receipt_json,
+                )?)
+            };
             let committed = bundle_from_snapshot(&committed, &identity, Some(SchemaVersion::FIRST))?;
             if committed.schema() != prepared.schema() || committed.manifest() != prepared.manifest() {
                 return Err("committed version differs from the entire prepared contract".into());
             }
-            json!({ "table": name, "registered": true })
+            json!({ "table": name, "registered": true, "registrationReceipt": receipt })
         }
         CatalogCommand::List { endpoint } => {
             let snapshot = rpc::schema_catalog_client::SchemaCatalogClient::new(channel(endpoint).await?)
@@ -184,7 +191,12 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
                     "schema": bundle.schema(),
                     "properties": snapshot.properties,
                     "location": snapshot.location,
-                    "comment": snapshot.comment
+                    "comment": snapshot.comment,
+                    "registrationReceipt": if snapshot.native_receipt_json.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::from_slice::<serde_json::Value>(&snapshot.native_receipt_json)?)
+                    }
                 }));
             }
             tables.sort_by(|left, right| left["table"].as_str().cmp(&right["table"].as_str()));

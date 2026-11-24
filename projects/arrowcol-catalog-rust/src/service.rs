@@ -82,6 +82,7 @@ struct QueryTicket {
 #[derive(Clone)]
 pub struct CatalogService {
     config: Arc<CatalogConfig>,
+    native: Option<Arc<crate::native::NativeCatalog>>,
     state: Arc<Mutex<State>>,
     ddl_lock: Arc<Mutex<()>>,
     events: broadcast::Sender<rpc::ChangeEvent>,
@@ -103,6 +104,27 @@ impl CatalogService {
     /// # Errors
     /// Rejects corrupt state/logs, unsupported schemas, invalid seeds and storage failures.
     pub async fn open(config: CatalogConfig) -> Result<Self> {
+        Self::open_with_native(config, None).await
+    }
+
+    /// Opens a read-through CES bridge for adapter-owned native contracts.
+    ///
+    /// # Errors
+    /// Rejects unreceipted state, native drift and unsupported storage layouts.
+    pub async fn open_native(config: CatalogConfig, native: crate::NativeConfig) -> Result<Self> {
+        if config.ddl_dir.is_some() || config.ingestion_layout {
+            bail!(
+                "native bridges accept registration-last contracts only, without seed DDL or ingestion-layout rewriting"
+            );
+        }
+        let native = crate::native::NativeCatalog::open(native, config.state_dir.join("native"))?;
+        Self::open_with_native(config, Some(Arc::new(native))).await
+    }
+
+    async fn open_with_native(
+        config: CatalogConfig,
+        native: Option<Arc<crate::native::NativeCatalog>>,
+    ) -> Result<Self> {
         if config.retained_events == 0 {
             bail!("retained_events must be positive");
         }
@@ -119,6 +141,7 @@ impl CatalogService {
         };
         let service = Self {
             config: Arc::new(config),
+            native,
             state: Arc::new(Mutex::new(State {
                 epoch: uuid::Uuid::new_v4().to_string(),
                 event_id: 0,
@@ -144,7 +167,9 @@ impl CatalogService {
             }
         }
         // Discover managed table directories even if an index was lost.
-        if let Ok(root) = warehouse_file_path(&service.config.warehouse_root) {
+        if service.native.is_none()
+            && let Ok(root) = warehouse_file_path(&service.config.warehouse_root)
+        {
             discover_tables(&root, &root, &mut indexes)?;
         }
         for entry in indexes {
@@ -165,6 +190,11 @@ impl CatalogService {
                     continue;
                 }
                 let table = service.recover_table(entry.identity.clone(), entry.location, snapshot)?;
+                if let Some(native) = &service.native {
+                    native
+                        .verify(table.history.last().context("empty native history")?)
+                        .await?;
+                }
                 service.store.hydrate_committed(table.history.clone()).await?;
                 service.state.lock().await.tables.insert(entry.identity, table);
             }
@@ -219,6 +249,7 @@ impl CatalogService {
         sql: &str,
         expected: Option<rpc::EventPosition>,
     ) -> Result<(arrow_array::RecordBatch, rpc::EventPosition)> {
+        self.verify_native().await?;
         let statement = self.parser.parse_statement(sql)?;
         let state = self.state.lock().await;
         if expected.is_some_and(|expected| expected != position(&state)) {
@@ -452,6 +483,11 @@ impl CatalogService {
         sql: &str,
         candidate: Option<&CatalogSchemaVersion>,
     ) -> Result<Option<DdlCompletion>> {
+        if self.native.is_some() {
+            bail!(
+                "native authorities accept only verified PrepareTable/PromoteTable contracts; direct DDL is disabled"
+            );
+        }
         let statement = self.parser.parse_statement(sql)?;
         let _ddl = self.ddl_lock.lock().await;
         if let SparkStatement::CreateNamespace(namespace) = &statement {
@@ -819,6 +855,120 @@ impl CatalogService {
         }
         bail!("catalog changed repeatedly; retry DDL after concurrent writers settle")
     }
+
+    async fn verify_native(&self) -> Result<()> {
+        let Some(native) = &self.native else {
+            return Ok(());
+        };
+        let _ddl = self.ddl_lock.lock().await;
+        let schemas = self
+            .state
+            .lock()
+            .await
+            .tables
+            .values()
+            .map(|table| table.history.last().cloned().context("empty native history"))
+            .collect::<Result<Vec<_>>>()?;
+        if schemas.is_empty() {
+            native.probe().await?;
+        }
+        for schema in schemas {
+            native.verify(&schema).await?;
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self, table: &Table, position: &rpc::EventPosition) -> Result<rpc::TableSnapshot, Status> {
+        let mut snapshot = table_snapshot(table, position)?;
+        if let Some(native) = &self.native {
+            snapshot.native_receipt_json = native
+                .receipt_json(
+                    table
+                        .history
+                        .last()
+                        .ok_or_else(|| Status::internal("empty native history"))?,
+                )
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        }
+        Ok(snapshot)
+    }
+
+    async fn promote_native(&self, schema: &CatalogSchemaVersion) -> Result<()> {
+        let native = self.native.as_ref().context("missing native authority")?;
+        let _ddl = self.ddl_lock.lock().await;
+        let identity = schema.identity();
+        if let Some(table) = self.state.lock().await.tables.get(identity).cloned() {
+            if table.history.as_slice() != std::slice::from_ref(schema) {
+                bail!("native candidate conflicts with the registered contract");
+            }
+            native.verify(schema).await?;
+            return Ok(());
+        }
+        let location = schema.metadata().location.clone().context("candidate lacks location")?;
+        let observed = read_delta(&location).await?;
+        if observed.is_some() && !native.has_intent(schema)? {
+            bail!("native candidate cannot adopt an existing unowned Delta location");
+        }
+        native.begin(schema).await?;
+        let history = vec![schema.clone()];
+        let physical = self.storage_schema(&history)?;
+        let partitions = self.storage_partitions(schema)?;
+        let mut properties = schema.metadata().properties.clone();
+        properties.insert(HISTORY_KEY.to_owned(), serde_json::to_string(&history)?);
+        let comment = schema.metadata().comment.clone();
+        let snapshot = match observed {
+            Some(snapshot) => snapshot,
+            None => {
+                let location = location.clone();
+                let physical = Arc::clone(&physical);
+                let partitions = partitions.clone();
+                let properties = properties.clone();
+                let comment = comment.clone();
+                // An uncertain Delta outcome is left for an explicit resume of the
+                // durable intent. Never retry a native CREATE because Delta failed.
+                tokio::task::spawn_blocking(move || {
+                    DeltaTable::open_catalog(storage_url(&location)?)?
+                        .commit_catalog(None, physical, partitions, properties, comment)
+                })
+                .await??
+            }
+        };
+        if snapshot.schema != arrow_deltalake::normalize::schema(&physical)?
+            || snapshot.properties != properties
+            || snapshot.partition_columns != partitions
+            || snapshot.comment != comment
+        {
+            bail!("provisioned Delta metadata differs from the native candidate; retained for investigation");
+        }
+        native.register(schema).await?;
+        self.persist_index(identity, &location)?;
+        self.store.hydrate_committed(history.clone()).await?;
+        let mut state = self.state.lock().await;
+        state.event_id = state
+            .event_id
+            .checked_add(1)
+            .context("native bridge event ID exhausted")?;
+        state.tables.insert(
+            identity.clone(),
+            Table {
+                history,
+                location,
+                delta_version: snapshot.version,
+            },
+        );
+        let event = rpc::ChangeEvent {
+            position: Some(position(&state)),
+            event_type: rpc::EventType::CreateTable as i32,
+            table: Some(table_request(identity)),
+            schema_version: schema.version().get(),
+        };
+        state.events.push_back(event.clone());
+        while state.events.len() > self.config.retained_events {
+            state.events.pop_front();
+        }
+        let _ = self.events.send(event);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -980,6 +1130,12 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
                 "table already exists; rebuild a committed version",
             ));
         }
+        if let Some(native) = &self.native {
+            native
+                .preflight(&schema)
+                .await
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        }
         let location = schema
             .metadata()
             .location
@@ -1037,16 +1193,28 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
                 "candidate artifacts or metadata are inconsistent",
             ));
         }
-        self.apply_sql_candidate(schema.canonical_ddl(), Some(schema))
-            .await
-            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        if self.native.is_some() {
+            self.promote_native(schema)
+                .await
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        } else {
+            self.apply_sql_candidate(schema.canonical_ddl(), Some(schema))
+                .await
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        }
         self.get_table(Request::new(table_request(schema.identity()))).await
     }
 
     async fn get_current_event_id(&self, _: Request<rpc::Empty>) -> Result<Response<rpc::EventPosition>, Status> {
+        self.verify_native()
+            .await
+            .map_err(|error| Status::unavailable(format!("{error:#}")))?;
         Ok(Response::new(position(&*self.state.lock().await)))
     }
     async fn get_events(&self, request: Request<rpc::EventsRequest>) -> Result<Response<rpc::EventsResponse>, Status> {
+        self.verify_native()
+            .await
+            .map_err(|error| Status::unavailable(format!("{error:#}")))?;
         let state = self.state.lock().await;
         let from = checked_from(&state, request.into_inner().from)?;
         Ok(Response::new(rpc::EventsResponse {
@@ -1060,6 +1228,9 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
         }))
     }
     async fn watch(&self, request: Request<rpc::EventsRequest>) -> Result<Response<Self::WatchStream>, Status> {
+        self.verify_native()
+            .await
+            .map_err(|error| Status::unavailable(format!("{error:#}")))?;
         let state = self.state.lock().await;
         let mut shutdown = self.shutdown.subscribe();
         if *shutdown.borrow() {
@@ -1075,7 +1246,9 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
         let mut subscription = self.events.subscribe();
         drop(state);
         let (sender, receiver) = mpsc::channel(32);
+        let service = self.clone();
         tokio::spawn(async move {
+            let mut native_check = tokio::time::interval(std::time::Duration::from_secs(2));
             for event in replay {
                 if sender.send(Ok(event)).await.is_err() {
                     return;
@@ -1084,6 +1257,12 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
             loop {
                 tokio::select! {
                     _ = sender.closed() => return,
+                    _ = native_check.tick(), if service.native.is_some() => {
+                        if let Err(error) = service.verify_native().await {
+                            let _ = sender.send(Err(Status::unavailable(format!("{error:#}")))).await;
+                            return;
+                        }
+                    }
                     event = subscription.recv() => match event {
                         Ok(event) => if sender.send(Ok(event)).await.is_err() { return; },
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1103,6 +1282,9 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
         Ok(Response::new(Box::pin(stream)))
     }
     async fn get_table(&self, request: Request<rpc::TableRequest>) -> Result<Response<rpc::TableSnapshot>, Status> {
+        self.verify_native()
+            .await
+            .map_err(|error| Status::unavailable(format!("{error:#}")))?;
         let identity = identity_from_request(&request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let state = self.state.lock().await;
@@ -1110,15 +1292,18 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
             .tables
             .get(&identity)
             .ok_or_else(|| Status::not_found(format!("catalog table {identity} does not exist")))?;
-        Ok(Response::new(table_snapshot(table, &position(&state))?))
+        Ok(Response::new(self.snapshot(table, &position(&state))?))
     }
     async fn get_snapshot(&self, _: Request<rpc::Empty>) -> Result<Response<rpc::CatalogSnapshot>, Status> {
+        self.verify_native()
+            .await
+            .map_err(|error| Status::unavailable(format!("{error:#}")))?;
         let state = self.state.lock().await;
         let position = position(&state);
         let tables = state
             .tables
             .values()
-            .map(|table| table_snapshot(table, &position))
+            .map(|table| self.snapshot(table, &position))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Response::new(rpc::CatalogSnapshot {
             position: Some(position),
@@ -1243,6 +1428,7 @@ fn table_snapshot(table: &Table, position: &rpc::EventPosition) -> Result<rpc::T
         arrow_schema_ipc: artifacts.arrow_schema().to_vec(),
         manifest: artifacts.manifest().to_vec(),
         protobuf_descriptor: artifacts.protobuf_descriptor().to_vec(),
+        native_receipt_json: Vec::new(),
     })
 }
 
@@ -1338,7 +1524,7 @@ fn discover_tables(root: &Path, path: &Path, indexes: &mut Vec<IndexEntry>) -> R
     Ok(())
 }
 
-fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()

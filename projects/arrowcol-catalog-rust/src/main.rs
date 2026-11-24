@@ -24,6 +24,10 @@ struct Args {
     state_dir: PathBuf,
     #[arg(long, env = "ARROWCOL_CATALOG_DDL_DIR")]
     ddl_dir: Option<PathBuf>,
+    #[arg(long, env = "ARROWCOL_CATALOG_NATIVE_CONFIG")]
+    native_config: Option<PathBuf>,
+    #[arg(long, requires = "native_config")]
+    inspect_native_table: Option<String>,
     #[arg(
         long,
         env = "ARROWCOL_CATALOG_DDL_AUTH_MODE",
@@ -42,6 +46,20 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(table) = &args.inspect_native_table {
+        let config: arrowcol_catalog_rust::NativeConfig = serde_json::from_slice(&std::fs::read(
+            args.native_config.as_ref().context("missing native config")?,
+        )?)?;
+        anyhow::ensure!(
+            config.provider == arrowcol_catalog_rust::NativeProvider::Hive,
+            "structured native inspection currently uses Hive Thrift; Unity has a JSON REST inspector"
+        );
+        println!(
+            "{}",
+            arrowcol_catalog_rust::inspect_hive_table(config.endpoint, table).await?
+        );
+        return Ok(());
+    }
     if args.healthcheck {
         let endpoint = format!("http://127.0.0.1:{}", args.listen.port());
         let check = async {
@@ -78,14 +96,18 @@ async fn main() -> Result<()> {
             DdlIdentityPolicy::dev_only_allow_unsigned()
         }
     };
-    let service = CatalogService::open(CatalogConfig {
+    let config = CatalogConfig {
         warehouse_root: args.warehouse_root,
         state_dir: args.state_dir,
         ddl_dir: args.ddl_dir,
         retained_events: 4096,
         ingestion_layout: args.ingestion_layout,
-    })
-    .await?;
+    };
+    let service = if let Some(path) = args.native_config {
+        CatalogService::open_native(config, serde_json::from_slice(&std::fs::read(path)?)?).await?
+    } else {
+        CatalogService::open(config).await?
+    };
     tracing::info!(listen = %args.listen, "catalog Flight SQL and CES ready");
     let shutdown_service = service.clone();
     let (signal_sender, signal_receiver) = tokio::sync::oneshot::channel();

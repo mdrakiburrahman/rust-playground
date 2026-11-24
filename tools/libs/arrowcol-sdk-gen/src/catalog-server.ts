@@ -227,12 +227,19 @@ try {
     if (!existsSync(secret)) writeFileSync(secret, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 });
     const output = openSync(resolve(workspace, root, 'service.log'), 'a');
     const binary = resolve(workspace, 'target/debug', process.platform === 'win32' ? 'arrowcol-catalog-rust.exe' : 'arrowcol-catalog-rust');
+    const nativeArgs: string[] = [];
+    if (registry.native) {
+      const nativeConfig = resolve(workspace, root, 'native-config.json');
+      writeFileSync(nativeConfig, `${JSON.stringify(registry.native)}\n`);
+      nativeArgs.push('--native-config', nativeConfig);
+    }
     const child = spawn(binary, [
       '--listen', new URL(registry.endpoint).host,
       '--ddl-auth-mode', 'signed_identity',
       '--ddl-identity-secret-file', secret,
       '--state-dir', resolve(workspace, root, 'state'),
       '--warehouse-root', resolve(workspace, root, 'warehouse'),
+      ...nativeArgs,
     ], { cwd: workspace, stdio: ['ignore', output, output], shell: false });
     closeSync(output);
     children.push(child);

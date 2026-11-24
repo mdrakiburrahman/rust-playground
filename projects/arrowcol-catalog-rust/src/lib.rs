@@ -7,3 +7,5 @@ mod identity;
 pub use identity::{DdlIdentityPolicy, DdlIdentityVerifier};
 mod service;
 pub use service::{CatalogCesService, CatalogConfig, CatalogService};
+mod native;
+pub use native::{NativeConfig, NativeProvider, inspect_hive_table};

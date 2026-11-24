@@ -1,5 +1,5 @@
 import { pipelineSteps, type PipelineRun } from './run-pipeline.js';
-interface Registry { id: string; label: string; endpoint: string; mode: string; authority: string }
+interface Registry { id: string; label: string; endpoint: string; mode: string; authority: string; native?: { provider: string; endpoint: string } }
 interface PropertyDefinition {
   key: string; option_name: string; optional: boolean; kind: string;
   enum_values: string[]; declared_default: string | null;
@@ -8,6 +8,7 @@ interface PropertyDefinitions { definitions_sha256: string; options: PropertyDef
 interface Table {
   table: string; tableId: string; version: number; fingerprint: string; location: string;
   properties: Record<string, string>;
+  registrationReceipt?: { provider: string; native_table_id: string };
   schema: { fields: { name: string; nullable: boolean; field_number: number; mapping: { spark: string } }[] };
 }
 interface Run extends PipelineRun {
@@ -44,7 +45,10 @@ const nativeChoices = [
   { id: 'native:hive', label: 'Hive Metastore' },
 ];
 const nativeOptions = () => nativeChoices.map((item) =>
-  `<option value="${item.id}">${item.label} (inspection only)</option>`).join('');
+  `<option value="${item.id}">${item.label} (native metadata inspector)</option>`).join('');
+const unavailableNativeOptions = () => nativeChoices.filter((item) =>
+  !registries.some((registry) => registry.native?.provider === item.id.slice(7)))
+  .map((item) => `<option value="${item.id}">${item.label} (enable builds first)</option>`).join('');
 const selectedNative = () => nativeChoices.find((item) => item.id === registrySelect.value);
 const dialog = element<HTMLDialogElement>('create-dialog');
 let inspectedRunId: string | undefined = location.hash.match(/^#run=([a-f0-9-]{36})$/)?.[1];
@@ -121,6 +125,7 @@ function renderRunPipeline(): void {
     ['schema', 'Canonical row .proto'], ['options', 'Property options .proto'], ['manifest', 'Schema manifest'],
     ...(run.request.codegen === 'protoc' ? [['compiler', 'Compiler entry .proto']] : []),
     ['sdk', 'Generated SDK manifest'], ['release', 'Release provenance'],
+    ...(run.registry.native ? [['registration', 'Native registration receipt']] : []),
   ];
   const select = element<HTMLSelectElement>('pipeline-document');
   select.innerHTML = documents.map(([value, name]) => `<option value="${value}">${name}</option>`).join('');
@@ -160,7 +165,8 @@ const connectionDialog = document.createElement('dialog');
 connectionDialog.setAttribute('aria-label', 'Catalogue connections');
 connectionDialog.innerHTML = `<div class="dialog-heading"><h2>Catalogue connections</h2><button id="close-connections">Close</button></div>
   <p class="small">Local and Hosted simulation are independent Rust catalogues with full SDK builds.
-  Unity Catalog and Hive below are real optional native services, but their SDK-build/collector adapters are not implemented yet.</p>
+  Unity Catalog and Hive are optional independent native authorities. Enable their build connections to create contracts;
+  the native metadata inspectors also browse foreign tables without importing them.</p>
   <label for="inspect-connection">Inspect catalogue connection</label><select id="inspect-connection"></select>
   <p id="connection-status" class="small"></p><div id="native-namespace" hidden><div class="identity-fields">
   <label>Native catalogue<input id="native-catalog" placeholder="Leave empty to list catalogues"></label>
@@ -174,20 +180,29 @@ element('close-connections').onclick = () => connectionDialog.close();
 interface NativeConnection { provider: string; installed: boolean; running?: boolean; endpoint?: string; container?: string; note?: string }
 let nativeConnections: NativeConnection[] = [];
 let connectionSequence = 0;
+let connectionLoad = 0;
+connectionDialog.addEventListener('close', () => { connectionLoad++; connectionSequence++; });
 connectionButton.onclick = () => handle(openConnections);
 async function openConnections(): Promise<void> {
+  const load = ++connectionLoad;
+  connectionSequence++;
   if (!connectionDialog.open) connectionDialog.showModal();
+  const select = element<HTMLSelectElement>('inspect-connection');
+  select.disabled = true;
   element('connection-status').textContent = 'Loading connection status...';
   for (const part of ['catalog', 'schema', 'table']) element<HTMLInputElement>(`native-${part}`).value = '';
   try {
     const connections = await api<{ registries: Registry[]; native: NativeConnection[] }>('/api/connections');
+    if (load !== connectionLoad || !connectionDialog.open) return;
     nativeConnections = connections.native;
-    const select = element<HTMLSelectElement>('inspect-connection');
-    select.innerHTML = connections.registries.map((registry) => `<option value="${escape(registry.id)}">${escape(registry.label)} (Rust)</option>`).join('') +
+    select.innerHTML = connections.registries.map((registry) => `<option value="${escape(registry.id)}">${escape(registry.label)} (${registry.native ? 'committed contracts' : 'Rust'})</option>`).join('') +
       nativeOptions();
     select.value = registrySelect.value;
+    select.disabled = false;
     await inspectConnection();
   } catch (error) {
+    if (load !== connectionLoad || !connectionDialog.open) return;
+    select.disabled = false;
     element('connection-status').textContent = 'Could not load connections';
     element('connection-metadata').textContent = error instanceof Error ? error.message : String(error);
   }
@@ -205,7 +220,7 @@ async function inspectConnection(): Promise<void> {
     if (provider) {
       const state = nativeConnections.find((item) => item.provider === provider);
       element('connection-status').textContent = state?.installed
-        ? `${state.running ? 'Container running' : 'Stopped'} | ${state.endpoint} | ${state.container} | SDK build adapter pending`
+        ? `${state.running ? 'Container running' : 'Stopped'} | ${state.endpoint} | ${state.container} | ${registries.some((registry) => registry.native?.provider === provider) ? 'Native builds enabled; select the authority in the main catalogue dropdown' : 'Enable builds with --action=enable-build, then restart catalog-ui'}`
         : `Not installed. Run: npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=up --provider=${provider}`;
       const query = new URLSearchParams();
       for (const part of ['catalog', 'schema', 'table']) {
@@ -252,7 +267,7 @@ function showTab(name: 'catalog' | 'runs'): void {
 function renderTree(): void {
   const native = selectedNative();
   if (native) {
-    const message = `<div class="empty"><h2>${native.label}</h2><p class="muted">Inspection only. Use Inspect connections to browse native namespaces and table metadata.</p><p class="muted small">SDK-build and collector adapters are not implemented yet.</p></div>`;
+    const message = `<div class="empty"><h2>${native.label}</h2><p class="muted">Use Inspect connections to browse native metadata.</p><p class="muted small">Enable SDK builds in the devcontainer with native-catalogues --action=enable-build --provider=${native.id.slice(7)}, then restart catalog-ui.</p></div>`;
     element('tree').innerHTML = fabric ? message : '<p class="muted small">Native metadata inspection</p>';
     if (fabric) {
       element('workspace-list').replaceChildren();
@@ -334,7 +349,8 @@ function renderLakehouseDetail(table: Table): string {
     <section id="lakehouse-contract" role="tabpanel" aria-labelledby="contract-view" hidden>
     <div class="table-heading"><div><h2>SDK contract</h2><span class="pill">Registered · v${table.version}</span></div><button id="rebuild" class="primary">Build committed v${table.version}</button></div>
     <div class="property-grid"><span>Table</span><span>${escape(table.table)}</span><span>Table identity</span><span class="mono">${escape(table.tableId)}</span>
-    <span>Schema fingerprint</span><span class="mono">${escape(table.fingerprint)}</span></div>
+    <span>Schema fingerprint</span><span class="mono">${escape(table.fingerprint)}</span>
+    ${table.registrationReceipt ? `<span>Native ${escape(table.registrationReceipt.provider)} identity</span><span class="mono">${escape(table.registrationReceipt.native_table_id)}</span>` : ''}</div>
     <p class="metadata-note">Build the committed schema without registering it again. The generated SDK calls Arrowcol, not the catalogue. Downloads and host paths appear under Workflow runs.</p></section>`;
 }
 function favoriteKey(table: string): string {
@@ -443,7 +459,7 @@ async function refreshTables(): Promise<void> {
   element<HTMLButtonElement>('add-table').disabled = !!native;
   if (fabric) element<HTMLButtonElement>('create-nav').disabled = !!native;
   if (native) {
-    element('registry-note').textContent = `${native.label} · Inspection only · SDK build adapter pending`;
+    element('registry-note').textContent = `${native.label} · Inspection only · Build connection not enabled`;
     tables = [];
     selected = '';
     if (fabric) element('schema-filter').innerHTML = '<option value="">All databases</option>';
@@ -452,7 +468,9 @@ async function refreshTables(): Promise<void> {
     return;
   }
   const registry = registries.find((item) => item.id === registrySelect.value)!;
-  element('registry-note').textContent = `${registry.endpoint} · ${registry.mode === 'owned' ? 'Persistent independent service' : 'Configured external service'}`;
+  element('registry-note').textContent = registry.native
+    ? `${registry.native.endpoint} · Native authority · Collector bridge ${registry.endpoint}`
+    : `${registry.endpoint} · ${registry.mode === 'owned' ? 'Persistent independent service' : 'Configured external service'}`;
   const result = await api<{ tables: Table[] }>(`/api/tables?registry=${encodeURIComponent(registry.id)}`);
   if (sequence !== tableSequence) return;
   tables = result.tables;
@@ -518,9 +536,10 @@ async function refreshRuns(): Promise<void> {
   await refreshRunOutput();
 }
 element('add-table').onclick = () => {
-  if (selectedNative()) { notice('This connection is inspection-only; its SDK build adapter is not implemented yet.'); return; }
+  if (selectedNative()) { notice('Enable this native build connection first, then restart catalog-ui.'); return; }
   const registry = registries.find((item) => item.id === registrySelect.value)!;
   element('create-registry').textContent = `Target: ${registry.label} (${registry.endpoint})`;
+  if (registry.native?.provider === 'hive') element<HTMLInputElement>('catalog-name').value = 'hive';
   if (fabric && workspaceFilter) element<HTMLInputElement>('catalog-name').value = workspaceFilter;
   element('column-rows').replaceChildren();
   element('property-rows').replaceChildren();
@@ -594,7 +613,7 @@ element('close-dialog').onclick = () => dialog.close();
 element<HTMLFormElement>('create-form').onsubmit = (event) => {
   event.preventDefault();
   if (selectedNative()) {
-    element('form-error').textContent = 'This connection is inspection-only; its SDK build adapter is not implemented yet.';
+    element('form-error').textContent = 'Enable this native build connection first, then restart catalog-ui.';
     return;
   }
   updateDdl();
@@ -674,7 +693,7 @@ handle(async () => {
     definitions.options.map((definition) => `<option value="${escape(definition.key)}">${escape(definition.option_name)}${definition.optional ? ' (optional)' : ''}${definition.declared_default === null ? '' : ` — default: ${escape(definition.declared_default)}`}</option>`).join('');
   registries = config.registries;
   token = config.token;
-  registrySelect.innerHTML = registries.map((registry) => `<option value="${escape(registry.id)}">${escape(registry.label)}</option>`).join('') + nativeOptions();
+  registrySelect.innerHTML = registries.map((registry) => `<option value="${escape(registry.id)}">${escape(registry.label)}</option>`).join('') + unavailableNativeOptions();
   const saved = (lakehouse ? new URLSearchParams(location.search).get('registry') : null) ?? localStorage.getItem('arrowcol-registry');
   if (saved && [...registrySelect.options].some((option) => option.value === saved)) registrySelect.value = saved;
   if (lakehouse) selected = new URLSearchParams(location.search).get('table') ?? '';

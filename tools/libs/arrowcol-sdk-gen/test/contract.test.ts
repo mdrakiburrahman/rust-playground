@@ -140,6 +140,42 @@ test('recovery preserves a completed release when the worker exits during its li
     assert.deepEqual(readRun(f.workspace, queued.id), completed);
   } finally { context.mock.restoreAll(); f.cleanup(); }
 });
+test('native promotion retains its separate receipt without repackaging the verified archive', async () => {
+  const f = fixture();
+  try {
+    const config = loadConfig(f.workspace);
+    config.registries[0].native = { provider: 'unity', endpoint: 'http://127.0.0.1:18080/api/2.1/unity-catalog' };
+    writeFileSync(join(f.workspace, contractRoot, 'config.json'), JSON.stringify(config));
+    const receipt = { provider: 'unity', native_table_id: 'native-assigned-id', contract_sha256: 'digest' };
+    const execute: Execute = async (...args) => {
+      const output = await f.execute(...args);
+      return args[1][1] === 'promote' ? JSON.stringify({ registered: true, registrationReceipt: receipt }) : output;
+    };
+    const queued = enqueue(f.workspace, { registry: 'local', mode: 'create', ddl: 'CREATE TABLE telemetry.prod.events (id BIGINT)' });
+    const run = await buildContract(f.workspace, queued.id, execute);
+    assert.equal(run.status, 'succeeded', run.error ?? '');
+    assert.equal(run.artifact?.sha256, digest('deterministic-archive'));
+    assert.deepEqual(run.registrationReceipt, receipt);
+    const document = inspectRunDocument(f.workspace, run.id, 'registration');
+    assert.equal(document.available, true);
+    assert.deepEqual(JSON.parse(document.text!), receipt);
+  } finally { f.cleanup(); }
+});
+test('failed native SDK verification cannot invoke promotion', async () => {
+  const f = fixture();
+  try {
+    const config = loadConfig(f.workspace);
+    config.registries[0].native = { provider: 'hive', endpoint: 'thrift://127.0.0.1:19083' };
+    writeFileSync(join(f.workspace, contractRoot, 'config.json'), JSON.stringify(config));
+    f.fail('test');
+    const queued = enqueue(f.workspace, { registry: 'local', mode: 'create', ddl: 'CREATE TABLE hive.prod.events (id BIGINT)' });
+    const run = await buildContract(f.workspace, queued.id, f.execute);
+    assert.equal(run.status, 'failed');
+    assert.equal(run.registration, 'not-attempted');
+    assert.ok(!f.calls.some((call) => call.includes('promote')));
+    assert.equal(run.artifact, undefined);
+  } finally { f.cleanup(); }
+});
 test('recovery fails an interrupted worker without discarding staged bytes or registration state', (context) => {
   const f = fixture();
   try {

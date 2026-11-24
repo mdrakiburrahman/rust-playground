@@ -45,6 +45,9 @@ message TableSnapshot {
   bytes arrow_schema_ipc = 9;
   bytes manifest = 10;
   bytes protobuf_descriptor = 11;
+  // Optional native registration receipt, produced after SDK verification.
+  // Never part of the frozen candidate or generated schema artifacts.
+  bytes native_receipt_json = 12;
 }
 message CatalogSnapshot {
   EventPosition position = 1;

@@ -165,7 +165,7 @@ This is original prototype code, not a pixel-perfect or Microsoft-hosted product
 | --- | --- |
 | Workspaces / database filter | Views over logical catalogue/schema namespaces, not actual Fabric workspaces |
 | Catalogue connection | Independent source of truth used by Nx; not an SDK or compiler variant |
-| Inspect connections | Read-only Rust catalogue and native Unity/Hive metadata inspection; native SDK-build adapters are still pending |
+| Inspect connections | Read-only Rust and native Unity/Hive metadata inspection, including foreign native tables without importing them |
 | Table overview | Columns, properties, identity, version/fingerprint and committed-version rebuild |
 | New table | Ordered schema editor, compiled property defaults, DDL preview and configured protoc entry |
 | Workflow runs | Clickable live top-down pipeline, step attempts/timings and DDL/proto/log inspection, immutable download and actual host path |
@@ -177,8 +177,12 @@ available. It follows the reference's nested Lakehouse/Tables/schema/table tree
 and inline table pane rather than replacing the catalogue grid with a drawer.
 Schema, Properties and SDK contract tabs display committed local metadata.
 New table, Build SDK and Workflow runs share the existing backend and compiler
-workflow. Catalogue selection includes inspection-only Unity/Hive entries with
-builds disabled. The surrounding Learn, Real-Time, Apps and other rail controls
+workflow. Catalogue selection includes Unity/Hive build authorities after
+[`enable-build`](catalog.md#optional-local-unity-catalog-and-hive-services);
+unconfigured native entries remain inspection-only. Native builds support new
+flat, unpartitioned immutable v1 contracts and exact rebuilds; the separate native
+registration receipt never changes the already verified SDK archive.
+The surrounding Learn, Real-Time, Apps and other rail controls
 are visual-only; OneLake catalog links to the working `/fabric` surface.
 The table overview links back into Explorer using explicit registry/table query
 parameters, which preserve the selected table on reload.

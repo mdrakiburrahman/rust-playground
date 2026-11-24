@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, openSync, closeSync, unlinkSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { commandRunner, contractRoot, digest, ensureDirectory, uuidPattern, type Execute } from './contract.js';
+import { commandRunner, contractRoot, digest, ensureDirectory, listRuns, loadConfig, writeJson, uuidPattern, type Execute, type Registry } from './contract.js';
 import { dockerExec, localDockerSocket } from './docker-exec.js';
 
 export type NativeProvider = 'unity' | 'hive';
@@ -14,7 +14,12 @@ export const nativeImages = {
 const label = 'io.arrowcol.native.owner';
 const jdbcSha256 = '2a32a9dcbc42d67a50ad3a0de5efd102c8d2be46720045f2cbd6689f160ab7c7';
 interface NativeState { id: string }
-interface Container { Id: string; Config: { Image: string; Labels: Record<string, string> }; State: { Running: boolean; Status: string } }
+interface Container {
+  Id: string; Config: { Image: string; Hostname?: string; Labels: Record<string, string> };
+  State: { Running: boolean; Status: string };
+  Mounts?: { Type: string; Source: string; Destination: string }[];
+  NetworkSettings?: { Networks: Record<string, unknown> };
+}
 
 export function nativeNames(id: string) {
   if (!uuidPattern.test(id)) throw new Error('Invalid native catalogue ownership identity');
@@ -43,6 +48,36 @@ export function nativeManager(workspace: string, execute: Execute = commandRunne
     undefined, { DOCKER_CONTEXT: undefined, DOCKER_HOST: undefined });
   async function execContainer(name: string, command: string[]) {
     return dockerExec(await endpoint(), name, command);
+  }
+  function buildRegistry(provider: NativeProvider): Registry | undefined {
+    if (!existsSync(resolve(workspace, contractRoot, 'config.json'))) return undefined;
+    return loadConfig(workspace).registries.find((registry) => registry.native?.provider === provider);
+  }
+  async function sharedWarehouse(state: NativeState, registry: Registry) {
+    const hostname = process.env.HOSTNAME;
+    if (process.platform !== 'linux' || !hostname) throw new Error('Enable native builds from the Linux development container');
+    const [self]: Container[] = JSON.parse(await docker(['container', 'inspect', hostname]));
+    const mount = self.Mounts?.find((item) => item.Type === 'bind' && item.Destination === resolve(workspace));
+    if (!self.State.Running || self.Config.Hostname !== hostname || !mount) {
+      throw new Error('Cannot prove the current development container and its workspace bind mount');
+    }
+    const target = resolve(workspace, contractRoot, 'registries', digest(registry.authority), 'warehouse');
+    ensureDirectory(workspace, relative(workspace, target));
+    const source = `${mount.Source}/${relative(workspace, target)}`;
+    const network = nativeNames(state.id).network;
+    if (!self.NetworkSettings?.Networks[network]) await docker(['network', 'connect', network, self.Id]);
+    return { source, target };
+  }
+  async function warehouseArguments(state: NativeState, provider: NativeProvider): Promise<string[]> {
+    const registry = buildRegistry(provider);
+    if (!registry) return [];
+    if (registry.authority !== `${state.id}:${provider}`) throw new Error('Native authority does not match the owned service');
+    const { source, target } = await sharedWarehouse(state, registry);
+    const found = await container(state, provider);
+    if (found && !found.Mounts?.some((mount) => mount.Type === 'bind' && mount.Source === source && mount.Destination === target)) {
+      throw new Error(`The owned ${provider} container needs its shared warehouse mount; run --action=enable-build`);
+    }
+    return ['--mount', `type=bind,source=${source},target=${target}`];
   }
   async function container(state: NativeState, service: keyof typeof nativeImages): Promise<Container | undefined> {
     const name = nativeNames(state.id)[service];
@@ -113,12 +148,14 @@ export function nativeManager(workspace: string, execute: Execute = commandRunne
       }
       const names = nativeNames(state.id);
       await resource(state, 'network', names.network);
+      const shared = await warehouseArguments(state, provider);
       if (provider === 'unity') {
         const volume = `${names.unity}-metadata`;
         await resource(state, 'volume', volume);
         await create(state, 'unity', [
           '--publish', '127.0.0.1:18080:8080', '--env', 'JAVA_TOOL_OPTIONS=-Xmx768m',
           '--mount', `type=volume,source=${volume},target=/home/unitycatalog/etc/db`,
+          ...shared,
           '--entrypoint', '/bin/sh',
         ], ['-c', 'exec java -cp "$(cat server/target/classpath)" io.unitycatalog.server.UnityCatalogServer']);
         const configuration = join(root, 'hibernate.properties');
@@ -170,6 +207,7 @@ export function nativeManager(workspace: string, execute: Execute = commandRunne
         await create(state, 'hive', [
           '--publish', '127.0.0.1:19083:9083', '--env', 'SERVICE_NAME=metastore', '--env', 'DB_DRIVER=postgres',
           '--mount', `type=volume,source=${warehouse},target=/opt/hive/data/warehouse`,
+          ...shared,
         ]);
         const found = await container(state, 'hive');
         if (!found?.State.Running) {
@@ -192,9 +230,52 @@ export function nativeManager(workspace: string, execute: Execute = commandRunne
     return { provider, installed: !!found, running: found?.State.Running ?? false,
       container: nativeNames(state.id)[provider], image: nativeImages[provider],
       endpoint: provider === 'unity' ? 'http://localhost:18080/api/2.1/unity-catalog' : 'thrift://localhost:19083',
-      buildSupported: false, note: 'Native service only; the registration-last SDK/collector adapter is not implemented.' };
+      buildSupported: !!buildRegistry(provider),
+      note: buildRegistry(provider) ? 'Native registration-last authority; restart catalog-ui after enabling its CES bridge.'
+        : 'Run --action=enable-build from the devcontainer to enable native registration and SDK builds.' };
   }
-  async function inspect(provider: NativeProvider, catalog?: string, schema?: string, table?: string) {
+  async function enableBuild(provider: NativeProvider) {
+    if (listRuns(workspace).some((run) => (run.registry.native?.provider === provider || run.registry.id === provider) &&
+      ['queued', 'running'].includes(run.status))) throw new Error('Wait for native builds to finish before changing the service');
+    let state = nativeState(workspace);
+    if (!state || !await container(state, provider)) {
+      await up(provider);
+      state = nativeState(workspace);
+    }
+    if (!state) throw new Error('Native service did not persist its ownership identity');
+    const lock = join(root, 'lifecycle.lock');
+    closeSync(openSync(lock, 'wx'));
+    try {
+      const config = loadConfig(workspace);
+      const names = nativeNames(state.id);
+      const registry: Registry = {
+        id: provider, label: provider === 'unity' ? 'Unity Catalog' : 'Hive Metastore',
+        authority: `${state.id}:${provider}`, endpoint: `http://127.0.0.1:${provider === 'unity' ? 18819 : 18820}`, mode: 'owned',
+        native: { provider, endpoint: provider === 'unity'
+          ? `http://${names.unity}:8080/api/2.1/unity-catalog` : `thrift://${names.hive}:9083` },
+      };
+      const existing = config.registries.find((item) => item.id === provider || item.native?.provider === provider);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(registry)) {
+        throw new Error('Refusing to overwrite an existing different native registry configuration');
+      }
+      if (!existing && config.registries.some((item) => item.endpoint === registry.endpoint || item.authority === registry.authority)) {
+        throw new Error('Native bridge endpoint or authority is already configured for another registry');
+      }
+      const { source, target } = await sharedWarehouse(state, registry);
+      const found = await container(state, provider);
+      if (found && !found.Mounts?.some((mount) => mount.Type === 'bind' && mount.Source === source && mount.Destination === target)) {
+        // Replace only the proved owned container, never its persistent volumes.
+        if (found.State.Running) await docker(['stop', '--time', '45', found.Id]);
+        await docker(['container', 'rm', found.Id]);
+      }
+      if (!existing) {
+        config.registries.push(registry);
+        writeJson(resolve(workspace, contractRoot, 'config.json'), config);
+      }
+    } finally { unlinkSync(lock); }
+    return up(provider);
+  }
+  async function inspect(provider: NativeProvider, catalog?: string, schema?: string, table?: string): Promise<unknown> {
     for (const name of [catalog, schema, table]) {
       if (name !== undefined && !/^[a-zA-Z_][a-zA-Z0-9_]{0,127}$/.test(name)) throw new Error('Expected a simple native namespace identifier');
     }
@@ -207,6 +288,17 @@ export function nativeManager(workspace: string, execute: Execute = commandRunne
       return unityRequest(state, path);
     }
     if (catalog && catalog !== 'hive') throw new Error('The local Hive inspector supports the default hive catalog');
+    const registry = buildRegistry('hive');
+    if (table && registry) {
+      const config = resolve(workspace, contractRoot, 'registries', digest(registry.authority), 'native-config.json');
+      if (!existsSync(config)) writeJson(config, registry.native);
+      else if (JSON.stringify(JSON.parse(readFileSync(config, 'utf8'))) !== JSON.stringify(registry.native)) {
+        throw new Error('Native inspector configuration differs from the selected authority');
+      }
+      return JSON.parse(await execute(resolve(workspace, 'target/debug/arrowcol-catalog-rust'), [
+        '--native-config', config, '--inspect-native-table', `${catalog}.${schema}.${table}`,
+      ]));
+    }
     return { text: await hiveQuery(state, table ? `DESCRIBE FORMATTED \`${schema}\`.\`${table}\`;`
       : schema ? `SHOW TABLES IN \`${schema}\`;` : 'SHOW DATABASES;') };
   }
@@ -264,13 +356,24 @@ export function nativeManager(workspace: string, execute: Execute = commandRunne
     if (provider === 'unity' && JSON.stringify(tableBefore) !== JSON.stringify(table)) {
       throw new Error('Unity table identity or metadata changed across restart');
     }
-    if (provider === 'hive' && (!table || typeof table !== 'object' || !('text' in table) ||
-        typeof table.text !== 'string' || !/^id\s+bigint/m.test(table.text) || !/^payload\s+string/m.test(table.text))) {
-      throw new Error('Hive table schema was not retained across restart');
+    if (provider === 'hive') {
+      if (!table || typeof table !== 'object') throw new Error('Hive returned no table metadata');
+      if ('text' in table) {
+        if (typeof table.text !== 'string' || !/^id\s+bigint/m.test(table.text) || !/^payload\s+string/m.test(table.text)) {
+          throw new Error('Hive table schema was not retained across restart');
+        }
+      } else if (!('columns' in table) || !Array.isArray(table.columns) ||
+          !table.columns.some((column: unknown) => column && typeof column === 'object' &&
+            'name' in column && column.name === 'id' && 'type' in column && column.type === 'bigint') ||
+          !table.columns.some((column: unknown) => column && typeof column === 'object' &&
+            'name' in column && column.name === 'payload' && 'type' in column && column.type === 'string') ||
+          JSON.stringify(tableBefore) !== JSON.stringify(table)) {
+        throw new Error('Hive structured identity/schema was not retained across restart');
+      }
     }
-    const result = { provider, namespace, persistence: 'verified', metadata, table, buildSupported: false };
+    const result = { provider, namespace, persistence: 'verified', metadata, table, buildSupported: !!buildRegistry(provider) };
     writeFileSync(join(root, `${provider}-${namespace}.json`), `${JSON.stringify(result, null, 2)}\n`, { flag: 'wx' });
     return result;
   }
-  return { up, stop, status, inspect, verify };
+  return { up, stop, status, inspect, verify, enableBuild };
 }

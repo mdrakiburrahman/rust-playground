@@ -14,6 +14,7 @@ export function inspectRunDocument(workspace: string, id: string, document: stri
     manifest: ['payload', 'contract', 'manifest.json'],
     sdk: ['payload', 'sdk', 'sdk-manifest.json'],
     release: ['payload', 'release.json'],
+    ...(run.registry.native ? { registration: ['registration-receipt.json'] } : {}),
     ...(request.codegen === 'protoc'
       ? { compiler: ['payload', 'compiler', request.protoEntry ?? 'schema.proto'] } : {}),
   };

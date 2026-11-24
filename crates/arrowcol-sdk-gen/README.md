@@ -23,7 +23,10 @@ The UI starts two independent persistent catalogue services, not mock APIs.
 | `CONTRACT_COLLECTOR_RUN=RUN_UUID npx --no-install nx run arrowcol-sdk-gen:collector-contract-e2e` | Writes three synthetic rows using a fresh protoc UI run's SDK, then checks committed Delta rows; requires the owned catalogue/UI running and an empty table |
 | `npx --no-install nx run arrowcol-sdk-gen:contract-properties` | List optional properties, enum values and native defaults from compiled proto2 descriptors |
 | `npx --no-install nx run arrowcol-protoc:build-contract --registry=local --definition=schemas/events.sql` | Opt into real protoc generation; the original website/default target remain direct, while `/fabric` defaults to protoc |
-| `npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=up --provider=unity` | Start persistent local Unity Catalog; substitute `hive` for Hive/PostgreSQL. **Unauthenticated local development only; never publish native ports. SDK-build adapters remain pending.** |
+| `npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=up --provider=unity` | Start persistent local Unity Catalog; substitute `hive` for Hive/PostgreSQL. **Unauthenticated local development only; never publish native ports.** |
+| `npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=enable-build --provider=unity` | Enable native registration/SDK builds; substitute `hive`. **Run with builds idle: may recreate the owned container to add a shared warehouse, retaining its metadata volumes. Restart `catalog-ui` afterward.** |
+| `npx --no-install nx run arrowcol-sdk-gen:native-contract-e2e` | Real Lakehouse CREATE, protoc artifact, native receipt, deterministic rebuild and duplicate rejection for both enabled native authorities |
+| `npx --no-install nx run arrowcol-sdk-gen:native-recovery-e2e` | **Run with native builds idle:** stop/restart both native services, check fail-closed reads and retained schemas/receipts; preserves volumes |
 | `npx --no-install nx run arrowcol-sdk-gen:native-catalogues --action=verify --provider=hive` | Retains a native metadata-only example and checks restart persistence; substitute `unity`. Not a Delta/SDK ingestion test |
 
 CLI builds require the selected registry to be running. Configuration, run logs,
@@ -35,10 +38,12 @@ inspection and logs. The UI offers downloads and copyable host paths. Set `CONTR
 to the host checkout path on first startup when running inside a container.
 Browser checks require Playwright Chromium and its system libraries
 (`npx --no-install playwright install --with-deps chromium --only-shell`).
-The catalogue dropdown includes Unity Catalog and Hive Metastore as **inspection-only**
-connections. Selecting either opens native metadata inspection and disables SDK builds;
-switch back to Local/Hosted to build. **Inspect connections** also browses any service
-without changing the selected connection.
+After `enable-build`, the main dropdown selects Unity or Hive for the same
+create/build workflow. Before enabling, their entries open inspection only.
+Native builds support new unpartitioned, flat-primitive v1 contracts and exact
+rebuilds; Hive names start with `hive`. **Inspect connections** also browses
+foreign native metadata without adopting it. SDKs remain registry-independent;
+the collector's deployment selects the signed native CES bridge.
 See [native setup, inspection and safety](../../docs/architecture/arrowcol-platform/catalog.md#optional-local-unity-catalog-and-hive-services).
 
 | Frontend | Purpose |

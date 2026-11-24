@@ -21,6 +21,8 @@ page.on('request', (request) => {
   }
 });
 try {
+  const config: { registries: { id: string; native?: { provider: string } }[] } =
+    await (await page.request.get(`${baseURL}/api/config`)).json();
   for (const frontend of ['/', '/fabric', '/lakehouse']) {
     await page.goto(`${baseURL}${frontend}`);
     await page.locator('#registry option[value=hosted]').waitFor({ state: 'attached' });
@@ -34,19 +36,28 @@ try {
       const receipt: { namespace: string; persistence: string; table?: unknown } = JSON.parse(readFileSync(resolve(root, file), 'utf8'));
       assert.equal(receipt.persistence, 'verified');
       assert.ok(receipt.table, 'native table persistence was verified, not just namespace creation');
-      await page.locator('#registry').selectOption(`native:${provider}`);
+      const buildRegistry = config.registries.find((registry) => registry.native?.provider === provider);
+      const selectedRegistry = buildRegistry?.id ?? `native:${provider}`;
+      await page.locator('#registry').selectOption(selectedRegistry);
+      if (buildRegistry) {
+        assert.equal(await page.locator('#add-table').isEnabled(), true);
+        await page.locator('#inspect-connections').click();
+        await page.locator('#inspect-connection').selectOption(`native:${provider}`);
+      }
       await page.waitForFunction((provider) =>
         (document.getElementById('inspect-connection') as HTMLSelectElement)?.value === `native:${provider}`, provider);
       await page.waitForFunction(() => {
         const text = document.getElementById('connection-metadata')?.textContent;
         return text && !text.includes('Reading catalogue metadata...') &&
-          document.getElementById('connection-status')?.textContent?.includes('SDK build adapter pending');
+          /Native builds enabled|Enable builds with/.test(document.getElementById('connection-status')?.textContent ?? '');
       }, undefined, { timeout: 90_000 });
-      assert.equal(await page.locator('#add-table').isDisabled(), true);
-      if (frontend === '/fabric') assert.equal(await page.locator('#create-nav').isDisabled(), true);
-      if (frontend === '/lakehouse') assert.equal(await page.locator('#build-selected').isDisabled(), true);
-      assert.equal(await page.locator('[data-table]').count(), 0, 'native selection must not show Rust tables');
-      assert.match(await page.locator('#connection-status').innerText(), /SDK build adapter pending/);
+      assert.equal(await page.locator('#add-table').isEnabled(), !!buildRegistry);
+      if (frontend === '/fabric') assert.equal(await page.locator('#create-nav').isEnabled(), !!buildRegistry);
+      if (!buildRegistry) {
+        if (frontend === '/lakehouse') assert.equal(await page.locator('#build-selected').isDisabled(), true);
+        assert.equal(await page.locator('[data-table]').count(), 0, 'inspection-only selection must not show Rust tables');
+      }
+      assert.match(await page.locator('#connection-status').innerText(), /Native builds enabled|Enable builds with/);
       assert.doesNotMatch(await page.locator('#connection-metadata').innerText(), /Inspection failed/);
       await page.getByLabel('Native catalogue', { exact: true }).fill(provider === 'unity' ? receipt.namespace : 'hive');
       await page.getByLabel('Native schema / database', { exact: true }).fill(provider === 'unity' ? 'contracts' : receipt.namespace);
@@ -63,15 +74,15 @@ try {
       assert.match(metadata, /payload/);
       assert.match(metadata, /bigint/);
       console.log(JSON.stringify({ frontend, provider, metadataMs: Date.now() - started }));
-      assert.match(await page.locator(`#registry option[value="native:${provider}"]`).innerText(), /inspection only/);
+      assert.match(await page.locator(`#inspect-connection option[value="native:${provider}"]`).innerText(), /metadata inspector/);
       await page.screenshot({ path: resolve(evidence, `${frontend === '/' ? 'original' : frontend.slice(1)}-${provider}.png`), fullPage: true });
       await page.locator('#close-connections').click();
       await page.reload();
-      await page.waitForFunction((provider) =>
-        (document.getElementById('registry') as HTMLSelectElement)?.value === `native:${provider}` &&
-          document.getElementById('registry-note')?.textContent?.includes('Inspection only'), provider);
-      assert.equal(await page.locator('#add-table').isDisabled(), true, 'native selection survives reload without enabling builds');
+      await page.waitForFunction((selectedRegistry) =>
+        (document.getElementById('registry') as HTMLSelectElement)?.value === selectedRegistry, selectedRegistry);
+      assert.equal(await page.locator('#add-table').isEnabled(), !!buildRegistry, 'native build capability survives reload');
       await page.locator('#inspect-connections').click();
+      if (buildRegistry) await page.locator('#inspect-connection').selectOption(`native:${provider}`);
       await page.waitForFunction((provider) =>
         (document.getElementById('inspect-connection') as HTMLSelectElement)?.value === `native:${provider}`, provider);
       await page.locator('#close-connections').click();

@@ -801,13 +801,16 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "clap",
+ "fs2",
  "futures",
  "hmac",
  "prost 0.14.4",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thrift",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -8237,6 +8240,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadpool"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
+dependencies = [
+ "num_cpus",
+]
+
+[[package]]
 name = "thrift"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8244,7 +8256,9 @@ checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
 dependencies = [
  "byteorder",
  "integer-encoding",
+ "log",
  "ordered-float",
+ "threadpool",
 ]
 
 [[package]]

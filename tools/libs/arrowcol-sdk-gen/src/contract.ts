@@ -15,6 +15,7 @@ export interface Registry {
   authority: string;
   endpoint: string;
   mode: 'owned' | 'external';
+  native?: { provider: 'unity' | 'hive'; endpoint: string };
 }
 export interface ContractConfig {
   registries: Registry[];
@@ -46,6 +47,7 @@ export interface ContractRun {
   staged?: { sha256: string; bytes: number; candidateSha256?: string };
   artifact?: { path: string; hostPath: string; sha256: string; bytes: number };
   error?: string;
+  registrationReceipt?: unknown;
   steps?: { phase: string; status: 'running' | 'succeeded' | 'failed'; startedAt: string; finishedAt?: string; error?: string }[];
 }
 export function setRunPhase(workspace: string, run: ContractRun, phase: string): void {
@@ -138,6 +140,17 @@ export function loadConfig(workspace = process.cwd()): ContractConfig {
     if (registry.mode === 'owned' &&
         (url.hostname !== '127.0.0.1' || url.protocol !== 'http:' || !url.port)) {
       throw new Error('Owned registries require distinct http://127.0.0.1:port endpoints');
+    }
+    if (registry.native) {
+      if (registry.mode !== 'owned' || !['unity', 'hive'].includes(registry.native.provider) ||
+          typeof registry.native.endpoint !== 'string') throw new Error('Invalid native bridge configuration');
+      const native = new URL(registry.native.endpoint);
+      if (native.username || native.password || native.search || native.hash ||
+          (registry.native.provider === 'unity'
+            ? native.protocol !== 'http:' || native.pathname !== '/api/2.1/unity-catalog'
+            : native.protocol !== 'thrift:' || !native.port || native.pathname !== '')) {
+        throw new Error('Invalid local native API endpoint');
+      }
     }
     ids.add(registry.id);
     authorities.add(registry.authority);
@@ -448,10 +461,16 @@ async function finalizeContract(workspace: string, run: ContractRun, execute: Ex
     if (digest(readFileSync(candidate)) !== run.staged.candidateSha256) throw new Error('Prepared candidate digest mismatch');
     run.registration = 'unknown';
     setRunPhase(workspace, run, 'promoting');
-    await execute(generatorPath(workspace), [
+    const promotion = await execute(generatorPath(workspace), [
       'catalog', 'promote', '--endpoint', run.registry.endpoint, '--candidate', relative(workspace, candidate),
     ], join(directory, 'build.log'), registryEnvironment(workspace, run.registry));
     run.registration = 'committed';
+    if (run.registry.native) {
+      const result: { registrationReceipt?: unknown } = JSON.parse(promotion);
+      if (!result.registrationReceipt) throw new Error('Native authority did not return a registration receipt');
+      run.registrationReceipt = result.registrationReceipt;
+      writeJson(join(directory, 'registration-receipt.json'), result.registrationReceipt);
+    }
   }
   setRunPhase(workspace, run, 'publishing');
   const releaseDirectory = join(
