@@ -66,7 +66,24 @@ fn build_aks_catalog_registration_job(spec: AksClientJobSpec<'_>, config_map_nam
     Ok(job)
 }
 
+#[cfg(test)]
 fn validate_catalog_registration_receipt(logs: &str, run_id: &str, table: &str, delta_root: &str) -> Result<Value> {
+    validate_catalog_registration_receipt_with_properties(
+        logs,
+        run_id,
+        table,
+        delta_root,
+        &InitialDeltaProperties::default(),
+    )
+}
+
+fn validate_catalog_registration_receipt_with_properties(
+    logs: &str,
+    run_id: &str,
+    table: &str,
+    delta_root: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
     let receipts = logs
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -94,6 +111,7 @@ fn validate_catalog_registration_receipt(logs: &str, run_id: &str, table: &str, 
             "catalog registration receipt does not prove the exact canonical table/schema at the run-scoped location"
         );
     }
+    verify_initial_delta_property_readback(&receipt["properties"], properties)?;
     Ok((*receipt).clone())
 }
 
@@ -398,7 +416,13 @@ async fn run_aks_catalog_registration_stage(
                     if failed { "failed" } else { "timed out" }
                 );
             }
-            let receipt = validate_catalog_registration_receipt(&logs, run_id, &table, &delta_root)?;
+            let receipt = validate_catalog_registration_receipt_with_properties(
+                &logs,
+                run_id,
+                &table,
+                &delta_root,
+                &config.initial_delta_properties()?,
+            )?;
             let (proxy, api_url) = if FIXTURE_BOUNDARY.try_with(|_| ()).is_ok() {
                 (
                     None,
@@ -663,6 +687,44 @@ mod catalog_registration_tests {
             "catalog_table_count":1
         });
         validate_catalog_registration_receipt(&receipt.to_string(), run_id, table, &root)?;
+        let properties = InitialDeltaProperties {
+            target_file_size_bytes: Some(67108864),
+            checkpoint_interval: Some(17),
+        };
+        assert!(
+            validate_catalog_registration_receipt_with_properties(
+                &receipt.to_string(),
+                run_id,
+                table,
+                &root,
+                &properties,
+            )
+            .is_err()
+        );
+        let mut committed = receipt.clone();
+        committed["properties"] = json!(properties.properties()?);
+        let observed = validate_catalog_registration_receipt_with_properties(
+            &committed.to_string(),
+            run_id,
+            table,
+            &root,
+            &properties,
+        )?;
+        assert_eq!(observed["properties"], committed["properties"]);
+        for key in ["delta.targetFileSize", "delta.checkpointInterval"] {
+            let mut wrong = committed.clone();
+            wrong["properties"][key] = json!("1");
+            assert!(
+                validate_catalog_registration_receipt_with_properties(
+                    &wrong.to_string(),
+                    run_id,
+                    table,
+                    &root,
+                    &properties,
+                )
+                .is_err()
+            );
+        }
         for (key, value) in [
             ("run_id", json!("22222222-2222-4222-8222-222222222222")),
             ("table", json!("telemetry.sqlserver.sqlserver_wait_stats")),

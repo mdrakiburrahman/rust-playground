@@ -9,7 +9,7 @@ use arrowcol_routing::{
     LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest,
 };
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,19 @@ use uuid::Uuid;
 
 const DATABASE: &str = "arrowcol";
 const MIGRATOR_USERNAME: &str = "arrowcol_migrator";
+
+#[derive(Serialize)]
+struct RegisteredRunTableReceipt<'a, P: Serialize> {
+    kind: &'static str,
+    run_id: &'a str,
+    table: String,
+    location: &'a str,
+    provider: &'a str,
+    schema_version: u64,
+    schema_fingerprint: String,
+    catalog_table_count: usize,
+    properties: &'a P,
+}
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -235,16 +248,17 @@ async fn register_run_table(
     {
         bail!("catalog registration readback does not prove the exact canonical schema at the run-scoped location");
     }
-    Ok(serde_json::json!({
-        "kind": "oat_run_table_registered",
-        "run_id": config.run_id,
-        "table": head.identity().to_string(),
-        "location": table.location,
-        "provider": table.provider,
-        "schema_version": completion.schema_version().get(),
-        "schema_fingerprint": completion.schema_fingerprint().to_string(),
-        "catalog_table_count": snapshot.len(),
-    }))
+    Ok(serde_json::to_value(RegisteredRunTableReceipt {
+        kind: "oat_run_table_registered",
+        run_id: &config.run_id,
+        table: head.identity().to_string(),
+        location: &table.location,
+        provider: &table.provider,
+        schema_version: completion.schema_version().get(),
+        schema_fingerprint: completion.schema_fingerprint().to_string(),
+        catalog_table_count: snapshot.len(),
+        properties: &table.properties,
+    })?)
 }
 
 fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
@@ -422,6 +436,31 @@ fn unix_time_ms() -> Result<UnixMillis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_receipt_preserves_actual_snapshot_properties_including_unrequested_keys() -> Result<()> {
+        let mut actual = InitialDeltaProperties {
+            target_file_size_bytes: Some(67108864),
+            checkpoint_interval: Some(17),
+        }
+        .properties()?;
+        actual.insert("delta.dataSkippingStatsColumns".to_owned(), "sample".to_owned());
+        for properties in [actual, Default::default()] {
+            let receipt = serde_json::to_value(RegisteredRunTableReceipt {
+                kind: "oat_run_table_registered",
+                run_id: "00000000-0000-0000-0000-000000000001",
+                table: HOT_RUN_TABLE.to_owned(),
+                location: "file:///runs/00000000-0000-0000-0000-000000000001/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states",
+                provider: "delta",
+                schema_version: 1,
+                schema_fingerprint: "fixture".to_owned(),
+                catalog_table_count: 1,
+                properties: &properties,
+            })?;
+            assert_eq!(receipt["properties"], serde_json::to_value(properties)?);
+        }
+        Ok(())
+    }
 
     #[test]
     fn register_only_mode_is_run_bound_and_does_not_require_migrator_credentials() -> Result<()> {

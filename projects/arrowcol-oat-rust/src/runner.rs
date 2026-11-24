@@ -10,7 +10,7 @@ use arrow::array::{
 };
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow_deltalake::delta::object_store_for_url;
+use arrow_deltalake::delta::{InitialDeltaProperties, object_store_for_url};
 use arrowcol_protocol::ImplementationPool;
 use arrowcol_routing::{AdmissionPressureGauge, LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
 use bytes::Bytes;
@@ -39,6 +39,8 @@ use url::Url;
 include!("runner_failure_tests.rs");
 #[cfg(all(test, unix))]
 include!("runner_pin_init_tests.rs");
+#[cfg(test)]
+include!("runner_initial_delta_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
 include!("runner_cpu_quota.rs");
@@ -1297,6 +1299,27 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn preload_delta_evidence(&self, config: &OatConfig, tables: &[String]) -> Result<Option<Value>> {
+        let properties = config.initial_delta_properties()?;
+        if properties.properties()?.is_empty() {
+            return Ok(None);
+        }
+        let [table] = tables else {
+            bail!("AKS initial Delta property evidence requires exactly one table");
+        };
+        Ok(Some(read_aks_initial_delta_evidence(
+            self.runtime_dir
+                .as_deref()
+                .context("AKS property evidence directory missing")?,
+            &self.run_id,
+            &canonical_initializer_table_name(table)?,
+            self.delta_root
+                .as_deref()
+                .context("AKS property evidence Delta root missing")?,
+            &properties,
+        )?))
+    }
+
     fn delta_root(&self) -> Option<&str> {
         self.delta_root.as_deref()
     }
@@ -1962,19 +1985,32 @@ impl Platform for AksPlatform {
 #[async_trait::async_trait]
 impl Platform for LocalPlatform {
     fn preload_delta_evidence(&self, config: &OatConfig, tables: &[String]) -> Result<Option<Value>> {
-        if !config.platform.local.partitioned_table_bootstrap {
+        let properties = config.initial_delta_properties()?;
+        if !config.platform.local.partitioned_table_bootstrap && properties.properties()?.is_empty() {
             return Ok(None);
         }
         let [table] = tables else {
             bail!("partitioned bootstrap requires exactly one table");
         };
-        let canonical = canonical_dmv_table_name(table)?;
-        let root = self
-            .state_dir
-            .join("dataflow/telemetry/sqlserver")
-            .join(table)
-            .join("_delta_log");
-        Ok(Some(verify_preload_delta(&root, &canonical)?))
+        let canonical = canonical_initializer_table_name(table)?;
+        let initial = if !properties.properties()?.is_empty() {
+            Some(read_local_initial_delta_evidence(
+                &self.state_dir,
+                &canonical,
+                &properties,
+            )?)
+        } else {
+            None
+        };
+        let partition = if config.platform.local.partitioned_table_bootstrap {
+            let root = local_delta_table_target(&self.state_dir, table)?
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("invalid canonical local preload Delta path"))?;
+            Some(verify_preload_delta(&root.join("_delta_log"), &canonical)?)
+        } else {
+            None
+        };
+        Ok(combine_preload_delta_evidence(partition, initial))
     }
 
     fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
@@ -2077,6 +2113,39 @@ impl Platform for LocalPlatform {
         tables: &[String],
     ) -> Result<()> {
         verify_maintenance_stop_budget_before_admission(config, self).await?;
+        let properties = config.initial_delta_properties()?;
+        if !properties.properties()?.is_empty() {
+            let [table] = tables else {
+                bail!("initial Delta property readback requires exactly one table");
+            };
+            let canonical = canonical_initializer_table_name(table)?;
+            let url = local_delta_table_target(&self.state_dir, table)?;
+            let observed = tokio::task::spawn_blocking(move || -> Result<_> {
+                arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&url)?.maintenance_properties()
+            })
+            .await
+            .context("join local initial Delta property readback")??;
+            verify_initial_delta_property_readback(&json!(observed), &properties)?;
+            let initial: Value =
+                serde_json::from_slice(&fs::read(self.state_dir.join("initial-delta-properties.json"))?)?;
+            verify_local_initial_delta_receipt(
+                &initial.to_string(),
+                &canonical,
+                local_maintenance_table_initialization_mode(config).context("missing fresh local initializer")?,
+                &properties,
+            )?;
+            let evidence = json!({
+                "table": canonical,
+                "requested_initial_properties": properties.properties()?,
+                "committed_properties": observed,
+                "source": "fresh_checkpoint_aware_delta_metadata_read",
+                "initial_receipt": initial,
+            });
+            fs::write(
+                self.state_dir.join("initial-delta-before-admission.json"),
+                serde_json::to_vec(&evidence)?,
+            )?;
+        }
         verify_local_partition_policy_before_admission(config, self, tables).await
     }
 
@@ -5394,6 +5463,14 @@ fn result_rows(
             &mut table_leaf_evidence,
             client_run.evidence.client_reports.get(&table),
         )?;
+        verify_literal_delta_consumers(
+            config,
+            &mut table_leaf_evidence,
+            client_run.evidence.processes.as_ref(),
+            client_run.evidence.preload_delta.as_ref(),
+            replicas,
+            &table,
+        )?;
         for field in [
             "inert_fields",
             "projection_only",
@@ -7981,6 +8058,333 @@ fn pin_init_config_json(
     }))?)
 }
 
+fn pin_config_with_initial_delta_properties(config: &str, properties: &InitialDeltaProperties) -> Result<String> {
+    if properties.properties()?.is_empty() {
+        return Ok(config.to_owned());
+    }
+    let mut config: Value = serde_json::from_str(config)?;
+    config["run_table"]
+        .as_object_mut()
+        .context("literal Delta properties require fresh run-table initialization")?
+        .insert("delta_properties".to_owned(), serde_json::to_value(properties)?);
+    Ok(serde_json::to_string(&config)?)
+}
+
+fn verify_initial_delta_property_readback(observed: &Value, properties: &InitialDeltaProperties) -> Result<()> {
+    for (key, expected) in properties.properties()? {
+        if observed.get(&key).and_then(Value::as_str) != Some(expected.as_str()) {
+            bail!("committed initial Delta property readback omitted or mismatched {key}");
+        }
+    }
+    Ok(())
+}
+
+fn read_local_initial_delta_evidence(
+    state_dir: &Path,
+    table: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    let mut evidence: Value =
+        serde_json::from_slice(&fs::read(state_dir.join("initial-delta-before-admission.json"))?)?;
+    ensure!(
+        evidence["table"] == table && evidence["requested_initial_properties"] == json!(properties.properties()?),
+        "initial Delta property evidence is for a different table or request",
+    );
+    verify_initial_delta_property_readback(&evidence["committed_properties"], properties)?;
+    evidence["consumer_evidence_scope"] =
+        json!("committed_metadata_only_not_ingest_estimator_or_maintenance_operation");
+    Ok(evidence)
+}
+
+fn enforce_delta_projection_only(config: &OatConfig, evidence: &mut Value) -> Result<()> {
+    let properties = config.initial_delta_properties()?;
+    let operation_state = |operation| {
+        let Some(settings) = config
+            .tunables
+            .maintenance
+            .as_ref()
+            .filter(|settings| settings.enabled == Some(true))
+        else {
+            return "disabled";
+        };
+        let Some(operations) = &settings.operations else {
+            return "unverified";
+        };
+        if !operations.contains(&operation) {
+            "disabled"
+        } else if settings.apply == Some(true) {
+            "configured_apply_not_effective_readback"
+        } else {
+            "plan_only_not_effective_readback"
+        }
+    };
+    for (path, requested, operation) in [
+        (
+            "delta.target_file_size_bytes",
+            properties.target_file_size_bytes,
+            arrowcol_tunables::MaintenanceOperation::Optimize,
+        ),
+        (
+            "delta.checkpoint_interval",
+            properties.checkpoint_interval,
+            arrowcol_tunables::MaintenanceOperation::Checkpoint,
+        ),
+    ] {
+        if requested.is_none() {
+            continue;
+        }
+        for field in [
+            "runner_controls",
+            "consumer_verified",
+            "inert_fields",
+            "projection_only",
+        ] {
+            evidence[field]
+                .as_array_mut()
+                .with_context(|| format!("{field} must be an array"))?
+                .retain(|entry| entry["path"] != path);
+        }
+        evidence["projection_only"].as_array_mut().context("projection_only must be an array")?.push(json!({
+            "path": path,
+            "reason": "committed_metadata_not_effective_consumer_readback",
+            "ingest_estimator": if properties.target_file_size_bytes.is_some() && path == "delta.target_file_size_bytes" {
+                Some("unverified")
+            } else {
+                None
+            },
+            "maintenance_operation": operation_state(operation),
+            "precedence": if path == "delta.target_file_size_bytes" {
+                "table_arrowcol_writer_or_optimize_target_then_table_delta_target_then_process_specific_target_then_process_delta_fallback_then_registry"
+            } else {
+                "table_delta_checkpoint_interval_then_process_interval_then_registry"
+            },
+        }));
+    }
+    Ok(())
+}
+
+fn verify_literal_delta_consumers(
+    config: &OatConfig,
+    evidence: &mut Value,
+    processes: Option<&Value>,
+    preload: Option<&Value>,
+    replicas: u32,
+    table: &str,
+) -> Result<()> {
+    enforce_delta_projection_only(config, evidence)?;
+    let properties = config.initial_delta_properties()?;
+    if properties.properties()?.is_empty() {
+        return Ok(());
+    }
+    let table = canonical_initializer_table_name(table)?;
+    let metadata = preload
+        .filter(|value| value["table"] == table)
+        .and_then(|value| {
+            let initial = &value["initial_delta_properties"];
+            initial.get("committed_properties").or_else(|| {
+                initial
+                    .get("catalog_registration_receipt")
+                    .and_then(|receipt| receipt.get("properties"))
+            })
+        })
+        .and_then(Value::as_object);
+    let literal_present = |key: &str, value: u64| {
+        metadata.and_then(|metadata| metadata.get(key)).and_then(Value::as_str) == Some(value.to_string().as_str())
+    };
+    let override_present = metadata.is_some_and(|metadata| {
+        ["arrowcol.writer.targetFileSize", "arrowcol.optimize.targetFileSize"]
+            .iter()
+            .any(|key| metadata.contains_key(*key))
+    });
+    let collectors = verified_processes(config, processes, ComponentRole::Collector, replicas);
+    let maintenance = verified_processes(config, processes, ComponentRole::Maintenance, 1);
+    let operation_enabled = |operation| {
+        config.tunables.maintenance.as_ref().is_some_and(|settings| {
+            settings.enabled == Some(true)
+                && settings.apply == Some(true)
+                && settings
+                    .operations
+                    .as_ref()
+                    .is_some_and(|operations| operations.contains(&operation))
+        })
+    };
+    for (path, requested, operation, property_key, operation_field, policy_field) in [
+        (
+            "delta.target_file_size_bytes",
+            properties.target_file_size_bytes,
+            arrowcol_tunables::MaintenanceOperation::Optimize,
+            "delta.targetFileSize",
+            "optimize_target_file_bytes",
+            "arrowcol.optimize.targetFileSize",
+        ),
+        (
+            "delta.checkpoint_interval",
+            properties.checkpoint_interval,
+            arrowcol_tunables::MaintenanceOperation::Checkpoint,
+            "delta.checkpointInterval",
+            "checkpoint_every_commits",
+            "delta.checkpointInterval",
+        ),
+    ] {
+        let Some(requested) = requested else { continue };
+        let target = path == "delta.target_file_size_bytes";
+        let operation_name = if target { "optimize" } else { "checkpoint" };
+        let mut estimator_records = Vec::new();
+        let estimator_matched = !target
+            || collectors.as_ref().is_some_and(|processes| {
+                processes.iter().all(|process| {
+                    let Some(records) = process["adaptive_table_policies"].as_array() else {
+                        return false;
+                    };
+                    let records = records
+                        .iter()
+                        .filter(|record| record["table_name"] == table)
+                        .collect::<Vec<_>>();
+                    if records.is_empty() {
+                        return false;
+                    }
+                    records.iter().all(|record| {
+                        estimator_records.push(json!({
+                            "instance_id": process["instance_id"], "table_name":record["table_name"],
+                            "scope":record["scope"], "target_parquet_bytes":record["config"]["target_parquet_bytes"],
+                        }));
+                        record["scope"] == "installed_estimator_not_full_run_history"
+                            && record["config"]["target_parquet_bytes"].as_u64() == Some(requested)
+                    })
+                })
+            });
+        let mut operation_records = Vec::new();
+        let operation_matched = operation_enabled(operation)
+            && maintenance.as_ref().is_some_and(|processes| {
+                processes.iter().all(|process| {
+                    let policies = &process["maintenance_table_policies"];
+                    let Some(policy) = policies["tables"].get(&table) else {
+                        return false;
+                    };
+                    operation_records.push(json!({
+                        "instance_id":process["instance_id"],"table":table,"active":policy["active"],
+                        "apply":policy["startup"]["apply"],"operations":policy["startup"]["operations"],
+                        "installed_value":policy["operation_settings"][operation_field],
+                        "resolved_policy_value":policy["table_policy"][policy_field],
+                    }));
+                    policies["source"] == "validated_consumer_per_table_policy"
+                        && policy["active"] == true
+                        && policy["startup"]["apply"] == true
+                        && policy["startup"]["operations"]
+                            .as_array()
+                            .is_some_and(|operations| operations.iter().any(|value| value == operation_name))
+                        && policy["operation_settings"][operation_field].as_u64() == Some(requested)
+                        && policy["table_policy"][policy_field].as_u64() == Some(requested)
+                })
+            });
+        let metadata_matched = literal_present(property_key, requested);
+        let verified = metadata_matched && (!target || !override_present) && estimator_matched && operation_matched;
+        let projection = evidence["projection_only"]
+            .as_array_mut()
+            .context("projection array missing")?;
+        let entry = projection
+            .iter_mut()
+            .find(|entry| entry["path"] == path)
+            .context("literal Delta projection entry missing")?;
+        entry["per_table_consumer_readback"] = json!({
+            "table":table,"literal_metadata_matched":metadata_matched,
+            "higher_priority_target_override_present":target && override_present,
+            "ingest_estimator_matched":target.then_some(estimator_matched),
+            "maintenance_operation_matched":operation_matched,
+            "estimator_records":estimator_records,"operation_records":operation_records,
+            "scope":"installed_configuration_snapshot_not_full_run_history_execution_or_durability_proof",
+        });
+        if verified {
+            let mut promoted = entry.clone();
+            promoted["reason"] = json!(if target {
+                "literal_table_target_installed_estimator_and_optimize_readback"
+            } else {
+                "literal_table_checkpoint_installed_operation_readback"
+            });
+            promoted["maintenance_operation"] = json!("installed_configuration_readback_not_execution_proof");
+            if target {
+                promoted["ingest_estimator"] = json!("installed_estimator_readback_not_full_run_history");
+            }
+            projection.retain(|entry| entry["path"] != path);
+            evidence["consumer_verified"]
+                .as_array_mut()
+                .context("consumer_verified array missing")?
+                .push(promoted);
+        }
+    }
+    Ok(())
+}
+
+fn combine_preload_delta_evidence(partition: Option<Value>, initial: Option<Value>) -> Option<Value> {
+    match (partition, initial) {
+        (Some(mut partition), Some(initial)) => {
+            partition["initial_delta_properties"] = initial;
+            Some(partition)
+        }
+        (None, Some(initial)) => Some(json!({
+            "table": initial["table"],
+            "initial_delta_properties": initial,
+        })),
+        (partition, None) => partition,
+    }
+}
+
+fn read_aks_initial_delta_evidence(
+    runtime_dir: &Path,
+    run_id: &str,
+    table: &str,
+    delta_root: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    let initialized: Value =
+        serde_json::from_slice(&fs::read(runtime_dir.join("run-table-initial-delta-properties.json"))?)?;
+    ensure!(
+        initialized["requested_initial_properties"] == json!(properties.properties()?),
+        "AKS initialization receipt belongs to a different property request"
+    );
+    let initialization_receipt = validate_run_table_init_receipt_with_properties(
+        &initialized["receipt"].to_string(),
+        run_id,
+        table,
+        properties,
+    )?;
+    let registered: Value =
+        serde_json::from_slice(&fs::read(runtime_dir.join("run-table-catalog-registration.json"))?)?;
+    let catalog_receipt = validate_catalog_registration_receipt_with_properties(
+        &registered["receipt"].to_string(),
+        run_id,
+        table,
+        delta_root,
+        properties,
+    )?;
+    Ok(json!({
+        "table": table,
+        "initial_delta_properties": {
+            "requested_initial_properties": properties.properties()?,
+            "initialization_receipt": initialization_receipt,
+            "catalog_registration_receipt": catalog_receipt,
+            "source": "signed_catalog_snapshot_readback",
+            "consumer_evidence_scope": "committed_metadata_only_not_ingest_estimator_or_maintenance_operation",
+        },
+    }))
+}
+
+fn canonical_initializer_table_name(table: &str) -> Result<String> {
+    collector_chain::dmv::tables()?
+        .into_iter()
+        .find(|definition| {
+            definition.identity().to_string() == table || definition.identity().table().as_str() == table
+        })
+        .map(|definition| definition.identity().to_string())
+        .context("initializer table is not a canonical DMV identity")
+}
+
+fn local_delta_table_target(state_dir: &Path, table: &str) -> Result<Url> {
+    let root = Url::from_directory_path(state_dir.join("dataflow"))
+        .map_err(|()| anyhow::anyhow!("invalid run-owned local Dataflow root"))?;
+    Ok(arrowcol_loadgen::initialize::canonical_table_target(&root, &canonical_initializer_table_name(table)?)?.0)
+}
+
 async fn run_local_pin_setup(
     config: &OatConfig,
     platform: &LocalPlatform,
@@ -8172,6 +8576,7 @@ async fn run_aks_pin_setup_job(
         router_yaml,
         run_table,
     )?;
+    let pin_config = pin_config_with_initial_delta_properties(&pin_config, &config.initial_delta_properties()?)?;
     let run_suffix = uuid::Uuid::parse_str(run_id)?.simple().to_string();
     let config_map_name = format!("oat-pin-init-config-{run_suffix}");
     let job_name = format!("oat-pin-init-{run_suffix}");
@@ -8705,8 +9110,41 @@ async fn wait_for_aks_pin_setup(
     }
     if let Some(table) = expected_table {
         validate_run_table_init_receipt(&logs, run_id, table)?;
+        let properties = config.initial_delta_properties()?;
+        if !properties.properties()?.is_empty() {
+            let receipt = validate_run_table_init_receipt_with_properties(&logs, run_id, table, &properties)?;
+            fs::write(
+                platform
+                    .runtime_dir
+                    .as_deref()
+                    .context("initial property receipt evidence directory missing")?
+                    .join("run-table-initial-delta-properties.json"),
+                serde_json::to_vec(
+                    &json!({"receipt":receipt,"requested_initial_properties":properties.properties()?}),
+                )?,
+            )?;
+        }
     }
     Ok(())
+}
+
+fn validate_run_table_init_receipt_with_properties(
+    logs: &str,
+    run_id: &str,
+    table: &str,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    validate_run_table_init_receipt(logs, run_id, table)?;
+    let receipts = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|receipt| receipt["kind"] == "oat_run_table_initialized")
+        .collect::<Vec<_>>();
+    let [receipt] = receipts.as_slice() else {
+        bail!("initial Delta properties require exactly one committed initialization receipt");
+    };
+    verify_initial_delta_property_readback(&receipt["delta"]["properties"], properties)?;
+    Ok((*receipt).clone())
 }
 
 fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Result<()> {
@@ -8841,7 +9279,7 @@ fn local_initializer_args(table: &str, dataflow_root: &Path, partitioned: bool) 
     if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
         bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
     }
-    let canonical_table = canonical_dmv_table_name(table)?;
+    let canonical_table = canonical_initializer_table_name(table)?;
     if partitioned && canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
         bail!("local partition initialization only supports the campaign hot table");
     }
@@ -8877,23 +9315,108 @@ fn local_table_initializer_command(config: &OatConfig, workspace: &Path, argumen
 }
 
 async fn initialize_local_maintenance_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let properties = config.initial_delta_properties()?;
     let Some(partitioned) = local_maintenance_table_initialization_mode(config) else {
+        if !properties.properties()?.is_empty() {
+            bail!("literal Delta properties have no fresh local table initializer");
+        }
         return Ok(());
     };
     let [table] = config.tables.as_slice() else {
         bail!("local initialization requires exactly one table");
     };
     let dataflow_root = platform.state_dir.join("dataflow");
-    let arguments = if partitioned {
+    let mut arguments = if partitioned {
         local_partition_initializer_args(table, &dataflow_root)?
     } else {
         local_initializer_args(table, &dataflow_root, false)?
     };
+    append_initial_delta_initializer_arguments(&mut arguments, &properties)?;
     let workspace = std::env::current_dir()?;
     let initialize = local_table_initializer_command(config, &workspace, arguments)?;
-    run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
-        .await
-        .context("setup local table before starting Dataflow or any DMV client")
+    if properties.properties()?.is_empty() {
+        return run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
+            .await
+            .context("setup local table before starting Dataflow or any DMV client");
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS),
+        run_command(initialize, "initialize literal Delta table properties"),
+    )
+    .await
+    .context("local initial Delta property setup timed out; indeterminate initialization is not retried")??;
+    let receipt = verify_local_initial_delta_receipt(
+        std::str::from_utf8(&output.stdout)?,
+        &canonical_initializer_table_name(table)?,
+        partitioned,
+        &properties,
+    )?;
+    tokio::fs::write(
+        platform.state_dir.join("initial-delta-properties.json"),
+        serde_json::to_vec(&receipt)?,
+    )
+    .await?;
+    Ok(())
+}
+
+fn append_initial_delta_initializer_arguments(
+    arguments: &mut Vec<String>,
+    properties: &InitialDeltaProperties,
+) -> Result<()> {
+    properties.properties()?;
+    for (flag, value) in [
+        ("--delta-target-file-size-bytes", properties.target_file_size_bytes),
+        ("--delta-checkpoint-interval", properties.checkpoint_interval),
+    ] {
+        if let Some(value) = value {
+            arguments.extend([flag.to_owned(), value.to_string()]);
+        }
+    }
+    Ok(())
+}
+
+fn verify_local_initial_delta_receipt(
+    logs: &str,
+    table: &str,
+    partitioned: bool,
+    properties: &InitialDeltaProperties,
+) -> Result<Value> {
+    let receipts = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|receipt| receipt["kind"] == "local_delta_table_initialized")
+        .collect::<Vec<_>>();
+    let [receipt] = receipts.as_slice() else {
+        bail!("local initializer must emit exactly one committed Delta property receipt");
+    };
+    let delta = &receipt["delta"];
+    let table_id = delta["table_id"]
+        .as_str()
+        .context("local initializer Delta table ID missing")?;
+    let id = uuid::Uuid::parse_str(table_id)?;
+    let schema: Value = serde_json::from_str(
+        delta["schema_json"]
+            .as_str()
+            .context("local initializer schema missing")?,
+    )?;
+    let expected_partitions: Vec<&str> = if partitioned {
+        vec!["__arrowcol_ingestion"]
+    } else {
+        Vec::new()
+    };
+    if receipt["table"] != table
+        || receipt["publisher_drained"] != true
+        || id.is_nil()
+        || id.to_string() != table_id
+        || delta["version"] != 0
+        || delta["active_files"] != 0
+        || delta["partition_columns"] != json!(expected_partitions)
+        || schema != arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?
+    {
+        bail!("local initializer receipt does not prove the fresh canonical Delta table");
+    }
+    verify_initial_delta_property_readback(&delta["properties"], properties)?;
+    Ok((*receipt).clone())
 }
 
 fn local_collector_profile_tag(profile_hash: &str) -> String {
@@ -14414,6 +14937,7 @@ async fn apply_runtime_evidence_retention(directory: &Path, retention: RuntimeEv
             for name in [
                 "run-table-initializer-job.json",
                 "run-table-initializer-termination.json",
+                "run-table-initial-delta-properties.json",
                 "run-table-catalog-registration.json",
             ] {
                 let path = directory.join(name);
