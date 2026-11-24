@@ -102,6 +102,7 @@ These controls are rebuild-only. The canonical profile key is `allocator=<value>
 | `collector.panic` | Unsupported | Rust release default (`unwind`) | Not configurable | `panic=abort` is not exposed because panic/unwind behavior participates in the collector startup and shutdown error contract. |
 | PGO | Unsupported | N/A | Not configurable | Requires a representative training run and profile artifact lifecycle; no safe, deterministic profile collection/consumption pipeline exists in the image build. |
 | BOLT | Unsupported | N/A | Not configurable | Requires post-link instrumentation, profile collection and binary rewrite tooling that are not present in the image pipeline. |
+| jemalloc | Unsupported | N/A | Not configurable | The collector build supports only system and mimalloc allocators; no jemalloc build or effective allocator readback is available. |
 
 Every profile hash, requested field, image identity, and compiled startup value is recorded separately. A startup-profile mismatch is a failed arm, never a throughput result.
 
@@ -232,6 +233,7 @@ selection and effect claims.
 | DFE scheduler builder options | The DFE engine constructs its current-thread Tokio runtime internally without a collector-side builder hook. Delta I/O settings do not change it. |
 | Other receiver TCP options and pre-bind socket settings | The DFE listener is bound and listening before the collector receives it; the current listener API offers no pre-bind socket-option hook. The documented listener buffers and accepted-socket `TCP_NODELAY` are applied separately. |
 | Allocator environment tuning | `MALLOC_*` and `MIMALLOC_*` are not typed OAT fields here. The effective allocator build readback does not establish that an environment option was consumed. Even with mimalloc for the Rust heap, C libraries can still use glibc allocation. |
+| Arbitrary OTEL environment | Unrestricted environment pass-through cannot establish which options are consumed or preserve telemetry destination and measurement provenance. Only explicitly documented controls are supported. |
 | Per-allocation `madvise` | No collector allocation-specific control/readback is available. The process THP-disable flag does not establish actual huge-page use. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
