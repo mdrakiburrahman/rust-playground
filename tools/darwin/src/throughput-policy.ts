@@ -22,7 +22,7 @@ const fields: Readonly<Record<string, Field>> = {
   "tunables.collector.commit.max_files_per_commit": { group: "commit", values: [1, 4, 16] },
   "tunables.collector.runtime.cpu_workers": { group: "runtime", values: [1, 2, 4] },
   "tunables.collector.runtime.cpu_dispatch": { group: "runtime", values: ["shared_fifo", "bounded_shards"] },
-  "tunables.collector.runtime.cpu_placement": { group: "runtime", values: ["os", "compact_allowed", "scatter_allowed"] },
+  "tunables.collector.runtime.cpu_placement": { group: "runtime", values: ["os", "compact_allowed", "scatter_allowed", "physical_first"] },
   "tunables.collector.runtime.upload_limit": { group: "runtime", values: [1, 2, 4] },
   "tunables.router.sql_pool_max_size": { group: "router", values: [1, 2, 4, 8] },
 };

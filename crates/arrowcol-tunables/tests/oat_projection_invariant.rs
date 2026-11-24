@@ -715,6 +715,7 @@ fn cpu_modes_and_stage_concurrency_require_typed_named_values() -> Result<()> {
         ("shared_fifo", "os", 1),
         ("bounded_shards", "compact_allowed", 8),
         ("bounded_shards", "scatter_allowed", 16),
+        ("bounded_shards", "physical_first", 4),
     ] {
         let input = json!({"collector":{"runtime":{"cpu_dispatch":dispatch,"cpu_placement":placement},
                                        "batching":{"coalesce_publications":true,"stage_file_concurrency":concurrency}}});
