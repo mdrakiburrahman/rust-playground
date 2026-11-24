@@ -475,7 +475,7 @@ fn client_sentinel_value(
     if proof["version"] != 1
         || proof["requested"][field] != 0
         || proof["legacy"]["rows"] != config.rows_per_table
-        || proof["legacy"]["concurrency"] != config.dmv_concurrency
+        || proof["legacy"]["concurrency"] != config.effective_dmv_concurrency()
     {
         bail!("client sentinel resolution source disagrees with requested tuning or legacy inputs");
     }
@@ -488,7 +488,7 @@ fn client_sentinel_value(
             json!(cores)
         }
         "batch_rows" => json!(config.rows_per_table),
-        "streams_per_worker" => json!(config.dmv_concurrency),
+        "streams_per_worker" => json!(config.effective_dmv_concurrency()),
         "string_width" => {
             let profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
             let profile = serde_json::to_value(profile)?;
@@ -576,6 +576,31 @@ fn router_readback_path(variable: &str) -> Result<String> {
         _ => bail!("router environment has no checked effective-config adapter: {variable}"),
     };
     Ok(path)
+}
+
+fn verify_dmv_concurrency_readback(config: &OatConfig, observed: &Value) -> Result<Value> {
+    let requested_streams = config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).unwrap_or(0);
+    let concurrency = config.effective_dmv_concurrency();
+    let (streams, source) = if requested_streams == 0 {
+        (concurrency, "legacy_concurrency")
+    } else {
+        (requested_streams, "explicit_streams_per_worker")
+    };
+    let proof = &observed["resolution"];
+    if observed["streams_per_worker"] != streams
+        || proof["requested"]["streams_per_worker"] != requested_streams
+        || proof["legacy"]["concurrency"] != concurrency
+        || proof["resolved"]["streams_per_worker"] != streams
+        || proof["streams_per_worker_source"] != source
+    {
+        bail!("dmv_concurrency / streams_per_worker consumer readback does not match the requested per-worker stream limit");
+    }
+    let workers = observed["workers"].as_u64().filter(|workers| *workers > 0)
+        .context("dmv_concurrency readback omitted the effective worker count")?;
+    let configured_slots = workers.checked_mul(u64::try_from(streams)?)
+        .context("dmv_concurrency configured slot count overflow")?;
+    Ok(json!({"source": source, "streams_per_worker": streams, "workers": workers,
+        "configured_slots": configured_slots, "requested_dmv_concurrency": config.dmv_concurrency}))
 }
 
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
@@ -2155,9 +2180,11 @@ mod startup_readback_tests {
                 "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
             ))?;
             config.tunables = serde_json::from_value(tunables)?;
+            config.dmv_concurrency = None;
             let output = format!("OAT_CLIENT_BUILD_PROFILE {}\nOAT_CLIENT_EFFECTIVE_CONFIG {}\n",
                 json!({"lto":"off", "codegen_units":16, "opt_level":3, "target_cpu":"generic"}),
-                json!({"request_timeout_ms":1234, "quiesce_timeout_ms":effective_timeout}));
+                json!({"request_timeout_ms":1234, "quiesce_timeout_ms":effective_timeout, "workers":1, "streams_per_worker":4,
+                    "resolution":{"requested":{"streams_per_worker":0},"legacy":{"concurrency":4},"resolved":{"streams_per_worker":4},"streams_per_worker_source":"legacy_concurrency"}}));
             let mut evidence = CellEvidence::default();
             evidence.record_client(&config, "table-a", "client-a", &output)?;
             evidence.record_client(&config, "table-b", "client-b", &output)?;
@@ -2617,7 +2644,7 @@ mod startup_readback_tests {
             "--rows",
             &config.rows_per_table.to_string(),
             "--concurrency",
-            &config.dmv_concurrency.to_string(),
+            &config.effective_dmv_concurrency().to_string(),
         ]);
         command.envs(role_environment(&config, ComponentRole::Client)?);
         let output = command
@@ -3267,6 +3294,27 @@ groups:
         Ok(())
     }
 
+    #[test]
+    fn dmv_concurrency_requires_matching_consumer_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        config.dmv_concurrency = Some(28);
+        let mut observed = json!({"workers":14,"streams_per_worker":28,"resolution":{
+            "requested":{"streams_per_worker":0},"legacy":{"concurrency":28},
+            "resolved":{"streams_per_worker":28},"streams_per_worker_source":"legacy_concurrency"}});
+        let proof = verify_dmv_concurrency_readback(&config, &observed)?;
+        assert_eq!(proof["configured_slots"], 392);
+        observed["streams_per_worker"] = json!(2);
+        assert!(matches!(verify_dmv_concurrency_readback(&config, &observed), Err(error) if error.to_string().contains("dmv_concurrency")));
+        config.dmv_concurrency = None;
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables { streams_per_worker: Some(2), ..Default::default() });
+        observed["resolution"] = json!({"requested":{"streams_per_worker":2},"legacy":{"concurrency":4},
+            "resolved":{"streams_per_worker":2},"streams_per_worker_source":"explicit_streams_per_worker"});
+        let proof = verify_dmv_concurrency_readback(&config, &observed)?;
+        assert_eq!(proof["configured_slots"], 28);
+        assert_eq!(proof["source"], "explicit_streams_per_worker");
+        Ok(())
+    }
+
     fn actual_client_startup(binary: &Path, config: &OatConfig) -> Result<Value> {
         let table = config.tables.first().context("startup fixture needs a table")?;
         let mut command = std::process::Command::new(binary);
@@ -3274,8 +3322,10 @@ groups:
         command.args([
             "--endpoint", "http://127.0.0.1:0", "--table", table,
             "--rows", &config.rows_per_table.to_string(),
-            "--concurrency", &config.dmv_concurrency.to_string(),
         ]);
+        if let Some(concurrency) = config.dmv_concurrency {
+            command.args(["--concurrency", &concurrency.to_string()]);
+        }
         let output = command.output().context("launch actual client binary")?;
         anyhow::ensure!(!output.status.success(), "unreachable endpoint unexpectedly succeeded");
         let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
@@ -3358,7 +3408,7 @@ groups:
         ))?;
         // Keep legacy sentinel resolutions deterministic and distinct from the test values.
         config.rows_per_table = 128;
-        config.dmv_concurrency = 1;
+        config.dmv_concurrency = Some(1);
         config.tunables = arrowcol_tunables::Tunables::default();
         let baseline = actual_client_startup(&binary, &config).context("read baseline client startup")?;
         for (mut input, field) in cases {
@@ -3369,6 +3419,7 @@ groups:
             if field == "runtime_threads" && baseline.get(field) == Some(&json!(5)) {
                 input["client"]["runtime_threads"] = json!(11);
             }
+            config.dmv_concurrency = if field == "streams_per_worker" { None } else { Some(1) };
             config.tunables = arrowcol_tunables::Tunables::parse_oat_json(input.clone())
                 .with_context(|| format!("invalid startup fixture {input}"))?;
             let observed = actual_client_startup(&binary, &config)

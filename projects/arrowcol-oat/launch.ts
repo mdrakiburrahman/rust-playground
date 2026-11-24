@@ -8,7 +8,7 @@ import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { assertLocalFailedDisposition, localDispositionSuffix, recordLocalFailedDisposition, reconcileAndQuarantineLocalFailedReceipt } from './local-failed-disposition.js';
+import { assertLocalFailedDisposition, localDispositionSuffix, localQuarantineDispositions, recordLocalFailedDisposition, reconcileAndQuarantineLocalFailedReceipt } from './local-failed-disposition.js';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
@@ -104,7 +104,7 @@ Options:
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
   --recover-failed-local <invocation-id> <ownership-marker-path>
   --reconcile-failed-local <invocation-id> <ownership-marker-path>
-                       Record verified cleanup without changing the failed receipt
+                       Quarantine verified failed local evidence without ranking it
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
                        Post-load evidence must be no more than 60 minutes old.
@@ -1167,7 +1167,7 @@ async function assertOperatorQuarantineRecords(receiptRoot: string, activeReceip
     if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== id || receipt.creation_state !== 'accepted' ||
         receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' || !isRecord(record) || record.version !== 1 ||
         record.authorized_by !== 'coordinator f0767c48 (ArrowCollector tunability Project)' ||
-        record.disposition !== 'failed_before_measurement_quarantined_not_settled' || record.invocation_id !== id ||
+        !localQuarantineDispositions.some(disposition => disposition === record.disposition) || record.invocation_id !== id ||
         record.run_id !== receipt.run_id ||
         !validOperatorTimestamp(record.authorized_at_utc) || typeof record.reason !== 'string' || record.reason.length === 0 ||
         record.receipt_sha256 !== sha256Bytes(receiptBytes) || activeReceiptNames.includes(`${id}.json`)) {

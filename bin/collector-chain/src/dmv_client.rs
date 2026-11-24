@@ -336,9 +336,12 @@ impl Options {
         if self.runtime_threads == 0 {
             self.runtime_threads = available_parallelism;
         }
-        if self.streams_per_worker == 0 {
+        let streams_per_worker_source = if self.streams_per_worker == 0 {
             self.streams_per_worker = concurrency;
-        }
+            "legacy_concurrency"
+        } else {
+            "explicit_streams_per_worker"
+        };
         self.string_length_distribution.get_or_insert(match self.data_profile {
             DataProfile::Diagnostic => StringLengthDistribution::Fixed,
             DataProfile::Realistic => StringLengthDistribution::Uniform,
@@ -461,6 +464,7 @@ impl Options {
                 "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
             },
             "corpus_rows_source": corpus_rows_source,
+            "streams_per_worker_source": streams_per_worker_source,
         });
         Ok((self, evidence))
     }
@@ -2606,24 +2610,36 @@ fn memory_budget(
             .context("realistic profile has no tables for live-batch budgeting")?;
         let rows_per_batch = rows.min(options.batch_rows);
         budget.per_live_batch_bytes = memory_estimate(tables, rows_per_batch, identity_row_bytes, 1, options)?;
-        let available = options
-            .max_memory_bytes
-            .checked_sub(corpus_bytes)
-            .context("corpus reservation exceeds max-memory-bytes")?;
-        anyhow::ensure!(
-            available >= budget.per_live_batch_bytes,
-            "one realistic live batch needs {} reserved bytes beyond the {}-byte corpus reservation, exceeding max-memory-bytes={}",
-            budget.per_live_batch_bytes,
-            corpus_bytes,
-            options.max_memory_bytes
-        );
-        budget.admitted_live_slots =
-            usize::try_from((available / budget.per_live_batch_bytes).min(configured_live_slots as u64))
-                .context("admitted live-batch slot count exceeds address space")?;
-        anyhow::ensure!(
-            budget.admitted_live_slots > 0,
-            "no realistic live-batch slot fits max-memory-bytes"
-        );
+        let available = options.max_memory_bytes.saturating_sub(corpus_bytes);
+        let configured_slots =
+            u64::try_from(configured_live_slots).context("configured live stream count exceeds u64")?;
+        let required_reservation =
+            u128::from(corpus_bytes) + u128::from(budget.per_live_batch_bytes) * u128::from(configured_slots);
+        budget.admitted_live_slots = usize::try_from((available / budget.per_live_batch_bytes).min(configured_slots))
+            .context("admitted live-batch slot count exceeds address space")?;
+        if budget.admitted_live_slots != configured_live_slots {
+            let evidence = serde_json::json!({
+                "version": 1,
+                "status": "client_under_admission",
+                "configured_slots": configured_live_slots,
+                "admitted_slots": budget.admitted_live_slots,
+                "required_reservation_bytes": u64::try_from(required_reservation).ok(),
+                "required_reservation_bytes_exact": required_reservation.to_string(),
+                "max_memory_bytes": options.max_memory_bytes,
+                "corpus_reservation_bytes": corpus_bytes,
+                "per_live_batch_reservation_bytes": budget.per_live_batch_bytes,
+            });
+            eprintln!("OAT_CLIENT_ADMISSION_REJECTED {evidence}");
+            anyhow::bail!(
+                "client_under_admission configured_slots={} admitted_slots={} required_reservation_bytes={} max_memory_bytes={} corpus_reservation_bytes={} per_live_batch_reservation_bytes={}",
+                configured_live_slots,
+                budget.admitted_live_slots,
+                required_reservation,
+                options.max_memory_bytes,
+                corpus_bytes,
+                budget.per_live_batch_bytes
+            );
+        }
         budget.live_batch_bytes = budget
             .per_live_batch_bytes
             .checked_mul(budget.admitted_live_slots as u64)
@@ -4368,7 +4384,20 @@ mod tests {
         assert_eq!(evidence["resolved"]["batch_rows"], 123);
         assert_eq!(evidence["resolved"]["corpus_rows"], 123);
         assert_eq!(evidence["resolved"]["streams_per_worker"], 7);
+        assert_eq!(evidence["streams_per_worker_source"], "legacy_concurrency");
         assert_eq!(evidence["corpus_rows_source"], "legacy_rows");
+        for mode in [DataMode::Shared, DataMode::Independent] {
+            for profile in [DataProfile::Diagnostic, DataProfile::Realistic] {
+                let mut options = options()?;
+                options.data_mode = mode;
+                options.data_profile = profile;
+                options.workers = 14;
+                options.streams_per_worker = 0;
+                let (resolved, proof) = options.resolve_with_evidence(123, 2)?;
+                assert_eq!(resolved.workers * resolved.streams_per_worker, 28);
+                assert_eq!(proof["streams_per_worker_source"], "legacy_concurrency");
+            }
+        }
 
         let mut options = options()?;
         options.corpus_rows = 0;
@@ -4453,41 +4482,152 @@ mod tests {
     }
 
     #[test]
-    fn realistic_memory_budget_admits_only_live_batches_that_fit() -> Result<()> {
-        let table = table_named("sqlserver_availability_replica_states")?;
-        let tables = vec![table];
+    fn realistic_memory_budget_requires_every_configured_slot() -> Result<()> {
+        let tables = vec![table_named("sqlserver_availability_replica_states")?];
         let mut options = options()?;
         options.data_profile = DataProfile::Realistic;
-        options.workers = 32;
-        options.streams_per_worker = 32;
-        options.batch_rows = 32_768;
-        options.corpus_rows = 32_768;
+        options.workers = 4;
+        options.streams_per_worker = 3;
+        options.batch_rows = 128;
+        options.corpus_rows = 256;
         options.string_width = 96;
-        options.max_memory_bytes = 512 * 1_024 * 1_024;
+        options.max_memory_bytes = u64::MAX;
         let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
         let budget = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
-        assert_eq!(budget.configured_live_slots, 1_024);
-        assert!(budget.admitted_live_slots > 0);
-        assert!(budget.admitted_live_slots < budget.configured_live_slots);
+        assert_eq!(budget.configured_live_slots, 12);
+        assert_eq!(budget.admitted_live_slots, 12);
+        assert_eq!(budget.live_batch_bytes, budget.per_live_batch_bytes * 12);
         assert_eq!(budget.total_bytes, budget.corpus_bytes + budget.live_batch_bytes);
-        assert!(budget.total_bytes <= options.max_memory_bytes);
-        eprintln!(
-            "W2_MEMORY_BUDGET cap_bytes={} corpus_bytes={} per_live_batch_bytes={} configured_slots={} admitted_slots={} live_reserved_bytes={} total_reserved_bytes={}",
-            options.max_memory_bytes,
-            budget.corpus_bytes,
-            budget.per_live_batch_bytes,
-            budget.configured_live_slots,
-            budget.admitted_live_slots,
-            budget.live_batch_bytes,
-            budget.total_bytes
-        );
 
-        options.max_memory_bytes = budget.corpus_bytes + budget.per_live_batch_bytes - 1;
-        assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_err());
-        eprintln!(
-            "W2_MEMORY_SINGLE_BATCH_REJECT cap_bytes={} corpus_bytes={} required_one_live_batch_bytes={}",
-            options.max_memory_bytes, budget.corpus_bytes, budget.per_live_batch_bytes
-        );
+        options.max_memory_bytes = budget.total_bytes;
+        let exact = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
+        assert_eq!(exact.total_bytes, options.max_memory_bytes);
+        assert_eq!(exact.admitted_live_slots, 12);
+        for (cap, admitted) in [
+            (budget.total_bytes - 1, 11),
+            (budget.corpus_bytes + budget.per_live_batch_bytes, 1),
+            (budget.corpus_bytes + budget.per_live_batch_bytes - 1, 0),
+            (budget.corpus_bytes - 1, 0),
+        ] {
+            options.max_memory_bytes = cap;
+            let error = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)
+                .err()
+                .context("under-admitted client was accepted")?
+                .to_string();
+            assert!(error.contains("client_under_admission"), "{error}");
+            assert!(error.contains("configured_slots=12"), "{error}");
+            assert!(error.contains(&format!("admitted_slots={admitted}")), "{error}");
+            assert!(
+                error.contains(&format!("required_reservation_bytes={}", budget.total_bytes)),
+                "{error}"
+            );
+            assert!(error.contains(&format!("max_memory_bytes={cap}")), "{error}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realistic_under_admission_fails_before_connection() -> Result<()> {
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        options.workers = 2;
+        options.streams_per_worker = 2;
+        options.corpus_rows = 32;
+        options.batch_rows = 16;
+        options.max_memory_bytes = 1;
+        let error = PreparedClient::prepare(
+            "not-an-endpoint",
+            "client",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            options,
+        )
+        .await
+        .err()
+        .context("under-admitted client was accepted")?
+        .to_string();
+        assert!(error.contains("client_under_admission"), "{error}");
+        assert!(error.contains("configured_slots=4"), "{error}");
+        assert!(error.contains("admitted_slots=0"), "{error}");
+        assert!(error.contains("required_reservation_bytes="), "{error}");
+        assert!(error.contains("max_memory_bytes=1"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn under_admission_emits_machine_readable_event() -> Result<()> {
+        const CHILD: &str = "OAT_TEST_UNDER_ADMISSION_EVENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let tables = vec![table_named("sqlserver_availability_replica_states")?];
+            let mut options = options()?;
+            options.data_profile = DataProfile::Realistic;
+            options.workers = 2;
+            options.streams_per_worker = 2;
+            options.corpus_rows = 32;
+            options.batch_rows = 16;
+            options.max_memory_bytes = 1;
+            let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
+            assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_err());
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "dmv::client::tests::under_admission_emits_machine_readable_event",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        anyhow::ensure!(output.status.success(), "under-admission fixture process failed");
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        let mut lines = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("OAT_CLIENT_ADMISSION_REJECTED "));
+        let evidence: serde_json::Value =
+            serde_json::from_str(lines.next().context("missing admission rejection event")?)?;
+        assert!(lines.next().is_none());
+        assert_eq!(evidence["version"], 1);
+        assert_eq!(evidence["status"], "client_under_admission");
+        assert_eq!(evidence["configured_slots"], 4);
+        assert_eq!(evidence["admitted_slots"], 0);
+        assert_eq!(evidence["max_memory_bytes"], 1);
+        let corpus = evidence["corpus_reservation_bytes"]
+            .as_u64()
+            .context("missing corpus reservation")?;
+        let per_batch = evidence["per_live_batch_reservation_bytes"]
+            .as_u64()
+            .context("missing live batch reservation")?;
+        let required = corpus + per_batch * 4;
+        assert_eq!(evidence["required_reservation_bytes"], required);
+        assert_eq!(evidence["required_reservation_bytes_exact"], required.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_budget_does_not_reserve_live_batches() -> Result<()> {
+        let tables = vec![table_named("sqlserver_availability_replica_states")?];
+        let mut options = options()?;
+        options.data_profile = DataProfile::Diagnostic;
+        options.workers = 4;
+        options.streams_per_worker = 3;
+        options.batch_rows = 128;
+        options.corpus_rows = 256;
+        options.max_memory_bytes = u64::MAX;
+        let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
+        let budget = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
+        assert_eq!(budget.configured_live_slots, 12);
+        assert_eq!(budget.admitted_live_slots, 0);
+        assert_eq!(budget.live_batch_bytes, 0);
+        assert_eq!(budget.total_bytes, budget.corpus_bytes);
+        options.max_memory_bytes = budget.total_bytes;
+        assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_ok());
+        options.max_memory_bytes -= 1;
+        let error = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)
+            .err()
+            .context("oversized diagnostic corpus was accepted")?
+            .to_string();
+        assert!(error.contains("conservative workload reservation"), "{error}");
+        assert!(!error.contains("client_under_admission"), "{error}");
         Ok(())
     }
 
@@ -4588,11 +4728,10 @@ mod tests {
     #[tokio::test]
     async fn queued_realistic_work_stops_at_window_end_without_identity_or_send() -> Result<()> {
         let mut prepared = manifest_test_client()?;
-        let workers = 64;
-        let streams_per_worker = 16;
-        let admitted_slots = 3;
+        let workers = 3;
+        let streams_per_worker = 1;
         let configured_slots = workers * streams_per_worker;
-        assert_eq!(configured_slots, 1_024);
+        let admitted_slots = configured_slots;
         prepared.options.workers = workers;
         prepared.options.streams_per_worker = streams_per_worker;
         prepared.live_batch_slots = Arc::new(tokio::sync::Semaphore::new(admitted_slots));
@@ -4609,7 +4748,7 @@ mod tests {
             Arc::clone(&client.live_batch_slots).acquire_owned().await?,
             Arc::clone(&client.live_batch_slots).acquire_owned().await?,
         ];
-        let waiter_count = configured_slots - admitted_slots;
+        let waiter_count = configured_slots;
         let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
         let (end_tx, end_rx) = tokio::sync::watch::channel(false);
         let open = Arc::new(AtomicBool::new(true));

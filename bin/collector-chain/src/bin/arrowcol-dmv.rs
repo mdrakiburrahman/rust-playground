@@ -17,8 +17,8 @@ struct Args {
     client_id: String,
     #[arg(long, env = "ARROWCOL_CLIENT_ROWS", default_value_t = 1_000)]
     rows: usize,
-    #[arg(long, env = "ARROWCOL_CLIENT_CONCURRENCY", default_value_t = 4)]
-    concurrency: usize,
+    #[arg(long, env = "ARROWCOL_CLIENT_CONCURRENCY")]
+    concurrency: Option<usize>,
     #[arg(long, env = "ARROWCOL_CLIENT_TABLE")]
     table: Option<String>,
     #[arg(long, env = "ARROWCOL_CLIENT_EDGE_SECRET_FILE")]
@@ -68,10 +68,20 @@ fn emit_build_profile_readback() -> Result<()> {
     Ok(())
 }
 
+fn validate_concurrency(args: &Args) -> Result<()> {
+    if args.concurrency.is_some() && args.tuning.streams_per_worker > 0 {
+        anyhow::bail!("concurrency has no effect when streams_per_worker is nonzero; omit concurrency");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     emit_build_profile_readback()?;
     let mut args = Args::parse();
-    let (tuning, resolution) = args.tuning.resolve_with_evidence(args.rows, args.concurrency)?;
+    validate_concurrency(&args)?;
+    let (tuning, resolution) = args
+        .tuning
+        .resolve_with_evidence(args.rows, args.concurrency.unwrap_or(4))?;
     args.tuning = tuning;
     println!("OAT_CLIENT_RESOLUTION {resolution}");
     tokio::runtime::Builder::new_multi_thread()
@@ -285,7 +295,38 @@ async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>)
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_schedule_timeout, wait_until_unix_ms};
+    use super::{
+        Args, MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_concurrency, validate_schedule_timeout,
+        wait_until_unix_ms,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn explicit_legacy_concurrency_conflicts_with_explicit_streams() -> anyhow::Result<()> {
+        let conflict = Args::try_parse_from([
+            "test",
+            "--endpoint",
+            "http://localhost",
+            "--concurrency",
+            "2",
+            "--streams-per-worker",
+            "2",
+        ])?;
+        assert!(matches!(validate_concurrency(&conflict), Err(error) if error.to_string().contains("concurrency")));
+        let legacy = Args::try_parse_from([
+            "test",
+            "--endpoint",
+            "http://localhost",
+            "--concurrency",
+            "28",
+            "--streams-per-worker",
+            "0",
+        ])?;
+        validate_concurrency(&legacy)?;
+        let explicit = Args::try_parse_from(["test", "--endpoint", "http://localhost", "--streams-per-worker", "2"])?;
+        validate_concurrency(&explicit)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn shared_start_wait_rechecks_backward_clock_steps() -> anyhow::Result<()> {

@@ -107,6 +107,7 @@ function projectName(base: unknown, cell: string, length: number, compactLength:
 
 async function inspect(
   receiptPath: string, markerPath: string, env: RecoveryEnvironment, preload?: PreloadProofPins,
+  classifyQuarantine = false,
 ): Promise<Json> {
   const receiptBytes = await boundedFile(receiptPath, 1024 * 1024);
   const markerBytes = await boundedFile(markerPath, 1024 * 1024);
@@ -273,6 +274,7 @@ async function inspect(
     state_root: stateRoot, owner_pid: marker.ownerPid, owner_start_ticks: marker.ownerStartTicks,
     server_pid: marker.serverPid, server_start_ticks: marker.serverStartTicks,
     measurement_produced: evidence.overload_guard !== null || evidence.durable_commits !== null || evidence.client_schedule !== null,
+    ...(classifyQuarantine ? { quarantine_disposition: classifyLocalQuarantine(row, evidence, status.error) } : {}),
     port: Number(serverUrl.port), listener_output: listenerOutput,
     cleanup: { state_empty: true, compose_resources: 0, legacy_resources: 0, client_containers: 0 },
   };
@@ -355,7 +357,28 @@ export async function recordLocalFailedDisposition(
 }
 
 const operatorAuthorization = 'coordinator f0767c48 (ArrowCollector tunability Project)';
-const quarantineDisposition = 'failed_before_measurement_quarantined_not_settled';
+export const localQuarantineDispositions = [
+  'failed_before_measurement_quarantined_not_settled',
+  'failed_incomplete_delivery_quarantined_not_settled',
+  'failed_teardown_drain_quarantined_not_settled',
+] as const;
+
+function classifyLocalQuarantine(row: Json, evidence: Json, error: string): string | null {
+  const measured = evidence.overload_guard !== null || evidence.durable_commits !== null || evidence.client_schedule !== null;
+  if (!measured) return localQuarantineDispositions[0];
+  if (row.status !== 'failed') return null;
+  const failure = typeof row.failure === 'string' ? row.failure : '';
+  if (error.includes('dataflow drain incomplete') || failure.includes('dataflow drain incomplete')) {
+    return localQuarantineDispositions[2];
+  }
+  const durable = isRecord(evidence.durable_commits) ? evidence.durable_commits : undefined;
+  const reconciliation = isRecord(evidence.reconciliation) ? evidence.reconciliation : undefined;
+  const admissions = isRecord(durable?.collector_teardown_admissions) ? durable.collector_teardown_admissions : undefined;
+  if (evidence.complete_delivery_established === false || durable?.complete_delivery_established === false ||
+      reconciliation?.status === 'unsettled' || reconciliation?.status === 'outside_bound' ||
+      admissions?.status === 'ambiguous') return localQuarantineDispositions[1];
+  return null;
+}
 
 async function writeDurable(path: string, contents: Uint8Array): Promise<void> {
   const file = await open(path, 'wx', 0o600);
@@ -381,9 +404,9 @@ export async function reconcileAndQuarantineLocalFailedReceipt(
 ): Promise<Json> {
   if (!uuid.test(invocation)) throw new Error('Invalid invocation ID');
   const receiptPath = resolve(root, `${invocation}.json`);
-  const proof = await inspect(receiptPath, markerPath, env);
-  if (proof.invocation_id !== invocation || proof.measurement_produced !== false) {
-    throw new Error('Operator quarantine is limited to failed runs with no measurement evidence');
+  const proof = await inspect(receiptPath, markerPath, env, undefined, true);
+  if (proof.invocation_id !== invocation || typeof proof.quarantine_disposition !== 'string') {
+    throw new Error('Operator quarantine requires a supported failed-run disposition');
   }
   const receiptBytes = await boundedFile(receiptPath, 1024 * 1024);
   const markerBytes = await boundedFile(markerPath, 1024 * 1024);
@@ -490,7 +513,7 @@ export async function reconcileAndQuarantineLocalFailedReceipt(
       version: 1,
       authorized_by: operatorAuthorization,
       authorized_at_utc: utcNow(),
-      reason: 'Failed before measurement; the recorded server and launcher are gone, the port is closed, and no run-owned Docker resources remain.',
+      reason: 'Failed run retained as evidence only; the recorded server and launcher are gone, the port is closed, and no run-owned Docker resources remain.',
       invocation_id: invocation,
       run_id: proof.run_id,
       cell_id: cell,
@@ -498,10 +521,10 @@ export async function reconcileAndQuarantineLocalFailedReceipt(
       archived_evidence_files: archivedEvidence,
       missing_evidence: missingEvidence,
       custody_checks: checks,
-      disposition: quarantineDisposition,
+      disposition: proof.quarantine_disposition,
     };
     await syncDirectory(evidenceDir);
-    const finalProof = await inspect(receiptPath, markerPath, env);
+    const finalProof = await inspect(receiptPath, markerPath, env, undefined, true);
     if (JSON.stringify(finalProof) !== JSON.stringify(proof) ||
         sha256(await boundedFile(receiptPath, 1024 * 1024)) !== sha256(receiptBytes) ||
         sha256(await boundedFile(markerPath, 1024 * 1024)) !== sha256(markerBytes)) {

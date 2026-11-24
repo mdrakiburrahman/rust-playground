@@ -12,7 +12,7 @@ const fleetSizing = () => ({
   collector_pool: 'hugepool',
   collector: { dfe_workers: 'auto', runtime_workers: 'auto', blocking_workers: 'auto', cpu_workers: 'auto' },
   client: { workers: 'auto', runtime_threads: 'auto', connections_per_worker: 'auto', streams_per_worker: 'auto',
-    rows_per_table: 'auto', dmv_concurrency: 'auto', corpus_bytes: 'auto', max_memory_bytes: 'auto' },
+    rows_per_table: 'auto', corpus_bytes: 'auto', max_memory_bytes: 'auto' },
 });
 const fleetNode = (node: string, pool: string, cores: number, gib: number): FleetNodeObservation => ({
   node, pool, sku: `Standard_D${cores}s_v6`, architecture: 'amd64',
@@ -36,6 +36,8 @@ test('full fleet auto resolves each heterogeneous node after requests and suppor
     [['client-big', 63], ['client-small', 3]]);
   assert.notEqual(fleet.clients[0].tunables.corpus_bytes, fleet.clients[1].tunables.corpus_bytes);
   assert.ok(fleet.clients.every(client => client.tunables.corpus_rows === undefined));
+  assert.ok(fleet.clients.every(client => !('dmv_concurrency' in client)));
+  assert.ok(!('dmv_concurrency' in resolved));
   assert.equal(resolved.clients_per_table, 2);
   assert.equal(resolved.clients_per_table_sweep, undefined);
   assert.deepEqual(prepareFullFleetExperiment({ ...source, platform: { ...source.platform, fleet: fleetSizing() } },
@@ -48,6 +50,37 @@ test('full fleet auto resolves each heterogeneous node after requests and suppor
   assert.deepEqual(overridden.dfe_worker_concurrency, [20]);
   assert.equal(((overridden.platform as Record<string, any>).fleet.clients[0]).tunables.connections_per_worker, 128);
 });
+test('shipped full fleet template resolves without conflicting concurrency', async () => {
+  const template = JSON.parse(await readFile('docs/experiments/arrowcol-oat/oat-config.aks.full-fleet.json', 'utf8'));
+  template.platform.fleet.collector_pool = 'hugepool';
+  const nodes = [fleetNode('collector', 'hugepool', 192, 1800), fleetNode('client', 'clientpool', 4, 16)];
+  const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: 4, state: 'ready' as const, reason: null }));
+  const resolved = prepareFullFleetExperiment(template, { nodes, pools });
+  assert.ok(!('dmv_concurrency' in resolved));
+  const client = (resolved.platform as { fleet: { clients: { tunables: { streams_per_worker: number } }[] } }).fleet.clients[0]!;
+  assert.ok(!('dmv_concurrency' in client));
+  assert.equal(client.tunables.streams_per_worker, 1);
+});
+
+test('fleet concurrency chooses explicit streams or a per-node legacy fallback without ignoring settings', () => {
+  const nodes = [fleetNode('collector', 'hugepool', 192, 1800), fleetNode('client', 'clientpool', 4, 16)];
+  const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: 4, state: 'ready' as const, reason: null }));
+  const base = { platform: { kind: 'aks' }, campaign_profile: 'scale_out_single_table', tables: ['hot'] };
+  const sizing = fleetSizing();
+  Object.assign(sizing.client, { dmv_concurrency: 2 });
+  assert.throws(() => resolveFleetExperiment(base, sizing, nodes, pools), /dmv_concurrency/);
+  Object.assign(sizing.client, { streams_per_worker: 0 });
+  const resolved = resolveFleetExperiment(base, sizing, nodes, pools);
+  const client = (resolved.platform as { fleet: { clients: { dmv_concurrency: number; tunables: { streams_per_worker: number } }[] } }).fleet.clients[0]!;
+  assert.equal(client.dmv_concurrency, 2);
+  assert.equal(client.tunables.streams_per_worker, 0);
+  assert.throws(() => resolveFleetExperiment({ ...base, dmv_concurrency: 28 }, sizing, nodes, pools), /dmv_concurrency/);
+  assert.throws(() => resolveFleetExperiment({ ...base, tunables: { client: { streams_per_worker: 2 } } }, sizing, nodes, pools), /streams_per_worker/);
+  Object.assign(sizing.client, { dmv_concurrency: 'auto' });
+  const automatic = resolveFleetExperiment(base, sizing, nodes, pools);
+  assert.equal((automatic.platform as { fleet: { clients: { dmv_concurrency: number }[] } }).fleet.clients[0]!.dmv_concurrency, 3);
+});
+
 test('full fleet retains ready and failed constrained SKU identities from the approved stamp grammar', () => {
   const nodes = [fleetNode('collector', 'hugepool', 192, 1800),
     { ...fleetNode('client-constrained', 'clientpool', 32, 256), sku: 'Standard_E128-32ds_v6' }];
@@ -194,6 +227,9 @@ test('binding refuses unknown/out-of-budget pilot settings, ambiguous baselines 
     { clients_per_table: 2 }, { dfe_worker_concurrency: [1, 2] }, { dfe_worker_concurrency: [] },
     { qap_database: null }, { rows_per_table: 0 }, { dmv_concurrency: 65 },
   ]) assert.throws(() => prepareExperiments({ ...base, ...change }, tables, binding));
+  const withoutConcurrency = { ...base, dmv_concurrency: undefined, tunables: { client: { streams_per_worker: 2 } } };
+  assert.doesNotThrow(() => prepareExperiments(withoutConcurrency, tables, binding));
+  assert.throws(() => prepareExperiments({ ...withoutConcurrency, dmv_concurrency: 2 }, tables, binding), /dmv_concurrency/);
   assert.throws(() => prepareExperiments(base, tables.slice(1), binding));
   assert.throws(() => prepareExperiments(base, tables.map(() => tables[0]), binding));
   assert.throws(() => fixtureTables('CREATE TABLE telemetry.sqlserver.only_one ('));
@@ -296,7 +332,7 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
     await assert.rejects(main([...args, '--stamp-config', selectedStampPath], workspace), /EEXIST/);
     const sizing = { ...fleetSizing(), collector_pool: 'benche64' };
     const maintenanceImage = `arrowcollector89152.azurecr.io/maintenance@sha256:${'b'.repeat(64)}`;
-    const fullFleet = { ...config, campaign_profile: 'scale_out_single_table', tables: [tables[0]], maintenance_image: maintenanceImage,
+    const fullFleet = { ...config, dmv_concurrency: undefined, campaign_profile: 'scale_out_single_table', tables: [tables[0]], maintenance_image: maintenanceImage,
       platform: { ...platform, fleet: sizing } };
     const nodes = [fleetNode('collector', 'benche64', 192, 1800), fleetNode('client', 'benchd64', 4, 16)];
     const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: Math.round(node.allocatableCpuMillicores / 1000),

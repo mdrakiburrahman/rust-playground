@@ -17,7 +17,6 @@
         "connections_per_worker": "auto",
         "streams_per_worker": "auto",
         "rows_per_table": "auto",
-        "dmv_concurrency": "auto",
         "corpus_bytes": "auto",
         "max_memory_bytes": "auto"
       }
@@ -47,7 +46,6 @@
   "tables": ["sqlserver_availability_replica_states"],
   "rows_per_table": 1,
   "clients_per_table": 1,
-  "dmv_concurrency": 1,
   "qap_endpoint": "https://arrow-collector-00000.canadacentral.kusto.windows.net",
   "qap_database": null,
   "qap_timeout_seconds": 180,

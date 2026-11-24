@@ -4170,6 +4170,7 @@ fn attach_teardown_outcome(outcome: &mut MatrixOutcome, status: &str) -> Result<
             evidence["screen_v1_csv_reason"] = json!("cell_failed");
             evidence["commit_window_output_usage"] = json!("diagnostic_only");
         }
+        annotate_zero_durable_output(&mut evidence);
         row.evidence_json = Some(serde_json::to_string(&evidence)?);
     }
     Ok(())
@@ -5122,9 +5123,10 @@ fn result_rows(
             },
             "client": {
                 "requested_concurrency_per_process": config.dmv_concurrency,
+                "requested_concurrency_per_worker": config.dmv_concurrency,
                 "limit_cpu": requested.client.limits.cpu,
                 "limit_millicores": client_limit_millicores,
-                "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
+                "concurrency_per_cpu_core": config.dmv_concurrency.map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
             },
             "throttling": throttling,
         }))
@@ -5228,11 +5230,20 @@ fn result_rows(
         } else {
             None
         };
-        let table_failure = match (failure.as_deref(), reconciliation_failure) {
+        let admission =
+            client_admission_for_table(config, run_id, &table, client_run.evidence.client_reports.get(&table));
+        let admission_failure = admission["failure"].as_str();
+        let mut table_failure = match (failure.as_deref(), reconciliation_failure) {
             (Some(failure), Some((reason, _))) => Some(format!("{failure}; {reason}")),
             (None, Some((reason, _))) => Some(reason.to_owned()),
             (_, None) => failure.clone(),
         };
+        if let Some(reason) = admission_failure {
+            table_failure = Some(match table_failure.take() {
+                Some(previous) => format!("{previous}; {reason}"),
+                None => reason.to_owned(),
+            });
+        }
         if client.is_none() && table_failure.is_none() {
             bail!("DMV client did not report measurements for {table}");
         }
@@ -5301,6 +5312,7 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                evidence["client_admission"] = admission;
                 evidence["inert_fields"] = table_leaf_evidence["inert_fields"].clone();
                 evidence["projection_only"] = table_leaf_evidence["projection_only"].clone();
                 evidence["runner_controls"] = table_leaf_evidence["runner_controls"].clone();
@@ -5624,8 +5636,6 @@ async fn run_clients_inner(
                 format!("oat-{project_run_id}-{table}-c{}", client_index + 1),
                 "--rows".to_owned(),
                 client_config.rows_per_table.to_string(),
-                "--concurrency".to_owned(),
-                client_config.dmv_concurrency.to_string(),
                 "--table".to_owned(),
                 table.clone(),
                 "--edge-secret-file".to_owned(),
@@ -5643,6 +5653,9 @@ async fn run_clients_inner(
                 "--schedule-timeout-secs".to_owned(),
                 timing_budget.schedule_wait_seconds.to_string(),
             ];
+            if let Some(concurrency) = client_config.dmv_concurrency {
+                arguments.extend(["--concurrency".to_owned(), concurrency.to_string()]);
+            }
             if config.pilot_mode {
                 arguments.push("--pilot".to_owned());
             }
@@ -5669,14 +5682,24 @@ async fn run_clients_inner(
             Ok(progress) => progress,
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after readiness polling failed also failed: {cleanup_error:#}"
-                    ))),
-                };
+                let mut failure = format!("{error:#}");
+                if let Err(cleanup_error) = cleanup {
+                    failure.push_str(&format!(
+                        "; cancelling clients after readiness polling failed also failed: {cleanup_error:#}"
+                    ));
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some(failure),
+                    evidence,
+                });
             }
         };
+        for (handle, state) in handles.iter().zip(&progress) {
+            evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&state.output));
+        }
         match validate_client_readiness(
             &progress,
             readiness_started.elapsed(),
@@ -5686,18 +5709,71 @@ async fn run_clients_inner(
             Ok(false) => {}
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after readiness failure also failed: {cleanup_error:#}"
-                    ))),
-                };
+                let mut failure = format!("{error:#}");
+                if let Err(cleanup_error) = cleanup {
+                    failure.push_str(&format!(
+                        "; cancelling clients after readiness failure also failed: {cleanup_error:#}"
+                    ));
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some(failure),
+                    evidence,
+                });
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    let _ = diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await?;
+    macro_rules! fail_prepared {
+        ($error:expr, $cleanup:expr, $qap:expr) => {{
+            let mut failure = format!("{:#}", $error);
+            if let Err(error) = $cleanup {
+                failure.push_str(&format!("; client cancellation failed: {error:#}"));
+            }
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: $qap,
+                failure: Some(failure),
+                evidence,
+            });
+        }};
+    }
+    for table in tables {
+        let admission = client_admission_for_table(config, project_run_id, table, evidence.client_reports.get(table));
+        if let Some(reason) = admission["failure"].as_str() {
+            let cleanup = cancel_clients(platform, config, &handles).await;
+            let mut failure = reason.to_owned();
+            if let Err(error) = cleanup {
+                failure.push_str(&format!(
+                    "; cancelling clients after admission failure also failed: {error:#}"
+                ));
+            }
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: Vec::new(),
+                failure: Some(failure),
+                evidence,
+            });
+        }
+    }
+    let _ =
+        match diagnostic_admission_or_cancel(config, platform, &handles, &ready_clients, project_run_id, false).await {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some(format!("{error:#}")),
+                    evidence,
+                });
+            }
+        };
 
     let darwin_precheck = std::env::var("OAT_DARWIN_PARITY_PRECHECK");
     if matches!(darwin_precheck.as_deref(), Ok("1" | "qualified")) {
@@ -5715,12 +5791,11 @@ async fn run_clients_inner(
             Ok(proof) => evidence.parity_admission_readback = Some(proof),
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error).context("verify parity readback before admission"),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after parity readback failure also failed: {cleanup_error:#}"
-                    ))),
-                };
+                fail_prepared!(
+                    error.context("verify parity readback before admission"),
+                    cleanup,
+                    Vec::new()
+                );
             }
         }
     }
@@ -5728,12 +5803,11 @@ async fn run_clients_inner(
         && let Err(error) = wait_observer_barrier(config, project_run_id).await
     {
         let cleanup = cancel_clients(platform, config, &handles).await;
-        return match cleanup {
-            Ok(()) => Err(error).context("verify observer readiness before admission"),
-            Err(cleanup_error) => Err(error.context(format!(
-                "cancelling clients after observer readiness failure also failed: {cleanup_error:#}"
-            ))),
-        };
+        fail_prepared!(
+            error.context("verify observer readiness before admission"),
+            cleanup,
+            Vec::new()
+        );
     }
 
     // Delta metadata is committed during preflight, so QAP binding must precede arming.
@@ -5769,62 +5843,87 @@ async fn run_clients_inner(
         Err(error) => {
             platform.mark_qap_outcome_unresolved();
             let cleanup = cancel_clients(platform, config, &handles).await;
-            return match cleanup {
-                Ok(()) => Err(error).context("initialize run-scoped QAP before client schedule"),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "cancelling prepared OAT clients after QAP initialization failure also failed: {cleanup_error:#}"
-                ))),
-            };
+            fail_prepared!(
+                error.context("initialize run-scoped QAP before client schedule"),
+                cleanup,
+                Vec::new()
+            );
         }
     };
-    platform
+    if let Err(error) = platform
         .finalize_campaign_load_admission(config, project_run_id, tables)
-        .await?;
+        .await
+    {
+        let cleanup = cancel_clients(platform, config, &handles).await;
+        fail_prepared!(error, cleanup, qap_tables);
+    }
     evidence.preload_delta = match platform.preload_delta_evidence(config, tables) {
         Ok(proof) => proof,
         Err(error) => {
             let cleanup = cancel_clients(platform, config, &handles).await;
-            return match cleanup {
-                Ok(()) => Err(error).context("verify pre-load Delta layout"),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "cancelling prepared OAT clients after Delta verification failure also failed: {cleanup_error:#}"
-                ))),
-            };
+            fail_prepared!(error.context("verify pre-load Delta layout"), cleanup, qap_tables);
         }
     };
-    let schedule_admission = diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await?;
+    let schedule_admission = match diagnostic_recheck_or_cancel(config, platform, &handles, project_run_id).await {
+        Ok(value) => value,
+        Err(error) => fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables),
+    };
     let diagnostic_reference = if schedule_admission.is_some() {
-        Some(std::env::var(DIAGNOSTIC_REFERENCE_ENV).context("diagnostic reference is missing before schedule")?)
+        match std::env::var(DIAGNOSTIC_REFERENCE_ENV).context("diagnostic reference is missing before schedule") {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(error, cleanup, qap_tables);
+            }
+        }
     } else {
         None
     };
-    diagnostic_memory_admission_or_cancel(config, platform, &handles).await?;
+    if let Err(error) = diagnostic_memory_admission_or_cancel(config, platform, &handles).await {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
+    }
     let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
-    let schedule_created_at_unix_ms = unix_time_ms_u64()?;
-    let run_start_unix_ms = schedule_created_at_unix_ms
-        .checked_add(
-            config
-                .schedule_lead_seconds
-                .checked_mul(1_000)
-                .context("OAT schedule lead overflow")?,
-        )
-        .context("shared OAT run start timestamp overflow")?;
-    let measurement_start_unix_ms = run_start_unix_ms
-        .checked_add(
-            config
-                .warmup_seconds
-                .checked_mul(1_000)
-                .context("OAT warm-up duration overflow")?,
-        )
-        .context("shared OAT measurement start timestamp overflow")?;
-    let measurement_end_unix_ms = measurement_start_unix_ms
-        .checked_add(
-            config
-                .measure_seconds
-                .checked_mul(1_000)
-                .context("OAT measurement duration overflow")?,
-        )
-        .context("shared OAT measurement end timestamp overflow")?;
+    let timestamps = (|| -> Result<_> {
+        let schedule_created_at_unix_ms = unix_time_ms_u64()?;
+        let run_start_unix_ms = schedule_created_at_unix_ms
+            .checked_add(
+                config
+                    .schedule_lead_seconds
+                    .checked_mul(1_000)
+                    .context("OAT schedule lead overflow")?,
+            )
+            .context("shared OAT run start timestamp overflow")?;
+        let measurement_start_unix_ms = run_start_unix_ms
+            .checked_add(
+                config
+                    .warmup_seconds
+                    .checked_mul(1_000)
+                    .context("OAT warm-up duration overflow")?,
+            )
+            .context("shared OAT measurement start timestamp overflow")?;
+        let measurement_end_unix_ms = measurement_start_unix_ms
+            .checked_add(
+                config
+                    .measure_seconds
+                    .checked_mul(1_000)
+                    .context("OAT measurement duration overflow")?,
+            )
+            .context("shared OAT measurement end timestamp overflow")?;
+        Ok((
+            schedule_created_at_unix_ms,
+            run_start_unix_ms,
+            measurement_start_unix_ms,
+            measurement_end_unix_ms,
+        ))
+    })();
+    let (schedule_created_at_unix_ms, run_start_unix_ms, measurement_start_unix_ms, measurement_end_unix_ms) =
+        match timestamps {
+            Ok(timestamps) => timestamps,
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(error, cleanup, qap_tables);
+            }
+        };
     let delivery = tokio::time::timeout_at(schedule_deadline, async {
         schedule_after_diagnostic_admission(
             diagnostic_reference.as_deref(),
@@ -5871,12 +5970,12 @@ async fn run_clients_inner(
         Ok(observed_at) => observed_at,
         Err(error) => {
             let cleanup = cancel_clients(platform, config, &handles).await;
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "cancelling clients after schedule delivery failure also failed: {cleanup_error:#}"
-                ))),
-            };
+            fail_prepared!(
+                error,
+                cleanup
+                    .map_err(|error| error.context("cancelling clients after schedule delivery failure also failed")),
+                qap_tables
+            );
         }
     };
     evidence.client_schedule = Some(json!({
@@ -5899,7 +5998,13 @@ async fn run_clients_inner(
     if let Some(prepared) = &mut prepared_guard {
         prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
         prepared.engine.proof["run_id"] = json!(project_run_id);
-        prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
+        prepared.probe.since_ms = match unix_time_ms_u64() {
+            Ok(now) => now.saturating_sub(GUARD_MAX_GAP_MS),
+            Err(error) => {
+                let cleanup = cancel_clients(platform, config, &handles).await;
+                fail_prepared!(error, cleanup, qap_tables);
+            }
+        };
     }
     let native = match platform.native_telemetry_source(config, &qap_tables).await {
         Ok(source) => source,
@@ -5990,6 +6095,7 @@ async fn run_clients_inner(
         for (index, state) in pending_indices.into_iter().zip(progress) {
             let handle = &handles[index];
             if let Some(failure) = state.failure {
+                evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&state.output));
                 let error = anyhow::anyhow!("OAT client {} failed: {failure}", handle.client_id);
                 retain_armed_client_failure!(error);
             }
@@ -6031,23 +6137,40 @@ async fn run_clients_inner(
                         retain_armed_client_failure!(error);
                     }
                 };
-                let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
+                let effective_client_config =
+                    match resolved_fleet_client_config(config, index % config.clients_per_table) {
+                        Ok(config) => config,
+                        Err(error) => {
+                            evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
+                            retain_armed_client_failure!(error);
+                        }
+                    };
                 if let Err(error) =
                     evidence.record_client(&effective_client_config, &handle.table, &handle.client_id, &output)
                 {
                     evidence.record_cancelled_client(&handle.table, &handle.client_id, Some(&output));
                     retain_armed_client_failure!(error);
                 }
-                if let Some(report) = evidence
-                    .client_reports
-                    .get_mut(&handle.table)
-                    .and_then(|reports| reports.last_mut())
+                let placement = match config
+                    .platform
+                    .fleet
+                    .as_ref()
+                    .map(|fleet| serde_json::to_value(&fleet.clients[index].placement))
+                    .transpose()
                 {
+                    Ok(placement) => placement,
+                    Err(error) => retain_armed_client_failure!(error),
+                };
+                if let Some(report) = evidence.client_reports.get_mut(&handle.table).and_then(|reports| {
+                    reports
+                        .iter_mut()
+                        .find(|report| report["client_id"] == handle.client_id)
+                }) {
                     report["client_id"] = json!(handle.client_id);
                     report["rows_per_second"] = json!(measurement.metrics.rows_per_second);
                     report["rows"] = json!(measurement.metrics.rows);
-                    if let Some(fleet) = &config.platform.fleet {
-                        report["placement"] = serde_json::to_value(&fleet.clients[index].placement)?;
+                    if let Some(placement) = placement {
+                        report["placement"] = placement;
                     }
                 }
                 client_metrics
@@ -6100,7 +6223,9 @@ async fn run_clients_inner(
         measurement_end_unix_ms,
     ));
     let mut metrics = HashMap::with_capacity(tables.len());
-    sampler.finish(&mut evidence).await?;
+    if let Err(error) = sampler.finish(&mut evidence).await {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
+    }
     if evidence.overload_stop.is_some()
         || evidence
             .overload_guard
@@ -6115,73 +6240,81 @@ async fn run_clients_inner(
             evidence,
         });
     }
-    if darwin_precheck.as_deref() == Ok("qualified") {
-        wait_observer_completion(config, project_run_id, measurement_end_unix_ms).await?;
+    if darwin_precheck.as_deref() == Ok("qualified")
+        && let Err(error) = wait_observer_completion(config, project_run_id, measurement_end_unix_ms).await
+    {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
     }
-    for table in tables {
-        let reports = client_metrics
-            .remove(table)
-            .with_context(|| format!("no DMV clients reported measurements for {table}"))?;
-        if reports.len() != config.clients_per_table {
-            bail!(
-                "DMV table {table} returned {} of {} client measurements",
-                reports.len(),
-                config.clients_per_table
-            );
-        }
-        let rows = reports
-            .iter()
-            .try_fold(0_u64, |sum, report| sum.checked_add(report.metrics.rows))
-            .context("aggregated DMV row count overflow")?;
-        let rows_per_second = reports.iter().map(|report| report.metrics.rows_per_second).sum::<f64>();
-        if !rows_per_second.is_finite() || rows_per_second <= 0.0 {
-            bail!("aggregated DMV throughput for {table} is invalid");
-        }
-        let mut windows = std::collections::BTreeMap::<u64, u64>::new();
-        for report in &reports {
-            for window in &report.pilot_windows {
-                let rows = windows.entry(window.index).or_default();
-                *rows = rows
-                    .checked_add(window.rows)
-                    .context("aggregated pilot row count overflow")?;
-            }
-        }
-        if config.pilot_mode {
-            let expected_windows = config.measure_seconds / 30;
-            if windows.len() != expected_windows as usize || windows.keys().copied().ne(0..expected_windows) {
-                bail!("pilot clients returned an incomplete 30-second window set for {table}");
-            }
-            let mut rates = Vec::with_capacity(windows.len());
-            for (index, rows) in &windows {
-                let rate = *rows as f64 / 30.0;
-                rates.push(rate);
-                println!(
-                    "pilot_table={table} window={} window_seconds=30 rows={rows} rows_per_second={rate:.3}",
-                    index + 1
+    let aggregation = (|| -> Result<()> {
+        for table in tables {
+            let reports = client_metrics
+                .remove(table)
+                .with_context(|| format!("no DMV clients reported measurements for {table}"))?;
+            if reports.len() != config.clients_per_table {
+                bail!(
+                    "DMV table {table} returned {} of {} client measurements",
+                    reports.len(),
+                    config.clients_per_table
                 );
             }
-            let stable_horizon =
-                stable_window_horizon(&rates).map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
-            println!("pilot_table={table} stable_from_seconds={stable_horizon}");
-        } else if !windows.is_empty() {
-            bail!("non-pilot DMV client unexpectedly returned pilot windows for {table}");
+            let rows = reports
+                .iter()
+                .try_fold(0_u64, |sum, report| sum.checked_add(report.metrics.rows))
+                .context("aggregated DMV row count overflow")?;
+            let rows_per_second = reports.iter().map(|report| report.metrics.rows_per_second).sum::<f64>();
+            if !rows_per_second.is_finite() || rows_per_second <= 0.0 {
+                bail!("aggregated DMV throughput for {table} is invalid");
+            }
+            let mut windows = std::collections::BTreeMap::<u64, u64>::new();
+            for report in &reports {
+                for window in &report.pilot_windows {
+                    let rows = windows.entry(window.index).or_default();
+                    *rows = rows
+                        .checked_add(window.rows)
+                        .context("aggregated pilot row count overflow")?;
+                }
+            }
+            if config.pilot_mode {
+                let expected_windows = config.measure_seconds / 30;
+                if windows.len() != expected_windows as usize || windows.keys().copied().ne(0..expected_windows) {
+                    bail!("pilot clients returned an incomplete 30-second window set for {table}");
+                }
+                let mut rates = Vec::with_capacity(windows.len());
+                for (index, rows) in &windows {
+                    let rate = *rows as f64 / 30.0;
+                    rates.push(rate);
+                    println!(
+                        "pilot_table={table} window={} window_seconds=30 rows={rows} rows_per_second={rate:.3}",
+                        index + 1
+                    );
+                }
+                let stable_horizon =
+                    stable_window_horizon(&rates).map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
+                println!("pilot_table={table} stable_from_seconds={stable_horizon}");
+            } else if !windows.is_empty() {
+                bail!("non-pilot DMV client unexpectedly returned pilot windows for {table}");
+            }
+            metrics.insert(
+                table.clone(),
+                ClientMetrics {
+                    rows,
+                    duration_ms: reports
+                        .iter()
+                        .map(|report| report.metrics.duration_ms)
+                        .max()
+                        .unwrap_or(1),
+                    rows_per_second,
+                    completions: reports
+                        .iter()
+                        .flat_map(|report| report.metrics.completions.clone())
+                        .collect(),
+                },
+            );
         }
-        metrics.insert(
-            table.clone(),
-            ClientMetrics {
-                rows,
-                duration_ms: reports
-                    .iter()
-                    .map(|report| report.metrics.duration_ms)
-                    .max()
-                    .unwrap_or(1),
-                rows_per_second,
-                completions: reports
-                    .iter()
-                    .flat_map(|report| report.metrics.completions.clone())
-                    .collect(),
-            },
-        );
+        Ok(())
+    })();
+    if let Err(error) = aggregation {
+        fail_prepared!(error, Ok::<(), anyhow::Error>(()), qap_tables);
     }
     Ok(ClientRun {
         metrics,

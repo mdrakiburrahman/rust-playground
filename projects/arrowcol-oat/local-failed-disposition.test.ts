@@ -381,7 +381,7 @@ for (const resultStatus of ['failed', 'pinning_violation']) test(`local ${result
   await assert.rejects(assertLocalFailedDisposition(receiptPath, dispositionPath, env), /Run log does not bind/);
 });
 
-test('operator quarantine archives only failed pre-measurement receipts with verified zero-resource custody', async t => {
+for (const dispositionCase of ['before', 'delivery', 'drain'] as const) test(`operator quarantine archives ${dispositionCase} failure with verified zero-resource custody`, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oat-operator-quarantine-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const receiptRoot = path.join(root, 'deadline-receipts');
@@ -408,7 +408,7 @@ test('operator quarantine archives only failed pre-measurement receipts with ver
     serverUrl: 'http://127.0.0.1:1234/', serverExecutable: '/tmp/oat',
     submitted_config_body: body, submitted_config_sha256: configHash, source_config_sha256: 'a'.repeat(64),
   };
-  const error = 'collector failed before measurement';
+  const error = dispositionCase === 'drain' ? 'dataflow drain incomplete: unpublished identities' : 'collector failed';
   const receipt = {
     version: 1, invocation_id: invocation, run_id: run, creation_state: 'accepted', run_state: 'failed',
     started_at_unix_ms: 1, started_at_monotonic_ms: 1, deadline_at_unix_ms: null, deadline_seconds: null,
@@ -428,11 +428,18 @@ test('operator quarantine archives only failed pre-measurement receipts with ver
     client_schedule: null, client_phase_reports: null, durable_commits: null, durable_bytes: null,
     rows: { delta_committed: null },
   };
-  const table = tableFromArrays({
-    run_id: [cell], mode: ['local'], status: ['failed'], table: ['test_table'],
-    evidence_json: [JSON.stringify(evidence)],
-  });
-  const resultBytes = writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream')));
+  const measuredEvidence = { ...evidence, overload_guard: { run_id: cell },
+    durable_commits: { complete_delivery_established: false },
+    teardown_outcome: dispositionCase === 'drain' ? 'failed' : 'succeeded' };
+  const makeResult = (resultEvidence: object, status = 'failed') => {
+    const table = tableFromArrays({
+      run_id: [cell], mode: ['local'], status: [status], table: ['test_table'],
+      schema_version: [3], git_sha: ['a'.repeat(40)], pinning_ok: [true], replicas: [1],
+      evidence_json: [JSON.stringify(resultEvidence)],
+    });
+    return writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream')));
+  };
+  const resultBytes = makeResult(dispositionCase === 'before' ? evidence : measuredEvidence);
   await writeFile(resultPath, resultBytes);
   await writeFile(receiptPath, JSON.stringify(receipt));
   await writeFile(markerPath, JSON.stringify(marker));
@@ -443,6 +450,17 @@ test('operator quarantine archives only failed pre-measurement receipts with ver
     bootId: async () => '123e4567-e89b-42d3-a456-426614174104',
     listeningSockets: (_port: number) => '',
   };
+  if (dispositionCase !== 'before') {
+    await writeFile(resultPath, makeResult({ ...measuredEvidence, durable_commits: {} }));
+    if (dispositionCase === 'delivery') await assert.rejects(
+      reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env), /supported failed-run disposition/);
+    await writeFile(resultPath, makeResult(measuredEvidence, 'succeeded'));
+    await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env), /Failed cell identity mismatch/);
+    await writeFile(resultPath, resultBytes);
+  }
+  await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, {
+    ...env, processStartTicks: async pid => pid === marker.ownerPid ? marker.ownerStartTicks : undefined,
+  }), /still active/);
   await assert.rejects(reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, {
     ...env, docker: () => 'owned-container',
   }), /resources remain/);
@@ -463,12 +481,23 @@ test('operator quarantine archives only failed pre-measurement receipts with ver
 
   const record = await reconcileAndQuarantineLocalFailedReceipt(receiptRoot, invocation, markerPath, env);
   const quarantineDir = path.join(root, 'operator-quarantine', invocation);
-  assert.equal(record.disposition, 'failed_before_measurement_quarantined_not_settled');
+  assert.equal(record.disposition, {
+    before: 'failed_before_measurement_quarantined_not_settled',
+    delivery: 'failed_incomplete_delivery_quarantined_not_settled',
+    drain: 'failed_teardown_drain_quarantined_not_settled',
+  }[dispositionCase]);
   assert.equal(record.receipt_sha256, hash(JSON.stringify(receipt)));
   assert.deepEqual(JSON.parse(await readFile(path.join(quarantineDir, `${invocation}.json`), 'utf8')), receipt);
   await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });
   await assert.rejects(readFile(markerPath), { code: 'ENOENT' });
   await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const recordPath = path.join(quarantineDir, 'operator-reconciliation.json');
+  const originalRecord = await readFile(recordPath);
+  await writeFile(recordPath, JSON.stringify({ ...record, authorized_by: 'unauthorized' }));
+  await assert.rejects(assertNoUnsettledDeadlineReceipts(receiptRoot), /Invalid operator reconciliation/);
+  await writeFile(recordPath, JSON.stringify({ ...record, disposition: 'unknown' }));
+  await assert.rejects(assertNoUnsettledDeadlineReceipts(receiptRoot), /Invalid operator reconciliation/);
+  await writeFile(recordPath, originalRecord);
 
   const archivedEvidence = record.archived_evidence_files;
   assert.ok(Array.isArray(archivedEvidence));
@@ -477,6 +506,8 @@ test('operator quarantine archives only failed pre-measurement receipts with ver
   assert.ok(archivedResultEntry && typeof archivedResultEntry === 'object' && 'path' in archivedResultEntry &&
     typeof archivedResultEntry.path === 'string');
   const archivedResult = path.join(quarantineDir, archivedResultEntry.path);
+  await assert.rejects(readReconciledOatResult(archivedResult, runRoot, 'test_table', 'a'.repeat(40), null,
+    'diagnostic', { config: {}, decodeFile: async () => 0 }), /status is invalid/);
   await writeFile(archivedResult, 'tampered');
   await assert.rejects(assertNoUnsettledDeadlineReceipts(receiptRoot), /archive digest mismatch/);
   await writeFile(archivedResult, resultBytes);

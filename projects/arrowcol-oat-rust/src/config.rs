@@ -67,7 +67,8 @@ pub struct OatConfig {
     pub clients_per_table: usize,
     #[serde(default)]
     pub clients_per_table_sweep: Option<Vec<usize>>,
-    pub dmv_concurrency: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dmv_concurrency: Option<usize>,
     pub qap_endpoint: String,
     pub qap_database: Option<String>,
     pub qap_timeout_seconds: u64,
@@ -79,16 +80,31 @@ pub struct OatConfig {
     pub website_url: String,
 }
 
-fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurrency: usize) -> Result<()> {
+#[derive(Serialize)]
+pub(crate) struct ClientMemoryPreflightEstimate {
+    pub required_bytes: u64,
+    pub max_memory_bytes: u64,
+    pub corpus_bytes: u64,
+    pub corpus_copies: usize,
+    pub data_mode: DataMode,
+    pub workers: usize,
+    pub worker_source: &'static str,
+    pub realistic_live_slots: usize,
+}
+
+pub(crate) fn client_memory_preflight_estimate(
+    client: Option<&ClientTunables>,
+    concurrency: usize,
+) -> Result<Option<ClientMemoryPreflightEstimate>> {
     const DEFAULT_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
     const CORPUS_RESERVATION_NUMERATOR: u64 = 40_014;
     const CORPUS_RESERVATION_DENOMINATOR: u64 = 10_000;
     const LIVE_SLOT_RESERVATION_BYTES: u64 = 260_000_000;
     const EXTRA_RESERVATION_BYTES: u64 = 1024 * 1024 * 1024;
 
-    let Some(client) = client else { return Ok(()) };
+    let Some(client) = client else { return Ok(None) };
     let Some(corpus_bytes) = client.corpus_bytes.filter(|bytes| *bytes > 0) else {
-        return Ok(());
+        return Ok(None);
     };
     let data_mode = client.data_mode.unwrap_or(DataMode::Shared);
     let data_profile = client.data_profile.unwrap_or(ClientDataProfile::Diagnostic);
@@ -129,12 +145,35 @@ fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurren
         .and_then(|bytes| bytes.checked_add(EXTRA_RESERVATION_BYTES))
         .context("client conservative workload reservation overflow")?;
     let max_memory_bytes = client.max_memory_bytes.unwrap_or(DEFAULT_MAX_MEMORY_BYTES);
-    if max_memory_bytes < required_bytes {
+    Ok(Some(ClientMemoryPreflightEstimate {
+        required_bytes,
+        max_memory_bytes,
+        corpus_bytes,
+        corpus_copies: copies,
+        data_mode,
+        workers,
+        worker_source: if !needs_worker_count {
+            "not_needed"
+        } else if client.workers.is_some_and(|value| value > 0) {
+            "configured"
+        } else {
+            "oat_host_available_parallelism_at_recomputation"
+        },
+        realistic_live_slots: live_slots,
+    }))
+}
+
+fn validate_client_memory_reservation(client: Option<&ClientTunables>, concurrency: usize) -> Result<()> {
+    if let Some(estimate) = client_memory_preflight_estimate(client, concurrency)?
+        && estimate.max_memory_bytes < estimate.required_bytes
+    {
         bail!(
-            "tunables.client.max_memory_bytes={} is below the conservative workload reservation of {} bytes (corpus_bytes={}, data_mode={data_mode:?}, configured_live_slots={live_slots}); increase max_memory_bytes or reduce corpus size, workers, or streams_per_worker",
-            max_memory_bytes,
-            required_bytes,
-            corpus_bytes,
+            "tunables.client.max_memory_bytes={} is below the conservative workload reservation of {} bytes (corpus_bytes={}, data_mode={:?}, configured_live_slots={}); increase max_memory_bytes or reduce corpus size, workers, or streams_per_worker",
+            estimate.max_memory_bytes,
+            estimate.required_bytes,
+            estimate.corpus_bytes,
+            estimate.data_mode,
+            estimate.realistic_live_slots
         );
     }
     Ok(())
@@ -246,7 +285,8 @@ pub struct FleetNode {
 pub struct FleetClient {
     pub placement: FleetNode,
     pub rows_per_table: usize,
-    pub dmv_concurrency: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dmv_concurrency: Option<usize>,
     pub tunables: arrowcol_tunables::ClientTunables,
 }
 
@@ -265,6 +305,21 @@ pub struct FleetPoolOutcome {
 pub enum FleetPoolState {
     Ready,
     Failed,
+}
+
+fn validate_dmv_concurrency(concurrency: Option<usize>, client: Option<&ClientTunables>, field: &str) -> Result<()> {
+    if let Some(value) = concurrency {
+        if !(1..=64).contains(&value) {
+            bail!("{field} must be 1..=64");
+        }
+        if client
+            .and_then(|client| client.streams_per_worker)
+            .is_some_and(|streams| streams > 0)
+        {
+            bail!("{field} has no effect when streams_per_worker is nonzero; omit {field}");
+        }
+    }
+    Ok(())
 }
 
 impl FleetPlacement {
@@ -322,10 +377,7 @@ impl FleetPlacement {
             bail!("fleet collector resources differ from platform.resources.collector");
         }
         for client in &self.clients {
-            if client.placement.pool == self.collector.pool
-                || !(1..=1_000_000).contains(&client.rows_per_table)
-                || !(1..=64).contains(&client.dmv_concurrency)
-            {
+            if client.placement.pool == self.collector.pool || !(1..=1_000_000).contains(&client.rows_per_table) {
                 bail!("fleet clients require separate client pools and bounded numeric rows/concurrency");
             }
             Tunables {
@@ -333,7 +385,12 @@ impl FleetPlacement {
                 ..Default::default()
             }
             .validate_for_oat()?;
-            validate_client_memory_reservation(Some(&client.tunables), client.dmv_concurrency)?;
+            validate_dmv_concurrency(
+                client.dmv_concurrency,
+                Some(&client.tunables),
+                "platform.fleet.clients[].dmv_concurrency",
+            )?;
+            validate_client_memory_reservation(Some(&client.tunables), client.dmv_concurrency.unwrap_or(4))?;
         }
         let mut pools = HashSet::new();
         for pool in &self.pools {
@@ -678,6 +735,20 @@ pub fn client_build_profile_hash(profile: ClientBuildProfile) -> String {
 }
 
 impl OatConfig {
+    pub(crate) fn effective_dmv_concurrency(&self) -> usize {
+        self.dmv_concurrency.unwrap_or(4)
+    }
+    fn validate_dmv_configuration(&self) -> Result<()> {
+        if self.platform.fleet.is_some() {
+            if self.dmv_concurrency.is_some() {
+                bail!("dmv_concurrency has no effect with platform.fleet; set it per fleet client instead");
+            }
+        } else {
+            validate_dmv_concurrency(self.dmv_concurrency, self.tunables.client.as_ref(), "dmv_concurrency")?;
+            validate_client_memory_reservation(self.tunables.client.as_ref(), self.effective_dmv_concurrency())?;
+        }
+        Ok(())
+    }
     pub(crate) fn cgroup_guard_requested_limits(&self) -> Result<(u64, u64)> {
         let pressure = self
             .tunables
@@ -1311,7 +1382,7 @@ impl OatConfig {
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;
         self.tunables.validate_for_oat()?;
-        validate_client_memory_reservation(self.tunables.client.as_ref(), self.dmv_concurrency)?;
+        self.validate_dmv_configuration()?;
         self.validate_platform_resources()?;
         self.maintenance_stop_budget()?;
         self.validate_selected_parquet_schemas()?;
@@ -1600,8 +1671,8 @@ impl OatConfig {
         if !matches!(metrics_endpoint.scheme(), "http" | "https") || metrics_endpoint.host_str().is_none() {
             bail!("router_metrics_endpoint must be an HTTP(S) URL with a host");
         }
-        if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
-            bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
+        if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 {
+            bail!("rows_per_table must be 1..=1000000");
         }
         if let Some(fleet) = &self.platform.fleet {
             fleet.validate(self)?;
@@ -1840,6 +1911,37 @@ mod tests {
     }
 
     #[test]
+    fn dmv_concurrency_is_a_per_worker_fallback_and_conflicts_are_rejected() -> Result<()> {
+        let mut config = valid();
+        config.dmv_concurrency = Some(28);
+        config.tunables.client = Some(ClientTunables {
+            workers: Some(14),
+            streams_per_worker: Some(2),
+            ..Default::default()
+        });
+        assert!(validation_error(&config)?.contains("dmv_concurrency"));
+        config.dmv_concurrency = Some(2);
+        assert!(validation_error(&config)?.contains("dmv_concurrency"));
+        config.dmv_concurrency = None;
+        config.validate()?;
+        let serialized = serde_json::to_value(&*config)?;
+        assert!(serialized.get("dmv_concurrency").is_none());
+        serde_json::from_value::<OatConfig>(serialized)?.validate()?;
+        config
+            .tunables
+            .client
+            .as_mut()
+            .context("missing client tunables")?
+            .streams_per_worker = Some(0);
+        config.dmv_concurrency = Some(28);
+        config.validate()?;
+        assert_eq!(config.effective_dmv_concurrency(), 28);
+        config.dmv_concurrency = None;
+        assert_eq!(config.effective_dmv_concurrency(), 4);
+        Ok(())
+    }
+
+    #[test]
     fn local_setup_timeout_is_strictly_bounded() -> Result<()> {
         let mut config = valid();
         config.platform.local.setup_timeout_ms = Some(0);
@@ -1866,6 +1968,7 @@ mod tests {
     #[test]
     fn client_memory_preflight_rejects_underreserved_corpora_before_setup() -> Result<()> {
         let mut config = valid();
+        config.dmv_concurrency = None;
         config.tunables.client = Some(ClientTunables {
             corpus_bytes: Some(5 * 1024 * 1024 * 1024),
             max_memory_bytes: Some(10 * 1024 * 1024 * 1024),
@@ -2088,7 +2191,7 @@ mod tests {
             "client": { "requests": {"cpu":"250m","memory":"256Mi"}, "limits": {"cpu":"1","memory":"2Gi"} }
         }))?);
         config.dfe_worker_concurrency = vec![4];
-        config.dmv_concurrency = 16;
+        config.dmv_concurrency = Some(16);
         config.validate()?;
 
         for bad in ["1.0001", "1n", "0m", "", " 1"] {
@@ -2314,7 +2417,7 @@ mod tests {
             rows_per_table: 1000,
             clients_per_table: 1,
             clients_per_table_sweep: None,
-            dmv_concurrency: 2,
+            dmv_concurrency: Some(2),
             qap_endpoint: "http://kusto:8080".to_owned(),
             qap_database: Some("experimentqap".to_owned()),
             qap_timeout_seconds: 30,
@@ -3117,6 +3220,7 @@ mod tests {
     #[test]
     fn resolved_fleet_requires_distinct_nodes_numeric_tunables_and_ready_pool_binding() -> Result<()> {
         let mut config = valid();
+        config.dmv_concurrency = None;
         config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
         config.tables.truncate(1);
         config.replica_counts = vec![1];
@@ -3135,7 +3239,7 @@ mod tests {
         let client = |name: &str, pool: &str, cores| FleetClient {
             placement: node(name, pool, cores),
             rows_per_table: 1024,
-            dmv_concurrency: 2,
+            dmv_concurrency: Some(2),
             tunables: arrowcol_tunables::ClientTunables {
                 workers: Some(2),
                 ..Default::default()
@@ -3157,6 +3261,18 @@ mod tests {
             })
             .collect();
         fleet.validate(&config)?;
+        fleet.clients[0].tunables.streams_per_worker = Some(2);
+        assert!(
+            matches!(fleet.validate(&config), Err(error) if error.to_string().contains("platform.fleet.clients[].dmv_concurrency"))
+        );
+        fleet.clients[0].dmv_concurrency = None;
+        fleet.validate(&config)?;
+        config.platform.fleet = Some(fleet.clone());
+        config.dmv_concurrency = Some(28);
+        assert!(
+            matches!(config.validate_dmv_configuration(), Err(error) if error.to_string().contains("dmv_concurrency"))
+        );
+        config.dmv_concurrency = None;
         let encoded = serde_json::to_value(&fleet)?;
         assert!(serde_json::from_value::<FleetPlacement>(encoded.clone()).is_ok());
         let mut unresolved = encoded;
@@ -3294,7 +3410,7 @@ mod tests {
     #[test]
     fn rejects_unbounded_client_workload_and_experiment_matrices() {
         let mut config = valid();
-        config.dmv_concurrency = 65;
+        config.dmv_concurrency = Some(65);
         assert!(config.validate().is_err());
 
         let mut config = valid();
