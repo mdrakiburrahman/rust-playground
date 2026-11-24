@@ -1801,9 +1801,11 @@ mod tests {
                     let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(count, Ordering::SeqCst);
                     if let Some((started, peer)) = peer {
-                        started.send(()).expect("peer must be live");
-                        peer.recv_timeout(Duration::from_secs(10))
-                            .expect("blocking jobs must overlap");
+                        assert!(started.send(()).is_ok(), "peer must be live");
+                        assert!(
+                            peer.recv_timeout(Duration::from_secs(10)).is_ok(),
+                            "blocking jobs must overlap"
+                        );
                     }
                     std::thread::sleep(Duration::from_millis(10));
                     active.fetch_sub(1, Ordering::SeqCst);
