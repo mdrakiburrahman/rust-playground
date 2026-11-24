@@ -87,9 +87,12 @@ export async function reconcileStoppedSnapshot(
   rawPreload: unknown, decodeFile?: (path: string, active: boolean) => Promise<number>,
   verifyActive?: (paths: string[]) => Promise<void>,
   verifyAllActiveCodecs = false,
+  expectedWriterLevel?: number | null,
 ): Promise<{
   rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number;
   activeFileRows: FileGeometry; windowFileRows: FileGeometry;
+  parquetFooter: { physicalCodec: string; rowGroups: number; columnChunks: number; filesWithDeclaration: number;
+    filesMissingDeclaration: number; verifiedWriterLevel: number | null; unrelatedKeyCount: number };
 }> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
@@ -227,6 +230,8 @@ export async function reconcileStoppedSnapshot(
   }
   const selectedPaths = new Set([...ingestionAdds.entries()]
     .filter(([version]) => selected.has(version)).flatMap(([, adds]) => adds.map(add => add.path)));
+  const parquetFooter = { physicalCodec: Compression[expectedCodec]!.toLowerCase(), rowGroups: 0, columnChunks: 0,
+    filesWithDeclaration: 0, filesMissingDeclaration: 0, verifiedWriterLevel: expectedWriterLevel ?? null, unrelatedKeyCount: 0 };
   const decoded = new Map<string, number>();
   let activeRows = 0;
   const activeFileRows: number[] = [];
@@ -239,17 +244,53 @@ export async function reconcileStoppedSnapshot(
     let footerRows: number;
     try {
       const fileMetadata = metadata.fileMetadata();
-      try { footerRows = fileMetadata.numRows(); } finally { fileMetadata.free(); }
-      if (selectedPaths.has(add.path) || (verifyAllActiveCodecs && active.has(add.path))) {
-        if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
-        for (const group of metadata.rowGroups()) {
-          const columns = group.columns();
-          const valid = columns.length > 0 && columns.every(column => column.compression() === expectedCodec);
-          for (const column of columns) column.free();
-          group.free();
-          if (!valid) throw new Error("selected Parquet codec differs from expected codec");
+      try {
+        footerRows = fileMetadata.numRows();
+        if (selectedPaths.has(add.path) || (verifyAllActiveCodecs && active.has(add.path))) {
+          const kv = fileMetadata.keyValueMetadata();
+          const key = "arrowcol.writer.codec_levels.v1";
+          const present = kv.has(key);
+          parquetFooter.unrelatedKeyCount += kv.size - Number(present);
+          if (present) parquetFooter.filesWithDeclaration++;
+          else {
+            parquetFooter.filesMissingDeclaration++;
+            if (expectedWriterLevel !== undefined) throw new Error("selected Parquet writer codec declaration is missing (legacy file)");
+          }
+          if (!metadata.numRowGroups()) throw new Error("selected Parquet file has no row groups");
+          for (let i = 0; i < metadata.numRowGroups(); i++) {
+            const group = metadata.rowGroup(i);
+            try {
+              const width = group.numColumns();
+              if (!width) throw new Error("selected Parquet file has no physical columns");
+              for (let j = 0; j < width; j++) {
+                const column = group.column(j);
+                try {
+                  if (column.compression() !== expectedCodec) throw new Error("selected Parquet codec differs from expected codec");
+                } finally { column.free(); }
+              }
+              if (present && i === 0) {
+                const value: unknown = kv.get(key);
+                let columns: unknown;
+                if (typeof value === "string" && value.length <= 2 + 32 * width) {
+                  try { columns = JSON.parse(value); } catch { /* Never expose parser input. */ }
+                }
+                if (!Array.isArray(columns) || columns.length !== width || !columns.every(pair => {
+                  if (!Array.isArray(pair) || pair.length !== 2 || pair[0] !== parquetFooter.physicalCodec) return false;
+                  if (expectedWriterLevel !== undefined) return pair[1] === expectedWriterLevel;
+                  switch (expectedCodec) {
+                    case Compression.ZSTD: return Number.isInteger(pair[1]) && pair[1] >= 1 && pair[1] <= 22;
+                    case Compression.GZIP: return Number.isInteger(pair[1]) && pair[1] >= 0 && pair[1] <= 9;
+                    case Compression.BROTLI: return Number.isInteger(pair[1]) && pair[1] >= 0 && pair[1] <= 11;
+                    default: return pair[1] === null;
+                  }
+                })) throw new Error("selected Parquet writer codec or level declaration differs");
+              }
+              parquetFooter.rowGroups++;
+              parquetFooter.columnChunks += width;
+            } finally { group.free(); }
+          }
         }
-      }
+      } finally { fileMetadata.free(); }
     } finally { metadata.free(); }
     const rows = decodeFile
       ? uint(await decodeFile(path, active.has(add.path)), "decoded file rows")
@@ -315,7 +356,7 @@ export async function reconcileStoppedSnapshot(
     }
   }
   return {
-    rows, parquetBytes, activeRows, latestVersion, commits: selected.size,
+    rows, parquetBytes, activeRows, latestVersion, commits: selected.size, parquetFooter,
     activeFileRows: fileGeometry(activeFileRows), windowFileRows: fileGeometry(windowFileRows),
   };
 }

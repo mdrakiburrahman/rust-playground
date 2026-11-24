@@ -57,9 +57,17 @@ requires distinct roles.
 | `brotli` | `null` or 0–11 |
 | `zstd` | `null` or 1–22 |
 
-`null` selects the writer's codec-specific default. Footer metadata proves the
-codec, not its level; the requested level must also match both startup and
-pre-admission readbacks.
+`null` selects the writer default (gzip 6, brotli/zstd 1), or no level for a
+level-less codec. Reconciliation checks the physical codec of every selected
+column chunk in every row group. Parquet has **no standard compression-level
+field**. ArrowCol records `arrowcol.writer.codec_levels.v1` as file key-value
+metadata: a JSON array of `[codec, level-or-null]` pairs in physical leaf order,
+derived from the final `WriterProperties` after base and column overrides. This
+is a writer declaration, not an independent measurement of encoder behavior.
+Compression runs require a matching declaration as well as the existing
+startup and pre-admission checks. Legacy files still have physical codec
+evidence, but cannot qualify a level. New footers change file sizes; compare
+bytes between worker modes at the same writer revision.
 
 The driver writes an exclusive original 24-hour deadline and retains failed
 locks for manual owned-cell recovery; it does not resume interrupted series or

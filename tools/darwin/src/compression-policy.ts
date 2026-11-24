@@ -49,6 +49,16 @@ export function parseCompressionSpec(value: unknown): CompressionSpec {
   }
 }
 
+/** Defaults applied by ParquetWriterConfig before building WriterProperties. */
+export function resolvedWriterLevel(spec: CompressionSpec): number | null {
+  if (spec.level !== null) return spec.level;
+  switch (spec.codec) {
+    case "gzip": return 6;
+    case "brotli": case "zstd": return 1;
+    default: return null;
+  }
+}
+
 export function configCompressionSpec(config: unknown): CompressionSpec {
   const configDefaults = defaults(config);
   return parseCompressionSpec({ codec: configDefaults.compression, level: configDefaults.compression_level ?? null });

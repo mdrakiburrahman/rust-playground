@@ -16,9 +16,9 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
   try {
     const tableRoot = join(root, "orders", "table");
     await mkdir(join(tableRoot, "_delta_log"), { recursive: true });
-    const parquet = (rows: number[], codec = Compression.ZSTD) => Buffer.from(writeParquet(
+    const parquet = (rows: number[], codec = Compression.ZSTD, kv = new Map<string, string>()) => Buffer.from(writeParquet(
       WasmTable.fromIPCStream(tableToIPC(tableFromArrays({ value: rows }), "stream")),
-      new WriterPropertiesBuilder().setCompression(codec).build(),
+      new WriterPropertiesBuilder().setCompression(codec).setKeyValueMetadata(kv).build(),
     ));
     const one = parquet([1, 2, 3]);
     const two = parquet([4, 5]);
@@ -70,7 +70,10 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
     };
     for (const codec of ["uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd"]) {
       const expected = wasmCompression(parseCompressionSpec({ codec, level: null }));
-      const encoded = parquet([1, 2, 3], expected);
+      const level = codec === "gzip" ? 6 : ["brotli", "zstd"].includes(codec) ? 1 : null;
+      const encoded = parquet([1, 2, 3], expected, new Map([
+        ["arrowcol.writer.codec_levels.v1", JSON.stringify([[codec, level]])], ["fixture", "not evidence"],
+      ]));
       files["first.parquet"] = encoded;
       files["_delta_log/00000000000000000002.json"] = Buffer.from(
         JSON.stringify({ add: { path: "first.parquet", size: encoded.length, dataChange: true } }) + "\n",
@@ -79,8 +82,14 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       const window = { ...measurement, parquetBytes: encoded.length, parquetBytesPerRow: encoded.length / 3 };
       const selected = { ...receipt, parquetBytes: encoded.length };
       const actual = reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
-        window, [selected], [selected, laterReceipt], expected, preload);
-      assert.equal((await actual).rows, 3);
+        window, [selected], [selected, laterReceipt], expected, preload, undefined, undefined, false, level);
+      const proof = await actual;
+      assert.equal(proof.rows, 3);
+      assert.equal(proof.parquetFooter.filesWithDeclaration, 1);
+      assert.equal(proof.parquetFooter.verifiedWriterLevel, level);
+      assert.ok(!JSON.stringify(proof).includes("not evidence"));
+      await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+        window, [selected], [selected, laterReceipt], expected, preload, undefined, undefined, false, 8), /level declaration differs/);
       const wrong = expected === Compression.SNAPPY ? Compression.ZSTD : Compression.SNAPPY;
       await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
         window, [selected], [selected, laterReceipt], wrong, preload), /selected Parquet codec differs/);
@@ -106,9 +115,13 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
         measurement, receipts, allReceipts, Compression.ZSTD, proof);
     assert.deepEqual(await reconcile([receipt]),
-      { rows: 3, parquetBytes: one.length, activeRows: 5, latestVersion: 4, commits: 1,
+      { parquetFooter: { physicalCodec: "zstd", rowGroups: 1, columnChunks: 1, filesWithDeclaration: 0,
+          filesMissingDeclaration: 1, verifiedWriterLevel: null, unrelatedKeyCount: 1 },
+        rows: 3, parquetBytes: one.length, activeRows: 5, latestVersion: 4, commits: 1,
         activeFileRows: { count: 2, min: 2, p50: 2.5, max: 3, mean: 2.5 },
         windowFileRows: { count: 1, min: 3, p50: 3, max: 3, mean: 3 } });
+    await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+      measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload, undefined, undefined, false, 1), /legacy file/);
     const inspected: string[] = [];
     await reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
       measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,

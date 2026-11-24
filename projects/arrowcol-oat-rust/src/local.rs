@@ -340,6 +340,7 @@ fn snapshot_proof(root: &Path, files: &[SnapshotFile]) -> Result<Value> {
         }
     }
     let mut rows = 0_u64;
+    let mut footer = arrow_deltalake::footer::FooterEvidence::default();
     for (path, expected_size) in referenced {
         let file = files
             .iter()
@@ -347,6 +348,9 @@ fn snapshot_proof(root: &Path, files: &[SnapshotFile]) -> Result<Value> {
             .context("snapshot is missing a historical Delta payload")?;
         ensure!(file.size == expected_size, "Delta Add size differs from copied payload");
         let builder = ParquetRecordBatchReaderBuilder::try_new(regular_file(&root.join(&path))?)?;
+        if active.contains(&path) {
+            footer.observe(builder.metadata())?;
+        }
         let footer_rows = u64::try_from(builder.metadata().file_metadata().num_rows())?;
         let mut decoded_rows = 0_u64;
         for batch in builder.build()? {
@@ -365,7 +369,7 @@ fn snapshot_proof(root: &Path, files: &[SnapshotFile]) -> Result<Value> {
     ensure!(rows > 0, "snapshot contains no committed active rows");
     Ok(json!({
         "latestVersion": logs.last_key_value().context("missing Delta version")?.0,
-        "rowCount": rows,
+        "rowCount": rows, "active_parquet_footer": footer,
         "schemaString": schema.context("snapshot has no Delta schema")?,
     }))
 }
@@ -481,6 +485,7 @@ pub(crate) fn export_stopped(
             &json!({
                 "schema_version": 1, "run_id": run_id, "table": table,
                 "latestVersion": proof["latestVersion"], "rowCount": proof["rowCount"],
+                "active_parquet_footer": proof["active_parquet_footer"],
                 "schemaString": proof["schemaString"], "files": files, "writers": writers,
                 "semantics": "last committed stopped snapshot; not proof all admitted rows flushed"
             }),
@@ -542,6 +547,7 @@ pub(crate) fn stopped_snapshot_references(destination: &Path, run_id: &str, tabl
                 "run_id": run_id, "table": table, "manifest": format!("{run_id}/{relative}"),
                 "manifest_sha256": sha256, "table_version": version, "row_count": rows,
                 "source": "verified_stopped_snapshot_manifest",
+                "active_parquet_footer": manifest["active_parquet_footer"],
             }),
         );
     }
@@ -694,9 +700,14 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
         assert_eq!(manifest["rowCount"], 2);
         assert_eq!(manifest["latestVersion"], 1);
+        let footer = &manifest["active_parquet_footer"];
+        assert_eq!(footer["files"], 1); // exclude the removed Add
+        assert_eq!(footer["files_missing_writer_declaration"], 1);
+        assert_eq!(footer["samples"][0]["writer_declaration_present"], false);
         let references = stopped_snapshot_references(&destination, &run, &tables)?;
         assert_eq!(references[&tables[0]]["table_version"], 1);
         assert_eq!(references[&tables[0]]["row_count"], 2);
+        assert_eq!(references[&tables[0]]["active_parquet_footer"], *footer);
         assert_eq!(
             references[&tables[0]]["manifest_sha256"],
             file_digest(&root.join("manifest.json"))?.1

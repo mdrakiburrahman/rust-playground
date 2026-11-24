@@ -28,6 +28,7 @@ mod delta_io;
 pub mod delta_stats;
 #[cfg(feature = "delta")]
 pub use delta_io::{DeltaRuntimeConfig, runtime_config};
+pub mod footer;
 pub mod layout;
 #[cfg(feature = "delta")]
 pub mod maintenance;

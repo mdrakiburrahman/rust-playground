@@ -2031,6 +2031,14 @@ mod io_tests {
             let reader =
                 parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&file.file.path)?)?;
             assert!(reader.metadata().num_row_groups() > 1);
+            let mut footer = crate::footer::FooterEvidence::default();
+            footer.observe(reader.metadata())?;
+            let evidence = serde_json::to_value(footer)?;
+            assert_eq!(evidence["files_with_writer_declaration"], 1);
+            assert_eq!(evidence["samples"][0]["physical_codec"], "snappy");
+            assert!(evidence["samples"][0]["writer_declared_level"].is_null());
+            assert_eq!(evidence["samples"][1]["physical_codec"], "zstd");
+            assert_eq!(evidence["samples"][1]["writer_declared_level"], 7);
             for group in reader.metadata().row_groups() {
                 assert_eq!(group.num_columns(), 2);
                 for col in group.columns() {
@@ -3058,17 +3066,7 @@ impl LayoutReadback {
         let mut parquet_column_options = serde_json::Map::new();
         let mut columns_unavailable = descriptor.columns().len() > 256;
         for column in descriptor.columns().iter().take(256) {
-            use parquet::basic::Compression;
-            let (codec, level) = match properties.compression(column.path()) {
-                Compression::UNCOMPRESSED => ("uncompressed", None),
-                Compression::SNAPPY => ("snappy", None),
-                Compression::GZIP(level) => ("gzip", Some(i64::from(level.compression_level()))),
-                Compression::BROTLI(level) => ("brotli", Some(i64::from(level.compression_level()))),
-                Compression::LZ4 => ("lz4", None),
-                Compression::LZ4_RAW => ("lz4_raw", None),
-                Compression::ZSTD(level) => ("zstd", Some(i64::from(level.compression_level()))),
-                Compression::LZO => ("lzo", None),
-            };
+            let (codec, level) = crate::footer::codec(properties.compression(column.path()));
             if parquet_columns
                 .insert(
                     column.path().string(),
