@@ -6,6 +6,8 @@ import { baselineDelta, immutableBlob, readBlob } from './aks-data-safety.js';
 import { parseStop } from './aks-lifecycle.js';
 import { CleanupDeadlineExpiredError } from './aks-cleanup-budget.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
+import { readFrozenDeltaCommits } from './aks-delta-preservation.js';
+import { COLLECTOR_TERMINAL_LOG_MAX_BYTES, parseTerminalSummary, terminalSummaryClear, terminalTableDigest, type BoundTerminalSummary } from './aks-terminal-evidence.js';
 
 interface Ref { blob: string; etag: string; sha256: string }
 interface Input { schema_version: 1; campaign_id: string; orchestration_run_id: string; cell_run_id: string;
@@ -106,7 +108,7 @@ function parseReconciliation(raw: unknown): Reconciliation {
     throw new Error('Invalid exact measured reconciliation proof.');
   return raw as unknown as Reconciliation;
 }
-async function refs(azure: Azure, inventory: RunInventory, guard: () => Promise<void>) {
+async function refs(azure: Azure, inventory: RunInventory, guard: () => Promise<void>, deadlineUnixMs: number) {
   const destination = inventory.evidence_destination;
   if (destination && (destination.account !== azure.c.account || destination.container !== azure.c.checkpoints))
     throw new Error('Finalization evidence destination differs from the selected stamp.');
@@ -139,8 +141,62 @@ async function refs(azure: Azure, inventory: RunInventory, guard: () => Promise<
           'terminal_identity_unavailable' : null;
   const make = (blob: string | null, value: { etag: string; value: Record<string, unknown> } | undefined): Ref | null =>
     blob && value ? { blob, etag: value.etag, sha256: digest(value.value) } : null;
+  let terminal_summaries: BoundTerminalSummary[] | null = null;
+  let summary_required = false;
+  if (capture && Array.isArray(capture.value.workloads)) {
+    summary_required = capture.value.workloads.some(workload => object(workload) && object(workload.original_stop) &&
+      (workload.original_stop.terminal_evidence_version === 1 ||
+        Array.isArray(workload.original_stop.logs) && workload.original_stop.logs.some(log =>
+          object(log) && Object.hasOwn(log, 'terminal_summary_status'))));
+    if (!identityUnavailable && verdicts.length > 0 && verdicts.every(value => value.classification === 'exit_0') && initial && final &&
+        final.observation === 'table' && final.row_count !== null && (initial.observation === 'observed_absent' || initial.row_count !== null)) {
+      try {
+        const candidates: BoundTerminalSummary[] = [];
+        for (const resource of inventory.resources.filter(value => value.role === 'collector' && value.state !== 'absent')) {
+          const workload = capture.value.workloads.find(value => object(value) && canonical_json(value.identity) ===
+            canonical_json({ api_version: resource.api_version, kind: resource.kind, name: resource.name, namespace: resource.namespace, uid: resource.uid }));
+          if (!object(workload)) throw new Error('Original terminal summary workload is unavailable.');
+          const stop = parseStop(workload.original_stop, inventory, 'bounded_drain', resource);
+          if (stop.initial_desired !== stop.initial_pods.length)
+            throw new Error('Original terminal summary replica coverage is unavailable.');
+          for (const pod of stop.initial_pods) for (const container of pod.containers) {
+            const ended = stop.terminal_pods.find(value => value.uid === pod.uid && value.name === pod.name);
+            const terminal = ended?.containers.find(value => value.name === container.name);
+            const logs = stop.logs.filter(log => log.phase === 'terminal' && log.pod_uid === pod.uid &&
+              log.pod_name === pod.name && log.container === container.name);
+            if (container.restart_count !== 0 || terminal?.restart_count !== 0 || terminal.exit_code !== 0 ||
+                logs.length !== 1 || logs[0]!.full_log_read !== true || logs[0]!.restart_count !== 0 ||
+                logs[0]!.collector_startup_observed !== true ||
+                logs[0]!.terminal_summary_status !== 0 || logs[0]!.bytes >= COLLECTOR_TERMINAL_LOG_MAX_BYTES)
+              throw new Error('Original terminal summary log completeness/lifetime is unavailable.');
+            const summary = parseTerminalSummary(logs[0]!.terminal_summary);
+            if (!terminalSummaryClear(summary)) throw new Error('Terminal summary accounting is incomplete or ambiguous.');
+            candidates.push({ pod_name: pod.name, pod_uid: pod.uid, container: container.name,
+              restart_count: 0, exit_code: 0, summary });
+          }
+        }
+        const expectedTable = terminalTableDigest(azure.c.account, azure.c.data, final.table_root);
+        const tuples = candidates.flatMap(value => value.summary.commits);
+        if (new Set(candidates.map(value => `${value.pod_uid}:${value.container}`)).size !== candidates.length ||
+            tuples.some(value => value.table_id !== expectedTable) ||
+            new Set(tuples.map(value => value.version)).size !== tuples.length)
+          throw new Error('Terminal summary table/version identities differ or duplicate.');
+        const frozen = await readFrozenDeltaCommits(azure, initial, final, guard, deadlineUnixMs);
+        const numeric = tuples.map(({ version, rows, files, parquet_bytes }) => ({ version, rows, files, parquet_bytes }))
+          .sort((a, b) => a.version - b.version);
+        const rows = candidates.reduce((sum, value) => sum + value.summary.committed_rows, 0);
+        if (canonical_json(numeric) !== canonical_json(frozen) || !Number.isSafeInteger(rows) ||
+            rows !== final.row_count - (initial.observation === 'table' ? initial.row_count! : 0))
+          throw new Error('Terminal summary tuples differ from independently frozen Delta.');
+        terminal_summaries = candidates;
+      } catch (error) {
+        if (error instanceof CampaignConflictError || error instanceof CleanupDeadlineExpiredError) throw error;
+      }
+    }
+  }
+  await guard();
   return { terminal_capture: make(names.terminal_capture, capture), delta_before: make(names.delta_before, before),
-    delta_terminal: make(names.delta_terminal, terminal), verdicts, initial, final, unavailable_reason };
+    delta_terminal: make(names.delta_terminal, terminal), verdicts, initial, final, unavailable_reason, terminal_summaries, summary_required };
 }
 async function context(store: CampaignStore, azure: Azure, input: Input, env: NodeJS.ProcessEnv) {
   const request = { schema_version: 1, campaign_id: input.campaign_id, orchestration_run_id: input.orchestration_run_id,
@@ -153,13 +209,13 @@ async function context(store: CampaignStore, azure: Azure, input: Input, env: No
     if (next.etag !== input.expected_etag || canonical_json(next.inventory) !== canonical_json(current.inventory))
       throw new CampaignConflictError();
   };
-  return { inventory: current.inventory, guard, evidence: await refs(azure, current.inventory, guard) };
+  return { inventory: current.inventory, guard, deadline, evidence: await refs(azure, current.inventory, guard, deadline) };
 }
 export async function shutdownFinalizationInputs(store: CampaignStore, azure: Azure, raw: unknown, env: NodeJS.ProcessEnv) {
   const input = parseInput(raw), current = await context(store, azure, input, env);
   return { schema_version: 1, inventory_etag: input.expected_etag, terminal_capture: current.evidence.terminal_capture,
     delta_before: current.evidence.delta_before, delta_terminal: current.evidence.delta_terminal,
-    unavailable_reason: current.evidence.unavailable_reason };
+    unavailable_reason: current.evidence.unavailable_reason, terminal_summaries: current.evidence.terminal_summaries };
 }
 function valueFor(input: Input, inventory: RunInventory, evidence: Awaited<ReturnType<typeof refs>>, reconciliation: Reconciliation) {
   const { proof } = reconciliation;
@@ -176,6 +232,7 @@ function valueFor(input: Input, inventory: RunInventory, evidence: Awaited<Retur
     } else if (reconciliation.profile !== 'single_hot_table' || !proof || proof.status !== 'matched' ||
         proof.post_teardown_verification !== 'matched_final_delta_log' || proof.expected_rows === null ||
         proof.observed_rows === null || proof.settled_zero_ambiguity !== true || proof.teardown_admissions_clear !== true ||
+        evidence.summary_required && evidence.terminal_summaries === null ||
         !evidence.initial || evidence.initial.observation === 'table' && evidence.initial.row_count === null ||
         !evidence.final || evidence.final.observation !== 'table' || evidence.final.row_count === null)
       reason_code = 'reconciliation_unavailable';
@@ -220,7 +277,7 @@ export async function shutdownFinalize(store: CampaignStore, azure: Azure, raw: 
   for (const key of ['terminal_capture', 'delta_before', 'delta_terminal'] as const)
     if (canonical_json(raw[key]) !== canonical_json(current.evidence[key])) throw new Error(`Finalization ${key} reference changed.`);
   const verifySources = async () => {
-    const observed = await refs(azure, current.inventory, current.guard);
+    const observed = await refs(azure, current.inventory, current.guard, current.deadline);
     if (canonical_json(observed) !== canonical_json(current.evidence)) throw new CampaignConflictError();
     await current.guard();
   };
@@ -248,7 +305,7 @@ export async function shutdownFinalize(store: CampaignStore, azure: Azure, raw: 
 export async function shutdownFinalizationRead(store: CampaignStore, azure: Azure, raw: unknown, env: NodeJS.ProcessEnv) {
   const input = parseInput(raw), current = await context(store, azure, input, env);
   const result = await readValidated(azure, current.inventory, current.evidence, current.guard);
-  if (canonical_json(await refs(azure, current.inventory, current.guard)) !== canonical_json(current.evidence))
+  if (canonical_json(await refs(azure, current.inventory, current.guard, current.deadline)) !== canonical_json(current.evidence))
     throw new CampaignConflictError();
   await current.guard();
   return result;
@@ -258,13 +315,15 @@ export async function requireFinalizedCollectorStop(store: CampaignStore, azure:
   await authority.assertCurrent();
   const snapshot = await store.read();
   if (!snapshot || canonical_json(snapshot.state.runInventory) !== canonical_json(inventory)) throw new CampaignConflictError();
+  const deadline = Date.now() + 35_000;
   const guard = async () => {
+    if (Date.now() >= deadline) throw new CleanupDeadlineExpiredError('Shutdown source verification shared deadline expired.');
     await authority.assertCurrent();
     const current = await store.read();
     if (!current || current.etag !== snapshot.etag || canonical_json(current.state.runInventory) !== canonical_json(inventory))
       throw new CampaignConflictError();
   };
-  const evidence = await refs(azure, inventory, guard);
+  const evidence = await refs(azure, inventory, guard, deadline);
   if (evidence.unavailable_reason || evidence.verdicts.some(value => value.classification.includes('143')))
     throw new Error('Collector shutdown finalization is unavailable or failed; release and handoff withheld.');
   const saved = await readValidated(azure, inventory, evidence, guard);
@@ -273,6 +332,6 @@ export async function requireFinalizedCollectorStop(store: CampaignStore, azure:
       saved.verdicts.length > 0 && saved.verdicts.every(value =>
         ['exit_0', 'exit_nonzero', 'exit_oom_killed'].includes(value.classification))))
     throw new Error('Collector shutdown finalization is unavailable or failed; release and handoff withheld.');
-  if (canonical_json(await refs(azure, inventory, guard)) !== canonical_json(evidence)) throw new CampaignConflictError();
+  if (canonical_json(await refs(azure, inventory, guard, deadline)) !== canonical_json(evidence)) throw new CampaignConflictError();
   await guard();
 }

@@ -1141,6 +1141,7 @@ impl GroupPublisher<'_> {
                 let mut inputs = Vec::with_capacity(group.len());
                 for entry in group.iter() {
                     if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
+                        arrow_deltalake::telemetry::mark_terminal_commit_incomplete();
                         if stamp != entry.ingested_at_ms {
                             return Err(ExportFailure::Transient(
                                 "replayed publication has conflicting ingestion timestamps; retained for reconciliation"
@@ -1245,6 +1246,7 @@ impl GroupPublisher<'_> {
             }
             for entry in group.iter() {
                 if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
+                    arrow_deltalake::telemetry::mark_terminal_commit_incomplete();
                     if stamp != entry.ingested_at_ms {
                         return Err(ExportFailure::Transient(
                             "replayed publication has conflicting ingestion timestamps; retained for reconciliation"

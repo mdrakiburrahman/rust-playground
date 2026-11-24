@@ -605,6 +605,7 @@ http.createServer((request, response) => {
             campaign_cli_paths: None,
             maintenance_cell_baseline: Vec::new(),
             stopped_collector_logs: None,
+            shutdown_inputs: None,
         };
         let script = script_path.clone();
         let mut command = || {
