@@ -77,6 +77,8 @@ macro_rules! gated_capability {
 }
 
 const CAPABILITIES: &[Capability] = &[
+    capability!("delta.target_file_size_bytes", "table default (128 MiB)"),
+    capability!("delta.checkpoint_interval", "table default (10)"),
     capability!("client.payload_customer_id", "delivery client ID"),
     capability!("client.corpus_rows", "component default"),
     capability!("client.corpus_bytes", "component default"),
@@ -706,6 +708,11 @@ impl Tunables {
                 "maintenance.enabled" | "maintenance.operations" | "maintenance.apply"
             ) {
                 (controls, "maintenance_runner_control")
+            } else if matches!(
+                name.as_str(),
+                "delta.target_file_size_bytes" | "delta.checkpoint_interval"
+            ) {
+                (controls, "delta_table_initialization")
             } else if name == "logging.router" && value == "inherit" {
                 (controls, "router_log_filter_inheritance")
             } else {
@@ -747,6 +754,13 @@ impl Tunables {
     /// # Errors
     /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
     pub fn parse_oat_json(value: Value) -> Result<Self> {
+        if let Some(delta) = value.get("delta").and_then(Value::as_object) {
+            for key in delta.keys() {
+                if !matches!(key.as_str(), "target_file_size_bytes" | "checkpoint_interval") {
+                    bail!("delta.{key}: unknown field");
+                }
+            }
+        }
         if let Some(builder) = value.get("client").and_then(|client| client.get("identity_builder"))
             && !matches!(builder.as_str(), Some("formatted_rows" | "direct_utf8"))
         {
@@ -794,6 +808,29 @@ impl Tunables {
         default_flight_bytes: u64,
         oat_collector_defaults: bool,
     ) -> Result<()> {
+        if let Some(delta) = &self.delta {
+            let mut properties = BTreeMap::new();
+            for (field, property, value) in [
+                (
+                    "target_file_size_bytes",
+                    "delta.targetFileSize",
+                    delta.target_file_size_bytes,
+                ),
+                (
+                    "checkpoint_interval",
+                    "delta.checkpointInterval",
+                    delta.checkpoint_interval,
+                ),
+            ] {
+                if let Some(value) = value {
+                    let property_value = value.to_string();
+                    let individual = BTreeMap::from([(property.to_owned(), property_value.clone())]);
+                    arrowcol_props::validate_table_properties(&individual).with_context(|| format!("delta.{field}"))?;
+                    properties.insert(property.to_owned(), property_value);
+                }
+            }
+            arrowcol_props::validate_table_properties(&properties).context("delta table initialization properties")?;
+        }
         if let Some(client) = &self.client {
             if client.identity_builder.is_some() && client.data_profile != Some(ClientDataProfile::Realistic) {
                 bail!("client.identity_builder requires client.data_profile=realistic");

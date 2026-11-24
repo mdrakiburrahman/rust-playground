@@ -96,6 +96,12 @@ pub struct Tunables {
     pub transport: Option<TransportTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrow_ipc: Option<ArrowIpcTunables>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_delta"
+    )]
+    pub delta: Option<DeltaTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +114,31 @@ pub struct Tunables {
     pub maintenance: Option<MaintenanceTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingTunables>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaTunables {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub target_file_size_bytes: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub checkpoint_interval: Option<u64>,
+}
+
+fn deserialize_present_delta<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<DeltaTunables>, D::Error> {
+    DeltaTunables::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
