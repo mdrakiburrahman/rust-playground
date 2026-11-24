@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config, canonical_json } from '../../infra/azure/bootstrap.js';
 import { createBlobCampaignStore, newCampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
-import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement, readOfficialKustoWindow,
+import { assessCommitRateResolution, createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement, readOfficialKustoWindow,
   readOfficialNativeWindow } from './aks-scale-evidence.js';
 import type { ScaleMeasurementEnvelope } from './aks-scale.js';
 
@@ -26,6 +26,12 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, 
     cleanup: { stop_admission: step(), bounded_drain: step(), evidence_capture: step(), stop_maintenance: step(),
       terminal_capture: step(), handoff: step() } };
   const effective = canonical_json({ typed_oat_config: { tables: ['synthetic_offline_table'] } });
+  const seconds = window ? (window.endMs - window.startMs) / 1000 : 30;
+  const screen = { durable_rows_per_s: 1234, rate_resolution_rows_per_second: 30 / seconds, window_commit_count: 100, max_commit_rows: 30 };
+  const outputFixture = { teardown_outcome: 'succeeded',
+    scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
+    measurement_start_unix_ms: window?.startMs ?? now - 60_000, measurement_end_unix_ms: window?.endMs ?? now - 30_000,
+    window_seconds: seconds, rows_per_second: 1234 };
   const document = { schema_version: 1, scope: 'original_official_cell_window_not_paired_scale_authorization',
     origin: { campaign_id: campaignId, owner_id: ownerId, fencing_token: 1, orchestration_run_id: orchestrationId,
       cell_run_id: cellId, namespace_uid: null },
@@ -33,15 +39,11 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, 
     source_revision: 'a'.repeat(40),
     official_result: { run_id: cellId, table: 'synthetic_offline_table', status: 'succeeded', git_sha: 'a'.repeat(40),
       tunables: { orchestration_run_id: orchestrationId }, evidence: { version: 1, teardown_outcome: 'succeeded',
-        durable_commits: { collector_teardown_admissions: { status: 'clear', cancelled_ambiguous: 0 }, run_cumulative_output: { teardown_outcome: 'succeeded' },
-          complete_30_second_commit_windows: [{ teardown_outcome: 'succeeded' }],
+        screen_v1: structuredClone(screen), durable_commits: { output_throughput: structuredClone(outputFixture),
+          delta_log_reconciliation: { csv: structuredClone(screen) }, collector_teardown_admissions: { status: 'clear', cancelled_ambiguous: 0 }, run_cumulative_output: { teardown_outcome: 'succeeded' },
+          complete_30_second_commit_windows: [{ teardown_outcome: 'succeeded', rate_resolution_rows_per_second: 1, window_commit_count: 100 }],
           post_teardown_delta_reconciliation: { status: 'matched' } },
-        reconciliation: { status: 'within_bound', settled: true, ambiguous_rows: 0 }, commit_window_output_throughput: {
-        teardown_outcome: 'succeeded',
-        scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
-        measurement_start_unix_ms: window?.startMs ?? now - 60_000, measurement_end_unix_ms: window?.endMs ?? now - 30_000,
-        window_seconds: window ? (window.endMs - window.startMs) / 1000 : 30, rows_per_second: 1234,
-      } } } };
+        reconciliation: { status: 'within_bound', settled: true, ambiguous_rows: 0 }, commit_window_output_throughput: structuredClone(outputFixture) } } };
   let bytes = supplied ?? Buffer.from(canonical_json(document));
   const decoded = JSON.parse(new TextDecoder().decode(bytes)) as typeof document;
   const origin = decoded.origin, output = decoded.official_result.evidence.commit_window_output_throughput;
@@ -393,7 +395,7 @@ test('real raw POST/GET identity crosses Rust immutable publication, custody and
     assert.notEqual(matched.original.reference.effective_config_sha256, hash(exactBytes));
     assert.equal(matched.original.startMs, 1_000);
     assert.equal(matched.original.endMs, 31_000);
-    assert.equal(matched.original.committedRowsPerSecond, 0);
+    assert.equal(matched.original.committedRowsPerSecond, null);
     assert.ok(matched.original.unavailableReasons.includes('original_official_cell_did_not_succeed'));
     assert.match(matched.authorization, /hold/);
     const otherBytes = Buffer.from(proof.cases.find(other => other !== entry)!.submitted_config_body, 'utf8');
@@ -424,6 +426,31 @@ test('immutable measurement reader uses selected authenticated storage and canno
   for (const invalid of [{ ...window, startMs: window.startMs + 1 }, { ...window, endMs: window.endMs - 1 },
     { ...window, notBeforeMs: window.startMs + 1 }, { ...window, deadlineAtMs: window.deadlineAtMs + 1 }])
     await assert.rejects(verifier.verifyMeasurement(envelope, f.state, invalid), /original cell\/window\/deadline/);
+});
+
+test('injected scale verifier reports low-commit windows while keeping admission closed', async t => {
+  const f = syntheticAuthenticatedTransport(t), raw = Buffer.from('exact submission');
+  f.document.submitted_config_sha256 = hash(raw);
+  f.inventory.official_measurement!.submitted_config_sha256 = hash(raw);
+  f.document.official_result.evidence.durable_commits.complete_30_second_commit_windows[0]!.window_commit_count = 99;
+  f.publishSyntheticDocument();
+  const verifier = createScaleEvidenceVerifier({ ...f.options, submittedConfigBytes: raw });
+  const envelope: ScaleMeasurementEnvelope = { schema_version: 2, campaign_id: campaignId, cell_run_id: cellId,
+    observed_at_ms: now - 30_000, window_ms: 30_000, measurement: { committedRowsPerSecond: 1234, qapPendingBacklog: null } };
+  const window = { startMs: now - 60_000, endMs: now - 30_000, notBeforeMs: now - 60_000, deadlineAtMs: f.options.deadlineAtMs };
+  await assert.rejects(verifier.verifyMeasurement(envelope, f.state, window), error => {
+    assert.match(String(error), /paired baseline\/trial cell custody/);
+    assert.match(String(error), /low_commit_windows: 1 \(99\)/);
+    return true;
+  });
+  Object.assign(f.document.official_result.evidence.screen_v1, { rate_resolution_rows_per_second: null });
+  Object.assign(f.document.official_result.evidence.durable_commits.delta_log_reconciliation.csv, { rate_resolution_rows_per_second: null });
+  f.publishSyntheticDocument();
+  await assert.rejects(verifier.verifyMeasurement(envelope, f.state, window), error => {
+    assert.match(String(error), /provisional_commit_rate_resolution_unavailable/);
+    assert.match(String(error), /low_commit_windows: 1 \(99\)/);
+    return true;
+  });
 });
 
 test('immutable measurement reader rejects changed bytes, source identity, permissions and custody', async t => {
@@ -561,7 +588,7 @@ test('actual Rust immutable producer bytes remain an original window with unavai
   const f = syntheticAuthenticatedTransport(t, bytes), observed = await f.read();
   assert.equal(observed.startMs, 1000);
   assert.equal(observed.endMs, 31_000);
-  assert.equal(observed.committedRowsPerSecond, 0);
+  assert.equal(observed.committedRowsPerSecond, null);
   assert.ok(observed.unavailableReasons.includes('authoritative_submitted_config_identity_unavailable'));
   assert.ok(observed.unavailableReasons.includes('original_official_cell_did_not_succeed'));
 });
@@ -572,7 +599,7 @@ test('official reader never reports failed or nonfinal cells as performance', as
     await t.test(defect, async t => {
       const f = syntheticAuthenticatedTransport(t);
       const result = f.document.official_result;
-      if (defect === 'failed') result.status = 'failed';
+      if (defect === 'failed') { result.status = 'failed'; Object.assign(result.evidence, { screen_v1: null }); }
       if (defect === 'missing-teardown') result.evidence.teardown_outcome = 'pending';
       if (defect === 'unsettled') result.evidence.reconciliation.settled = false;
       if (defect === 'ambiguous') result.evidence.reconciliation.ambiguous_rows = 1;
@@ -585,4 +612,52 @@ test('official reader never reports failed or nonfinal cells as performance', as
       assert.ok(read.unavailableReasons.includes(defect === 'failed' ? 'original_official_cell_did_not_succeed' : 'final_teardown_or_delivery_evidence_unavailable'));
     });
   }
+});
+
+
+test('original cell resolution is provisional when reconciliation or window resolution is absent', async t => {
+  for (const defect of ['none', 'missing-screen-resolution', 'mismatched-csv', 'missing-window-resolution', 'different-output', 'failed-screen'] as const) {
+    await t.test(defect, async t => {
+      const f = syntheticAuthenticatedTransport(t);
+      const evidence = f.document.official_result.evidence;
+      if (defect === 'missing-screen-resolution') {
+        Object.assign(evidence.screen_v1, { rate_resolution_rows_per_second: null });
+        Object.assign(evidence.durable_commits.delta_log_reconciliation.csv, { rate_resolution_rows_per_second: null });
+      }
+      if (defect === 'mismatched-csv') evidence.durable_commits.delta_log_reconciliation.csv.max_commit_rows++;
+      if (defect === 'missing-window-resolution') Object.assign(evidence.durable_commits.complete_30_second_commit_windows[0]!, { rate_resolution_rows_per_second: null });
+      if (defect === 'different-output') evidence.durable_commits.output_throughput.rows_per_second++;
+      if (defect === 'failed-screen') f.document.official_result.status = 'failed';
+      f.publishSyntheticDocument();
+      const measured = await f.read();
+      if (defect === 'none') assert.equal(measured.rateResolutionRowsPerSecond, 1);
+      else if (defect === 'different-output') {
+        assert.equal(measured.committedRowsPerSecond, null);
+        assert.ok(measured.unavailableReasons.includes('published_commit_window_differs_from_durable_output'));
+      } else if (defect === 'failed-screen') {
+        assert.equal(measured.committedRowsPerSecond, null);
+        assert.ok(measured.unavailableReasons.includes('failed_cell_screen_v1_not_null'));
+      } else assert.ok(measured.unavailableReasons.includes('provisional_commit_rate_resolution_unavailable'));
+    });
+  }
+});
+
+test('resolution comparison respects baseline and paired thresholds without authorizing the trial', async t => {
+  const f = syntheticAuthenticatedTransport(t);
+  const windows = f.document.official_result.evidence.durable_commits.complete_30_second_commit_windows;
+  windows[0]!.window_commit_count = 99;
+  windows.push({ ...windows[0]!, window_commit_count: 100 });
+  f.publishSyntheticDocument();
+  const original = await f.read();
+  assert.deepEqual(original.lowCommitWindows, [{ index: 1, commitCount: 99 }]);
+  const cell = (rate: number, resolution: number | null) => ({ ...original, unavailableReasons: [],
+    committedRowsPerSecond: rate, rateResolutionRowsPerSecond: resolution });
+  const before = cell(1000, 10), after = cell(1000, 10);
+  assert.equal(assessCommitRateResolution(cell(1010, 10), before, after, 'AB'), 'resolved');
+  assert.equal(assessCommitRateResolution(cell(1009, 10), before, after, 'AB'), 'unresolved');
+  assert.equal(assessCommitRateResolution(cell(1010, 10), before, cell(1015, 10), 'BA'), 'unresolved');
+  assert.equal(assessCommitRateResolution(cell(1020, 10), before, cell(1000, 10.01), 'AB'), 'invalid_aa');
+  assert.equal(assessCommitRateResolution(cell(1020, null), before, after, 'AB'), 'provisional');
+  assert.equal(assessCommitRateResolution(cell(Number.NaN, 10), before, after, 'AB'), 'provisional');
+  assert.equal(assessCommitRateResolution({ ...cell(1020, 10), unavailableReasons: ['provisional_commit_rate_resolution_unavailable'] }, before, after, 'AB'), 'provisional');
 });
