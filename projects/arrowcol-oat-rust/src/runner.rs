@@ -5029,6 +5029,8 @@ async fn run_matrix_cell(
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
+    let expected_source_revision = local_build_source_revision()?;
+    verify_collector_startup_source_revision(&expected_source_revision, &baseline_logs)?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
     let diagnostics_root = Path::new("out/arrowcol-oat/admission-diagnostics");
@@ -5070,6 +5072,7 @@ async fn run_matrix_cell(
         .await?;
         client_run.evidence.durable_commits = durable_commits;
         let process_logs = platform.process_logs(config).await?;
+        verify_collector_startup_source_revision(&expected_source_revision, &process_logs)?;
         client_run.evidence.processes = Some(process_evidence_for_cell(
             config,
             &process_logs,

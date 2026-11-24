@@ -1141,6 +1141,32 @@ fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRo
     Ok(())
 }
 
+fn verify_collector_startup_source_revision(expected_source_revision: &str, logs: &[ProcessLog]) -> Result<()> {
+    if !is_lower_hex_string(expected_source_revision, 40) {
+        bail!("timed OAT runs require GIT_SHA to be a full 40-character lowercase Git revision");
+    }
+    let collectors = logs
+        .iter()
+        .filter(|log| matches!(log.role, ComponentRole::Collector))
+        .collect::<Vec<_>>();
+    if collectors.is_empty() {
+        bail!("collector startup source_revision readback is missing");
+    }
+    for log in collectors {
+        let observed = process_configurations(&log.text)?
+            .get("source_revision")
+            .and_then(Value::as_str)
+            .context("collector startup source_revision readback is missing")?;
+        if !is_lower_hex_string(observed, 40) {
+            bail!("collector startup source_revision readback must be a full 40-character lowercase Git revision");
+        }
+        if observed != expected_source_revision {
+            bail!("collector startup source_revision does not match the checked-out source revision");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
     let mut logs = logs.to_vec();
@@ -2130,6 +2156,48 @@ mod startup_readback_tests {
             .iter().find(|entry| entry["component"] == "collector").context("missing collector evidence")?;
         assert!(collector["startup_source_revision"].is_null());
         assert_eq!(collector["source_revision"], label_revision);
+        Ok(())
+    }
+
+    #[test]
+    fn timed_collector_startup_revision_gate_rejects_missing_mismatched_and_local_revisions() -> Result<()> {
+        let expected = "a".repeat(40);
+        let make_log = |text: String| ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "collector-test".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 1,
+            stdout: text.clone(),
+            stderr: String::new(),
+            text,
+        };
+        let matching = format!("arrowcol_effective_config {}\n", json!({
+            "component": "build",
+            "config": {"source_revision": expected}
+        }));
+        verify_collector_startup_source_revision(&expected, &[make_log(matching)])?;
+
+        assert!(verify_collector_startup_source_revision(
+            &expected,
+            &[make_log("unrelated startup output\n".to_owned())],
+        )
+        .is_err());
+
+        let mismatched = "b".repeat(40);
+        let mismatched_log = format!("arrowcol_effective_config {}\n", json!({
+            "component": "build",
+            "config": {"source_revision": mismatched}
+        }));
+        assert!(verify_collector_startup_source_revision(&expected, &[make_log(mismatched_log)]).is_err());
+        assert!(verify_collector_startup_source_revision(
+            "local",
+            &[make_log("unrelated startup output\n".to_owned())],
+        )
+        .is_err());
         Ok(())
     }
 
