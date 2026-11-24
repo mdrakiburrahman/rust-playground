@@ -974,21 +974,24 @@ impl CatalogService {
 #[async_trait]
 impl FlightSqlDdlHandler for CatalogService {
     async fn execute_ddl(&self, request: FlightSqlDdlRequest) -> CatalogResult<DdlCompletion> {
-        self.apply_sql(request.command())
-            .await
-            .map_err(|error| {
-                CatalogError::new(CatalogErrorCode::ReconciliationFailed, format!("{error:#}")).with_diagnostic_context(
-                    "catalog_execute_ddl",
-                    None,
-                    Some("catalog_apply_sql_failure"),
-                )
-            })?
-            .ok_or_else(|| {
-                CatalogError::new(
-                    CatalogErrorCode::DdlUnsupportedStatement,
-                    "statement has no table schema completion",
-                )
-            })
+        let started = std::time::Instant::now();
+        let result =
+            self.apply_sql(request.command())
+                .await
+                .map_err(|error| {
+                    CatalogError::new(CatalogErrorCode::ReconciliationFailed, format!("{error:#}"))
+                        .with_diagnostic_context("catalog_execute_ddl", None, Some("catalog_apply_sql_failure"))
+                })
+                .and_then(|completion| {
+                    completion.ok_or_else(|| {
+                        CatalogError::new(
+                            CatalogErrorCode::DdlUnsupportedStatement,
+                            "statement has no table schema completion",
+                        )
+                    })
+                });
+        crate::telemetry::record_ddl(started.elapsed(), result.is_ok());
+        result
     }
 }
 
@@ -1048,7 +1051,10 @@ impl FlightSqlService for CatalogService {
         query: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        self.apply_statement_update(query, request).await?;
+        let started = std::time::Instant::now();
+        let result = self.apply_statement_update(query, request).await;
+        crate::telemetry::record_ddl(started.elapsed(), result.is_ok());
+        result?;
         Ok(0)
     }
 

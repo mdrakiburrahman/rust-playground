@@ -20,6 +20,9 @@ Run the Windows bootstrap from PowerShell 7 as Administrator.
 .\dev\bootstrap-dev-env.ps1
 ```
 
+The fresh WSL clone retries DNS resolution failures up to four attempts without
+recreating WSL. Other clone errors or a remaining destination stop immediately.
+
 Then enter Ubuntu 24.04 and run the Linux bootstrap. It performs the full
 administrator setup for generic host prerequisites, including Docker daemon
 configuration and namespace sysctls, and clears existing Docker containers,

@@ -34,6 +34,7 @@ enum Fault {
     Conflict,
     Rejected,
     Unknown { applied: bool },
+    AppliedButUnsettled,
 }
 
 type Hook = Box<dyn FnOnce(&mut BTreeMap<String, String>) + Send>;
@@ -113,6 +114,12 @@ impl ControlMetadata for Memory {
                         state.etag += 1;
                     }
                     return CasOutcome::Unknown("connection reset".into());
+                }
+                Some(Fault::AppliedButUnsettled) => {
+                    state.metadata = metadata.clone();
+                    state.etag += 1;
+                    state.writes += 1;
+                    return CasOutcome::AppliedButUnsettled("terminal lease release refused".into());
                 }
                 None => {}
             }
@@ -968,5 +975,49 @@ async fn unknown_shared_admission_is_permanent() -> Result<()> {
     }
     assert_eq!(control.state().cas_calls, 1);
     assert_eq!(control.members()?.len(), 1, "orphan retained as a blocker");
+    Ok(())
+}
+
+#[tokio::test]
+async fn applied_unsettled_shared_admission_is_permanent() -> Result<()> {
+    let control = Memory::new(authority("ready-v1", "{}"));
+    control.state().faults.push_back(Fault::AppliedButUnsettled);
+    let first = shared(&control, "applied-unsettled")
+        .await
+        .err()
+        .context("unsettled admission returned a session")?;
+    let message = format!("{first:#}");
+    assert!(
+        message.contains("metadata applied but terminal settlement failed"),
+        "{message}"
+    );
+    assert!(!message.contains("outcome unknown"), "{message}");
+    let original = control.members()?;
+    assert_eq!(
+        original.len(),
+        1,
+        "the failed admission's registration was confirmed applied"
+    );
+    for _ in 0..2 {
+        let next = shared(&control, "applied-unsettled").await;
+        assert!(
+            next.is_err(),
+            "applied-but-unsettled admission re-enrolled a fresh publisher"
+        );
+        let error = next.err().context("unsettled admission retried")?;
+        assert_eq!(format!("{error:#}"), message);
+    }
+    let state = control.state();
+    assert_eq!(
+        state.cas_calls, 1,
+        "permanent admission failure must not replay registration"
+    );
+    assert_eq!(state.writes, 1);
+    drop(state);
+    assert_eq!(
+        control.members()?,
+        original,
+        "the original confirmed member must stay present"
+    );
     Ok(())
 }

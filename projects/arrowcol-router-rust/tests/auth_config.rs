@@ -76,6 +76,51 @@ fn trusted_edge_signature_rejects_direct_forged_tampered_and_replayed_requests()
     assert_eq!(invalid.kind(), AuthFailureKind::Invalid);
 }
 
+#[test]
+fn signed_client_send_observations_are_optional_and_immutable() {
+    const OBSERVATION_ID: &str = "x-arrowcol-client-observation-id";
+    const SEND_UNIX_NS: &str = "x-arrowcol-client-send-unix-ns";
+    let secret = vec![8_u8; 32];
+    let signer = EdgeRequestSigner::new(secret.clone()).unwrap_or_else(|error| panic!("create signer: {error}"));
+    let verifier = EdgeVerifier::new(secret, 30_000).unwrap_or_else(|error| panic!("create verifier: {error}"));
+    let method = Method::POST;
+    let path = "/arrow.flight.protocol.FlightService/DoPut";
+
+    let mut legacy = request_headers();
+    insert_edge_signature_headers(&mut legacy, &signer, &method, path, now(300_000), "legacy-observation")
+        .unwrap_or_else(|error| panic!("sign legacy request: {error}"));
+    verifier
+        .verify(&method, path, &legacy, now(300_001))
+        .unwrap_or_else(|error| panic!("legacy signature without observation headers must remain valid: {error}"));
+
+    let mut signed = request_headers();
+    signed.insert(OBSERVATION_ID, HeaderValue::from_static("1234-7-1700000000000000000"));
+    signed.insert(SEND_UNIX_NS, HeaderValue::from_static("1700000000000000000"));
+    insert_edge_signature_headers(&mut signed, &signer, &method, path, now(300_010), "observation-pair")
+        .unwrap_or_else(|error| panic!("sign observation request: {error}"));
+    verifier
+        .verify(&method, path, &signed, now(300_011))
+        .unwrap_or_else(|error| panic!("valid observation signature failed: {error}"));
+
+    for (header, replacement) in [
+        (OBSERVATION_ID, "1234-8-1700000000000000000"),
+        (SEND_UNIX_NS, "1700000000000000001"),
+    ] {
+        let mut tampered = signed.clone();
+        tampered.insert(header, HeaderValue::from_static(replacement));
+        let Err(failure) = verifier.verify(&method, path, &tampered, now(300_012)) else {
+            panic!("tampering with {header} must invalidate the edge signature");
+        };
+        assert_eq!(failure.kind(), AuthFailureKind::Invalid);
+    }
+
+    let mut incomplete = request_headers();
+    incomplete.insert(OBSERVATION_ID, HeaderValue::from_static("1234-7-1700000000000000000"));
+    assert!(
+        insert_edge_signature_headers(&mut incomplete, &signer, &method, path, now(300_020), "incomplete").is_err()
+    );
+}
+
 #[tokio::test]
 async fn allow_all_identity_is_signed_with_a_bounded_expiry() {
     let authenticator = AllowAllAuthenticator;

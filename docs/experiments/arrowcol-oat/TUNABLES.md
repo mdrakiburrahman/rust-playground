@@ -10,6 +10,64 @@
 | Durability | Requested WAL class is recorded separately from consumer evidence. Nondefault weaker durability must not be compared as equivalent to durable configurations. |
 | Cleanup | Only run-owned resources/configuration are changed. Existing namespace, identity, pinning and cleanup guards remain required. Never delete a resource group to clean up an experiment. |
 
+## Client data profile and identity
+
+| Setting | Contract |
+| --- | --- |
+| `client.data_profile` | Strict `diagnostic` (default) or `realistic`. Diagnostic preserves the older replayable values; `realistic` must be explicitly selected for D53 and uses documented field-specific Always On state categories, variable-width strings elsewhere, per-row numeric/timestamp values, GUID uniqueness, and a fresh row identity in `endpoint_url`. Diagnostic replay is not eligible for unique-delivery proof. |
+| Generation telemetry | Both profiles prepare the corpus before load. Realistic phase counters must report positive corpus rows, encoded and retained bytes, and memory reservation, plus `preparation.steady_state_generation: true` because each logical send adds a fresh identity and re-encodes a prepared batch. Diagnostic replay reports `false`; older Diagnostic clients may omit the field or snapshots. Startup generation rates do not represent the Realistic send path. |
+| `client.max_memory_bytes` | Strict positive byte cap. Startup reserves the conservative encoded corpus plus identity-bearing live-batch slots; realistic stream admission is semaphore-bounded to the number of slots that fit. Startup fails before registration or generation if the corpus and one live batch cannot fit. A live slot remains reserved through retries and releases on completion, error, or cancellation. |
+| Byte accounting | `completed_flight_data_bytes_uncompressed` and `completed_flight_data_bytes_configured_ipc_compression` count serialized FlightData protobuf lengths before and after the configured Arrow IPC compression. They exclude gRPC/HTTP/2 framing and are not logical Arrow buffer sizes. Legacy `completed_raw_arrow_bytes` / `completed_wire_bytes` fields remain aliases. |
+| `client.string_width` / `client.string_length_distribution` | Width defaults to 96 for generated realistic strings; distribution defaults to `uniform` for realistic and `fixed` for diagnostic. Categorical state labels use their natural lengths. The identity URL in realistic mode is additional required width and is included in the uncompressed FlightData byte total. |
+| `client.value_variation` / `client.guid_uniqueness` | Each accepts `cardinality` or `per_row`; realistic defaults to `per_row`, diagnostic to `cardinality`. `client.cardinality` and `client.skew` also select category frequencies; `client.entropy` controls generated strings, not categorical state labels. Required fixture columns are never nulled. |
+| Logical row identity | Realistic rows encode a client-generated `run_uuid`, client-incarnation UUID, worker, logical-batch sequence, and row ordinal in the existing `endpoint_url` value. The client-pod `client.pod_ordinal` (strict unsigned 32-bit; assign a distinct value to each client pod) salts generated GUIDs separately and is independent of routing. `run_uuid_source` and `incarnation_uuid_source` are `client_generated`; `oat_run_uuid` is null because OAT does not supply that UUID. Retries reuse the exact same values and encoded bytes; fresh sends and process restarts use disjoint identities. |
+| `logical_batch_manifest_v1` | The terminal `OAT_CLIENT_METRICS` receipt includes every logical batch's attempted count, acknowledgement/ambiguity outcome, retry count, and cohort. Cohorts use the exact half-open measurement interval `[start_unix_ms, end_unix_ms)`. Contiguous equivalent batches may be range-coalesced without changing their identities. |
+| Manifest limits | At most 1,000,000 logical batches and 1 MiB serialized terminal manifest. The complete line with the `OAT_CLIENT_METRICS` prefix followed by a space, including its newline, is capped at 1 MiB. The client remeasures after manifest truncation; if non-manifest fields still exceed the cap, it emits a minimal bounded failed receipt that preserves the first terminal failure reason. Oversized or incomplete evidence cannot qualify as a pass. |
+
+## AKS per-role resources
+
+| Role | Default request | Default limit |
+| --- | --- | --- |
+| Collector | 2 CPU / 4Gi | 2 CPU / 6Gi |
+| Client | 250m CPU / 256Mi | 2 CPU / 2Gi |
+| Maintenance | 250m CPU / 512Mi | 1 CPU / 2Gi |
+| Router | 500m CPU / 512Mi | 2 CPU / 1Gi |
+| Catalog | 500m CPU / 1Gi | 2 CPU / 4Gi |
+
+`platform.resources` may override any role with CPU/memory requests and limits. Only `scale_out_single_table` may omit or set `collector.limits.cpu: null` for an uncapped collector; a finite CPU limit is strictly parsed and preserved. Other resource fields remain required, and unknown fields, malformed quantities, and requests above finite limits fail before setup. This profile requires the exact hot table, memory-only buffering, exactly one collector and one router replica, hostname anti-affinity, and enabled same-table maintenance with all five operations. Replica counts other than one are rejected, never clamped; only clients scale out (1..128 client pods per table). The D53 maximum-throughput campaign selects uncapped collector CPU on one high-bandwidth node. AKS applies the settings to rendered workloads and client Jobs, then verifies live resource specs and node names. Per-cell evidence records requested/effective values, configured concurrency, CPU limits, and oversubscription ratios. OAT measures per-container CFS throttled-period deltas from kubelet cAdvisor; unavailable counters remain explicitly unavailable.
+
+### D53 capacity reference
+
+| Resource | Published target | Interpretation |
+| --- | --- | --- |
+| `Standard_D64ds_v6` / `Standard_E64ds_v6` | 64 vCPUs; 30,000 Mbps per VM | Existing pool sizes; additional client nodes increase offered load, not one collector's bandwidth. |
+| `Standard_D192ds_v6` | 192 vCPUs; 82,000 Mbps per VM | Scale-up fallback; 10.25 GB/s nominal outbound before protocol overhead. |
+| `Standard_E128ns_v6` | 128 vCPUs; 200,000 Mbps per VM | Network-optimized alternative with no local temporary disk. |
+| `Standard_E192ids_v6` | 192 vCPUs; 200,000 Mbps per VM | Preferred collector candidate among these verified sizes: tied highest bandwidth, most cores. Regional availability, AKS support, quota and allocatable resources are not yet verified. |
+| Standard GPv2 storage in Canada Central | 40,000 requests/s, 60 Gbps ingress, 200 Gbps egress | The campaign account is StorageV2, `Standard_LRS`, with HNS enabled. These are account targets, not a guarantee; increase limits only if measured throttling or saturation identifies storage as the bottleneck. |
+
+The target 17.4 GB/s is 139.2 Gbps of uncompressed Arrow payload. D53 requires lz4 or zstd wire IPC compression and measures actual compressed bytes and decode cost; Parquet compression is a separate ratio. Published network values aggregate all NICs and are not guarantees. Azure enforces the VM allocation on egress, not as a direct ingress cap; client/router egress and collector processing remain separate bottlenecks. A 200 Gbps reference does not prove a single pod can receive 139.2 Gbps. Keep one ingest committer plus maintenance; report the measured single-pod ceiling instead of adding collectors. Scale campaign bench pools to verified zero afterward, preserving data.
+
+Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series), [Edsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/edsv6-series), [Ensv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/ensv6-series), [VM network bandwidth](https://learn.microsoft.com/azure/virtual-network/virtual-machine-network-throughput), and [standard storage scalability targets](https://learn.microsoft.com/azure/storage/common/scalability-targets-standard-account).
+
+## Single-table preparation and commit overlap
+
+| Setting | Contract |
+| --- | --- |
+| `collector.batching.pipeline_depth` | Integer `1..=64`, default `1`. Bounds in-flight preparation/publication groups per logical table through durable receipts. Values above `1` require `coalesce_publications: true`. Projected unchanged inside `ARROWCOL_COLLECTOR_BATCHING_CONFIG`; exporter startup readback reports the resolved value. |
+| `collector.batching.max_concurrent_flushes` | Existing exporter-backend semaphore, shared across cores using the same root. Bounds active file groups including their commit wait; independent of the per-table pipeline depth. |
+| `collector.commit.max_files_per_commit` | Existing maximum add actions per version (default `64`). A coalesced group remains indivisible; separate groups may share a version only when their identities do not overlap and their combined file count fits. |
+| `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
+| `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
+| `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
+
+Coalesced preparation uses the same opened table as the single Delta commit worker,
+without acquiring another writer. Arrow reservations remain charged until terminal
+publication results. Kernel commit-time identity, schema, retention and ownership
+checks remain authoritative; staging is not acknowledgment. Existing bounded append
+conflict retries refresh and replan against maintenance commits and emit publication
+attempt/conflict telemetry. A larger depth is not evidence of a throughput gain.
+
 ## Router timeout compatibility
 
 | Setting | Contract |
@@ -30,6 +88,19 @@
 
 For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max_size: 0`) and set `logging.router: inherit` so its YAML filter matches the main router; use a positive pool size for Profile C (`64` is the documented comparison value), whose default `warn,tiberius=error` filter differs from A. Set `collector.cpu_pressure: process` in AKS Profile C; Profile A keeps the default `off`. Attribute any A/C result to both pooling and the log-filter change, and note that excluding CPU only changes admission when CPU sampling is `process`. Pooling changes connection reuse only; it does not cache, weaken or skip authoritative pin reads.
 
+## Flight gRPC compression direction
+
+These controls are independent of Arrow IPC and Parquet compression. Each end defaults to `none` and accepts the strict enum `none | gzip | zstd`; a default of `none` does not enable compression.
+
+| Setting | Direction and required peer match |
+| --- | --- |
+| `transport.grpc_send_compression` | Client request encoding; match with receiver `collector.limits.grpc_accept_compression`. |
+| `transport.grpc_accept_compression` | Client response acceptance; match with receiver `collector.limits.grpc_send_compression`. |
+| `collector.limits.grpc_accept_compression` | Receiver request acceptance; match with client `transport.grpc_send_compression`. |
+| `collector.limits.grpc_send_compression` | Receiver response encoding; match with client `transport.grpc_accept_compression`. |
+
+Receiver settings are projected through `ARROWCOL_COLLECTOR_LIMITS_CONFIG`. See the [Flight receiver configuration and negotiation notes](../../../crates/arrowcol-flight/README.md). These options configure codec negotiation only; they do not prove wire-byte savings, durable Delta writes, or performance qualification.
+
 ## Overload retry and admission policy
 
 | Setting or signal | Contract |
@@ -42,13 +113,72 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 | Attempt counters | `error_rows` and `rejected_rows` count attempts, not unique rows. A retry of the same encoded batch is another attempt. |
 | Counter readback | Rejected, retried, given-up and ambiguous stream/row counters are retained per worker for the measurement-start delta and, where available, the shared measurement window. Older clients default missing counters to zero. |
 
+## In-flight overload guard
+
+These are root OAT settings, not component `tunables`. Memory-only runs do not
+need WAL or Quiver; disk protection is explicitly not applicable.
+
+| Setting or evidence | Contract |
+| --- | --- |
+| `overload_guard.enabled` | Strict bool, default `true`. Disabled runs cannot qualify for the throughput campaign. |
+| `overload_guard.cap_fraction` | Finite number in `(0, 0.90]`, default `0.90`; lower values stop earlier, never weaken the approved ceiling. |
+| `overload_guard.zero_progress_windows` | Strict integer `1..=2`, default `2`; complete 30-second windows with outstanding publications, rows or logical bytes and no new ingestion commit. Idle windows do not trigger. |
+| `platform.local.collector_memory_limit_bytes` | Optional strict integer bytes, `8388608..=1099511627776` (8 MiB–1 TiB); strings/units, fractions and negative values fail. Projects `mem_limit` only into the run-owned local collector. Omission does not change existing Compose limits: an unlimited collector remains unprotected and cannot admit a guarded cell. Example explicit request: `4294967296` (4 GiB). AKS rejects this local-only override and preserves its existing pod limit. Requested bytes and actual cgroup cap are recorded separately and must match when requested. |
+| Hard-cap accounting | Exactly one run-owned collector: read its actual cgroup-v2 `memory.current`/finite `memory.max` in its private cgroup namespace, and its pressure endpoint's actual RSS and buffered bytes against startup-confirmed limits. Never compare aggregate pod/Docker working-set memory or publication logical bytes with a different cap. Unlimited/unsupported cgroups, mismatched identities/accounting, missing readback or a sampling gap over 5 seconds are unavailable, not healthy under-cap observations. |
+| Coverage and progress | Pre-admission readback, then 1-second sampling through warm-up and measurement (3-second request deadlines). Startup capability is read once; live Docker/Kubernetes logs use an incremental timestamp cursor with a 5-second overlap, not full-log replay. Ingestion-only durable commit telemetry is deduplicated by table/version and assigned by commit finish time; rewrites and replayed retries cannot create progress. |
+| Stop and custody | `evidence_json.overload_stop` carries `classification: above_ceiling`, reason, metric, value, cap/fraction (null for no-progress), zero-based window index and Unix-ms timestamp. Cancel active clients and retain the normal drain, maintenance and ownership-safe cleanup path; never destroy on failed stop. |
+| Unknown protection | Admission fails closed before clients are created if required readback is unavailable. Mid-cell unavailability stops clients and records guard status `unavailable`, with null current caps; it is not mislabelled as an actual threshold trigger. |
+| Local endpoint lifecycle | Rediscover published router, collector and downstream bindings after setup and each scale/recreate, before pins, maintenance and admission. Failed discovery clears the old URL: required router failure aborts setup/scaling; missing collector protection refuses guarded admission; optional downstream remains unavailable. Samplers use the refreshed collector binding and the guard independently discovers the current container identity. |
+| Qualification | `overload_guard` retains settings, run/schedule identity, coverage, sampling gaps, peak cap fraction and complete progress windows. Missing/disabled/unavailable/incomplete protection and actual stops cannot qualify; a stop is rendered `above_ceiling` even for a failed official row. Existing debt, backlog, reconciliation and 30-second rate gates remain unchanged. |
+
+The collector RSS limit comes from its registration configuration, **not** from
+the cgroup cap. The guard checks both independently against actual readback.
+Slow CPU/resource statistics run as a separate single-flight task; they do not
+serialize cap/backlog/commit observations. Incomplete resource samples remain
+unavailable rather than delaying the safety loop.
+
+The ignored integration check below requires separate authorization. It creates
+only test-owned no-load collectors with memory catalog/routing and local storage,
+no clients, cloud calls or shared-stack changes. Run inside a Linux Docker
+devcontainer whose ID is `OAT_GUARD_DOCKER_RUNNER`; it records the actual cgroup
+namespace, capped/uncapped admission, pressure/startup agreement and bounded idle
+sampling, then removes only its own containers. This is not AKS portability or
+benchmark qualification proof.
+
+```bash
+cargo build --locked --package arrowcol-dataflow-rust
+OAT_GUARD_COLLECTOR_BINARY="$PWD/target/debug/arrowcol-dataflow-rust" \
+OAT_GUARD_DOCKER_RUNNER="$HOSTNAME" \
+cargo test --locked --package arrowcol-oat-rust --lib \
+  overload_actual_docker_admission_and_idle_sampling -- --ignored --nocapture
+```
+
+The separately authorized lifecycle check below uses existing cached component
+images without rebuilding or relabelling them. Its local single-hot-table config
+must request a 4 GiB collector cap, hour granularity and `sealed_partitions_only:
+false`. It creates an isolated stack, scales/recreates the collector, initializes
+pins and maintenance, then prepares guard/policy admission without creating
+workload clients or arming a schedule. It retains an unscored receipt (old/new
+container IDs and endpoints, HTTP status, cgroup and policy readbacks, cleanup)
+under `out/arrowcol-oat/endpoint-lifecycle-<run-id>/`. This is not a load diagnostic.
+The test uses the normal non-snapshot stop/destroy path because no committed rows
+exist; it does not claim an empty successful snapshot. Any remaining test-owned
+containers must be verified stopped before the harness removes them.
+
+```bash
+OAT_ENDPOINT_LIFECYCLE_CONFIG=/absolute/path/to/authorized-local-config.json \
+cargo test --locked --package arrowcol-oat-rust --lib \
+  local_endpoint_actual_docker_lifecycle_without_clients -- --ignored --nocapture
+```
+
 ## AKS rollout readiness
 
 | Setting | Contract |
 | --- | --- |
 | `aks_rollout_timeout_seconds` | Overall Deployment readiness deadline; defaults to 600 seconds and accepts `600..=3600`. Image-pull and container-config errors fail immediately; an unready container fails at four or more restarts. Failure details include previous logs and `kubectl describe` output. |
 | `reconciliation_settle_timeout_seconds` | Post-client Delta commit drain deadline; defaults to 120 seconds and accepts `0..=1800`. Zero performs one immediate read. Settling is outside the measurement window. Commit evidence uses appended-log offsets plus ingress timestamps at or after the cell start. A log-prefix mismatch/rotation safely falls back to ingress-time-only scope and records that choice; prior-cell tail events are excluded, while commits crossing the cell boundary are reported unavailable. |
-| `collector_stop_grace_seconds` | Collector shutdown grace, default 300 seconds, range `30..=3600`; projected to local Compose and AKS, verified against the effective runtime configuration, and included in the run-pin lifetime budget. |
+| `collector_stop_grace_seconds` | Outer stop grace for local Compose and AKS (default 300 seconds, `30..=3600`). Must also cover twice the DFE drain budget plus 60 seconds for terminal writes. Verified on the runtime and included in the run-pin lifetime budget. |
+| `tunables.collector.shutdown_drain_timeout_seconds` | DFE SIGTERM drain budget per phase. Whole JSON seconds (`1..=1500`, default `60`); applies at process startup. OAT verifies the requested value against the DFE's startup readback. |
 
 ## Quick-run measurement scopes
 
@@ -100,8 +230,11 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | AKS image | `aks setup --maintenance` builds/publishes/verifies a sixth revision-labelled image and captures its registry digest as `maintenance_image`. An enabled run requires that pinned image. |
 | Policy | Startup defaults and each table's resolved policy are recorded, including negative/no-op probes. Table properties override process defaults; those overrides remain visible. Missing per-table readback fails. |
 | Writer policy | `parquet_writer_overrides` proves startup override consumption, not full per-schema physical properties. Schema compatibility is checked by the writer; inherited/null values are not invented defaults. |
-| Operation outcomes | `operation_outcomes` records process-lifetime operation/error counts and sanitized `error_kind_counts`; raw error strings are omitted and a fixed comment explains the evidence. Per-cell `maintenance_operation_outcomes` uses separate stdout/stderr offsets; when logs cannot be scoped, its counts are null with a sanitized comment. Truncated maintenance logs still fail. |
-| Maintenance shutdown | `deadline_exceeded` remains a genuine operation error; `cancelled` is healthy only when the signal-driven cancel flag is set, so signal-cancelled work does not make graceful shutdown unhealthy. Local snapshot evidence records `delta-maintenance` exit 1 as `maintenance_operation_failure`; exit 2, 137 and OOM remain fatal. |
+| Operation outcomes | Process-lifetime and per-cell receipts retain operation/error counts and separate `retry_kind_counts` (`stale_plan` only). Per-operation cell counts use separate stdout/stderr offsets captured before clients start, retained through drain. Missing/partial/unscopable records yield null/UNKNOWN, never a clean zero; raw error strings are omitted. |
+| Maintenance shutdown | Keep raw exit code separate from record-derived `maintenance_operation_failure`. Exit 1 never qualifies: retries alone cannot explain terminal health, including a stale-plan limit latched before later success. Unclassified exits remain UNKNOWN. Persistent stale-plan starvation is unhealthy, not a transient retry. `deadline_exceeded` remains a genuine operation error; the consumer's signal-cancel exception is unchanged. Exit 2, 137 and OOM remain fatal. |
+| `maintenance.max_consecutive_stale_plans` | Strict integer 1–1024, consumer default 8. `ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS` / `--max-consecutive-stale-plans`. Per-(table,operation) scheduled counter resets only on error-free completion; reaching the limit latches unhealthy. Requested startup and effective operation settings are checked. |
+| `maintenance.sealed_partitions_only` | Strict opt-in boolean, consumer default true. `ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY` / `--sealed-partitions-only <true\|false>`. Requires OPTIMIZE; cannot be combined with `sealed_final`. Startup bool/null is the requested process override; effective operation/table policy is separate and table properties win. False permits newest/open partition optimization; it provides no file-age guarantee. |
+| Protected partition debt | Preserve nullable `compaction_debt.protected_partition_backlog` (files, physical Parquet bytes, oldest UTC partition-start ms). A zero object is measured none; absent/null is UNKNOWN. Qualify its per-window trend separately from eligible/due debt, without adding the vectors twice. |
 | Mutations | Only explicit `apply: true` adds `--apply`. Supported operations and their applicable knobs are validated; normal retention protections remain active. |
 
 ## Component adapter notes
@@ -122,6 +255,13 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | WAL storage | Local state is a run-owned bind mount with separate hostname directories. AKS uses one writable `emptyDir` per pod. Filesystem fsync classes do not imply survival of pod/node loss or durable Delta delivery; storage scope is recorded separately. Existing durable WAL defaults remain unchanged. |
 | Local worker count | Both profiles are rendered into run-owned configuration without resource-policy overrides that could shadow `--num-cores`; source profiles are not edited. |
 | Client automatic values | Explicit zero workers/runtime threads require the consumer's matching available-parallelism observation. Zero batch/corpus rows and streams use verified legacy rows/concurrency; byte-target corpus sizing remains deferred until preparation. Arbitrary positive values are not accepted as automatic-resolution proof. |
+
+## Campaign verdict policy
+
+| Config field | Behavior |
+| --- | --- |
+| Omitted or `dataflow_verdict_policy: "legacy"` | Preserves the existing quick/legacy QAP verdict, including its 100% acceleration, zero-pending, and healthy-catalog gates. |
+| `dataflow_verdict_policy: "single_hot_table_campaign"` | Keeps ingest validity separate from downstream state. Observed QAP lag is a `FINDING`, not an ingest failure; incomplete/timeout/missing QAP evidence is UNKNOWN and cannot PASS. Missing commit telemetry, zero committed output, and unbalanced matrices also cannot PASS. |
 
 ## Result evidence (schema v3)
 

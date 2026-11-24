@@ -7,6 +7,13 @@
 .nx
 dev
 docs
+!docs/
+docs/*
+!docs/experiments/
+docs/experiments/*
+!docs/experiments/arrowcol-oat/
+docs/experiments/arrowcol-oat/*
+!docs/experiments/arrowcol-oat/oat-config.quick.json
 node_modules
 target
 tools/*

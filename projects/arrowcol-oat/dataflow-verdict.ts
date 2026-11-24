@@ -24,6 +24,17 @@ export interface Verdict {
   reasons: string[];
   rows: RecordValue[];
   lines: string[];
+  findings?: string[];
+  ingestPass?: boolean;
+  downstreamStatus?: 'clear' | 'lagging' | 'unknown';
+}
+
+export type DataFlowVerdictPolicy = 'legacy' | 'single_hot_table_campaign';
+
+export function parseDataFlowVerdictPolicy(value: unknown): DataFlowVerdictPolicy {
+  if (value === undefined || value === 'legacy') return 'legacy';
+  if (value === 'single_hot_table_campaign') return value;
+  throw new Error('Unsupported dataflow_verdict_policy: ' + String(value));
 }
 
 export function record(value: unknown): value is RecordValue {
@@ -46,6 +57,11 @@ function tunables(row: RecordValue): RecordValue | undefined {
 }
 
 function collectorOutputIssue(evidence: RecordValue, row: RecordValue): string | undefined {
+  const durable = evidence.durable_commits;
+  const reconciliation = record(durable) ? durable.delta_log_reconciliation : undefined;
+  if (evidence.evidence_class === 'd53_exploratory' &&
+      (evidence.ranking_eligible === false || !record(reconciliation) || reconciliation.status !== 'matched'))
+    return 'exploratory Delta-log reconciliation did not match';
   const output = evidence.commit_window_output_throughput;
   if (!record(output)) return 'missing collector commit-window output evidence';
   if (output.unavailable_reason != null) return 'collector output telemetry unavailable';
@@ -105,8 +121,18 @@ export function evaluateDataFlow(
   expectedSha: string | undefined,
   mode: 'local' | 'aks',
   config: RecordValue,
+  policy: DataFlowVerdictPolicy = 'legacy',
 ): Verdict {
+  policy = parseDataFlowVerdictPolicy(policy);
+  const campaign = policy === 'single_hot_table_campaign';
   const reasons: string[] = [];
+  const downstreamProblems: string[] = [];
+  const findings: string[] = [];
+  let downstreamStatus: 'clear' | 'lagging' | 'unknown' = 'clear';
+  const markDownstreamUnknown = (reason: string): void => {
+    downstreamStatus = 'unknown';
+    downstreamProblems.push(reason);
+  };
   const rows = allRows.filter((row) => tunables(row)?.orchestration_run_id === status.id);
   if (status.state !== 'succeeded') reasons.push(`run state is ${status.state}: ${status.error ?? status.progress}`);
   if (status.error) reasons.push(`runner error: ${status.error}`);
@@ -114,13 +140,24 @@ export function evaluateDataFlow(
   if (!rows.length) reasons.push('no Parquet rows match this orchestration run');
   if (rows.length !== status.result_count) reasons.push('matching Parquet result count differs from runner result_count');
   if (!expectedSha || !SHA.test(expectedSha)) reasons.push('expected server revision unavailable; cannot verify provenance');
-  if (mode === 'aks' && (typeof config.qap_database !== 'string' || !config.qap_database.trim())) reasons.push('QAP database is missing from run configuration');
+  if (mode === 'aks' && (typeof config.qap_database !== 'string' || !config.qap_database.trim())) {
+    if (campaign) markDownstreamUnknown('QAP database is missing from run configuration');
+    else reasons.push('QAP database is missing from run configuration');
+  }
   const tables = Array.isArray(config.tables) && config.tables.every((table) => typeof table === 'string') ? config.tables : [];
   const replicas = Array.isArray(config.replica_counts) ? config.replica_counts : [];
   const concurrency = Array.isArray(config.dfe_worker_concurrency) ? config.dfe_worker_concurrency : [];
   if (!tables.length || !replicas.length || !concurrency.length) reasons.push('expected experiment matrix is missing');
+  const clientSweep = config.clients_per_table_sweep;
+  const hasClientSweep = clientSweep != null;
+  const clientCounts = !hasClientSweep ? [undefined] : Array.isArray(clientSweep) ? clientSweep.map(integer) : [];
+  if (hasClientSweep && (!clientCounts.length || clientCounts.some((count) => count === undefined || count === 0n) ||
+      new Set(clientCounts).size !== clientCounts.length)) reasons.push('invalid clients_per_table_sweep in expected experiment matrix');
+  const cellKey = (replica: unknown, worker: unknown, clients: bigint | undefined) =>
+    `${String(replica)}:${String(worker)}${hasClientSweep ? `:${String(clients)}` : ''}`;
   const expected = new Set(replicas.flatMap((replica) =>
-    concurrency.flatMap((worker) => tables.map((table) => `${replica}:${worker}:${table}`))));
+    concurrency.flatMap((worker) => clientCounts.flatMap((clients) =>
+      tables.map((table) => `${cellKey(replica, worker, clients)}:${table}`)))));
   const seen = new Set<string>();
   const cells = new Map<string, string>();
   const cellIds = new Map<string, string>();
@@ -130,6 +167,7 @@ export function evaluateDataFlow(
   for (const row of rows) {
     const label = String(row.table);
     if (row.schema_version !== 2 && row.schema_version !== 3) reasons.push(`${label}: unsupported result schema`);
+    if (campaign && row.schema_version !== 3) reasons.push(label + ': campaign requires committed-output telemetry');
     if (row.schema_version === 3) {
       try {
         const evidence: unknown = JSON.parse(String(row.evidence_json));
@@ -137,9 +175,15 @@ export function evaluateDataFlow(
         else {
           const issue = collectorOutputIssue(evidence, row);
           if (issue) reasons.push(`${label}: ${issue}`);
-          else if (record(evidence.commit_window_output_throughput) && integer(evidence.commit_window_output_throughput.rows) === 0n) knownZeroOutputs++;
+          else if (record(evidence.commit_window_output_throughput) && integer(evidence.commit_window_output_throughput.rows) === 0n) {
+            knownZeroOutputs++;
+            if (campaign) reasons.push(label + ': no committed output in campaign window');
+          }
           if (evidence.downstream_status === 'unavailable') {
-            if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
+            if (campaign) {
+              markDownstreamUnknown(label + ": downstream evidence unavailable");
+              if (mode === 'local') localDownstreamUnavailable = true;
+            } else if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
             else localDownstreamUnavailable = true;
           }
         }
@@ -157,24 +201,45 @@ export function evaluateDataFlow(
     if ((integer(row.rows) ?? 0n) <= 0n) reasons.push(`${label}: zero or invalid measured rows`);
     if ((integer(row.duration_ms) ?? 0n) <= 0n) reasons.push(`${label}: zero or invalid duration`);
     if (typeof row.rows_per_second !== 'number' || !Number.isFinite(row.rows_per_second) || row.rows_per_second <= 0) reasons.push(`${label}: invalid rows per second`);
-    const key = `${String(row.replicas)}:${String(row.dfe_worker_concurrency)}:${label}`;
+    const clients = hasClientSweep ? integer(tunables(row)?.clients_per_table) : undefined;
+    if (hasClientSweep && (clients === undefined || !clientCounts.includes(clients))) {
+      reasons.push(`${label}: missing or undeclared clients_per_table sweep coordinate`);
+    }
+    const cell = cellKey(row.replicas, row.dfe_worker_concurrency, clients);
+    const key = `${cell}:${label}`;
     if (!expected.has(key) || seen.has(key)) reasons.push(`${label}: unexpected or duplicate matrix result`);
-    seen.add(key);
-    const cell = `${String(row.replicas)}:${String(row.dfe_worker_concurrency)}`;
+    if (expected.has(key)) seen.add(key);
     if (cells.has(cell) && cells.get(cell) !== row.run_id) reasons.push(`${label}: inconsistent matrix cell run_id`);
     cells.set(cell, String(row.run_id));
     if (cellIds.has(String(row.run_id)) && cellIds.get(String(row.run_id)) !== cell) reasons.push(`${label}: reused matrix cell run_id`);
     cellIds.set(String(row.run_id), cell);
     if (integer(row.tables) !== BigInt(tables.length)) reasons.push(`${label}: table count mismatch`);
-    if (mode === 'aks' && (
-      integer(row.qap_observation_complete) !== 1n ||
-      integer(row.qap_observed_tables) !== BigInt(tables.length) ||
-      row.qap_completion_percent !== 100 ||
-      integer(row.qap_pending_artifacts) !== 0n ||
-      integer(row.qap_unhealthy_catalogs) !== 0n
-    )) reasons.push(`${label}: QAP observation incomplete or unhealthy`);
+    if (campaign || mode === 'aks') {
+      const completion = row.qap_completion_percent;
+      const pending = integer(row.qap_pending_artifacts);
+      const unhealthy = integer(row.qap_unhealthy_catalogs);
+      const qapComplete = integer(row.qap_observation_complete) === 1n &&
+        integer(row.qap_observed_tables) === BigInt(tables.length) &&
+        typeof completion === 'number' && Number.isFinite(completion) && completion >= 0 && completion <= 100 &&
+        pending !== undefined && unhealthy !== undefined;
+      if (!qapComplete) {
+        if (campaign) markDownstreamUnknown(label + ': QAP observation incomplete or metrics missing');
+        else reasons.push(label + ': QAP observation incomplete or unhealthy');
+      } else if (campaign) {
+        const rowFindings: string[] = [];
+        if (completion < 100) rowFindings.push(label + ': QAP acceleration is ' + completion + '%');
+        if (pending > 0n) rowFindings.push(label + ': QAP has ' + pending + ' pending artifact(s)');
+        if (unhealthy > 0n) rowFindings.push(label + ': QAP reports ' + unhealthy + ' unhealthy catalog(s)');
+        findings.push(...rowFindings);
+        if (rowFindings.length && downstreamStatus === 'clear') downstreamStatus = 'lagging';
+      } else if (completion !== 100 || pending !== 0n || unhealthy !== 0n) {
+        reasons.push(label + ': QAP observation incomplete or unhealthy');
+      }
+    }
   }
   if (expected.size !== seen.size) reasons.push('Parquet does not cover the expected experiment matrix');
+  const ingestPass = reasons.length === 0;
+  reasons.push(...downstreamProblems);
   const lines = [
     `run: ${status.id}; matching result rows: ${rows.length}`,
     `git_sha: ${expectedSha ?? 'unavailable'}`,
@@ -183,11 +248,16 @@ export function evaluateDataFlow(
   if (localDownstreamUnavailable) lines.push('WARNING: local Kustainer/QAP unavailable; collector-only evidence, downstream metrics are null');
   if (knownZeroOutputs) lines.push(`commit-window output: ${knownZeroOutputs} known-zero result(s); buffered output may commit later; not a delivery/drain proof`);
   if (legacyOutputs) lines.push(`WARNING: ${legacyOutputs} legacy result(s) have no committed-output telemetry; admission is not durability`);
-  return { pass: !reasons.length, reasons: [...new Set(reasons)], rows, lines };
+  if (campaign) lines.push('INGEST: ' + (ingestPass ? 'PASS' : 'FAIL'), 'DOWNSTREAM: ' + downstreamStatus.toUpperCase());
+  return {
+    pass: !reasons.length, reasons: [...new Set(reasons)], rows, lines,
+    ...(campaign ? { findings, ingestPass, downstreamStatus } : {}),
+  };
 }
 
 export function formatDataFlow(verdict: Verdict, network?: NetworkObservation, warnings: string[] = []): string {
   const lines = [`DATA FLOW: ${verdict.pass ? 'PASS' : 'FAIL'}`, ...verdict.lines];
+  for (const finding of verdict.findings ?? []) lines.push('FINDING: ' + finding);
   if (network) lines.push(network.enforcing
     ? `network: ${network.provider} (enforced)`
     : "network: NOT ENFORCED (accepted risk: another workload inside the cluster could reach the dataflow engine's passwordless port; no public ingress)");
@@ -380,13 +450,14 @@ export async function collectDataFlow(
   status: OatRunStatus, config: RecordValue, mode: 'local' | 'aks', expectedSha: string | undefined,
   runner: typeof run_tree = run_tree, environment: NodeJS.ProcessEnv = process.env,
 ): Promise<Verdict> {
-  if (status.state !== 'succeeded') return evaluateDataFlow(status, [], expectedSha, mode, config);
+  const policy = parseDataFlowVerdictPolicy(config.dataflow_verdict_policy);
+  if (status.state !== 'succeeded') return evaluateDataFlow(status, [], expectedSha, mode, config, policy);
   let verdict: Verdict;
   try {
     const bytes = await readResultBytes(config, mode, runner);
-    verdict = evaluateDataFlow(status, decodeResultRows(bytes), expectedSha, mode, config);
+    verdict = evaluateDataFlow(status, decodeResultRows(bytes), expectedSha, mode, config, policy);
   } catch (error) {
-    const verdict = evaluateDataFlow(status, [], expectedSha, mode, config);
+    const verdict = evaluateDataFlow(status, [], expectedSha, mode, config, policy);
     verdict.reasons.push(error instanceof Error ? error.message : 'unreadable result evidence');
     return verdict;
   }

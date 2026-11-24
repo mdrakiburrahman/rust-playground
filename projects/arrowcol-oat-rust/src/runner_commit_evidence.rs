@@ -70,6 +70,7 @@ fn commit_window_output(
         "measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": seconds,
         "clock": "collector_system_unix_ms_shared_schedule_clock_skew_not_measured",
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null, "rows_per_second": null,
+        "input_bytes_per_second": null, "parquet_bytes_per_second": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
         "unique_delivered_rows": null, "complete_delivery_established": false,
         "warmup_backlog": "included_when_commit_finishes_in_window",
@@ -136,6 +137,8 @@ fn commit_window_output(
     result["input_bytes"] = json!(input_bytes);
     result["parquet_bytes"] = json!(parquet_bytes);
     result["rows_per_second"] = json!(rows as f64 / seconds);
+    result["input_bytes_per_second"] = json!(input_bytes as f64 / seconds);
+    result["parquet_bytes_per_second"] = json!(parquet_bytes as f64 / seconds);
     result["commits"] = json!(latencies.len());
     result["bytes_per_row"] = json!((rows > 0).then(|| parquet_bytes as f64 / rows as f64));
     result["compression_ratio"] = json!((parquet_bytes > 0).then(|| input_bytes as f64 / parquet_bytes as f64));
@@ -158,11 +161,13 @@ fn run_cumulative_output(
         return Ok(json!({
             "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
             "rows": null,
+            "commits_by_version": [],
             "unavailable_reason": reason,
         }));
     }
     let mut rows = 0_u64;
     let mut commits = 0_u64;
+    let mut commits_by_version = Vec::new();
     for event in events
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
@@ -172,6 +177,7 @@ fn run_cumulative_output(
                 return Ok(json!({
                     "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
                     "rows": null,
+                    "commits_by_version": [],
                     "unavailable_reason": "cumulative_commit_ingress_boundary_unavailable",
                 }));
             };
@@ -182,6 +188,7 @@ fn run_cumulative_output(
                 return Ok(json!({
                     "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
                     "rows": null,
+                    "commits_by_version": [],
                     "unavailable_reason": "commit_crosses_cell_ingress_boundary",
                 }));
             }
@@ -190,18 +197,53 @@ fn run_cumulative_output(
             return Ok(json!({
                 "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
                 "rows": null,
+                "commits_by_version": [],
                 "unavailable_reason": "cumulative_commit_rows_unavailable",
+            }));
+        };
+        let Some(delta_version) = event.delta_version else {
+            return Ok(json!({
+                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+                "rows": null,
+                "commits_by_version": [],
+                "unavailable_reason": "cumulative_commit_version_unavailable",
             }));
         };
         rows = rows.checked_add(event_rows).context("cumulative commit row overflow")?;
         commits = commits.checked_add(1).context("cumulative commit count overflow")?;
+        commits_by_version.push(json!({
+            "delta_version": delta_version,
+            "rows": event_rows,
+            "files": event.files,
+            "parquet_bytes": event.parquet_bytes,
+        }));
     }
     Ok(json!({
         "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
         "rows": rows,
         "commits": commits,
         "complete_delivery_established": false,
+        "commits_by_version": commits_by_version,
     }))
+}
+
+fn complete_commit_windows(
+    events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
+    table: &str,
+    start: u64,
+    end: u64,
+    unavailable: Option<&str>,
+    cell_start_unix_ms: Option<u64>,
+) -> Result<Vec<Value>> {
+    let mut windows = Vec::new();
+    let mut window_start = start;
+    while let Some(window_end) = window_start.checked_add(30_000).filter(|window_end| *window_end <= end) {
+        windows.push(commit_window_output(
+            events, table, window_start, window_end, unavailable, cell_start_unix_ms,
+        )?);
+        window_start = window_end;
+    }
+    Ok(windows)
 }
 
 #[cfg(test)]
@@ -345,7 +387,14 @@ fn durable_commit_evidence_for_cell(
     for table in &config.tables {
         let canonical_table_name = canonical_dmv_table_name(table)?;
         if let Some(reason) = unavailable {
-            result.insert(table.clone(), unavailable_commits(reason));
+            let mut evidence = unavailable_commits(reason);
+            evidence["output_throughput"] = commit_window_output(
+                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms,
+            )?;
+            evidence["complete_30_second_commit_windows"] = json!(complete_commit_windows(
+                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms,
+            )?);
+            result.insert(table.clone(), evidence);
             continue;
         }
         let mut selected = Vec::new();
@@ -437,6 +486,9 @@ fn durable_commit_evidence_for_cell(
             cumulative_unavailable,
             cell_start_unix_ms,
         )?;
+        evidence["complete_30_second_commit_windows"] = json!(complete_commit_windows(
+            &events, &canonical_table_name, start, end, cumulative_unavailable, cell_start_unix_ms,
+        )?);
         evidence["run_cumulative_output"] = run_cumulative_output(
             &events,
             &canonical_table_name,
@@ -445,6 +497,329 @@ fn durable_commit_evidence_for_cell(
         )?;
     }
     Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeltaLogAdd {
+    rows: u64,
+    bytes: u64,
+}
+
+fn parse_delta_log_adds(
+    version: u64,
+    contents: &[u8],
+    adds: &mut BTreeMap<(u64, String), DeltaLogAdd>,
+) -> Result<()> {
+    for (line_number, line) in contents.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let action: Value = serde_json::from_slice(line)
+            .with_context(|| format!("invalid Delta log JSON at line {}", line_number + 1))?;
+        let Some(add) = action.get("add") else {
+            continue;
+        };
+        match add.get("dataChange") {
+            None | Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => continue,
+            Some(_) => bail!("Delta add dataChange must be a boolean"),
+        }
+        let path = add
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .context("Delta add action omitted its path")?;
+        let stats = match add.get("stats") {
+            Some(Value::String(stats)) => serde_json::from_str::<Value>(stats)
+                .context("Delta add action has invalid stats JSON")?,
+            Some(Value::Object(_)) => add["stats"].clone(),
+            _ => bail!("Delta add action omitted row statistics"),
+        };
+        let rows = stats
+            .get("numRecords")
+            .and_then(Value::as_u64)
+            .context("Delta add statistics omitted numRecords")?;
+        let bytes = add
+            .get("size")
+            .and_then(Value::as_u64)
+            .context("Delta add action omitted file size")?;
+        let identity = (version, path.to_owned());
+        let record = DeltaLogAdd { rows, bytes };
+        if let Some(previous) = adds.insert(identity, record)
+            && previous != record
+        {
+            bail!("conflicting duplicate Delta add action");
+        }
+    }
+    Ok(())
+}
+
+fn parse_delta_checkpoint_version(filename: &str) -> Result<Option<u64>> {
+    let Some((version_text, suffix)) = filename.split_once(".checkpoint.") else {
+        return Ok(None);
+    };
+    ensure!(
+        version_text.len() == 20 && version_text.bytes().all(|byte| byte.is_ascii_digit()),
+        "Delta checkpoint filename has a noncanonical version"
+    );
+    let valid_suffix = suffix == "parquet"
+        || suffix.strip_suffix(".parquet").is_some_and(|parts| {
+            let segments = parts.split('.').collect::<Vec<_>>();
+            segments.len() == 2
+                && segments.iter().all(|segment| {
+                    segment.len() == 10 && segment.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        });
+    ensure!(valid_suffix, "Delta checkpoint filename is malformed");
+    Ok(Some(version_text.parse::<u64>().context("Delta checkpoint version is invalid")?))
+}
+
+fn parse_last_checkpoint_version(contents: &[u8]) -> Result<u64> {
+    let checkpoint: Value = serde_json::from_slice(contents).context("invalid Delta _last_checkpoint JSON")?;
+    checkpoint
+        .get("version")
+        .and_then(Value::as_u64)
+        .context("Delta _last_checkpoint omitted its version")
+}
+
+fn validate_delta_log_version_history(versions: &BTreeSet<u64>, checkpoint_tips: &BTreeSet<u64>) -> Result<()> {
+    ensure!(!versions.is_empty(), "Delta log history contains no commit JSON files");
+    ensure!(versions.first() == Some(&0), "Delta log history does not begin at run-scoped version zero");
+    ensure!(
+        versions.iter().enumerate().all(|(index, version)| u64::try_from(index).ok() == Some(*version)),
+        "Delta log history has a missing commit version"
+    );
+    let latest = versions.last().copied().context("Delta log history has no latest version")?;
+    ensure!(
+        checkpoint_tips.iter().all(|tip| *tip <= latest),
+        "Delta checkpoint tip is newer than verified JSON history"
+    );
+    Ok(())
+}
+
+async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> {
+    use futures_util::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    ensure!(
+        !table.is_empty() && table.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "Delta evidence table path is not a canonical DMV name"
+    );
+    let mut url = Url::parse(delta_root).context("parse run-scoped Delta root")?;
+    ensure!(url.scheme() == "abfss" && url.query().is_none() && url.fragment().is_none(), "Delta evidence requires a plain run-scoped abfss URL");
+    let log_path = format!("{}/telemetry/sqlserver/{table}/_delta_log", url.path().trim_end_matches('/'));
+    url.set_path(&log_path);
+    let prefix = ObjectPath::from_url_path(url.path())?;
+    let store = object_store_for_url(&url)?;
+    let mut stream = store.list(Some(&prefix));
+    let mut adds = BTreeMap::new();
+    let mut log_files = 0_usize;
+    let mut versions_seen = BTreeSet::new();
+    let mut checkpoint_tips = BTreeSet::new();
+    while let Some(meta) = stream.try_next().await? {
+        let Some(filename) = meta.location.filename() else {
+            continue;
+        };
+        if filename == "_last_checkpoint" {
+            ensure!(meta.size <= 64 * 1024, "Delta _last_checkpoint exceeds the 64 KiB evidence bound");
+            let contents = store.get(&meta.location).await?.bytes().await?;
+            ensure!(contents.len() <= 64 * 1024, "Delta _last_checkpoint exceeds the 64 KiB evidence bound");
+            checkpoint_tips.insert(parse_last_checkpoint_version(&contents)?);
+            continue;
+        }
+        if filename.contains(".checkpoint") {
+            let version = parse_delta_checkpoint_version(filename)?
+                .context("Delta checkpoint filename is malformed")?;
+            checkpoint_tips.insert(version);
+            continue;
+        }
+        let Some(version_text) = filename.strip_suffix(".json") else {
+            continue;
+        };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Delta log JSON filename is not a canonical version");
+        }
+        let version = version_text.parse::<u64>().context("Delta log version is invalid")?;
+        ensure!(versions_seen.insert(version), "duplicate Delta log version file");
+        ensure!(meta.size <= 16 * 1024 * 1024, "Delta log JSON exceeds the 16 MiB evidence bound");
+        log_files = log_files.checked_add(1).context("Delta log file count overflow")?;
+        ensure!(log_files <= 10_000, "Delta log exceeds the 10,000-file evidence bound");
+        let contents = store.get(&meta.location).await?.bytes().await?;
+        parse_delta_log_adds(version, &contents, &mut adds)?;
+    }
+    validate_delta_log_version_history(&versions_seen, &checkpoint_tips)?;
+    let mut versions: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+    for ((version, _), add) in adds {
+        let totals = versions.entry(version).or_default();
+        totals.0 = totals.0.checked_add(add.rows).context("Delta log row count overflow")?;
+        totals.1 = totals.1.checked_add(1).context("Delta log file count overflow")?;
+        totals.2 = totals.2.checked_add(add.bytes).context("Delta log byte count overflow")?;
+    }
+    let (rows, files, bytes) = versions.values().try_fold((0_u64, 0_u64, 0_u64), |(rows, files, bytes), (version_rows, version_files, version_bytes)| {
+        Some((rows.checked_add(*version_rows)?, files.checked_add(*version_files)?, bytes.checked_add(*version_bytes)?))
+    }).context("Delta log total overflow")?;
+    Ok(json!({
+        "scope": "unique_data_change_true_add_actions_in_run_scoped_table_log",
+        "rows": rows,
+        "files": files,
+        "parquet_bytes": bytes,
+        "versions": versions.iter().map(|(version, (rows, files, bytes))| json!({
+            "delta_version": version, "rows": rows, "files": files, "parquet_bytes": bytes,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+#[cfg(test)]
+mod delta_log_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn delta_log_add_parser_excludes_rewrites_and_deduplicates_paths() -> Result<()> {
+        let mut adds = BTreeMap::new();
+        let commit = br#"{"add":{"path":"part-1.parquet","size":20,"dataChange":true,"stats":"{\"numRecords\":5}"}}
+{"add":{"path":"part-1.parquet","size":20,"dataChange":true,"stats":"{\"numRecords\":5}"}}
+{"add":{"path":"compact.parquet","size":30,"dataChange":false,"stats":"{\"numRecords\":5}"}}"#;
+        parse_delta_log_adds(7, commit, &mut adds)?;
+        assert_eq!(adds, BTreeMap::from([((7, "part-1.parquet".to_owned()), DeltaLogAdd { rows: 5, bytes: 20 })]));
+        Ok(())
+    }
+
+    #[test]
+    fn exploratory_reconciliation_marks_mismatches_without_hiding_counts() {
+        let delta = json!({
+            "rows": 5,
+            "versions": [{"delta_version": 7, "rows": 5, "files": 1, "parquet_bytes": 20}],
+        });
+        let events = json!({
+            "rows": 5,
+            "commits_by_version": [{"delta_version": 7, "rows": 5, "files": 1, "parquet_bytes": 20}],
+        });
+        let matched = exploratory_delta_reconciliation(Some(&delta), Some(&events), Some(5), None);
+        assert_eq!(matched["status"], "matched");
+        assert_eq!(matched["delta_log_committed_rows"], 5);
+        assert_eq!(matched["client_acknowledged_rows"], 5);
+        assert_eq!(matched["qualification"], "not_qualifying");
+
+        let mismatch = exploratory_delta_reconciliation(Some(&delta), Some(&events), Some(6), None);
+        assert_eq!(mismatch["status"], "mismatch");
+        assert_eq!(mismatch["delta_vs_acknowledged_rows"], -1);
+        assert_eq!(mismatch["delta_log_committed_rows"], 5);
+
+        let unavailable = exploratory_delta_reconciliation(None, Some(&events), Some(5), Some("delta_log_read_failed"));
+        assert_eq!(unavailable["status"], "unavailable");
+        assert!(unavailable["delta_log_committed_rows"].is_null());
+    }
+
+    #[test]
+    fn exploratory_reconciliation_detects_per_version_commit_divergence() {
+        let delta = json!({"rows": 5, "versions": [{"delta_version": 7, "rows": 5, "files": 1, "parquet_bytes": 20}]});
+        let events = json!({"rows": 5, "commits_by_version": [{"delta_version": 7, "rows": 4, "files": 1, "parquet_bytes": 20}]});
+        let result = exploratory_delta_reconciliation(Some(&delta), Some(&events), Some(5), None);
+        assert_eq!(result["status"], "mismatch");
+        assert_eq!(result["per_version"][0]["matched"], false);
+    }
+
+    #[test]
+    fn delta_log_history_accepts_benign_checkpoint_only_with_complete_json() -> Result<()> {
+        let complete = BTreeSet::from([0, 1, 2]);
+        assert!(validate_delta_log_version_history(&complete, &BTreeSet::new()).is_ok());
+        assert!(validate_delta_log_version_history(&complete, &BTreeSet::from([2])).is_ok());
+        assert!(validate_delta_log_version_history(&complete, &BTreeSet::from([3])).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::new(), &BTreeSet::from([0])).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([0, 2]), &BTreeSet::from([1])).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([1]), &BTreeSet::from([0])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn delta_checkpoint_markers_require_canonical_metadata() -> Result<()> {
+        assert_eq!(parse_last_checkpoint_version(br#"{"version":2,"size":3}"#)?, 2);
+        assert!(parse_last_checkpoint_version(br#"{"size":3}"#).is_err());
+        assert_eq!(
+            parse_delta_checkpoint_version("00000000000000000002.checkpoint.0000000001.0000000002.parquet")?,
+            Some(2)
+        );
+        assert!(parse_delta_checkpoint_version("not-a-checkpoint.parquet").is_ok_and(|tip| tip.is_none()));
+        assert!(parse_delta_checkpoint_version("00000000000000000002.checkpoint.bad.parquet").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn delta_log_add_parser_rejects_missing_row_statistics() {
+        let mut adds = BTreeMap::new();
+        assert!(parse_delta_log_adds(1, br#"{"add":{"path":"part.parquet","size":20,"dataChange":true}}"#, &mut adds).is_err());
+    }
+}
+
+fn exploratory_delta_reconciliation(
+    delta_log: Option<&Value>,
+    commit_output: Option<&Value>,
+    client_acknowledged_rows: Option<u64>,
+    unavailable_reason: Option<&str>,
+) -> Value {
+    let delta_rows = delta_log.and_then(|value| value["rows"].as_u64());
+    let event_rows = commit_output.and_then(|value| value["rows"].as_u64());
+    let delta_vs_event_rows = delta_rows.zip(event_rows).map(|(delta, event)| i128::from(delta) - i128::from(event));
+    let delta_vs_acknowledged_rows = delta_rows
+        .zip(client_acknowledged_rows)
+        .map(|(delta, acknowledged)| i128::from(delta) - i128::from(acknowledged));
+    let delta_versions = delta_log.and_then(|value| value["versions"].as_array());
+    let event_versions = commit_output.and_then(|value| value["commits_by_version"].as_array());
+    let version_comparison = delta_versions.zip(event_versions).map(|(delta, events)| {
+        let mut delta_by_version = BTreeMap::new();
+        let mut event_by_version = BTreeMap::new();
+        let valid_delta = delta.iter().all(|version| {
+            let Some(number) = version["delta_version"].as_u64() else { return false; };
+            delta_by_version.insert(number, (version["rows"].as_u64(), version["files"].as_u64(), version["parquet_bytes"].as_u64())).is_none()
+        });
+        let valid_events = events.iter().all(|event| {
+            let Some(number) = event["delta_version"].as_u64() else { return false; };
+            event_by_version.insert(number, (event["rows"].as_u64(), event["files"].as_u64(), event["parquet_bytes"].as_u64())).is_none()
+        });
+        if !valid_delta || !valid_events {
+            return (None, json!([]));
+        }
+        let numbers = delta_by_version.keys().chain(event_by_version.keys()).copied().collect::<BTreeSet<_>>();
+        let mut comparisons = Vec::new();
+        let mut matched = true;
+        for number in numbers {
+            let delta = delta_by_version.get(&number).copied();
+            let event = event_by_version.get(&number).copied();
+            let equal = delta.is_some() && delta == event && delta.is_some_and(|(rows, files, bytes)| rows.is_some() && files.is_some() && bytes.is_some());
+            matched &= equal;
+            comparisons.push(json!({
+                "delta_version": number,
+                "delta_log": delta.map(|(rows, files, bytes)| json!({"rows": rows, "files": files, "parquet_bytes": bytes})),
+                "collector_event": event.map(|(rows, files, bytes)| json!({"rows": rows, "files": files, "parquet_bytes": bytes})),
+                "matched": equal,
+            }));
+        }
+        (Some(matched), json!(comparisons))
+    });
+    let versions_match = version_comparison.as_ref().and_then(|(matched, _)| *matched);
+    let ack_matches = delta_vs_acknowledged_rows.map(|delta| delta == 0);
+    let status = if versions_match == Some(false) || ack_matches == Some(false) {
+        "mismatch"
+    } else if delta_rows.is_some() && event_rows.is_some() && client_acknowledged_rows.is_some()
+        && versions_match == Some(true) && ack_matches == Some(true)
+    {
+        "matched"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "evidence_class": "d53_exploratory",
+        "status": status,
+        "qualification": "not_qualifying",
+        "unavailable_reason": (status == "unavailable").then_some(unavailable_reason.unwrap_or("required_reconciliation_evidence_unavailable")),
+        "delta_log_committed_rows": delta_rows,
+        "collector_event_committed_rows": event_rows,
+        "client_acknowledged_rows": client_acknowledged_rows,
+        "delta_vs_collector_event_rows": delta_vs_event_rows,
+        "delta_vs_acknowledged_rows": delta_vs_acknowledged_rows,
+        "per_version": version_comparison.map(|(_, comparisons)| comparisons),
+        "scope": "unique_data_change_true_delta_adds_cross_checked_against_ingestion_only_commit_events_and_whole_run_client_acknowledgments_including_drain",
+    })
 }
 
 #[cfg(test)]
@@ -640,6 +1015,8 @@ mod commit_evidence_tests {
         assert!(table["rows"].is_null());
         assert_eq!(table["output_throughput"]["rows"], 20);
         assert_eq!(table["output_throughput"]["rows_per_second"], 200.0);
+        assert_eq!(table["output_throughput"]["input_bytes_per_second"], 2000.0);
+        assert_eq!(table["output_throughput"]["parquet_bytes_per_second"], 1000.0);
         assert_eq!(table["run_cumulative_output"]["rows"], 40);
         assert!(table["output_throughput"]["unique_delivered_rows"].is_null());
         let zero = durable_commit_evidence(&config, &[log(&[])], Some((100, 200)))?;
@@ -648,6 +1025,33 @@ mod commit_evidence_tests {
         absent.text.clear();
         let absent = durable_commit_evidence(&config, &[absent], Some((100, 200)))?;
         assert!(absent[&config.tables[0]]["output_throughput"]["rows"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_commit_windows_preserve_half_open_boundaries_and_unknowns() -> Result<()> {
+        let config = config()?;
+        let mut first = event(&config, 900, 999)?;
+        first["finished_at_unix_ms"] = json!(1000);
+        let mut boundary = event(&config, 1000, 1001)?;
+        boundary["delta_version"] = json!(8);
+        boundary["finished_at_unix_ms"] = json!(31_000);
+        let mut tail = event(&config, 1000, 1001)?;
+        tail["delta_version"] = json!(9);
+        tail["finished_at_unix_ms"] = json!(61_000);
+        let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail])], Some((1000, 66_000)))?;
+        let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
+        assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
+        assert_eq!(windows[0]["rows"], 10);
+        assert_eq!(windows[1]["rows"], 10);
+        assert_eq!(evidence[&config.tables[0]]["output_throughput"]["rows"], 30);
+        let mut missing = log(&[]);
+        missing.complete = false;
+        let evidence = durable_commit_evidence(&config, &[missing], Some((1000, 66_000)))?;
+        let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
+        assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
+        assert!(windows[0]["rows"].is_null());
+        assert_eq!(windows[0]["unavailable_reason"], "collector_commit_log_incomplete");
         Ok(())
     }
 }

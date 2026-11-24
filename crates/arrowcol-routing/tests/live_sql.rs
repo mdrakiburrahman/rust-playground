@@ -968,6 +968,48 @@ async fn live_sql_collector_state_is_monotone_across_same_instance_writers() -> 
 }
 
 /// Returns a routing collector's state, heartbeat and lease expiry (Unix ms).
+#[tokio::test]
+#[ignore = "requires the local arrowcol-infra SQL Server integration harness"]
+async fn live_sql_terminal_collector_state_after_expiry() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_ROUTING_CASE.lock().await;
+    let store = SqlServerRoutingStore::new(sql_config()?);
+    let started = subtract(now()?, 120_000)?;
+    let expiry = add(started, 60_000)?;
+    let draining_at = subtract(expiry, 1)?;
+    for (terminal, expected) in [(CollectorState::Stopped, "stopped"), (CollectorState::Failed, "failed")] {
+        let id = CollectorInstanceId::new();
+        store
+            .register_collector(&live_registration(
+                id,
+                format!("live-terminal-expiry-{id}"),
+                51_102,
+                started,
+                expiry,
+            )?)
+            .await?;
+        store
+            .set_collector_state(id, CollectorState::Draining, draining_at)
+            .await?;
+        let expired = store.heartbeat_collector(id, expiry, add(expiry, 60_000)?).await;
+        assert_eq!(
+            expired.err().map(|error| error.kind()),
+            Some(RoutingErrorKind::Conflict)
+        );
+        for offset in 0..32_u64 {
+            let terminal_at = add(expiry, offset)?;
+            store.set_collector_state(id, terminal, terminal_at).await?;
+            assert_eq!(
+                live_collector_row(id).await?,
+                (expected.to_owned(), draining_at.get(), expiry.get())
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn live_collector_row(instance_id: CollectorInstanceId) -> anyhow::Result<(String, u64, u64)> {
     let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
     let row = connection

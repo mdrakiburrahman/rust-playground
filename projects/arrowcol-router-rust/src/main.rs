@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let _metrics_guard = arrowcol_buffer::MetricsGuard::install("arrowcol-router-rust")?;
     let edge_secret = read_secret_file(&config.auth.edge_secret_file)?;
     let internal_secret = read_secret_file(&config.auth.internal_signing_secret_file)?;
     let routing_sql = SqlServerRoutingConfig::with_password_file(

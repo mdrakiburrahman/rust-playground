@@ -12,6 +12,75 @@ const fail = (message: string): never => {
 };
 
 if (tool === 'docker') {
+  if (mode === 'overload_success') {
+    const services = { 'guard-client': 'oat-client', 'guard-maintenance': 'delta-maintenance', 'guard-collector': 'dataflow-1' };
+    if (args[0] === 'compose' && args.includes('down')) {
+      writeFileSync(join(root, 'compose-destroyed'), '');
+      const profiles = args.flatMap((arg, index) => arg === '--profile' ? [args[index + 1]] : []);
+      writeFileSync(join(root, 'down-profiles'), JSON.stringify(profiles));
+      if (profiles.includes('maintenance')) writeFileSync(join(root, 'guard-maintenance-removed'), '');
+    } else if (args[0] === 'ps' || args[0] === 'compose' && args.includes('ps')) {
+      console.log(args.some(arg => arg.includes('service=oat-client'))
+        ? existsSync(join(root, 'guard-client-removed')) ? '' : 'guard-client'
+        : Object.keys(services).join('\n'));
+    } else if (args[0] === 'inspect') {
+      console.log(JSON.stringify(Object.entries(services).filter(([id]) => args.includes(id)).map(([id, service]) => {
+        const stopped = existsSync(join(root, `${id}-stopped`));
+        return { Id: id, RestartCount: 0,
+          Config: { Labels: { 'com.docker.compose.project': readFileSync(join(root, 'project'), 'utf8'), 'com.docker.compose.service': service } },
+          State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
+            Error: '', ExitCode: 0, OOMKilled: false, FinishedAt: new Date().toISOString() } };
+      })));
+    } else if (args[0] === 'stop') {
+      for (const id of Object.keys(services).filter(id => args.includes(id))) writeFileSync(join(root, `${id}-stopped`), '');
+    } else if (args[0] === 'logs') {
+      if (args.includes('guard-collector')) console.log('arrowcol_effective_config {"component":"receiver"}');
+      if (args.includes('guard-maintenance')) {
+        console.log('arrowcol_maintenance_effective_config {}');
+        if (existsSync(join(root, 'guard-maintenance-stopped'))) {
+          for (const operation of ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'])
+            console.log(JSON.stringify({ table: 't', operation, applied: true, report: { outcome: 'noop', interrupted: false } }));
+        }
+      }
+    } else if (args[0] === 'rm') writeFileSync(join(root, 'guard-client-removed'), '');
+    else fail('unexpected overload lifecycle command');
+    process.exit(0);
+  }
+  if (mode === 'maintenance_cell') {
+    const project = readFileSync(join(root, 'project'), 'utf8');
+    const stopped = existsSync(join(root, 'maintenance-stopped'));
+    if (args[0] === 'ps' || args[0] === 'compose' && args.includes('ps')) {
+      console.log('maintenance-fixture');
+      process.exit(0);
+    }
+    if (args[0] === 'inspect') {
+      console.log(JSON.stringify([{
+        Id: 'maintenance-fixture', RestartCount: 0,
+        Config: { Labels: { 'com.docker.compose.project': project, 'com.docker.compose.service': 'delta-maintenance' } },
+        State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
+          Error: '', ExitCode: stopped ? 1 : 0, OOMKilled: false, FinishedAt: '2026-11-16T15:54:00Z' },
+      }]));
+      process.exit(0);
+    }
+    if (args[0] === 'stop') {
+      writeFileSync(join(root, 'maintenance-stopped'), '');
+      process.exit(0);
+    }
+    if (args[0] === 'logs') {
+      console.log('arrowcol_maintenance_effective_config {}');
+      const cycles = stopped ? 31 : existsSync(join(root, 'measurement-finished')) ? 30 : 0;
+      for (let cycle = 0; cycle < cycles; cycle++) {
+        for (const operation of ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log']) {
+          const retry = cycle >= 1 && cycle <= 5;
+          console.log(JSON.stringify({ table: 't', operation, applied: true,
+            error_kind: retry ? 'stale_plan' : null, error: retry ? 'private replan message' : null,
+            report: retry ? null : { outcome: 'noop', interrupted: false } }));
+        }
+      }
+      process.exit(0);
+    }
+    fail('unexpected maintenance lifecycle fixture command');
+  }
   if (args[0] === 'ps') {
     if (args.includes('--all')) fail('fixture stop listing failed');
     process.exit(0);

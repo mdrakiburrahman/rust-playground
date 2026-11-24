@@ -29,6 +29,7 @@ cpu-time = "1.0"
 futures = "0.3"
 humantime-serde = "1"
 linkme = "0.3"
+opentelemetry.workspace = true
 otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
 otel-arrow-dfe-channel = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/channel" }
 otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine" }
@@ -49,6 +50,7 @@ otel-arrow-dfe-core-nodes = { path = "../../submodules/otel-arrow/rust/otap-data
 otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine", features = ["test-utils"] }
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 uuid = { version = "1", features = ["v5"] }
 
 [lints.rust]

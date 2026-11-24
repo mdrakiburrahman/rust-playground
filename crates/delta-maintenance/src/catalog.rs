@@ -1,6 +1,6 @@
 //! Maintenance discovery through the catalog client's authoritative gRPC contract.
 
-use crate::{DiscoveredTable, MAX_TABLES, TableDiscovery};
+use crate::{DiscoveredTable, MAX_TABLES, TableDiscovery, TargetTable};
 use anyhow::{Context, Result, bail};
 use arrowcol_catalog_client::rpc::schema_catalog_client::SchemaCatalogClient;
 use arrowcol_catalog_client::{InternalRequestSigner, rpc};
@@ -53,6 +53,7 @@ pub struct CatalogDiscovery {
     signer: InternalRequestSigner,
     allowlist: Vec<String>,
     tables: Mutex<BTreeMap<String, DiscoveredTable>>,
+    identities: Mutex<BTreeMap<String, TargetTable>>,
     rpc_timeout: Duration,
 }
 
@@ -110,6 +111,7 @@ impl CatalogDiscovery {
             signer,
             allowlist,
             tables: Mutex::new(BTreeMap::new()),
+            identities: Mutex::new(BTreeMap::new()),
             rpc_timeout: options.rpc_timeout,
         })
     }
@@ -179,7 +181,30 @@ impl TableDiscovery for CatalogDiscovery {
             .block_on(async { tokio::time::timeout(self.rpc_timeout, client.get_snapshot(request)).await })
             .context("catalog snapshot timeout")??
             .into_inner();
+        let identities = snapshot
+            .tables
+            .iter()
+            .filter(|table| table.provider == "delta")
+            .filter_map(|table| table.table.as_ref())
+            .map(|table| {
+                (
+                    format!("{}.{}.{}", table.catalog, table.database, table.table),
+                    TargetTable {
+                        catalog: table.catalog.clone(),
+                        schema: table.database.clone(),
+                        table: table.table.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let selected = selected_tables(snapshot, &self.allowlist)?;
+        *self
+            .identities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("catalog identity mutex poisoned"))? = identities
+            .into_iter()
+            .filter(|(name, _)| selected.contains_key(name))
+            .collect();
         let names = selected.keys().cloned().collect();
         *self
             .tables
@@ -195,6 +220,15 @@ impl TableDiscovery for CatalogDiscovery {
             .get(name)
             .cloned()
             .with_context(|| format!("table {name} is absent from the current catalog snapshot"))
+    }
+
+    fn table_identity(&self, name: &str) -> Result<TargetTable> {
+        self.identities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("catalog identity mutex poisoned"))?
+            .get(name)
+            .cloned()
+            .with_context(|| format!("table {name} has no current catalog identity"))
     }
 }
 

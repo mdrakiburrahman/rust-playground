@@ -33,6 +33,10 @@ pub enum Command {
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
     AzureManifest(InitializeAzureArgs),
+    /// Create one fresh local ingestion-partitioned table without connecting to Flight or sending rows.
+    InitializeLocal(InitializeLocalArgs),
+    /// Create one fresh owned-run table only through an explicitly supplied storage bridge.
+    InitializeOwnedRunTable(InitializeOwnedRunTableArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
 }
@@ -117,6 +121,34 @@ pub struct InitializeAzureArgs {
     /// Output manifest used by infrastructure reconciliation.
     #[arg(long, env = "ARROWCOL_AZURE_TABLE_MANIFEST")]
     pub manifest: PathBuf,
+}
+
+/// Setup-only local Delta table initialization inputs.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeLocalArgs {
+    /// Explicitly opt into the supported ingestion-date partition.
+    #[arg(long)]
+    pub partition_by_ingestion_date: bool,
+    /// One fully qualified table from the canonical public schema fixture.
+    #[arg(long = "table")]
+    pub table: String,
+    /// Absolute, existing, writable run-owned local Dataflow root.
+    #[arg(long, required = true)]
+    pub dataflow_root: PathBuf,
+}
+
+/// One fresh zero-row table; never the all-table bootstrap.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeOwnedRunTableArgs {
+    /// Strict JSON plan binding storage, campaign/run, generation and publication authority.
+    #[arg(long)]
+    pub plan: PathBuf,
+    /// Private JSON with original StorageBridge authority and absolute deadline.
+    #[arg(long, requires = "storage_bridge_stdio")]
+    pub storage_bridge_input: Option<PathBuf>,
+    /// Dedicated StorageBridge request/response pipes; never a direct-network fallback.
+    #[arg(long, requires = "storage_bridge_input")]
+    pub storage_bridge_stdio: bool,
 }
 
 /// Benchmark scenario.
@@ -228,6 +260,10 @@ pub struct RunArgs {
     /// Optional fully qualified tables to load; empty means all registered tables.
     #[arg(long = "table", env = "LOADTEST_TABLES", value_delimiter = ',')]
     pub tables: Vec<String>,
+
+    /// Initialize selected fresh local tables with the ingestion partition before registration.
+    #[arg(long)]
+    pub partition_by_ingestion_date: bool,
 
     /// Concurrent scheduling lanes; zero uses all available cores. Each lane has one logical batch in flight.
     #[arg(long, env = "LOADTEST_LANES", default_value_t = 4)]
@@ -493,6 +529,7 @@ mod tests {
         assert_eq!(arguments.measure.get(), Duration::from_secs(30));
         assert_eq!(arguments.lanes, 8);
         assert_eq!(arguments.batch_rows, 1024);
+        assert!(!arguments.partition_by_ingestion_date);
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Dataflow]);
         Ok(())
     }
@@ -510,6 +547,7 @@ mod tests {
             keep_stack: false,
             scenarios: vec![Scenario::Dataflow],
             tables: Vec::new(),
+            partition_by_ingestion_date: false,
             lanes: 1,
             batch_rows: 1,
             seed: 1,

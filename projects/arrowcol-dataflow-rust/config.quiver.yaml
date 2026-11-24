@@ -1,5 +1,6 @@
 version: otel_dataflow/v1
-engine: {}
+engine:
+  shutdown_drain_timeout_seconds: ${env:ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS:-60}
 policies:
   resources:
     core_allocation:

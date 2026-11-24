@@ -14,6 +14,8 @@ arrow-array = { version = "58.3", default-features = false }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 arrow-schema = { version = "58.3", default-features = false }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
+arrowcol-buffer = { path = "../../crates/arrowcol-buffer" }
+opentelemetry.workspace = true
 arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
 arrowcol-catalog-client = { path = "../../crates/arrowcol-catalog-client" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }

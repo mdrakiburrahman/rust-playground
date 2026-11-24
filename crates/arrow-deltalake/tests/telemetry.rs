@@ -54,6 +54,7 @@ async fn real_kernel_and_publication_events_reach_meter_provider() -> Result<()>
         "delta.kernel.version",
         "delta.publication.events",
         "delta.publication.duration",
+        "delta.commit.input_bytes",
     ] {
         assert!(names.contains(expected), "missing {expected}: {names:?}");
     }
@@ -65,6 +66,18 @@ async fn real_kernel_and_publication_events_reach_meter_provider() -> Result<()>
         version.unit(),
         "",
         "unit \"1\" gauges export to Prometheus as delta_kernel_version_ratio"
+    );
+    let input_bytes = metrics
+        .iter()
+        .find(|metric| metric.name() == "delta.commit.input_bytes")
+        .context("committed Arrow bytes")?;
+    let AggregatedMetrics::U64(MetricData::Sum(input_bytes)) = input_bytes.data() else {
+        anyhow::bail!("committed Arrow bytes did not export a sum");
+    };
+    assert_eq!(
+        input_bytes.data_points().map(|point| point.value()).sum::<u64>(),
+        arrow_deltalake::record_batch_logical_bytes(&batch)?,
+        "a deduplicated replay must not count as another committed batch"
     );
     let events = metrics
         .iter()

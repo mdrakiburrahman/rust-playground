@@ -1895,13 +1895,12 @@ async fn succession_hands_crashed_holder_lease_to_same_key_restart() {
 /// Guarantees: succession conflicts and the lease is unchanged; a live holder
 /// keeps ownership until it expires or reports a terminal state.
 #[tokio::test]
-async fn succession_rejects_predecessor_with_live_registration() {
+async fn succession_rejects_predecessor_with_live_registration() -> anyhow::Result<()> {
     let fixture = CrashedHolder::new(LONG_LEASE_TTL_MS).await;
     fixture
         .store
-        .heartbeat_collector(fixture.crashed, millis(249_000), millis(300_000))
-        .await
-        .unwrap_or_else(|error| panic!("extend holder registration: {error}"));
+        .heartbeat_collector(fixture.crashed, millis(249_000), millis(252_000))
+        .await?;
 
     fixture
         .assert_rejected(
@@ -1909,6 +1908,30 @@ async fn succession_rejects_predecessor_with_live_registration() {
             RoutingErrorKind::Conflict,
         )
         .await;
+    fixture
+        .store
+        .set_collector_state(fixture.crashed, CollectorState::Draining, millis(251_000))
+        .await?;
+    fixture
+        .store
+        .heartbeat_collector(fixture.crashed, millis(251_500), millis(311_500))
+        .await?;
+    fixture
+        .assert_rejected(
+            &fixture.succession(fixture.restart, 252_001),
+            RoutingErrorKind::Conflict,
+        )
+        .await;
+    fixture
+        .store
+        .set_collector_state(fixture.crashed, CollectorState::Stopped, millis(252_002))
+        .await?;
+    let successor = fixture
+        .store
+        .transfer_to_successor(&fixture.succession(fixture.restart, 252_003))
+        .await?;
+    assert_eq!(successor.holder_instance_id, fixture.restart);
+    Ok(())
 }
 
 /// Scenario: the holder's registration is unexpired, but its shutdown recorded
@@ -2299,6 +2322,64 @@ async fn rebalance_never_moves_crashed_lease_to_different_key_without_drain_proo
 /// repeated drains are idempotent; a registration refresh cannot resurrect
 /// `ready`; heartbeats never move the lease backwards; a terminal state never
 /// regresses or changes.
+#[tokio::test]
+async fn collector_timestamp_writes_preserve_registration_check() -> anyhow::Result<()> {
+    let store = MemoryRoutingStore::default();
+    let id = CollectorInstanceId::new();
+    let original = registration(id, 5101, 90_000);
+    let expiry = original.lease_expires_at_unix_ms;
+
+    for (heartbeat, expires) in [
+        (millis(89_999), expiry),
+        (original.heartbeat_at_unix_ms, original.heartbeat_at_unix_ms),
+    ] {
+        let invalid = CollectorRegistration {
+            heartbeat_at_unix_ms: heartbeat,
+            lease_expires_at_unix_ms: expires,
+            ..original.clone()
+        };
+        assert!(store.register_collector(&invalid).await.is_err());
+    }
+    store.register_collector(&original).await?;
+    assert!(store.heartbeat_collector(id, expiry, expiry).await.is_err());
+    store.heartbeat_collector(id, millis(89_999), millis(90_000)).await?;
+    store.set_collector_state(id, CollectorState::Draining, expiry).await?;
+    let late = store
+        .heartbeat_collector(id, expiry, millis(expiry.get() + 1_000))
+        .await;
+    assert_eq!(late.err().map(|error| error.kind()), Some(RoutingErrorKind::Conflict));
+    let draining = &store.load_view(expiry).await?.collectors[&id];
+    draining.registration.validate()?;
+    assert_eq!(draining.state, CollectorState::Draining);
+    assert_eq!(draining.registration, original);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_collector_state_after_expiry_does_not_change_lease() -> anyhow::Result<()> {
+    let store = MemoryRoutingStore::default();
+    for terminal in [CollectorState::Stopped, CollectorState::Failed] {
+        let id = CollectorInstanceId::new();
+        let original = registration(id, 5101, 90_000);
+        let expiry = original.lease_expires_at_unix_ms;
+        store.register_collector(&original).await?;
+        let draining_at = millis(expiry.get() - 1);
+        store
+            .set_collector_state(id, CollectorState::Draining, draining_at)
+            .await?;
+        for terminal_at in [expiry, millis(expiry.get() + 1_000)] {
+            store.set_collector_state(id, terminal, terminal_at).await?;
+            let view = store.load_view(terminal_at).await?;
+            let stopped = &view.collectors[&id];
+            assert_eq!(stopped.state, terminal);
+            assert_eq!(stopped.registration.heartbeat_at_unix_ms, draining_at);
+            assert_eq!(stopped.registration.lease_expires_at_unix_ms, expiry);
+            stopped.registration.validate()?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn collector_state_is_monotone_across_same_instance_writers() {
     let store = MemoryRoutingStore::default();

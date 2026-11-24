@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 /// Maximum lifetime of an internal signed catalog RPC assertion.
 pub const MAX_INTERNAL_AUTH_TTL_MS: u64 = 30_000;
+// Leave room for client/server clock skew within the verifier's maximum.
+const SIGNED_INTERNAL_AUTH_TTL_MS: u64 = 25_000;
 /// Identity context metadata header.
 pub const INTERNAL_AUTH_CONTEXT_HEADER: &str = "x-arrowcol-internal-auth-context";
 /// Assertion expiry metadata header.
@@ -93,7 +95,7 @@ impl InternalRequestSigner {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let now_ms = u64::try_from(now_ms)?;
         let expires_ms = now_ms
-            .checked_add(MAX_INTERNAL_AUTH_TTL_MS)
+            .checked_add(SIGNED_INTERNAL_AUTH_TTL_MS)
             .context("internal assertion expiry overflow")?;
         let principal = AuthenticatedPrincipal::new(
             PrincipalId::new("arrowcol-internal-client")?,

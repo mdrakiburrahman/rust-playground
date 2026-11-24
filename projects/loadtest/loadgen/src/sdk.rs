@@ -78,8 +78,18 @@ pub async fn prepare_tables(
 
     let store = RemoteCatalogClient::connect(&arguments.catalog_endpoint, Duration::from_secs(10)).await?;
 
+    let statements = schema_statements()?;
+    if arguments.partition_by_ingestion_date {
+        let root = arguments.dataflow_root.clone();
+        let selected = arguments.tables.clone();
+        let fixture = statements.clone();
+        tokio::task::spawn_blocking(move || crate::initialize::initialize_fresh_local(&root, &selected, &fixture))
+            .await
+            .context("local table initialization task failed")??;
+    }
+
     let mut tables = Vec::new();
-    for statement in schema_statements()? {
+    for statement in statements {
         let completion = transport
             .register_schema(&statement.ddl, &statement.identity, arguments.request_timeout.get())
             .await

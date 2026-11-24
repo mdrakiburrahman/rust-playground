@@ -7,11 +7,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::array::{Int64Array, RecordBatch};
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse,
     PollInfo, PutResult, SchemaResult, Ticket,
+};
+use arrowcol_catalog::{
+    CatalogControlPlane, CatalogSchemaVersion, CatalogStore, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest,
+    MemoryCatalogStore,
+};
+use arrowcol_flight::{
+    ArrowColFlightService, BatchAdmission, PutResultEmitter, RuntimeLimits, RuntimeResult, StreamAbortReason,
+    StreamCompletion, StreamContext, StreamLifecycle, StreamSummary,
 };
 use arrowcol_protocol::{
     BasisPoints, CatalogName, CollectorInstanceId, ImplementationPool, Measurement, NOT_ADMITTED_METADATA_KEY,
@@ -29,11 +39,12 @@ use arrowcol_routing::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use http::{HeaderMap, HeaderValue, Method};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status};
@@ -47,6 +58,7 @@ const BACKEND_HEADER: &str = "x-test-backend";
 const FAIL_AFTER_HEADER: &str = "x-test-fail-after";
 const INTERNAL_CONTEXT_HEADER: &str = "x-arrowcol-internal-auth-context";
 const EDGE_SIGNATURE_HEADER: &str = "x-arrowcol-edge-signature";
+const COMPRESSION_ENV: &str = "ARROWCOL_ROUTER_TEST_COMPRESSION";
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -466,14 +478,349 @@ async fn production_pingora_preserves_streaming_errors_control_auth_reuse_and_bo
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "loopback ProductionRouter/shared receiver; requires ARROWCOL_TEST_DMV_BIN built from this source"]
+async fn production_pingora_forwards_configured_shared_flight_compression() -> anyhow::Result<()> {
+    anyhow::ensure!(cfg!(target_os = "linux"), "Pingora witness requires Linux");
+    let dmv_binary = std::fs::canonicalize(std::env::var("ARROWCOL_TEST_DMV_BIN")?)?;
+    let (_, schema) = compression_catalog().await?;
+    for (accept, send, client_send, client_accept) in [
+        ("none", "none", None, None),
+        ("none", "none", None, Some(CompressionEncoding::Zstd)),
+        (
+            "gzip",
+            "gzip",
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Gzip),
+        ),
+        (
+            "zstd",
+            "zstd",
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+        ),
+        (
+            "gzip",
+            "zstd",
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Zstd),
+        ),
+        (
+            "gzip",
+            "gzip",
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Zstd),
+        ),
+        ("none", "none", Some(CompressionEncoding::Gzip), None),
+        (
+            "gzip",
+            "gzip",
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Gzip),
+        ),
+    ] {
+        let proxy = reserve_address()?;
+        let backend = reserve_address()?;
+        let state = format!("target/pingora-compression-{}-{}", std::process::id(), now()?.get());
+        std::fs::create_dir_all(&state)?;
+        let process = Command::new(std::env::current_exe()?)
+            .args(["--ignored", "--exact", "pingora_child_process", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env(LISTEN_ENV, proxy.to_string())
+            .env(BACKEND_ENV, backend.to_string())
+            .env(STATE_ENV, &state)
+            .env(COMPRESSION_ENV, format!("{accept},{send}"))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let mut child = ChildGuard {
+            child: Some(process),
+            state: state.clone(),
+        };
+        wait_for_port(proxy, Duration::from_secs(15)).await?;
+        wait_for_port(backend, Duration::from_secs(15)).await?;
+        let channel = Endpoint::from_shared(format!("http://{proxy}"))?
+            .timeout(Duration::from_secs(5))
+            .connect()
+            .await?;
+        let mut client = FlightServiceClient::new(channel);
+        if let Some(encoding) = client_send {
+            client = client.send_compressed(encoding);
+        }
+        if let Some(encoding) = client_accept {
+            client = client.accept_compressed(encoding);
+        }
+        let signer = EdgeRequestSigner::new(vec![1_u8; 32])?;
+        let nonce = Arc::new(AtomicU64::new(1));
+        let result = client
+            .do_put(compression_request(&schema, &signer, Arc::clone(&nonce), 1).await?)
+            .await;
+        if client_send.is_some() && client_send != test_codec(accept)? {
+            let error = match result {
+                Err(error) => error,
+                Ok(response) => response
+                    .into_inner()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .err()
+                    .ok_or_else(|| anyhow::anyhow!("incompatible request unexpectedly accepted"))?,
+            };
+            assert_eq!(error.code(), Code::Unimplemented);
+            assert_eq!(std::fs::read_to_string(format!("{state}/compression-rows"))?, "0");
+            println!(
+                "COMPRESSION_WITNESS accept={accept} send={send} request={client_send:?} rejected={:?}",
+                error.code()
+            );
+        } else {
+            let response = result?;
+            let negotiated = response
+                .metadata()
+                .get("grpc-encoding")
+                .map(|value| value.to_str().map(str::to_owned))
+                .transpose()?;
+            let expected = test_codec(send)?
+                .filter(|encoding| Some(*encoding) == client_accept)
+                .map(|encoding| {
+                    if encoding == CompressionEncoding::Gzip {
+                        "gzip"
+                    } else {
+                        "zstd"
+                    }
+                });
+            assert_eq!(negotiated.as_deref(), expected);
+            assert_eq!(response.into_inner().try_collect::<Vec<_>>().await?.len(), 1);
+            assert_eq!(std::fs::read_to_string(format!("{state}/compression-rows"))?, "1");
+            println!("COMPRESSION_WITNESS accept={accept} send={send} request={client_send:?} response={negotiated:?}");
+
+            let oversized = client
+                .do_put(compression_request(&schema, &signer, nonce, 32_768).await?)
+                .await;
+            let error = match oversized {
+                Err(error) => error,
+                Ok(response) => response
+                    .into_inner()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .err()
+                    .ok_or_else(|| anyhow::anyhow!("oversized request unexpectedly accepted"))?,
+            };
+            println!(
+                "COMPRESSION_LIMIT_WITNESS request={client_send:?} code={:?} message={}",
+                error.code(),
+                error.message()
+            );
+            assert_eq!(
+                error.code(),
+                if client_send.is_some() {
+                    Code::ResourceExhausted
+                } else {
+                    Code::InvalidArgument
+                }
+            );
+            assert_eq!(std::fs::read_to_string(format!("{state}/compression-rows"))?, "1");
+
+            if client_send == test_codec(accept)? && client_accept == test_codec(send)? {
+                let secret = format!("{state}/test-edge-key");
+                std::fs::write(&secret, [1_u8; 32])?;
+                let output = Command::new(&dmv_binary)
+                    .args([
+                        "--endpoint",
+                        &format!("http://{proxy}"),
+                        "--client-id",
+                        "compression-witness",
+                        "--table",
+                        "sqlserver_availability_replica_states",
+                        "--edge-secret-file",
+                        &secret,
+                        "--rows",
+                        "4",
+                        "--batch-rows",
+                        "4",
+                        "--corpus-rows",
+                        "4",
+                        "--max-rows",
+                        "4",
+                        "--workers",
+                        "1",
+                        "--runtime-threads",
+                        "1",
+                        "--concurrency",
+                        "1",
+                        "--grpc-send-compression",
+                        accept,
+                        "--grpc-accept-compression",
+                        send,
+                        "--request-timeout-ms",
+                        "5000",
+                        "--connect-timeout-ms",
+                        "5000",
+                    ])
+                    .output()?;
+                println!(
+                    "OAT_CLIENT_WITNESS accept={accept} send={send} status={}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                anyhow::ensure!(
+                    output.status.success(),
+                    "actual OAT client failed through ProductionRouter"
+                );
+                assert_eq!(std::fs::read_to_string(format!("{state}/compression-rows"))?, "5");
+            }
+        }
+        child.terminate()?;
+        child.wait(Duration::from_secs(20))?;
+    }
+    Ok(())
+}
+
+fn test_codec(value: &str) -> anyhow::Result<Option<CompressionEncoding>> {
+    match value {
+        "none" => Ok(None),
+        "gzip" => Ok(Some(CompressionEncoding::Gzip)),
+        "zstd" => Ok(Some(CompressionEncoding::Zstd)),
+        _ => anyhow::bail!("invalid compression fixture codec {value}"),
+    }
+}
+
+async fn compression_catalog() -> anyhow::Result<(Arc<dyn CatalogStore>, CatalogSchemaVersion)> {
+    let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
+    CatalogControlPlane::new(DdlParser::default(), Arc::clone(&store))
+        .execute_ddl(FlightSqlDdlRequest::new(
+            "CREATE TABLE telemetry.prod.traces (value BIGINT) USING DELTA",
+        ))
+        .await?;
+    let schema = store
+        .current_schema(&integration_table())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("compression fixture schema missing"))?;
+    Ok((store, schema))
+}
+
+async fn compression_request(
+    schema: &CatalogSchemaVersion,
+    signer: &EdgeRequestSigner,
+    nonce: Arc<AtomicU64>,
+    rows: usize,
+) -> anyhow::Result<Request<impl Stream<Item = FlightData> + Send + 'static>> {
+    let arrow_schema = Arc::new(schema.arrow_schema()?);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![Arc::new(Int64Array::from(vec![7_i64; rows]))],
+    )?;
+    let data = FlightDataEncoderBuilder::new()
+        .with_schema(arrow_schema)
+        .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![
+            "telemetry".to_owned(),
+            "prod".to_owned(),
+            "traces".to_owned(),
+            "v1".to_owned(),
+        ])))
+        .build(stream::iter([Ok(batch)]))
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut request = Request::new(stream::iter(data));
+    add_ingest_metadata(&mut request, signer, Arc::clone(&nonce), false, None, None)?;
+    request.metadata_mut().insert(
+        "x-arrowcol-schema-fingerprint",
+        MetadataValue::try_from(schema.fingerprint().to_string())?,
+    );
+    let mut headers = request.metadata().clone().into_headers();
+    headers.insert("content-type", HeaderValue::from_static("application/grpc"));
+    sign_and_copy(
+        request.metadata_mut(),
+        signer,
+        &Method::POST,
+        "/arrow.flight.protocol.FlightService/DoPut",
+        headers,
+        nonce,
+    )?;
+    Ok(request)
+}
+
+struct CompressionAdmission {
+    rows: Arc<AtomicU64>,
+    path: String,
+}
+
+#[async_trait]
+impl BatchAdmission for CompressionAdmission {
+    async fn begin(&self, _: StreamContext, _: Arc<dyn PutResultEmitter>) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+        Ok(Box::new(Self {
+            rows: Arc::clone(&self.rows),
+            path: self.path.clone(),
+        }))
+    }
+}
+
+#[async_trait]
+impl StreamLifecycle for CompressionAdmission {
+    async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
+        let rows = self.rows.fetch_add(batch.num_rows() as u64, Ordering::SeqCst) + batch.num_rows() as u64;
+        std::fs::write(&self.path, rows.to_string()).map_err(|_| arrowcol_flight::RuntimeError::internal())?;
+        Ok(())
+    }
+    async fn complete(&mut self, _: StreamSummary) -> RuntimeResult<StreamCompletion> {
+        Ok(StreamCompletion::best_effort())
+    }
+    async fn abort(self: Box<Self>, _: StreamAbortReason) {}
+}
+
+async fn serve_compression_backend(backend: SocketAddr, codecs: &str, state: &str) -> anyhow::Result<()> {
+    let (accept, send) = codecs
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("invalid fixture compression pair"))?;
+    let (store, _) = compression_catalog().await?;
+    let principal = arrowcol_protocol::AuthenticatedPrincipal::new(
+        arrowcol_protocol::PrincipalId::new("compression")?,
+        arrowcol_protocol::PrincipalIssuer::new("fixture")?,
+        Default::default(),
+    )?;
+    let auth =
+        arrowcol_protocol::AuthContext::new(principal, arrowcol_protocol::AuthMethod::WorkloadIdentity, now()?, None)?;
+    let path = format!("{state}/compression-rows");
+    std::fs::write(&path, "0")?;
+    let service = ArrowColFlightService::new(
+        ImplementationPool::Dataflow,
+        Arc::clone(&store),
+        Arc::new(arrowcol_flight::AllowAllAuthenticator::new(auth)),
+        Arc::new(CompressionAdmission {
+            rows: Arc::new(AtomicU64::new(0)),
+            path,
+        }),
+        RuntimeLimits {
+            grpc_accept_compression: test_codec(accept)?,
+            grpc_send_compression: test_codec(send)?,
+            max_message_bytes: 64 * 1024,
+            max_schema_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    )?
+    .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)));
+    Server::builder()
+        .add_service(service.into_tonic_service())
+        .serve(backend)
+        .await?;
+    Ok(())
+}
+
 fn run_child() -> anyhow::Result<()> {
     let listen: SocketAddr = std::env::var(LISTEN_ENV)?.parse()?;
     let backend: SocketAddr = std::env::var(BACKEND_ENV)?.parse()?;
     let state = std::env::var(STATE_ENV)?;
     let oat_run_id = std::env::var(OAT_RUN_ID_ENV).ok();
+    let compression = std::env::var(COMPRESSION_ENV).ok();
+    let backend_state = state.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|error| panic!("create backend runtime: {error}"));
         runtime.block_on(async move {
+            if let Some(codecs) = compression {
+                serve_compression_backend(backend, &codecs, &backend_state)
+                    .await
+                    .unwrap_or_else(|error| panic!("serve shared compression backend: {error}"));
+                return;
+            }
             Server::builder()
                 .add_service(
                     FlightServiceServer::new(TestFlight)

@@ -1,4 +1,9 @@
 use anyhow::{Context, Result, bail};
+use arrow_deltalake::delta::{
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
+    PublicationFenceError, object_store_for_url,
+};
+use arrow_deltalake::publisher::{MutationRetries, PublisherSession};
 use arrowcol_protocol::{CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis};
 use arrowcol_routing::{
     LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest,
@@ -8,6 +13,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
 use uuid::Uuid;
 
 const DATABASE: &str = "arrowcol";
@@ -15,10 +21,35 @@ const MIGRATOR_USERNAME: &str = "arrowcol_migrator";
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
-    migrator_password_file: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "register_only_config",
+        conflicts_with = "register_only_config"
+    )]
+    config: Option<PathBuf>,
+    #[arg(
+        long,
+        required_unless_present = "register_only_config",
+        conflicts_with = "register_only_config"
+    )]
+    migrator_password_file: Option<PathBuf>,
+    #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
+    register_only_config: Option<PathBuf>,
+    #[arg(long, requires = "register_only_config")]
+    edge_secret_file: Option<PathBuf>,
+    #[arg(long, requires = "register_only_config")]
+    internal_secret_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterOnlyConfig {
+    schema_version: u32,
+    run_id: String,
+    table: String,
+    delta_root: String,
+    endpoint: String,
+    catalog_endpoint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +62,15 @@ struct PinInitConfig {
     expected_digest: String,
     routing_policy: RoutingPolicy,
     sql_server: SqlServerConfig,
+    #[serde(default)]
+    run_table: Option<RunTableInitialization>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunTableInitialization {
+    delta_root: String,
+    table: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,8 +93,25 @@ struct SqlServerConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let bytes = std::fs::read(&cli.config)
-        .with_context(|| format!("read OAT pin initialization config {}", cli.config.display()))?;
+    if let Some(path) = cli.register_only_config {
+        let config: RegisterOnlyConfig = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("read catalog registration config {}", path.display()))?,
+        )
+        .context("parse catalog registration config")?;
+        let receipt = register_run_table(
+            &config,
+            &cli.edge_secret_file
+                .context("catalog registration requires the client edge signing key")?,
+            &cli.internal_secret_file
+                .context("catalog readback requires the client internal signing key")?,
+        )
+        .await?;
+        println!("{receipt}");
+        return Ok(());
+    }
+    let path = cli.config.context("pin initialization config is required")?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read OAT pin initialization config {}", path.display()))?;
     let config: PinInitConfig = serde_json::from_slice(&bytes).context("parse OAT pin initialization config")?;
     let expected = validate_config(&config)?;
     let actual_digest = config.expected_digest.as_str();
@@ -67,7 +124,8 @@ async fn main() -> Result<()> {
         config.sql_server.port,
         DATABASE,
         MIGRATOR_USERNAME,
-        &cli.migrator_password_file,
+        &cli.migrator_password_file
+            .context("pin initialization migrator password file is required")?,
     )?
     .trust_server_certificate(config.sql_server.trust_server_certificate)
     .with_timeouts(Duration::from_secs(15), Duration::from_secs(30));
@@ -75,6 +133,19 @@ async fn main() -> Result<()> {
     let engine = RoutingEngine::new(Arc::new(store), config.routing_policy)
         .map_err(anyhow::Error::msg)
         .context("construct migrator-authenticated OAT routing engine")?;
+    if let Some(run_table) = config.run_table.as_ref() {
+        let receipt = initialize_fresh_run_table(run_table).await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind": "oat_run_table_initialized",
+                "run_id": config.run_id,
+                "table": run_table.table,
+                "publisher_drained": true,
+                "delta": receipt,
+            })
+        );
+    }
     engine
         .initialize_run_table_pins(&config.run_id, &expected, expires, now)
         .await
@@ -88,6 +159,90 @@ async fn main() -> Result<()> {
         actual_digest
     );
     Ok(())
+}
+
+fn validate_register_only_config(config: &RegisterOnlyConfig) -> Result<Url> {
+    let run_id = Uuid::parse_str(&config.run_id).context("registration requires a UUID run_id")?;
+    let root = Url::parse(&config.delta_root).context("parse registration Delta root")?;
+    if config.schema_version != 1
+        || run_id.to_string() != config.run_id
+        || config.table != HOT_RUN_TABLE
+        || !matches!(root.scheme(), "abfss" | "file")
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || !root.path().ends_with(&format!("/runs/{run_id}/dataflow"))
+    {
+        bail!("catalog registration requires the exact canonical hot table and run-scoped Dataflow root");
+    }
+    for endpoint in [&config.endpoint, &config.catalog_endpoint] {
+        let endpoint = Url::parse(endpoint).context("parse registration service endpoint")?;
+        if endpoint.scheme() != "http"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || endpoint.path() != "/"
+        {
+            bail!("catalog registration endpoints must be plain credential-free HTTP service URLs");
+        }
+    }
+    Ok(arrowcol_loadgen::initialize::canonical_table_target(&root, &config.table)?.0)
+}
+
+async fn register_run_table(
+    config: &RegisterOnlyConfig,
+    edge_secret_file: &std::path::Path,
+    internal_secret_file: &std::path::Path,
+) -> Result<serde_json::Value> {
+    let expected_location = validate_register_only_config(config)?;
+    let completion =
+        collector_chain::dmv::register_table_authenticated(&config.endpoint, &config.table, edge_secret_file)
+            .await
+            .context("register the initialized run table through the DMV client Flight SQL route")?;
+    let snapshot = arrowcol_loadgen::initialize::catalog_snapshot(&config.catalog_endpoint, internal_secret_file)
+        .await
+        .context("read back catalog registration through signed GetSnapshot")?;
+    let [cached] = snapshot.as_slice() else {
+        bail!("catalog registration snapshot must contain exactly the canonical run table");
+    };
+    let table = &cached.snapshot;
+    let head = cached
+        .versions
+        .last()
+        .context("catalog registration snapshot has no schema history")?;
+    let actual_location = if std::path::Path::new(&table.location).is_absolute() {
+        Url::from_directory_path(&table.location).map_err(|()| anyhow::anyhow!("invalid catalog table directory"))?
+    } else {
+        Url::parse(&table.location).context("invalid catalog registration location URL")?
+    };
+    if head.identity().to_string() != config.table
+        || table.provider != "delta"
+        || actual_location.as_str().trim_end_matches('/') != expected_location.as_str().trim_end_matches('/')
+        || head.version() != completion.schema_version()
+        || head.fingerprint() != completion.schema_fingerprint()
+        || head.metadata().provider != table.provider
+        || head.metadata().location.as_deref() != Some(table.location.as_str())
+        || head
+            .metadata()
+            .properties
+            .iter()
+            .any(|(key, value)| table.properties.get(key) != Some(value))
+        || head.metadata().properties.len() != table.properties.len()
+    {
+        bail!("catalog registration readback does not prove the exact canonical schema at the run-scoped location");
+    }
+    Ok(serde_json::json!({
+        "kind": "oat_run_table_registered",
+        "run_id": config.run_id,
+        "table": head.identity().to_string(),
+        "location": table.location,
+        "provider": table.provider,
+        "schema_version": completion.schema_version().get(),
+        "schema_fingerprint": completion.schema_fingerprint().to_string(),
+        "catalog_table_count": snapshot.len(),
+    }))
 }
 
 fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
@@ -153,7 +308,91 @@ fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
     if actual_digest != config.expected_digest {
         bail!("OAT pin initialization table-set digest does not match expected_digest");
     }
+    validate_run_table_initialization(config.run_table.as_ref(), &config.run_id)?;
     Ok(keys)
+}
+
+const HOT_RUN_TABLE: &str = "telemetry.sqlserver.sqlserver_availability_replica_states";
+
+fn validate_run_table_initialization(run_table: Option<&RunTableInitialization>, run_id: &str) -> Result<()> {
+    let Some(run_table) = run_table else {
+        return Ok(());
+    };
+    let root = Url::parse(&run_table.delta_root).context("parse run-scoped table initialization root")?;
+    let expected_suffix = format!("/runs/{run_id}/dataflow");
+    if root.scheme() != "abfss"
+        || root.username().is_empty()
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || !root.path().ends_with(&expected_suffix)
+        || root.path().contains('%')
+        || root.path().contains('\\')
+        || root
+            .path()
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        bail!("run-table initialization root must be the exact credential-free run Dataflow root");
+    }
+    if run_table.table != HOT_RUN_TABLE {
+        bail!("run-table initialization only permits the canonical OAT hot table");
+    }
+    Ok(())
+}
+
+struct RunTableInitializationFence {
+    session: Arc<PublisherSession>,
+}
+
+impl PublicationFence for RunTableInitializationFence {
+    fn check_before_commit(&self, context: &PublicationFenceContext<'_>) -> Result<(), PublicationFenceError> {
+        if context.read_version() != 0 || context.proposed_version() != 0 || context.file_count() != 0 {
+            return Err(PublicationFenceError::stale(
+                "OAT run-table initialization permits only an empty version0 schema commit",
+            ));
+        }
+        self.session.check().map_err(|error| {
+            PublicationFenceError::check_failed(format!("OAT run-table publisher authority check failed: {error:#}"))
+        })
+    }
+}
+
+async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Result<FreshTableReceipt> {
+    let root = Url::parse(&run_table.delta_root)?;
+    let (url, schema) = arrowcol_loadgen::initialize::canonical_table_target(&root, &run_table.table)?;
+    let store = object_store_for_url(&url)?;
+    let session = PublisherSession::open_async(&url).await?;
+    let fence = Arc::new(RunTableInitializationFence {
+        session: Arc::clone(&session),
+    });
+    let init_url = url.clone();
+    let init_session = Arc::clone(&session);
+    let initialization = tokio::task::spawn_blocking(move || {
+        DeltaTable::initialize_fresh_url_with_session(
+            init_url,
+            schema,
+            vec![INGESTION_PARTITION.to_owned()],
+            init_session,
+            fence,
+            FreshTableTransport {
+                store,
+                mutation_retries: MutationRetries::Disabled,
+            },
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("join run-table schema initialization: {error}"))
+    .and_then(|result| result);
+    let drained = session.close_after_drain_async().await;
+    match (initialization, drained) {
+        (Ok(receipt), Ok(())) => Ok(receipt),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.context("drain run-table initializer publisher")),
+        (Err(error), Err(drain_error)) => {
+            Err(error.context(format!("run-table initializer publisher drain failed: {drain_error:#}")))
+        }
+    }
 }
 
 fn validate_expiry(config: &PinInitConfig, now: UnixMillis) -> Result<UnixMillis> {
@@ -178,6 +417,51 @@ fn unix_time_ms() -> Result<UnixMillis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_only_mode_is_run_bound_and_does_not_require_migrator_credentials() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let mut config = RegisterOnlyConfig {
+            schema_version: 1,
+            run_id: run_id.to_owned(),
+            table: HOT_RUN_TABLE.to_owned(),
+            delta_root: format!("file:///tmp/oat/runs/{run_id}/dataflow"),
+            endpoint: "http://router:50050".to_owned(),
+            catalog_endpoint: "http://catalog:8817".to_owned(),
+        };
+        validate_register_only_config(&config)?;
+        config.endpoint = "http://user:password@router:50050".to_owned();
+        assert!(validate_register_only_config(&config).is_err());
+        config.endpoint = "http://router:50050".to_owned();
+        config.run_id = "00000000-0000-0000-0000-000000000002".to_owned();
+        assert!(validate_register_only_config(&config).is_err());
+        config.run_id = run_id.to_owned();
+        config.table = "telemetry.sqlserver.sqlserver_wait_stats".to_owned();
+        assert!(validate_register_only_config(&config).is_err());
+        let args = [
+            "pin-init",
+            "--register-only-config",
+            "register.json",
+            "--edge-secret-file",
+            "edge",
+            "--internal-secret-file",
+            "internal",
+        ];
+        assert!(Cli::try_parse_from(args)?.migrator_password_file.is_none());
+        assert!(Cli::try_parse_from(&args[..5]).is_err());
+        assert!(Cli::try_parse_from(["pin-init", "--config", "pins.json"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "pin-init",
+                "--config",
+                "pins.json",
+                "--migrator-password-file",
+                "password"
+            ])
+            .is_ok()
+        );
+        Ok(())
+    }
 
     fn config() -> Result<PinInitConfig> {
         let key = LeaseKey::new(
@@ -209,6 +493,7 @@ mod tests {
                 port: 1433,
                 trust_server_certificate: true,
             },
+            run_table: None,
         })
     }
 
@@ -216,6 +501,17 @@ mod tests {
     fn pin_init_config_requires_matching_digest_and_validated_table_identities() -> Result<()> {
         let valid = config()?;
         assert_eq!(validate_config(&valid)?.len(), 1);
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let valid_run_table = RunTableInitialization {
+            delta_root: format!(
+                "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"
+            ),
+            table: HOT_RUN_TABLE.to_owned(),
+        };
+        validate_run_table_initialization(Some(&valid_run_table), run_id)?;
+        let mut wrong_table = valid_run_table;
+        wrong_table.table = "telemetry.sqlserver.sqlserver_wait_stats".to_owned();
+        assert!(validate_run_table_initialization(Some(&wrong_table), run_id).is_err());
         assert_eq!(
             validate_expiry(&valid, UnixMillis::new(9_000)?)?,
             UnixMillis::new(10_000)?

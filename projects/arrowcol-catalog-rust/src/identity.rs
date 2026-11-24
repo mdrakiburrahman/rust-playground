@@ -319,6 +319,41 @@ mod tests {
     }
 
     #[test]
+    fn signed_snapshot_accepts_small_client_clock_lead() -> anyhow::Result<()> {
+        use arrowcol_catalog_client::{InternalRequestSigner, rpc::Empty};
+        use tonic::Request;
+
+        let client_now = now_ms();
+        let signer = InternalRequestSigner::from_secret(KEY.to_vec())?;
+        let mut request = Request::new(Empty {});
+        signer.sign_message(&mut request, METHOD)?;
+        let expiry: u64 = request
+            .metadata()
+            .get(INTERNAL_AUTH_EXPIRES_HEADER)
+            .context("missing expiry")?
+            .to_str()?
+            .parse()?;
+
+        DdlIdentityVerifier::from_secret(KEY.to_vec())?.verify_request(
+            request.metadata(),
+            METHOD,
+            &[],
+            client_now - 1_000,
+        )?;
+        assert!(
+            DdlIdentityVerifier::from_secret(KEY.to_vec())?
+                .verify_request(request.metadata(), METHOD, &[], client_now - 10_000)
+                .is_err()
+        );
+        assert!(
+            DdlIdentityVerifier::from_secret(KEY.to_vec())?
+                .verify_request(request.metadata(), METHOD, &[], expiry)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn accepts_one_signed_method_and_payload_then_rejects_replay() -> anyhow::Result<()> {
         let now = now_ms();
         let expected = identity(now)?;

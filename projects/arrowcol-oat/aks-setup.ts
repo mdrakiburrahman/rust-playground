@@ -11,6 +11,7 @@ import type { Metadata } from '../../infra/azure/authority.js';
 import type { LiveStamp, SetupOptions, SetupResult } from './aks-types.js';
 import { renderStampConfig } from './aks-stamp.js';
 import { generatePrivateInputs, renderBootstrapEnv, validateRuntime, writePrivateFile, type RuntimeConfig } from './runtime.js';
+import { DEFAULT_EFFECTIVE_STOP_BUDGETS } from './stop-budgets.js';
 
 const setupCommand = 'npx --no-install arrowcol-oat aks setup';
 const destroyCommand = 'npx --no-install arrowcol-oat aks destroy --confirm arrow-collector-rg';
@@ -73,7 +74,7 @@ async function requireCurrentState(stamp: LiveStamp, directory: string): Promise
   }
 }
 
-async function capturedGeneration(config: Config, runner: typeof run_tree): Promise<string> {
+export async function capturedGeneration(config: Config, runner: typeof run_tree): Promise<string> {
   const authority = new PublisherControl({
     c: { sandbox: config.sandbox },
     async head_control(): Promise<[Metadata, string]> {
@@ -240,6 +241,10 @@ export async function setup(
     namespace: 'arrow-collector', serviceAccount: 'arrow-collector', oatRunId: randomUUID(),
     workloadIdentityClientId: clientId, subscriptionId: live.subscription, stamp: live.stamp,
     deltaRoot: `${config.table_root}dataflow`,
+    effective_stop_budgets: {
+      maintenance_grace_seconds: DEFAULT_EFFECTIVE_STOP_BUDGETS.maintenanceGraceSeconds,
+      maintenance_stop_timeout_ms: DEFAULT_EFFECTIVE_STOP_BUDGETS.maintenanceStopTimeoutMs,
+    },
     images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished',
       ...(options.maintenance ? { maintenance: 'unpublished' } : {}) },
   };

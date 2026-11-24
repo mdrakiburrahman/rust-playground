@@ -108,7 +108,7 @@ pub trait RoutingStore: Send + Sync {
     /// Registers or refreshes one collector process lifetime.
     async fn register_collector(&self, registration: &CollectorRegistration) -> RoutingResult<()>;
 
-    /// Extends a collector registration lease.
+    /// Extends a collector registration lease without reviving an expired draining collector.
     async fn heartbeat_collector(
         &self,
         instance_id: CollectorInstanceId,
@@ -116,7 +116,7 @@ pub trait RoutingStore: Send + Sync {
         lease_expires_at: UnixMillis,
     ) -> RoutingResult<()>;
 
-    /// Changes collector lifecycle state.
+    /// Changes collector lifecycle state without extending the lease or advancing the heartbeat past its bounds.
     async fn set_collector_state(
         &self,
         instance_id: CollectorInstanceId,

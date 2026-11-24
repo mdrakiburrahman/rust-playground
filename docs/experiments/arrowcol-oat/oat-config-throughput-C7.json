@@ -1,0 +1,544 @@
+{
+  "schema_version": 1,
+  "cohort": "C7",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "seed-only-not-capability-registry",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
+  "baseline_overrides": {
+    "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
+    "tables": [
+      "sqlserver_availability_replica_states"
+    ],
+    "replica_counts": [
+      1
+    ],
+    "rows_per_table": 65536,
+    "warmup_seconds": 10,
+    "measure_seconds": 150
+  },
+  "invariants": {
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "interval_secs": 15,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000,
+      "continuous": true
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 15,
+      "target_file_mib": 128,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000
+    }
+  },
+  "comparisons": [
+    {
+      "id": "maintenance-cadence",
+      "factor": "tunables.maintenance.interval_secs",
+      "candidates": [
+        {
+          "id": "cadence-30",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "interval_secs": 30,
+                "max_idle_backoff_secs": 30
+              }
+            }
+          },
+          "qualification": "exploratory"
+        },
+        {
+          "id": "cadence-60",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "interval_secs": 60,
+                "max_idle_backoff_secs": 60
+              }
+            }
+          },
+          "qualification": "exploratory"
+        },
+        {
+          "id": "cadence-120",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "interval_secs": 120,
+                "max_idle_backoff_secs": 120
+              }
+            }
+          },
+          "qualification": "exploratory"
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "max-consecutive-stale-plans",
+      "factor": "tunables.maintenance.max_consecutive_stale_plans",
+      "candidates": [
+        {
+          "id": "stale-plans-1",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "max_consecutive_stale_plans": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "stale-plans-8",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "max_consecutive_stale_plans": 8
+              }
+            }
+          }
+        },
+        {
+          "id": "stale-plans-1024",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "max_consecutive_stale_plans": 1024
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "sealed-partitions-only",
+      "factor": "tunables.maintenance.sealed_partitions_only",
+      "candidates": [
+        {
+          "id": "sealed-partitions-true",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "sealed_partitions_only": true
+              }
+            }
+          }
+        },
+        {
+          "id": "sealed-partitions-false",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "sealed_partitions_only": false
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "small-file-threshold",
+      "factor": "tunables.maintenance.small_file_bytes",
+      "candidates": [
+        {
+          "id": "small-file-16777216",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "small_file_bytes": 16777216
+              }
+            }
+          }
+        },
+        {
+          "id": "small-file-33554432",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "small_file_bytes": 33554432
+              }
+            }
+          }
+        },
+        {
+          "id": "small-file-67108864",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "small_file_bytes": 67108864
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "retry-budget",
+      "factor": "tunables.maintenance.commit_attempts",
+      "candidates": [
+        {
+          "id": "attempts-1",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "commit_attempts": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "attempts-3",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "commit_attempts": 3
+              }
+            }
+          }
+        },
+        {
+          "id": "attempts-5",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "commit_attempts": 5
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "checkpoint-interval",
+      "factor": "tunables.maintenance.checkpoint_every_commits",
+      "candidates": [
+        {
+          "id": "checkpoint-64",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "checkpoint_every_commits": 64
+              }
+            }
+          }
+        },
+        {
+          "id": "checkpoint-256",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "checkpoint_every_commits": 256
+              }
+            }
+          }
+        },
+        {
+          "id": "checkpoint-1024",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "checkpoint_every_commits": 1024
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "input-read-strategy",
+      "factor": "tunables.maintenance.input_read_strategy",
+      "candidates": [
+        {
+          "id": "input-memory",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "input_read_strategy": "memory"
+              }
+            }
+          }
+        },
+        {
+          "id": "input-spool",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "input_read_strategy": "spool"
+              }
+            }
+          }
+        },
+        {
+          "id": "input-range",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "input_read_strategy": "range"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "granularity",
+      "factor": "tunables.maintenance.granularity",
+      "candidates": [
+        {
+          "id": "granularity-minute",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "granularity": "minute"
+              }
+            }
+          }
+        },
+        {
+          "id": "granularity-hour",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "granularity": "hour"
+              }
+            }
+          }
+        },
+        {
+          "id": "granularity-day",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "granularity": "day"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "optimize-upload-mode",
+      "factor": "tunables.maintenance.optimize_upload_mode",
+      "candidates": [
+        {
+          "id": "put-create",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "optimize_upload_mode": "put_create"
+              }
+            }
+          }
+        },
+        {
+          "id": "buffered-multipart",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "optimize_upload_mode": "buffered_multipart",
+                "optimize_upload_buffer_bytes": 8388608
+              }
+            }
+          },
+          "qualification": "exploratory"
+        }
+      ],
+      "candidate_limit": 4
+    }
+  ],
+  "source_enum_coverage": {
+    "input_read_strategy": {
+      "path": "tunables.maintenance.input_read_strategy",
+      "accepted": [
+        "memory",
+        "spool",
+        "range"
+      ],
+      "configured": [
+        "memory",
+        "spool",
+        "range"
+      ],
+      "baseline_requested": null,
+      "effective_default": "memory",
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "granularity": {
+      "path": "tunables.maintenance.granularity",
+      "accepted": [
+        "minute",
+        "hour",
+        "day"
+      ],
+      "configured": [
+        "minute",
+        "hour",
+        "day"
+      ],
+      "baseline_requested": "hour",
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "optimize_upload_mode": {
+      "path": "tunables.maintenance.optimize_upload_mode",
+      "accepted": [
+        "put_create",
+        "buffered_multipart"
+      ],
+      "configured": [
+        "put_create",
+        "buffered_multipart"
+      ],
+      "baseline_requested": null,
+      "effective_default": "put_create",
+      "excluded": {},
+      "pending": [],
+      "coupled_setting": "buffered_multipart candidate requests optimize_upload_buffer_bytes=8388608; source bounds are 4194304..67108864.",
+      "status": "config-screened-buffered-multipart-exploratory"
+    },
+    "operations": {
+      "path": "tunables.maintenance.operations",
+      "accepted": [
+        "purge",
+        "optimize",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "configured": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "excluded": {},
+      "pending": [],
+      "status": "fixed-campaign-invariant-never-varied"
+    }
+  },
+  "runnable": false,
+  "config_validation": {
+    "status": "config-validated",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 25,
+    "pass_count": 26,
+    "fail_count": 0
+  },
+  "runtime_qualification": "unqualified"
+}

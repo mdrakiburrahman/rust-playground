@@ -588,7 +588,7 @@ fn validate_snapshot(
             failures,
         );
         if let Some(expected) = expected_row_hashes.and_then(|tables| tables.get(table)) {
-            validate_row_multiset(pool, table, expected, &actual.row_hashes, failures);
+            validate_row_multiset(pool, table, expected, &actual.payload_row_hashes, failures);
         }
         validate_table_storage(pool, table, actual, failures);
         if let Some(contract) = contracts.get(table) {
@@ -1470,6 +1470,85 @@ mod tests {
                 .is_some_and(|failure| failure.contains("different run")),
             "{}",
             report["failures"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_snapshot_validates_durable_payloads_across_partitions() -> Result<()> {
+        let table = "telemetry.sqlserver.example";
+        let contract = SchemaContract {
+            table: table.into(),
+            schema_version: 1,
+            fingerprint: String::new(),
+            descriptor_path: vec![],
+            fields: vec![crate::manifest::SchemaFieldContract {
+                name: "id".into(),
+                arrow_type: "Int32".into(),
+                nullable: false,
+            }],
+        };
+        let mut snapshot: SnapshotSummary = serde_json::from_value(serde_json::json!({
+            "files": 2,
+            "tables": {table: {
+                "schema": {"fields": [
+                    {"name": "id", "type": "integer", "nullable": false},
+                    {"name": "__arrowcol_ingestion", "type": "string", "nullable": false}
+                ]},
+                "version": 1, "active_files": 2, "rows": 2, "bytes": 20,
+                "minimum_file_bytes": 10, "maximum_file_bytes": 10,
+                "row_hashes": {"partition-a-row": 1, "partition-b-row": 1},
+                "payload_row_hashes": {"same-payload": 2},
+                "files": [
+                    {"path": "a.parquet", "bytes": 10, "rows": 1,
+                     "partition_values": {"__arrowcol_ingestion": "2026-11-16-15-58"}},
+                    {"path": "b.parquet", "bytes": 10, "rows": 1,
+                     "partition_values": {"__arrowcol_ingestion": "2026-11-16-15-59"}}
+                ],
+                "partition_columns": ["__arrowcol_ingestion"]
+            }}
+        }))?;
+        let contracts = BTreeMap::from([(table.to_owned(), &contract)]);
+        let rows = BTreeMap::from([(table.to_owned(), 2)]);
+        let hashes = BTreeMap::from([(table.to_owned(), BTreeMap::from([("same-payload".to_owned(), 2)]))]);
+        let mut failures = Vec::new();
+        validate_snapshot(
+            "dataflow",
+            &snapshot,
+            &contracts,
+            Some(&rows),
+            Some(&hashes),
+            &mut failures,
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+
+        let actual = snapshot.tables.get_mut(table).context("fixture table")?;
+        actual.payload_row_hashes.insert("same-payload".into(), 1);
+        actual.rows = 1;
+        actual.partition_columns.push("unexpected".into());
+        failures.clear();
+        validate_snapshot(
+            "dataflow",
+            &snapshot,
+            &contracts,
+            Some(&rows),
+            Some(&hashes),
+            &mut failures,
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("missing 1 durably acknowledged"))
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("at least 2 logical rows"))
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("unexpected generated partition"))
         );
         Ok(())
     }

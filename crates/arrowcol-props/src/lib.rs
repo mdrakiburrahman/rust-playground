@@ -295,8 +295,8 @@ pub static REGISTRY: &[PropKey] = &[
         "arrowcol.layout.sortColumns",
         StringList,
         "customer_id",
-        Validator::Positive,
-        "Comma-separated sort columns; names must exist in the table schema."
+        Validator::Any,
+        "Comma-separated sort columns; empty disables sorting and names must exist in the table schema."
     ),
     key!(
         "arrowcol.layout.bloomColumns",
@@ -382,6 +382,209 @@ pub static REGISTRY: &[PropKey] = &[
         Validator::Positive,
         "Upper compression-ratio clamp."
     ),
+    // PERF69-PROPS-BEGIN oat-evidence
+    // PERF69-PROPS-END oat-evidence
+    // PERF69-PROPS-BEGIN oat-campaign
+    // PERF69-PROPS-END oat-campaign
+    // PERF69-PROPS-BEGIN aks-custody
+    // PERF69-PROPS-END aks-custody
+    // PERF69-PROPS-BEGIN file-formation
+    // PERF69-PROPS-END file-formation
+    // PERF69-PROPS-BEGIN commit-pipeline
+    PropKey {
+        name: "arrowcol.collector.upload.mode",
+        prop_type: PropType::Enum,
+        default: "put_create",
+        validator: Validator::OneOf(&["put_create", "buffered_multipart"]),
+        scope: Scope::Process,
+        doc: "Upload strategy; buffered multipart is opt-in and relies on UUID object names rather than conditional create.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.collector.upload.bufferCapacityBytes",
+        prop_type: PropType::Bytes,
+        default: "8 MiB",
+        validator: Validator::Range(1_048_576.0, 67_108_864.0),
+        scope: Scope::Process,
+        doc: "Per-upload multipart part buffer, active only with buffered_multipart mode.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.collector.upload.requestConcurrency",
+        prop_type: PropType::Integer,
+        default: "2",
+        validator: Validator::Range(1.0, 16.0),
+        scope: Scope::Process,
+        doc: "In-flight multipart part requests per upload, active only with buffered_multipart mode.",
+        since: "0.1",
+    },
+    // PERF69-PROPS-END commit-pipeline
+    // PERF69-PROPS-BEGIN maintenance
+    key!(
+        "arrowcol.maintenance.optimizeUploadMode",
+        Enum,
+        "put_create",
+        Validator::OneOf(&["put_create", "buffered_multipart"]),
+        "OPTIMIZE upload mode; buffered multipart is unqualified and not for scored cells."
+    ),
+    key!(
+        "arrowcol.maintenance.optimizeUploadBufferBytes",
+        Integer,
+        "8388608",
+        Validator::Range(4_194_304.0, 67_108_864.0),
+        "Buffered multipart upload buffer bytes; effective only in buffered_multipart mode."
+    ),
+    // PERF69-PROPS-END maintenance
+    // PERF69-PROPS-BEGIN loadgen
+    PropKey {
+        name: "arrowcol.client.corpusRows",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Any,
+        scope: Scope::Process,
+        doc: "Prepared synthetic corpus row target; zero preserves the legacy rows-derived default and cannot be combined with corpusBytes.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.corpusBytes",
+        prop_type: PropType::Bytes,
+        default: "0",
+        validator: Validator::Any,
+        scope: Scope::Process,
+        doc: "Prepared synthetic corpus byte target; zero uses row-based sizing and cannot be combined with corpusRows.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.batchRows",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Range(0.0, 2147483647.0),
+        scope: Scope::Process,
+        doc: "Rows encoded per prepared batch; zero inherits the legacy rows option.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.workers",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Range(0.0, 1024.0),
+        scope: Scope::Process,
+        doc: "Concurrent client workers; zero resolves to available parallelism.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.runtimeThreads",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Range(0.0, 1024.0),
+        scope: Scope::Process,
+        doc: "Tokio runtime worker threads; zero resolves to available parallelism.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.dataMode",
+        prop_type: PropType::Enum,
+        default: "shared",
+        validator: Validator::OneOf(&["shared", "independent"]),
+        scope: Scope::Process,
+        doc: "Whether workers reuse one prepared corpus or each own an independent prepared corpus.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.stringWidth",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Range(0.0, 65536.0),
+        scope: Scope::Process,
+        doc: "Synthetic UTF-8 string width in bytes; zero uses each fixture field's canonical width.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.cardinality",
+        prop_type: PropType::Integer,
+        default: "1024",
+        validator: Validator::Positive,
+        scope: Scope::Process,
+        doc: "Maximum generated key cardinality for non-identity synthetic fields.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.skew",
+        prop_type: PropType::Float,
+        default: "0",
+        validator: Validator::Range(0.0, 1.0),
+        scope: Scope::Process,
+        doc: "Synthetic key skew fraction; zero is uniform and one is maximally skewed.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.entropy",
+        prop_type: PropType::Float,
+        default: "1",
+        validator: Validator::Range(0.0, 1.0),
+        scope: Scope::Process,
+        doc: "Fraction of synthetic string positions varied by the deterministic generator.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.seed",
+        prop_type: PropType::Integer,
+        default: "20260923",
+        validator: Validator::Any,
+        scope: Scope::Process,
+        doc: "Deterministic synthetic corpus seed.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.maxMemoryBytes",
+        prop_type: PropType::Bytes,
+        default: "536870912",
+        validator: Validator::Positive,
+        scope: Scope::Process,
+        doc: "Maximum memory reservation for prepared corpus and encoding scratch; must fit the process address space.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.intervalUs",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Range(0.0, 86400000000.0),
+        scope: Scope::Process,
+        doc: "Delay between continuous send attempts in microseconds; zero continuously blasts the prepared corpus.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.connectionsPerWorker",
+        prop_type: PropType::Integer,
+        default: "1",
+        validator: Validator::Range(1.0, 256.0),
+        scope: Scope::Process,
+        doc: "Persistent Flight connections per worker; total connections are capped at 4096.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.streamsPerWorker",
+        prop_type: PropType::Integer,
+        default: "0",
+        validator: Validator::Range(0.0, 1024.0),
+        scope: Scope::Process,
+        doc: "Concurrent continuous send streams per worker; zero inherits legacy concurrency and total streams are capped at 65536.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.client.ipcCompression",
+        prop_type: PropType::Enum,
+        default: "none",
+        validator: Validator::OneOf(&["none", "lz4_frame", "zstd"]),
+        scope: Scope::Process,
+        doc: "Arrow IPC payload compression; invalid codec names are rejected.",
+        since: "0.1",
+    },
+    // PERF69-PROPS-END loadgen
+    // PERF69-PROPS-BEGIN telemetry
+    // PERF69-PROPS-END telemetry
+    // PERF69-PROPS-BEGIN grafana
+    // PERF69-PROPS-END grafana
 ];
 
 /// A parsed value; sizes are bytes and durations are milliseconds.

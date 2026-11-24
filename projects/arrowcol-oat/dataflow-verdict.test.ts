@@ -9,7 +9,7 @@ import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import type { run_tree } from '../../infra/azure/bootstrap.js';
 import {
   CLEANUP_TIMEOUT_MS, MAX_RESULT_BYTES, RESULT_TIMEOUT_MS, collectDataFlow, dataFlowExitCode,
-  decodeResultRows, evaluateDataFlow, fetchResultBytes, formatDataFlow, readResultBytes, reportDataFlowRun, verifyRunCleanup,
+  decodeResultRows, evaluateDataFlow, fetchResultBytes, formatDataFlow, parseDataFlowVerdictPolicy, readResultBytes, reportDataFlowRun, verifyRunCleanup,
 } from './dataflow-verdict.js';
 import type { OatRunStatus } from './launch.js';
 
@@ -21,7 +21,7 @@ const config = {
   stamp: '00000', namespace: 'arrow-collector', kubectl_context: 'arrow-collector-00000', subscriptionId,
   qap_database: 'experimentqap', tables: ['sqlserver_active_sessions'], replica_counts: [1], dfe_worker_concurrency: [8],
 };
-const status: OatRunStatus = { id: orchestration, state: 'succeeded', progress: 'published', result_count: 1, error: null };
+const status: OatRunStatus = { id: orchestration, config_sha256: null, state: 'succeeded', progress: 'published', result_count: 1, error: null };
 function row(overrides: Record<string, unknown> = {}) {
   return {
     schema_version: 2, run_id: cell, mode: 'aks', stamp: '00000',
@@ -94,6 +94,26 @@ test('only the launched orchestration, exact source revision and full matrix can
   }
 });
 
+test('client sweep verifies declared coordinates and their distinct actual cell UUIDs', () => {
+  const secondCell = '33333333-3333-4333-8333-333333333333';
+  const point = (clients_per_table: number | undefined, run_id: string) => row({
+    run_id, tunables_json: JSON.stringify({ orchestration_run_id: orchestration, clients_per_table }),
+  });
+  const one = point(1, cell);
+  const two = point(2, secondCell);
+  const sweep = { ...config, clients_per_table_sweep: [1, 2] };
+  const evaluate = (rows: Record<string, unknown>[]) =>
+    evaluateDataFlow({ ...status, result_count: rows.length }, rows, sha, 'aks', sweep);
+  const covered = evaluate([two, one]);
+  assert.equal(covered.pass, true, covered.reasons.join('; '));
+  assert.match(evaluate([one]).reasons.join(), /does not cover the expected experiment matrix/);
+  assert.match(evaluate([one, point(3, secondCell)]).reasons.join(), /undeclared clients_per_table sweep coordinate/);
+  assert.match(evaluate([one, point(undefined, secondCell)]).reasons.join(), /missing or undeclared clients_per_table/);
+  assert.match(evaluate([one, point(2, cell)]).reasons.join(), /reused matrix cell run_id/);
+  assert.match(evaluate([one, point(1, secondCell)]).reasons.join(), /inconsistent matrix cell run_id/);
+  assert.equal(evaluateDataFlow(status, [two], sha, 'aks', { ...sweep, clients_per_table_sweep: [2] }).pass, true);
+});
+
 test('failed state, empty output, bad throughput and pinning fail with concrete reasons', () => {
   const failed = evaluateDataFlow({ ...status, state: 'failed', error: 'client crashed' }, [], sha, 'local', config);
   assert.equal(failed.pass, false);
@@ -127,6 +147,39 @@ test('AKS QAP requires every observation health condition; local omits it', () =
   assert.equal(evaluateDataFlow(status, [row({ mode: 'local', qap_completion_percent: null })], sha, 'local', config).pass, true);
 });
 
+test('single-hot-table campaign separates QAP lag from ingest validity and rejects unknown evidence', () => {
+  const valid = row({ schema_version: 3, measure_seconds: 1, evidence_json: JSON.stringify(outputEvidence()) });
+  const lagging = evaluateDataFlow(status, [row({ ...valid, qap_completion_percent: 75, qap_pending_artifacts: 5n, qap_unhealthy_catalogs: 1n })], sha, 'aks', config, 'single_hot_table_campaign');
+  assert.equal(lagging.pass, true);
+  assert.equal(lagging.ingestPass, true);
+  assert.equal(lagging.downstreamStatus, 'lagging');
+  assert.match(formatDataFlow(lagging), /DATA FLOW: PASS/);
+  assert.match(formatDataFlow(lagging), /FINDING: .*QAP acceleration is 75%/);
+
+  for (const override of [
+    { qap_completion_percent: null },
+    { qap_observation_complete: 0n },
+  ]) {
+    const unknown = evaluateDataFlow(status, [row({ ...valid, ...override })], sha, 'aks', config, 'single_hot_table_campaign');
+    assert.equal(unknown.pass, false);
+    assert.equal(unknown.ingestPass, true);
+    assert.equal(unknown.downstreamStatus, 'unknown');
+    assert.match(unknown.reasons.join('; '), /QAP observation incomplete or metrics missing/);
+  }
+
+  const unavailable = evaluateDataFlow(status, [row({ ...valid, mode: 'local', evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }) })], sha, 'local', config, 'single_hot_table_campaign');
+  assert.equal(unavailable.pass, false);
+  assert.equal(unavailable.ingestPass, true);
+  assert.equal(unavailable.downstreamStatus, 'unknown');
+  assert.match(formatDataFlow(unavailable), /downstream metrics are null/);
+
+  const unbalanced = evaluateDataFlow(status, [valid], sha, 'aks', { ...config, dfe_worker_concurrency: [8, 16] }, 'single_hot_table_campaign');
+  assert.equal(unbalanced.pass, false);
+  assert.equal(unbalanced.ingestPass, false);
+  assert.match(unbalanced.reasons.join('; '), /does not cover the expected experiment matrix/);
+  assert.throws(() => parseDataFlowVerdictPolicy('campaign'), /Unsupported dataflow_verdict_policy/);
+});
+
 test('network summary retains the explicit accepted-risk warning and preflight warnings', () => {
   const result = evaluateDataFlow(status, [row()], sha, 'aks', config);
   assert.match(formatDataFlow(result, { provider: 'cilium', enforcing: true }), /network: cilium \(enforced\)/);
@@ -152,6 +205,14 @@ test('v3 requires evidenced collector output, but known zero commits remain vali
   const evaluate = (evidence: unknown) => evaluateDataFlow(status,
     [row({ schema_version: 3, measure_seconds: 1, evidence_json: JSON.stringify(evidence) })], sha, 'aks', config);
   assert.equal(evaluate(outputEvidence()).pass, true);
+  for (const status of [undefined, 'unavailable', 'mismatch', 'matched']) {
+    const verdict = evaluate({
+      ...outputEvidence(), evidence_class: 'd53_exploratory',
+      durable_commits: status === undefined ? {} : { delta_log_reconciliation: { status } },
+    });
+    assert.equal(verdict.pass, status === 'matched');
+    if (status !== 'matched') assert.match(verdict.reasons.join(), /exploratory Delta-log reconciliation did not match/);
+  }
   const zero = outputEvidence();
   Object.assign(zero.commit_window_output_throughput, {
     rows: 0, files: 0, input_bytes: 0, parquet_bytes: 0, commits: 0, rows_per_second: 0,

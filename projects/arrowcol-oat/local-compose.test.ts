@@ -39,7 +39,7 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
         build?: { args?: Record<string, string> };
         environment?: Record<string, string>;
         networks: Record<string, { ipv4_address?: string }>;
-        ports?: Array<{ host_ip: string; published: string }>;
+        ports?: Array<{ host_ip: string; published: string; target: number }>;
       }>;
       networks: Record<string, { ipam?: { config?: unknown[] } }>;
     };
@@ -50,6 +50,14 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
         assert.equal(port.published, '0', service);
       }
     }
+    assert.deepEqual(
+      resolved.services['dataflow-1']?.ports?.map(({ host_ip, published, target }) => ({
+        host_ip,
+        published,
+        target,
+      })),
+      [{ host_ip: '172.18.0.1', published: '0', target: 32011 }],
+    );
     assert.equal(
       resolved.services['arrowcol-catalog']?.environment?.ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE,
       '/run/secrets/internal-hmac',
