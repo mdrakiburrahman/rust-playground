@@ -4772,6 +4772,7 @@ impl DeltaTable {
                 if let Some(previous) = previous
                     && previous == version
                 {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     committed_identities.push((identity, version, stamp));
                     continue;
                 }
@@ -5277,6 +5278,9 @@ impl DeltaTable {
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let started = Instant::now();
         for attempt in 0..8 {
+            if attempt != 0 {
+                crate::telemetry::mark_terminal_commit_incomplete();
+            }
             observation.event("attempt");
             self.check_publication()?;
             let snapshot = self.snapshot()?;
@@ -5288,6 +5292,7 @@ impl DeltaTable {
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
                     return Ok((snapshot.version(), None, Vec::new()));
@@ -5327,12 +5332,14 @@ impl DeltaTable {
                     }
                 }
                 if committed != 0 && committed != group.identities.len() {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     return Err(anyhow::Error::new(PartialPublicationGroup {
                         committed,
                         total: group.identities.len(),
                     }));
                 }
                 if committed == group.identities.len() {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     skipped.extend(group.start..group.end);
                     continue;
                 }
@@ -5364,6 +5371,7 @@ impl DeltaTable {
                             bail!("publication transaction fenced by newer application version");
                         }
                         if previous == *version {
+                            crate::telemetry::mark_terminal_commit_incomplete();
                             continue;
                         }
                     }
@@ -5377,6 +5385,7 @@ impl DeltaTable {
                 pending_indices.push(index);
             }
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
+                crate::telemetry::mark_terminal_commit_incomplete();
                 self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
                 return Ok((snapshot.version(), None, Vec::new()));
@@ -5478,6 +5487,9 @@ impl DeltaTable {
                     .iter()
                     .zip(&pending_indices)
                     .all(|(append, index)| append.publication.is_some() || group_pending_indices.contains(index));
+            if !identifiable {
+                crate::telemetry::mark_terminal_commit_incomplete();
+            }
             let reconcile = || -> Result<Option<u64>> {
                 let latest = self
                     .snapshot()
@@ -5537,7 +5549,16 @@ impl DeltaTable {
                 .collect();
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
-                    sync_directory(&self.root)?;
+                    sync_directory(&self.root).inspect_err(|_| crate::telemetry::mark_terminal_commit_incomplete())?;
+                    if attempt == 0 {
+                        crate::telemetry::record_terminal_commit(
+                            &table_id,
+                            commit.commit_version(),
+                            rows,
+                            files_count,
+                            parquet_bytes,
+                        );
+                    }
                     crate::telemetry::data_commit(
                         commit.commit_version(),
                         rows,
@@ -5557,8 +5578,12 @@ impl DeltaTable {
                         committed_file_observations,
                     ));
                 }
-                Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
+                Ok(CommitResult::Conflicted(_)) => {
+                    crate::telemetry::mark_terminal_commit_incomplete();
+                    observation.event("conflict");
+                }
                 Ok(CommitResult::Retryable(retry)) => {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
@@ -5571,6 +5596,7 @@ impl DeltaTable {
                     }
                 }
                 Err(error) => {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     // Kernel can surface post-publication I/O as Err, not only Retryable.
                     // A proven transaction is success; an unreadable outcome stays an error.
                     if identifiable && let Some(version) = reconcile()? {
