@@ -314,6 +314,8 @@ impl Default for OverloadGuardConfig {
 #[serde(deny_unknown_fields)]
 pub struct PlatformConfig {
     pub kind: OatMode,
+    #[serde(default = "default_aks_drain_budget_ms")]
+    pub aks_drain_budget_ms: u64,
     pub compose_file: Option<String>,
     pub compose_override_file: Option<String>,
     pub compose_project: Option<String>,
@@ -329,6 +331,13 @@ pub struct PlatformConfig {
     pub resources: Option<AksResourceOverrides>,
     #[serde(default)]
     pub fleet: Option<FleetPlacement>,
+}
+
+pub const AKS_PRE_STOP_CAPTURE_MARGIN_MS: u64 = 30_000;
+pub const DEFAULT_AKS_DRAIN_BUDGET_MS: u64 = 120_000;
+
+fn default_aks_drain_budget_ms() -> u64 {
+    DEFAULT_AKS_DRAIN_BUDGET_MS
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1543,6 +1552,15 @@ impl OatConfig {
         if !(30..=3_600).contains(&self.collector_stop_grace_seconds) {
             bail!("collector_stop_grace_seconds must be between 30 and 3600");
         }
+        if self.platform.kind == OatMode::Aks
+            && (self.platform.aks_drain_budget_ms == 0
+                || self.platform.aks_drain_budget_ms
+                    > self.collector_stop_grace_seconds * 1_000 - AKS_PRE_STOP_CAPTURE_MARGIN_MS)
+        {
+            bail!(
+                "platform.aks_drain_budget_ms must be positive and no greater than collector_stop_grace_seconds in milliseconds minus the {AKS_PRE_STOP_CAPTURE_MARGIN_MS}ms pre-stop capture margin"
+            );
+        }
         const TERMINAL_WRITE_MARGIN_SECONDS: u64 = 60;
         let drain_seconds = u64::from(
             self.tunables
@@ -2489,6 +2507,7 @@ mod tests {
             campaign_profile: None,
             platform: PlatformConfig {
                 kind: OatMode::Aks,
+                aks_drain_budget_ms: DEFAULT_AKS_DRAIN_BUDGET_MS,
                 compose_file: None,
                 compose_override_file: None,
                 compose_project: None,
@@ -3313,6 +3332,41 @@ mod tests {
     }
 
     #[test]
+    fn aks_drain_budget_is_typed_bounded_and_defaulted() -> Result<()> {
+        let mut config = valid();
+        let mut value = serde_json::to_value(&config.platform)?;
+        value
+            .as_object_mut()
+            .context("platform object")?
+            .remove("aks_drain_budget_ms");
+        let platform: PlatformConfig = serde_json::from_value(value.clone())?;
+        assert_eq!(platform.aks_drain_budget_ms, DEFAULT_AKS_DRAIN_BUDGET_MS);
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("120000"),
+            serde_json::Value::Null,
+        ] {
+            value["aks_drain_budget_ms"] = invalid;
+            assert!(serde_json::from_value::<PlatformConfig>(value.clone()).is_err());
+        }
+        config.platform.aks_drain_budget_ms = 270_000;
+        config.validate()?;
+        for invalid in [0, 270_001, 300_001] {
+            config.platform.aks_drain_budget_ms = invalid;
+            assert!(
+                config
+                    .validate()
+                    .err()
+                    .context("invalid drain budget must be rejected")?
+                    .to_string()
+                    .contains("platform.aks_drain_budget_ms")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn allows_one_to_sixteen_replica_cases_and_tables() -> Result<()> {
         let mut config = valid();
         config.replica_counts = (1..=16).collect();
@@ -3326,6 +3380,7 @@ mod tests {
         let mut config = valid();
         config.platform = PlatformConfig {
             kind: OatMode::Local,
+            aks_drain_budget_ms: DEFAULT_AKS_DRAIN_BUDGET_MS,
             compose_file: Some("projects/loadtest/compose.yaml".to_owned()),
             compose_override_file: Some("projects/loadtest/compose.oat.yaml".to_owned()),
             compose_project: Some("oat-test-run".to_owned()),
@@ -3419,6 +3474,7 @@ mod tests {
         let mut config = valid();
         config.platform = PlatformConfig {
             kind: OatMode::Local,
+            aks_drain_budget_ms: DEFAULT_AKS_DRAIN_BUDGET_MS,
             compose_file: Some("projects/loadtest/compose.yaml".to_owned()),
             compose_override_file: Some("projects/loadtest/compose.oat.yaml".to_owned()),
             compose_project: Some("oat-test-run".to_owned()),
@@ -3495,6 +3551,7 @@ mod tests {
         let mut config = valid();
         config.platform = PlatformConfig {
             kind: OatMode::Local,
+            aks_drain_budget_ms: DEFAULT_AKS_DRAIN_BUDGET_MS,
             compose_file: Some("projects/loadtest/compose.yaml".to_owned()),
             compose_override_file: Some("projects/loadtest/compose.oat.yaml".to_owned()),
             compose_project: Some("oat-test-run".to_owned()),
