@@ -2624,11 +2624,23 @@ async fn start_local_client(
     if container_id.is_empty() {
         bail!("Compose returned an empty local OAT client container ID");
     }
-    Ok(ClientHandle {
+    let handle = ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
-        process: ClientProcess::Local { container_id },
-    })
+        process: ClientProcess::Local {
+            container_id: container_id.clone(),
+        },
+    };
+    if let Err(error) = local_client_image_evidence(&container_id).await {
+        let error = error.context("local client image provenance must pass before measurement");
+        if let Err(cleanup_error) = cancel_local_client(config, &handle).await {
+            return Err(error.context(format!(
+                "cleanup after client provenance failure also failed: {cleanup_error:#}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(handle)
 }
 
 async fn poll_local_client(handle: &ClientHandle) -> Result<ClientProgress> {
