@@ -1977,14 +1977,16 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
 
 #[cfg(test)]
 #[test]
-fn txn_lookup_mode_rejects_invalid_inputs_by_field_name() {
+fn txn_lookup_mode_rejects_invalid_inputs_by_field_name() -> Result<()> {
     for value in [serde_json::json!("cached"), serde_json::json!(42), Value::Null] {
-        let error = Tunables::parse_oat_json(serde_json::json!({
+        let Err(error) = Tunables::parse_oat_json(serde_json::json!({
             "collector": {"commit": {"txn_lookup_mode": value}}
-        }))
-        .expect_err("invalid txn lookup mode accepted");
+        })) else {
+            bail!("invalid txn lookup mode accepted");
+        };
         assert!(format!("{error:#}").contains("collector.commit.txn_lookup_mode"));
     }
+    Ok(())
 }
 
 #[cfg(test)]
