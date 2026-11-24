@@ -56,6 +56,8 @@ export interface OfficialCellMeasurement {
   startMs: number | null;
   endMs: number | null;
   committedRowsPerSecond: number | null;
+  rateResolutionRowsPerSecond: number | null;
+  lowCommitWindows: { index: number; commitCount: number }[];
   submittedConfigIdentity: 'verified_exact_server_bytes' | 'unknown';
   unavailableReasons: string[];
 }
@@ -186,10 +188,55 @@ export async function readOfficialCellMeasurement(options: {
     output.unavailable_reason == null && typeof output.rows_per_second === 'number' &&
     Number.isFinite(output.rows_per_second) && output.rows_per_second >= 0;
   if (!complete) unavailableReasons.push('original_official_commit_window_incomplete');
+  const durableOutput = commits?.output_throughput;
+  const outputMatches = record(durableOutput) && canonical_json(output) === canonical_json(durableOutput);
+  if (!outputMatches) unavailableReasons.push('published_commit_window_differs_from_durable_output');
+  const screen = evidence.screen_v1;
+  const deltaLog = record(commits?.delta_log_reconciliation) ? commits.delta_log_reconciliation : undefined;
+  const csv = deltaLog?.csv;
+  const seconds = output.window_seconds;
+  let rateResolutionRowsPerSecond: number | null = null;
+  if (result.status !== 'succeeded') {
+    if (screen !== null) unavailableReasons.push('failed_cell_screen_v1_not_null');
+  } else if (record(screen) && record(csv) && canonical_json(screen) === canonical_json(csv) &&
+      typeof screen.durable_rows_per_s === 'number' && Number.isFinite(screen.durable_rows_per_s) && screen.durable_rows_per_s > 0 &&
+      typeof output.rows_per_second === 'number' && Math.abs(screen.durable_rows_per_s - output.rows_per_second) <= 1e-9 &&
+      typeof screen.rate_resolution_rows_per_second === 'number' && Number.isFinite(screen.rate_resolution_rows_per_second) &&
+      screen.rate_resolution_rows_per_second > 0 && integer(screen.window_commit_count) && screen.window_commit_count > 0 &&
+      integer(screen.max_commit_rows) && screen.max_commit_rows > 0 && typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 &&
+      Math.abs(screen.rate_resolution_rows_per_second - screen.max_commit_rows / seconds) <=
+        Math.max(1e-9, screen.rate_resolution_rows_per_second * 1e-9)) {
+    rateResolutionRowsPerSecond = screen.rate_resolution_rows_per_second;
+  }
+  if (result.status === 'succeeded' && (rateResolutionRowsPerSecond === null || !Array.isArray(windows) || windows.length === 0 ||
+      windows.some(window => !record(window) || typeof window.rate_resolution_rows_per_second !== 'number' ||
+        !Number.isFinite(window.rate_resolution_rows_per_second) || window.rate_resolution_rows_per_second <= 0)))
+    unavailableReasons.push('provisional_commit_rate_resolution_unavailable');
+  const lowCommitWindows = Array.isArray(windows) ? windows.flatMap((window, index) =>
+    record(window) && integer(window.window_commit_count) && window.window_commit_count < 100
+      ? [{ index: index + 1, commitCount: window.window_commit_count }] : []) : [];
   assertDeadline();
   return { reference: structuredClone(reference), inventory: structuredClone(inventory), effectiveConfig,
     officialResult: result, output, startMs: integer(start) ? start : null, endMs: integer(end) ? end : null,
-    committedRowsPerSecond: complete && finalEvidence && result.status === 'succeeded' ? output.rows_per_second as number : null, submittedConfigIdentity, unavailableReasons };
+    committedRowsPerSecond: complete && finalEvidence && outputMatches && result.status === 'succeeded' ? output.rows_per_second as number : null,
+    rateResolutionRowsPerSecond, lowCommitWindows, submittedConfigIdentity, unavailableReasons };
+}
+
+/** Resolution gate only; successful comparison does not authorize or otherwise qualify a scale trial. */
+export function assessCommitRateResolution(candidate: OfficialCellMeasurement, before: OfficialCellMeasurement,
+  after: OfficialCellMeasurement, pairOrder: 'AB' | 'BA'): 'provisional' | 'invalid_aa' | 'unresolved' | 'resolved' {
+  const observations = [candidate, before, after];
+  if (observations.some(observation => observation.unavailableReasons.length > 0 ||
+      observation.committedRowsPerSecond === null || !Number.isFinite(observation.committedRowsPerSecond) || observation.committedRowsPerSecond <= 0 ||
+      observation.rateResolutionRowsPerSecond === null || !Number.isFinite(observation.rateResolutionRowsPerSecond) || observation.rateResolutionRowsPerSecond <= 0)) return 'provisional';
+  const [candidateRate, beforeRate, afterRate] = observations.map(observation => observation.committedRowsPerSecond!);
+  const [candidateResolution, beforeResolution, afterResolution] = observations.map(observation => observation.rateResolutionRowsPerSecond!);
+  if (Math.max(beforeResolution! / beforeRate!, afterResolution! / afterRate!) > 0.01) return 'invalid_aa';
+  const resolution = Math.max(candidateResolution!, beforeResolution!, afterResolution!);
+  const mean = (beforeRate! + afterRate!) / 2;
+  const pairedRate = pairOrder === 'AB' ? beforeRate! : afterRate!;
+  return Math.abs(candidateRate! - mean) < resolution || Math.abs(candidateRate! - pairedRate) < resolution
+    ? 'unresolved' : 'resolved';
 }
 
 // Microsoft.Kusto/clusters: Percent/Average/PT1M, not row latency or cache fullness.
@@ -613,8 +660,13 @@ export function createScaleEvidenceVerifier(options: Parameters<typeof readOffic
           original.endMs !== post.endMs || !Number.isSafeInteger(post.notBeforeMs) || original.startMs < post.notBeforeMs ||
           original.endMs > post.deadlineAtMs || post.deadlineAtMs !== options.deadlineAtMs))
       throw new Error('Official measurement does not match the selected original cell/window/deadline.');
-    if (original.unavailableReasons.length) throw new Error('Official measurement is UNKNOWN: ' + original.unavailableReasons.join(','));
-    throw new Error('Scale admission requires explicit paired baseline/trial cell custody; an original cell is not same-cell post-effect authorization.');
+    const lowWindows = original.lowCommitWindows;
+    const lowWindowNotice = lowWindows.length ? ' low_commit_windows: ' + lowWindows.slice(0, 10)
+      .map(window => window.index + ' (' + window.commitCount + ')').join(', ') +
+      (lowWindows.length > 10 ? ' (+' + (lowWindows.length - 10) + ' more)' : '') + '.' : '';
+    if (original.unavailableReasons.length)
+      throw new Error('Official measurement is UNKNOWN: ' + original.unavailableReasons.join(',') + '.' + lowWindowNotice);
+    throw new Error('Scale admission requires explicit paired baseline/trial cell custody; an original cell is not same-cell post-effect authorization.' + lowWindowNotice);
   };
   return { verifyInitial: (envelope, state) => verify(envelope, state),
     verifyMeasurement: (envelope, state, window) => verify(envelope, state, window) };
