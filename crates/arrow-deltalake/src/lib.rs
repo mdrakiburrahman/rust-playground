@@ -479,6 +479,19 @@ pub(crate) mod sync_hook {
     static FAIL: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+    type SyncGate = (PathBuf, tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+    static GATES: Mutex<Vec<SyncGate>> = Mutex::new(Vec::new());
+
+    pub(crate) fn pause_next(path: PathBuf) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        GATES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path, entered, wait));
+        (ready, release)
+    }
+
     pub(crate) fn fail_on(path: &Path) {
         FAIL.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -506,6 +519,17 @@ pub(crate) mod sync_hook {
     }
 
     pub(super) fn observe(path: &Path) -> anyhow::Result<()> {
+        let gate = {
+            let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);
+            gates
+                .iter()
+                .position(|(p, _, _)| p == path)
+                .map(|i| gates.swap_remove(i))
+        };
+        if let Some((_, entered, wait)) = gate {
+            let _ = entered.send(());
+            let _ = wait.recv();
+        }
         if FAIL
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

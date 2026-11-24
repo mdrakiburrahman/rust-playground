@@ -301,6 +301,9 @@ fn fixture(path: &str, value: Value) -> Value {
         input["maintenance"] =
             json!({"enabled": true, "operations": ["optimize", "purge", "vacuum", "checkpoint", "prune_log"]});
     }
+    if path == "collector.batching.stage_file_concurrency" {
+        input["collector"] = json!({"batching":{"coalesce_publications":true}});
+    }
     if path == "router.sql_pool_acquire_timeout_ms" {
         input["router"] = json!({"sql_pool_max_size": 1});
     }
@@ -702,19 +705,25 @@ fn cpu_modes_and_stage_concurrency_require_typed_named_values() -> Result<()> {
     assert!(!environment.contains_key("ARROWCOL_COLLECTOR_CPU_DISPATCH"));
     assert!(!environment.contains_key("ARROWCOL_COLLECTOR_CPU_PLACEMENT"));
     assert!(!environment.contains_key("ARROWCOL_COLLECTOR_BATCHING_CONFIG"));
+    for batching in [
+        json!({"stage_file_concurrency":2}),
+        json!({"stage_file_concurrency":16,"coalesce_publications":false}),
+    ] {
+        assert!(Tunables::parse_oat_json(json!({"collector":{"batching":batching}})).is_err());
+    }
     for (dispatch, placement, concurrency) in [
         ("shared_fifo", "os", 1),
         ("bounded_shards", "compact_allowed", 8),
         ("bounded_shards", "scatter_allowed", 16),
     ] {
         let input = json!({"collector":{"runtime":{"cpu_dispatch":dispatch,"cpu_placement":placement},
-                                       "batching":{"stage_file_concurrency":concurrency}}});
+                                       "batching":{"coalesce_publications":true,"stage_file_concurrency":concurrency}}});
         let env = Tunables::parse_oat_json(input)?.environment_for(ComponentRole::Collector)?;
         assert_eq!(env["ARROWCOL_COLLECTOR_CPU_DISPATCH"], dispatch);
         assert_eq!(env["ARROWCOL_COLLECTOR_CPU_PLACEMENT"], placement);
         assert_eq!(
             serde_json::from_str::<Value>(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?,
-            json!({"stage_file_concurrency": concurrency})
+            json!({"coalesce_publications":true, "stage_file_concurrency": concurrency})
         );
     }
     Ok(())
