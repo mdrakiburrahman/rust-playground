@@ -1540,7 +1540,7 @@ mod io_tests {
             .map_err(|error| anyhow::anyhow!("{error}"))?
             .as_ref()
             .context("missing table writer readback")?
-            .event(&table.url, crate::writer::process_config()?)?;
+            .clone();
         let expected_codec = codec_readback["parquet_columns"]["id"]["compression"]
             .as_str()
             .context("missing codec readback")?;
@@ -1623,7 +1623,7 @@ mod io_tests {
             .map_err(|error| anyhow::anyhow!("{error}"))?
             .as_ref()
             .context("missing disabled layout readback")?
-            .event(&table.url, crate::writer::process_config()?)?;
+            .clone();
         assert_eq!(disabled_readback["config"]["enabled"], false);
         assert!(disabled_readback["config"]["sort_columns"].is_null());
         assert_eq!(writer.adaptive_file_config(&defaults)?.target_parquet_bytes, 64);
@@ -1976,6 +1976,126 @@ mod io_tests {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
         )?)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn column_worker_files_are_byte_identical() -> Result<()> {
+        const OUTPUT: &str = "ARROWCOL_TEST_COLUMN_OUTPUT";
+        let Some(output) = std::env::var_os(OUTPUT) else {
+            let directory = tempfile::tempdir()?;
+            for workers in [1, 2, 4, 8, 16] {
+                let arm = directory.path().join(workers.to_string());
+                fs::create_dir(&arm)?;
+                let run = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "delta::io_tests::column_worker_files_are_byte_identical"])
+                    .env(OUTPUT, &arm)
+                    .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", workers.to_string())
+                    .env(crate::writer::PARQUET_CONFIG_ENV, r#"{"defaults":{"compression":"zstd","compression_level":7,"statistics":"page"},"columns":{"id":{"compression":"snappy","dictionary_enabled":false,"encoding":"delta_binary_packed"}},"writer_version":"v2","max_row_group_rows":4,"data_page_row_count_limit":2,"write_batch_size":1}"#)
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&run.stdout);
+                anyhow::ensure!(
+                    run.status.success() && stdout.contains("1 passed;"),
+                    "{workers}: {stdout} {}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                for name in ["single", "bucket=a", "bucket=b"] {
+                    let actual = fs::read(arm.join(name))?;
+                    let expected = fs::read(directory.path().join("1").join(name))?;
+                    anyhow::ensure!(
+                        actual == expected,
+                        "{name}: complete file differs with {workers} column workers"
+                    );
+                }
+            }
+            return Ok(());
+        };
+        let output = PathBuf::from(output);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from_iter_values(0..16)),
+                Arc::new(arrow::array::StringArray::from_iter(
+                    (0..16).map(|i| (i % 3 != 0).then_some("repeated")),
+                )),
+            ],
+        )?;
+        let single = DeltaTable::open(output.join("single-table"))?;
+        let mut writer = single.new_file_with_publication(Arc::clone(&schema), "single".into(), 0, 1000)?;
+        writer.write(&input).await?;
+        let staged = writer.stage().await?;
+        let save = |file: &StagedAppend, name: &str| -> Result<()> {
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&file.file.path)?)?;
+            assert!(reader.metadata().num_row_groups() > 1);
+            for group in reader.metadata().row_groups() {
+                assert_eq!(group.num_columns(), 2);
+                for col in group.columns() {
+                    assert!(col.column_index_offset().is_some() && col.offset_index_offset().is_some());
+                    match col.column_path().string().as_str() {
+                        "id" => assert_eq!(col.compression(), parquet::basic::Compression::SNAPPY),
+                        "label" => assert!(matches!(col.compression(), parquet::basic::Compression::ZSTD(_))),
+                        path => anyhow::bail!("unexpected column {path}"),
+                    }
+                }
+            }
+            let event = file.table.layout_readback.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let event = event.as_ref().context("missing table properties")?;
+            assert_eq!(
+                event["parquet_columns"]["label"],
+                serde_json::json!({"compression":"zstd","compression_level":7})
+            );
+            fs::copy(&file.file.path, output.join(name))?;
+            Ok(())
+        };
+        save(&staged, "single")?;
+        let multi_root = output.join("multi-table");
+        fs::create_dir(&multi_root)?;
+        let url = Url::from_directory_path(&multi_root).map_err(|()| anyhow::anyhow!("invalid fixture URL"))?;
+        let schema = Arc::new(Schema::new(vec![
+            schema.field(0).clone(),
+            schema.field(1).clone(),
+            Field::new("bucket", DataType::Utf8, false),
+        ]));
+        let mut columns = input.columns().to_vec();
+        columns.push(Arc::new(arrow::array::StringArray::from_iter_values(
+            (0..16).map(|i| if i % 2 == 0 { "a" } else { "b" }),
+        )));
+        let input = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        let partitions = vec!["bucket".to_owned()];
+        DeltaTable::open_catalog(url.clone())?.commit_catalog(
+            None,
+            Arc::clone(&schema),
+            partitions.clone(),
+            BTreeMap::new(),
+            None,
+        )?;
+        let table = DeltaTable::open_url(url, schema, partitions)?;
+        let (files, _, _, _, _) = table
+            .stage_coalesced_publications(
+                vec![
+                    (input.slice(0, 7), "first".into(), 0, 1000),
+                    (input.slice(7, 9), "second".into(), 0, 1000),
+                ],
+                2,
+                2,
+            )
+            .await?;
+        assert_eq!(files.len(), 2);
+        for file in files {
+            let partition = file
+                .file
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .context("missing partition")?;
+            save(&file, partition)?;
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2877,7 +2997,7 @@ pub struct DeltaTable {
     session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
-    layout_readback: Mutex<Option<LayoutReadback>>,
+    layout_readback: Mutex<Option<serde_json::Value>>,
     stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
@@ -2913,9 +3033,8 @@ impl LayoutReadback {
         })
     }
 
-    fn event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
-        let mut config = self.policy.config_json(Some(self.enabled));
-        config["sort_execution"] = serde_json::json!(self.enabled.then_some(self.mode));
+    #[cfg(test)]
+    fn test_event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
         let base = if self.enabled {
             Some(self.policy.writer_properties(&self.schema)?)
         } else {
@@ -2926,6 +3045,12 @@ impl LayoutReadback {
             base.clone(),
             &crate::writer::sorting_from_properties(&self.schema, base.as_ref())?,
         )?;
+        self.event(url, &properties)
+    }
+
+    fn event(&self, url: &Url, properties: &WriterProperties) -> Result<serde_json::Value> {
+        let mut config = self.policy.config_json(Some(self.enabled));
+        config["sort_execution"] = serde_json::json!(self.enabled.then_some(self.mode));
         let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
         let mut parquet_columns = serde_json::Map::new();
         let mut parquet_column_options = serde_json::Map::new();
@@ -3032,6 +3157,8 @@ impl LayoutReadback {
                     parquet::file::properties::WriterVersion::PARQUET_1_0 => "v1",
                     parquet::file::properties::WriterVersion::PARQUET_2_0 => "v2",
                 },
+                "max_row_group_rows": properties.max_row_group_row_count(),
+                "data_page_row_count_limit": properties.data_page_row_count_limit(),
                 "max_row_group_bytes": properties.max_row_group_bytes(),
                 "write_batch_size": properties.write_batch_size(),
                 "offset_index_enabled": !properties.offset_index_disabled(),
@@ -3859,26 +3986,27 @@ impl DeltaTable {
 
     fn record_layout_readback(
         &self,
-        physical: SchemaRef,
+        writer: &DeltaFileWriter,
         properties: &arrowcol_props::ResolvedProps,
         table: &BTreeMap<String, String>,
         enabled: bool,
         mode: SortExecution,
     ) -> Result<()> {
-        let next = LayoutReadback::new(physical, properties, table, enabled, mode)?;
+        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+        let event = LayoutReadback::new(physical, properties, table, enabled, mode)?
+            .event(&self.url, &writer.parquet.properties)?;
         let mut previous = self
             .layout_readback
             .lock()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        if previous.as_ref() != Some(&next) {
-            let event = next.event(&self.url, crate::writer::process_config()?)?;
+        if previous.as_ref() != Some(&event) {
             eprintln!("arrowcol_effective_config {event}");
             tracing::info!(
                 component = "layout",
                 effective_config = %event,
                 "arrowcol_effective_config"
             );
-            *previous = Some(next);
+            *previous = Some(event);
         }
         Ok(())
     }
@@ -4230,13 +4358,7 @@ impl DeltaTable {
             writer.discard_empty()?;
             bail!("table properties changed while preparing publication; retry with refreshed policy");
         }
-        self.record_layout_readback(
-            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-            &properties,
-            &table_properties,
-            enabled,
-            mode,
-        )?;
+        self.record_layout_readback(&writer, &properties, &table_properties, enabled, mode)?;
         Ok(writer)
     }
 
@@ -4427,13 +4549,7 @@ impl DeltaTable {
             }
         }
         if let Some((writer, _)) = files.first() {
-            self.record_layout_readback(
-                Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-                &resolved,
-                &table_properties,
-                layout.is_some(),
-                mode,
-            )?;
+            self.record_layout_readback(writer, &resolved, &table_properties, layout.is_some(), mode)?;
         }
         Ok(files)
     }
@@ -4833,7 +4949,7 @@ impl DeltaTable {
             }
             if first {
                 self.record_layout_readback(
-                    Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+                    &writer,
                     &policy.resolved,
                     &policy.table_properties,
                     policy.layout.is_some(),
@@ -6288,7 +6404,7 @@ mod layout_readback_tests {
             }}
         }))?;
         let url = Url::parse("file:///safe/catalog/schema/events/")?;
-        let event = readback.event(&url, &parquet)?;
+        let event = readback.test_event(&url, &parquet)?;
         assert_eq!(event["table_name"], "catalog.schema.events");
         assert_eq!(
             event["table_id"],
@@ -6314,7 +6430,7 @@ mod layout_readback_tests {
         assert_eq!(
             event["parquet_properties"],
             serde_json::json!({
-                "writer_version":"v2", "max_row_group_bytes":2048, "write_batch_size":5,
+                "writer_version":"v2", "max_row_group_rows":3, "data_page_row_count_limit":1, "max_row_group_bytes":2048, "write_batch_size":5,
                 "offset_index_enabled":true, "column_index_truncate_length":32, "statistics_truncate_length":64
             })
         );
@@ -6344,7 +6460,7 @@ mod layout_readback_tests {
                 "defaults": defaults,
                 "columns":{"customer_id":{"compression":"gzip","compression_level":5}}
             }))?;
-            let event = readback.event(&url, &policy)?;
+            let event = readback.test_event(&url, &policy)?;
             assert_eq!(
                 event["parquet_columns"]["value"],
                 serde_json::json!({"compression":codec,"compression_level":level})
@@ -6359,7 +6475,7 @@ mod layout_readback_tests {
         assert!(publication_layout(&schema, &resolved)?.is_none());
         assert!(collector_publication_layout(&schema, &resolved, SortExecution::VerifyOrder).is_err());
         let disabled = LayoutReadback::new(schema, &resolved, &table, false, SortExecution::Concatenate)?;
-        let event = disabled.event(&url, &parquet)?;
+        let event = disabled.test_event(&url, &parquet)?;
         assert_eq!(event["applied"], false);
         assert_eq!(event["config"]["enabled"], false);
         for name in [

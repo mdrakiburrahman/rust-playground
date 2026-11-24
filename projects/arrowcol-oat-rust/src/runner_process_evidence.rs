@@ -1074,7 +1074,9 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
         }
         let properties = &value["parquet_properties"];
         let valid_properties = properties.as_object().is_some_and(|object| {
-            object.len() == 6
+            (object.len() == 6 || (object.len() == 8
+                && object.get("max_row_group_rows").is_some_and(|value| value.is_null() || value.as_u64().is_some_and(|rows| rows > 0))
+                && properties["data_page_row_count_limit"].as_u64().is_some_and(|rows| rows > 0)))
                 && matches!(properties["writer_version"].as_str(), Some("v1" | "v2"))
                 && properties["write_batch_size"].as_u64().is_some_and(|value| value > 0)
                 && properties["offset_index_enabled"].is_boolean()
@@ -2214,11 +2216,13 @@ mod startup_readback_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         let mut event = json!({"component":"layout","scope":"table_effective","table_id":"a".repeat(64),
+            "parquet_properties":{"writer_version":"v2","max_row_group_bytes":null,"max_row_group_rows":32,"data_page_row_count_limit":8,"write_batch_size":8,"offset_index_enabled":true,"column_index_truncate_length":null,"statistics_truncate_length":null},
             "table_name":canonical_dmv_table_name(&config.tables[0])?,
             "config":{"enabled":false,"sort_execution":null,"sort_columns":null,"bloom_columns":null,"max_rows":null,
                 "max_input_bytes":null,"row_group_rows":null,"page_rows":null}});
         let records = collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n"))?;
         assert_eq!(records[0]["config"]["enabled"], false);
+        assert_eq!(records[0]["parquet_properties"], event["parquet_properties"]);
         assert!(records[0]["config"]["row_group_rows"].is_null());
         event["config"]["row_group_rows"] = json!(123);
         assert!(collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n")).is_err());
