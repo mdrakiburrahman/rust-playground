@@ -5,7 +5,7 @@ import { plan_run_fic } from '../../infra/azure/run_fic.js';
 import { hasVerifiedUnsettledDrain, validateCampaignState, type CampaignStore, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import { assertRunCleanupActor, observeExactKubernetes, type CustodyCommandRunner } from './aks-setup-cleanup.js';
 import type { CleanupActionResult, CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
-import { cleanupBudget, withCleanupDeadline } from './aks-cleanup-budget.js';
+import { cleanupBudget, CleanupDeadlineExpiredError, withCleanupDeadline } from './aks-cleanup-budget.js';
 import { captureTerminalData } from './aks-data-safety.js';
 
 type LifecycleField = 'stop_admission' | 'bounded_drain' | 'evidence_capture' | 'stop_maintenance' | 'terminal_capture';
@@ -310,7 +310,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       const etag = await write(blob, record, bounded, saved?.etag);
       await bounded.assertCurrent();
       const remaining = cleanupBudget(bounded)!.deadlineUnixMs - Date.now();
-      if (remaining <= 0) throw new Error('Lifecycle stop deadline expired before PATCH admission.');
+      if (remaining <= 0) throw new CleanupDeadlineExpiredError('Lifecycle stop deadline expired before PATCH admission.');
       const patch = [{ op: 'test', path: '/metadata/uid', value: resource.uid },
         { op: 'test', path: '/metadata/resourceVersion', value: text(metadata.resourceVersion) },
         { op: 'add', path: observation.deployment ? '/spec/replicas' : '/spec/suspend', value: observation.deployment ? 0 : true }];
@@ -437,11 +437,29 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       const stop = savedStop ? parseStop(savedStop.value, inventory, stopField, resource) : null;
       const logs = await captureLogs(observed.plan.server, inventory, observed.pods, field === 'terminal_capture' ? 'terminal' : 'evidence', authority);
       const terminalSamples = field === 'terminal_capture' && resource.role === 'collector' && stop ?
-        stop.initial_pods.map(pod => ({
-          pod_name: pod.name, pod_uid: pod.uid,
-          terminal_sample: stop.terminal_pods.some(ended => ended.uid === pod.uid) ? 'observed' :
-            observed.pods.some(current => current.uid === pod.uid) ? 'unobserved' : 'pod_gone',
-        })) : null;
+        stop.initial_pods.map(pod => {
+          const ended = stop.terminal_pods.find(value => value.uid === pod.uid && value.name === pod.name);
+          return {
+            pod_name: pod.name, pod_uid: pod.uid,
+            terminal_sample: ended ? 'observed' :
+              observed.pods.some(current => current.uid === pod.uid) ? 'unobserved' : 'pod_gone',
+            containers: pod.containers.map(initial => {
+              const terminal = ended?.containers.find(value => value.name === initial.name);
+              const sameInstance = terminal && initial.restart_count !== undefined &&
+                terminal.restart_count === initial.restart_count;
+              const marker = sameInstance && stop.logs.some(log => log.phase === 'terminal' &&
+                log.pod_uid === pod.uid && log.pod_name === pod.name && log.container === initial.name &&
+                log.drain_complete_marker === true);
+              const classification = !sameInstance || terminal.exit_code === null ? 'terminal_status_unavailable' :
+                terminal.oom_killed ? 'exit_oom_killed' :
+                terminal.exit_code === 0 ? 'exit_0' :
+                terminal.exit_code === 143 ? marker ? 'sigterm_after_drain_pending_reconciliation' : 'exit_143_without_drain_marker' :
+                'exit_nonzero';
+              return { container: initial.name, restart_count: initial.restart_count ?? null,
+                exit_code: terminal?.exit_code ?? null, classification };
+            }),
+          };
+        }) : null;
       const podGone = terminalSamples?.some(sample => sample.terminal_sample === 'pod_gone') ?? false;
       workloads.push({ identity: identity(resource), resource_version: text(metadata.resourceVersion),
         desired_instances: integer(observed.deployment ? observed.spec.replicas : observed.spec.parallelism), pods: observed.pods,
@@ -454,6 +472,16 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     }
     await write(blob, { schema_version: 1, field, origin: origin(inventory), observed_at_unix_ms: Date.now(),
       bounded_drain: inventory.cleanup.bounded_drain, unsettled: hasVerifiedUnsettledDrain(state),
+      ...(field === 'terminal_capture' ? { drain_timing: {
+        budget_ms: inventory.drain_budget?.budget_ms ?? null,
+        collector_grace_ms: inventory.drain_budget?.collector_grace_ms ?? null,
+        pre_stop_capture_margin_ms: inventory.drain_budget?.pre_stop_capture_margin_ms ?? null,
+        actual_drain_duration_ms: null,
+        actual_drain_started_at_unix_ms: null,
+        actual_drain_finished_at_unix_ms: null,
+        actual_drain_source: null,
+        unavailable_reason: 'collector_sigterm_timestamp_unavailable',
+      } } : {}),
       workloads, scope: 'exact_kubernetes_status_and_sanitized_log_receipts' }, authority);
     if (field === 'terminal_capture') await freezeTerminal(inventory, authority);
     return 'complete' as const;

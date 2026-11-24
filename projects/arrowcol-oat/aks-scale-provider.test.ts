@@ -51,6 +51,7 @@ async function fixture() {
     orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000004', cell_run_id: cellId,
     load_admission: 'not_authorized', planned_cell_duration_ms: 60_000,
     effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
+    drain_budget: { budget_ms: 120_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 },
     namespace: { name: namespace, uid: null, owner_token: ownerId },
     resources: [
       { api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol', uid: null, absence: null, role: 'collector', state: 'planned' },
