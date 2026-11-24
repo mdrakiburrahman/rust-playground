@@ -113,20 +113,88 @@ fn scalar_tail(
     mut groups: BTreeMap<PartitionValues, Vec<u64>>,
     mut on_new_partition: impl FnMut(&PartitionValues) -> Result<()>,
 ) -> Result<Groups> {
-    for row in start..batch.num_rows() {
+    let end = batch.num_rows();
+    let arrays = columns.iter().map(|column| batch.column(*column)).collect::<Vec<_>>();
+    let mut visit = |first: usize, stop: usize| -> Result<()> {
         let mut values = BTreeMap::new();
-        for (name, column) in names.iter().zip(columns) {
-            values.insert(name.clone(), value(batch.column(*column).as_ref(), row)?);
+        for (name, array) in names.iter().zip(&arrays) {
+            values.insert(name.clone(), value(array.as_ref(), first)?);
         }
         if !groups.contains_key(&values) {
             on_new_partition(&values)?;
         }
-        groups.entry(values).or_default().push(u64::try_from(row)?);
+        let rows = groups.entry(values).or_default();
+        rows.reserve(stop - first);
+        for row in first..stop {
+            rows.push(u64::try_from(row)?);
+        }
+        Ok(())
+    };
+    if let Some(starts) = run_starts(&arrays, start) {
+        for (index, first) in starts.iter().enumerate() {
+            visit(*first, starts.get(index + 1).copied().unwrap_or(end))?;
+        }
+    } else {
+        for row in start..end {
+            visit(row, row + 1)?;
+        }
     }
     groups
         .into_iter()
         .map(|(values, rows)| Ok((take_rows(batch, rows)?, values)))
         .collect()
+}
+
+/// First rows of every maximal run, from `start`, in which all `arrays` repeat the previous row.
+/// Equal Arrow values serialize identically, so one row per run stands for the whole run.
+/// Returns `None` when the types cannot be compared, leaving callers on the per-row path.
+fn run_starts(arrays: &[&arrow::array::ArrayRef], start: usize) -> Option<Vec<usize>> {
+    let rows = arrays.first()?.len();
+    if start >= rows {
+        return Some(Vec::new());
+    }
+    let tail = rows - start;
+    let mut changed: Option<arrow::array::BooleanArray> = None;
+    if tail > 1 {
+        for array in arrays {
+            let differs = arrow::compute::kernels::cmp::distinct(
+                &array.slice(start, tail - 1),
+                &array.slice(start + 1, tail - 1),
+            )
+            .ok()?;
+            changed = Some(match changed {
+                Some(previous) => arrow::compute::or(&previous, &differs).ok()?,
+                None => differs,
+            });
+        }
+    }
+    let mut starts = vec![start];
+    if let Some(changed) = changed {
+        starts.extend(changed.values().set_indices().map(|index| start + index + 1));
+    }
+    Some(starts)
+}
+
+/// Whether every row of `array` serializes to `expected`.
+pub(crate) fn all_rows_equal(array: &arrow::array::ArrayRef, expected: &Option<String>) -> Result<bool> {
+    let check = |row: usize| -> Result<bool> { Ok(value(array.as_ref(), row)? == *expected) };
+    match run_starts(&[array], 0) {
+        Some(starts) => {
+            for first in starts {
+                if !check(first)? {
+                    return Ok(false);
+                }
+            }
+        }
+        None => {
+            for row in 0..array.len() {
+                if !check(row)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 // Use the same materialization for either grouping mode. A small partition must
@@ -368,6 +436,127 @@ mod tests {
             publication_id("stable", &groups[0].1, batch.schema().as_ref())?,
             publication_id("stable", &groups[0].1, batch.schema().as_ref())?
         );
+        Ok(())
+    }
+
+    fn per_row_reference(
+        batch: &RecordBatch,
+        names: &[String],
+        columns: &[usize],
+        start: usize,
+        admitted: &mut Vec<PartitionValues>,
+    ) -> Result<Groups> {
+        let mut groups: BTreeMap<PartitionValues, Vec<u64>> = BTreeMap::new();
+        for row in start..batch.num_rows() {
+            let mut values = BTreeMap::new();
+            for (name, column) in names.iter().zip(columns) {
+                values.insert(name.clone(), value(batch.column(*column).as_ref(), row)?);
+            }
+            if !groups.contains_key(&values) {
+                admitted.push(values.clone());
+            }
+            groups.entry(values).or_default().push(u64::try_from(row)?);
+        }
+        groups
+            .into_iter()
+            .map(|(values, rows)| Ok((take_rows(batch, rows)?, values)))
+            .collect()
+    }
+
+    #[test]
+    fn run_detection_matches_per_row_grouping() -> Result<()> {
+        use arrow::array::{BooleanArray, Float64Array};
+        let columns: Vec<Vec<ArrayRef>> = vec![
+            vec![Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("a"),
+                None,
+                None,
+                Some(""),
+                Some("a"),
+                Some("a"),
+                None,
+            ]))],
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some("x"),
+                    Some("x"),
+                    None,
+                    None,
+                    Some("x"),
+                    Some("y"),
+                    Some("y"),
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    Some(2),
+                    None,
+                    None,
+                    Some(1),
+                    Some(1),
+                ])),
+            ],
+            vec![Arc::new(Float64Array::from(vec![
+                0.0,
+                -0.0,
+                f64::NAN,
+                f64::NAN,
+                1.5,
+                1.5,
+                0.0,
+                0.0,
+            ]))],
+            vec![Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(true),
+                None,
+                Some(false),
+                Some(false),
+                None,
+                None,
+                Some(true),
+            ]))],
+            vec![Arc::new(Int64Array::from_iter_values(0..8))],
+            vec![Arc::new(Int64Array::from(vec![7_i64; 8]))],
+            vec![Arc::new(Int64Array::from(vec![7_i64]))],
+        ];
+        for keys in columns {
+            let rows = keys[0].len();
+            let mut fields = (0..keys.len())
+                .map(|index| Field::new(format!("k{index}"), keys[index].data_type().clone(), true))
+                .collect::<Vec<_>>();
+            fields.push(Field::new("row", DataType::Int64, false));
+            let names = (0..keys.len()).map(|index| format!("k{index}")).collect::<Vec<_>>();
+            let positions = (0..keys.len()).collect::<Vec<_>>();
+            let mut arrays = keys;
+            arrays.push(Arc::new(Int64Array::from_iter_values(0..i64::try_from(rows)?)));
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+            for start in [0, 1, rows.saturating_sub(1), rows] {
+                let mut expected_admitted = Vec::new();
+                let expected = per_row_reference(&batch, &names, &positions, start, &mut expected_admitted);
+                let mut admitted = Vec::new();
+                let actual = scalar_tail(&batch, &names, &positions, start, BTreeMap::new(), |values| {
+                    admitted.push(values.clone());
+                    Ok(())
+                });
+                assert_eq!(admitted, expected_admitted);
+                let (actual, expected) = (actual?, expected?);
+                assert_eq!(actual, expected);
+                for ((group, _), (reference, _)) in actual.iter().zip(&expected) {
+                    assert_eq!(group.get_array_memory_size(), reference.get_array_memory_size());
+                }
+            }
+            for column in 0..names.len() {
+                let array = batch.column(column);
+                let first = value(array.as_ref(), 0)?;
+                let uniform = (0..rows).all(|row| value(array.as_ref(), row).ok() == Some(first.clone()));
+                assert_eq!(all_rows_equal(array, &first)?, uniform);
+                assert!(!all_rows_equal(array, &Some("missing".to_owned()))?);
+            }
+        }
         Ok(())
     }
 }
