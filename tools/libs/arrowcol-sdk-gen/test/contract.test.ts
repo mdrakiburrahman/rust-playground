@@ -13,7 +13,7 @@ import { protocPaths } from '../src/protoc.js';
 import { inspectRunDocument } from '../src/run-inspection.js';
 import { pipelineSteps } from '../ui/run-pipeline.js';
 
-function fixture() {
+function fixture(typed = false) {
   const workspace = mkdtempSync(join(tmpdir(), 'contract-workflow-'));
   const put = (path: string, value: string) => {
     mkdirSync(dirname(path), { recursive: true });
@@ -21,6 +21,7 @@ function fixture() {
   };
   put(generatorPath(workspace), 'test-generator');
   put(join(workspace, 'tools/libs/arrowcol-sdk-gen/src/contract.ts'), 'test-workflow');
+  put(join(workspace, 'tools/libs/arrowcol-sdk-gen/src/distributions.ts'), 'test-packaging-workflow');
   put(join(workspace, 'package-lock.json'), '{}');
   const pin = { table: 'telemetry.prod.events', tableId: '4a9d8c13-96a2-4c33-8888-e883bfbc1111', version: 1, fingerprint: 'schema-only' };
   const calls: string[][] = [];
@@ -42,6 +43,17 @@ function fixture() {
       put(out, 'deterministic-archive');
       return JSON.stringify({ sha256: `sha256:${digest('deterministic-archive')}`, bytes: 21 });
     }
+    if (operation === 'generate' && typed) {
+      put(join(out, 'models/manifest.json'), '{}');
+      const contract = readFileSync(join(dirname(out), 'contract/manifest.json'), 'utf8');
+      for (const language of ['rust', 'cpp', 'csharp']) {
+        put(join(out, 'models', language, 'contract/manifest.json'), contract);
+        put(join(out, 'models', language, 'model.txt'), 'ordinary protobuf model');
+      }
+      for (const path of ['arrowcol-sdk-runtime', 'arrowcol-sdk-ffi', 'cpp', 'csharp']) {
+        put(join(out, 'runtime', path, 'source.txt'), 'schema-independent SDK');
+      }
+    }
     return '{}';
   };
   return {
@@ -59,6 +71,40 @@ test('registry authorities persist and managed services have isolated endpoints'
     assert.equal(hostPath({ ...first, hostWorkspace: 'Q:\\src\\rust-playground' }, '.temp/releases/a.tar.gz'), 'Q:\\src\\rust-playground\\.temp\\releases\\a.tar.gz');
     writeFileSync(join(f.workspace, contractRoot, 'config.json'), '{ broken');
     assert.throws(() => loadConfig(f.workspace), SyntaxError);
+  } finally { f.cleanup(); }
+});
+test('typed releases publish independent neutral, models and SDK packages before exposing success', async () => {
+  const f = fixture(true);
+  try {
+    const queued = enqueue(f.workspace, { registry: 'local', mode: 'create', ddl: 'CREATE TABLE telemetry.prod.events (id BIGINT)' });
+    const run = await buildContract(f.workspace, queued.id, f.execute);
+    assert.equal(run.status, 'succeeded', run.error ?? '');
+    assert.deepEqual(run.packages?.map((item) => item.id),
+      ['contract', 'models-rust', 'sdk-rust', 'models-cpp', 'sdk-cpp', 'models-csharp', 'sdk-csharp']);
+    for (const item of run.packages!) {
+      assert.equal(digest(readFileSync(resolve(f.workspace, item.path))), item.sha256);
+    }
+    const operations = f.calls.map((call) => call[1] === 'catalog' ? call[2] : call[1]);
+    assert.equal(operations.filter((operation) => operation === 'package-artifact').length, 8);
+    assert.ok(operations.lastIndexOf('package-artifact') < operations.indexOf('promote'));
+    assert.equal(inspectRunDocument(f.workspace, run.id, 'packages').available, true);
+  } finally { f.cleanup(); }
+});
+
+test('a damaged standalone package blocks promotion resume', async () => {
+  const f = fixture(true);
+  try {
+    f.fail('promote');
+    const queued = enqueue(f.workspace, { registry: 'local', mode: 'create', ddl: 'CREATE TABLE telemetry.prod.events (id BIGINT)' });
+    const staged = await buildContract(f.workspace, queued.id, f.execute);
+    assert.ok(staged.staged?.packages);
+    writeFileSync(join(runDirectory(f.workspace, queued.id), 'packages/models-csharp.tar.gz'), 'damaged');
+    const before = f.calls.length;
+    f.fail('');
+    const run = await resumePromotion(f.workspace, queued.id, f.execute);
+    assert.equal(run.status, 'failed');
+    assert.match(run.error ?? '', /Staged package changed: models-csharp/);
+    assert.ok(!f.calls.slice(before).some((call) => call.includes('promote')));
   } finally { f.cleanup(); }
 });
 test('requests reject absent versions, arbitrary modes, oversized DDL and malformed identities', () => {
@@ -136,7 +182,8 @@ test('recovery preserves a completed release when the worker exits during its li
       saveRun(f.workspace, completed);
       throw Object.assign(new Error('worker exited after final save'), { code: 'ESRCH' });
     });
-    recoverRuns(f.workspace);
+    assert.deepEqual(recoverRuns(f.workspace).find((run) => run.id === completed.id), completed,
+      'the returned snapshot includes a concurrently completed run without a second directory scan');
     assert.deepEqual(readRun(f.workspace, queued.id), completed);
   } finally { context.mock.restoreAll(); f.cleanup(); }
 });

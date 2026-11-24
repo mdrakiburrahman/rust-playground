@@ -2,7 +2,7 @@
 
 | Component | Local address | Purpose |
 | --- | --- | --- |
-| Catalogue UI | <http://localhost:4173/lakehouse> | Explore contracts, build SDKs and download artifacts |
+| Catalogue UI | <http://localhost:4173/lakehouse> | Explore contracts and download independent models/SDK packages |
 | Local / hosted simulation | `18817` / `18818` | Two independent, persistent catalogue authorities |
 | Regional Arrowcol | `18830` | Admit SDK batches and commit Delta/Parquet |
 | Optional on-node Arrowcol | `18832` | Admit and forward to regional using the same catalogue authority |
@@ -41,7 +41,9 @@ npx --no-install nx run arrowcol-sdk-gen:catalog-ui
 Keep it running and forward port `4173` in your editor. `/`, `/fabric` and
 `/lakehouse` remain separate frontends. Select a registry, browse its tables, or
 use **Create and build**. Click a workflow run for its pipeline, logs, pinned
-version and downloadable archive. The host-visible path is also displayed.
+version and downloadable archives. Expand **Individual contract and SDK packages**
+for the neutral contract and each language's models/SDK. Every package has a
+digest and host-visible path. The complete developer bundle remains available.
 
 The default hosted choice is a second local service, not a cloud deployment.
 For actual local Unity/Hive metadata services, follow
@@ -52,10 +54,11 @@ and exact rebuilds; this does not adopt arbitrary foreign tables.
 
 The screenshots below are real local captures using **Hosted simulation**, the
 second local authority; the same controls apply to **Local catalogue**.
+They use an isolated qualification namespace; the commands below use `demo.public.events`.
 
 ![Local lakehouse explorer showing the committed three-column events schema](images/localhost-catalogue.png)
 
-## 2. Build the editable sample's SDK
+## 2. Build the editable sample's contract packages
 
 In a second devcontainer terminal:
 
@@ -65,7 +68,9 @@ npx --no-install nx run arrowcol-protoc:build-contract --registry=local --defini
 
 This creates `demo.public.events`: required `event_id`, required `observed_at`
 (UTC microseconds), and nullable `payload`. Copy the successful run's `id`.
-The workflow compiles and validates the SDK before registering the new contract.
+The workflow checks canonical artifacts, Rust models and legacy Rust/TypeScript
+builders before registration. C++/C# compilation and full ingestion are verified
+by the demo, not claimed by the workflow's build-only success.
 It does not silently overwrite an existing table.
 
 For an existing, intentionally reused sample contract, rebuild instead:
@@ -78,9 +83,15 @@ Do not use the fixture generator as a substitute for this committed build.
 Changing values in the sample app needs no schema rebuild. Changing the schema
 does: use a new contract rather than assuming this CREATE-only demo performs ALTER.
 
-Open the successful run to inspect its stages and download the SDK:
+Open the successful run to inspect its stages and download packages. This capture
+shows a pinned-version rebuild: registration is correctly skipped, not replayed.
 
-![Successful SDK pipeline with registration and a local artifact download](images/localhost-workflow.png)
+![Successful pinned-contract rebuild showing independent package digests](images/localhost-workflow.png)
+
+Expand the run's package section to download the neutral contract or either
+dependency for your language:
+
+![Seven independent contract, models and SDK downloads with hashes and host paths](images/localhost-packages.png)
 
 ## 3. Prepare and start collectors
 
@@ -94,7 +105,7 @@ npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=serve --run-id="$R
 
 Leave `serve` running. Omit `--node` for regional-only ingestion. Both collectors
 resolve the selected authority themselves; SDK clients never receive a registry
-endpoint. Configurations, logs, extracted SDK and sample build projects are under
+endpoint. Configurations, logs, separately extracted SDK/models packages and sample projects are under
 `.temp/contract-builder/demos/RUN_UUID/`.
 
 The on-node exporter uses explicit `registration: shared_catalog`: it does not
@@ -124,19 +135,23 @@ npx --no-install nx run arrowcol-sdk-gen:stream-demo --action=emit --run-id="$RU
 | `--duration-seconds=5` | Short smoke run |
 
 The wrapper compiles the chosen sample and runs it against the active demo.
-C++ and C# first build the generated native bridge to the shared Rust runtime.
+C++ and C# first build the same schema-independent native SDK library.
 Build output is retained outside the immutable release archive.
 Use `--action=build --language=cpp` (or `rust`/`csharp`) to compile without sending.
 Samples use deterministic synthetic timestamps and values for exact comparison;
 edit the event construction to use your own values or current timestamps.
 
-When running a compiled sample directly, pass `--endpoint` or set
-`ARROWCOL_ENDPOINT`; there is no hardcoded IP fallback. The wrapper supplies the
-active local endpoint automatically, overriding the environment. See
+When running a compiled sample directly, pass `--endpoint` / `ARROWCOL_ENDPOINT`
+and `--contract` / `ARROWCOL_CONTRACT`. The contract path is the corresponding
+`sdk/models/<language>/contract` directory under the prepared demo. There is no
+hardcoded IP fallback. The wrapper supplies both values from the active run,
+overriding the environment. See
 [connection configuration and DNS](sdk-developer-guide.md#configure-the-collector-connection)
 and the complete Cargo, CMake and .NET project-reference examples in that guide.
-Ordinary protobuf types stay `Events`; only the Arrowcol-specific helpers are
-named `ArrowcolEventsContract` and `ArrowcolEventsStream`.
+Ordinary protobuf types stay `Events`. The new API is `ArrowcolStream<Events>`
+bound to a loaded `ArrowcolContract`; no event-specific SDK/native build is needed.
+Applications reference the language SDK and models package independently.
+Legacy generated adapters remain in the complete developer archive only.
 
 Run the app directly if you need its own Ctrl+C handler to flush before exit;
 the wrapper is primarily a bounded-duration runner. Killing a process does not
@@ -284,7 +299,9 @@ even in UI-only mode; do not report an unstarted component as ready.
    service). Inspect for `demo.public.events` before CREATE. Build the sample
    contract if absent; otherwise rebuild the exact existing version only after
    confirming its three-column schema matches. Record the successful run ID,
-   registry, table ID, schema version, fingerprint and artifact path.
+   registry, table ID, schema version, fingerprint and artifact path. Require a
+   new modular release with separate `models-*` and `sdk-*` packages; rebuild an
+   older pinned release rather than editing its immutable archive.
 4. Run `stream-demo --action=prepare --run-id=...`. Build the selected language
    with `--action=build`; fix missing toolchains rather than changing the schema.
    The projects generated under `.temp` are not checked in. For a user's own
@@ -323,8 +340,8 @@ out-of-scope components as **not started (outside requested mode)**:
 | Return to the user | Required evidence/details |
 | --- | --- |
 | Catalogue URL | Actual host URL, normally `http://localhost:4173/lakehouse`, with registry/table selected when possible |
-| SDK artifact | Successful run ID, pinned schema version, downloadable artifact and real host-visible path |
-| Collector connection | `ARROWCOL_ENDPOINT` value and where the app must run to reach it; node versus regional |
+| SDK / models / neutral artifacts | Successful run ID, pinned version, independent download links, package digests and real host-visible paths |
+| Collector connection | `ARROWCOL_ENDPOINT`, matching `ARROWCOL_CONTRACT`, and where the app runs; node versus regional |
 | Kusto connection | Verified host cluster URI, internal Docker URI, `NetDefaultDB`, no-auth emulator setting and the query below |
 | Kusto browser UI | Verified workbench URL and connection name if started; otherwise say it was not started |
 | Evidence | Actual admitted/committed/query counts and screenshots or their file paths; distinguish old rows from new sends |

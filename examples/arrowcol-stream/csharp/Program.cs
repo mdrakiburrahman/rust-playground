@@ -2,17 +2,19 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using Arrowcol.Generated;
+using Arrowcol.Client;
 // The prepared demo's Schema.cs aliases Events to the ordinary protobuf message.
 // For your own project reference and aliases, see docs/architecture/arrowcol-platform/sdk-developer-guide.md.
 
 string? endpoint = null;
+string? contract = null;
 int seconds = 300, intervalMs = 1000;
 for (int i = 0; i < args.Length; i += 2)
 {
     if (i + 1 == args.Length) throw new ArgumentException("Each option requires a value");
     switch (args[i]) {
         case "--endpoint": endpoint = args[i + 1]; break;
+        case "--contract": contract = args[i + 1]; break;
         case "--duration-seconds": seconds = int.Parse(args[i + 1]); break;
         case "--interval-ms": intervalMs = int.Parse(args[i + 1]); break;
         default: throw new ArgumentException($"Unknown option: {args[i]}");
@@ -26,12 +28,14 @@ if (string.IsNullOrWhiteSpace(endpoint))
     throw new ArgumentException("ARROWCOL_ENDPOINT or --endpoint must not be blank");
 using var stop = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
-await using var stream = await ArrowcolEventsStream.ConnectAsync(endpoint);
+contract ??= Environment.GetEnvironmentVariable("ARROWCOL_CONTRACT")
+    ?? throw new ArgumentException("Set ARROWCOL_CONTRACT or pass --contract");
+await using var stream = await ArrowcolStream<Events>.ConnectAsync(endpoint, ArrowcolContract.Load(contract));
 var clock = Stopwatch.StartNew();
 long id = 0;
 while (clock.Elapsed.TotalSeconds < seconds && !stop.IsCancellationRequested)
 {
-    // Edit event values here; the generated adapter supplies the Arrow schema and routing.
+    // The shared SDK binds this ordinary protobuf type to the loaded contract.
     await stream.PushAsync(new Events {
         EventId = id,
         ObservedAt = 1_700_000_000_000_000 + id,

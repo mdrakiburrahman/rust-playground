@@ -22,10 +22,18 @@ restart, are never reused, and skip the protobuf-reserved range 19000-19999.
 
 | Generated surface | Responsibility |
 | --- | --- |
+| `models/{rust,cpp,csharp}` | Ordinary protobuf types plus the exact embedded contract; no Arrowcol SDK dependency |
+| `runtime/` language SDK projects | Schema-independent `ArrowcolStream<Event>` binds a loaded contract and validates/converts messages at runtime |
 | Rust `src/proto.rs` | Prost-generated contract types, alongside Arrow row builders |
 | Rust and TypeScript row/builders | Construct the exact registered Arrow layout |
 | Flight descriptor, fingerprint and routing helpers | Configure transport and send through Dataflow |
 | `sdk-manifest.json` | Hashes of artifacts and generated files; package/version identity |
+
+For the new flat-scalar stream API, applications reference a language SDK and a
+separate language models package. The neutral contract is independently available
+to non-Arrowcol consumers. C++/C# share one native library across schemas; legacy
+generated adapters remain only for compatibility. See the
+[developer guide](sdk-developer-guide.md) for exact project references and limits.
 
 Generation cross-checks source, descriptor, Arrow schema and normalized manifest.
 Unsupported/lossy types, identifier collisions, stale output, symlinks and unsafe
@@ -92,10 +100,10 @@ It serializes input only; the Rust parser and central property registry validate
 | Prepare | Read-only `PrepareTable` freezes table/field IDs, v1, complete schema, exact properties, comment, partitions and the selected authority's managed location |
 | Export / validate protobuf (protoc only) | Export the compiler entry and options, then run descriptor-only `protoc` to resolve imports and validate protobuf; the plugin separately validates semantic IR/API binding |
 | Generate | Direct backend uses the existing Rust renderer; the opt-in protoc backend invokes `protoc-gen-arrowcol-sdk` and reuses that same renderer |
-| Verify | Canonical byte-exact check, TypeScript typecheck and generated tests, Rust generated-crate tests |
-| Stage | Deterministic archive containing `contract/`, both SDKs in `sdk/`, and `release.json`; not exposed as a completed release |
+| Verify | Canonical byte-exact check, Rust models compilation/tests and legacy Rust/TypeScript builder checks; C++/C# and ingestion qualification happen separately |
+| Stage | Neutral contract, independent language models/SDK source archives and complete developer bundle; individual digests in `packages.json`; not exposed before registration |
 | Promote | `PromoteTable` validates the entire candidate under the catalogue DDL lock and commits through the existing Delta optimistic transaction/reconciliation path |
-| Publish | Read-back equality of the complete committed v1 contract; create-only content-addressed archive and download reference |
+| Publish | Read-back equality of the complete committed v1 contract; create-only content-addressed archives, independent downloads and host paths |
 
 Preparation is not a reservation and publishes no table/event. Conflicting
 concurrent creation fails promotion; schema fingerprint equality alone is never
@@ -128,6 +136,7 @@ First startup creates `.temp/contract-builder/config.json`.
 | `registries/<authority-hash>/identity.key` | Local generated signing secret, retained across restarts; never served to the browser or packaged |
 | `runs/<UUID>/` | Request, state, Nx/build logs, candidate, staged archive and payload |
 | `releases/<authority-hash>/<table-UUID>/vN/<SHA-256>/contract-sdk.tar.gz` | Immutable completed SDK + schema contract |
+| Same release directory: `contract.tar.gz`, `models-*.tar.gz`, `sdk-*.tar.gz` | Independently consumable neutral bundle, language models and reusable SDK sources; each has its own digest |
 
 Stop the UI before editing configuration. An external endpoint must implement
 the candidate RPCs for new tables; no fallback to registration-first is allowed.
@@ -176,7 +185,7 @@ This is original prototype code, not a pixel-perfect or Microsoft-hosted product
 available. It follows the reference's nested Lakehouse/Tables/schema/table tree
 and inline table pane rather than replacing the catalogue grid with a drawer.
 Schema, Properties and SDK contract tabs display committed local metadata.
-New table, Build SDK and Workflow runs share the existing backend and compiler
+New table, Build packages and Workflow runs share the existing backend and compiler
 workflow. Catalogue selection includes Unity/Hive build authorities after
 [`enable-build`](catalog.md#optional-local-unity-catalog-and-hive-services);
 unconfigured native entries remain inspection-only. Native builds support new

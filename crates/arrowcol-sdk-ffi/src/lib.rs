@@ -1,7 +1,8 @@
 //! Narrow C ABI implementation shared by generated table adapters.
 //! Callers serialize access to a handle. All pointers must remain valid for the duration of a call.
-use arrowcol_sdk_runtime::{ArrowcolStream, Contract, Error, Result, StreamOptions};
+use arrowcol_sdk_runtime::{ArrowcolContract, ArrowcolStream, Contract, Error, GeneratedStream, Result, StreamOptions};
 use prost::Message;
+use prost_reflect::{DescriptorPool, DynamicMessage};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -13,7 +14,7 @@ trait Producer: Send {
     fn close(&mut self) -> Result<()>;
 }
 struct Typed<C: Contract> {
-    stream: ArrowcolStream<C>,
+    stream: GeneratedStream<C>,
     runtime: tokio::runtime::Runtime,
     max_rows: usize,
 }
@@ -85,7 +86,7 @@ where
             .enable_all()
             .build()
             .map_err(Error::invalid)?;
-        let stream = runtime.block_on(ArrowcolStream::<C>::connect(endpoint, options))?;
+        let stream = runtime.block_on(GeneratedStream::<C>::connect(endpoint, options))?;
         let handle = Box::new(Handle(Box::new(Typed {
             stream,
             runtime,
@@ -169,4 +170,138 @@ pub unsafe fn free_error(error: *mut c_char) {
             drop(CString::from_raw(error));
         }
     }
+}
+
+struct Reflected {
+    stream: ArrowcolStream<DynamicMessage>,
+    contract: ArrowcolContract,
+    runtime: tokio::runtime::Runtime,
+    max_rows: usize,
+}
+impl Producer for Reflected {
+    fn push(&mut self, mut data: &[u8], batch: bool) -> Result<()> {
+        let mut events = Vec::new();
+        if batch {
+            while !data.is_empty() {
+                if events.len() == self.max_rows {
+                    return Err(Error::invalid("batch exceeds batch_rows"));
+                }
+                let len = prost::decode_length_delimiter(&mut data).map_err(Error::invalid)?;
+                let bytes = data
+                    .get(..len)
+                    .ok_or_else(|| Error::invalid("truncated protobuf batch"))?;
+                events.push(self.contract.decode(bytes)?);
+                data = &data[len..];
+            }
+        } else {
+            events.push(self.contract.decode(data)?);
+        }
+        self.runtime.block_on(self.stream.push_batch(&events))
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.runtime.block_on(self.stream.flush())
+    }
+    fn close(&mut self) -> Result<()> {
+        self.runtime.block_on(self.stream.close())
+    }
+}
+
+/// Opens the schema-independent producer. Descriptor bytes are a compiled model's
+/// FileDescriptorSet, including imports. Model binding is checked before any network call.
+///
+/// # Safety
+/// Strings must be NUL-terminated UTF-8. Descriptor bytes must remain readable for `model_len`.
+/// `output` must be writable and the resulting handle must be used exclusively.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_open(
+    endpoint: *const c_char,
+    contract_path: *const c_char,
+    model: *const u8,
+    model_len: usize,
+    model_name: *const c_char,
+    options: *const c_char,
+    output: *mut *mut c_void,
+) -> *mut c_char {
+    boundary(|| {
+        if output.is_null() {
+            return Err(Error::invalid("null output pointer"));
+        }
+        unsafe {
+            *output = std::ptr::null_mut();
+        }
+        if endpoint.is_null()
+            || contract_path.is_null()
+            || model.is_null()
+            || model_name.is_null()
+            || options.is_null()
+            || model_len > 16 * 1024 * 1024
+        {
+            return Err(Error::invalid("null open argument or oversized descriptor"));
+        }
+        let text = |ptr| unsafe { CStr::from_ptr(ptr) }.to_str().map_err(Error::invalid);
+        let contract = ArrowcolContract::load(text(contract_path)?)?;
+        let pool =
+            DescriptorPool::decode(unsafe { std::slice::from_raw_parts(model, model_len) }).map_err(Error::invalid)?;
+        let descriptor = pool
+            .get_message_by_name(text(model_name)?)
+            .ok_or_else(|| Error::invalid("compiled message not found in descriptor set"))?;
+        contract.validate_model(&descriptor)?;
+        let options: StreamOptions = serde_json::from_str(text(options)?).map_err(Error::invalid)?;
+        let max_rows = options.batch_rows;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(Error::invalid)?;
+        let stream = runtime.block_on(ArrowcolStream::connect_dynamic(
+            text(endpoint)?,
+            contract.clone(),
+            &descriptor,
+            options,
+        ))?;
+        let handle = Box::new(Handle(Box::new(Reflected {
+            stream,
+            contract,
+            runtime,
+            max_rows,
+        })));
+        unsafe {
+            *output = Box::into_raw(handle).cast();
+        }
+        Ok(())
+    })
+}
+
+/// # Safety
+/// Same pointer/lifecycle requirements as [`push`]. `batch` must be zero or one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_push(handle: *mut c_void, data: *const u8, len: usize, batch: u8) -> *mut c_char {
+    if batch > 1 {
+        return boundary(|| Err(Error::invalid("invalid batch flag")));
+    }
+    unsafe { push(handle, data, len, batch != 0) }
+}
+/// # Safety
+/// Same requirements as [`flush`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_flush(handle: *mut c_void) -> *mut c_char {
+    unsafe { flush(handle) }
+}
+/// # Safety
+/// Same requirements as [`close`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_close(handle: *mut c_void) -> *mut c_char {
+    unsafe { close(handle) }
+}
+/// # Safety
+/// Same requirements as [`destroy`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_destroy(handle: *mut c_void) {
+    unsafe { destroy(handle) }
+}
+/// # Safety
+/// Same requirements as [`free_error`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_free_error(error: *mut c_char) {
+    unsafe { free_error(error) }
 }

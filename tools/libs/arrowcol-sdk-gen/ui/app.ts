@@ -16,6 +16,7 @@ interface Run extends PipelineRun {
   createdAt: string; startedAt?: string; finishedAt?: string;
   pin?: { table: string; version: number };
   error?: string; artifact?: { hostPath: string; sha256: string };
+  packages?: { id: string; kind: string; language?: string; hostPath: string; sha256: string }[];
 }
 const element = <T extends HTMLElement>(id: string) => {
   const result = document.getElementById(id);
@@ -24,6 +25,18 @@ const element = <T extends HTMLElement>(id: string) => {
 };
 const escape = (text: unknown) => String(text ?? '').replace(/[&<>"']/g, (char) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
+function packageDownloads(run: Run): string {
+  if (!run.packages?.length) return '';
+  return `<details class="package-downloads"><summary>Individual contract and SDK packages (${run.packages.length})</summary>
+    <p class="small">Apps reference two packages: their language SDK and their schema models.
+    Models embed the neutral contract and do not depend on Arrowcol. SDK source is shared across schemas.
+    Build native binaries for your OS/architecture; these are source distributions, not published package feeds.</p>
+    ${run.packages.map((item) => `<div class="artifact">
+      <a href="/api/runs/${run.id}/artifact?package=${encodeURIComponent(item.id)}">Download ${escape(item.kind === 'contract'
+        ? 'language-neutral contract' : `${item.language} ${item.kind === 'sdk' ? 'Arrowcol SDK' : 'models + contract'}`)}</a>
+      <input aria-label="${escape(item.id)} package path" readonly value="${escape(item.hostPath)}">
+      <div class="mono">SHA-256 ${escape(item.sha256)}</div></div>`).join('')}</details>`;
+}
 let registries: Registry[] = [];
 let tables: Table[] = [];
 let runs: Run[] = [];
@@ -125,13 +138,14 @@ function renderRunPipeline(): void {
     ['schema', 'Canonical row .proto'], ['options', 'Property options .proto'], ['manifest', 'Schema manifest'],
     ...(run.request.codegen === 'protoc' ? [['compiler', 'Compiler entry .proto']] : []),
     ['sdk', 'Generated SDK manifest'], ['release', 'Release provenance'],
+    ...(run.distributionVersion ? [['models', 'Language models manifest'], ['packages', 'Package digests']] : []),
     ...(run.registry.native ? [['registration', 'Native registration receipt']] : []),
   ];
   const select = element<HTMLSelectElement>('pipeline-document');
   select.innerHTML = documents.map(([value, name]) => `<option value="${value}">${name}</option>`).join('');
   select.value = inspectedDocument ?? (active.skip ? 'log' : active.document);
   element('pipeline-artifact').innerHTML = run.artifact
-    ? `<a href="/api/runs/${run.id}/artifact">Download SDK + contract</a><p class="mono">${escape(run.artifact.hostPath)}</p><p class="mono">SHA-256 ${escape(run.artifact.sha256)}</p>` : '';
+    ? `<a href="/api/runs/${run.id}/artifact">Download SDK + contract</a><p class="small">Complete developer source bundle${run.packages ? '; individual packages below' : ' (legacy generated adapters)'}.</p><p class="mono">${escape(run.artifact.hostPath)}</p><p class="mono">SHA-256 ${escape(run.artifact.sha256)}</p>${packageDownloads(run)}` : '';
 }
 async function refreshRunOutput(): Promise<void> {
   if (!runDialog.open || !inspectedRunId) return;
@@ -351,7 +365,7 @@ function renderLakehouseDetail(table: Table): string {
     <div class="property-grid"><span>Table</span><span>${escape(table.table)}</span><span>Table identity</span><span class="mono">${escape(table.tableId)}</span>
     <span>Schema fingerprint</span><span class="mono">${escape(table.fingerprint)}</span>
     ${table.registrationReceipt ? `<span>Native ${escape(table.registrationReceipt.provider)} identity</span><span class="mono">${escape(table.registrationReceipt.native_table_id)}</span>` : ''}</div>
-    <p class="metadata-note">Build the committed schema without registering it again. The generated SDK calls Arrowcol, not the catalogue. Downloads and host paths appear under Workflow runs.</p></section>`;
+    <p class="metadata-note">Build the committed schema without registering it again. Schema models and the reusable Arrowcol SDK are separate packages. The SDK binds the contract at runtime and calls Arrowcol, not the catalogue. Downloads and host paths appear under Workflow runs.</p></section>`;
 }
 function favoriteKey(table: string): string {
   return `${registrySelect.value}:${table}`;
@@ -421,7 +435,7 @@ function renderDetail(): void {
   }
   if (fabric) element('detail-panel').hidden = !table;
   if (!table) {
-    element('detail').innerHTML = '<div class="empty"><div class="empty-symbol">▦</div><h2>Your catalogue starts here</h2><p class="muted">Create a table to register a real schema and build its Rust and TypeScript SDKs.</p><p class="muted small">The local catalogue and hosted simulation have independent persistent state.</p></div>';
+    element('detail').innerHTML = '<div class="empty"><div class="empty-symbol">▦</div><h2>Your catalogue starts here</h2><p class="muted">Create a table and build its neutral contract and Rust/C++/C# models. Consume them with reusable language SDKs.</p><p class="muted small">The local catalogue and hosted simulation have independent persistent state. Typed streams support flat scalars; legacy Rust/TypeScript Arrow builders remain available.</p></div>';
     return;
   }
   const [catalog, schema, name] = table.table.split('.');
@@ -494,7 +508,7 @@ function renderRuns(): void {
       <div class="run-meta">${escape(run.registry.label)} &nbsp; / &nbsp; ${escape(run.phase)} &nbsp; / &nbsp; ${escape(new Date(run.createdAt).toLocaleString())}</div>
       <div class="small muted">Registration: ${escape(run.registration)}${run.startedAt ? ` · Started ${escape(new Date(run.startedAt).toLocaleTimeString())}` : ''}${run.finishedAt ? ` · Finished ${escape(new Date(run.finishedAt).toLocaleTimeString())}` : ''}</div>
       ${run.error ? `<p class="error">${run.registration === 'committed' || run.registration === 'existing' ? 'Table registered; artifact build failed. ' : run.registration === 'unknown' ? 'Registration outcome uncertain; inspect the catalogue before rebuilding. ' : ''}${escape(run.error)}</p>` : ''}
-      ${run.artifact ? `<div class="artifact"><a href="/api/runs/${run.id}/artifact">Download SDK + contract</a><input aria-label="Artifact path" readonly value="${escape(run.artifact.hostPath)}"><button class="text-button" data-copy="${escape(run.id)}">Copy path</button><div class="mono">SHA-256 ${escape(run.artifact.sha256)}</div></div>` : ''}
+      ${run.artifact ? `<div class="artifact"><a href="/api/runs/${run.id}/artifact">Download SDK + contract</a><input aria-label="Artifact path" readonly value="${escape(run.artifact.hostPath)}"><button class="text-button" data-copy="${escape(run.id)}">Copy path</button><div class="mono">SHA-256 ${escape(run.artifact.sha256)}</div></div>${packageDownloads(run)}` : ''}
       <button class="text-button" data-log="${escape(run.id)}">View logs</button><span class="mono muted">${escape(run.id)}</span>
     </article>`).join('') : '<div class="empty"><h2>No builds yet</h2><p class="muted">Create a table or rebuild a committed version to start the Nx workflow.</p></div>';
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-log]')) {
@@ -513,7 +527,7 @@ function renderRuns(): void {
   }
   for (const article of document.querySelectorAll<HTMLElement>('[data-run]')) {
     article.onclick = (event) => {
-      if (event.target instanceof Element && event.target.closest('a, input, button') &&
+      if (event.target instanceof Element && event.target.closest('a, input, button, details') &&
         !event.target.closest('[data-pipeline]')) return;
       openRunPipeline(article.dataset.run!);
     };

@@ -66,7 +66,7 @@
       <label class="registry-picker">Catalogue <select id="registry" aria-label="Registry"></select></label>
       <span class="command-divider"></span>
       <button id="add-table" disabled><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>New table</button>
-      <button id="build-selected" disabled><svg class="icon" aria-hidden="true"><use href="#icon-build"/></svg>Build SDK</button>
+      <button id="build-selected" disabled><svg class="icon" aria-hidden="true"><use href="#icon-build"/></svg>Build packages</button>
       <details class="compiler-settings"><summary>SDK options</summary><div>
         <label for="codegen">SDK compiler</label><select id="codegen"><option value="protoc">Arrowcol protoc builder</option><option value="direct">Direct builder</option></select>
         <p>Compiler choice does not change the catalogue authority. The SDK calls Arrowcol.</p>
@@ -105,7 +105,7 @@
   <dialog id="create-dialog">
     <form id="create-form">
       <div class="dialog-heading"><div><span class="pill">Schema contracts</span><h2>New table</h2></div><button type="button" id="close-dialog" aria-label="Close new table">Close</button></div>
-      <p class="muted">Define a table once. Build strongly typed Arrowcol SDKs before registration.</p>
+      <p class="muted">Define a table once. Package its neutral contract and language models for the reusable Arrowcol SDK.</p>
       <p id="create-registry" class="connection-summary"></p>
       <div class="identity-fields">
         <label>Catalogue<input id="catalog-name" value="telemetry" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
@@ -122,7 +122,7 @@
       <label for="proto-entry">Compiler entry filename (protoc only)</label><input id="proto-entry" value="telemetry.proto" pattern="[A-Za-z0-9_][A-Za-z0-9_.-]*\.proto">
       <div class="pipeline"><span>Schema &rarr; DDL</span><span>Frozen contract</span><span>Proto + options</span><span>Arrowcol compiler</span><span>Verify SDK</span><span>Register</span></div>
       <p id="form-error" role="alert"></p>
-      <div class="dialog-footer"><span class="muted small">No table is registered if SDK verification fails.<br>SDK calls Arrowcol, not the catalogue service.</span><button id="create-submit" class="primary" type="submit">Create and build SDK</button></div>
+      <div class="dialog-footer"><span class="muted small">Canonical output and Rust/TypeScript checks precede registration.<br>SDK and schema models are separate packages.</span><button id="create-submit" class="primary" type="submit">Create and build packages</button></div>
     </form>
   </dialog>
 </body>

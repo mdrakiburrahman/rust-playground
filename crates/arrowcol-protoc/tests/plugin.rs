@@ -172,10 +172,7 @@ fn real_protoc_composes_two_plugins_and_preserves_direct_sdk_output() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     for (name, bytes) in render_sdk_files(&f.bundle).unwrap_or_else(|error| panic!("{error}")) {
         let portable_name = name.to_string_lossy().replace('\\', "/");
-        if matches!(
-            portable_name.as_str(),
-            "descriptors/descriptor.pb" | "descriptors/schema.arrow"
-        ) {
+        if portable_name.ends_with("/descriptor.pb") || portable_name.ends_with("/schema.arrow") {
             continue;
         }
         assert_eq!(

@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   commandRunner, contractRoot, digest, enqueue, ensureDirectory, errorMessage, generatorPath,
   failRunStep, isCode, listRuns, loadConfig, readRun, recoverRuns, registryEnvironment, runDirectory, saveRun,
+  type ContractRun,
 } from './contract.js';
 import { inspectRunDocument } from './run-inspection.js';
 import { nativeManager } from './native-catalogues.js';
@@ -29,6 +30,15 @@ let stopping = false;
 let pumping = false;
 let ownsLock = false;
 const lock = resolve(workspace, contractRoot, 'server.lock');
+let runSnapshot: { expires: number; runs: ContractRun[] } | undefined;
+
+function workflowRuns(): ContractRun[] {
+  if (runSnapshot && Date.now() < runSnapshot.expires) return runSnapshot.runs;
+  const runs = recoverRuns(workspace);
+  // Several open frontends share one bounded disk scan, including on slow bind mounts.
+  runSnapshot = { runs, expires: Date.now() + 1000 };
+  return runs;
+}
 
 async function listening(endpoint: string): Promise<boolean> {
   const url = new URL(endpoint);
@@ -133,10 +143,10 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       undefined, registryEnvironment(workspace, registry));
     json(response, 200, JSON.parse(snapshot));
   } else if (request.method === 'GET' && url.pathname === '/api/runs') {
-    recoverRuns(workspace);
-    json(response, 200, listRuns(workspace));
+    json(response, 200, workflowRuns());
   } else if (request.method === 'POST' && url.pathname === '/api/runs') {
     const run = enqueue(workspace, await body(request));
+    runSnapshot = undefined;
     json(response, 202, run);
     void pump().catch((error) => console.error(`Run dispatcher: ${errorMessage(error)}`));
   } else if (request.method === 'GET' && /^\/api\/runs\/[^/]+\/documents\/[^/]+$/.test(url.pathname)) {
@@ -153,16 +163,21 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   } else if (request.method === 'GET' && /^\/api\/runs\/[^/]+\/artifact$/.test(url.pathname)) {
     const run = readRun(workspace, url.pathname.split('/')[3]);
     if (run.status !== 'succeeded' || !run.artifact) { json(response, 404, { error: 'No completed artifact' }); return; }
+    const packageId = url.searchParams.get('package');
+    const artifact = packageId ? run.packages?.find((item) => item.id === packageId) : run.artifact;
+    if (!artifact) { json(response, 404, { error: 'Package is not available for this release' }); return; }
+    if (packageId && !/^(contract|(models|sdk)-(rust|cpp|csharp))$/.test(packageId)) throw new Error('Invalid package');
+    const filename = packageId ? `${packageId}.tar.gz` : 'contract-sdk.tar.gz';
     const expected = join(
       contractRoot, 'releases', digest(run.registry.authority), run.pin!.tableId,
-      `v${run.pin!.version}`, run.artifact.sha256, 'contract-sdk.tar.gz',
+      `v${run.pin!.version}`, run.artifact.sha256, filename,
     );
-    if (run.artifact.path !== expected) throw new Error('Invalid release path');
+    if (artifact.path !== expected) throw new Error('Invalid release path');
     const bytes = readFileSync(resolve(workspace, expected));
-    if (digest(bytes) !== run.artifact.sha256) throw new Error('Release integrity check failed');
+    if (digest(bytes) !== artifact.sha256) throw new Error('Release integrity check failed');
     response.writeHead(200, {
       'Content-Type': 'application/gzip',
-      'Content-Disposition': 'attachment; filename="contract-sdk.tar.gz"',
+      'Content-Disposition': `attachment; filename="${filename}"`,
       'Content-Length': bytes.length,
       'Cache-Control': 'no-store',
     });

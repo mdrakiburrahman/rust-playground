@@ -1,4 +1,5 @@
-#include "contract.hpp"
+#include "arrowcol_client.hpp"
+#include "Schema.hpp"
 #include <algorithm>
 #include <chrono>
 #include <csignal>
@@ -12,12 +13,14 @@ namespace { volatile std::sig_atomic_t stopped = 0; void stop(int) { stopped = 1
 int main(int argc, char** argv) {
     try {
         std::optional<std::string> endpoint;
+        std::optional<std::string> contract;
         int seconds = 300, interval_ms = 1000;
         for (int i = 1; i < argc; i += 2) {
             if (i + 1 == argc) throw std::invalid_argument("Each option requires a value");
             const std::string flag = argv[i], value = argv[i + 1];
             std::size_t consumed = 0;
             if (flag == "--endpoint") { endpoint = value; continue; }
+            if (flag == "--contract") { contract = value; continue; }
             const auto number = std::stoi(value, &consumed);
             if (consumed != value.size()) throw std::invalid_argument("Expected an integer");
             if (flag == "--duration-seconds") seconds = number;
@@ -34,12 +37,17 @@ int main(int argc, char** argv) {
         if (endpoint->find_first_not_of(" \t\r\n") == std::string::npos)
             throw std::invalid_argument("ARROWCOL_ENDPOINT or --endpoint must not be blank");
         std::signal(SIGINT, stop);
-        auto stream = arrowcol_generated::ArrowcolEventsStream::Connect(*endpoint);
+        if (!contract) {
+            const char* configured = std::getenv("ARROWCOL_CONTRACT");
+            if (!configured) throw std::invalid_argument("Set ARROWCOL_CONTRACT or pass --contract");
+            contract = configured;
+        }
+        auto stream = arrowcol::ArrowcolStream<Events>::Connect(*endpoint, arrowcol::ArrowcolContract::Load(*contract));
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         std::int64_t id = 0;
         while (!stopped && std::chrono::steady_clock::now() < end) {
             // Edit these values. This is the ordinary protoc-generated event class.
-            arrowcol_generated::ArrowcolEventsContract::Event event;
+            Events event;
             event.set_event_id(id);
             event.set_observed_at(1700000000000000 + id);
             event.set_payload("cpp-event-" + std::to_string(id));

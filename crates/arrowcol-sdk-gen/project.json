@@ -93,7 +93,7 @@
       "options": {
         "commands": [
           {
-            "command": "cargo build --locked --package arrowcol-sdk-gen",
+            "command": "cargo build --locked --package arrowcol-sdk-gen --package arrowcol-protoc",
             "forwardAllArgs": false
           },
           {

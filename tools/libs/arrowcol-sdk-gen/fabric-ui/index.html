@@ -83,7 +83,7 @@
   <dialog id="create-dialog">
     <form id="create-form">
       <div class="dialog-heading"><div><span class="preview-tag">Schema contracts</span><h2>New table</h2></div><button type="button" id="close-dialog" aria-label="Close new table">✕</button></div>
-      <p class="muted">Define a table once. Build strongly typed Arrowcol SDKs before registration.</p>
+      <p class="muted">Define a table once. Package its neutral contract and language models for the reusable Arrowcol SDK.</p>
       <p id="create-registry" class="connection-summary"></p>
       <div class="identity-fields">
         <label>Workspace / catalogue<input id="catalog-name" value="telemetry" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
@@ -100,7 +100,7 @@
       <label for="proto-entry">Compiler entry filename (protoc only)</label><input id="proto-entry" value="telemetry.proto" pattern="[A-Za-z0-9_][A-Za-z0-9_.-]*\.proto">
       <div class="pipeline"><span>Schema → DDL</span><span>Frozen contract</span><span>Proto + options</span><span>Arrowcol compiler</span><span>Verify SDK</span><span>Register</span></div>
       <p id="form-error" role="alert"></p>
-      <div class="dialog-footer"><span class="muted small">No table is registered if SDK verification fails.<br>SDK calls Arrowcol, not the catalogue service.</span><button id="create-submit" class="primary" type="submit">Create and build SDK</button></div>
+      <div class="dialog-footer"><span class="muted small">Canonical output and Rust/TypeScript checks precede registration.<br>SDK and schema models are separate packages.</span><button id="create-submit" class="primary" type="submit">Create and build packages</button></div>
     </form>
   </dialog>
 </body>

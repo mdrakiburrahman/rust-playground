@@ -11,6 +11,7 @@ import { parseArgs } from 'node:util';
 import {
   commandRunner, contractRoot, digest, ensureDirectory, errorMessage, isCode,
   loadConfig, readRun, registryEnvironment, writeJson,
+  type ContractRun,
 } from './contract.js';
 import { kustoDemo } from './stream-demo-kusto.js';
 
@@ -38,7 +39,10 @@ async function main(): Promise<void> {
   ensureDirectory(workspace, root);
   const execute = commandRunner(workspace);
   const sdk = join(root, 'sdk');
-  const proof = { run: run.id, artifactSha256: run.artifact.sha256, pin: run.pin };
+  const packages = run.packages;
+  assert.ok(packages && packages.some((item) => item.id === 'models-rust'), 'Rebuild this contract to obtain independent SDK and models packages');
+  const proof = { run: run.id, artifactSha256: run.artifact.sha256, pin: run.pin,
+    packages: packages.map(({ id, sha256 }) => ({ id, sha256 })) };
   const prepared = join(root, 'prepared.json');
   const sample = resolve('examples/arrowcol-stream');
   const cargoTarget = resolve('target/arrowcol-sdk-gen-validation-cargo-target');
@@ -56,11 +60,19 @@ async function main(): Promise<void> {
       return;
     }
     assert.ok(!existsSync(sdk), `Partial preparation exists at ${root}; preserve it and use a new build run`);
-    await execute('tar', ['-xzf', resolve(run.artifact.path), '-C', root, 'sdk']);
-    assert.ok(existsSync(join(sdk, 'native/Cargo.toml')), 'Rebuild this contract with the new typed stream generator');
-    const manifest = JSON.parse(readFileSync(join(sdk, 'sdk-manifest.json'), 'utf8'));
-    const csEvent = readFileSync(join(sdk, 'csharp/Contract.cs'), 'utf8').match(/IArrowcolContract<([^>]+)>/)?.[1];
-    assert.ok(csEvent, 'Missing generated protobuf event alias');
+    ensureDirectory(workspace, sdk);
+    for (const language of ['rust', 'cpp', 'csharp']) {
+      for (const kind of ['sdk', 'models']) {
+        const item: NonNullable<ContractRun['packages']>[number] | undefined =
+          packages.find((candidate) => candidate.id === `${kind}-${language}`);
+        assert.ok(item, `Missing ${kind}-${language} package`);
+        assert.equal(digest(readFileSync(resolve(item.path))), item.sha256, `Changed ${item.id} package`);
+        await execute('tar', ['-xzf', resolve(item.path), '-C', sdk]);
+      }
+    }
+    const model = (language: string): { name: string; message: string; header?: string } =>
+      JSON.parse(readFileSync(join(sdk, 'models', language, 'package.json'), 'utf8'));
+    const csEvent = model('csharp').message;
     for (const language of ['rust', 'csharp', 'cpp']) ensureDirectory(workspace, join(root, 'apps', language));
     writeFileSync(cargoManifest, `[package]
 name = "arrowcol-stream-demo"
@@ -74,7 +86,8 @@ path = ${JSON.stringify(join(sample, 'rust/main.rs'))}
 name = "inspect"
 path = ${JSON.stringify(join(sample, 'rust/inspect.rs'))}
 [dependencies]
-sdk = { package = ${JSON.stringify(manifest.packages.rust.name)}, path = ${JSON.stringify(join(sdk, 'rust'))} }
+models = { package = ${JSON.stringify(model('rust').name)}, path = ${JSON.stringify(join(sdk, 'models/rust'))} }
+arrowcol-sdk-runtime = { path = ${JSON.stringify(join(sdk, 'runtime/arrowcol-sdk-runtime'))} }
 tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "signal"] }
 arrow-array = "=58.4.0"
 parquet = { version = "=58.4.0", features = ["arrow"] }
@@ -83,20 +96,24 @@ serde_json = "=1.0.154"
     writeFileSync(csProject, `<Project Sdk="Microsoft.NET.Sdk">
 <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><Nullable>enable</Nullable></PropertyGroup>
 <ItemGroup>
-<ProjectReference Include="${xml(join(sdk, 'csharp/Contract.csproj'))}" />
+<ProjectReference Include="${xml(join(sdk, 'models/csharp/Models.csproj'))}" />
+<ProjectReference Include="${xml(join(sdk, 'runtime/csharp/Arrowcol.Sdk.csproj'))}" />
 <Compile Include="${xml(join(sample, 'csharp/Program.cs'))}" Link="Program.cs" />
 </ItemGroup></Project>
 `);
     writeFileSync(join(root, 'apps/csharp/Schema.cs'),
-      `global using Events = ${csEvent};\n`);
+      `global using Events = global::${csEvent};\n`);
+    writeFileSync(join(cppProject, 'Schema.hpp'), `#pragma once\n#include "${model('cpp').header ?? 'schema.pb.h'}"\nusing Events = ${model('cpp').message};\n`);
     writeFileSync(join(cppProject, 'CMakeLists.txt'), `cmake_minimum_required(VERSION 3.20)
 project(arrowcol_emitter LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
-add_subdirectory(${cmake(join(sdk, 'cpp'))} contract)
+add_subdirectory(${cmake(join(sdk, 'models/cpp'))} models)
+add_subdirectory(${cmake(join(sdk, 'runtime/cpp'))} arrowcol)
 add_executable(emitter ${cmake(join(sample, 'cpp/main.cpp'))})
-target_link_libraries(emitter PRIVATE arrowcol_contract)
+target_include_directories(emitter PRIVATE "\${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(emitter PRIVATE ${model('cpp').name} arrowcol_sdk)
 if(WIN32)
-  add_custom_command(TARGET emitter POST_BUILD COMMAND \${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:contract_native> $<TARGET_FILE_DIR:emitter>)
+  add_custom_command(TARGET emitter POST_BUILD COMMAND \${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:arrowcol_native> $<TARGET_FILE_DIR:emitter>)
 endif()
 `);
     writeJson(prepared, proof);
@@ -146,7 +163,8 @@ endif()
       process.kill(endpoints.pid, 0);
       const endpoint = values.node ? endpoints.node : endpoints.regional;
       assert.ok(typeof endpoint === 'string', 'Start serve with --node before emitting through the on-node hop');
-      args = ['--endpoint', endpoint, '--duration-seconds', String(seconds), '--interval-ms', String(interval)];
+      args = ['--endpoint', endpoint, '--contract', join(sdk, 'models', values.language!, 'contract'),
+        '--duration-seconds', String(seconds), '--interval-ms', String(interval)];
     }
     if (values.language === 'rust') {
       console.log(await execute('cargo', [values.action === 'build' ? 'build' : 'run', '--quiet', '--manifest-path', cargoManifest,
@@ -154,15 +172,15 @@ endif()
         undefined, { CARGO_TARGET_DIR: cargoTarget }));
       return;
     }
-    const nativeManifest = join(sdk, 'native/Cargo.toml');
-    const name = readFileSync(nativeManifest, 'utf8').match(/^name = "([a-z0-9_]+)"$/m)?.[1];
-    assert.ok(name, 'Missing native adapter library');
+    const nativeRoot = join(sdk, 'runtime/arrowcol-sdk-ffi');
+    const nativeManifest = join(nativeRoot, 'Cargo.toml');
+    const name = 'arrowcol_sdk_ffi';
     const nativeTarget = resolve('target/arrowcol-sdk-native-target');
     await execute('cargo', ['build', '--quiet', '--release', '--manifest-path', nativeManifest, '--target-dir', nativeTarget]);
-    ensureDirectory(workspace, join(sdk, 'native/target/release'));
+    ensureDirectory(workspace, join(nativeRoot, 'target/release'));
     const libraries = process.platform === 'win32' ? [`${name}.dll`, `${name}.dll.lib`]
       : [process.platform === 'darwin' ? `lib${name}.dylib` : `lib${name}.so`];
-    for (const file of libraries) copyFileSync(join(nativeTarget, 'release', file), join(sdk, 'native/target/release', file));
+    for (const file of libraries) copyFileSync(join(nativeTarget, 'release', file), join(nativeRoot, 'target/release', file));
     if (values.language === 'csharp') {
       console.log(await execute('dotnet', values.action === 'build'
         ? ['build', csProject, '--configuration', 'Release', '--nologo']

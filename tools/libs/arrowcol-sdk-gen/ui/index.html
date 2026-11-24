@@ -18,10 +18,10 @@
       <input id="filter" type="search" placeholder="Find tables..." aria-label="Find tables">
       <div class="tree-heading"><span>Catalogues</span><button id="refresh" class="text-button" title="Refresh catalogue">Refresh</button></div>
       <nav id="tree" aria-label="Catalogue tree"></nav>
-      <div class="sidebar-footer">One contract. Two SDKs.<br><span class="muted">Rust + TypeScript / Arrow Flight</span></div>
+      <div class="sidebar-footer">Reusable SDK. Independent models.<br><span class="muted">Rust / C++ / C# / Arrow Flight</span></div>
     </aside>
     <main>
-      <div class="page-heading"><div><div class="eyebrow">DATA &amp; CONTRACTS</div><h1>Catalogue Explorer</h1><p class="muted">Browse committed schemas and build versioned client SDKs.</p></div><button id="add-table" class="primary" disabled>+ Add table</button></div>
+      <div class="page-heading"><div><div class="eyebrow">DATA &amp; CONTRACTS</div><h1>Catalogue Explorer</h1><p class="muted">Browse committed schemas and build independently versioned contract packages.</p></div><button id="add-table" class="primary" disabled>+ Add table</button></div>
       <div id="notice" role="status" hidden></div>
       <nav class="tabs" aria-label="Explorer views"><button id="catalog-tab" class="selected">Overview</button><button id="runs-tab">Workflow runs <span id="run-count">0</span></button></nav>
       <section id="catalog-view"><div id="detail"></div></section>
@@ -48,7 +48,7 @@
       <p class="muted small">The Rust catalogue parser validates this definition. Preparation freezes identities, schema, properties and managed location without registering a table. Policy metadata does not add enforcement.</p>
       <div class="pipeline"><span>Prepare</span><span>Generate</span><span>Verify</span><span>Stage</span><span>Register exact candidate</span><span>Publish</span></div>
       <p id="form-error" role="alert"></p>
-      <div class="dialog-footer"><span class="muted small">Registers only after both SDKs pass verification.</span><button id="create-submit" class="primary" type="submit">Create and build</button></div>
+      <div class="dialog-footer"><span class="muted small">Registers only after canonical output and Rust/TypeScript checks pass.</span><button id="create-submit" class="primary" type="submit">Create and build</button></div>
     </form>
   </dialog>
 </body>

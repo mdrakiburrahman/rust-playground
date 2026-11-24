@@ -312,7 +312,7 @@ pub fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse>
     for (path, bytes) in render_sdk_files(&bundle)? {
         let name = path.to_string_lossy().replace('\\', "/");
         // CodeGeneratorResponse.File.content is UTF-8; Nx copies these originals.
-        if matches!(name.as_str(), "descriptors/descriptor.pb" | "descriptors/schema.arrow") {
+        if name.ends_with("/descriptor.pb") || name.ends_with("/schema.arrow") {
             continue;
         }
         response.file.push(GeneratedFile {

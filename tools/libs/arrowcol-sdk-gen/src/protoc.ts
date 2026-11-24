@@ -1,4 +1,4 @@
-import { copyFileSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { digest, ensureDirectory, type Execute } from './contract.js';
 
@@ -39,11 +39,18 @@ export async function generateWithProtoc(
     `--plugin=protoc-gen-arrowcol-sdk=${protocPaths(workspace).plugin}`,
     `--arrowcol-sdk_out=${sdk}`, entry,
   ], log);
-  // protoc returns UTF-8 source files. Keep the two binary artifacts byte-exact.
-  for (const name of ['descriptor.pb', 'schema.arrow']) {
-    copyFileSync(join(artifacts, name), join(sdk, 'descriptors', name));
+  // protoc returns UTF-8 files; copy every embedded binary contract unchanged.
+  const contracts = ['descriptors', ...(existsSync(join(sdk, 'models/manifest.json'))
+    ? ['models/rust/contract', 'models/cpp/contract', 'models/csharp/contract'] : [])];
+  for (const contract of contracts) {
+    for (const name of ['descriptor.pb', 'schema.arrow']) {
+      copyFileSync(join(artifacts, name), join(sdk, contract, name));
+    }
   }
-
+  for (const root of ['rust', 'models/rust']) {
+    const lock = join(sdk, root, 'Cargo.lock');
+    if (existsSync(lock)) unlinkSync(lock);
+  }
 }
 
 export async function validateCompiler(

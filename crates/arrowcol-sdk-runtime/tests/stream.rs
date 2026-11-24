@@ -6,7 +6,9 @@ use arrow_flight::{
     *,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrowcol_sdk_runtime::{ArrowcolStream, Contract, Error, StreamOptions, decimal128};
+use arrowcol_sdk_runtime::{
+    ArrowcolContract, Contract, Error, GeneratedStream as ArrowcolStream, StreamOptions, decimal128,
+};
 use futures::{Stream, TryStreamExt};
 use serde_json::json;
 use std::{
@@ -51,6 +53,7 @@ enum Behavior {
 struct Mock {
     behavior: Behavior,
     rows: Arc<Mutex<Vec<i64>>>,
+    contract: Option<ArrowcolContract>,
 }
 type Reply<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send>>;
 #[tonic::async_trait]
@@ -102,14 +105,34 @@ impl FlightService for Mock {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
-        assert_eq!(
-            request.metadata().get("x-test-contract").expect("contract header"),
-            "expected"
-        );
+        if let Some(contract) = &self.contract {
+            for (key, value) in [
+                ("x-arrowcol-protocol-version", "1"),
+                ("x-arrowcol-implementation-pool", "dataflow"),
+                ("x-arrowcol-catalog", "demo"),
+                ("x-arrowcol-schema", "public"),
+                ("x-arrowcol-table", contract.identity()[2].as_str()),
+                ("x-arrowcol-schema-fingerprint", contract.fingerprint()),
+            ] {
+                assert_eq!(request.metadata().get(key).expect("routing header"), value);
+            }
+        } else {
+            assert_eq!(
+                request.metadata().get("x-test-contract").expect("contract header"),
+                "expected"
+            );
+        }
         let messages: Vec<_> = request.into_inner().try_collect().await?;
         assert_eq!(
             messages[0].flight_descriptor.as_ref().expect("descriptor").path,
-            TestContract::descriptor()
+            self.contract
+                .as_ref()
+                .map(|contract| {
+                    let mut path = contract.identity().to_vec();
+                    path.push("v1".into());
+                    path
+                })
+                .unwrap_or_else(TestContract::descriptor)
         );
         let batches: Vec<_> =
             FlightRecordBatchStream::new_from_flight_data(futures::stream::iter(messages.into_iter().map(Ok)))
@@ -118,7 +141,13 @@ impl FlightService for Mock {
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         for batch in batches {
-            assert_eq!(batch.schema(), TestContract::schema());
+            assert_eq!(
+                batch.schema(),
+                self.contract
+                    .as_ref()
+                    .map(ArrowcolContract::schema)
+                    .unwrap_or_else(TestContract::schema)
+            );
             let values = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("int64");
             self.rows
                 .lock()
@@ -131,7 +160,7 @@ impl FlightService for Mock {
         let mut final_reply = json!({
             "kind": "best_effort_admission", "wire_version": 1, "protocol_version": 1,
             "delivery_guarantee": "best_effort", "source_schema_version": 1, "target_schema_version": 2,
-            "schema_fingerprint": TestContract::fingerprint(), "summary": { "rows": count, "batches": 1, "bytes": count * 8 }
+            "schema_fingerprint": self.contract.as_ref().map(ArrowcolContract::fingerprint).unwrap_or_else(|| TestContract::fingerprint()), "summary": { "rows": count, "batches": 1, "bytes": count * 8 }
         });
         if matches!(self.behavior, Behavior::WrongRows) {
             final_reply["summary"]["rows"] = json!(count + 1);
@@ -167,12 +196,16 @@ impl Drop for Server {
     }
 }
 async fn server(behavior: Behavior) -> Server {
+    server_with_contract(behavior, None).await
+}
+async fn server_with_contract(behavior: Behavior, contract: Option<ArrowcolContract>) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listen");
     let endpoint = format!("http://{}", listener.local_addr().expect("address"));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let mock = Mock {
         behavior,
         rows: Arc::clone(&rows),
+        contract,
     };
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -331,5 +364,190 @@ fn decimals_are_exact_and_never_rounded() {
         (".", 1, 0),
     ] {
         assert!(decimal128(text, precision, scale).is_err(), "{text}");
+    }
+}
+
+fn runtime_contract(table: &str) -> ArrowcolContract {
+    use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+    use prost::Message;
+    use prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        field_descriptor_proto::{Label, Type},
+    };
+    let columns = [
+        (
+            "event_id",
+            DataType::Int64,
+            false,
+            json!({"kind":"int64"}),
+            Type::Int64,
+            "int64",
+        ),
+        (
+            "observed_at",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+            json!({"kind":"timestamp","unit":"microsecond","timezone":"UTC"}),
+            Type::Int64,
+            "int64",
+        ),
+        (
+            "payload",
+            DataType::Utf8,
+            true,
+            json!({"kind":"utf8"}),
+            Type::String,
+            "string",
+        ),
+    ];
+    let schema = Schema::new(
+        columns
+            .iter()
+            .map(|(name, ty, nullable, ..)| Field::new(*name, ty.clone(), *nullable))
+            .collect::<Vec<_>>(),
+    );
+    let arrow = IpcDataGenerator::default()
+        .schema_to_bytes_with_dictionary_tracker(
+            &schema,
+            &mut DictionaryTracker::new(false),
+            &IpcWriteOptions::default(),
+        )
+        .ipc_message;
+    let manifest = json!({
+        "artifact_manifest_version":1,
+        "schema":{
+            "table_id":"9b1e9392-b345-5573-b368-f0d7b52fb93e",
+            "identity":{"catalog":"demo","schema":"public","table":table},
+            "version":1,"fingerprint":"sha256:75c465746aa29c29b38b9edf9d639fd3f160cb81bda38e2cf20dd1f458498e6c",
+            "fields":columns.iter().enumerate().map(|(i,(name,_,nullable,mapping,_,proto))| json!({
+                "id":format!("00000000-0000-0000-0000-{i:012}"), "name":name, "position":i,
+                "field_number":i+1, "nullable":nullable, "mapping":{"arrow":mapping,"protobuf":proto}
+            })).collect::<Vec<_>>()
+        }
+    });
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _, _, _, ty, _))| FieldDescriptorProto {
+            name: Some((*name).into()),
+            json_name: Some((*name).into()),
+            number: Some(i as i32 + 1),
+            label: Some(Label::Optional as i32),
+            r#type: Some(*ty as i32),
+            ..Default::default()
+        })
+        .collect();
+    let descriptors = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("schema.proto".into()),
+            package: Some("arrowcol.demo.public".into()),
+            syntax: Some("proto2".into()),
+            message_type: vec![DescriptorProto {
+                name: Some(if table == "events" { "Events" } else { "Measurements" }.into()),
+                field: fields,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec();
+    ArrowcolContract::from_artifacts(&serde_json::to_vec(&manifest).expect("manifest"), &arrow, &descriptors)
+        .expect("runtime contract")
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct Events {
+    #[prost(int64, optional, tag = "1")]
+    event_id: Option<i64>,
+    #[prost(int64, optional, tag = "2")]
+    observed_at: Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    payload: Option<String>,
+}
+impl prost_reflect::ReflectMessage for Events {
+    fn descriptor(&self) -> prost_reflect::MessageDescriptor {
+        runtime_contract("events").descriptor()
+    }
+}
+#[derive(Clone, PartialEq, prost::Message)]
+struct Measurements {
+    #[prost(int64, optional, tag = "1")]
+    event_id: Option<i64>,
+    #[prost(int64, optional, tag = "2")]
+    observed_at: Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    payload: Option<String>,
+}
+impl prost_reflect::ReflectMessage for Measurements {
+    fn descriptor(&self) -> prost_reflect::MessageDescriptor {
+        runtime_contract("measurements").descriptor()
+    }
+}
+
+#[tokio::test]
+async fn ordinary_models_use_two_independent_contracts_and_atomic_validation() {
+    use arrowcol_sdk_runtime::ArrowcolStream;
+    let first = runtime_contract("events");
+    let second = runtime_contract("measurements");
+    let first_server = server_with_contract(Behavior::Good, Some(first.clone())).await;
+    let second_server = server_with_contract(Behavior::Good, Some(second.clone())).await;
+    let mut first = ArrowcolStream::<Events>::connect(&first_server.endpoint, first, options())
+        .await
+        .expect("first connect");
+    let mut second = ArrowcolStream::<Measurements>::connect(&second_server.endpoint, second, options())
+        .await
+        .expect("second connect");
+    let event = Events {
+        event_id: Some(10),
+        observed_at: Some(0),
+        payload: None,
+    };
+    first.push(event.clone()).await.expect("first push");
+    let mut missing = event.clone();
+    missing.observed_at = None;
+    assert!(first.push_batch(&[event, missing]).await.is_err());
+    second
+        .push(Measurements {
+            event_id: Some(20),
+            observed_at: Some(-1),
+            payload: Some("second".into()),
+        })
+        .await
+        .expect("second push");
+    first.close().await.expect("first admitted");
+    second.close().await.expect("second admitted");
+    assert_eq!(*first_server.rows.lock().expect("rows"), [10]);
+    assert_eq!(*second_server.rows.lock().expect("rows"), [20]);
+    let error = ArrowcolStream::<Measurements>::connect("not an endpoint", runtime_contract("events"), options())
+        .await
+        .err()
+        .expect("model mismatch");
+    assert!(error.message.contains("compiled model"));
+}
+
+#[tokio::test]
+async fn reflected_stream_latches_bad_admission_without_replay() {
+    use arrowcol_sdk_runtime::ArrowcolStream;
+    for behavior in [
+        Behavior::Missing,
+        Behavior::WrongRows,
+        Behavior::WrongContract,
+        Behavior::Duplicate,
+    ] {
+        let contract = runtime_contract("events");
+        let server = server_with_contract(behavior, Some(contract.clone())).await;
+        let mut stream = ArrowcolStream::<Events>::connect(&server.endpoint, contract, options())
+            .await
+            .expect("connect");
+        let event = Events {
+            event_id: Some(99),
+            observed_at: Some(0),
+            payload: None,
+        };
+        stream.push(event.clone()).await.expect("buffered");
+        assert_eq!(stream.flush().await.expect_err("bad admission").kind, "outcome_unknown");
+        assert_eq!(stream.push(event).await.expect_err("latched").kind, "outcome_unknown");
+        assert!(stream.close().await.is_err());
+        assert_eq!(*server.rows.lock().expect("rows"), [99]);
     }
 }

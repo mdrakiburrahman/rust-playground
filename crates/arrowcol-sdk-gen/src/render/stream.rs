@@ -16,35 +16,7 @@ pub(super) fn supported(context: &RenderContext<'_>) -> bool {
 }
 
 pub(super) fn render(context: &RenderContext<'_>, bundle: &ArtifactBundle) -> SdkGenResult<BTreeMap<PathBuf, Vec<u8>>> {
-    let mut files = BTreeMap::new();
-    for (name, source) in [
-        (
-            "runtime/arrowcol-sdk-runtime/Cargo.toml",
-            include_str!("../../../arrowcol-sdk-runtime/Cargo.toml"),
-        ),
-        (
-            "runtime/arrowcol-sdk-runtime/src/lib.rs",
-            include_str!("../../../arrowcol-sdk-runtime/src/lib.rs"),
-        ),
-        (
-            "runtime/arrowcol-sdk-runtime/bindings/cpp/arrowcol_stream.hpp",
-            include_str!("../../../arrowcol-sdk-runtime/bindings/cpp/arrowcol_stream.hpp"),
-        ),
-        (
-            "runtime/arrowcol-sdk-runtime/bindings/dotnet/ArrowcolStream.cs",
-            include_str!("../../../arrowcol-sdk-runtime/bindings/dotnet/ArrowcolStream.cs"),
-        ),
-        (
-            "runtime/arrowcol-sdk-ffi/Cargo.toml",
-            include_str!("../../../arrowcol-sdk-ffi/Cargo.toml"),
-        ),
-        (
-            "runtime/arrowcol-sdk-ffi/src/lib.rs",
-            include_str!("../../../arrowcol-sdk-ffi/src/lib.rs"),
-        ),
-    ] {
-        files.insert(PathBuf::from(name), source.as_bytes().to_vec());
-    }
+    let mut files = super::runtime::render();
     if !supported(context) {
         files.insert(PathBuf::from("STREAMS.md"), b"# Typed streams\n\nThe new protobuf-backed stream adapters currently support flat scalar schemas only.\nThis schema has collections or nested fields. Existing Rust/TypeScript Arrow builders remain available;\nno lossy protobuf-to-Arrow adapter is generated (repeated fields cannot represent nullable collections).\n".to_vec());
         return Ok(files);
@@ -104,7 +76,7 @@ pub(super) fn render(context: &RenderContext<'_>, bundle: &ArtifactBundle) -> Sd
     let rust = format!(
         r#"use arrowcol_sdk_runtime::{{Contract, Error, Result}};
 use super::*;
-pub use arrowcol_sdk_runtime::{{ArrowcolStream, StreamOptions}};
+pub use arrowcol_sdk_runtime::{{GeneratedStream as ArrowcolStream, StreamOptions}};
 pub struct {contract};
 pub type {stream} = ArrowcolStream<{contract}>;
 pub use {contract} as {event}Contract;
@@ -210,7 +182,7 @@ struct {contract} {{
     static void Destroy(void* handle) {{ {prefix}_destroy(handle); }}
     static void FreeError(char* error) {{ {prefix}_free_error(error); }}
 }};
-using {stream} = arrowcol::ArrowcolStream<{contract}>;
+using {stream} = arrowcol::GeneratedStream<{contract}>;
 using {event}Contract = {contract};
 using {event}Stream = {stream};
 }}
@@ -305,6 +277,56 @@ add_library(arrowcol_contract ${{PROTO_SOURCES}})
 target_include_directories(arrowcol_contract PUBLIC "${{CMAKE_CURRENT_BINARY_DIR}}" "${{CMAKE_CURRENT_SOURCE_DIR}}" "${{CMAKE_CURRENT_SOURCE_DIR}}/../runtime/arrowcol-sdk-runtime/bindings/cpp")
 target_link_libraries(arrowcol_contract PUBLIC protobuf::libprotobuf contract_native)
 "#).into_bytes());
-    files.insert("STREAMS.md".into(), format!("# Typed streams\n\n| Piece | Source |\n| --- | --- |\n| Event `{event}` | Standard protobuf compiler (prost, protoc C++ or Grpc.Tools C#); no Arrowcol type prefix |\n| `{contract}` | Arrowcol plugin: validates presence/types and maps to the committed Arrow schema |\n| `{stream}` | Arrowcol-specific convenience helper |\n| Stream engine | Shared `arrowcol-sdk-runtime`, copied verbatim under `runtime/` for an offline source bundle |\n| C++ / C# bridge | Table-specific `native/` adapter to the same Rust engine, not another transport |\n\nUse Rust `{stream}::connect(endpoint, Default::default()).await?`, C# `Arrowcol.Generated.{stream}.ConnectAsync(endpoint)`, or C++ `arrowcol_generated::{stream}::Connect(endpoint)`. The older `{event}Contract` and `{event}Stream` names remain available for source compatibility. Ordinary protobuf message names, descriptors and schema identity are unchanged. Push normal generated protobuf events, then explicitly flush and close. Read the collector endpoint from application configuration (for example `ARROWCOL_ENDPOINT`); prefer a stable DNS service name to a machine IP. The SDK takes the resolved configuration value explicitly, not a registry argument, and does not discover services or read environment variables itself.\n\nBuild `native/Cargo.toml` with `cargo build --release --manifest-path native/Cargo.toml` before C++/C# builds. Do not override its target directory. C# `dotnet build csharp/Contract.csproj` and CMake `cpp/` invoke standard language protobuf generation; do not edit their generated message classes. Use matching native binaries for your OS/architecture. Native adapters are source-distributed, not prebuilt binaries.\n\nThe initial stream surface supports flat scalar schemas. Required fields preserve protobuf presence, integers are range checked, and decimal strings express numeric values (for example `12.34`, not an unscaled integer). Existing direct Arrow builders also support their previous nested types.\n\nPush queues a copied snapshot, with bounded backpressure; it does not wait for a per-record acknowledgement. Flush waits for validated collector admission. Neither flush nor on-node admission proves regional delivery or Delta/Kusto publication. There are no automatic network retries or exactly-once promises. Retain the application's source events for recovery; uncertain failures must be reconciled, not blindly replayed. Explicit Close surfaces errors; destruction/disposal alone does not flush. One logical writer per stream; C# serializes calls and C++ callers must serialize access.\n\nDefaults: 1,024 rows, 1 MiB Arrow batches, 32 MiB retained Arrow buffers, 1-second flush interval and 30-second per-RPC/capacity timeouts. The buffer budget is not total RSS. Oversized single calls fail before enqueueing and must be split. TLS uses native roots for HTTPS; HTTP is for trusted local development. This SDK does not provision authentication or enable public collector exposure.\n").into_bytes());
+    files.insert("STREAMS.md".into(), br#"# Descriptor-driven typed streams
+
+| Package | Contents | Dependency |
+| --- | --- | --- |
+| Neutral contract (`descriptors/`) | Canonical .proto, custom options/imports, descriptors, Arrow schema, manifest | No Arrowcol SDK |
+| Models (`models/rust`, `models/cpp`, `models/csharp`) | Ordinary protobuf event types and an identical embedded contract | Protobuf only; no Arrowcol SDK |
+| Rust SDK (`runtime/arrowcol-sdk-runtime`) | Generic typed streams, loaded contract validation/conversion, Flight transport | Schema-independent |
+| C++ SDK (`runtime/cpp`) / C# SDK (`runtime/csharp`) | Typed bindings to `runtime/arrowcol-sdk-ffi` | One native library for all schemas |
+
+Reference your language SDK and models package separately. Load the models' `contract/`
+directory and connect `ArrowcolStream<Event>` with the configured collector endpoint.
+No event-specific Arrowcol helper class or native library is needed. Native SDK sources
+must be built for your OS/architecture:
+
+```sh
+cargo build --release --manifest-path runtime/arrowcol-sdk-ffi/Cargo.toml
+```
+
+The Nx workflow also publishes each source package and the neutral contract as an
+independently downloadable immutable archive. Package feeds/prebuilt native binaries
+are not configured. C# uses `Models.csproj` and `Arrowcol.Sdk.csproj` project references;
+C++ links the target named in `models/cpp/package.json` and `arrowcol_sdk`; Rust references the models crate and
+`arrowcol-sdk-runtime`. SDK source is identical across schemas. C# and C++ compile models
+with their normal protobuf compilers; Rust models include protobuf reflection metadata.
+
+The typed runtime supports flat scalars, validates the compiled message against the
+loaded contract before connection, and validates values before enqueueing. Required
+presence, integer ranges, decimal precision/scale and temporal units are preserved.
+Decimal strings express numeric values, not unscaled integers. Optional DDL properties
+remain in .proto/descriptors as metadata; the SDK does not enforce backend policies.
+
+Configure the collector with a stable DNS name where appropriate. Samples accept
+`--endpoint` / `ARROWCOL_ENDPOINT` and `--contract` / `ARROWCOL_CONTRACT`; the SDK accepts
+explicit values and does not read environment variables or discover services.
+
+Push means bounded enqueue, not per-event network acknowledgment. Flush/Close confirm
+collector admission, not Delta commit, node-to-regional delivery or Kusto visibility.
+There is no automatic replay or exactly-once promise. Reconcile uncertain outcomes
+before retrying. Disposal alone does not flush. One logical writer per stream.
+
+Defaults: 1,024 rows, 1 MiB batches, 32 MiB retained Arrow buffers, one-second flush
+interval and 30-second deadlines. This is not a total RSS limit. HTTPS uses native
+trusted roots; bearer-token and mTLS configuration are not provided.
+
+## Compatibility
+
+The old generated `rust/`, `typescript/`, `cpp/`, `csharp/` and `native/` trees remain
+for existing consumers. Their event-specific helpers/native adapters are legacy,
+not dependencies of the new models or SDK packages. Existing immutable releases
+are never rewritten. New demo applications use only the independent packages.
+"#.to_vec());
     Ok(files)
 }

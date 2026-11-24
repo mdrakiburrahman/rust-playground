@@ -6,6 +6,7 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
 import { exportCompiler, generateWithProtoc, protocProvenance, validateCompiler } from './protoc.js';
+import { stageDistributions, type Distribution } from './distributions.js';
 
 export const contractRoot = '.temp/contract-builder';
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -44,10 +45,12 @@ export interface ContractRun {
   pid?: number;
   pin?: Pin;
   definitionsDigest?: string;
-  staged?: { sha256: string; bytes: number; candidateSha256?: string };
+  staged?: { sha256: string; bytes: number; candidateSha256?: string; packages?: Distribution[] };
   artifact?: { path: string; hostPath: string; sha256: string; bytes: number };
+  packages?: (Distribution & { path: string; hostPath: string })[];
   error?: string;
   registrationReceipt?: unknown;
+  distributionVersion?: 1;
   steps?: { phase: string; status: 'running' | 'succeeded' | 'failed'; startedAt: string; finishedAt?: string; error?: string }[];
 }
 export function setRunPhase(workspace: string, run: ContractRun, phase: string): void {
@@ -231,6 +234,7 @@ export function enqueue(workspace: string, input: unknown): ContractRun {
   const run: ContractRun = {
     id: randomUUID(), registry, request, status: 'queued', phase: 'queued',
     registration: 'not-attempted', createdAt: new Date().toISOString(), steps: [],
+    distributionVersion: 1,
   };
   ensureDirectory(workspace, relative(workspace, runDirectory(workspace, run.id)));
   saveRun(workspace, run);
@@ -314,6 +318,7 @@ export async function buildContract(
     const provenance = {
       generatorSha256: digest(readFileSync(generatorPath(workspace))),
       workflowSha256: digest(readFileSync(resolve(workspace, 'tools/libs/arrowcol-sdk-gen/src/contract.ts'))),
+      packagingWorkflowSha256: digest(readFileSync(resolve(workspace, 'tools/libs/arrowcol-sdk-gen/src/distributions.ts'))),
       dependencyLockSha256: digest(readFileSync(resolve(workspace, 'package-lock.json'))),
       optionDefinitionsSha256: '',
       ...(run.request.codegen === 'protoc'
@@ -388,6 +393,12 @@ export async function buildContract(
     await execute('cargo', ['test', '--manifest-path', join(sdk, 'rust', 'Cargo.toml')], log, {
       CARGO_TARGET_DIR: resolve(workspace, 'target/arrowcol-sdk-gen-validation-cargo-target'),
     });
+    const typed = existsSync(join(sdk, 'models/manifest.json'));
+    if (typed) {
+      await execute('cargo', ['test', '--manifest-path', join(sdk, 'models/rust/Cargo.toml')], log, {
+        CARGO_TARGET_DIR: resolve(workspace, 'target/arrowcol-sdk-gen-validation-cargo-target'),
+      });
+    }
     // Cargo creates a lockfile in the generated crate. Package only canonical SDK output.
     if (run.request.codegen === 'protoc' && existsSync(join(sdk, 'rust', 'Cargo.lock'))) {
       unlinkSync(join(sdk, 'rust', 'Cargo.lock'));
@@ -401,7 +412,9 @@ export async function buildContract(
       authority: run.registry.authority,
       endpoint: run.registry.endpoint,
       ...pin,
-      client: { transport: 'Arrow Flight', languages: ['rust', 'typescript'], sdk: 'sdk/sdk-manifest.json' },
+      client: { transport: 'Arrow Flight', languages: typed ? ['rust', 'cpp', 'csharp'] : [],
+        sdk: 'sdk/sdk-manifest.json', models: typed ? 'sdk/models/manifest.json' : null,
+        packages: 'packages.json', legacyArrowBuilders: ['rust', 'typescript'] },
       backendPolicy: {
         properties: manifest.schema.metadata.properties,
         note: 'Recorded catalog metadata; this workflow does not add policy enforcement.',
@@ -415,6 +428,7 @@ export async function buildContract(
       throw new Error('Protoc toolchain changed during the build; the candidate has not been promoted');
     }
     phase('packaging');
+    const packages = await stageDistributions(workspace, directory, generatorPath(workspace), execute, log, typed);
     const candidate = join(directory, 'contract-sdk.tar.gz');
     const packaged: { sha256: string; bytes: number } = JSON.parse(await generator([
       'package-artifact', '--input', relativePath(payload), '--out', relativePath(candidate),
@@ -423,6 +437,7 @@ export async function buildContract(
     if (packaged.sha256 !== `sha256:${sha256}`) throw new Error('Packaged digest mismatch');
     run.staged = {
       sha256, bytes: packaged.bytes,
+      ...(packages ? { packages } : {}),
       ...(run.request.mode === 'create'
         ? { candidateSha256: digest(readFileSync(join(directory, 'candidate.pb'))) } : {}),
     };
@@ -456,6 +471,11 @@ async function finalizeContract(workspace: string, run: ContractRun, execute: Ex
   }
   const candidateArchive = join(directory, 'contract-sdk.tar.gz');
   if (digest(readFileSync(candidateArchive)) !== run.staged.sha256) throw new Error('Staged archive digest mismatch');
+  for (const item of run.staged.packages ?? []) {
+    if (!/^(contract|(models|sdk)-(rust|cpp|csharp))$/.test(item.id)) throw new Error('Invalid staged package identity');
+    const bytes = readFileSync(join(directory, 'packages', `${item.id}.tar.gz`));
+    if (digest(bytes) !== item.sha256 || bytes.length !== item.bytes) throw new Error(`Staged package changed: ${item.id}`);
+  }
   if (run.request.mode === 'create') {
     const candidate = join(directory, 'candidate.pb');
     if (digest(readFileSync(candidate)) !== run.staged.candidateSha256) throw new Error('Prepared candidate digest mismatch');
@@ -484,6 +504,13 @@ async function finalizeContract(workspace: string, run: ContractRun, execute: Ex
     path: archive, hostPath: hostPath(config, archive),
     sha256: run.staged.sha256, bytes: run.staged.bytes,
   };
+  if (run.staged.packages) {
+    run.packages = run.staged.packages.map((item) => {
+      const path = join(releaseDirectory, `${item.id}.tar.gz`);
+      publishArchive(join(directory, 'packages', `${item.id}.tar.gz`), resolve(workspace, path));
+      return { ...item, path, hostPath: hostPath(config, path) };
+    });
+  }
   run.status = 'succeeded';
   setRunPhase(workspace, run, 'complete');
 }
@@ -515,8 +542,9 @@ export async function resumePromotion(
   return run;
 }
 
-export function recoverRuns(workspace: string): void {
-  for (const observed of listRuns(workspace)) {
+export function recoverRuns(workspace: string): ContractRun[] {
+  const runs = listRuns(workspace);
+  for (const [index, observed] of runs.entries()) {
     if (observed.status !== 'running') continue;
     if (observed.pid) {
       try {
@@ -528,6 +556,7 @@ export function recoverRuns(workspace: string): void {
     }
     // The worker may have persisted its final result before exiting during the probe.
     const run = readRun(workspace, observed.id);
+    runs[index] = run;
     if (run.status !== 'running' || run.pid !== observed.pid) continue;
     run.status = 'failed';
     run.error = run.staged
@@ -537,4 +566,5 @@ export function recoverRuns(workspace: string): void {
     failRunStep(run);
     saveRun(workspace, run);
   }
+  return runs;
 }

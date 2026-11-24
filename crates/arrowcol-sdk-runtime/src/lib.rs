@@ -12,6 +12,11 @@ use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
+pub mod contract;
+mod fingerprint;
+pub use contract::ArrowcolContract;
+use prost_reflect::{DynamicMessage, MessageDescriptor, ReflectMessage};
+
 /// Failure surfaced by push, flush or close. Unknown outcomes must not be blindly replayed.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{kind}: {message}")]
@@ -147,18 +152,26 @@ enum Command {
 
 /// One table-specific producer. Use one mutable writer; create another stream for another producer.
 /// A successful flush means validated collector admission, never proof of a downstream sink commit.
-pub struct ArrowcolStream<C: Contract> {
+struct Transport {
     sender: Option<mpsc::Sender<Command>>,
     memory: Arc<Semaphore>,
     failure: watch::Receiver<Option<Error>>,
     worker: Option<tokio::task::JoinHandle<()>>,
     options: StreamOptions,
     terminal_error: Option<Error>,
-    _contract: PhantomData<C>,
 }
 
-impl<C: Contract> ArrowcolStream<C> {
-    pub async fn connect(endpoint: &str, options: StreamOptions) -> Result<Self> {
+#[derive(Clone)]
+struct Routing {
+    schema: SchemaRef,
+    descriptor: Vec<String>,
+    metadata: Vec<(String, String)>,
+    fingerprint: String,
+    version: u64,
+}
+
+impl Transport {
+    async fn connect(endpoint: &str, routing: Routing, options: StreamOptions) -> Result<Self> {
         options.validate()?;
         let timeout = Duration::from_millis(options.timeout_ms);
         let mut endpoint_config = Endpoint::from_shared(endpoint.to_owned())
@@ -181,7 +194,7 @@ impl<C: Contract> ArrowcolStream<C> {
         let worker_options = options.clone();
         let worker = tokio::spawn(async move {
             let mut receiver = receiver;
-            if let Err(error) = worker::<C>(channel, &mut receiver, worker_options).await {
+            if let Err(error) = worker(channel, &mut receiver, worker_options, routing).await {
                 failure_tx.send_replace(Some(error));
             }
             worker_memory.close();
@@ -193,7 +206,6 @@ impl<C: Contract> ArrowcolStream<C> {
             worker: Some(worker),
             options,
             terminal_error: None,
-            _contract: PhantomData,
         })
     }
 
@@ -213,25 +225,15 @@ impl<C: Contract> ArrowcolStream<C> {
         Ok(())
     }
 
-    pub async fn push(&mut self, event: C::Event) -> Result<()> {
-        self.push_batch(std::slice::from_ref(&event)).await
-    }
-
     /// Validates the entire input before enqueueing. Oversized calls must be split by the caller.
     /// The byte budget bounds retained Arrow buffers, not total process RSS or transient encoding.
-    pub async fn push_batch(&mut self, events: &[C::Event]) -> Result<()> {
+    async fn push_batch(&mut self, data: RecordBatch) -> Result<()> {
         self.check()?;
-        if events.is_empty() {
+        if data.num_rows() == 0 {
             return Ok(());
         }
-        if events.len() > self.options.batch_rows {
+        if data.num_rows() > self.options.batch_rows {
             return Err(Error::invalid("push_batch exceeds batch_rows; split the input batch"));
-        }
-        let data = C::record_batch(events)?;
-        if data.schema() != C::schema() || data.num_rows() != events.len() {
-            return Err(Error::invalid(
-                "generated contract returned a different schema or row count",
-            ));
         }
         let bytes = data.get_array_memory_size().max(1);
         if bytes > self.options.batch_bytes {
@@ -309,7 +311,7 @@ impl<C: Contract> ArrowcolStream<C> {
     }
 }
 
-impl<C: Contract> Drop for ArrowcolStream<C> {
+impl Drop for Transport {
     fn drop(&mut self) {
         if let Some(worker) = &self.worker {
             worker.abort();
@@ -318,10 +320,11 @@ impl<C: Contract> Drop for ArrowcolStream<C> {
     }
 }
 
-async fn worker<C: Contract>(
+async fn worker(
     channel: Channel,
     receiver: &mut mpsc::Receiver<Command>,
     options: StreamOptions,
+    routing: Routing,
 ) -> Result<()> {
     let mut client = FlightServiceClient::new(channel).max_encoding_message_size(32 * 1024 * 1024);
     let mut pending = Vec::<Batch>::new();
@@ -337,7 +340,7 @@ async fn worker<C: Contract>(
                 Some(Command::Push(batch)) => {
                     if !pending.is_empty() && (rows + batch.data.num_rows() > options.batch_rows ||
                         bytes + batch.data.get_array_memory_size() > options.batch_bytes) {
-                        send::<C>(&mut client, &pending, options.timeout_ms).await?;
+                        send(&mut client, &pending, options.timeout_ms, &routing).await?;
                         pending.clear(); rows = 0; bytes = 0;
                     }
                     rows += batch.data.num_rows();
@@ -353,7 +356,7 @@ async fn worker<C: Contract>(
         let result = if pending.is_empty() {
             Ok(())
         } else {
-            send::<C>(&mut client, &pending, options.timeout_ms).await
+            send(&mut client, &pending, options.timeout_ms, &routing).await
         };
         if let Some(reply) = barrier {
             let _ = reply.send(result.clone());
@@ -365,24 +368,25 @@ async fn worker<C: Contract>(
     }
 }
 
-async fn send<C: Contract>(
+async fn send(
     client: &mut FlightServiceClient<Channel>,
     batches: &[Batch],
     timeout_ms: u64,
+    routing: &Routing,
 ) -> Result<()> {
-    let batch = arrow_select::concat::concat_batches(&C::schema(), batches.iter().map(|batch| &batch.data))
+    let batch = arrow_select::concat::concat_batches(&routing.schema, batches.iter().map(|batch| &batch.data))
         .map_err(Error::invalid)?;
     let expected_rows = batch.num_rows();
     let encoded = FlightDataEncoderBuilder::new()
-        .with_schema(C::schema())
-        .with_flight_descriptor(Some(FlightDescriptor::new_path(C::descriptor())))
+        .with_schema(Arc::clone(&routing.schema))
+        .with_flight_descriptor(Some(FlightDescriptor::new_path(routing.descriptor.clone())))
         .build(futures::stream::iter([Ok(batch)]))
         .try_collect::<Vec<_>>()
         .await
         .map_err(Error::invalid)?;
     let mut request = Request::new(futures::stream::iter(encoded));
     request.set_timeout(Duration::from_millis(timeout_ms));
-    for (key, value) in C::metadata() {
+    for (key, value) in &routing.metadata {
         request.metadata_mut().insert(
             key.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
                 .map_err(Error::invalid)?,
@@ -409,17 +413,18 @@ async fn send<C: Contract>(
                 _ => return Err(Error::unknown("missing recognized admission completion")),
             };
             if value["delivery_guarantee"] != guarantee
-                || value["source_schema_version"] != C::version()
+                || value["source_schema_version"] != routing.version
                 || value["target_schema_version"]
                     .as_u64()
-                    .is_none_or(|version| version < C::version())
-                || value["schema_fingerprint"] != C::fingerprint()
+                    .is_none_or(|version| version < routing.version)
+                || value["schema_fingerprint"] != routing.fingerprint
                 || value["summary"]["rows"].as_u64() != Some(expected_rows as u64)
             {
                 return Err(Error::unknown(
                     "admission completion does not match the submitted contract/rows",
                 ));
             }
+
             completed = true;
         }
         if !completed {
@@ -429,4 +434,121 @@ async fn send<C: Contract>(
     })
     .await
     .map_err(|_| Error::unknown("Flight deadline elapsed; data may have been admitted"))?
+}
+
+/// Compatibility adapter for plugin-generated contract implementations.
+pub struct GeneratedStream<C: Contract> {
+    transport: Transport,
+    _contract: PhantomData<C>,
+}
+
+impl<C: Contract> GeneratedStream<C> {
+    pub async fn connect(endpoint: &str, options: StreamOptions) -> Result<Self> {
+        let routing = Routing {
+            schema: C::schema(),
+            descriptor: C::descriptor(),
+            metadata: C::metadata()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+            fingerprint: C::fingerprint().to_owned(),
+            version: C::version(),
+        };
+        Ok(Self {
+            transport: Transport::connect(endpoint, routing, options).await?,
+            _contract: PhantomData,
+        })
+    }
+    pub async fn push(&mut self, event: C::Event) -> Result<()> {
+        self.push_batch(std::slice::from_ref(&event)).await
+    }
+    pub async fn push_batch(&mut self, events: &[C::Event]) -> Result<()> {
+        self.transport.check()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() > self.transport.options.batch_rows {
+            return Err(Error::invalid("batch exceeds batch_rows"));
+        }
+        let data = C::record_batch(events)?;
+        if data.schema() != C::schema() || data.num_rows() != events.len() {
+            return Err(Error::invalid(
+                "generated contract returned a different schema or row count",
+            ));
+        }
+        self.transport.push_batch(data).await
+    }
+    pub async fn flush(&mut self) -> Result<()> {
+        self.transport.flush().await
+    }
+    pub async fn close(&mut self) -> Result<()> {
+        self.transport.close().await
+    }
+}
+
+/// A producer bound to one immutable runtime contract and an ordinary protobuf model.
+pub struct ArrowcolStream<T> {
+    transport: Transport,
+    contract: ArrowcolContract,
+    _event: PhantomData<T>,
+}
+
+impl<T: ReflectMessage + Default> ArrowcolStream<T> {
+    pub async fn connect(endpoint: &str, contract: ArrowcolContract, options: StreamOptions) -> Result<Self> {
+        contract.validate_model(&T::default().descriptor())?;
+        Self::connect_validated(endpoint, contract, options).await
+    }
+}
+
+impl<T: ReflectMessage> ArrowcolStream<T> {
+    pub async fn push(&mut self, event: T) -> Result<()> {
+        self.push_batch(std::slice::from_ref(&event)).await
+    }
+    pub async fn push_batch(&mut self, events: &[T]) -> Result<()> {
+        self.transport.check()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() > self.transport.options.batch_rows {
+            return Err(Error::invalid("batch exceeds batch_rows"));
+        }
+        let messages = events
+            .iter()
+            .map(|event| {
+                self.contract.validate_model(&event.descriptor())?;
+                self.contract.decode(&event.encode_to_vec())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.transport.push_batch(self.contract.record_batch(&messages)?).await
+    }
+}
+
+impl ArrowcolStream<DynamicMessage> {
+    /// Foreign-language entry point: checks the compiled model before connecting.
+    pub async fn connect_dynamic(
+        endpoint: &str,
+        contract: ArrowcolContract,
+        model: &MessageDescriptor,
+        options: StreamOptions,
+    ) -> Result<Self> {
+        contract.validate_model(model)?;
+        Self::connect_validated(endpoint, contract, options).await
+    }
+}
+
+impl<T> ArrowcolStream<T> {
+    async fn connect_validated(endpoint: &str, contract: ArrowcolContract, options: StreamOptions) -> Result<Self> {
+        let transport = Transport::connect(endpoint, contract.routing(), options).await?;
+        Ok(Self {
+            transport,
+            contract,
+            _event: PhantomData,
+        })
+    }
+    pub async fn flush(&mut self) -> Result<()> {
+        self.transport.flush().await
+    }
+    pub async fn close(&mut self) -> Result<()> {
+        self.transport.close().await
+    }
 }

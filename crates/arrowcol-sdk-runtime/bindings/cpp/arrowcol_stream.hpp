@@ -25,20 +25,25 @@ struct StreamOptions {
 };
 
 // Contract is generated from the schema. This transport/lifecycle implementation is shared.
-template<class Contract> class ArrowcolStream {
+template<class Contract> class GeneratedStream {
 public:
     using Event = typename Contract::Event;
-    static ArrowcolStream Connect(const std::string& endpoint, StreamOptions options = {}) {
+    static GeneratedStream Connect(const std::string& endpoint, StreamOptions options = {}) {
         if (endpoint.find('\0') != std::string::npos) throw std::invalid_argument("Endpoint contains NUL");
-        ArrowcolStream stream(options.batch_rows);
+        GeneratedStream stream(options.batch_rows);
         Check(Contract::Open(endpoint.c_str(), options.Json().c_str(), &stream.handle_));
         return stream;
     }
-    ArrowcolStream(const ArrowcolStream&) = delete;
-    ArrowcolStream& operator=(const ArrowcolStream&) = delete;
-    ArrowcolStream(ArrowcolStream&& other) noexcept
+    static GeneratedStream FromHandle(void* handle, std::size_t max_rows) {
+        GeneratedStream stream(max_rows);
+        stream.handle_ = handle;
+        return stream;
+    }
+    GeneratedStream(const GeneratedStream&) = delete;
+    GeneratedStream& operator=(const GeneratedStream&) = delete;
+    GeneratedStream(GeneratedStream&& other) noexcept
         : handle_(std::exchange(other.handle_, nullptr)), max_rows_(other.max_rows_) {}
-    ArrowcolStream& operator=(ArrowcolStream&& other) noexcept {
+    GeneratedStream& operator=(GeneratedStream&& other) noexcept {
         if (this != &other) {
             Contract::Destroy(handle_);
             handle_ = std::exchange(other.handle_, nullptr);
@@ -47,7 +52,7 @@ public:
         return *this;
     }
     // Destruction frees resources only; explicit Close surfaces delivery errors.
-    ~ArrowcolStream() { Contract::Destroy(handle_); }
+    ~GeneratedStream() { Contract::Destroy(handle_); }
     void Push(const Event& event) {
         std::string bytes;
         if (!event.SerializeToString(&bytes)) throw std::invalid_argument("Invalid protobuf event");
@@ -71,7 +76,7 @@ public:
     void Flush() { Check(Contract::Flush(handle_)); }
     void Close() { Check(Contract::Close(handle_)); }
 private:
-    explicit ArrowcolStream(std::size_t max_rows) : max_rows_(max_rows) {}
+    explicit GeneratedStream(std::size_t max_rows) : max_rows_(max_rows) {}
     static void Check(char* error) {
         if (!error) return;
         std::unique_ptr<char, decltype(&Contract::FreeError)> owned(error, &Contract::FreeError);

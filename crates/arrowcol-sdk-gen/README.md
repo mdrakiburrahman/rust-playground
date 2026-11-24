@@ -5,13 +5,14 @@
 | Hydrate ordered Spark SQL `.sql` files through Flight SQL | Read only catalog-committed immutable schemas |
 | Generate Rust/TypeScript SDKs | Exact Arrow builders and Dataflow Flight helpers; Rust prost contract types |
 | Validate evolution | Nullable-tail Arrow policy plus real Buf `WIRE_JSON` through Nx |
-| Build a new contract before registration | Prepare exact candidate, verify both SDKs, stage, promote, publish |
-| Typed protobuf streams for flat scalar contracts | Rust, C++ and C# adapters backed by one shared Rust stream runtime |
+| Build a new contract before registration | Prepare exact candidate, verify generated output, stage all packages, promote, publish |
+| Typed protobuf streams for flat scalar contracts | Independent Rust/C++/C# models and reusable language SDK packages; descriptor-driven shared runtime |
+| Neutral contract distribution | Standalone .proto/options/descriptors/Arrow manifest bundle, with no SDK dependency |
 
 | Guide | Contents |
 | --- | --- |
 | [Localhost demo](../../docs/architecture/arrowcol-platform/localhost-demo.md) | UI, SDK build, editable five-minute emitters, optional node, regional Delta and local Kusto; Linux and Windows CMD commands |
-| [SDK developer guide](../../docs/architecture/arrowcol-platform/sdk-developer-guide.md) | Two compiler stages, minimal Rust/C++/C# APIs, options and delivery guarantees |
+| [SDK developer guide](../../docs/architecture/arrowcol-platform/sdk-developer-guide.md) | Separate SDK/model dependencies, generic Rust/C++/C# APIs, configuration and delivery guarantees |
 
 ## Catalogue Explorer and contract builds
 
@@ -40,7 +41,8 @@ registry state/warehouses and immutable releases live under
 `.temp/contract-builder`. **Do not clean this directory if you need its tables,
 run history or artifacts.** Copy releases elsewhere before repository cleanup.
 Click a workflow run for its live top-down pipeline, step timings, DDL/proto
-inspection and logs. The UI offers downloads and copyable host paths. Set `CONTRACT_HOST_WORKSPACE`
+inspection and logs. The UI offers independent neutral/model/SDK source downloads,
+digests and copyable host paths; no public package feed is configured. Set `CONTRACT_HOST_WORKSPACE`
 to the host checkout path on first startup when running inside a container.
 Browser checks require Playwright Chromium and its system libraries
 (`npx --no-install playwright install --with-deps chromium --only-shell`).

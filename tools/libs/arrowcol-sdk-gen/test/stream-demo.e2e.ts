@@ -63,7 +63,10 @@ try {
   for (const language of ['rust', 'cpp', 'csharp']) {
     for (const node of [false, true]) {
       const output = node
-        ? await emitter(language, ['--duration-seconds', '2'], { ARROWCOL_ENDPOINT: endpoints.node.replace('127.0.0.1', 'localhost') })
+        ? await emitter(language, ['--duration-seconds', '2'], {
+          ARROWCOL_ENDPOINT: endpoints.node.replace('127.0.0.1', 'localhost'),
+          ARROWCOL_CONTRACT: join(root, 'sdk/models', language, 'contract'),
+        })
         : await call('emit', [`--language=${language}`, '--duration-seconds=2'], { ARROWCOL_ENDPOINT: 'invalid-must-be-overridden' });
       const result = output.trim().split('\n').map((line) => line.trim()).reverse().find((line) => line.startsWith('{"language":'));
       assert.ok(result, `Missing emitter summary: ${output}`);
@@ -98,7 +101,8 @@ try {
   assert.deepEqual(sorted(kustoRows), sorted(expected), 'Kusto must expose exactly the committed values and microseconds');
   report = { result: 'passed', run: id, artifactSha256: baseline.artifactSha256,
     sends: reports, exactRows: expected.length, deltaFiles: committed.files,
-    topology: 'Rust/C++/C# standard protobuf -> shared SDK -> direct regional OR node -> regional -> Delta -> Kusto native external table' };
+    packages: baseline.packages,
+    topology: 'Rust/C++/C# independent protobuf models + runtime-loaded contract -> reusable language SDK -> direct regional OR node -> regional -> Delta -> Kusto native external table' };
 } finally {
   const errors: string[] = [];
   if (collector?.pid && collector.exitCode === null && collector.signalCode === null) {

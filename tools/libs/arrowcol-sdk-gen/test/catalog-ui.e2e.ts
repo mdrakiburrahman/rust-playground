@@ -11,9 +11,12 @@ const fabric = process.env.CONTRACT_UI_FRONTEND === 'fabric';
 const lakehouse = process.env.CONTRACT_UI_FRONTEND === 'lakehouse';
 const protoc = fabric || lakehouse;
 const frontendURL = `${baseURL}${lakehouse ? '/lakehouse' : fabric ? '/fabric' : '/'}`;
-const table = `verified_${Date.now()}`;
-const qualified = `telemetry.prod.${table}`;
-const evidence = resolve('.temp/contract-builder/evidence', table);
+const table = process.env.CONTRACT_UI_TABLE ?? `verified_${Date.now()}`;
+const catalog = process.env.CONTRACT_UI_CATALOG ?? 'telemetry';
+assert.match(table, /^[A-Za-z_][A-Za-z0-9_]*$/);
+assert.match(catalog, /^[A-Za-z_][A-Za-z0-9_]*$/);
+const qualified = `${catalog}.prod.${table}`;
+const evidence = resolve('.temp/contract-builder/evidence', `${catalog}_${table}`);
 mkdirSync(evidence, { recursive: true });
 const browser = await chromium.launch({ args: ['--no-sandbox'] });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -58,6 +61,7 @@ async function submitForm(page: Page, registry: string): Promise<ContractRun> {
   await page.getByLabel('Registry', { exact: true }).selectOption(registry);
   await page.locator('#catalog-tab').click();
   await page.locator('#add-table').click();
+  await page.getByLabel('Catalogue', { exact: true }).fill(catalog);
   await page.getByLabel('Table', { exact: true }).fill(table);
   const enumControl = page.locator('.property-editor').filter({
     has: page.locator(`[data-key][value=${JSON.stringify(option.key)}]`),
@@ -148,11 +152,11 @@ try {
     await page.locator('#contract-view').click();
     assert.ok((await page.locator('#lakehouse-contract').innerText()).includes(local.pin!.fingerprint));
     await page.locator('#schema-view').click();
-    const schemaBranch = page.locator('[data-branch="schema:telemetry.prod"] > summary');
+    const schemaBranch = page.locator(`[data-branch="schema:${catalog}.prod"] > summary`);
     await schemaBranch.click();
     assert.equal(await page.locator(`[data-table="${qualified}"]`).isVisible(), false);
     await schemaBranch.click();
-    await page.locator('#filter').fill(table);
+    await page.locator('#filter').fill(qualified);
     assert.equal(await page.locator('[data-table]').count(), 1);
     await page.locator('#filter').fill('');
     await page.locator('#toggle-explorer').click();
@@ -197,10 +201,30 @@ try {
   assert.notEqual(hosted.registry.authority, local.registry.authority);
   assert.notEqual(hosted.artifact?.path, local.artifact?.path);
   assert.equal(hosted.pin?.fingerprint, local.pin?.fingerprint, 'same physical schema independent of authority/policy location');
+  assert.equal(hosted.packages?.length, 7, 'neutral contract plus three independent models/SDK pairs');
+  for (const language of ['rust', 'cpp', 'csharp']) {
+    assert.equal(local.packages?.find((item) => item.id === `sdk-${language}`)?.sha256,
+      hosted.packages?.find((item) => item.id === `sdk-${language}`)?.sha256,
+      `${language} SDK source is independent of contract identity and policy`);
+  }
 
   await page.reload();
   await page.getByRole('button', { name: /^Workflow runs/ }).click();
   const runCard = page.locator(`[data-run="${hosted.id}"]`);
+  await runCard.locator('.package-downloads summary').click();
+  await runCard.getByRole('link', { name: 'Download language-neutral contract', exact: true }).waitFor();
+  for (const item of hosted.packages!) {
+    const response = await page.request.get(`${baseURL}/api/runs/${hosted.id}/artifact?package=${item.id}`);
+    assert.equal(response.status(), 200);
+    const bytes = await response.body();
+    assert.equal(digest(bytes), item.sha256);
+    const path = resolve(evidence, `${item.id}.tar.gz`);
+    writeFileSync(path, bytes);
+    const paths = execFileSync('tar', ['-tzf', path], { encoding: 'utf8' }).trim().split('\n');
+    assert.ok(paths.every((path) => path.startsWith(item.kind === 'sdk' ? 'runtime/' : item.kind === 'models' ? 'models/' : 'contract/')));
+    assert.equal(await runCard.getByLabel(`${item.id} package path`, { exact: true }).inputValue(), item.hostPath);
+  }
+  assert.equal((await page.request.get(`${baseURL}/api/runs/${hosted.id}/artifact?package=unknown`)).status(), 404);
   await runCard.getByRole('link', { name: 'Download SDK + contract' }).waitFor();
   const downloadEvent = page.waitForEvent('download');
   await runCard.getByRole('link', { name: 'Download SDK + contract' }).click();
@@ -231,7 +255,7 @@ try {
   await page.locator(`[data-table="${qualified}"]`).click();
   await page.screenshot({ path: resolve(evidence, 'catalogue.png'), fullPage: true });
   const { token } = await (await page.request.get(`${baseURL}/api/config`)).json();
-  const rejectedTable = `telemetry.prod.${table}_rejected`;
+  const rejectedTable = `${catalog}.prod.${table}_rejected`;
   const rejectedResponse = await page.request.post(`${baseURL}/api/runs`, {
     headers: { 'X-Contract-Token': token },
     data: {
