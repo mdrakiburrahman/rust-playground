@@ -36,7 +36,7 @@ explicit CLI values win. Run `arrowcol-dmv --help` for the complete reference.
 | `--grpc-send-compression`, `--grpc-accept-compression` | `none`, `gzip`, `zstd`; sending compressed gRPC requires receiver support. This codec runs per send, separately from precomputed IPC. |
 | Transport flags | Message/frame/header limits, HTTP/2 windows/adaptation, keepalive, TCP settings, endpoint concurrency/buffering, per-connection rate limit and timeouts are exposed in `--help`. |
 | `--connect-retries`, `--retry-backoff-ms` | Only retry connection establishment. Ambiguous `DoPut` uploads are never automatically retried; doing so could duplicate admitted rows. |
-| `--duration-secs`, `--warmup-secs` | Zero duration uploads the corpus once. A positive duration requires a shared future `--run-start-unix-ms` or OAT-armed `--schedule-file`; pilot mode preserves 30-second windows. |
+| `--duration-secs`, `--warmup-secs` | Zero duration uploads the corpus once; otherwise at most 1,800 and 300 seconds. A positive duration requires a shared future `--run-start-unix-ms` or OAT-armed `--schedule-file`; pilot mode preserves 30-second windows from 60 to 600 seconds. |
 
 `OAT_CLIENT_RESOLUTION` records requested sentinel values, legacy row/concurrency
 inputs, resolved values and the actual single CPU-availability observation before

@@ -30,7 +30,7 @@ in the cell evidence; configuring a larger budget is not proof of a clean drain.
 
 ## Local launcher deadline and recovery
 
-`--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:
+`--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. Omit it for local `measure_seconds` windows that cannot finish within 600 seconds. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:
 
 ```sh
 npx --no-install tsx projects/arrowcol-oat/launch.ts --mode local --config out/arrowcol-oat/oat-config.local.json --no-viewer --deadline-seconds 600

@@ -758,6 +758,9 @@ fn default_schedule_lead_seconds() -> u64 {
 
 // Matches the pinned arrowcol-dmv --schedule-timeout-secs consumer ceiling.
 const MAX_CLIENT_SCHEDULE_WAIT_SECONDS: u64 = 2_160;
+const MAX_MEASURE_SECONDS: u64 = 600;
+// Matches the arrowcol-dmv --duration-secs ceiling; run_pin_ttl_ms must still cover the whole run.
+const MAX_LOCAL_MEASURE_SECONDS: u64 = 1_800;
 pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 pub(crate) const CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS: u64 = 180;
@@ -1530,8 +1533,21 @@ impl OatConfig {
                 bail!("AKS maintenance_image must be a nonempty image reference pinned by a 64-digit sha256 digest");
             }
         }
-        if self.warmup_seconds > 300 || !(1..=600).contains(&self.measure_seconds) {
-            bail!("warmup_seconds must be at most 300 and measure_seconds must be between 1 and 600");
+        if self.warmup_seconds > 300 {
+            bail!("warmup_seconds must be at most 300");
+        }
+        let (max_measure_seconds, measure_scope) = if self.pilot_mode {
+            (MAX_MEASURE_SECONDS, "pilot")
+        } else if self.platform.kind == OatMode::Local {
+            (MAX_LOCAL_MEASURE_SECONDS, "local non-pilot")
+        } else {
+            (MAX_MEASURE_SECONDS, "AKS")
+        };
+        if !(1..=max_measure_seconds).contains(&self.measure_seconds) {
+            bail!(
+                "measure_seconds must be between 1 and {max_measure_seconds} for {measure_scope} runs, got {}",
+                self.measure_seconds
+            );
         }
         if !(30..=1_800).contains(&self.client_ready_timeout_seconds) {
             bail!("client_ready_timeout_seconds must be between 30 and 1800");
@@ -3546,8 +3562,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn local_mode_rejects_a_nonisolated_qap_database() -> Result<()> {
+    fn valid_local() -> TestConfig {
         let mut config = valid();
         config.platform = PlatformConfig {
             kind: OatMode::Local,
@@ -3566,6 +3581,14 @@ mod tests {
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
+        config.qap_database = Some("loadtest".to_owned());
+        config
+    }
+
+    #[test]
+    fn local_mode_rejects_a_nonisolated_qap_database() -> Result<()> {
+        let mut config = valid_local();
+        config.qap_database = Some("experimentqap".to_owned());
         let error = config
             .validate()
             .err()
@@ -3585,10 +3608,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_measurements_over_ten_minutes() {
-        let mut config = valid();
-        config.measure_seconds = 601;
-        assert!(config.validate().is_err());
+    fn only_local_non_pilot_runs_extend_the_measurement_window() -> Result<()> {
+        let mut aks = valid();
+        aks.measure_seconds = 600;
+        aks.validate()?;
+        aks.measure_seconds = 601;
+        assert!(validation_error(&aks)?.contains("between 1 and 600 for AKS runs, got 601"));
+
+        let mut local = valid_local();
+        for seconds in [601, 1_200, 1_800] {
+            local.measure_seconds = seconds;
+            local.run_pin_ttl_ms = local.timing_budget()?.minimum_pin_ttl_ms.max(3_600_000);
+            local.validate()?;
+        }
+        local.measure_seconds = 1_801;
+        assert!(validation_error(&local)?.contains("between 1 and 1800 for local non-pilot runs, got 1801"));
+        local.measure_seconds = 0;
+        assert!(validation_error(&local)?.contains("between 1 and 1800"));
+
+        local.pilot_mode = true;
+        local.warmup_seconds = 0;
+        local.measure_seconds = 630;
+        assert!(validation_error(&local)?.contains("between 1 and 600 for pilot runs, got 630"));
+        Ok(())
+    }
+
+    #[test]
+    fn long_local_window_requires_a_pin_ttl_covering_the_run_budget() -> Result<()> {
+        let mut local = valid_local();
+        local.measure_seconds = 1_200;
+        assert_eq!(local.run_pin_ttl_ms, 3_600_000);
+        local.validate()?;
+
+        local.measure_seconds = 1_800;
+        local.run_pin_ttl_ms = local.timing_budget()?.minimum_pin_ttl_ms;
+        local.validate()?;
+        local.run_pin_ttl_ms -= 1;
+        assert!(validation_error(&local)?.contains("run_pin_ttl_ms must cover"));
+        Ok(())
     }
 
     #[test]
