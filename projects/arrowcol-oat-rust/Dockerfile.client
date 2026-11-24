@@ -3,6 +3,7 @@
 ARG VCS_REF=local
 ARG OAT_CLIENT_BUILD_PROFILE_HASH=none
 FROM rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+ARG VCS_REF
 ARG OAT_CLIENT_BUILD_LTO=off
 ARG OAT_CLIENT_BUILD_CODEGEN_UNITS=16
 ARG OAT_CLIENT_BUILD_OPT_LEVEL=3
@@ -19,7 +20,7 @@ COPY docs/experiments/arrowcol-oat/oat-config.quick.json /workspace/docs/experim
 COPY submodules/otel-arrow /workspace/submodules/otel-arrow
 RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rust-playground-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=rust-playground-target-oat-client-${OAT_CLIENT_BUILD_LTO}-${OAT_CLIENT_BUILD_CODEGEN_UNITS}-${OAT_CLIENT_BUILD_OPT_LEVEL}-${OAT_CLIENT_BUILD_TARGET_CPU},target=/workspace/target,sharing=locked \
+    --mount=type=cache,id=rust-playground-target-oat-client-${OAT_CLIENT_BUILD_LTO}-${OAT_CLIENT_BUILD_CODEGEN_UNITS}-${OAT_CLIENT_BUILD_OPT_LEVEL}-${OAT_CLIENT_BUILD_TARGET_CPU}-${VCS_REF},target=/workspace/target,sharing=locked \
     set -eu; \
     case "${OAT_CLIENT_BUILD_LTO}" in off|thin-local|thin|fat) ;; *) echo 'invalid OAT_CLIENT_BUILD_LTO' >&2; exit 2 ;; esac; \
     case "${OAT_CLIENT_BUILD_CODEGEN_UNITS}" in ''|*[!0-9]*) echo 'invalid OAT_CLIENT_BUILD_CODEGEN_UNITS' >&2; exit 2 ;; esac; \
