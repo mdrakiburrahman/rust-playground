@@ -334,6 +334,8 @@ while ((pos = text.indexOf(key, pos)) !== -1) {
     assert.equal(DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION, 1);
     assert.equal(DIAGNOSTIC_REALISTIC_DEFAULT_WRITER_VERSION, 1);
     assert.equal(result.kind, "diagnostic-only");
+    assert.equal(result.parquetFooter.filesMissingDeclaration, 2);
+    assert.equal(result.parquetFooter.filesWithDeclaration, 0);
     assert.deepEqual(result.inert_fields, evidence.inert_fields);
     assert.deepEqual(result.projection_only, evidence.projection_only);
     assert.deepEqual(result.runner_controls, evidence.runner_controls);

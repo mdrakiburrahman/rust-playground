@@ -318,7 +318,9 @@ impl ParquetWriterConfig {
         verified_sort: &[SortColumn],
     ) -> Result<WriterProperties> {
         self.validate()?;
-        let descriptor = ArrowSchemaConverter::new().convert(schema)?;
+        let descriptor = ArrowSchemaConverter::new()
+            .with_coerce_types(base.as_ref().is_some_and(WriterProperties::coerce_types))
+            .convert(schema)?;
         let leaves = descriptor.columns();
         let leaf_index = |path: &str| -> Result<usize> {
             let mut matching = leaves
@@ -458,7 +460,7 @@ impl ParquetWriterConfig {
             "offset_index_enabled=false requires statistics=none or chunk for every column; page statistics force offset indexes"
         );
         self.verify_effective(&descriptor, &properties)?;
-        Ok(properties)
+        crate::footer::stamp(&descriptor, properties)
     }
 
     fn verify_effective(

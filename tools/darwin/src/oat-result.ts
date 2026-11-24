@@ -3,7 +3,7 @@ import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
-import { parseCompressionSpec, type CompressionSpec } from "./compression-policy.js";
+import { parseCompressionSpec, resolvedWriterLevel, type CompressionSpec } from "./compression-policy.js";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
 import { verifyReconciledDelivery, type IdentityTools } from "./identity-reconcile.js";
 import { adaptOatEvidence, CoverageUnavailableError, extractTimedReceipts, type OatMeasurement } from "./metrics-adapter.js";
@@ -476,6 +476,7 @@ export async function readReconciledOatResult(
 ): Promise<{
   measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; clientEvidences: ClientEvidence[];
   clientEffectiveConfigs: JsonObject[]; activeRows: number; snapshotVersion: number;
+  parquetFooter: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["parquetFooter"];
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   parityTelemetry: JsonObject | null;
@@ -641,6 +642,7 @@ export async function readReconciledOatResult(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
     compression === null ? Compression.UNCOMPRESSED : wasmCompression(compression), preload,
     parity?.decodeFile ?? diagnostic?.decodeFile, verifyActive, diagnostic !== undefined,
+    compression === null ? undefined : resolvedWriterLevel(compression),
   );
   if (identity && (!identityResult.value || identityResult.value.activeFileRows !== proof.activeRows)) {
     throw new Error("identity verdict does not match reconciled active rows");
@@ -653,7 +655,7 @@ export async function readReconciledOatResult(
     clientImageSourceRevision: typeof client.source_revision === "string" ? client.source_revision : null,
     clientImageSourceRevisionUnavailableReason: typeof client.source_revision === "string" ? null : "client image has no source revision label",
     clientEffectiveConfigs: clients.reports.map(report => report.config), activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
-    activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
+    parquetFooter: proof.parquetFooter, activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
     inert_fields: inertFields, projection_only: projectionOnly, runner_controls: runnerControls, consumer_verified: consumerVerified,
     ...(diagnostic ? { kind: "diagnostic-only" as const } : {}), diagnosticOnlyRealistic: diagnostic !== undefined,
     diagnosticRealisticReconciliationVersion: diagnostic ? DIAGNOSTIC_REALISTIC_RECONCILIATION_VERSION : null,

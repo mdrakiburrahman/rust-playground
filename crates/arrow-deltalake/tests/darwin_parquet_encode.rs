@@ -120,6 +120,8 @@ async fn darwin_parquet_encode() -> Result<()> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?;
     ensure!(builder.schema().as_ref() == schema.as_ref(), "decoded schema mismatch");
     let metadata = builder.metadata();
+    let mut footer = arrow_deltalake::footer::FooterEvidence::default();
+    footer.observe(metadata)?;
     let row_groups = metadata.num_row_groups();
     let row_group_rows: Vec<_> = metadata.row_groups().iter().map(|group| group.num_rows()).collect();
     let codecs: Vec<Vec<&str>> = metadata
@@ -176,6 +178,7 @@ async fn darwin_parquet_encode() -> Result<()> {
             "base_max_row_group_rows": ROW_GROUP_ROWS,
             "requested_process_config": requested_config,
             "footer_codecs_by_row_group": codecs,
+            "parquet_footer": footer,
             "footer_dictionary_pages_by_row_group": dictionary_pages,
             "arrow_deltalake_input_bytes": completed.input_bytes,
             "parquet_bytes": completed.bytes,
