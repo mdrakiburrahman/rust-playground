@@ -5111,7 +5111,10 @@ async fn run_matrix_cell(
             if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() {
                 client_run
                     .evidence
-                    .downstream_unavailable("local_qap_observation_unavailable");
+                    .downstream_unavailable(
+                        "local_qap_observation_unavailable",
+                        format!("Local QAP observation unavailable: {error:#}. Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged."),
+                    );
             } else {
                 client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
             }
@@ -5202,7 +5205,9 @@ fn result_rows(
                     "requested_concurrency_per_worker": config.dmv_concurrency,
                     "limit_cpu": requested.client.limits.cpu,
                     "limit_millicores": client_limit_millicores,
-                    "concurrency_per_cpu_core": config.dmv_concurrency.map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
+                    "concurrency_per_cpu_core": config.dmv_concurrency
+                        .filter(|_| !config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).is_some_and(|streams| streams > 0))
+                        .map(|value| value as f64 * 1_000.0 / client_limit_millicores as f64),
                 },
                 "throttling": throttling,
             }),
@@ -5289,27 +5294,38 @@ fn result_rows(
     for table in assigned_tables {
         let client = client_run.metrics.get(&table);
         let exploratory = config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable);
-        let reconciliation_failure = if exploratory {
-            match client_run
-                .evidence
-                .durable_commits
-                .get(&table)
-                .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
-                .and_then(Value::as_str)
-            {
-                Some("matched") => None,
-                Some("mismatch") => Some((
-                    "exploratory_delta_log_reconciliation_mismatch",
-                    "exploratory_reconciliation_mismatch",
-                )),
-                _ => Some((
-                    "exploratory_delta_log_reconciliation_unavailable",
-                    "exploratory_reconciliation_unavailable",
-                )),
-            }
-        } else {
-            None
-        };
+        let reconciliation = client_run
+            .evidence
+            .reconciliation(&table, client_run.evidence.durable_commits.get(&table));
+        let reconciliation_failure =
+            if reconciliation["exact_match_required"] == true && reconciliation["exact_match"] == false {
+                let reason = if reconciliation["status"] == "unsettled" {
+                    "delta_commit_drain_timeout"
+                } else {
+                    "delta_exact_match_failed"
+                };
+                Some((reason, reason))
+            } else if exploratory {
+                match client_run
+                    .evidence
+                    .durable_commits
+                    .get(&table)
+                    .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
+                    .and_then(Value::as_str)
+                {
+                    Some("matched") => None,
+                    Some("mismatch") => Some((
+                        "exploratory_delta_log_reconciliation_mismatch",
+                        "exploratory_reconciliation_mismatch",
+                    )),
+                    _ => Some((
+                        "exploratory_delta_log_reconciliation_unavailable",
+                        "exploratory_reconciliation_unavailable",
+                    )),
+                }
+            } else {
+                None
+            };
         let admission =
             client_admission_for_table(config, run_id, &table, client_run.evidence.client_reports.get(&table));
         let admission_failure = admission["failure"].as_str();
@@ -5444,8 +5460,11 @@ fn result_rows(
                         "window_seconds": seconds,
                         "scope": "collector_commit_finish_window_not_client_cohort",
                     });
-                    evidence["ranking_eligible"] = json!(reconciliation_failure.is_none());
-                    evidence["ranking_metrics"] = if let Some((reason, _)) = reconciliation_failure {
+                    let ineligible_reason = reconciliation_failure.map(|(reason, _)| reason).or_else(|| {
+                        (table_failure.is_some() || client_run.pinning.violation.is_some()).then_some("cell_failed")
+                    });
+                    evidence["ranking_eligible"] = json!(ineligible_reason.is_none());
+                    evidence["ranking_metrics"] = if let Some(reason) = ineligible_reason {
                         evidence["ranking_ineligible_reason"] = json!(reason);
                         evidence["commit_window_output_usage"] = json!("diagnostic_only");
                         evidence["diagnostic_client_rows_per_second"] =
@@ -5541,25 +5560,33 @@ async fn run_clients(
     replicas: u32,
 ) -> Result<ClientRun> {
     let mut pinning = PinningReport::default();
-    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
-        Ok(report) => Ok(report),
+    let mut report = match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
+        Ok(report) => report,
         Err(error) => {
-            let sample = async {
-                let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-                sample_router_table_owners(platform, config, &client, tables).await
-            }
-            .await;
-            let pinning = failed_client_pinning_report(&error, sample, tables, pinning);
             tracing::error!(run_id = project_run_id, error = %error, "OAT client run failed; incomplete measurements are unavailable");
-            Ok(ClientRun {
+            ClientRun {
                 metrics: HashMap::new(),
                 pinning,
                 qap_tables: Vec::new(),
                 failure: Some(format!("{error:#}")),
                 evidence: CellEvidence::default(),
-            })
+            }
         }
+    };
+    if let Some(failure) = &report.failure {
+        let sample = async {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+            sample_router_table_owners(platform, config, &client, tables).await
+        }
+        .await;
+        report.pinning = failed_client_pinning_report(
+            &anyhow::anyhow!("{failure}"),
+            sample,
+            tables,
+            std::mem::take(&mut report.pinning),
+        );
     }
+    Ok(report)
 }
 
 fn failed_client_pinning_report(
@@ -5917,7 +5944,10 @@ async fn run_clients_inner(
         Ok(qap_tables) => qap_tables,
         Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
             platform.mark_qap_outcome_unresolved();
-            evidence.downstream_unavailable("local_qap_initialization_unavailable");
+            evidence.downstream_unavailable(
+                "local_qap_initialization_unavailable",
+                format!("Local QAP initialization unavailable: {error:#}. Derived Kusto/QAP metrics are null."),
+            );
             Vec::new()
         }
         Err(error) => {
@@ -7565,7 +7595,12 @@ async fn observe_qap(
             if matches!(mode, arrowcol_loadgen::ObservationMode::Local)
                 && failures.iter().all(|table| table["temporary_unavailable"] == true)
             {
-                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+                let diagnostic = failures
+                    .iter()
+                    .filter_map(|table| table["error"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable).context(diagnostic));
             }
             bail!("QAP table metadata/statistics observation failed; not a temporary service-availability failure");
         }
@@ -7603,16 +7638,19 @@ fn apply_qap_observation(
     evidence: &mut CellEvidence,
 ) -> QapMetrics {
     if local_downstream_optional(mode) && observation["catch_up_status"] == "deadline_incomplete" {
-        evidence.downstream_unavailable(format!(
-            "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
+        evidence.downstream_unavailable(
+            "local_qap_observation_unavailable",
+            format!(
+                "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
              Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged.",
-            metrics
-                .completion_percent
-                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-            metrics
-                .pending_artifacts
-                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-        ));
+                metrics
+                    .completion_percent
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                metrics
+                    .pending_artifacts
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            ),
+        );
         evidence.qap_observation = Some(observation);
         return QapMetrics::default();
     }
@@ -19241,6 +19279,7 @@ mod tests {
         assert_eq!(result["inert_fields"], inert);
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
         assert_eq!(result["downstream_status"], "unavailable");
+        assert_eq!(result["downstream_reason"], "local_qap_observation_unavailable");
         assert!(result["ownership_samples"][0]["observed_at_unix_ms"].is_u64());
         assert_eq!(
             result["ownership_samples"][0]["owners_by_table"][&canonical_table_key(&table)][0],
@@ -19288,7 +19327,7 @@ mod tests {
                 },
             }),
         );
-        let rows_for = |evidence| {
+        let rows_for = |evidence, failure: Option<&str>, violation: Option<&str>| {
             let clients = ClientRun {
                 metrics: HashMap::from([(
                     table.clone(),
@@ -19301,10 +19340,11 @@ mod tests {
                 )]),
                 pinning: PinningReport {
                     owners: pinning.owners.clone(),
+                    violation: violation.map(str::to_owned),
                     ..PinningReport::default()
                 },
                 qap_tables: Vec::new(),
-                failure: None,
+                failure: failure.map(str::to_owned),
                 evidence,
             };
             result_rows(
@@ -19322,7 +19362,7 @@ mod tests {
                 },
             )
         };
-        let rows = rows_for(evidence.clone())?;
+        let rows = rows_for(evidence.clone(), None, None)?;
         assert_eq!(rows[0].status, "failed");
         assert!(
             rows[0]
@@ -19360,7 +19400,7 @@ mod tests {
                     .context("commit evidence object")?
                     .remove("delta_log_reconciliation");
             }
-            let rows = rows_for(cell)?;
+            let rows = rows_for(cell, None, None)?;
             let row = &rows[0];
             let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
             let eligible = reconciliation == Some("matched");
@@ -19381,6 +19421,82 @@ mod tests {
                 assert!(row.rows_per_second.is_none());
             }
         }
+        let mut matched = evidence.clone();
+        matched.durable_commits.get_mut(&table).context("commit evidence")?["delta_log_reconciliation"] =
+            json!({"status": "matched"});
+        for (failure, violation) in [(Some("client infrastructure unavailable"), None), (None, Some("ownership changed"))] {
+            let rows = rows_for(matched.clone(), failure, violation)?;
+            let row = &rows[0];
+            let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
+            assert_ne!(row.status, "succeeded");
+            assert_eq!(result["ranking_eligible"], false);
+            assert_eq!(result["ranking_ineligible_reason"], "cell_failed");
+            assert!(result["ranking_metrics"].is_null());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_reconciliation_mismatch_fails_the_result() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
+        let table = config.tables[0].clone();
+        let rows_for = |delta_rows, ambiguous_rows| {
+            let mut evidence = CellEvidence::default();
+            evidence.client_reports.insert(
+                table.clone(),
+                vec![json!({
+                    "client_id": format!("{run}:{table}:1"),
+                    "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": ambiguous_rows}}
+                })],
+            );
+            evidence.durable_commits.insert(table.clone(), json!({
+                "run_cumulative_output": {"rows": delta_rows, "settled": false, "settle_seconds": 120.0, "settle_timeout_seconds": 120}
+            }));
+            result_rows(
+                &config,
+                "orchestration",
+                run,
+                1,
+                1,
+                CellMeasurements {
+                    clients: ClientRun {
+                        metrics: HashMap::from([(
+                            table.clone(),
+                            ClientMetrics {
+                                rows: 10,
+                                duration_ms: 1000,
+                                rows_per_second: 10.0,
+                                completions: Vec::new(),
+                            },
+                        )]),
+                        pinning: PinningReport {
+                            owners: HashMap::from([(canonical_table_key(&table), "collector".to_owned())]),
+                            ..PinningReport::default()
+                        },
+                        qap_tables: Vec::new(),
+                        failure: None,
+                        evidence,
+                    },
+                    started_at_ms: 1,
+                    qap: QapMetrics::default(),
+                    resources: None,
+                    resource_evidence: None,
+                },
+            )
+        };
+        let failed = rows_for(8, 0)?;
+        assert_eq!(failed[0].status, "failed");
+        assert_eq!(failed[0].failure.as_deref(), Some("delta_commit_drain_timeout"));
+        assert!(failed[0].rows_per_second.is_none());
+        let evidence: Value = serde_json::from_str(failed[0].evidence_json.as_deref().context("evidence")?)?;
+        assert_eq!(evidence["reconciliation"]["exact_match_required"], true);
+        assert_eq!(evidence["reconciliation"]["exact_match"], false);
+        assert_eq!(evidence["reconciliation"]["reason"], "delta_commit_drain_timeout");
+        let success = rows_for(10, 0)?;
+        assert_eq!(success[0].status, "succeeded");
         Ok(())
     }
 

@@ -1421,6 +1421,9 @@ impl OatConfig {
         if self.reconciliation_settle_timeout_seconds > 1_800 {
             bail!("reconciliation_settle_timeout_seconds must be between 0 and 1800");
         }
+        if self.reconciliation_settle_timeout_seconds > self.collector_stop_grace_seconds {
+            bail!("reconciliation_settle_timeout_seconds must not exceed collector_stop_grace_seconds");
+        }
         let quiesce_timeout_ms = self.client_quiesce_timeout_ms();
         if quiesce_timeout_ms >= self.collector_stop_grace_seconds.saturating_mul(1_000) {
             bail!("client.quiesce_timeout_ms must be less than collector_stop_grace_seconds");
@@ -2706,8 +2709,19 @@ mod tests {
         assert_eq!(config.reconciliation_settle_timeout_seconds, 120);
         config.reconciliation_settle_timeout_seconds = 0;
         config.validate()?;
+        config.collector_stop_grace_seconds = 1_800;
+        config.run_pin_ttl_ms = 86_400_000;
         config.reconciliation_settle_timeout_seconds = 1_800;
         config.validate()?;
+        config.collector_stop_grace_seconds = 1_799;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("reconciliation_settle_timeout_seconds")
+        );
+        config.collector_stop_grace_seconds = 1_800;
         config.reconciliation_settle_timeout_seconds = 1_801;
         assert!(config.validate().is_err());
         Ok(())

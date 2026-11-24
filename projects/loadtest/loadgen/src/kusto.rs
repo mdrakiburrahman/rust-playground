@@ -47,6 +47,15 @@ impl std::fmt::Display for QapUnavailable {
 
 impl std::error::Error for QapUnavailable {}
 
+#[derive(Debug)]
+struct LocalInvalidObservationJson;
+
+impl std::fmt::Display for LocalInvalidObservationJson {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Kusto observation response is not valid JSON")
+    }
+}
+
 fn request_failure(error: &reqwest::Error) -> anyhow::Error {
     let diagnostic = format!("Kusto HTTP request failed: {}", redact_text(&error.to_string()));
     if error.is_connect() || error.is_timeout() {
@@ -207,8 +216,14 @@ impl KustoClient {
                 bytes.extend_from_slice(&chunk);
             }
             let text = std::str::from_utf8(&bytes).context("Kusto observation response is not valid UTF-8")?;
-            return serde_json::from_str(text)
-                .map_err(|_| anyhow::anyhow!("Kusto observation response is not valid JSON"));
+            return serde_json::from_str(text).map_err(|_| {
+                let diagnostic = "Kusto observation response is not valid JSON";
+                if self.mode == Mode::Local {
+                    anyhow::Error::new(QapUnavailable).context(LocalInvalidObservationJson)
+                } else {
+                    anyhow::anyhow!(diagnostic)
+                }
+            });
         }
         let text = response
             .text()
@@ -482,28 +497,42 @@ impl KustoClient {
 
     /// Best-effort sanitized `QueryAccelerationState`; never fails validation on its own.
     async fn details(&self, name: &str) -> Value {
+        self.observation_details(name)
+            .await
+            .unwrap_or_else(|error| json!({"error": short_error(&error)}))
+    }
+
+    async fn observation_details(&self, name: &str) -> Result<Value> {
         let Ok(table) = identifier(name) else {
-            return json!({"error": "invalid external table name"});
+            return Ok(json!({"error": "invalid external table name"}));
         };
         match self
             .execute(&format!(".show external table {table} details"), true, "qap")
             .await
         {
-            Ok(rows) => rows.first().map_or(Value::Null, |row| {
+            Ok(rows) => Ok(rows.first().map_or(Value::Null, |row| {
                 json!({
                     "QueryAccelerationPolicy": row.get("QueryAccelerationPolicy").map(|value| sanitize(&json_value(value))),
                     "QueryAccelerationState": row.get("QueryAccelerationState").map(|value| sanitize(&json_value(value))),
                 })
-            }),
-            Err(error) => json!({"error": short_error(&error)}),
+            })),
+            Err(error) if error.is::<LocalInvalidObservationJson>() => Err(error),
+            Err(error) => Ok(json!({"error": short_error(&error)})),
         }
     }
 
     async fn capacity(&self) -> Value {
+        self.observation_capacity()
+            .await
+            .unwrap_or_else(|error| json!({"available": false, "error": short_error(&error)}))
+    }
+
+    async fn observation_capacity(&self) -> Result<Value> {
         // Local emulator capacity is functional evidence only, never Azure performance evidence.
         match self.execute(".show capacity", true, "qap").await {
-            Ok(rows) => json!({"available": true, "rows": sanitize(&json!(rows))}),
-            Err(error) => json!({"available": false, "error": short_error(&error)}),
+            Ok(rows) => Ok(json!({"available": true, "rows": sanitize(&json!(rows))})),
+            Err(error) if error.is::<LocalInvalidObservationJson>() => Err(error),
+            Err(error) => Ok(json!({"available": false, "error": short_error(&error)})),
         }
     }
 
@@ -2007,8 +2036,8 @@ pub async fn observe_qap(
 /// # Errors
 ///
 /// Returns an error if client setup, the observation deadline, elapsed-time
-/// conversion, or diagnostic publication fails. Per-table failures are recorded
-/// in the returned JSON rather than failing the entire observation.
+/// conversion, diagnostic publication, or malformed local observation JSON fails.
+/// Other per-table failures are recorded in the returned JSON.
 pub async fn observe_qap_with_mode(
     endpoint: &str,
     results: &Path,
@@ -2043,6 +2072,7 @@ pub async fn observe_qap_with_mode(
                         policies.insert(name.clone(), max_age);
                         observed.insert(name, table);
                     }
+                    Err(error) if error.is::<LocalInvalidObservationJson>() => return Err(error),
                     Err(error) => {
                         observed.insert(name, json!({"available": false, "temporary_unavailable": error.is::<QapUnavailable>(), "error": short_error(&error)}));
                     }
@@ -2064,6 +2094,7 @@ pub async fn observe_qap_with_mode(
                             observed.get_mut(name).context("observed table missing")?["statistics"] = value;
                         }
                     }
+                    Err(error) if error.is::<LocalInvalidObservationJson>() => return Err(error),
                     Err(error) => {
                         for name in policies.keys() {
                             observed.insert(name.clone(), json!({"available": false, "temporary_unavailable": error.is::<QapUnavailable>(), "error": short_error(&error)}));
@@ -2074,7 +2105,7 @@ pub async fn observe_qap_with_mode(
             Ok::<_, anyhow::Error>(json!({
                 "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
                 "expected_tables": tables,
-                "capacity": client.capacity().await, "tables": observed
+                "capacity": client.observation_capacity().await?, "tables": observed
             }))
         })
         .await
@@ -2250,6 +2281,7 @@ async fn observe_qap_until_ready_with_poll_interval(
             },
             "elapsed_ms": u64::try_from(started.elapsed().as_millis())?,
             "samples": samples,
+            "error": outcome.as_ref().err().map(short_error),
             "delta_delivery": "not_established",
         }),
     )?;
@@ -2260,7 +2292,7 @@ async fn observe_qap_until_ready_with_poll_interval(
 
 async fn observe_table_metadata(client: &KustoClient, name: &str) -> Result<(Value, String)> {
     let (policy, max_age) = client.max_age(name).await?;
-    let details = client.details(name).await;
+    let details = client.observation_details(name).await?;
     let state = CacheState::from_details(&details);
     Ok((
         json!({
@@ -2491,32 +2523,46 @@ mod tests {
     #[tokio::test]
     async fn observation_response_rejects_malformed_and_truncated_bodies_without_payload_leaks() -> Result<()> {
         let directory = Directory::new()?;
-        for (status, body, extra_declared, expected) in [
-            (200, vec![0xff], 0, "not valid UTF-8"),
-            (200, b"CANARYSIG".to_vec(), 0, "not valid JSON"),
-            (200, b"{".to_vec(), 12, "response body failed"),
-            (503, b"CANARYSIG".to_vec(), 0, "not valid JSON"),
-        ] {
-            let server = Server::start_transport(move |stream, _| {
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len() + extra_declared
-                )?;
-                stream.write_all(&body)?;
-                Ok(())
-            })?;
-            let mut client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
-            client.response_byte_limit = Some(OBSERVATION_RESPONSE_MAX_BYTES);
-            let error = client
-                .execute(".show external tables", true, "observation")
-                .await
-                .err()
-                .context("malformed observation must fail")?;
-            let diagnostic = format!("{error:#}");
-            assert_eq!(error.is::<QapUnavailable>(), status == 503);
-            assert!(diagnostic.contains(expected), "{diagnostic}");
-            assert_public(&diagnostic);
+        for mode in [Mode::Local, Mode::Azure] {
+            for (status, body, extra_declared, expected, local_unavailable) in [
+                (200, vec![0xff], 0, "not valid UTF-8", false),
+                (200, b"CANARYSIG".to_vec(), 0, "not valid JSON", true),
+                (200, b"{".to_vec(), 12, "response body failed", false),
+                (503, b"CANARYSIG".to_vec(), 0, "not valid JSON", true),
+                (
+                    200,
+                    br#"{"error":"query rejected"}"#.to_vec(),
+                    0,
+                    "Kusto command failed",
+                    false,
+                ),
+            ] {
+                let server = Server::start_transport(move |stream, _| {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len() + extra_declared
+                    )?;
+                    stream.write_all(&body)?;
+                    Ok(())
+                })?;
+                // The fixture uses HTTP and no token; mode selects the observation parsing policy.
+                let mut client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+                client.mode = mode;
+                client.response_byte_limit = Some(OBSERVATION_RESPONSE_MAX_BYTES);
+                let error = client
+                    .execute(".show external tables", true, "observation")
+                    .await
+                    .err()
+                    .context("malformed observation must fail")?;
+                let diagnostic = format!("{error:#}");
+                assert_eq!(
+                    error.is::<QapUnavailable>(),
+                    status == 503 || (mode == Mode::Local && local_unavailable)
+                );
+                assert!(diagnostic.contains(expected), "{diagnostic}");
+                assert_public(&diagnostic);
+            }
         }
         Ok(())
     }
@@ -3940,6 +3986,69 @@ mod tests {
             Ok(Some(response(&[], vec![])))
         })?;
         Ok((server, samples))
+    }
+
+    #[tokio::test]
+    async fn catch_up_stops_on_local_invalid_json_in_any_observation_stage() -> Result<()> {
+        for stage in ["policy", "details", "statistics", "capacity"] {
+            let directory = Directory::new()?;
+            let server = Server::start_transport(move |stream, request| {
+                let command = request["csl"].as_str().context("command missing")?;
+                let current = if command.ends_with("policy query_acceleration") {
+                    "policy"
+                } else if command.ends_with(" details") {
+                    "details"
+                } else if command.contains("query_acceleration statistics") {
+                    "statistics"
+                } else {
+                    "capacity"
+                };
+                let body = if stage == current {
+                    "CANARYSIG".to_owned()
+                } else if current == "policy" {
+                    response(
+                        &["Policy"],
+                        vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:05:00\"}"])],
+                    )
+                    .to_string()
+                } else if current == "details" {
+                    response(&["QueryAccelerationState"], vec![json!(["{\"IsHealthy\":true}"])]).to_string()
+                } else {
+                    response(&[], vec![]).to_string()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+                Ok(())
+            })?;
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                observe_qap_until_ready_with_poll_interval(
+                    &server.endpoint,
+                    &directory.0,
+                    Mode::Local,
+                    DATABASE,
+                    &["dataflow_a".to_owned()],
+                    Duration::from_secs(10),
+                    Duration::from_secs(3),
+                ),
+            )
+            .await
+            .with_context(|| format!("catch-up did not stop promptly at {stage}"))?
+            .err()
+            .context("invalid JSON must fail")?;
+            assert!(error.is::<QapUnavailable>(), "{stage}: {error:#}");
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("not valid JSON"), "{stage}: {diagnostic}");
+            assert_public(&diagnostic);
+            let saved = fs::read_to_string(directory.0.join("catch-up-diagnostic.json"))?;
+            assert_public(&saved);
+            assert!(saved.contains("observation_failed"));
+            assert!(saved.contains("not valid JSON"));
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -191,6 +191,24 @@ mod failure_evidence_tests {
         Ok(())
     }
 
+    #[test]
+    fn streams_mode_serializes_legacy_concurrency_per_core_as_null() -> Result<()> {
+        let mut config = config()?;
+        config.platform.kind = crate::config::OatMode::Aks;
+        config.dmv_concurrency = Some(4);
+        let legacy = completed(&config, "legacy", 1, 100)?;
+        let tunables: Value = serde_json::from_str(&legacy[0].tunables_json)?;
+        assert!(tunables["cpu_quota"]["client"]["concurrency_per_cpu_core"].as_f64().is_some());
+        config.dmv_concurrency = None;
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables {
+            streams_per_worker: Some(2), ..Default::default()
+        });
+        let streams = completed(&config, "streams", 1, 100)?;
+        let tunables: Value = serde_json::from_str(&streams[0].tunables_json)?;
+        assert!(tunables["cpu_quota"]["client"]["concurrency_per_cpu_core"].is_null());
+        Ok(())
+    }
+
     fn read_batch(bytes: Vec<u8>) -> Result<RecordBatch> {
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?;
         let schema = Arc::clone(reader.schema());
