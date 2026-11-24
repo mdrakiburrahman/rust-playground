@@ -5,6 +5,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createServer } from 'node:net';
+import { pathToFileURL } from 'node:url';
 import { snapshot, difference, proc, procDifference, clientMetrics } from './measure.js';
 
 type Cell = { id: string; grid: string; x: string; y: string; env: Record<string, string> };
@@ -126,16 +127,31 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: key,
   };
   const knobs = { ...plan.common, ...cell.env };
+  const isolation = env.BWA_ISOLATION ?? 'l5';
+  const diagnostic = isolation !== 'l5';
+  if (env.BWA_ISOLATION) {
+    env.ARROWCOL_COLLECTOR_ISOLATION_LEVEL = isolation;
+    env.ARROWCOL_CLIENT_ISOLATION_LEVEL = isolation;
+  }
   const metadata = { cell: cell.id, grid: cell.grid, x: cell.x, y: cell.y,
     duration: plan.duration, warmup: plan.warmup, knobs, run, ...identity,
     allocator_env: { GLIBC_TUNABLES: env.GLIBC_TUNABLES ?? null, LD_PRELOAD: env.LD_PRELOAD ?? null },
-    storage: 'local_filesystem', kustainer_rows: null,
+    storage: 'local_filesystem', isolation_level: isolation, kustainer_rows: null,
     kustainer_comment: 'Not started: collector-only local filesystem experiment, no Kustainer claim',
   };
   let result: object;
   let valid = false;
   const offset = children.length;
+  const observationErrors: { endpoint: string; message: string; at: number }[] = [];
+  async function observe(endpoint: string): Promise<string | null> {
+    try { return await http(`http://127.0.0.1:32011/${endpoint}`); }
+    catch (error) {
+      observationErrors.push({ endpoint, message: error instanceof Error ? error.message : String(error), at: Date.now() });
+      return null;
+    }
+  }
   try {
+    if (!['l0', 'l1', 'l5'].includes(isolation)) throw new Error('BWA_ISOLATION must be l0, l1 or l5');
     for (const port of [8817, 32010, 32011]) await assertPortFree(port);
     const clients = positive(env, 'BWA_NCLIENTS', 1, 16);
     const cores = positive(env, 'BWA_CORES', 24, 128);
@@ -153,10 +169,17 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
       try { await http('http://127.0.0.1:32011/readyz'); return true; } catch { return false; }
     });
     const table = env.BWA_TABLE ?? 'sqlserver_availability_replica_states';
+    const isolationArgs = env.BWA_ISOLATION ? ['--isolation-level', isolation] : [];
     const ddl = start(path.join(bin, 'arrowcol-dmv'),
-      ['--endpoint', 'http://127.0.0.1:32010', '--client-id', 'bwa-ddl', '--table', table, '--rows', '8'],
+      ['--endpoint', 'http://127.0.0.1:32010', '--client-id', 'bwa-ddl', '--table', table, '--rows', '8', ...isolationArgs],
       env, path.join(run, 'ddl.log'), kcpus);
     if (await ddl.done !== 0) throw new Error(`DDL failed: ${fs.readFileSync(ddl.log, 'utf8').slice(-700)}`);
+    const maintenance = env.BWA_CHECKPOINT_EVERY_COMMITS ? start(path.join(bin, 'delta-maintenance'), [
+      '--root', pathToFileURL(root + path.sep).href, '--operation', 'checkpoint', '--apply',
+      '--interval-secs', '1', '--max-idle-backoff-secs', '1',
+      '--checkpoint-every-commits', String(positive(env, 'BWA_CHECKPOINT_EVERY_COMMITS', 5, 100000)),
+      '--no-metrics-listener',
+    ], env, path.join(run, 'maintenance.log'), kcpus) : null;
     const startMs = Date.now() + 8000, ws = startMs + plan.warmup * 1000, we = ws + plan.duration * 1000;
     const load: Managed[] = [];
     for (let i = 0; i < clients; i++) {
@@ -171,22 +194,31 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
         '--max-flight-data-bytes', '67108864', '--max-message-bytes', '134217728',
         '--max-memory-bytes', '1073741824', '--pod-ordinal', String(i),
         '--warmup-secs', String(plan.warmup), '--duration-secs', String(plan.duration), '--run-start-unix-ms', String(startMs),
+        ...isolationArgs,
       ], env, path.join(run, `client-${i}.log`), kcpus));
     }
     await sleepUntil(ws);
     alive(collector); alive(catalog); load.forEach(alive);
+    if (maintenance) alive(maintenance);
     const before = snapshot(root), cpuBefore = proc(collector.child.pid!);
-    fs.writeFileSync(path.join(run, 'metrics-start.txt'), await http('http://127.0.0.1:32011/metrics'));
+    const maintenanceBefore = maintenance ? proc(maintenance.child.pid!) : null;
+    const metricsStart = await observe('metrics');
+    if (metricsStart !== null) fs.writeFileSync(path.join(run, 'metrics-start.txt'), metricsStart);
     const pressure = [];
     for (let next = ws + 2500; next < we; next += 5000) {
       await sleepUntil(next);
       alive(collector); alive(catalog);
-      pressure.push({ at: Date.now(), value: JSON.parse(await http('http://127.0.0.1:32011/v1/pressure')) });
+      if (maintenance) alive(maintenance);
+      const sample = await observe('v1/pressure');
+      if (sample !== null) pressure.push({ at: Date.now(), value: JSON.parse(sample) });
     }
     await sleepUntil(we);
     alive(collector); alive(catalog);
+    if (maintenance) alive(maintenance);
     const after = snapshot(root), cpuAfter = proc(collector.child.pid!);
-    fs.writeFileSync(path.join(run, 'metrics-end.txt'), await http('http://127.0.0.1:32011/metrics'));
+    const maintenanceAfter = maintenance ? proc(maintenance.child.pid!) : null;
+    const metricsEnd = await observe('metrics');
+    if (metricsEnd !== null) fs.writeFileSync(path.join(run, 'metrics-end.txt'), metricsEnd);
     fs.writeFileSync(path.join(run, 'pressure.json'), JSON.stringify(pressure));
     fs.writeFileSync(path.join(run, 'commit-boundaries.json'), JSON.stringify({
       start: [...before.commits], end: [...after.commits], requested: { start: ws, end: we },
@@ -200,6 +232,14 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     }
     const stats = difference(before, after);
     const client = load.map((c) => clientMetrics(fs.readFileSync(c.log, 'utf8')));
+    if (client.some((c) => c.window_start_ms !== ws || c.window_end_ms !== we)) {
+      throw new Error('Client and collector measurement windows do not match');
+    }
+    if (diagnostic && (stats.rows !== 0 || client.some((c) =>
+      !c.completion || !(c.completion.diagnostic_discard_streams > 0) ||
+      c.completion.best_effort_streams !== 0 || c.completion.durable_streams !== 0))) {
+      throw new Error('Diagnostic sink emitted commits or incorrect receipt accounting');
+    }
     const admitted = client.reduce((sum, c) => sum + c.completed_rows, 0);
     const clientErrors = client.reduce((sum, c) => sum + c.error_logs + c.given_up_rows + c.ambiguous_rows, 0);
     const startup = fs.readFileSync(collector.log, 'utf8').split('\n')
@@ -208,17 +248,27 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     valid = clientErrors === 0;
     result = {
       ...metadata, status: clientErrors ? 'invalid_client_errors' : 'ok',
-      committed_rps: clientErrors ? null : stats.committed_rps,
-      comment: clientErrors ? 'Client errors or ambiguous outcomes: see raw stats' : null,
-      admitted_rps: admitted / plan.duration,
+      committed_rps: clientErrors || diagnostic ? null : stats.committed_rps,
+      diagnostic_rps: diagnostic && !clientErrors ? admitted / plan.duration : null,
+      comment: clientErrors ? 'Client errors or ambiguous outcomes: see raw stats' :
+        diagnostic ? 'Diagnostic discard path: not admission, durability or production throughput' :
+          observationErrors.length ? 'Some admin telemetry unavailable; Delta boundary evidence and process counters retained' : null,
+      admitted_rps: diagnostic ? null : admitted / plan.duration,
+      first_attempt_offered_rps: client.every((c) => c.offered_rows !== null)
+        ? client.reduce((sum, c) => sum + c.offered_rows!, 0) / plan.duration : null,
+      retry_offered_rps: client.every((c) => c.retry_offered_rows !== null)
+        ? client.reduce((sum, c) => sum + c.retry_offered_rows!, 0) / plan.duration : null,
       ipc_bytes_per_row: admitted ? client.reduce((sum, c) => sum + c.completed_ipc_bytes, 0) / admitted : null,
       bytes_per_row: stats.bytes_per_row, stats, client,
       effective_startup: startup,
       collector: procDifference(cpuBefore, cpuAfter, stats.seconds, hz),
+      maintenance: maintenanceBefore && maintenanceAfter ? procDifference(maintenanceBefore, maintenanceAfter, stats.seconds, hz) : null,
       pressure: pressure.map((sample) => ({ at: sample.at, rich: sample.value.rich })),
-      offered_capacity_rps: null,
-      offered_capacity_comment: 'Closed-loop ACK rate is not an independent offered-capacity measurement',
+      offered_capacity_rps: diagnostic && !clientErrors ? admitted / plan.duration : null,
+      offered_capacity_comment: diagnostic ? 'Validated diagnostic sink receipt rate; same configured clients, no Delta work' :
+        'Closed-loop ACK rate is not an independent offered-capacity measurement',
       boundary_scan_lag_ms: { start: before.observedAt - ws, end: after.observedAt - we },
+      observation_errors: observationErrors,
     };
   } catch (error) {
     result = { ...metadata, status: 'failed', committed_rps: null,
@@ -226,6 +276,7 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
   } finally {
     for (const child of children.slice(offset).reverse()) await stop(child);
     fs.rmSync(key, { force: true });
+    fs.writeFileSync(path.join(run, 'observation-errors.json'), JSON.stringify(observationErrors));
   }
   fs.appendFileSync(results, JSON.stringify(result) + '\n');
   fs.rmSync(root, { recursive: true });
@@ -248,6 +299,8 @@ async function main(): Promise<void> {
       config_sha256: createHash('sha256').update(fs.readFileSync(path.join(here, 'base.yaml'))).digest('hex'),
       binaries: Object.fromEntries(['arrowcol-dataflow-rust', 'arrowcol-dmv', 'arrowcol-catalog-rust'].map((name) =>
         [name, createHash('sha256').update(fs.readFileSync(path.join(bin, name))).digest('hex')])),
+      maintenance_sha256: fs.existsSync(path.join(bin, 'delta-maintenance'))
+        ? createHash('sha256').update(fs.readFileSync(path.join(bin, 'delta-maintenance'))).digest('hex') : null,
     };
     const done = new Set(fs.existsSync(results) ? fs.readFileSync(results, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line).cell) : []);
     for (const cell of plan.cells) {

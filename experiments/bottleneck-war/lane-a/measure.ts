@@ -96,13 +96,29 @@ export function clientMetrics(text: string) {
   const metrics = JSON.parse(lines.at(-1)!.slice('OAT_CLIENT_METRICS '.length));
   const window = metrics.measurement_window;
   if (!window || !Number.isFinite(window.completed_rows)) throw new Error('Missing client measurement window');
+  const optionalCount = (value: unknown): number | null => {
+    if (value === undefined) return null;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('Invalid offered-row counter');
+    return value;
+  };
+  const count = (name: string): number => {
+    const value = optionalCount(window[name]);
+    if (value === null) throw new Error(`Missing client counter: ${name}`);
+    return value;
+  };
+  const completionLine = text.split('\n').filter((line) => line.startsWith('OAT_COLLECTOR_COMPLETION ')).at(-1);
   return {
-    completed_rows: window.completed_rows as number,
-    completed_ipc_bytes: window.completed_flight_data_bytes_uncompressed as number,
-    ambiguous_rows: window.ambiguous_rows as number,
-    rejected_rows: window.rejected_rows as number,
-    given_up_rows: window.given_up_rows as number,
-    retried_rows: window.retried_rows as number,
+    completed_rows: count('completed_rows'),
+    completed_ipc_bytes: count('completed_flight_data_bytes_uncompressed'),
+    ambiguous_rows: count('ambiguous_rows'),
+    rejected_rows: count('rejected_rows'),
+    given_up_rows: count('given_up_rows'),
+    retried_rows: count('retried_rows'),
+    offered_rows: optionalCount(window.offered_rows),
+    retry_offered_rows: optionalCount(window.retry_offered_rows),
+    window_start_ms: count('start_unix_ms'),
+    window_end_ms: count('end_unix_ms'),
+    completion: completionLine ? JSON.parse(completionLine.slice('OAT_COLLECTOR_COMPLETION '.length)) : null,
     resources: window.client_resources,
     send_windows: window.windows,
     preparation: metrics.preparation,

@@ -28,10 +28,13 @@ test('counts newly visible commits even when their commitInfo timestamp precedes
 });
 
 test('client error fields do not count as error log lines', () => {
-  const metrics = { measurement_window: { completed_rows: 10, ambiguous_rows: 0, given_up_rows: 0 }, error_rows: 0 };
+  const metrics = { measurement_window: { completed_rows: 10, completed_flight_data_bytes_uncompressed: 100,
+    start_unix_ms: 1000, end_unix_ms: 2000, ambiguous_rows: 0, given_up_rows: 0, rejected_rows: 0, retried_rows: 0 }, error_rows: 0 };
   const line = `OAT_CLIENT_METRICS ${JSON.stringify(metrics)}\n`;
   assert.equal(clientMetrics(line).error_logs, 0);
   assert.equal(clientMetrics(`Error: rejected\n${line}`).error_logs, 1);
+  assert.equal(clientMetrics(line).offered_rows, null);
+  assert.throws(() => clientMetrics(`OAT_CLIENT_METRICS ${JSON.stringify({ measurement_window: { completed_rows: 10 } })}`), /Missing client counter/);
   assert.throws(() => clientMetrics('unexpected EOF'), /did not emit/);
 });
 
