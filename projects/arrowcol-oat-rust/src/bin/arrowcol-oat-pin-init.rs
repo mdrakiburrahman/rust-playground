@@ -35,17 +35,9 @@ struct RegisteredRunTableReceipt<'a, P: Serialize> {
 #[derive(Debug, Parser)]
 #[command(group(clap::ArgGroup::new("registration").args(["register_only_config", "register_maintenance_only_config"])))]
 struct Cli {
-    #[arg(
-        long,
-        required_unless_present = "registration",
-        conflicts_with = "registration"
-    )]
+    #[arg(long, required_unless_present = "registration", conflicts_with = "registration")]
     config: Option<PathBuf>,
-    #[arg(
-        long,
-        required_unless_present = "registration",
-        conflicts_with = "registration"
-    )]
+    #[arg(long, required_unless_present = "registration", conflicts_with = "registration")]
     migrator_password_file: Option<PathBuf>,
     #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
     register_only_config: Option<PathBuf>,
@@ -510,7 +502,12 @@ mod tests {
         validate_register_only_config(&config, true)?;
         config.table = "telemetry.sqlserver.sqlserver_active_sessions".to_owned();
         let location = validate_register_only_config(&config, true)?;
-        assert!(location.path().trim_end_matches('/').ends_with("/telemetry/sqlserver/sqlserver_active_sessions"));
+        assert!(
+            location
+                .path()
+                .trim_end_matches('/')
+                .ends_with("/telemetry/sqlserver/sqlserver_active_sessions")
+        );
         for table in ["sqlserver_active_sessions", "telemetry.sqlserver.unknown_table"] {
             config.table = table.to_owned();
             assert!(validate_register_only_config(&config, true).is_err());
