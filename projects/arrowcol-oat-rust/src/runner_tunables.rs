@@ -593,6 +593,10 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
             Some("client.stream_retry_base_backoff_ms") => ("stream_retry_base_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"),
             Some("client.stream_retry_max_backoff_ms") => ("stream_retry_max_backoff_ms", "ARROWCOL_CLIENT_STREAM_RETRY_MAX_BACKOFF_MS"),
             Some("transport.max_message_bytes") => ("max_message_bytes", "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES"),
+            Some("transport.socket_send_buffer_bytes") => ("socket_send_buffer_bytes", "ARROWCOL_CLIENT_SOCKET_SEND_BUFFER_BYTES"),
+            Some("transport.socket_recv_buffer_bytes") => ("socket_recv_buffer_bytes", "ARROWCOL_CLIENT_SOCKET_RECV_BUFFER_BYTES"),
+            Some("transport.grpc_max_encode_bytes") => ("grpc_max_encode_bytes", "ARROWCOL_CLIENT_GRPC_MAX_ENCODE_BYTES"),
+            Some("transport.grpc_max_decode_bytes") => ("grpc_max_decode_bytes", "ARROWCOL_CLIENT_GRPC_MAX_DECODE_BYTES"),
             Some("transport.grpc_send_compression") => ("grpc_send_compression", "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION"),
             Some("transport.grpc_accept_compression") => ("grpc_accept_compression", "ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION"),
             Some("transport.ipc_compression") | Some("arrow_ipc.compression") => ("ipc_compression", "ARROWCOL_CLIENT_IPC_COMPRESSION"),
@@ -716,13 +720,64 @@ fn promote_client_readback(config: &OatConfig, evidence: &mut Value, reports: Op
                 return true;
             }
         }
+        if matches!(field, "socket_send_buffer_bytes" | "socket_recv_buffer_bytes")
+            && reports.iter().any(|report| {
+                let effective = &report["consumer_effective_config"];
+                let expected = effective["workers"].as_u64().zip(effective["connections_per_worker"].as_u64())
+                    .and_then(|(workers, per_worker)| workers.checked_mul(per_worker));
+                let sockets = effective.pointer("/applied_transport/socket_connections").and_then(Value::as_array);
+                let final_sockets = effective.pointer("/final_transport/socket_connections").and_then(Value::as_array);
+                !expected.is_some_and(|count| count > 0 && sockets.is_some_and(|sockets| {
+                    sockets.len() as u64 == count && final_sockets.is_some_and(|final_sockets| {
+                        final_sockets.len() == sockets.len() && sockets.iter().zip(final_sockets).all(|(socket, final_socket)| {
+                            let (key, requested, clamped) = if field == "socket_send_buffer_bytes" {
+                                ("send_buffer_bytes", "requested_send_buffer_bytes", "send_buffer_kernel_clamp_observed")
+                            } else { ("recv_buffer_bytes", "requested_recv_buffer_bytes", "recv_buffer_kernel_clamp_observed") };
+                            socket.get(key).and_then(Value::as_u64).is_some_and(|value| value > 0)
+                                && socket.get(requested) == effective.get(field)
+                                && socket.get("generation").and_then(Value::as_u64).is_some_and(|value| value > 0)
+                                && ["generation", key, requested, clamped].iter().all(|name| socket.get(*name) == final_socket.get(*name))
+                        })
+                    })
+                }))
+            })
+        {
+            return true;
+        }
+        if matches!(field, "max_frame_bytes" | "keepalive_interval_ms" | "keepalive_timeout_ms" | "grpc_max_encode_bytes" | "grpc_max_decode_bytes")
+            && reports.iter().any(|report| {
+                let effective = &report["consumer_effective_config"];
+                effective.pointer(&format!("/applied_transport/{field}")) != effective.get(field)
+                    || effective.pointer(&format!("/final_transport/{field}")) != effective.get(field)
+            })
+        {
+            return true;
+        }
         if !environment.contains_key(variable)
             || reports.iter().any(|report| report["consumer_effective_config"].get(field).is_none())
         {
             return true;
         }
+        if matches!(field, "socket_send_buffer_bytes" | "socket_recv_buffer_bytes") {
+            let (key, clamped) = if field == "socket_send_buffer_bytes" {
+                ("send_buffer_bytes", "send_buffer_kernel_clamp_observed")
+            } else { ("recv_buffer_bytes", "recv_buffer_kernel_clamp_observed") };
+            let readbacks = reports.iter().map(|report| json!({
+                "client_id": report["client_id"],
+                "requested_bytes": report["consumer_effective_config"][field],
+                "connections": report["consumer_effective_config"]["applied_transport"]["socket_connections"]
+                    .as_array().into_iter().flatten().map(|socket| json!({
+                        "generation": socket["generation"], "effective_bytes": socket[key],
+                        "kernel_clamp_observed": socket[clamped]
+                    })).collect::<Vec<_>>()
+            })).collect::<Vec<_>>();
+            promoted.push(json!({"path": entry["path"], "reason": "stable_kernel_socket_readback", "readbacks": readbacks}));
+            return false;
+        }
         promoted.push(json!({"path": entry["path"], "reason": if matches!(field, "pod_ordinal" | "guid_uniqueness" | "value_variation" | "string_width" | "string_length_distribution" | "entropy" | "cardinality" | "seed" | "skew") {
             "consumer_startup_and_prepared_corpus"
+        } else if matches!(field, "max_frame_bytes" | "keepalive_interval_ms" | "keepalive_timeout_ms" | "grpc_max_encode_bytes" | "grpc_max_decode_bytes") {
+            "stable_transport_builder_application"
         } else { "consumer_startup_readback" }}));
         false
     });

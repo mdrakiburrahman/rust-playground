@@ -348,6 +348,59 @@ fn process_configurations(text: &str) -> Result<Value> {
     let mut delta_io_runtime_build_seen = false;
     let mut client_build_profile_seen = false;
     for line in text.lines() {
+        let transport = [("OAT_CLIENT_APPLIED_TRANSPORT ", "applied_transport"),
+            ("OAT_CLIENT_FINAL_TRANSPORT ", "final_transport")]
+            .into_iter().find_map(|(prefix, key)| line.strip_prefix(prefix).map(|value| (key, value)));
+        if let Some((key, value)) = transport {
+            if configuration.get(key).is_some() {
+                bail!("duplicate OAT client transport readback");
+            }
+            let value: Value = serde_json::from_str(value).context("invalid OAT client applied transport readback")?;
+            let object = value
+                .as_object()
+                .context("client applied transport readback must be an object")?;
+            let fields = [
+                "max_frame_bytes",
+                "keepalive_interval_ms",
+                "keepalive_timeout_ms",
+                "grpc_max_encode_bytes",
+                "grpc_max_decode_bytes",
+            ];
+            let sockets = object
+                .get("socket_connections")
+                .and_then(Value::as_array)
+                .context("client transport omitted socket readbacks")?;
+            let accounting = object.get("socket_buffer_accounting").and_then(Value::as_str);
+            if object.len() != fields.len() + 2
+                || !matches!(accounting, Some("linux_doubled" | "unsupported"))
+                || (accounting != Some("linux_doubled") && !sockets.is_empty())
+                || fields
+                    .iter()
+                    .any(|field| object.get(*field).and_then(Value::as_u64).is_none())
+                || sockets.iter().any(|socket| {
+                    socket.as_object().is_none_or(|object| {
+                        object.len() != 7
+                            || object.get("generation").and_then(Value::as_u64).is_none_or(|generation| generation == 0)
+                            || ["send", "recv"].iter().any(|direction| {
+                                let effective = object.get(&format!("{direction}_buffer_bytes")).and_then(Value::as_u64);
+                                let requested = object.get(&format!("requested_{direction}_buffer_bytes"));
+                                let clamped = object.get(&format!("{direction}_buffer_kernel_clamp_observed"));
+                                let Some(effective) = effective.filter(|value| *value > 0) else { return true; };
+                                match (requested, clamped) {
+                                    (Some(Value::Null), Some(Value::Null)) => false,
+                                    (Some(requested), Some(clamped)) => requested.as_u64().filter(|value| *value > 0)
+                                        .is_none_or(|requested| clamped.as_bool() != Some(effective / 2 < requested)),
+                                    _ => true,
+                                }
+                            })
+                    })
+                })
+            {
+                bail!("invalid OAT client applied transport settings");
+            }
+            configuration[key] = value;
+            continue;
+        }
         if let Some(value) = line.strip_prefix("OAT_CLIENT_BUILD_PROFILE ") {
             if client_build_profile_seen {
                 bail!("duplicate OAT client build-profile readback");
@@ -3443,6 +3496,97 @@ groups:
         Ok(())
     }
 
+    #[test]
+    fn transport_promotion_requires_applied_and_socket_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.clients_per_table = 1;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
+            "socket_send_buffer_bytes":4096, "max_frame_bytes":32768,
+            "grpc_max_encode_bytes":4194304, "grpc_max_decode_bytes":1024
+        }}))?;
+        let mut report = json!({"client_id":"client-1", "consumer_effective_config":{
+            "workers":2, "connections_per_worker":2, "socket_send_buffer_bytes":4096,
+            "max_frame_bytes":32768, "grpc_max_encode_bytes":4194304, "grpc_max_decode_bytes":1024
+        }});
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut evidence, Some(&vec![report.clone()]))?;
+        assert!(
+            evidence["consumer_verified"]
+                .as_array()
+                .context("consumer_verified")?
+                .is_empty()
+        );
+        report["consumer_effective_config"]["applied_transport"] = json!({
+            "max_frame_bytes":32768, "keepalive_interval_ms":10000, "keepalive_timeout_ms":20000,
+            "grpc_max_encode_bytes":4194304, "grpc_max_decode_bytes":1024,
+            "socket_buffer_accounting":"linux_doubled",
+            "socket_connections": [
+                {"generation":1,"requested_send_buffer_bytes":4096,"requested_recv_buffer_bytes":null,
+                 "send_buffer_bytes":4096,"recv_buffer_bytes":16384,
+                 "send_buffer_kernel_clamp_observed":true,"recv_buffer_kernel_clamp_observed":null},
+                {"generation":1,"requested_send_buffer_bytes":4096,"requested_recv_buffer_bytes":null,
+                 "send_buffer_bytes":8192,"recv_buffer_bytes":16384,
+                 "send_buffer_kernel_clamp_observed":false,"recv_buffer_kernel_clamp_observed":null},
+                {"generation":1,"requested_send_buffer_bytes":4096,"requested_recv_buffer_bytes":null,
+                 "send_buffer_bytes":8192,"recv_buffer_bytes":16384,
+                 "send_buffer_kernel_clamp_observed":false,"recv_buffer_kernel_clamp_observed":null},
+                {"generation":1,"requested_send_buffer_bytes":4096,"requested_recv_buffer_bytes":null,
+                 "send_buffer_bytes":8192,"recv_buffer_bytes":16384,
+                 "send_buffer_kernel_clamp_observed":false,"recv_buffer_kernel_clamp_observed":null}
+            ]
+        });
+        // Startup alone cannot establish that the same sockets survived the run.
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut evidence, Some(&vec![report.clone()]))?;
+        assert!(evidence["consumer_verified"].as_array().context("consumer_verified")?.is_empty());
+        report["consumer_effective_config"]["final_transport"] = report["consumer_effective_config"]["applied_transport"].clone();
+        let readback = &report["consumer_effective_config"]["applied_transport"];
+        let output = format!("OAT_CLIENT_APPLIED_TRANSPORT {readback}\nOAT_CLIENT_FINAL_TRANSPORT {readback}\n");
+        let parsed = process_configurations(&output)?;
+        assert_eq!(parsed["applied_transport"], parsed["final_transport"]);
+        assert!(process_configurations(&format!("{output}OAT_CLIENT_FINAL_TRANSPORT {readback}\n")).is_err());
+        let mut invalid = readback.clone();
+        invalid["socket_connections"][0]["send_buffer_kernel_clamp_observed"] = json!(false);
+        assert!(process_configurations(&format!("OAT_CLIENT_APPLIED_TRANSPORT {invalid}\n")).is_err());
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut evidence, Some(&vec![report.clone()]))?;
+        let verified = evidence["consumer_verified"].as_array().context("consumer_verified")?;
+        assert_eq!(verified.len(), 4);
+        let socket = verified.iter().find(|entry| entry["path"] == "transport.socket_send_buffer_bytes").context("socket evidence")?;
+        assert_eq!(socket["readbacks"][0]["requested_bytes"], 4096);
+        assert_eq!(socket["readbacks"][0]["connections"][0]["effective_bytes"], 4096);
+        assert_eq!(socket["readbacks"][0]["connections"][0]["kernel_clamp_observed"], true);
+        assert_eq!(socket["readbacks"][0]["connections"].as_array().context("connections")?.len(), 4);
+        let mut reconnected = report.clone();
+        reconnected["consumer_effective_config"]["final_transport"]["socket_connections"][3]["generation"] = json!(2);
+        let mut changed_buffer = report.clone();
+        changed_buffer["consumer_effective_config"]["final_transport"]["socket_connections"][0]["send_buffer_bytes"] = json!(8192);
+        let mut missing_socket = report.clone();
+        missing_socket["consumer_effective_config"]["final_transport"]["socket_connections"].as_array_mut().context("sockets")?.pop();
+        let mut wrong_request = report.clone();
+        wrong_request["consumer_effective_config"]["applied_transport"]["socket_connections"][0]["requested_send_buffer_bytes"] = json!(1024);
+        for bad in [reconnected, changed_buffer, missing_socket, wrong_request] {
+            let mut evidence = tunable_leaf_evidence(&config)?;
+            promote_client_readback(&config, &mut evidence, Some(&vec![bad]))?;
+            assert!(!evidence["consumer_verified"].as_array().context("consumer_verified")?.iter()
+                .any(|entry| entry["path"] == "transport.socket_send_buffer_bytes"));
+        }
+        report["consumer_effective_config"]["applied_transport"]["max_frame_bytes"] = json!(16384);
+        report["consumer_effective_config"]["applied_transport"]["socket_connections"] = json!([]);
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_client_readback(&config, &mut evidence, Some(&vec![report]))?;
+        assert_eq!(
+            evidence["consumer_verified"]
+                .as_array()
+                .context("consumer_verified")?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
     fn actual_client_startup(binary: &Path, config: &OatConfig) -> Result<Value> {
         let table = config.tables.first().context("startup fixture needs a table")?;
         let mut command = std::process::Command::new(binary);
@@ -3579,8 +3723,19 @@ groups:
                 } else {
                     format!("{}.{}", if input.get("client").is_some() { "client" } else { "transport" }, field)
                 };
-                assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-                    .iter().any(|entry| entry["path"] == path), "missing verified field {path}");
+                let verified = covered["consumer_verified"]
+                    .as_array()
+                    .context("consumer_verified array")?
+                    .iter()
+                    .any(|entry| entry["path"] == path);
+                assert_eq!(
+                    verified,
+                    !matches!(
+                        field,
+                        "max_frame_bytes" | "keepalive_interval_ms" | "keepalive_timeout_ms"
+                    ),
+                    "unexpected verification without a connected transport for {path}"
+                );
                 let mut wrong_report = report.clone();
                 wrong_report["consumer_effective_config"][field] = json!("wrong");
                 for reports in [vec![], vec![wrong_report], vec![report.clone(), report]] {
