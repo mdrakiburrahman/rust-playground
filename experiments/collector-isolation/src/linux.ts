@@ -14,6 +14,12 @@ export function parseTask(text: string): Task {
   if (left < 0 || right <= left || !/^\d+$/.test(fields[19]) || !Number.isSafeInteger(ticks) || ticks < 0) throw Error('Invalid Linux task stat');
   return {name: text.slice(left + 1, right), cpuTicks: ticks, startTicks: fields[19]};
 }
+/** Process-lifetime scheduler and fault counters from `/proc/PID/stat`, excluding children. */
+export function parseTaskCounters(text: string): Values {
+  const fields = text.slice(text.lastIndexOf(')') + 2).trim().split(/\s+/);
+  return {userTicks: finite(Number(fields[11])), systemTicks: finite(Number(fields[12])),
+    minorFaults: finite(Number(fields[7])), majorFaults: finite(Number(fields[9]))};
+}
 export function parseDevices(net: string | null, disk: string | null, system: Pick<System, 'interfaces' | 'disks'>): Values {
   const values: Values = {};
   for (const iface of system.interfaces) {
@@ -75,6 +81,10 @@ export async function sampleLinux(s: System, boundary: boolean): Promise<Linux> 
   const values = {...parseDevices(net, disk, s),...cg};
   const p = parseTask(stat);
   values.cpuTicks = p.cpuTicks;
+  Object.assign(values, parseTaskCounters(stat));
+  for (const [key, field] of Object.entries({voluntarySwitches: 'voluntary_ctxt_switches', involuntarySwitches: 'nonvoluntary_ctxt_switches'})) {
+    values[key] = finite(Number(status?.match(new RegExp(`^${field}:\\s*(\\d+)$`, 'm'))?.[1]));
+  }
   for (const key of ['read_bytes', 'write_bytes', 'cancelled_write_bytes']) values[`io.${key}`] = finite(Number(io?.match(new RegExp(`^${key}:\\s*(\\d+)$`, 'm'))?.[1]));
   values.rssBytes = finite(Number(status?.match(/^VmRSS:\s*(\d+) kB$/m)?.[1]) * 1024);
   return {process: p, cpusAllowed:status?.match(/^Cpus_allowed_list:\s*([0-9,-]+)$/m)?.[1]??null, netns, threads, values};

@@ -6,7 +6,7 @@ import {randomUUID} from 'node:crypto';
 import {join} from 'node:path';
 import {chart,cpuSecondsPerMillionRows} from './chart.ts';
 import {collectorMetrics,type Values} from './metrics.ts';
-import {parseDevices,parseTask,sampleLinux,systemInfo} from './linux.ts';
+import {parseDevices,parseTask,parseTaskCounters,sampleLinux,systemInfo} from './linux.ts';
 import {clientEvidence,committedEvidence,commitLogEvidence} from './evidence.ts';
 import {reduce,physicalEvidence,isolationEvidence,type Header,type Sample} from './reduce.ts';
 
@@ -17,7 +17,7 @@ const samples=():Sample[]=>[0,1,4].map((t,i)=>{
   const p:Values={received_rows_total:100+5*t,'reserved.global.bytes':held,'duration.commit.sum':t*.25,'groupSeconds.flush_slot':t*3,'groupSeconds.receipt_wait':t*1.5,'acquire_seconds_total.table.bytes':t*.75,'acquire_attempts_total.table.bytes':t*4,publication_backlog_available:1,
     'backlog.bytes':held, publication_settled_bytes_total:10*t,publication_settled_byte_seconds_total:5*t};
   const linux={process:{name:'collector',startTicks:'80',cpuTicks:ticks},netns:'net:[7]',threads:t===1?null:{
-    7:{name:'worker',startTicks:'80',cpuTicks:ticks},9:{name:'recycled',startTicks:String(t),cpuTicks:40}},values:{cpuTicks:ticks,'net.lo.rxBytes':11*t,'disk.vda.writeSectors':4*t}};
+    7:{name:'worker',startTicks:'80',cpuTicks:ticks},9:{name:'recycled',startTicks:String(t),cpuTicks:40}},values:{cpuTicks:ticks,userTicks:20*t,systemTicks:5*t,minorFaults:100*t,majorFaults:0,'net.lo.rxBytes':11*t,'disk.vda.writeSectors':4*t}};
   return {targetMs:ms,wallClockOffsetMs:0,prom:obs(ms,p),linux:obs(ms,linux)};
 });
 test('duration-weighted backlog and byte-weighted residence share one successful-settlement population',()=>{
@@ -25,7 +25,7 @@ test('duration-weighted backlog and byte-weighted residence share one successful
   assert.equal(r.littleLaw.sampledLogicalBytes?.timeWeightedMean,4);assert.equal(r.littleLaw.byteWeightedResidenceSeconds,.5);
   assert.equal(r.littleLaw.impliedBytesPerSecond,8);assert.equal(r.littleLaw.observedSettledBytesPerSecond,10);
   assert.equal(r.collector.flush.receiptWaitFractionOfCompletedSlotTime,.5);assert.equal(r.collector.capacityAcquisitions['table.bytes'].acquireSecondsPerElapsedSecond,.75);
-  assert.equal(r.linux.processCores,.25);assert.equal(r.linux.threads.matched?.length,1);assert.equal(r.linux.interfaces.lo?.rxBytesPerSecond,11);assert.equal(r.linux.disks.vda.writeBytesPerSecond,2048);
+  assert.equal(r.linux.processCores,.25);assert.equal(r.linux.scheduler.userCores,.2);assert.equal(r.linux.scheduler.systemCores,.05);assert.equal(r.linux.scheduler.systemFraction,.2);assert.equal(r.linux.scheduler.minorFaultsPerSecond,100);assert.equal(r.linux.scheduler.majorFaultsPerSecond,0);assert.equal(r.linux.scheduler.voluntarySwitchesPerSecond,null);assert.equal(r.linux.threads.matched?.length,1);assert.equal(r.linux.interfaces.lo?.rxBytesPerSecond,11);assert.equal(r.linux.disks.vda.writeBytesPerSecond,2048);
 });
 test('resets, unavailable backlog, late edge, and recycled process never fabricate an interval',()=>{
   const s=samples();s[1].prom.value!.received_rows_total=3;s[1].prom.value!.publication_backlog_available=0;
@@ -38,9 +38,10 @@ test('NaN, ambiguous series and absent device counters stay unknown',()=>{
   assert.equal(v['backlog.bytes'],null);assert.equal(v.received_rows_total,0);assert.equal(v['duration.commit.sum'],null);
   assert.equal(parseDevices(' lo: 2 1 0 1 0 0 0 0 4 3 2 1 0 0 0 0',null,h.system)['net.lo.txErrors'],2);assert.equal(parseDevices(null,null,h.system)['disk.vda.writeSectors'],null);
   assert.throws(()=>parseTask('7 (not valid)'),/Invalid/);
+  assert.deepEqual(parseTaskCounters('7 (a b) S 1 7 7 0 -1 4194560 41 3 2 1 13 5 0 0 20 0 9 0 80'),{userTicks:13,systemTicks:5,minorFaults:41,majorFaults:2});
 });
 test('linux sampler can read one real snapshot without assuming a physical NIC or disk',async()=>{
-  const s=await systemInfo(process.pid,[],[]),value=await sampleLinux(s,true);assert.ok(Object.keys(value.threads!).length>0);assert.ok(value.process.startTicks.length);assert.ok(value.values.cpuTicks!==null);
+  const s=await systemInfo(process.pid,[],[]),value=await sampleLinux(s,true);assert.ok(Object.keys(value.threads!).length>0);assert.ok(value.process.startTicks.length);assert.ok(value.values.cpuTicks!==null);assert.ok((value.values.userTicks??-1)>=0&&(value.values.minorFaults??-1)>0&&(value.values.voluntarySwitches??-1)>=0);
 });
 test('client exact send starts never fall back to lifetime attempts, require complete distinct terminal roster and receipt kind',()=>{
   const window={start_unix_ms:h.startMs,end_unix_ms:h.endMs,completed_rows:20,offered_rows:40};
