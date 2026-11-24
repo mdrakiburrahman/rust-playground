@@ -2994,7 +2994,7 @@ mod consumer_startup_projection_tests {
                     "max_batches_per_flush":333,"max_age":"12s","max_concurrent_flushes":2},
                 "commit":{"batch_window":"3s","max_files_per_commit":7,"max_pending_files":13,
                     "txn_lookup_mode":"incremental","snapshot_cache_mode":"checkpoint_aware",
-                    "checkpoint_mode":"async","checkpoint_interval":17,"trigger":"eager"},
+                    "preflight_lookup_mode":"grouped","checkpoint_mode":"async","checkpoint_interval":17,"trigger":"eager"},
                 "pressure":{"max_concurrent_streams":23,"rss_limit_bytes":1073741824,
                     "buffered_bytes_limit":134217728,"buffered_rows_limit":100000,
                     "buffered_batches_limit":123,"pressure_interval":"3s",
@@ -3121,6 +3121,7 @@ groups:
         let observed = process_configurations(&text.context("collector did not produce readback")?)?;
         assert_eq!(observed["commit"]["txn_lookup_mode"], "incremental");
         assert_eq!(observed["commit"]["snapshot_cache_mode"], "checkpoint_aware");
+        assert_eq!(observed["commit"]["preflight_lookup_mode"], "grouped");
         assert_eq!(observed["commit"]["checkpoint_mode"], "async");
         assert_eq!(observed["commit"]["checkpoint_interval"], 17);
         assert_eq!(observed["commit"]["trigger"], "eager");
@@ -3157,6 +3158,7 @@ groups:
         for path in [
             "collector.commit.txn_lookup_mode",
             "collector.commit.snapshot_cache_mode",
+            "collector.commit.preflight_lookup_mode",
             "collector.commit.checkpoint_mode",
             "collector.commit.checkpoint_interval",
             "collector.commit.trigger",
@@ -3256,6 +3258,7 @@ groups:
                     "max_pending_files",
                     "txn_lookup_mode",
                     "snapshot_cache_mode",
+                    "preflight_lookup_mode",
                     "checkpoint_mode",
                     "checkpoint_interval",
                 ][..],

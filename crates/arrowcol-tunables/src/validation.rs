@@ -552,6 +552,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.discovery_max_log_file_bytes", "67108864"),
     capability!("collector.isolation_level", "l5"),
     capability!("collector.commit.snapshot_cache_mode", "json_only"),
+    capability!("collector.commit.preflight_lookup_mode", "per_entry"),
     capability!("collector.commit.checkpoint_mode", "external"),
     capability!("collector.commit.checkpoint_interval", "10"),
     capability!("collector.socket.h2_stream_window_bytes", "tonic default"),
@@ -2069,6 +2070,7 @@ fn commit_modes_reject_invalid_inputs_by_field_name() -> Result<()> {
     for (field, misspelled) in [
         ("txn_lookup_mode", "Incremental"),
         ("snapshot_cache_mode", "checkpoint-aware"),
+        ("preflight_lookup_mode", "Grouped"),
         ("checkpoint_mode", "Async"),
     ] {
         for value in [
