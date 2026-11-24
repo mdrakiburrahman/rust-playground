@@ -12,6 +12,121 @@ const TUNABLES_SOURCE: &str = include_str!("../src/lib.rs");
 const WRITER_SOURCE: &str = include_str!("../../arrow-deltalake/src/writer.rs");
 
 #[test]
+fn delta_literal_properties_are_strict_and_match_initialization_bounds() -> Result<()> {
+    use arrowcol_tunables::DeltaTunables;
+    use std::collections::BTreeMap;
+
+    let empty = Tunables::parse_oat_json(json!({}))?;
+    assert!(empty.delta.is_none());
+    assert!(serde_json::to_value(&empty)?.get("delta").is_none());
+    let configured = Tunables::parse_oat_json(json!({"delta":{
+        "target_file_size_bytes": 67_108_864, "checkpoint_interval": 17
+    }}))?;
+    let delta = configured.delta.as_ref().context("missing delta")?;
+    assert_eq!(delta.target_file_size_bytes, Some(67_108_864));
+    assert_eq!(delta.checkpoint_interval, Some(17));
+    assert_eq!(configured.environment()?, empty.environment()?);
+
+    for field in ["target_file_size_bytes", "checkpoint_interval"] {
+        for bad in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(1.0),
+            json!("1"),
+            json!(true),
+        ] {
+            let input = json!({"delta": {(field): bad}});
+            let error = Tunables::parse_oat_json(input)
+                .err()
+                .context("accepted invalid Delta property")?;
+            assert!(
+                format!("{error:#}").contains(&format!("delta.{field}")),
+                "wrong error path: {error:#}"
+            );
+        }
+    }
+    for input in [
+        json!({"delta":null}),
+        json!({"delta":"invalid"}),
+        json!({"delta":{"unknown":1}}),
+    ] {
+        let error = Tunables::parse_oat_json(input)
+            .err()
+            .context("accepted invalid delta section")?;
+        assert!(format!("{error:#}").contains("delta"), "wrong error path: {error:#}");
+    }
+    let error = Tunables::parse_oat_json(json!({"delta":{"unknown":1}}))
+        .err()
+        .context("accepted unknown field")?;
+    assert!(format!("{error:#}").contains("delta.unknown"));
+
+    for (field, property, values) in [
+        (
+            "target_file_size_bytes",
+            "delta.targetFileSize",
+            vec![0, 1, 67_108_864, 1_072_693_248, 1_072_693_249, u64::MAX],
+        ),
+        (
+            "checkpoint_interval",
+            "delta.checkpointInterval",
+            vec![0, 1, 17, u64::MAX],
+        ),
+    ] {
+        for value in values {
+            let properties = BTreeMap::from([(property.to_owned(), value.to_string())]);
+            let expected = arrowcol_props::validate_table_properties(&properties).is_ok();
+            let actual = Tunables::parse_oat_json(json!({"delta": {(field): value}})).is_ok();
+            assert_eq!(actual, expected, "initialization bound mismatch for {field}={value}");
+        }
+    }
+    let direct = Tunables {
+        delta: Some(DeltaTunables {
+            target_file_size_bytes: Some(0),
+            checkpoint_interval: None,
+        }),
+        ..Default::default()
+    };
+    assert!(
+        format!(
+            "{:#}",
+            direct.validate().err().context("zero passed direct validation")?
+        )
+        .contains("delta.target_file_size_bytes")
+    );
+    Ok(())
+}
+
+#[test]
+fn delta_literals_are_table_initialization_runner_controls() -> Result<()> {
+    use arrowcol_tunables::{ApplyBoundary, capability_table};
+    let settings = Tunables::parse_oat_json(json!({"delta":{
+        "target_file_size_bytes": 67_108_864, "checkpoint_interval": 17
+    }}))?;
+    let evidence = settings.classify_oat_leaves()?;
+    assert_eq!(
+        evidence["runner_controls"],
+        json!([
+            {"path":"delta.checkpoint_interval", "reason":"delta_table_initialization"},
+            {"path":"delta.target_file_size_bytes", "reason":"delta_table_initialization"}
+        ])
+    );
+    assert_eq!(evidence["projection_only"], json!([]));
+    for path in ["delta.target_file_size_bytes", "delta.checkpoint_interval"] {
+        assert_eq!(
+            capability_table()
+                .iter()
+                .find(|entry| entry.name == path)
+                .context("missing delta capability")?
+                .boundary,
+            ApplyBoundary::ProcessStartup
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn connection_backoff_is_inert_only_when_retries_are_disabled() -> Result<()> {
     for (retries, expected) in [(None, true), (Some(0), true), (Some(2), false)] {
         let mut transport = json!({"retry_backoff_ms": 37});
@@ -264,6 +379,7 @@ fn classify(path: &str) -> LeafClass {
         | "collector.codegen_units"
         | "collector.opt_level"
         | "collector.target_cpu" => LeafClass::RunnerControl,
+        "delta.target_file_size_bytes" | "delta.checkpoint_interval" => LeafClass::RunnerControl,
         "client.build_profile.lto"
         | "client.build_profile.codegen_units"
         | "client.build_profile.opt_level"
