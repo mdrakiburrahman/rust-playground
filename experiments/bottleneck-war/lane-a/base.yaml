@@ -1,0 +1,91 @@
+version: otel_dataflow/v1
+engine:
+  shutdown_drain_timeout_seconds: 60
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: ${env:BWA_CORES:-24}
+groups:
+  arrowcol:
+    pipelines:
+      ingest:
+        policies:
+          channel_capacity:
+            control:
+              node: 64
+              pipeline: 64
+            pdata: ${env:BWA_PDATA:-32}
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: 127.0.0.1:32010
+              admin_listening_addr: 127.0.0.1:32011
+              native_quiver: false
+              catalog:
+                type: remote
+                endpoint: http://127.0.0.1:8817
+              routing:
+                type: standalone
+              registration:
+                instance_key: bwa
+                flight_endpoint: 127.0.0.1:32010
+                max_concurrent_streams: ${env:BWA_STREAMS:-256}
+                heartbeat_interval: 5s
+                pressure_interval: 2s
+                registration_ttl: 30s
+                rss_limit_bytes: ${env:BWA_RSS:-107374182400}
+                buffered_bytes_limit: ${env:BWA_BUF_BYTES:-4290000000}
+                buffered_rows_limit: ${env:BWA_BUF_ROWS:-25000000}
+                buffered_batches_limit: 16384
+              limits:
+                max_metadata_bytes: 16384
+                max_schema_bytes: 1048576
+                max_message_bytes: 134217728
+                batch_channel_capacity: ${env:BWA_BCC:-4}
+                put_result_channel_capacity: 16
+                max_stream_duration: 5m
+                admission_timeout: 30s
+                max_ddl_bytes: 65536
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: ${env:BWA_ROOT:-/tmp/bwa/delta}
+              routing:
+                type: standalone
+              commit:
+                txn_lookup_mode: ${env:BWA_TXN:-batched}
+                batch_window: ${env:BWA_BW:-2s}
+                max_files_per_commit: ${env:BWA_MFC:-128}
+                max_pending_files: ${env:BWA_MPF:-512}
+              batching:
+                global_capacity:
+                  bytes: ${env:BWA_GCAP_BYTES:-4290000000}
+                  rows: ${env:BWA_GCAP_ROWS:-25000000}
+                  batches: 16384
+                per_table_capacity:
+                  bytes: ${env:BWA_TCAP_BYTES:-4000000000}
+                  rows: ${env:BWA_TCAP_ROWS:-12000000}
+                  batches: 8192
+                max_arrow_memory_per_flush: ${env:BWA_MAMF:-1073741824}
+                max_rows_per_flush: ${env:BWA_MRPF:-2000000}
+                max_batches_per_flush: 2048
+                max_age: ${env:BWA_MAXAGE:-60s}
+                max_concurrent_flushes: ${env:BWA_MCF:-12}
+                stage_file_concurrency: ${env:BWA_SFC:-1}
+                adaptive_file:
+                  target_parquet_bytes: ${env:BWA_TARGET:-134217728}
+                  min_input_bytes: 1048576
+                  max_input_bytes: 1073741824
+                  cold_start_parquet_ratio: 0.25
+                  ewma_weight: 0.2
+                  min_parquet_ratio: 0.015625
+                  max_parquet_ratio: 4
+                coalesce_publications: true
+                age_flush_policy: drain_ready
+                pipeline_depth: ${env:BWA_PD:-8}
+              authority_timeout: 10s
+        connections:
+          - from: flight
+            to: delta
