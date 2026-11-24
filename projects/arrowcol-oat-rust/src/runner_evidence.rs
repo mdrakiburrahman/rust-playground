@@ -457,6 +457,7 @@ struct CellEvidence {
     cpu_quota: Option<Value>,
     overload_guard: Option<Value>,
     overload_stop: Option<Value>,
+    downstream_reason: Option<String>,
     downstream_comment: Option<String>,
     qap_observation: Option<Value>,
     native_telemetry: Option<Value>,
@@ -778,13 +779,15 @@ fn classify_local_qap_error(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl CellEvidence {
-    fn downstream_unavailable(&mut self, reason: impl Into<String>) {
-        let reason = reason.into();
+    fn downstream_unavailable(&mut self, reason: &str, comment: impl Into<String>) {
+        let comment = comment.into();
         tracing::warn!(
             reason = %reason,
+            comment = %comment,
             "downstream observation unavailable; preserving local collector evidence"
         );
-        self.downstream_comment.get_or_insert(reason);
+        self.downstream_reason.get_or_insert_with(|| reason.to_owned());
+        self.downstream_comment.get_or_insert(comment);
     }
 
     fn resource_summary(&self) -> Option<ResourceMetrics> {
@@ -1025,6 +1028,7 @@ impl CellEvidence {
             "commit_window_output_throughput": output,
             "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
+            "downstream_reason": self.downstream_reason,
             "downstream_comment": self.downstream_comment,
             "qap_observation": self.qap_observation,
             "native_telemetry": self.native_telemetry,
@@ -2087,9 +2091,10 @@ mod measurement_evidence_tests {
         assert!(local_downstream_optional(crate::config::OatMode::Local));
         assert!(!local_downstream_optional(crate::config::OatMode::Aks));
         let mut evidence = CellEvidence::default();
-        evidence.downstream_unavailable("local_qap_initialization_unavailable");
+        evidence.downstream_unavailable("local_qap_initialization_unavailable", "Local QAP initialization unavailable.");
         let public = evidence.for_table("table", None);
         assert_eq!(public["downstream_status"], "unavailable");
+        assert_eq!(public["downstream_reason"], "local_qap_initialization_unavailable");
         assert!(public["rows"]["delta_committed"].is_null());
         assert_eq!(public["reconciliation"]["status"], "unavailable");
         assert_eq!(public["reconciliation"]["reason"], "cumulative_delta_rows_unavailable");
@@ -3131,6 +3136,7 @@ mod downstream_runner_tests {
         PinInitFailed,
         GuardUnavailable,
         ObservationUnavailable,
+        ObservationInvalidJson,
         InitBindingRejected,
         ObservationBindingRejected,
         Collector,
@@ -3238,7 +3244,7 @@ mod downstream_runner_tests {
                     outcome.map_err(classify_local_qap_error)?;
                     Ok(vec!["observed".to_owned()])
                 }
-                Fault::ObservationUnavailable | Fault::ObservationBindingRejected => Ok(vec!["observed".to_owned()]),
+                Fault::ObservationUnavailable | Fault::ObservationInvalidJson | Fault::ObservationBindingRejected => Ok(vec!["observed".to_owned()]),
                 _ => Err(anyhow::anyhow!(LocalDownstreamUnavailable)),
             }
         }
@@ -3498,17 +3504,19 @@ mod downstream_runner_tests {
             "arrowcol_router_table_owners{pool=\"dataflow\",catalog=\"telemetry\",schema=\"sqlserver\",table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n"
         };
         let metric = format!("{metric}arrowcol_router_sql_connections_opened_total 0\n");
-        let downstream_status = if matches!(fault, Fault::InitBindingRejected | Fault::ObservationBindingRejected) {
-            axum::http::StatusCode::BAD_REQUEST
+        let (downstream_status, downstream_body) = if matches!(fault, Fault::ObservationInvalidJson) {
+            (axum::http::StatusCode::OK, "not-json")
+        } else if matches!(fault, Fault::InitBindingRejected | Fault::ObservationBindingRejected) {
+            (axum::http::StatusCode::BAD_REQUEST, "")
         } else {
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "")
         };
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 axum::Router::new()
                     .route("/metrics", axum::routing::get(move || async move { metric }))
-                    .fallback(move || async move { downstream_status }),
+                    .fallback(move || async move { (downstream_status, downstream_body) }),
             )
             .await
         });
@@ -3722,6 +3730,11 @@ mod downstream_runner_tests {
             let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing failure evidence")?)?;
             assert!(evidence["client_schedule"].is_null());
             assert!(evidence["backlog"]["measurement_window"].is_null());
+            let owner_sample = evidence["ownership_samples"].as_array().context("ownership samples")?
+                .last().context("failure-time ownership sample")?;
+            assert_eq!(owner_sample["require_owner"], true);
+            assert!(owner_sample["owners_by_table"].is_object());
+            assert!(owner_sample["unavailable_reason"].is_null());
             eprintln!("delivery_fault={fault:?} dropped_after_ms={dropped_after_ms} arm_attempts={} cancelled={:?}; measurement/schedule receipt absent", platform.arm_attempts, *cancelled);
         }
         Ok(())
@@ -3733,6 +3746,7 @@ mod downstream_runner_tests {
             Fault::InitUnavailable,
             Fault::InitTimeout,
             Fault::ObservationUnavailable,
+            Fault::ObservationInvalidJson,
         ] {
             let (rows, platform) = run_fault(fault, crate::config::OatMode::Local).await?;
             assert_eq!(rows[0].status, "succeeded", "failure: {:?}", rows[0].failure);
@@ -3740,6 +3754,10 @@ mod downstream_runner_tests {
             assert!(rows[0].qap.completion_percent.is_none());
             let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
             assert_eq!(evidence["downstream_status"], "unavailable");
+            if matches!(fault, Fault::ObservationInvalidJson) {
+                assert_eq!(evidence["downstream_reason"], "local_qap_observation_unavailable");
+                assert!(evidence["downstream_comment"].as_str().is_some_and(|comment| comment.contains("not valid JSON")));
+            }
             if matches!(fault, Fault::InitTimeout) {
                 assert!(platform.unresolved);
             }
