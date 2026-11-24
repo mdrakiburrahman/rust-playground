@@ -210,8 +210,8 @@ export function validateCampaignMeasurements(value: unknown): CampaignMeasuremen
     const before = raw.baselineBefore === undefined ? undefined : parseOfficialRun(raw.baselineBefore, `result ${index} baselineBefore`);
     const after = raw.baselineAfter === undefined ? undefined : parseOfficialRun(raw.baselineAfter, `result ${index} baselineAfter`);
     const disposition = raw.disposition == null ? undefined : requiredText(raw.disposition, `result ${index} disposition`);
-    const outcome = raw.outcome == null ? undefined : requiredText(raw.outcome, `result ${index} outcome`);
-    const status = raw.status == null ? undefined : requiredText(raw.status, `result ${index} status`);
+    const outcome = raw.outcome === undefined ? undefined : requiredText(raw.outcome, `result ${index} outcome`);
+    const status = raw.status === undefined ? undefined : requiredText(raw.status, `result ${index} status`);
     if (raw.pairOrder !== undefined && raw.pairOrder !== 'AB' && raw.pairOrder !== 'BA') {
       throw new Error(`result ${index} pairOrder must be AB or BA`);
     }
