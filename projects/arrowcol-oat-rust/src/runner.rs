@@ -1185,6 +1185,9 @@ trait Platform: Send + Sync {
         Ok(())
     }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
+    async fn finish_cleanup(&mut self, _config: &OatConfig, _rows: &[OatResult], _frozen: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct AksPlatform {
@@ -2035,6 +2038,37 @@ impl Platform for AksPlatform {
                 Some(json!({"status":"unavailable", "reason":"ordered_aks_shutdown_not_completed"}));
         }
         result
+    }
+
+    async fn finish_cleanup(&mut self, config: &OatConfig, rows: &[OatResult], frozen: bool) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        if !frozen {
+            bail!("campaign shutdown freeze was not confirmed; release remains unavailable");
+        }
+        let reconciliation = shutdown_reconciliation_request(rows);
+        let receipt = match finalize_campaign_shutdown(self, &reconciliation).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+                    evidence["finalization"] =
+                        json!({"status":"unavailable", "reason":"shutdown_finalization_unconfirmed"});
+                }
+                return Err(error.context("campaign shutdown finalization unavailable; release withheld"));
+            }
+        };
+        if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+            evidence["finalization"] = serde_json::to_value(&receipt)?;
+        }
+        ensure_shutdown_release(&receipt, rows)?;
+        let release = cleanup_campaign_aks_platform(config, self, CampaignCleanupPhase::Release).await?;
+        self.qap_cleanup_confirmed = true;
+        require_aks_cleanup_confirmation(self)?;
+        if let Some(evidence) = self.shutdown_drain_evidence.as_mut() {
+            evidence["release"] = release;
+        }
+        Ok(())
     }
 
     fn shutdown_drain_evidence(&self) -> Option<Value> {
@@ -3967,18 +4001,7 @@ async fn run_isolated_cell(
     }
     let shutdown_started = unix_time_ms_u64();
     let cleanup = platform.cleanup(&config).await;
-    let shutdown_drain_evidence = platform.shutdown_drain_evidence().map(|mut evidence| {
-        match shutdown_started {
-            Ok(timestamp) => evidence["ordered_shutdown_started_at_unix_ms"] = json!(timestamp),
-            Err(error) => {
-                evidence["ordered_shutdown_started_at_unix_ms"] = Value::Null;
-                evidence["ordered_shutdown_timestamp_unavailable_reason"] = json!(format!("{error:#}"));
-            }
-        }
-        evidence
-    });
-    let cleanup_succeeded = cleanup.is_ok();
-    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    let frozen = cleanup.is_ok();
     let stopped_logs = platform.stopped_commit_logs();
     if let Ok(rows) = &mut result
         && let Some((logs, baseline)) = &stopped_logs
@@ -3994,11 +4017,8 @@ async fn run_isolated_cell(
         }
     }
     if let Ok(rows) = &mut result
-        && let Err(error) = attach_collector_teardown_admissions(
-            rows,
-            stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()),
-            cleanup_succeeded,
-        )
+        && let Err(error) =
+            attach_collector_teardown_admissions(rows, stopped_logs.as_ref().map(|(logs, _)| logs.as_slice()), frozen)
     {
         for row in rows {
             row.status = "failed".to_owned();
@@ -4009,9 +4029,9 @@ async fn run_isolated_cell(
         && let Ok(rows) = &mut result
     {
         if config.platform.kind == crate::config::OatMode::Local {
-            attach_final_local_delta_reconciliation(&config, &run_id, rows, cleanup_succeeded);
+            attach_final_local_delta_reconciliation(&config, &run_id, rows, frozen);
         } else {
-            attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, cleanup_succeeded).await;
+            attach_final_aks_delta_reconciliation(&config, platform.delta_root(), rows, frozen).await;
         }
     }
     if !cancelled
@@ -4028,6 +4048,26 @@ async fn run_isolated_cell(
             });
         }
     }
+    let finalization = platform
+        .finish_cleanup(&config, result.as_deref().unwrap_or(&[]), frozen)
+        .await;
+    let cleanup = match (cleanup, finalization) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(final_error)) => Err(error.context(format!("finalize cleanup: {final_error:#}"))),
+    };
+    let cleanup_succeeded = cleanup.is_ok();
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup_succeeded;
+    let shutdown_drain_evidence = platform.shutdown_drain_evidence().map(|mut evidence| {
+        match shutdown_started {
+            Ok(timestamp) => evidence["ordered_shutdown_started_at_unix_ms"] = json!(timestamp),
+            Err(error) => {
+                evidence["ordered_shutdown_started_at_unix_ms"] = Value::Null;
+                evidence["ordered_shutdown_timestamp_unavailable_reason"] = json!(format!("{error:#}"));
+            }
+        }
+        evidence
+    });
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
@@ -11513,6 +11553,32 @@ enum CampaignCleanupAction {
     Handoff,
 }
 
+#[derive(Clone, Copy)]
+enum CampaignCleanupPhase {
+    Freeze,
+    Release,
+}
+
+impl CampaignCleanupPhase {
+    fn actions(self) -> &'static [CampaignCleanupAction] {
+        match self {
+            Self::Freeze => &[
+                CampaignCleanupAction::StopAdmission,
+                CampaignCleanupAction::BoundedDrain,
+                CampaignCleanupAction::EvidenceCapture,
+                CampaignCleanupAction::StopMaintenance,
+                CampaignCleanupAction::TerminalCapture,
+            ],
+            Self::Release => &[
+                CampaignCleanupAction::RemoveNamespace,
+                CampaignCleanupAction::RemoveQap,
+                CampaignCleanupAction::RemoveFic,
+                CampaignCleanupAction::Handoff,
+            ],
+        }
+    }
+}
+
 impl CampaignCleanupAction {
     fn selector(&self) -> &'static str {
         match self {
@@ -11637,6 +11703,416 @@ struct CampaignInventoryReadResponse {
     ok: bool,
     inventory: RunInventory,
     etag: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownSourceReference {
+    blob: String,
+    etag: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputsRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputs {
+    schema_version: u8,
+    inventory_etag: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    terminal_capture: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_before: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_terminal: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationInputsResponse {
+    ok: bool,
+    receipt: ShutdownFinalizationInputs,
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+    terminal_capture: &'a Option<ShutdownSourceReference>,
+    delta_before: &'a Option<ShutdownSourceReference>,
+    delta_terminal: &'a Option<ShutdownSourceReference>,
+    reconciliation: ShutdownReconciliationRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownReconciliationProof {
+    status: String,
+    post_teardown_verification: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    expected_rows: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    observed_rows: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    settled_zero_ambiguity: Option<bool>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    teardown_admissions_clear: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownReconciliationRequest {
+    profile: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    proof: Option<ShutdownReconciliationProof>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationOrigin {
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    namespace: InventoryNamespace,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalVerdict {
+    pod_name: String,
+    pod_uid: String,
+    container: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    restart_count: Option<u64>,
+    classification: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationReceipt {
+    schema_version: u8,
+    blob: String,
+    etag: String,
+    sha256: String,
+    inventory_etag: String,
+    actor: CampaignCleanupActor,
+    origin: ShutdownFinalizationOrigin,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    terminal_capture: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_before: Option<ShutdownSourceReference>,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    delta_terminal: Option<ShutdownSourceReference>,
+    verdicts: Vec<ShutdownFinalVerdict>,
+    status: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    reason_code: Option<String>,
+    release_allowed: bool,
+    reconciliation: ShutdownReconciliationRequest,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownFinalizationResponse {
+    ok: bool,
+    receipt: ShutdownFinalizationReceipt,
+}
+
+fn validate_shutdown_source(source: &ShutdownSourceReference, expected_blob: &str) -> Result<()> {
+    validate_campaign_etag(&source.etag)?;
+    if source.blob != expected_blob
+        || source.sha256.len() != 64
+        || !source
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("shutdown source does not match the exact original blob identity or SHA-256");
+    }
+    Ok(())
+}
+
+fn validate_shutdown_inputs(inputs: &ShutdownFinalizationInputs, inventory: &RunInventory, etag: &str) -> Result<()> {
+    inventory.validate()?;
+    validate_campaign_etag(etag)?;
+    if inputs.schema_version != 1 || inputs.inventory_etag != etag {
+        bail!("shutdown source lacks the exact frozen inventory ETag");
+    }
+    if !matches!(
+        inputs.unavailable_reason.as_deref(),
+        None | Some(
+            "no_baseline"
+                | "terminal_capture_unavailable"
+                | "terminal_delta_unavailable"
+                | "terminal_identity_unavailable"
+        )
+    ) || (inputs.unavailable_reason.is_none()
+        && (inputs.terminal_capture.is_none() || inputs.delta_before.is_none() || inputs.delta_terminal.is_none()))
+        || (inputs.delta_before.is_none() != (inputs.unavailable_reason.as_deref() == Some("no_baseline")))
+    {
+        bail!("shutdown source is incomplete or has an invalid unavailable reason");
+    }
+    let root = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}",
+        inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+    );
+    if let Some(source) = &inputs.terminal_capture {
+        let destination = inventory
+            .evidence_destination
+            .as_ref()
+            .context("missing shutdown evidence destination")?;
+        let capture = format!(
+            "{}/custody/{}/terminal_capture.json",
+            destination.blob_prefix.trim_end_matches('/'),
+            inventory.cell_run_id
+        );
+        validate_shutdown_source(source, &capture)?;
+    }
+    if let Some(source) = &inputs.delta_before {
+        validate_shutdown_source(source, &format!("{root}/delta-before.json"))?;
+    }
+    if let Some(source) = &inputs.delta_terminal {
+        validate_shutdown_source(source, &format!("{root}/delta-terminal.json"))?;
+    }
+    Ok(())
+}
+
+fn validate_shutdown_finalization(
+    receipt: &ShutdownFinalizationReceipt,
+    inventory: &RunInventory,
+    etag: &str,
+    actor: &CampaignCleanupActor,
+    inputs: &ShutdownFinalizationInputs,
+    reconciliation: &ShutdownReconciliationRequest,
+) -> Result<()> {
+    validate_shutdown_inputs(inputs, inventory, etag)?;
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}/shutdown-finalization.json",
+        inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+    );
+    if receipt.schema_version != 1
+        || receipt.blob != expected_blob
+        || receipt.inventory_etag != etag
+        || receipt.actor != *actor
+        || receipt.terminal_capture != inputs.terminal_capture
+        || receipt.delta_before != inputs.delta_before
+        || receipt.delta_terminal != inputs.delta_terminal
+        || receipt.reconciliation != *reconciliation
+        || !matches!(receipt.status.as_str(), "validated" | "unavailable" | "failed")
+        || !matches!(
+            receipt.reason_code.as_deref(),
+            None | Some(
+                "no_baseline"
+                    | "terminal_capture_unavailable"
+                    | "terminal_delta_unavailable"
+                    | "terminal_identity_unavailable"
+                    | "reconciliation_unavailable"
+                    | "reconciliation_mismatch"
+                    | "exit_143_unavailable"
+                    | "collector_exit_failed"
+            )
+        )
+        || (receipt.status != "validated" && receipt.reason_code.is_none())
+        || (receipt.release_allowed != (receipt.status == "validated" && receipt.reason_code.is_none()))
+        || (inputs.unavailable_reason.as_deref() == Some("no_baseline")
+            && (receipt.status != "unavailable"
+                || receipt.reason_code.as_deref() != Some("no_baseline")
+                || receipt.release_allowed))
+        || receipt.origin
+            != (ShutdownFinalizationOrigin {
+                campaign_id: inventory.campaign_id.clone(),
+                owner_id: inventory.owner_id.clone(),
+                fencing_token: inventory.fencing_token,
+                orchestration_run_id: inventory.orchestration_run_id.clone(),
+                cell_run_id: inventory.cell_run_id.clone(),
+                namespace: inventory.namespace.clone(),
+            })
+        || receipt.sha256.len() != 64
+        || !receipt
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("shutdown finalization does not bind the exact frozen source and actor");
+    }
+    let mut identities = BTreeSet::new();
+    for verdict in &receipt.verdicts {
+        if [&verdict.pod_name, &verdict.pod_uid, &verdict.container]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 253 || value.bytes().any(|byte| byte.is_ascii_control()))
+            || !identities.insert((&verdict.pod_uid, &verdict.container, verdict.restart_count))
+            || !matches!(
+                verdict.classification.as_str(),
+                "exit_0"
+                    | "exit_143_terminal_reconciliation_unavailable"
+                    | "exit_143_without_drain_marker"
+                    | "exit_oom_killed"
+                    | "exit_nonzero"
+                    | "terminal_status_unavailable"
+            )
+        {
+            bail!("shutdown finalization has duplicate, malformed, or provisional collector verdicts");
+        }
+    }
+    if receipt.status == "validated"
+        && (receipt.verdicts.is_empty()
+            || receipt
+                .verdicts
+                .iter()
+                .any(|verdict| verdict.classification != "exit_0")
+            || inputs.unavailable_reason.is_some()
+            || receipt.reconciliation.proof.as_ref().is_none_or(|proof| {
+                proof.status != "matched"
+                    || proof.post_teardown_verification != "matched_final_delta_log"
+                    || proof.expected_rows.is_none()
+                    || proof.expected_rows != proof.observed_rows
+                    || proof.settled_zero_ambiguity != Some(true)
+                    || proof.teardown_admissions_clear != Some(true)
+            }))
+    {
+        bail!("validated shutdown finalization contains unavailable or failed evidence");
+    }
+    Ok(())
+}
+
+fn shutdown_reconciliation_request(rows: &[OatResult]) -> ShutdownReconciliationRequest {
+    let proof = (|| {
+        let [row] = rows else {
+            return None;
+        };
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref()?).ok()?;
+        let final_delta = evidence.pointer("/durable_commits/post_teardown_delta_reconciliation")?;
+        let status = final_delta.get("status")?.as_str()?;
+        if !matches!(status, "matched" | "mismatch" | "unavailable") {
+            return None;
+        }
+        let verification = match evidence
+            .pointer("/durable_commits/run_cumulative_output/post_teardown_verification")?
+            .as_str()?
+        {
+            "matched_final_delta_log" => "matched_final_delta_log",
+            "unavailable_or_mismatched" if status == "mismatch" => "mismatch",
+            "unavailable_or_mismatched" => "unavailable",
+            _ => return None,
+        };
+        let safe_count = |value: &Value| value.as_u64().filter(|n| *n <= 9_007_199_254_740_991);
+        let settled = evidence.pointer("/reconciliation/settled").and_then(Value::as_bool);
+        let ambiguous = evidence
+            .pointer("/reconciliation/ambiguous_rows")
+            .and_then(Value::as_u64);
+        let admissions = evidence
+            .pointer("/durable_commits/collector_teardown_admissions/status")
+            .and_then(Value::as_str);
+        let cancelled = evidence
+            .pointer("/durable_commits/collector_teardown_admissions/cancelled_ambiguous")
+            .and_then(Value::as_u64);
+        Some(ShutdownReconciliationProof {
+            status: status.to_owned(),
+            post_teardown_verification: verification.to_owned(),
+            expected_rows: final_delta.get("client_acknowledged_rows").and_then(safe_count),
+            observed_rows: final_delta.get("delta_log_committed_rows").and_then(safe_count),
+            settled_zero_ambiguity: settled.zip(ambiguous).map(|(settled, count)| settled && count == 0),
+            teardown_admissions_clear: admissions
+                .zip(cancelled)
+                .map(|(status, count)| status == "clear" && count == 0),
+        })
+    })();
+    ShutdownReconciliationRequest {
+        profile: "single_hot_table".to_owned(),
+        proof,
+    }
+}
+
+fn ensure_shutdown_release(receipt: &ShutdownFinalizationReceipt, rows: &[OatResult]) -> Result<()> {
+    if !receipt.release_allowed || receipt.status != "validated" || receipt.reason_code.is_some() {
+        bail!("finalization is unavailable or failed; release withheld");
+    }
+    let local = shutdown_reconciliation_request(rows);
+    let proof = local.proof.as_ref().context("reconciliation proof unavailable")?;
+    if receipt.reconciliation != local
+        || proof.status != "matched"
+        || proof.post_teardown_verification != "matched_final_delta_log"
+        || proof.expected_rows.is_none()
+        || proof.expected_rows != proof.observed_rows
+        || proof.settled_zero_ambiguity != Some(true)
+        || proof.teardown_admissions_clear != Some(true)
+    {
+        bail!("final exact reconciliation unavailable or mismatched; release withheld");
+    }
+    let expected = rows
+        .first()
+        .map(|row| row.replicas as usize)
+        .context("final reconciliation unavailable")?;
+    if expected == 0 || rows.iter().any(|row| row.replicas as usize != expected) {
+        bail!("collector replica count unavailable or inconsistent");
+    }
+    let pods = receipt
+        .verdicts
+        .iter()
+        .map(|verdict| &verdict.pod_uid)
+        .collect::<BTreeSet<_>>();
+    if pods.len() != expected
+        || receipt.verdicts.is_empty()
+        || receipt
+            .verdicts
+            .iter()
+            .any(|verdict| verdict.classification != "exit_0")
+    {
+        bail!("collector final verdict is unavailable or failed; release withheld");
+    }
+    for row in rows {
+        let evidence: Value = serde_json::from_str(
+            row.evidence_json
+                .as_deref()
+                .context("missing final reconciliation evidence")?,
+        )?;
+        if evidence.pointer("/durable_commits/post_teardown_delta_reconciliation/status") != Some(&json!("matched"))
+            || evidence.pointer("/durable_commits/run_cumulative_output/post_teardown_verification")
+                != Some(&json!("matched_final_delta_log"))
+        {
+            bail!("final exact reconciliation unavailable or mismatched; release withheld");
+        }
+    }
+    Ok(())
+}
+
+async fn submit_shutdown_finalization_once<T, F, Fut, C>(mut call: F, confirm: C) -> Result<T>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    C: Fn(&[u8]) -> Result<T>,
+{
+    match call("shutdown-finalize").await.and_then(|output| confirm(&output)) {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let output = call("shutdown-finalization-read")
+                .await
+                .context("shutdown finalization outcome UNKNOWN; fenced readback failed, never retry write")?;
+            confirm(&output).context(format!(
+                "shutdown finalization readback did not confirm the original write: {error:#}"
+            ))
+        }
+    }
 }
 
 fn deserialize_present_campaign_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -11771,7 +12247,12 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
     .await
     {
         Ok(result) => result?,
-        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline" | "capture-baseline") => {
+        Err(_)
+            if matches!(
+                action,
+                "cleanup-step" | "capture-cell-baseline" | "capture-baseline" | "shutdown-finalize"
+            ) =>
+        {
             bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
         }
         Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
@@ -12326,7 +12807,105 @@ async fn persist_campaign_inventory_snapshot(
     Ok(())
 }
 
-async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
+async fn finalize_campaign_shutdown(
+    platform: &AksPlatform,
+    reconciliation: &ShutdownReconciliationRequest,
+) -> Result<ShutdownFinalizationReceipt> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let cached: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read frozen campaign inventory")?,
+    )
+    .context("parse frozen campaign inventory")?;
+    let cached_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read frozen campaign inventory ETag")?;
+    let cached_etag = cached_etag.trim();
+    validate_campaign_etag(cached_etag)?;
+    let (inventory, etag) = read_authoritative_campaign_inventory(
+        platform,
+        &identity,
+        &cached.orchestration_run_id,
+        Duration::from_secs(30),
+    )
+    .await?;
+    cached.validate_successor(&inventory)?;
+    if etag != cached_etag || inventory != cached {
+        bail!("frozen campaign inventory changed before shutdown finalization");
+    }
+    campaign_cleanup_step_complete(&CampaignCleanupAction::TerminalCapture, &inventory)?;
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let input_request = ShutdownFinalizationInputsRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+    };
+    let input_output = run_campaign_custody_json(
+        platform,
+        "shutdown-finalization-inputs",
+        None,
+        &input_request,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let input_response: ShutdownFinalizationInputsResponse =
+        serde_json::from_slice(&input_output).context("parse guarded shutdown source references")?;
+    if !input_response.ok {
+        bail!("shutdown source references were not positively confirmed");
+    }
+    let inputs = input_response.receipt;
+    validate_shutdown_inputs(&inputs, &inventory, &etag)?;
+    let request = ShutdownFinalizationRequest {
+        schema_version: 1,
+        campaign_id: &inventory.campaign_id,
+        orchestration_run_id: &inventory.orchestration_run_id,
+        cell_run_id: &inventory.cell_run_id,
+        expected_etag: &etag,
+        actor: &actor,
+        terminal_capture: &inputs.terminal_capture,
+        delta_before: &inputs.delta_before,
+        delta_terminal: &inputs.delta_terminal,
+        reconciliation: reconciliation.clone(),
+    };
+    let confirm = |output: &[u8]| -> Result<ShutdownFinalizationReceipt> {
+        let response: ShutdownFinalizationResponse =
+            serde_json::from_slice(output).context("parse guarded shutdown finalization")?;
+        if !response.ok {
+            bail!("shutdown finalization was not positively confirmed");
+        }
+        validate_shutdown_finalization(&response.receipt, &inventory, &etag, &actor, &inputs, reconciliation)?;
+        Ok(response.receipt)
+    };
+    let write = serde_json::to_value(&request)?;
+    let read = serde_json::to_value(&input_request)?;
+    let receipt = submit_shutdown_finalization_once(
+        |action| {
+            let payload = if action == "shutdown-finalize" { &write } else { &read };
+            async move { run_campaign_custody_json(platform, action, None, payload, Duration::from_secs(30)).await }
+        },
+        confirm,
+    )
+    .await?;
+    Ok(receipt)
+}
+
+async fn cleanup_campaign_aks_platform(
+    config: &OatConfig,
+    platform: &AksPlatform,
+    phase: CampaignCleanupPhase,
+) -> Result<Value> {
     let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
     let campaign_baseline = load_campaign_baseline_receipt(platform, &identity).await?;
     let runtime_dir = platform
@@ -12360,27 +12939,20 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
             .await?;
     cached.validate_successor(&inventory)?;
     persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
-    let actions = [
-        CampaignCleanupAction::StopAdmission,
-        CampaignCleanupAction::BoundedDrain,
-        CampaignCleanupAction::EvidenceCapture,
-        CampaignCleanupAction::StopMaintenance,
-        CampaignCleanupAction::TerminalCapture,
-        CampaignCleanupAction::RemoveNamespace,
-        CampaignCleanupAction::RemoveQap,
-        CampaignCleanupAction::RemoveFic,
-        CampaignCleanupAction::Handoff,
-    ];
+    if matches!(phase, CampaignCleanupPhase::Release) {
+        campaign_cleanup_step_complete(&CampaignCleanupAction::TerminalCapture, &inventory)?;
+    }
+    let actions = phase.actions();
     let mut receipts = Vec::with_capacity(actions.len());
     for action in actions {
-        if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
+        if !campaign_cleanup_action_needs_execution(action, &inventory)? {
             receipts.push(
                 json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
             );
             continue;
         }
         let (next_inventory, next_etag, receipt) =
-            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
+            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, action, &inventory, &etag)
                 .await
                 .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
         inventory = next_inventory;
@@ -15003,10 +15575,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         platform.router_metrics_url = None;
     }
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
-        match cleanup_campaign_aks_platform(config, platform).await {
+        match cleanup_campaign_aks_platform(config, platform, CampaignCleanupPhase::Freeze).await {
             Ok(evidence) => {
                 platform.shutdown_drain_evidence = Some(evidence);
-                platform.qap_cleanup_confirmed = true;
             }
             Err(error) => {
                 let detail = format!("{error:#}");
@@ -15017,9 +15588,6 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                 }));
                 failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
             }
-        }
-        if let Err(error) = require_aks_cleanup_confirmation(platform) {
-            failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
         }
         if failures.is_empty() {
             return Ok(());
@@ -17920,6 +18488,258 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_finalization_binds_frozen_sources_and_never_promotes_unproved_143() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let mut inventory = initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
+            "oat-00000000000000000000000000000004",
+            "campaignstorage",
+            "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
+            },
+        )?;
+        inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let root = format!(
+            "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}",
+            inventory.campaign_id, inventory.orchestration_run_id, inventory.cell_run_id
+        );
+        let reference = |blob: String| ShutdownSourceReference {
+            blob,
+            etag: "\"source\"".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let inputs = ShutdownFinalizationInputs {
+            schema_version: 1,
+            inventory_etag: "\"inventory\"".to_owned(),
+            terminal_capture: Some(reference(format!(
+                "{}/custody/{}/terminal_capture.json",
+                inventory
+                    .evidence_destination
+                    .as_ref()
+                    .context("destination")?
+                    .blob_prefix,
+                inventory.cell_run_id
+            ))),
+            delta_before: Some(reference(format!("{root}/delta-before.json"))),
+            delta_terminal: Some(reference(format!("{root}/delta-terminal.json"))),
+            unavailable_reason: None,
+        };
+        let mut row = sample_result("run", "table", 7);
+        row.evidence_json = Some(json!({
+            "durable_commits": {
+                "post_teardown_delta_reconciliation":{"status":"matched", "client_acknowledged_rows":7, "delta_log_committed_rows":7},
+                "run_cumulative_output":{"post_teardown_verification":"matched_final_delta_log"},
+                "collector_teardown_admissions":{"status":"clear", "cancelled_ambiguous":0}
+            }, "reconciliation":{"settled":true, "ambiguous_rows":0}
+        }).to_string());
+        let reconciliation = shutdown_reconciliation_request(std::slice::from_ref(&row));
+        let mut receipt = ShutdownFinalizationReceipt {
+            schema_version: 1,
+            blob: format!("{root}/shutdown-finalization.json"),
+            etag: "\"final\"".to_owned(),
+            sha256: "b".repeat(64),
+            inventory_etag: inputs.inventory_etag.clone(),
+            actor: actor.clone(),
+            origin: ShutdownFinalizationOrigin {
+                campaign_id: inventory.campaign_id.clone(),
+                owner_id: inventory.owner_id.clone(),
+                fencing_token: inventory.fencing_token,
+                orchestration_run_id: inventory.orchestration_run_id.clone(),
+                cell_run_id: inventory.cell_run_id.clone(),
+                namespace: inventory.namespace.clone(),
+            },
+            terminal_capture: inputs.terminal_capture.clone(),
+            delta_before: inputs.delta_before.clone(),
+            delta_terminal: inputs.delta_terminal.clone(),
+            status: "validated".to_owned(),
+            reason_code: None,
+            release_allowed: true,
+            reconciliation: reconciliation.clone(),
+            verdicts: vec![ShutdownFinalVerdict {
+                pod_name: "collector-0".to_owned(),
+                pod_uid: "pod-uid-0".to_owned(),
+                container: "dataflow".to_owned(),
+                restart_count: Some(0),
+                classification: "exit_0".to_owned(),
+            }],
+        };
+        validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)?;
+        ensure_shutdown_release(&receipt, std::slice::from_ref(&row))?;
+        assert!(ensure_shutdown_release(&receipt, &[]).is_err());
+        receipt.status = "unavailable".to_owned();
+        receipt.reason_code = Some("exit_143_unavailable".to_owned());
+        receipt.release_allowed = false;
+        for classification in [
+            "exit_143_terminal_reconciliation_unavailable",
+            "exit_143_without_drain_marker",
+        ] {
+            receipt.verdicts[0].classification = classification.to_owned();
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)?;
+            assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        }
+        receipt.status = "validated".to_owned();
+        receipt.reason_code = None;
+        receipt.release_allowed = true;
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        receipt.status = "unavailable".to_owned();
+        receipt.reason_code = Some("exit_143_unavailable".to_owned());
+        receipt.release_allowed = false;
+        receipt.verdicts[0].classification = "clean_sigterm_after_drain".to_owned();
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.verdicts[0].classification = "sigterm_after_drain_pending_reconciliation".to_owned();
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.verdicts[0].classification = "exit_0".to_owned();
+        receipt.status = "validated".to_owned();
+        receipt.reason_code = None;
+        receipt.release_allowed = true;
+        receipt.verdicts.push(receipt.verdicts[0].clone());
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.verdicts.pop();
+        receipt.delta_terminal.as_mut().context("terminal")?.sha256 = "c".repeat(64);
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.delta_terminal = inputs.delta_terminal.clone();
+        receipt.actor.fencing_token += 1;
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        receipt.actor.fencing_token -= 1;
+        receipt.origin.namespace.uid = None;
+        assert!(
+            validate_shutdown_finalization(&receipt, &inventory, "\"inventory\"", &actor, &inputs, &reconciliation)
+                .is_err()
+        );
+        assert!(validate_shutdown_inputs(&inputs, &inventory, "\"changed\"").is_err());
+        let mut wrong = inputs.clone();
+        wrong.delta_before.as_mut().context("baseline")?.blob.push_str(".other");
+        assert!(validate_shutdown_inputs(&wrong, &inventory, "\"inventory\"").is_err());
+        row.evidence_json = Some(
+            json!({"durable_commits":{"post_teardown_delta_reconciliation":{"status":"unavailable"},
+            "run_cumulative_output":{"post_teardown_verification":"unavailable_or_mismatched"}}})
+            .to_string(),
+        );
+        assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        let mut no_baseline = inputs.clone();
+        no_baseline.delta_before = None;
+        no_baseline.unavailable_reason = Some("no_baseline".to_owned());
+        receipt.origin.namespace.uid = inventory.namespace.uid.clone();
+        receipt.delta_before = None;
+        receipt.status = "unavailable".to_owned();
+        receipt.reason_code = Some("no_baseline".to_owned());
+        receipt.release_allowed = false;
+        validate_shutdown_finalization(
+            &receipt,
+            &inventory,
+            "\"inventory\"",
+            &actor,
+            &no_baseline,
+            &reconciliation,
+        )?;
+        assert!(ensure_shutdown_release(&receipt, std::slice::from_ref(&row)).is_err());
+        inventory.namespace.uid = None;
+        no_baseline.terminal_capture = None;
+        no_baseline.delta_terminal = None;
+        receipt.origin.namespace.uid = None;
+        receipt.terminal_capture = None;
+        receipt.delta_terminal = None;
+        validate_shutdown_finalization(
+            &receipt,
+            &inventory,
+            "\"inventory\"",
+            &actor,
+            &no_baseline,
+            &reconciliation,
+        )?;
+        assert_eq!(
+            CampaignCleanupPhase::Freeze
+                .actions()
+                .last()
+                .map(CampaignCleanupAction::selector),
+            Some("terminal_capture")
+        );
+        assert_eq!(
+            CampaignCleanupPhase::Release
+                .actions()
+                .last()
+                .map(CampaignCleanupAction::selector),
+            Some("handoff")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalization_unknown_write_uses_readback_without_replay() -> Result<()> {
+        for readback_available in [true, false] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let result = submit_shutdown_finalization_once(
+                move |action| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.lock().expect("calls lock").push(action);
+                        if action == "shutdown-finalization-read" && readback_available {
+                            Ok(b"confirmed".to_vec())
+                        } else {
+                            Err(anyhow::anyhow!("unknown outcome"))
+                        }
+                    }
+                },
+                |bytes| {
+                    if bytes == b"confirmed" {
+                        Ok(())
+                    } else {
+                        bail!("mismatched finalization")
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), readback_available);
+            assert_eq!(
+                *calls.lock().expect("calls lock"),
+                ["shutdown-finalize", "shutdown-finalization-read"]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn campaign_load_admission_waits_for_observed_qap_and_serializes_each_stage() -> Result<()> {
         let identity = CampaignIdentity {
             campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
@@ -18114,19 +18934,14 @@ mod tests {
 
     #[test]
     fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
-        let actions = [
-            CampaignCleanupAction::StopAdmission,
-            CampaignCleanupAction::BoundedDrain,
-            CampaignCleanupAction::EvidenceCapture,
-            CampaignCleanupAction::StopMaintenance,
-            CampaignCleanupAction::TerminalCapture,
-            CampaignCleanupAction::RemoveNamespace,
-            CampaignCleanupAction::RemoveQap,
-            CampaignCleanupAction::RemoveFic,
-            CampaignCleanupAction::Handoff,
-        ];
+        let actions = CampaignCleanupPhase::Freeze
+            .actions()
+            .iter()
+            .chain(CampaignCleanupPhase::Release.actions())
+            .map(CampaignCleanupAction::selector)
+            .collect::<Vec<_>>();
         assert_eq!(
-            actions.map(|action| action.selector()),
+            actions,
             [
                 "stop_admission",
                 "bounded_drain",
