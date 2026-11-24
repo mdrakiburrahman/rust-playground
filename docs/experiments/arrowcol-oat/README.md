@@ -220,6 +220,8 @@ npx --no-install arrowcol-oat aks setup --stamp ${STAMP_NUM} --stamp-config "$ST
 npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
 ```
 
+- To benchmark another revision without switching the primary checkout, run both commands inside a linked worktree (`git worktree add <dir> <commit>`). Setup state, images and the reported source SHA come from that worktree, while launcher receipts are read and written in the primary checkout's existing `out/arrowcol-oat/deadline-receipts` ledger, so its unsettled runs still block the launch. See [EXPERIMENTS.md](EXPERIMENTS.md) for the checks that refuse an unverifiable worktree.
+
 ### AKS destroy
 
 **Destructive:** `--confirm` deletes all of `arrow-collector-rg` and its AKS-managed resource groups, every stamp included. It is not per-run cleanup.

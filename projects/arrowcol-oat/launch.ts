@@ -4,7 +4,7 @@ import { constants, existsSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readlink, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -57,7 +57,8 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const launcherDeadlineReceiptRoot = resolve(workspaceRoot, 'out/arrowcol-oat/deadline-receipts');
+const launcherDeadlineReceiptPath = 'out/arrowcol-oat/deadline-receipts';
+const launcherDeadlineReceiptRoot = resolve(workspaceRoot, launcherDeadlineReceiptPath);
 const launcherDeadlineMaxSeconds = 600;
 const localCancellationCleanupMs = 10 * 60 * 1000;
 const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
@@ -1090,16 +1091,74 @@ async function syncLegacyReceiptDirectory(path: string): Promise<void> {
   }
 }
 
-export async function assertCanonicalAksLaunchWorkspace(root: string): Promise<void> {
-  const metadata = await lstat(resolve(root, '.git')).catch((error: unknown) => {
+export interface AksReceiptLedger {
+  root: string;
+  worktreeRoot?: string;
+}
+
+function ledgerOwnershipError(workspace: string, reason: string): Error {
+  return new Error(
+    `AKS benchmark submission requires the primary checkout, or a verified linked worktree of it, to own the launcher receipt ledger; refusing workspace ${workspace}: ${reason}`,
+  );
+}
+
+async function assertOwnedCanonicalEntry(path: string, kind: 'directory' | 'file', uid: number, workspace: string): Promise<void> {
+  const metadata = await lstat(path).catch(() => undefined);
+  if (!metadata || !(kind === 'directory' ? metadata.isDirectory() : metadata.isFile()) || metadata.uid !== uid ||
+      await realpath(path).catch(() => undefined) !== path) {
+    throw ledgerOwnershipError(workspace, `${path} is not a ${kind} owned by uid ${uid} at its canonical path`);
+  }
+}
+
+export async function resolveAksReceiptLedger(
+  workspace: string, receiptRoot = resolve(workspace, launcherDeadlineReceiptPath),
+): Promise<AksReceiptLedger> {
+  const dotGit = await lstat(resolve(workspace, '.git')).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
     throw error;
   });
-  if (!metadata?.isDirectory()) {
-    throw new Error(
-      `AKS benchmark submission requires the primary checkout that owns the launcher receipt ledger; refusing workspace ${root}`,
-    );
+  if (dotGit?.isDirectory()) return { root: receiptRoot };
+  if (!dotGit?.isFile()) throw ledgerOwnershipError(workspace, '.git is neither a checkout directory nor a worktree file');
+  const root = await realpath(workspace);
+  const uid = process.getuid?.() ?? dotGit.uid;
+  await assertOwnedCanonicalEntry(root, 'directory', uid, workspace);
+  await assertOwnedCanonicalEntry(join(root, '.git'), 'file', uid, workspace);
+  const pointer = /^gitdir: ([^\n]+)\n?$/.exec(await readFile(join(root, '.git'), 'utf8'))?.[1];
+  if (!pointer) throw ledgerOwnershipError(workspace, 'malformed .git file');
+  const adminDir = resolve(root, pointer);
+  const commonDir = dirname(dirname(adminDir));
+  const primary = dirname(commonDir);
+  if (basename(dirname(adminDir)) !== 'worktrees' || basename(commonDir) !== '.git') {
+    throw ledgerOwnershipError(workspace, 'gitdir is not a linked worktree of a non-bare checkout');
   }
+  for (const directory of [adminDir, commonDir, primary]) await assertOwnedCanonicalEntry(directory, 'directory', uid, workspace);
+  const backPointer = (await readFile(join(adminDir, 'gitdir'), 'utf8').catch(() => '')).trimEnd();
+  if (!backPointer || await realpath(resolve(adminDir, backPointer)).catch(() => undefined) !== join(root, '.git')) {
+    throw ledgerOwnershipError(workspace, 'worktree gitdir back-pointer does not name this workspace');
+  }
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+  const git = (cwd: string, ...args: string[]): string => execFileSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'],
+  }).trimEnd();
+  let reported: string[];
+  try {
+    reported = [
+      git(root, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir', '--show-toplevel'),
+      git(primary, 'rev-parse', '--path-format=absolute', '--is-bare-repository', '--git-dir', '--show-toplevel'),
+      git(primary, 'worktree', 'list', '--porcelain', '-z'),
+    ];
+  } catch {
+    throw ledgerOwnershipError(workspace, 'Git metadata could not be read (linked worktrees require Git 2.36 or newer)');
+  }
+  if (reported[0] !== [adminDir, commonDir, root].join('\n') || reported[1] !== ['false', commonDir, primary].join('\n') ||
+      !reported[2]!.split('\0\0').map(entry => entry.split('\0'))
+        .some(fields => fields[0] === `worktree ${root}` && !fields.some(field => field.startsWith('prunable')))) {
+    throw ledgerOwnershipError(workspace, 'Git does not report this workspace as a registered worktree of the primary checkout');
+  }
+  if (resolve(receiptRoot) !== resolve(workspace, launcherDeadlineReceiptPath)) return { root: receiptRoot };
+  const canonical = join(primary, launcherDeadlineReceiptPath);
+  await assertOwnedCanonicalEntry(canonical, 'directory', uid, workspace);
+  return { root: canonical, worktreeRoot: resolve(workspace, launcherDeadlineReceiptPath) };
 }
 
 async function diagnosticTransitionReceiptRoot(): Promise<string | undefined> {
@@ -2099,7 +2158,8 @@ export async function main(
     if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
       throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
     }
-    const kind = await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
+    const ledger = receiptRoot === launcherDeadlineReceiptRoot ? (await resolveAksReceiptLedger(workspaceRoot)).root : receiptRoot;
+    const kind = await recordLegacyAksDisposition(ledger, args[1], args[2]);
     console.log(aksDispositionMessage(kind));
     return;
   }
@@ -2148,7 +2208,10 @@ export async function main(
   if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only') || deadlineSeconds !== undefined)) {
     throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
   }
-  if (requestedMode === 'aks' && !preflightOnly) await assertCanonicalAksLaunchWorkspace(workspaceRoot);
+  let aksWorktreeReceiptRoot: string | undefined;
+  if (requestedMode === 'aks' && !preflightOnly) {
+    ({ root: receiptRoot, worktreeRoot: aksWorktreeReceiptRoot } = await resolveAksReceiptLedger(workspaceRoot, receiptRoot));
+  }
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
@@ -2206,6 +2269,9 @@ export async function main(
     config.subscriptionId = subscriptionId;
   }
   const transitionRoot = await diagnosticTransitionReceiptRoot();
+  if (transitionRoot && aksWorktreeReceiptRoot) {
+    throw new Error('Diagnostic transition runtime cannot launch AKS from a linked worktree of another checkout');
+  }
   if (transitionRoot) receiptRoot = transitionRoot;
   if (diagnosticParity && mode === 'local' && !transitionRoot) {
     const names = await readdir(receiptRoot).catch((error: unknown) => {
@@ -2214,6 +2280,7 @@ export async function main(
     });
     if (names.length !== 0) throw new Error('Fresh diagnostic requires an empty launcher receipt ledger');
   } else {
+    if (aksWorktreeReceiptRoot) await assertNoUnsettledDeadlineReceipts(aksWorktreeReceiptRoot);
     await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
       transitionRoot ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !transitionRoot);
   }
