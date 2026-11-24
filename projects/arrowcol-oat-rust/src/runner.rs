@@ -113,7 +113,43 @@ pub struct RunInventory {
     pub effective_stop_budgets: Option<EffectiveStopBudgets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_cell_duration_ms: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_drain_budget",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drain_budget: Option<InventoryDrainBudget>,
     pub cleanup: InventoryCleanup,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryDrainBudget {
+    pub budget_ms: u64,
+    pub collector_grace_ms: u64,
+    pub pre_stop_capture_margin_ms: u64,
+}
+
+fn deserialize_present_drain_budget<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<InventoryDrainBudget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <InventoryDrainBudget as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+impl InventoryDrainBudget {
+    fn validate(self) -> Result<()> {
+        if self.pre_stop_capture_margin_ms != crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS
+            || !(30_000..=3_600_000).contains(&self.collector_grace_ms)
+            || self.budget_ms == 0
+            || self.budget_ms > self.collector_grace_ms - self.pre_stop_capture_margin_ms
+        {
+            bail!("invalid custody collector drain budget or grace period");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -369,6 +405,9 @@ impl RunInventory {
         validate_official_measurement_reference(self)?;
         if let Some(budgets) = self.effective_stop_budgets {
             budgets.validate()?;
+        }
+        if let Some(budget) = self.drain_budget {
+            budget.validate()?;
         }
         if let Some(duration_ms) = self.planned_cell_duration_ms {
             let no_row_rehearsal = duration_ms == 0 && self.load_admission == InventoryLoadAdmission::NotAuthorized;
@@ -723,6 +762,7 @@ impl RunInventory {
             || !self.load_admission.can_advance_to(next.load_admission)
             || self.effective_stop_budgets != next.effective_stop_budgets
             || self.planned_cell_duration_ms != next.planned_cell_duration_ms
+            || self.drain_budget != next.drain_budget
             || self.namespace.name != next.namespace.name
             || self.namespace.owner_token != next.namespace.owner_token
             || self
@@ -2856,7 +2896,12 @@ fn render_aks_client_args(config: &OatConfig, args: &[String]) -> Result<Vec<Str
             rendered.push(arg.clone());
         }
     }
-    if let Some(streams) = config.tunables.client.as_ref().and_then(|client| client.streams_per_worker) {
+    if let Some(streams) = config
+        .tunables
+        .client
+        .as_ref()
+        .and_then(|client| client.streams_per_worker)
+    {
         rendered.extend(["--streams-per-worker".to_owned(), streams.to_string()]);
     }
     if let Some(concurrency) = config.dmv_concurrency {
@@ -11091,20 +11136,29 @@ impl std::fmt::Display for StaleCampaignVersionError {
 impl std::error::Error for StaleCampaignVersionError {}
 
 fn campaign_custody_helper_failure(action: &str, stdout: &[u8]) -> anyhow::Error {
-    let code = serde_json::from_slice::<Value>(stdout)
-        .ok()
-        .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
+    let response = serde_json::from_slice::<Value>(stdout).ok();
+    let code = response
+        .as_ref()
+        .and_then(|response| response.get("code").and_then(Value::as_str))
         .filter(|code| {
             matches!(
-                code.as_str(),
+                *code,
                 "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
             )
         })
-        .unwrap_or_else(|| "invalid_response".to_owned());
+        .unwrap_or("invalid_response");
     if action == "cleanup-step" && code == "stale_version" {
         anyhow::Error::new(StaleCampaignVersionError {
             action: action.to_owned(),
         })
+    } else if code == "write_outcome_unknown"
+        && response
+            .as_ref()
+            .and_then(|value| value.get("reason_code"))
+            .and_then(Value::as_str)
+            == Some("cleanup_deadline_expired")
+    {
+        anyhow::anyhow!("campaign custody helper {action} failed: {code} (cleanup_deadline_expired)")
     } else {
         anyhow::anyhow!("campaign custody helper {action} failed: {code}")
     }
@@ -11542,7 +11596,13 @@ fn campaign_cleanup_operation_deadline_ms(
         } else {
             let timeout_ms = match action {
                 CampaignCleanupAction::StopAdmission => 60_000,
-                CampaignCleanupAction::BoundedDrain => 120_000,
+                CampaignCleanupAction::BoundedDrain => match inventory.drain_budget {
+                    Some(budget) => {
+                        budget.validate()?;
+                        budget.budget_ms
+                    }
+                    None => crate::config::DEFAULT_AKS_DRAIN_BUDGET_MS,
+                },
                 CampaignCleanupAction::StopMaintenance => {
                     inventory
                         .effective_stop_budgets
@@ -11882,6 +11942,7 @@ async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInven
 struct CampaignCellBudget {
     effective_stop_budgets: EffectiveStopBudgets,
     planned_cell_duration_ms: u64,
+    drain_budget: InventoryDrainBudget,
 }
 
 fn initial_campaign_inventory(
@@ -11922,6 +11983,7 @@ fn initial_campaign_inventory(
         official_measurement: None,
         effective_stop_budgets: Some(budget.effective_stop_budgets.validate()?),
         planned_cell_duration_ms: Some(budget.planned_cell_duration_ms),
+        drain_budget: Some(budget.drain_budget),
         cleanup: InventoryCleanup {
             stop_admission: step(),
             bounded_drain: step(),
@@ -11956,6 +12018,14 @@ async fn initialize_campaign_inventory(
         CampaignCellBudget {
             effective_stop_budgets: config.maintenance_stop_budget()?,
             planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+            drain_budget: InventoryDrainBudget {
+                budget_ms: config.platform.aks_drain_budget_ms,
+                collector_grace_ms: config
+                    .collector_stop_grace_seconds
+                    .checked_mul(1_000)
+                    .context("collector grace overflow")?,
+                pre_stop_capture_margin_ms: crate::config::AKS_PRE_STOP_CAPTURE_MARGIN_MS,
+            },
         },
     )?;
     persist_campaign_inventory(platform, &inventory).await?;
@@ -16607,8 +16677,23 @@ mod tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         for (streams, concurrency, expected) in [
-            (Some(7), None, vec!["--endpoint", "http://router", "--streams-per-worker", "7"]),
-            (Some(0), Some(9), vec!["--endpoint", "http://router", "--streams-per-worker", "0", "--concurrency", "9"]),
+            (
+                Some(7),
+                None,
+                vec!["--endpoint", "http://router", "--streams-per-worker", "7"],
+            ),
+            (
+                Some(0),
+                Some(9),
+                vec![
+                    "--endpoint",
+                    "http://router",
+                    "--streams-per-worker",
+                    "0",
+                    "--concurrency",
+                    "9",
+                ],
+            ),
             (None, None, vec!["--endpoint", "http://router"]),
         ] {
             config.tunables.client = streams.map(|streams_per_worker| arrowcol_tunables::ClientTunables {
@@ -16617,8 +16702,14 @@ mod tests {
             });
             config.dmv_concurrency = concurrency;
             config.validate()?;
-            let incoming = ["--endpoint", "http://router", "--streams-per-worker", "2", "--concurrency=2"]
-                .map(str::to_owned);
+            let incoming = [
+                "--endpoint",
+                "http://router",
+                "--streams-per-worker",
+                "2",
+                "--concurrency=2",
+            ]
+            .map(str::to_owned);
             let args = render_aks_client_args(&config, &incoming)?;
             let job = build_aks_client_job(AksClientJobSpec {
                 namespace: "oat-test",
@@ -16632,11 +16723,24 @@ mod tests {
                 run_seconds: 3600,
                 stop_grace_seconds: 45,
             });
-            assert_eq!(job["spec"]["template"]["spec"]["containers"][0]["args"], json!(expected));
+            assert_eq!(
+                job["spec"]["template"]["spec"]["containers"][0]["args"],
+                json!(expected)
+            );
         }
         config.dmv_concurrency = Some(2);
-        config.tunables.client = Some(arrowcol_tunables::ClientTunables { streams_per_worker: Some(7), ..Default::default() });
-        assert!(config.validate().unwrap_err().to_string().contains("dmv_concurrency"));
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables {
+            streams_per_worker: Some(7),
+            ..Default::default()
+        });
+        assert!(
+            config
+                .validate()
+                .err()
+                .context("invalid concurrency must be rejected")?
+                .to_string()
+                .contains("dmv_concurrency")
+        );
         Ok(())
     }
 
@@ -17054,6 +17158,11 @@ mod tests {
                     maintenance_stop_timeout_ms: 1_500_000,
                 },
                 planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
             },
         )?;
         super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
@@ -17069,6 +17178,38 @@ mod tests {
             1_500_000
         );
         assert_eq!(value["planned_cell_duration_ms"], 1_000);
+        assert_eq!(
+            value["drain_budget"],
+            json!({"budget_ms":90_000,"collector_grace_ms":180_000,"pre_stop_capture_margin_ms":30_000})
+        );
+        let mut legacy = value.clone();
+        legacy
+            .as_object_mut()
+            .context("inventory object")?
+            .remove("drain_budget");
+        let legacy: RunInventory = serde_json::from_value(legacy)?;
+        assert!(legacy.drain_budget.is_none());
+        assert!(legacy.validate_successor(&inventory).is_err());
+        let mut changed = inventory.clone();
+        changed.drain_budget.as_mut().context("drain budget")?.budget_ms = 80_000;
+        assert!(inventory.validate_successor(&changed).is_err());
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &inventory, 1_000)?,
+            91_000
+        );
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &legacy, 1_000)?,
+            121_000
+        );
+        let mut null_budget = value.clone();
+        null_budget["drain_budget"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<RunInventory>(null_budget).is_err());
+        let mut extra_key = value.clone();
+        extra_key["drain_budget"]["unexpected"] = json!(1);
+        assert!(serde_json::from_value::<RunInventory>(extra_key).is_err());
+        let mut invalid = inventory.clone();
+        invalid.drain_budget.as_mut().context("drain budget")?.budget_ms = 150_001;
+        assert!(invalid.validate().is_err());
         let mut no_row_rehearsal = inventory.clone();
         no_row_rehearsal.planned_cell_duration_ms = Some(0);
         no_row_rehearsal.resources.push(InventoryResource {
@@ -17191,6 +17332,22 @@ mod tests {
             assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
             assert!(error.to_string().contains(code));
         }
+        let deadline = campaign_custody_helper_failure(
+            "cleanup-step",
+            br#"{"ok":false,"code":"write_outcome_unknown","reason_code":"cleanup_deadline_expired"}"#,
+        );
+        assert!(deadline.downcast_ref::<StaleCampaignVersionError>().is_none());
+        assert!(deadline.to_string().contains("cleanup_deadline_expired"));
+        let untrusted = campaign_custody_helper_failure(
+            "cleanup-step",
+            br#"{"ok":false,"code":"write_outcome_unknown","reason_code":"secret"}"#,
+        );
+        assert!(!untrusted.to_string().contains("secret"));
+        let wrong_code = campaign_custody_helper_failure(
+            "cleanup-step",
+            br#"{"ok":false,"code":"invalid_or_storage_error","reason_code":"cleanup_deadline_expired"}"#,
+        );
+        assert!(!wrong_code.to_string().contains("cleanup_deadline_expired"));
         Ok(())
     }
 
@@ -17216,6 +17373,11 @@ mod tests {
                     maintenance_stop_timeout_ms: 1_500_000,
                 },
                 planned_cell_duration_ms: 1_000,
+                drain_budget: InventoryDrainBudget {
+                    budget_ms: 90_000,
+                    collector_grace_ms: 180_000,
+                    pre_stop_capture_margin_ms: 30_000,
+                },
             },
         )?;
         inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
@@ -18261,7 +18423,8 @@ mod tests {
             Ok(vec![log("pod-a/dataflow"), log("pod-b/dataflow")])
         })
         .await
-        .expect_err("the original stop failure must remain visible");
+        .err()
+        .context("the original stop failure must remain visible")?;
         assert!(format!("{error:#}").contains("stop failed"));
         assert_eq!(
             logs.iter().map(|log| log.instance_id.as_str()).collect::<Vec<_>>(),
@@ -18274,7 +18437,8 @@ mod tests {
             Err(anyhow::anyhow!("snapshot failed"))
         })
         .await
-        .expect_err("capture failures must remain visible");
+        .err()
+        .context("capture failures must remain visible")?;
         let detail = format!("{error:#}");
         assert!(detail.contains("stop failed"));
         assert!(detail.contains("snapshot failed"));

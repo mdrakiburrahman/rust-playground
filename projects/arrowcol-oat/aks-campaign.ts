@@ -8,7 +8,7 @@ import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
 import { dispatchExternalEffect, isEffectBoundaryActive } from '../../infra/azure/effect-boundary.js';
-import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS } from './aks-cleanup-budget.js';
+import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, CleanupDeadlineExpiredError, drainBudgetMs, parseDrainBudget, type DrainBudget } from './aks-cleanup-budget.js';
 import { parseEffectiveStopBudgets } from './stop-budgets.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
@@ -24,11 +24,11 @@ export type CellLifetimeAssessment =
   | { status: 'unknown'; required_ms: number; reason: string }
   | { status: 'invalid'; reason: string };
 export function assessCellLifetimeBudget(remainingMs: number, durationMs: number, maintenanceStopMs: number,
-  cleanupReserveMs?: number): CellLifetimeAssessment {
+  cleanupReserveMs?: number, drainMs = DRAIN_BUDGET_MS): CellLifetimeAssessment {
   if (![remainingMs, durationMs, maintenanceStopMs].every(nonnegative) ||
-      cleanupReserveMs !== undefined && !nonnegative(cleanupReserveMs))
+      !nonnegative(drainMs) || drainMs === 0 || cleanupReserveMs !== undefined && !nonnegative(cleanupReserveMs))
     return { status: 'invalid', reason: 'Cell admission budget values must be nonnegative safe integers.' };
-  const reserve = cleanupReserveMs ?? KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS;
+  const reserve = cleanupReserveMs ?? ADMISSION_STOP_BUDGET_MS + drainMs + TERMINAL_CAPTURE_BUDGET_MS;
   const required = durationMs + maintenanceStopMs + reserve;
   if (!Number.isSafeInteger(required)) return { status: 'invalid', reason: 'Cell admission budget sum exceeds safe integer bounds.' };
   if (remainingMs < required) return { status: 'insufficient', required_ms: required };
@@ -264,6 +264,7 @@ export interface RunInventory {
   official_measurement?: OfficialCellMeasurementReference | null;
   planned_cell_duration_ms?: number;
   effective_stop_budgets?: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
+  drain_budget?: DrainBudget;
   cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep; stop_maintenance: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
@@ -295,9 +296,11 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
   const stopBudgets = value && typeof value === 'object' && !Array.isArray(value) ?
     (value as Record<string, unknown>).effective_stop_budgets : undefined;
   if (stopBudgets !== undefined) parseEffectiveStopBudgets(stopBudgets);
+  const drainBudget = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).drain_budget : undefined;
+  if (drainBudget !== undefined) parseDrainBudget(drainBudget);
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!optionalRecord(value, fields, ['evidence_destination', 'official_measurement', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination', 'official_measurement', 'planned_cell_duration_ms', 'effective_stop_budgets', 'drain_budget']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
       !['not_authorized', 'authorization_pending', 'authorized'].includes(String(value.load_admission)) ||
@@ -480,12 +483,14 @@ export function isInitialRunInventory(inventory: RunInventory | undefined): bool
 export function validateInitialRunInventory(value: unknown, campaignId: string, ownerId: string): RunInventory {
   const inventory = validateRunInventory(value, newCampaignState(campaignId, ownerId, 0));
   if (!isInitialRunInventory(inventory)) throw new Error('Initial RunInventory must remain not_authorized with persisted maintenance budgets.');
+  if (!inventory.drain_budget) throw new Error('Initial RunInventory requires drain_budget.');
   return inventory;
 }
 function mergeRunInventory(before: RunInventory | undefined, after: RunInventory): RunInventory {
   const initial = () => {
     if (!isInitialRunInventory(after))
       throw new Error('Initial RunInventory must positively record not_authorized before external provisioning.');
+    if (!after.drain_budget) throw new Error('Initial RunInventory requires drain_budget.');
     return after;
   };
   if (!before) return initial();
@@ -499,6 +504,9 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   const admission = ['not_authorized', 'authorization_pending', 'authorized'];
   const from = admission.indexOf(before.load_admission), to = admission.indexOf(after.load_admission);
   if (to < from || to > from + 1) throw new Error('RunInventory load admission must advance monotonically through authorization_pending.');
+  if ((before.drain_budget === undefined) !== (after.drain_budget === undefined) ||
+      before.drain_budget && after.drain_budget && !sameFlatRecord(before.drain_budget, after.drain_budget))
+    throw new Error('RunInventory drain_budget is immutable.');
   if (before.planned_cell_duration_ms !== after.planned_cell_duration_ms ||
       (before.effective_stop_budgets === undefined) !== (after.effective_stop_budgets === undefined) ||
       before.effective_stop_budgets && after.effective_stop_budgets &&
@@ -724,11 +732,15 @@ export class CampaignConflictError extends Error {
   constructor() { super('Campaign state changed concurrently; retry using a fresh read.'); this.name = 'CampaignConflictError'; }
 }
 export function cleanupFailureCode(error: unknown): 'stale_version' | 'write_outcome_unknown' | 'campaign_fenced' | 'invalid_or_storage_error' {
-  if (error instanceof CampaignWriteOutcomeUnknownError) return 'write_outcome_unknown';
+  if (error instanceof CampaignWriteOutcomeUnknownError || error instanceof CleanupDeadlineExpiredError) return 'write_outcome_unknown';
   if (error instanceof CampaignConflictError) return 'stale_version';
   if (error instanceof CampaignFencedError || error instanceof Error && /fenced|stale|heartbeat is expired/i.test(error.message))
     return 'campaign_fenced';
   return 'invalid_or_storage_error';
+}
+export function cleanupFailureResponse(error: unknown): { ok: false; code: ReturnType<typeof cleanupFailureCode>; message: string; reason_code?: 'cleanup_deadline_expired' } {
+  return { ok: false, code: cleanupFailureCode(error), message: error instanceof Error ? error.message : 'Campaign custody failed.',
+    ...(error instanceof CleanupDeadlineExpiredError ? { reason_code: error.code } : {}) };
 }
 export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string; recordPath?: string }
 
@@ -1027,7 +1039,7 @@ export async function publishRunInventory(store: CampaignStore, value: unknown, 
     if (!nonnegative(now) || now < state.startedAtMs || !nonnegative(duration) || !nonnegative(stopTimeout))
       throw new Error('Cell admission requires explicit planned duration and persisted maintenance stop budget.');
     const remaining = state.expiresAtMs - now;
-    const assessment = assessCellLifetimeBudget(remaining, duration, stopTimeout);
+    const assessment = assessCellLifetimeBudget(remaining, duration, stopTimeout, undefined, drainBudgetMs(inventory));
     if (assessment.status === 'invalid') throw new Error(assessment.reason);
     if (assessment.status === 'insufficient')
       throw new Error('Campaign lifetime cannot cover the planned cell, maintenance stop, and bounded cleanup reserves.');
@@ -1266,9 +1278,7 @@ if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.base
   campaignMain(process.argv.slice(2)).catch((error: unknown) => {
     const jsonActions = ['publish-inventory', 'assert-ready', 'cleanup-step', 'read-inventory', 'capture-cell-baseline', 'capture-baseline'];
     if (process.argv.slice(2).some(action => jsonActions.includes(action))) {
-      const message = error instanceof Error ? error.message : 'Campaign custody failed.';
-      const code = cleanupFailureCode(error);
-      console.log(JSON.stringify({ ok: false, code, message }));
+      console.log(JSON.stringify(cleanupFailureResponse(error)));
     } else console.error(error instanceof Error ? error.message : 'Campaign custody failed');
     process.exitCode = 1;
   });

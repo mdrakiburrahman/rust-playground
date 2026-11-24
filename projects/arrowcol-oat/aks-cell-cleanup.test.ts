@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config } from '../../infra/azure/bootstrap.js';
-import { CampaignConflictError, CampaignWriteOutcomeUnknownError, cleanupFailureCode, CUSTODY_CLEANUP_STEPS, newCampaignState,
+import { CampaignConflictError, CampaignWriteOutcomeUnknownError, cleanupFailureCode, cleanupFailureResponse, CUSTODY_CLEANUP_STEPS, newCampaignState,
   type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { CELL_CLEANUP_SELECTORS, createBlobCellStepJournal, createCellCleanupProviders, executeCellCleanupStep,
   readCellRunInventory, type CellCleanupEnvelope, type CellCleanupSelector, type CellStepProviders, type ReadInventoryEnvelope } from './aks-cell-cleanup.js';
 import type { CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
-import { cleanupBudget } from './aks-cleanup-budget.js';
+import { CleanupDeadlineExpiredError, cleanupBudget, withCleanupDeadline } from './aks-cleanup-budget.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001', ownerId = 'c0ffee00-0000-4000-8000-000000000002';
 const cellId = 'c0ffee00-0000-4000-8000-000000000003', namespace = 'oat-' + cellId.replaceAll('-', '');
@@ -199,6 +199,40 @@ test('recovery pins its confirmed current inventory version through provider aut
     await assert.rejects(f.invoke('stop_admission', providers), /lost effect response/);
     await assert.rejects(f.invoke('stop_admission', providers), CampaignWriteOutcomeUnknownError);
   });
+
+test('configured drain expiry is typed and recovery cannot extend the persisted deadline', async t => {
+  const f = fixture(t);
+  f.store.state.runInventory!.drain_budget = { budget_ms: 1_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 };
+  await f.invoke('stop_admission');
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const providers = createCellCleanupProviders({ ...f.actions, boundedDrain: async (_inventory, deadline, _key, authority) => {
+    assert.equal(deadline, now + 1_000);
+    const bounded = withCleanupDeadline(authority, deadline);
+    now = deadline;
+    await bounded.assertCurrent();
+    return 'complete';
+  } });
+  await assert.rejects(f.invoke('bounded_drain', providers), error => {
+    assert.ok(error instanceof CleanupDeadlineExpiredError);
+    assert.deepEqual(JSON.parse(JSON.stringify(cleanupFailureResponse(error))), { ok: false, code: 'write_outcome_unknown',
+      reason_code: 'cleanup_deadline_expired', message: error.message });
+    return true;
+  });
+  const journal = [...f.blobs.values()].map(value => JSON.parse(value.bytes.toString())).find(value => value.selector === 'bounded_drain');
+  assert.equal(journal.phase, 'running');
+  assert.equal(journal.inventory, null);
+  assert.equal(journal.receipt, null);
+  const deadline = f.store.state.runInventory!.cleanup.bounded_drain.deadline_unix_ms;
+  assert.equal(deadline, now);
+  await assert.rejects(f.invoke('bounded_drain', providers), error => {
+    assert.ok(error instanceof CleanupDeadlineExpiredError);
+    assert.match(error.message, /UNKNOWN/);
+    assert.equal(cleanupFailureResponse(error).reason_code, 'cleanup_deadline_expired');
+    return true;
+  });
+  assert.equal(f.store.state.runInventory!.cleanup.bounded_drain.deadline_unix_ms, deadline);
+});
 
 test('maintenance retains its original budget and refuses a second stop after the first exhausts it', async t => {
     const f = fixture(t), original = f.store.state.runInventory!.resources[0];

@@ -57,7 +57,8 @@ async function fixture(t: TestContext, deployment = false) {
   let fault: 'none' | 'patch_unknown' | 'completion_unknown' = 'none', patched = false, patchCount = 0, wrongUid = false;
   let onPatch: (() => void) | undefined, onIntent: (() => void) | undefined;
   let podShape: 'regular' | 'init_sidecar' | 'missing' | 'ephemeral' | 'terminal_auxiliary' | 'gone' = 'regular';
-  let restartCount = 0;
+  let restartCount = 0, exitCode = 0;
+  const containerLogs = new Map<string, string>();
   let logText = 'secret=must-not-be-persisted\n2026-01-01T00:00:00Z {"rows":9,"token":"must-not-be-persisted"}\n' +
     '2026-01-01T00:00:01Z arrowcol_shutdown {"event":"drain_complete"}\n';
   const timeouts: number[] = [];
@@ -103,7 +104,7 @@ async function fixture(t: TestContext, deployment = false) {
       if (fault === 'patch_unknown') throw new Error('Lost PATCH response');
       return { returncode: 0, stdout: JSON.stringify(job()), stderr: '' };
     }
-    if (args.includes('logs')) return { returncode: 0, stdout: logText, stderr: '' };
+    if (args.includes('logs')) return { returncode: 0, stdout: containerLogs.get(args[args.indexOf('--container') + 1]!) ?? logText, stderr: '' };
     const kind = args[args.indexOf('get') + 1];
     let response: unknown;
     if (kind === 'namespace') response = { apiVersion: 'v1', kind: 'Namespace', metadata: metadata(namespace, cellId) };
@@ -118,12 +119,12 @@ async function fixture(t: TestContext, deployment = false) {
       spec: { containers: [{ name: 'main' }, ...(podShape === 'missing' ? [{ name: 'unobserved-writer' }] : [])],
         ...(['init_sidecar', 'terminal_auxiliary'].includes(podShape) ? { initContainers: [{ name: 'sidecar', restartPolicy: 'Always' }] } : {}),
         ...(['ephemeral', 'terminal_auxiliary'].includes(podShape) ? { ephemeralContainers: [{ name: 'debug-writer' }] } : {}) },
-      status: { containerStatuses: [{ name: 'main', restartCount, state: patched ? { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } : { running: {} } }],
+      status: { containerStatuses: [{ name: 'main', restartCount, state: patched ? { terminated: { exitCode, finishedAt: new Date().toISOString() } } : { running: {} } }],
         ...(podShape === 'init_sidecar' ? { initContainerStatuses: [{ name: 'sidecar', restartCount: 0, state: { running: {} } }] } : {}),
         ...(podShape === 'ephemeral' ? { ephemeralContainerStatuses: [{ name: 'debug-writer', restartCount: 0, state: { running: {} } }] } : {}),
         ...(podShape === 'terminal_auxiliary' ? {
-          initContainerStatuses: [{ name: 'sidecar', restartCount: 0, state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
-          ephemeralContainerStatuses: [{ name: 'debug-writer', restartCount: 0, state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
+          initContainerStatuses: [{ name: 'sidecar', restartCount: 0, state: { terminated: { exitCode, finishedAt: new Date().toISOString() } } }],
+          ephemeralContainerStatuses: [{ name: 'debug-writer', restartCount: 0, state: { terminated: { exitCode, finishedAt: new Date().toISOString() } } }],
         } : {}) },
     }] };
     else throw new Error('Unexpected mock kubectl command: ' + args.join(' '));
@@ -154,6 +155,8 @@ async function fixture(t: TestContext, deployment = false) {
     alreadyStopped: () => { patched = true; }, touchVersion: () => { revision++; },
     setPodShape: (value: typeof podShape) => { podShape = value; },
     setRestartCount: (value: number) => { restartCount = value; },
+    setExitCode: (value: number) => { exitCode = value; },
+    setContainerLog: (name: string, value: string) => { containerLogs.set(name, value); },
     setLogText: (value: string) => { logText = value; },
     fence: () => { state.fencingToken++; }, get state() { return state; },
     get patchCount() { return patchCount; }, setFault: (value: typeof fault) => { fault = value; }, wrongUid: () => { wrongUid = true; } };
@@ -225,6 +228,9 @@ test('collector evidence is persisted before drain scales down the deployment', 
 test('a collector pod lost before terminal sampling makes log custody incomplete', async t => {
   const f = await fixture(t, true);
   f.inventory.resources[0]!.role = 'collector';
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(runtime, 'sleep', async (seconds: number) => { now += Math.ceil(seconds * 1000); });
   const deadline = Date.now() + 100;
   f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
   f.onPatch(() => f.setPodShape('gone'));
@@ -236,6 +242,59 @@ test('a collector pod lost before terminal sampling makes log custody incomplete
   assert.equal(evidence.workloads[0].terminal_samples[0].terminal_sample, 'pod_gone');
   assert.equal(evidence.workloads[0].log_custody, 'incomplete');
   assert.equal(evidence.workloads[0].log_metrics, 'provisional');
+});
+test('terminal collector exit classification requires the exact container drain marker and remains provisional', async t => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(runtime, 'sleep', async (seconds: number) => { now += Math.ceil(seconds * 1000); });
+  for (const [exitCode, marker, expected] of [
+    [143, true, 'sigterm_after_drain_pending_reconciliation'],
+    [143, false, 'exit_143_without_drain_marker'],
+    [7, true, 'exit_nonzero'],
+  ] as const) {
+    const f = await fixture(t, true);
+    f.inventory.resources[0]!.role = 'collector';
+    f.inventory.drain_budget = { budget_ms: 90_000, collector_grace_ms: 180_000, pre_stop_capture_margin_ms: 30_000 };
+    f.setExitCode(exitCode);
+    if (!marker) f.setLogText('secret=must-not-be-persisted\n');
+    const deadline = Date.now() + 150;
+    f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
+    assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), 'pending');
+    const current = await f.controller(deadline);
+    assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
+    const evidence = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
+      .find(value => value.field === 'terminal_capture' && Array.isArray(value.workloads));
+    const sample = evidence.workloads[0].terminal_samples[0];
+    assert.equal(sample.pod_uid, ownerId);
+    assert.deepEqual(sample.containers, [{ container: 'main', restart_count: 0, exit_code: exitCode, classification: expected }]);
+    assert.deepEqual(evidence.drain_timing, { budget_ms: 90_000, collector_grace_ms: 180_000,
+      pre_stop_capture_margin_ms: 30_000, actual_drain_duration_ms: null,
+      actual_drain_started_at_unix_ms: null, actual_drain_finished_at_unix_ms: null, actual_drain_source: null,
+      unavailable_reason: 'collector_sigterm_timestamp_unavailable' });
+    assert.ok(!JSON.stringify(evidence).includes('must-not-be-persisted'));
+  }
+});
+test('one container marker cannot prove another container drained', async t => {
+  const f = await fixture(t, true);
+  f.inventory.resources[0]!.role = 'collector';
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(runtime, 'sleep', async (seconds: number) => { now += Math.ceil(seconds * 1000); });
+  f.setPodShape('terminal_auxiliary');
+  f.setExitCode(143);
+  f.setContainerLog('sidecar', 'no marker\n');
+  f.setContainerLog('debug-writer', 'no marker\n');
+  const deadline = Date.now() + 150;
+  f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
+  assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), 'pending');
+  const current = await f.controller(deadline);
+  assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
+  const evidence = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
+    .find(value => value.field === 'terminal_capture' && Array.isArray(value.workloads));
+  const containers = evidence.workloads[0].terminal_samples[0].containers as Array<{ container: string; classification: string }>;
+  assert.equal(containers.find(value => value.container === 'main')?.classification, 'sigterm_after_drain_pending_reconciliation');
+  assert.equal(containers.find(value => value.container === 'sidecar')?.classification, 'exit_143_without_drain_marker');
+  assert.equal(containers.find(value => value.container === 'debug-writer')?.classification, 'exit_143_without_drain_marker');
 });
 test('restart captures previous container logs before stopping the workload', async t => {
   const f = await fixture(t);
