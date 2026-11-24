@@ -90,6 +90,7 @@ const MAX_OBJECTS = 20_000;
 const MAX_ACTIONS = 1_000_000;
 const MAX_PAGES = 100;
 const MAX_VERSIONS = 20_000;
+export const DELTA_READ_CONCURRENCY = 4;
 const HASH = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^[A-Za-z0-9-]{1,128}$/;
 const ETAG = /^"[^"\r\n]+"$/;
@@ -257,17 +258,32 @@ function normalizeArrow(value: any): any {
   if (Array.isArray(value)) return value.map(normalizeArrow);
   return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, normalizeArrow(val)]));
 }
-async function capture(azure: Azure, relativePath: string, assertCurrent: () => Promise<void>, historyAfter?: number):
+async function capture(azure: Azure, relativePath: string, assertCurrent: () => Promise<void>, historyAfter?: number,
+  deadlineUnixMs = Date.now() + 35_000):
   Promise<{ reference: DeltaReplayReference; commits: Map<number, Json[]> }> {
+  requireThat(Number.isSafeInteger(deadlineUnixMs) && deadlineUnixMs > 0, 'invalid Delta read deadline');
+  const checkDeadline = () => requireThat(Date.now() < deadlineUnixMs, 'Delta read shared deadline expired');
+  const bounded = async <T>(action: () => Promise<T>): Promise<T> => {
+    checkDeadline();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([action(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ReplayError('Delta read shared deadline expired')), deadlineUnixMs - Date.now());
+      })]);
+      checkDeadline();
+      return result;
+    } finally { if (timer !== undefined) clearTimeout(timer); }
+  };
+  const guarded = async () => { await bounded(assertCurrent); checkDeadline(); };
   const bound = binding(azure, relativePath), prefix = bound.table_root + '/_delta_log/';
   const absenceObservations: DeltaAbsenceObservation[] = [];
   let bytesRead = 0, actionCount = 0;
   const invoke = async (name: string, query?: Record<string, string>, headers: Record<string, string> = {}) => {
-    await assertCurrent();
+    await guarded();
     let receipt: HttpReceipt | undefined;
-    const [bytes, responseHeaders] = await azure.blob('GET', bound.container, name, query, undefined, headers,
-      false, true, value => { receipt = value; });
-    await assertCurrent();
+    const [bytes, responseHeaders] = await bounded(() => azure.blob('GET', bound.container, name, query, undefined, headers,
+      false, true, value => { receipt = value; }));
+    await guarded();
     requireThat(receipt && [200, 206].includes(receipt.status) && bytes, 'storage GET has no positive complete response');
     const h = Object.fromEntries(Object.entries(responseHeaders).map(([key, val]) => [key.toLowerCase(), val]));
     if (receipt.status === 206) {
@@ -386,16 +402,24 @@ async function capture(azure: Azure, relativePath: string, assertCurrent: () => 
   const start = checkpointVersion === null ? 0 : checkpointVersion + 1;
   const historyStart = historyAfter === undefined ? start : Math.min(start, historyAfter + 1);
   requireThat(latest - historyStart < MAX_VERSIONS, 'Delta history version limit exceeded');
-  for (let version = historyStart; version <= latest; version++) {
-    const name = json.get(version);
-    requireThat(name, 'contiguous JSON history is missing');
-    const lines = (await get(name)).toString('utf8').trim().split('\n');
-    requireThat(lines.length > 0, 'empty Delta commit');
-    actionCount += lines.length;
-    requireThat(actionCount <= MAX_ACTIONS, 'Delta action limit exceeded');
-    const actions = lines.map(line => object(JSON.parse(line), 'Delta JSON action'));
-    commits.set(version, actions);
-    if (version >= start) apply(state, actions);
+  for (let first = historyStart; first <= latest; first += DELTA_READ_CONCURRENCY) {
+    checkDeadline();
+    const batch = await Promise.all(Array.from({ length: Math.min(DELTA_READ_CONCURRENCY, latest - first + 1) },
+      async (_, offset) => {
+        const version = first + offset, name = json.get(version);
+        requireThat(name, 'contiguous JSON history is missing');
+        return { version, bytes: await get(name) };
+      }));
+    for (const { version, bytes } of batch) {
+      checkDeadline();
+      const lines = bytes.toString('utf8').trim().split('\n');
+      requireThat(lines.length > 0, 'empty Delta commit');
+      actionCount += lines.length;
+      requireThat(actionCount <= MAX_ACTIONS, 'Delta action limit exceeded');
+      const actions = lines.map(line => object(JSON.parse(line), 'Delta JSON action'));
+      commits.set(version, actions);
+      if (version >= start) apply(state, actions);
+    }
   }
   requireThat(state.tableId && state.protocol && state.metadataHash, 'Delta replay lacks metadata/protocol');
   const after = await inventory();
@@ -408,13 +432,45 @@ async function capture(azure: Azure, relativePath: string, assertCurrent: () => 
       source_objects: [...objects.values()].sort((a, b) => a.name.localeCompare(b.name)),
       inventory_sha256: hash(canonical_json(before)), reference_sha256: '' } };
   reference.provenance.reference_sha256 = fingerprint(reference);
+  checkDeadline();
   return { reference, commits };
 }
 
 /** Fresh replay or two authoritative empty-prefix observations; errors never manufacture absence or zero rows. */
 export async function readDeltaReference(azure: Azure, relativePath: string,
-  assertCurrent: () => Promise<void>): Promise<DeltaReplayReference> {
-  return (await capture(azure, relativePath, assertCurrent)).reference;
+  assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000): Promise<DeltaReplayReference> {
+  return (await capture(azure, relativePath, assertCurrent, undefined, deadlineUnixMs)).reference;
+}
+
+export async function readFrozenDeltaCommits(azure: Azure, baseline: DeltaReplayReference,
+  terminal: DeltaReplayReference, assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000):
+  Promise<Array<{ version: number; rows: number; files: number; parquet_bytes: number }>> {
+  requireThat(terminal.observation === 'table' && baseline.table_root === terminal.table_root, 'frozen Delta table is unavailable');
+  const after = baseline.observation === 'table' ? baseline.version : -1;
+  const snapshot = await capture(azure, terminal.table_root, assertCurrent, after, deadlineUnixMs);
+  const current = snapshot.reference;
+  requireThat(current.observation === 'table' && current.table_id === terminal.table_id && current.version === terminal.version &&
+    same(current.active_files, terminal.active_files) && current.row_count === terminal.row_count &&
+    same(current.provenance.source_objects, terminal.provenance.source_objects),
+  'frozen Delta source changed during terminal summary verification');
+  const result: Array<{ version: number; rows: number; files: number; parquet_bytes: number }> = [];
+  for (const [version, actions] of snapshot.commits) {
+    if (version <= after) continue;
+    let rows = 0, files = 0, parquet_bytes = 0;
+    for (const action of actions) {
+      if (action.remove && object(action.remove, 'terminal remove').dataChange === true)
+        throw new ReplayError('Data-changing removal cannot authenticate terminal collector commits');
+      if (!action.add) continue;
+      const add = object(action.add, 'terminal add');
+      if (add.dataChange !== true) continue;
+      const file = addFile(add);
+      requireThat(file.num_records !== null, 'terminal commit row statistics are unavailable');
+      rows += file.num_records!; files++; parquet_bytes += file.size;
+      requireThat([rows, files, parquet_bytes].every(Number.isSafeInteger), 'terminal commit total overflow');
+    }
+    if (files) result.push({ version, rows, files, parquet_bytes });
+  }
+  return result;
 }
 
 export interface DeltaAddWindow {
@@ -476,15 +532,16 @@ export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: nu
 }
 
 export async function readDeltaAddWindow(azure: Azure, relativePath: string, startUnixMs: number, endUnixMs: number,
-  assertCurrent: () => Promise<void>): Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
+  assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000):
+  Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
   let snapshot: Awaited<ReturnType<typeof capture>> | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      snapshot = await capture(azure, relativePath, assertCurrent, -1);
+      snapshot = await capture(azure, relativePath, assertCurrent, -1, deadlineUnixMs);
       break;
     } catch (error) {
       if (!(error instanceof ReplayError) || error.message !== 'Delta listing changed during replay' || attempt === 2) throw error;
-      await assertCurrent();
+      requireThat(Date.now() + 1000 * (attempt + 1) < deadlineUnixMs, 'Delta read shared deadline expired');
       await new Promise<void>(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
     }
   }
@@ -694,7 +751,8 @@ function checkCreation(actions: Json[]): void {
 }
 
 export async function verifyDeltaPreservation(azure: Azure, baseline: DeltaReplayReference, terminal: DeltaReplayReference,
-  assertCurrent: () => Promise<void>, retentionPolicy?: DeltaRetentionPolicy): Promise<DeltaPreservationResult> {
+  assertCurrent: () => Promise<void>, retentionPolicy?: DeltaRetentionPolicy,
+  deadlineUnixMs = Date.now() + 35_000): Promise<DeltaPreservationResult> {
   let current: DeltaReplayReference | null = null;
   try {
     baseline = parseDeltaReplayReference(baseline, azure, baseline.table_root);
@@ -703,7 +761,7 @@ export async function verifyDeltaPreservation(azure: Azure, baseline: DeltaRepla
       baseline.table_id !== terminal.table_id || terminal.version < baseline.version))
       throw new ReplayError('terminal table ID/version does not extend baseline', 'failed');
     const captured = await capture(azure, baseline.table_root, assertCurrent,
-      baseline.observation === 'table' ? baseline.version : -1);
+      baseline.observation === 'table' ? baseline.version : -1, deadlineUnixMs);
     current = captured.reference;
     if (terminal.observation === 'observed_absent') {
       requireThat(current.observation === 'observed_absent', 'table appeared after an absent terminal reference; terminal preservation is unproven');

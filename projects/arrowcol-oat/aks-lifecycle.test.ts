@@ -104,7 +104,11 @@ async function fixture(t: TestContext, deployment = false) {
       if (fault === 'patch_unknown') throw new Error('Lost PATCH response');
       return { returncode: 0, stdout: JSON.stringify(job()), stderr: '' };
     }
-    if (args.includes('logs')) return { returncode: 0, stdout: containerLogs.get(args[args.indexOf('--container') + 1]!) ?? logText, stderr: '' };
+    if (args.includes('logs')) {
+      const text = containerLogs.get(args[args.indexOf('--container') + 1]!) ?? logText;
+      const stdout = args.includes('--tail=500') ? Buffer.from(text.split('\n').slice(-501).join('\n')).subarray(-262_144).toString() : text;
+      return { returncode: 0, stdout, stderr: '' };
+    }
     const kind = args[args.indexOf('get') + 1];
     let response: unknown;
     if (kind === 'namespace') response = { apiVersion: 'v1', kind: 'Namespace', metadata: metadata(namespace, cellId) };
@@ -113,7 +117,7 @@ async function fixture(t: TestContext, deployment = false) {
       metadata: { uid: campaignId, ownerReferences: [{ uid: workloadUid, kind: 'Deployment', controller: true }] },
     }] };
     else if (kind === 'horizontalpodautoscalers.autoscaling') response = { kind: 'HorizontalPodAutoscalerList', metadata: { resourceVersion: '1' }, items: [] };
-    else if (kind === 'pods') response = { kind: 'PodList', metadata: { resourceVersion: '1' }, items: podShape === 'gone' ? [] : [{
+    else if (kind === 'pods' || kind === 'pod') response = { kind: 'PodList', metadata: { resourceVersion: '1' }, items: podShape === 'gone' ? [] : [{
       apiVersion: 'v1', kind: 'Pod', metadata: { ...metadata('maintenance-pod', ownerId),
         ownerReferences: [{ uid: deployment ? campaignId : workloadUid, kind: deployment ? 'ReplicaSet' : 'Job', controller: true }] },
       spec: { containers: [{ name: 'main' }, ...(podShape === 'missing' ? [{ name: 'unobserved-writer' }] : [])],
@@ -128,6 +132,7 @@ async function fixture(t: TestContext, deployment = false) {
         } : {}) },
     }] };
     else throw new Error('Unexpected mock kubectl command: ' + args.join(' '));
+    if (kind === 'pod') response = (response as { items: unknown[] }).items[0];
     return { returncode: 0, stdout: JSON.stringify(response), stderr: '' };
   });
   const controller = async (originalDeadline?: number) => {
@@ -225,6 +230,29 @@ test('collector evidence is persisted before drain scales down the deployment', 
     .find(value => value.field === 'evidence_capture');
   assert.equal(postStop.workloads[0].original_stop.phase, 'complete');
 });
+test('collector drain retains one typed summary from a full UID-bound log read without raw log data', async t => {
+  const f = await fixture(t, true);
+  f.inventory.resources[0]!.role = 'collector';
+  const summary = { schema_version: 1, admitted: 1, committed: 1, failed: 0, cancelled_ambiguous: 0, pending: 0,
+    committed_rows: 9, incomplete: 0, commits: [{ table_id: 'a'.repeat(64), version: 1, rows: 9, files: 1, parquet_bytes: 100 }] };
+  f.setLogText(`secret=must-not-be-persisted\n2026-01-01T00:00:00Z arrowcol_effective_config {"component":"receiver"}\n` +
+    '2026-01-01T00:00:00Z verbose collector diagnostic omitted from custody\n'.repeat(20_000) +
+    `2026-01-01T00:00:01Z arrowcol_terminal_evidence ${JSON.stringify(summary)}\n`);
+  const deadline = Date.now() + 120_000;
+  f.inventory.cleanup.bounded_drain = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
+  assert.equal(await f.actions.boundedDrain(f.inventory, deadline, 'key', f.authority), 'complete');
+  const stop = [...f.blobs.values()].map(blob => JSON.parse(blob.bytes.toString()))
+    .find(value => value.field === 'bounded_drain' && value.phase === 'complete');
+  const log = stop.logs.find((value: { full_log_read?: boolean }) => value.full_log_read);
+  assert.deepEqual(log.terminal_summary, summary);
+  assert.equal(log.terminal_summary_status, 0);
+  assert.equal(log.restart_count, 0);
+  assert.equal(log.collector_startup_observed, true);
+  assert.ok(log.bytes > 1_048_576, 'realistic full collector log must not be reduced to the old tail-sized bound');
+  assert.equal(log.pod_uid, ownerId);
+  assert.ok(!JSON.stringify(stop).includes('must-not-be-persisted'));
+});
+
 test('a collector pod lost before terminal sampling makes log custody incomplete', async t => {
   const f = await fixture(t, true);
   f.inventory.resources[0]!.role = 'collector';

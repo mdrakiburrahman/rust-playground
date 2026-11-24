@@ -7,6 +7,7 @@ import { readDeltaReference, parseDeltaReplayReference, verifyDeltaPreservation,
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { create_namespace_deletion_journal } from '../../infra/azure/aks-namespace-custody.js';
 import { find_run_fic_record, plan_run_fic } from '../../infra/azure/run_fic.js';
+import { cleanupBudget } from './aks-cleanup-budget.js';
 
 const digest = (value: unknown) => createHash('sha256').update(canonical_json(value)).digest('hex');
 function object(value: unknown): Record<string, unknown> {
@@ -333,6 +334,7 @@ export async function captureCellBaseline(store: CampaignStore, azure: Azure, in
 
 export async function captureTerminalData(store: CampaignStore, azure: Azure, authority: CleanupMutationAuthority,
   assertWritersStopped: () => Promise<void>): Promise<void> {
+  const deltaDeadline = Math.min(Date.now() + 35_000, cleanupBudget(authority)?.deadlineUnixMs ?? Infinity);
   const current = await store.read();
   if (!current?.state.runInventory) throw new Error('Terminal data capture requires exact durable inventory.');
   const inventory = current.state.runInventory;
@@ -348,7 +350,7 @@ export async function captureTerminalData(store: CampaignStore, azure: Azure, au
     if (existing.value.baseline_etag !== before.etag) throw new Error('Terminal reference is not paired with the immutable original baseline.');
     baselineDelta(existing.value, inventory, azure, 'terminal_after_writers_stopped'); return;
   }
-  const delta = await readDeltaReference(azure, initial.table_root, authority.assertCurrent);
+  const delta = await readDeltaReference(azure, initial.table_root, authority.assertCurrent, deltaDeadline);
   if (initial.observation === 'table' && (delta.observation !== 'table' || delta.table_id !== initial.table_id ||
       delta.version < initial.version) || delta.observation === 'table' && delta.row_count === null)
     throw new Error('Terminal Delta identity/version/row coverage is UNKNOWN or regressed.');
