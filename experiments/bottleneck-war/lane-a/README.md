@@ -33,6 +33,9 @@ configure the load. Runtime knobs use `ARROWCOL_COLLECTOR_*`.
 `delta-maintenance` binary in checkpoint-only mode at a one-second cadence.
 The output reports actual checkpoint files and maintenance CPU/fault counters;
 other maintenance operations remain disabled.
+`BWA_ISOLATION=l0` or `l1` requires the matching diagnostic-sink build on both
+client and collector. Diagnostic receipts are checked, Delta rows must stay zero,
+and the discard rate is recorded separately from committed throughput.
 
 Use the same binary, allocator and payload in every comparison arm. The output
 records binary/config hashes and startup settings. Completed cell IDs are skipped

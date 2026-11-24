@@ -53,4 +53,7 @@ if (kind === 'control') {
 } else {
   throw new Error('Expected plan kind: control, screen, checkpoint or capacity');
 }
-fs.writeFileSync(process.argv[3], JSON.stringify({ duration: kind === 'screen' ? 40 : 60, warmup: 20, common, cells }, null, 2) + '\n');
+fs.writeFileSync(process.argv[3], JSON.stringify({
+  duration: kind === 'capacity' ? 20 : kind === 'screen' ? 40 : 60,
+  warmup: kind === 'capacity' ? 5 : 20, common, cells,
+}, null, 2) + '\n');
