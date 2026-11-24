@@ -1259,51 +1259,49 @@ fn upload_settings_project_without_a_runtime_section() -> Result<()> {
         for (key, value) in expected {
             assert_eq!(env.get(key).map(String::as_str), Some(value), "{key}");
         }
-
-        #[test]
-        fn column_pipeline_and_file_splits_are_strict_and_projected() -> Result<()> {
-            for invalid in [
-                Value::Null,
-                json!(true),
-                json!(1),
-                json!("ColumnPipeline"),
-                json!("pipeline"),
-            ] {
-                assert!(Tunables::parse_oat_json(fixture("collector.runtime.parquet_encode_mode", invalid)).is_err());
-            }
-            for workers in [Value::Null, json!(0), json!(1), json!(17)] {
-                assert!(
-                    Tunables::parse_oat_json(json!({"collector":{"runtime":{
-                        "parquet_encode_mode":"column_pipeline", "parquet_column_workers":workers
-                    }}}))
-                    .is_err()
-                );
-            }
-            for invalid in [Value::Null, json!("4"), json!(1.5), json!(0), json!(17)] {
-                assert!(
-                    Tunables::parse_oat_json(fixture("collector.batching.stage_files_per_group", invalid)).is_err()
-                );
-            }
-            assert!(Tunables::parse_oat_json(json!({"collector":{"batching":{"stage_files_per_group":2}}})).is_err());
-            assert!(
-                Tunables::parse_oat_json(json!({"collector":{
-                "runtime":{"parquet_encode_mode":"column_pipeline","parquet_column_workers":4}
-            },"parquet_writer":{"max_row_group_bytes":2048}}))
-                .is_err()
-            );
-            let tunables = Tunables::parse_oat_json(json!({"collector":{
-                "runtime":{"parquet_encode_mode":"column_pipeline","parquet_column_workers":4},
-                "batching":{"coalesce_publications":true,"stage_files_per_group":4,"stage_file_concurrency":2},
-                "upload":{"mode":"buffered_multipart","staging_mode":"streaming"}
-            }}))?;
-            let env = tunables.environment_for(ComponentRole::Collector)?;
-            assert_eq!(env["ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE"], "column_pipeline");
-            let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
-            assert_eq!(batching["stage_files_per_group"], 4);
-            assert_eq!(batching["stage_file_concurrency"], 2);
-            Ok(())
-        }
     }
+    Ok(())
+}
+
+#[test]
+fn column_pipeline_and_file_splits_are_strict_and_projected() -> Result<()> {
+    for invalid in [
+        Value::Null,
+        json!(true),
+        json!(1),
+        json!("ColumnPipeline"),
+        json!("pipeline"),
+    ] {
+        assert!(Tunables::parse_oat_json(fixture("collector.runtime.parquet_encode_mode", invalid)).is_err());
+    }
+    for workers in [Value::Null, json!(0), json!(1), json!(17)] {
+        assert!(
+            Tunables::parse_oat_json(json!({"collector":{"runtime":{
+                "parquet_encode_mode":"column_pipeline", "parquet_column_workers":workers
+            }}}))
+            .is_err()
+        );
+    }
+    for invalid in [Value::Null, json!("4"), json!(1.5), json!(0), json!(17)] {
+        assert!(Tunables::parse_oat_json(fixture("collector.batching.stage_files_per_group", invalid)).is_err());
+    }
+    assert!(Tunables::parse_oat_json(json!({"collector":{"batching":{"stage_files_per_group":2}}})).is_err());
+    assert!(
+        Tunables::parse_oat_json(json!({"collector":{
+        "runtime":{"parquet_encode_mode":"column_pipeline","parquet_column_workers":4}
+    },"parquet_writer":{"max_row_group_bytes":2048}}))
+        .is_err()
+    );
+    let tunables = Tunables::parse_oat_json(json!({"collector":{
+        "runtime":{"parquet_encode_mode":"column_pipeline","parquet_column_workers":4},
+        "batching":{"coalesce_publications":true,"stage_files_per_group":4,"stage_file_concurrency":2},
+        "upload":{"mode":"buffered_multipart","staging_mode":"streaming"}
+    }}))?;
+    let env = tunables.environment_for(ComponentRole::Collector)?;
+    assert_eq!(env["ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE"], "column_pipeline");
+    let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+    assert_eq!(batching["stage_files_per_group"], 4);
+    assert_eq!(batching["stage_file_concurrency"], 2);
     Ok(())
 }
 

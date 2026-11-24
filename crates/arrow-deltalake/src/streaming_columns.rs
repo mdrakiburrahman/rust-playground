@@ -18,6 +18,22 @@ enum Message {
 
 struct ColumnSink(mpsc::Sender<Message>);
 
+#[derive(Debug)]
+struct ColumnStreamClosed(StreamingUploadError);
+
+impl std::fmt::Display for ColumnStreamClosed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ColumnStreamClosed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // io::Error forwards its inner error's source; preserve the retryable marker in that chain.
+        Some(&self.0)
+    }
+}
+
 impl Write for ColumnSink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         for chunk in bytes.chunks(CHUNK_BYTES) {
@@ -29,9 +45,9 @@ impl Write for ColumnSink {
                 Err(mpsc::error::TrySendError::Closed(message)) => Err(mpsc::error::SendError(message)),
             };
             result.map_err(|_| {
-                std::io::Error::other(StreamingUploadError(anyhow::anyhow!(
+                std::io::Error::other(ColumnStreamClosed(StreamingUploadError(anyhow::anyhow!(
                     "Parquet column stream consumer stopped"
-                )))
+                ))))
             })?;
         }
         Ok(bytes.len())
@@ -82,7 +98,11 @@ impl StreamingColumnWriter {
             Ok(sink) => sink,
             Err(error) => {
                 // Let dropping the stream abort any multipart upload before returning the encode failure.
-                let _upload = self.upload.await;
+                let error = match self.upload.await {
+                    Ok(Ok(_)) => error,
+                    Ok(Err(upload)) => error.context(format!("Parquet stream upload terminated: {upload:#}")),
+                    Err(join) => error.context(format!("Parquet stream upload worker failed: {join}")),
+                };
                 return Err(error);
             }
         };
@@ -177,7 +197,7 @@ mod tests {
             };
             let producer = tokio::task::spawn_blocking(move || ColumnSink(sender).write_all(&vec![0; CHUNK_BYTES * 8]));
             assert!(consume(sink, receiver).await.is_err());
-            let error = anyhow::Error::new(producer.await?.expect_err("consumer failed"));
+            let error = anyhow::Error::new(producer.await?.err().context("consumer failure was not propagated")?);
             assert!(error.chain().any(|cause| cause.is::<StreamingUploadError>()));
             assert!(!completed.load(Ordering::SeqCst));
             Ok::<_, anyhow::Error>(())

@@ -42,6 +42,19 @@ struct BlockingSink<W> {
     inner: W,
     enabled: bool,
     failed: bool,
+    state: Arc<PipelineState>,
+}
+
+impl<W> BlockingSink<W> {
+    fn preserve_error(&self, error: std::io::Error) -> std::io::Error {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return error;
+        }
+        let kind = error.kind();
+        // Capture before Parquet's footer-flush path turns I/O errors into text.
+        let failure = self.state.fail(anyhow::Error::new(SinkFailure(error)));
+        std::io::Error::new(kind, failure)
+    }
 }
 
 impl<W: Write> Write for BlockingSink<W> {
@@ -55,7 +68,7 @@ impl<W: Write> Write for BlockingSink<W> {
             Err(error) => error.kind() != std::io::ErrorKind::Interrupted,
             _ => false,
         };
-        result
+        result.map_err(|error| self.preserve_error(error))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -66,26 +79,62 @@ impl<W: Write> Write for BlockingSink<W> {
         self.failed = result
             .as_ref()
             .is_err_and(|error| error.kind() != std::io::ErrorKind::Interrupted);
-        result
+        result.map_err(|error| self.preserve_error(error))
+    }
+}
+
+#[derive(Debug)]
+struct SinkFailure(std::io::Error);
+
+impl std::fmt::Display for SinkFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for SinkFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // io::Error::source skips the custom inner error itself. Expose it so
+        // retry classification can still downcast to the sink's marker type.
+        Some(match self.0.get_ref() {
+            Some(inner) => inner,
+            None => &self.0,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SharedFailure(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "pipelined Parquet writer is unusable: {}", self.0)
+    }
+}
+
+impl std::error::Error for SharedFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
     }
 }
 
 struct PipelineState {
-    failure: OnceLock<String>,
+    failure: OnceLock<Arc<anyhow::Error>>,
     window: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
 }
 
 impl PipelineState {
-    fn fail(&self, message: impl Into<String>) {
-        let _ = self.failure.set(message.into());
+    fn fail(&self, error: anyhow::Error) -> SharedFailure {
+        let failure = self.failure.get_or_init(|| Arc::new(error));
         self.window.close();
         self.cpu.close();
+        SharedFailure(Arc::clone(failure))
     }
 
     fn check(&self) -> Result<()> {
-        if let Some(message) = self.failure.get() {
-            anyhow::bail!("pipelined Parquet writer is unusable: {message}");
+        if let Some(failure) = self.failure.get() {
+            return Err(SharedFailure(Arc::clone(failure)).into());
         }
         Ok(())
     }
@@ -107,18 +156,16 @@ impl StopOnDrop {
         }
     }
 
-    fn complete<T>(&mut self, result: &Result<T>) {
-        if let Err(error) = result {
-            self.state.fail(format!("{error:#}"));
-        }
+    fn complete<T>(&mut self, result: Result<T>) -> Result<T> {
         self.armed = false;
+        result.map_err(|error| self.state.fail(error).into())
     }
 }
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            self.state.fail(self.reason);
+            self.state.fail(anyhow::anyhow!(self.reason));
         }
     }
 }
@@ -164,20 +211,21 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
             "Parquet max row-group rows must be positive"
         );
 
-        let sink = BlockingSink {
-            inner: writer,
-            enabled: true,
-            failed: false,
-        };
-        let writer = ArrowWriter::try_new(sink, Arc::clone(&schema), Some(properties))?;
-        let (mut file_writer, factory) = writer.into_serialized_writer()?;
-        file_writer.inner_mut().enabled = false;
-        let columns = factory.create_column_writers(0)?;
         let state = Arc::new(PipelineState {
             failure: OnceLock::new(),
             window: Arc::new(Semaphore::new(2 * usize::from(column_workers))),
             cpu: Arc::new(Semaphore::new(usize::from(column_workers))),
         });
+        let sink = BlockingSink {
+            inner: writer,
+            enabled: true,
+            failed: false,
+            state: Arc::clone(&state),
+        };
+        let writer = ArrowWriter::try_new(sink, Arc::clone(&schema), Some(properties))?;
+        let (mut file_writer, factory) = writer.into_serialized_writer()?;
+        file_writer.inner_mut().enabled = false;
+        let columns = factory.create_column_writers(0)?;
         let (row_groups, receiver) = mpsc::channel(1);
         let mut writer = Self {
             schema,
@@ -213,8 +261,7 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
         self.state.check()?;
         let mut guard = StopOnDrop::new(&self.state, "write was cancelled before all slices were enqueued");
         let result = self.write_inner(batch).await;
-        guard.complete(&result);
-        result
+        guard.complete(result)
     }
 
     async fn write_inner(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -319,7 +366,7 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
             error => error,
         };
         if let Err(error) = result {
-            self.state.fail(format!("{error:#}"));
+            self.state.fail(error);
         }
         self.lanes.clear();
         self.row_groups.take();
@@ -329,8 +376,13 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
         for worker in self.workers.drain(..) {
             match worker.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => self.state.fail(format!("{error:#}")),
-                Err(error) => self.state.fail(format!("Parquet column task failed: {error}")),
+                Ok(Err(error)) => {
+                    self.state.fail(error);
+                }
+                Err(error) => {
+                    self.state
+                        .fail(anyhow::Error::new(error).context("Parquet column task failed"));
+                }
             }
         }
         let assembled = match self.assembler.take() {
@@ -340,9 +392,7 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
                 .and_then(|result| result),
             None => Err(anyhow::anyhow!("Parquet row-group assembler is unavailable")),
         };
-        if let Err(error) = &assembled {
-            self.state.fail(format!("{error:#}"));
-        }
+        let assembled = assembled.map_err(|error| self.state.fail(error));
         self.state.check()?;
         let mut file_writer = assembled?;
         let state = Arc::clone(&self.state);
@@ -356,9 +406,7 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
                     .context("close pipelined Parquet file")
             })
             .await?;
-        if let Err(error) = &result {
-            self.state.fail(format!("{error:#}"));
-        }
+        let result = result.map_err(|error| self.state.fail(error).into());
         self.finished = result.is_ok();
         result
     }
@@ -370,7 +418,8 @@ impl<W: Write + Send + 'static> Drop for PipelinedArrowWriter<W> {
             // Closing admission wakes idle workers; their already admitted work
             // checks this flag between messages. A synchronous Write already in
             // progress cannot be interrupted, just as with ArrowWriter.
-            self.state.fail("writer dropped before successful finish");
+            self.state
+                .fail(anyhow::anyhow!("writer dropped before successful finish"));
         }
     }
 }
@@ -401,16 +450,14 @@ async fn run_lane(
                 let _permit = permit;
                 let mut guard = StopOnDrop::new(&work_state, "Parquet column encoder panicked");
                 let result = encode_messages(column, messages, &work_state);
-                guard.complete(&result);
-                result
+                guard.complete(result)
             })
             .await??;
         }
         state.check()
     }
     .await;
-    guard.complete(&result);
-    result
+    guard.complete(result)
 }
 
 fn encode_messages(
@@ -480,8 +527,7 @@ async fn assemble<W: Write + Send + 'static>(
         Ok(writer)
     }
     .await;
-    guard.complete(&result);
-    result
+    guard.complete(result)
 }
 
 #[cfg(test)]
@@ -801,6 +847,63 @@ mod tests {
         heartbeat?;
         let error = result.err().context("failing sink succeeded")?;
         assert!(format!("{error:#}").contains("injected pipeline sink failure"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_sink_failures_survive_row_group_and_footer_error_paths() -> Result<()> {
+        #[derive(Debug)]
+        struct RetryableSinkFailure;
+        impl std::fmt::Display for RetryableSinkFailure {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("injected retryable sink failure")
+            }
+        }
+        impl std::error::Error for RetryableSinkFailure {}
+
+        struct Sink(Arc<AtomicBool>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other(RetryableSinkFailure));
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+        // An empty file fails in the footer's BufWriter flush; a large,
+        // uncompressed column fails while appending the completed row group.
+        for rows in [0, 8192] {
+            let fail = Arc::new(AtomicBool::new(false));
+            let properties = WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_max_row_group_row_count(Some(8192))
+                .build();
+            let mut writer =
+                PipelinedArrowWriter::try_new(Sink(Arc::clone(&fail)), Arc::clone(&schema), properties, 2)?;
+            fail.store(true, Ordering::SeqCst);
+            if rows > 0 {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef],
+                )?;
+                if let Err(error) = writer.write(&batch).await {
+                    assert!(error.chain().any(|cause| cause.is::<RetryableSinkFailure>()));
+                }
+            }
+            let error = tokio::time::timeout(Duration::from_secs(5), writer.finish())
+                .await?
+                .err()
+                .context("failing sink unexpectedly succeeded")?;
+            assert!(
+                error.chain().any(|cause| cause.is::<RetryableSinkFailure>()),
+                "typed sink cause was lost for {rows} rows: {error:#}"
+            );
+        }
         Ok(())
     }
 

@@ -116,7 +116,7 @@ fn corpus(batches: usize, rows: usize, width: usize, random: bool) -> Result<Vec
         .collect()
 }
 
-fn process_usage() -> Result<(f64, f64, u64)> {
+fn process_usage() -> Result<(f64, f64, u64, u64, u64)> {
     let stat = std::fs::read_to_string("/proc/self/stat")?;
     let fields: Vec<_> = stat
         .rsplit_once(") ")
@@ -127,9 +127,32 @@ fn process_usage() -> Result<(f64, f64, u64)> {
     let user: u64 = fields.get(11).context("missing user ticks")?.parse()?;
     let system: u64 = fields.get(12).context("missing system ticks")?.parse()?;
     let minor_faults: u64 = fields.get(7).context("missing minor faults")?.parse()?;
+    let major_faults: u64 = fields.get(9).context("missing major faults")?.parse()?;
+    let io = std::fs::read_to_string("/proc/self/io")?;
+    let write_bytes = io
+        .lines()
+        .find_map(|line| line.strip_prefix("write_bytes:"))
+        .context("missing write_bytes")?
+        .trim()
+        .parse()?;
     let result = std::process::Command::new("getconf").arg("CLK_TCK").output()?;
     let ticks: f64 = std::str::from_utf8(&result.stdout)?.trim().parse()?;
-    Ok((user as f64 / ticks, system as f64 / ticks, minor_faults))
+    Ok((
+        user as f64 / ticks,
+        system as f64 / ticks,
+        minor_faults,
+        major_faults,
+        write_bytes,
+    ))
+}
+
+fn peak_rss_kib() -> Result<u64> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .context("missing VmHWM")?;
+    Ok(value.split_whitespace().next().context("missing peak RSS")?.parse()?)
 }
 
 #[cfg(target_os = "linux")]
@@ -235,6 +258,9 @@ async fn parquet_encode_parallelism() -> Result<()> {
             "user_cpu_s": user,
             "system_cpu_s": system,
             "minor_faults": cpu_finished.2 - cpu_started.2,
+            "major_faults": cpu_finished.3 - cpu_started.3,
+            "write_bytes": cpu_finished.4 - cpu_started.4,
+            "rss_hwm_kib": peak_rss_kib()?,
             "cpu_s_per_mrow": cpu / total_rows as f64 * 1e6,
             "cores_busy": cpu / wall,
             "slowest_finish_s": finish_s,
@@ -250,10 +276,29 @@ async fn parquet_commit_parallelism() -> Result<()> {
         commit::{BatchedTable, CommitOptions},
         delta::DeltaTable,
     };
-    let rows = env_usize("BENCH_ROWS", 1_048_576)?;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn latest(log: &std::path::Path) -> Result<u64> {
+        std::fs::read_dir(log)?.try_fold(0_u64, |maximum, entry| {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                && stem.len() == 20
+                && stem.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Ok(maximum.max(stem.parse()?));
+            }
+            Ok(maximum)
+        })
+    }
+
+    let rows = env_usize("BENCH_ROWS", 131_072)?;
     let batch_rows = env_usize("BENCH_BATCH_ROWS", 8_192)?;
     let files = env_usize("BENCH_FILES", 1)?;
     let concurrency = env_usize("BENCH_STAGE_CONCURRENCY", 1)?;
+    let groups = env_usize("BENCH_GROUPS", 1)?;
+    let seconds = env_usize("BENCH_SECONDS", 15)?;
     let width = env_usize("BENCH_STRING_BYTES", 150)?;
     let random = match std::env::var("BENCH_DATA").as_deref() {
         Err(std::env::VarError::NotPresent) | Ok("random") => true,
@@ -268,6 +313,10 @@ async fn parquet_commit_parallelism() -> Result<()> {
         (1..=16).contains(&files) && (1..=16).contains(&concurrency),
         "file widths must be in 1..=16"
     );
+    ensure!(
+        (1..=16).contains(&groups) && (15..=600).contains(&seconds),
+        "groups must be 1..=16 and seconds 15..=600"
+    );
     let batches = corpus(rows / batch_rows, batch_rows, width, random)?;
     let schema = batches[0].schema();
     let dir = match std::env::var_os("BENCH_DIR") {
@@ -281,46 +330,118 @@ async fn parquet_commit_parallelism() -> Result<()> {
     let input_bytes = batches.iter().try_fold(0_u64, |total, batch| {
         Ok::<_, anyhow::Error>(total + arrow_deltalake::record_batch_logical_bytes(batch)?)
     })?;
-    let entries = batches
+    let stop = AtomicBool::new(false);
+    let offered = AtomicU64::new(0);
+    let clients = try_join_all((0..groups).map(|producer| {
+        let batches = &batches;
+        let table = &table;
+        let stop = &stop;
+        let offered = &offered;
+        async move {
+            let mut iteration = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                let entries = batches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, batch)| {
+                        (
+                            batch.clone(),
+                            format!("bench-{producer}-{iteration}-{index}"),
+                            0,
+                            1_700_000_000_000,
+                        )
+                    })
+                    .collect();
+                offered.fetch_add(rows as u64, Ordering::Relaxed);
+                let group = table
+                    .stage_coalesced_publications_with_file_policy(entries, concurrency, files)
+                    .await?;
+                let result = table.submit_prepared_group(group, true).await?.wait().await?;
+                ensure!(
+                    result.files.iter().map(|file| file.rows).sum::<usize>() == rows,
+                    "receipt row count mismatch"
+                );
+                iteration += 1;
+            }
+            Ok::<_, anyhow::Error>(iteration * rows as u64)
+        }
+    }));
+    tokio::pin!(clients);
+    let log_dir = root.join("_delta_log");
+    let sample = async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let before = latest(&log_dir)?;
+        ensure!(before > 0, "warmup did not produce a durable commit");
+        let usage_started = process_usage()?;
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(seconds as u64)).await;
+        let after = latest(&log_dir)?;
+        let wall_s = started.elapsed().as_secs_f64();
+        let usage_finished = process_usage()?;
+        Ok::<_, anyhow::Error>((before, after, wall_s, usage_started, usage_finished))
+    };
+    let (before, after, wall_s, usage_started, usage_finished) = tokio::select! {
+        outcome = &mut clients => anyhow::bail!("traffic ended during sample: {outcome:?}"),
+        result = sample => result?,
+    };
+    stop.store(true, Ordering::Relaxed);
+    let acked_rows: u64 = tokio::time::timeout(Duration::from_secs(120), clients)
+        .await??
         .into_iter()
-        .enumerate()
-        .map(|(index, batch)| (batch, format!("bench-{index}"), 0, 1_700_000_000_000))
-        .collect();
-    let usage_started = process_usage()?;
-    let started = Instant::now();
-    let group = table
-        .stage_coalesced_publications_with_file_policy(entries, concurrency, files)
-        .await?;
-    let stage_s = started.elapsed().as_secs_f64();
-    let result = table.submit_prepared_group(group, true).await?.wait().await?;
-    let wall_s = started.elapsed().as_secs_f64();
-    let usage_finished = process_usage()?;
+        .sum();
+    let final_version = latest(&log_dir)?;
     let mut committed_rows = 0_u64;
-    let log = std::fs::read_to_string(root.join(format!("_delta_log/{:020}.json", result.version)))?;
-    for line in log.lines() {
-        let action: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(add) = action.get("add") {
-            let stats: serde_json::Value =
-                serde_json::from_str(add["stats"].as_str().context("missing add statistics")?)?;
-            committed_rows += stats["numRecords"].as_u64().context("missing committed row count")?;
+    let mut all_rows = 0_u64;
+    let mut parquet_bytes = 0_u64;
+    let mut committed_files = 0_u64;
+    let mut paths = std::collections::HashSet::new();
+    for version in 0..=final_version {
+        let log = std::fs::read_to_string(log_dir.join(format!("{version:020}.json")))?;
+        for line in log.lines() {
+            let action: serde_json::Value = serde_json::from_str(line)?;
+            ensure!(action.get("remove").is_none(), "measurement table must be append-only");
+            if let Some(add) = action.get("add") {
+                ensure!(
+                    paths.insert(add["path"].as_str().context("missing add path")?.to_owned()),
+                    "duplicate add path"
+                );
+                let stats: serde_json::Value =
+                    serde_json::from_str(add["stats"].as_str().context("missing add statistics")?)?;
+                let records = stats["numRecords"].as_u64().context("missing committed row count")?;
+                all_rows += records;
+                if before < version && version <= after {
+                    committed_rows += records;
+                    parquet_bytes += add["size"].as_u64().context("missing add size")?;
+                    committed_files += 1;
+                }
+            }
         }
     }
-    ensure!(committed_rows == rows as u64, "Delta log row count mismatch");
+    ensure!(
+        all_rows == acked_rows && all_rows == offered.load(Ordering::Relaxed),
+        "Delta log, offered and drained receipt rows disagree"
+    );
+    ensure!(committed_rows > 0, "no durable commits in measurement window");
     let user_s = usage_finished.0 - usage_started.0;
     let system_s = usage_finished.1 - usage_started.1;
-    let parquet_bytes: u64 = result.files.iter().map(|file| file.bytes).sum();
     println!(
         "BW_COMMIT_RESULT={}",
         json!({
-            "level":"L5_local_fsync", "rows":committed_rows, "files":result.files.len(),
+            "level":"L5_local_fsync", "rows":committed_rows, "files":committed_files,
             "stage_file_concurrency":concurrency, "requested_files":files,
-            "batch_rows":batch_rows, "data":if random {"random"} else {"loadgen"},
-            "string_bytes":width, "wall_s":wall_s, "stage_s":stage_s,
-            "commit_s":wall_s-stage_s, "committed_rows_per_s":committed_rows as f64 / wall_s,
-            "arrow_bytes_per_row":input_bytes as f64 / committed_rows as f64,
+            "groups":groups, "rows_per_group":rows, "batch_rows":batch_rows, "data":if random {"random"} else {"loadgen"},
+            "string_bytes":width, "warmup_s":5, "wall_s":wall_s,
+            "start_version_exclusive":before, "end_version_inclusive":after,
+            "all_durable_rows":all_rows,"drained_acked_rows":acked_rows,
+            "committed_rows_per_s":committed_rows as f64 / wall_s,
+            "arrow_bytes_per_row":input_bytes as f64 / rows as f64,
             "parquet_bytes_per_row":parquet_bytes as f64 / committed_rows as f64,
             "user_cpu_s":user_s, "system_cpu_s":system_s,
             "minor_faults":usage_finished.2-usage_started.2,
+            "major_faults":usage_finished.3-usage_started.3,
+            "write_bytes":usage_finished.4-usage_started.4,
+            "write_mb_per_s":(usage_finished.4-usage_started.4) as f64 / wall_s / 1e6,
+            "rss_hwm_kib":peak_rss_kib()?,
             "cpu_s_per_mrow":(user_s+system_s) / committed_rows as f64 * 1e6,
             "cores_busy":(user_s+system_s) / wall_s,
             "allocator":"system", "glibc_tunables":std::env::var("GLIBC_TUNABLES").ok(),
