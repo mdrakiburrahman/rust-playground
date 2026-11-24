@@ -31,8 +31,10 @@ binary directory. `BWA_CCPUS` and `BWA_KCPUS` default to `0-23` and `24-31`.
 configure the load. Runtime knobs use `ARROWCOL_COLLECTOR_*`.
 `BWA_CHECKPOINT_EVERY_COMMITS` optionally runs the separately built
 `delta-maintenance` binary in checkpoint-only mode at a one-second cadence.
-The output reports actual checkpoint files and maintenance CPU/fault counters;
-other maintenance operations remain disabled.
+The output reports checkpoint files at window end (`stats.checkpoints`), newly
+visible checkpoint files (`stats.checkpoint_files_added`), and maintenance
+CPU/fault counters. A checkpoint-enabled cell without a new file during the
+measurement window is not scored. Other maintenance operations remain disabled.
 `BWA_ISOLATION=l0` or `l1` requires the matching diagnostic-sink build on both
 client and collector. Diagnostic receipts are checked, Delta rows must stay zero,
 and the discard rate is recorded separately from committed throughput.

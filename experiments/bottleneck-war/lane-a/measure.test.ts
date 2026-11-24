@@ -11,10 +11,13 @@ test('counts newly visible commits even when their commitInfo timestamp precedes
     const log = path.join(root, 'table', '_delta_log');
     fs.mkdirSync(log, { recursive: true });
     fs.writeFileSync(path.join(log, '00000000000000000000.json'), '{"commitInfo":{"timestamp":1}}\n');
+    fs.writeFileSync(path.join(log, '00000000000000000000.checkpoint.parquet'), '');
     const start = snapshot(root);
     start.observedAt = 1000;
+    assert.equal(difference(start, { ...start, observedAt: 2000 }).checkpoint_files_added, 0);
     fs.writeFileSync(path.join(log, '00000000000000000001.json'),
       '{"commitInfo":{"timestamp":1}}\n{"add":{"size":400,"stats":"{\\"numRecords\\":20}"}}\n');
+    fs.writeFileSync(path.join(log, '00000000000000000001.checkpoint.parquet'), '');
     const end = snapshot(root);
     end.observedAt = 3000;
     const stats = difference(start, end);
@@ -22,6 +25,8 @@ test('counts newly visible commits even when their commitInfo timestamp precedes
     assert.equal(stats.committed_rps, 10);
     assert.equal(stats.bytes_per_row, 20);
     assert.equal(stats.commits, 1);
+    assert.equal(stats.checkpoints, 2);
+    assert.equal(stats.checkpoint_files_added, 1);
     fs.writeFileSync(path.join(log, '00000000000000000002.json'), '{"add":{"size":20}}\n');
     assert.throws(() => snapshot(root), /statistics/);
   } finally { fs.rmSync(root, { recursive: true }); }

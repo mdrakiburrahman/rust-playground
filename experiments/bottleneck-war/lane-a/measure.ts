@@ -2,11 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export type Commit = { rows: number; bytes: number; files: number; timestamp: number };
-export type Snapshot = { observedAt: number; commits: Map<string, Commit>; checkpoints: number };
+export type Snapshot = { observedAt: number; commits: Map<string, Commit>; checkpoints: Set<string> };
 
 export function snapshot(root: string): Snapshot {
   const commits = new Map<string, Commit>();
-  let checkpoints = 0;
+  const checkpoints = new Set<string>();
   function walk(dir: string): void {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
@@ -16,7 +16,9 @@ export function snapshot(root: string): Snapshot {
         continue;
       }
       for (const name of fs.readdirSync(full).sort()) {
-        if (name.includes('.checkpoint')) checkpoints++;
+        if (/^\d{20}\.checkpoint(?:\.(?:\d+\.\d+|[a-f0-9-]+))?\.(?:parquet|json)$/i.test(name)) {
+          checkpoints.add(path.relative(root, path.join(full, name)));
+        }
         if (!/^\d{20}\.json$/.test(name)) continue;
         const file = path.join(full, name);
         const commit = { rows: 0, bytes: 0, files: 0, timestamp: fs.statSync(file).mtimeMs };
@@ -54,7 +56,8 @@ export function difference(start: Snapshot, end: Snapshot) {
     bytes_per_row: rows ? bytes / rows : null,
     rows_per_file: files ? rows / files : null,
     files_per_commit: added.length ? files / added.length : null,
-    checkpoints: end.checkpoints,
+    checkpoints: end.checkpoints.size,
+    checkpoint_files_added: [...end.checkpoints].filter((key) => !start.checkpoints.has(key)).length,
     start_observed_ms: start.observedAt, end_observed_ms: end.observedAt,
     semantics: 'new_local_Delta_versions_visible_between_boundary_scans_not_client_ACKs',
   };

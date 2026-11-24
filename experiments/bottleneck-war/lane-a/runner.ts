@@ -244,14 +244,14 @@ async function runCell(cell: Cell, plan: Plan, identity: object): Promise<boolea
     const startup = fs.readFileSync(collector.log, 'utf8').split('\n')
       .filter((line) => line.startsWith('arrowcol_effective_config '))
       .map((line) => JSON.parse(line.slice('arrowcol_effective_config '.length)));
-    const checkpointMissing = maintenance !== null && stats.checkpoints === 0;
+    const checkpointMissing = maintenance !== null && stats.checkpoint_files_added === 0;
     valid = clientErrors === 0 && !checkpointMissing;
     result = {
       ...metadata, status: clientErrors ? 'invalid_client_errors' : checkpointMissing ? 'checkpoint_not_exercised' : 'ok',
       committed_rps: !valid || diagnostic ? null : stats.committed_rps,
       diagnostic_rps: diagnostic && !clientErrors ? admitted / plan.duration : null,
       comment: clientErrors ? 'Client errors or ambiguous outcomes: see raw stats' :
-        checkpointMissing ? 'Requested checkpoint service produced no checkpoint files; raw Delta rate is not a checkpoint treatment' :
+        checkpointMissing ? 'No new checkpoint files appeared in the measurement window; raw Delta rate is not a checkpoint treatment' :
         diagnostic ? 'Diagnostic discard path: not admission, durability or production throughput' :
           observationErrors.length ? 'Some admin telemetry unavailable; Delta boundary evidence and process counters retained' : null,
       admitted_rps: diagnostic ? null : admitted / plan.duration,
@@ -296,6 +296,8 @@ async function main(): Promise<void> {
       sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
       dirty: execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim(),
       host: os.hostname(),
+      build_provenance: fs.existsSync(path.join(bin, 'build-provenance.json'))
+        ? JSON.parse(fs.readFileSync(path.join(bin, 'build-provenance.json'), 'utf8')) : null,
       harness_sha256: createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'),
       config_sha256: createHash('sha256').update(fs.readFileSync(path.join(here, 'base.yaml'))).digest('hex'),
       binaries: Object.fromEntries(['arrowcol-dataflow-rust', 'arrowcol-dmv', 'arrowcol-catalog-rust'].map((name) =>
