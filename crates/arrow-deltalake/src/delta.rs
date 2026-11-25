@@ -1513,6 +1513,7 @@ mod io_tests {
         assert_eq!(executor.available_upload_slots(), upload_limit);
         Ok(())
     }
+
     #[tokio::test]
     async fn batched_local_directory_sync_precedes_commit_and_deduplicates() -> Result<()> {
         use crate::sync_hook;
@@ -1527,7 +1528,7 @@ mod io_tests {
         ]));
         let columns = || vec!["p1".to_owned(), "p2".to_owned()];
         let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
-        let mut table = DeltaTable::open_url(url, Arc::clone(&schema), columns())?;
+        let mut table = DeltaTable::open_url(url.clone(), Arc::clone(&schema), columns())?;
         Arc::get_mut(&mut table)
             .context("table is unexpectedly shared")?
             .local_directory_sync_policy = crate::LocalDirectorySyncPolicy::BeforeCommit;
@@ -1551,8 +1552,10 @@ mod io_tests {
         }
         let intermediate = root.join("p1=a");
         let leaf = intermediate.join("p2=b");
+        assert!(!sync_hook::synced_under(&base_path).contains(&leaf));
+        let publisher = DeltaTable::open_url(url, Arc::clone(&schema), columns())?;
         sync_hook::reset(&base_path);
-        let committed = table.commit_files(&staged)?;
+        let committed = publisher.commit_files(&staged)?;
         let events = sync_hook::synced_under(&base_path);
         let log = root.join("_delta_log").join(format!("{committed:020}.json"));
         let commit_index = events
@@ -1588,8 +1591,8 @@ mod io_tests {
         let failed_file = failed_file.stage().await?;
         sync_hook::reset(&base_path);
         sync_hook::fail_on(&leaf);
-        assert!(table.commit_files(&[failed_file]).is_err());
-        assert_eq!(table.version()?, committed);
+        assert!(publisher.commit_files(&[failed_file]).is_err());
+        assert_eq!(publisher.version()?, committed);
         assert!(
             !root
                 .join("_delta_log")
@@ -3509,7 +3512,7 @@ pub struct DeltaTable {
     stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
-    pub(crate) local_directory_sync_policy: crate::LocalDirectorySyncPolicy,
+    local_directory_sync_policy: crate::LocalDirectorySyncPolicy,
 }
 
 #[derive(PartialEq, Eq)]
@@ -4445,58 +4448,10 @@ impl DeltaTable {
     pub(crate) fn sync_local_output(&self, file: &Path) -> Result<()> {
         let parent = file.parent().context("local output has no directory")?;
         if self.url.scheme() == "file" {
-            match self.local_directory_sync_policy {
-                crate::LocalDirectorySyncPolicy::PerFile => sync_directory_chain(parent, &self.root),
-                crate::LocalDirectorySyncPolicy::BeforeCommit => Ok(()),
-            }
+            sync_directory_chain(parent, &self.root)
         } else {
             sync_directory(parent)
         }
-    }
-    fn sync_pending_local_directories(&self, files: &[&StagedAppend]) -> Result<()> {
-        if self.url.scheme() != "file"
-            || self.local_directory_sync_policy != crate::LocalDirectorySyncPolicy::BeforeCommit
-        {
-            return Ok(());
-        }
-        let mut directories = std::collections::BTreeSet::new();
-        for append in files {
-            anyhow::ensure!(append.table.url == self.url, "staged output belongs to another table");
-            let mut directory = append
-                .file
-                .path
-                .parent()
-                .context("local output has no directory")?
-                .to_path_buf();
-            loop {
-                anyhow::ensure!(
-                    directory.starts_with(&self.root),
-                    "{} is outside table root {}",
-                    directory.display(),
-                    self.root.display()
-                );
-                directories.insert(directory.clone());
-                if directory == self.root {
-                    break;
-                }
-                directory = directory
-                    .parent()
-                    .context("local output did not reach table root")?
-                    .to_path_buf();
-            }
-        }
-        let mut directories = directories.into_iter().collect::<Vec<_>>();
-        directories.sort_by(|left, right| {
-            right
-                .components()
-                .count()
-                .cmp(&left.components().count())
-                .then_with(|| left.cmp(right))
-        });
-        for directory in directories {
-            sync_directory(&directory)?;
-        }
-        Ok(())
     }
 
     fn validate_retention(snapshot: &SnapshotRef) -> Result<()> {
@@ -4542,7 +4497,9 @@ impl DeltaTable {
 
     fn prepare_upload(&self, file: &CompletedFile) -> Result<Option<object_store::path::Path>> {
         if self.url.scheme() == "file" {
-            self.sync_local_output(&file.path)?;
+            if self.local_directory_sync_policy == crate::LocalDirectorySyncPolicy::PerFile {
+                self.sync_local_output(&file.path)?;
+            }
             return Ok(None);
         }
         if file.bytes > 512 * 1024 * 1024 {
@@ -4662,7 +4619,6 @@ impl DeltaTable {
             reuse_snapshots,
             publication_fence,
             local_directory_sync_policy: config.local_directory_sync_policy,
-
             session: None,
             bootstrap_only: false,
         };
@@ -6410,6 +6366,7 @@ impl DeltaTable {
             if !pending.is_empty() {
                 transaction = transaction.with_blind_append();
             }
+            let mut deferred_directories = std::collections::BTreeSet::new();
             for append in &pending {
                 if append.table.url != self.url || canonical != *append.schema {
                     bail!("table or schema changed while file was open; file remains uncommitted");
@@ -6420,6 +6377,15 @@ impl DeltaTable {
                     .strip_prefix(&self.root)?
                     .to_str()
                     .context("invalid data file path")?;
+                if append.table.local_directory_sync_policy == crate::LocalDirectorySyncPolicy::BeforeCommit
+                    && self.url.scheme() == "file"
+                {
+                    for dir in append.file.path.ancestors().skip(1) {
+                        if !deferred_directories.insert(dir) || dir == self.root {
+                            break;
+                        }
+                    }
+                }
                 let url = self.staged_url(relative)?;
                 let modified = match append.remote_modified {
                     Some(modified) => modified,
@@ -6447,6 +6413,16 @@ impl DeltaTable {
             }
             if let Some((app_id, version)) = identity {
                 transaction = transaction.with_transaction_id(app_id.to_owned(), version);
+            }
+            if !deferred_directories.is_empty() {
+                // Reverse component order puts every child before its parent.
+                crate::telemetry::publication_phase("sync", || {
+                    deferred_directories.into_iter().rev().try_for_each(sync_directory)
+                })
+                .inspect_err(|_| {
+                    evidence.fail(PublicationReason::SyncFailed);
+                    crate::telemetry::mark_terminal_commit_incomplete();
+                })?;
             }
             if let Some(publication_fence) = &self.publication_fence {
                 publication_fence
@@ -6546,14 +6522,6 @@ impl DeltaTable {
                 .zip(&pending_indices)
                 .map(|(append, index)| (*index, append.observation()))
                 .collect();
-            if self.local_directory_sync_policy == crate::LocalDirectorySyncPolicy::BeforeCommit {
-                crate::telemetry::publication_phase("sync", || self.sync_pending_local_directories(&pending))
-                    .inspect_err(|_| {
-                        evidence.fail(PublicationReason::SyncFailed);
-                        crate::telemetry::mark_terminal_commit_incomplete();
-                    })?;
-            }
-
             match crate::telemetry::publication_phase("commit", || transaction.commit(&self.engine)) {
                 Ok(CommitResult::Committed(commit)) => {
                     crate::telemetry::publication_phase("sync", || sync_directory(&self.root)).inspect_err(|_| {
@@ -6724,7 +6692,8 @@ pub struct FileStageTimings {
     pub upload: Option<Duration>,
 }
 
-/// A durable Parquet file that is not yet visible in a Delta snapshot.
+/// A finished Parquet file not yet visible in a Delta snapshot. Local file contents
+/// are durable; `before_commit` defers directory-entry durability until publication.
 pub struct StagedAppend {
     pub(crate) table: Arc<DeltaTable>,
     pub(crate) schema: SchemaRef,
