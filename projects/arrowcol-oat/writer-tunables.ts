@@ -51,9 +51,11 @@ function validateWriter(writer: unknown, path: string): boolean {
     if (present(writer, field) && typeof writer[field] !== 'boolean') throw new Error(`${path}.${field} must be a boolean`);
   }
   for (const field of limitFields) {
+    if (!present(writer, field)) continue;
     const value = writer[field];
-    // Pre-existing fields keep their null-as-omitted behaviour; "unlimited" is the explicit upstream None.
-    if (value == null || value === 'unlimited') continue;
+    // null would be ambiguous between "unlimited" (upstream None) and omission (today's default).
+    if (value === null) throw new Error(`${path}.${field} must be a positive integer or "unlimited"; omit it to keep the default`);
+    if (value === 'unlimited') continue;
     if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new Error(`${path}.${field} must be a positive integer or "unlimited"`);
   }
   if (!present(writer, 'content_defined_chunking')) return false;

@@ -424,12 +424,16 @@ pub struct ParquetWriterConfig {
     pub defaults: ColumnOptions,
     pub columns: BTreeMap<String, ColumnOptions>,
     pub writer_version: Option<Version>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub max_row_group_rows: Option<Limit>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub max_row_group_bytes: Option<Limit>,
     pub data_page_row_count_limit: Option<usize>,
     pub write_batch_size: Option<usize>,
     pub offset_index_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub column_index_truncate_length: Option<Limit>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub statistics_truncate_length: Option<Limit>,
     pub sorting_columns: Option<Vec<SortColumn>>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
@@ -1204,6 +1208,10 @@ mod tests {
             r#"{"max_row_group_bytes":-1}"#,
             r#"{"statistics_truncate_length":1.5}"#,
             r#"{"column_index_truncate_length":"none"}"#,
+            r#"{"max_row_group_rows":null}"#,
+            r#"{"max_row_group_bytes":null}"#,
+            r#"{"column_index_truncate_length":null}"#,
+            r#"{"statistics_truncate_length":null}"#,
         ] {
             assert!(serde_json::from_str::<ParquetWriterConfig>(json).is_err(), "{json}");
         }
@@ -1244,6 +1252,11 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ParquetWriterConfig>(serde_json::to_value(&config)?)?,
             config
+        );
+        let omitted = ParquetWriterConfig::default();
+        assert_eq!(
+            serde_json::from_value::<ParquetWriterConfig>(serde_json::to_value(&omitted)?)?,
+            omitted
         );
         let base = WriterProperties::builder()
             .set_max_row_group_row_count(Some(7))

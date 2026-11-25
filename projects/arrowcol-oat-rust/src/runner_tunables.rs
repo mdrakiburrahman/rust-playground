@@ -182,11 +182,13 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             && matches!(field, "writer_version" | "max_row_group_bytes" | "write_batch_size"
                 | "offset_index_enabled" | "column_index_truncate_length" | "statistics_truncate_length")
         {
+            // "unlimited" is upstream None, which the table readback reports as null.
             let requested = parquet_policy.as_ref().and_then(|policy| policy.get(field))
-                .filter(|value| !value.is_null());
+                .filter(|value| !value.is_null())
+                .map(|value| if value.as_str() == Some("unlimited") { Value::Null } else { value.clone() });
             if tables_covered && requested.is_some()
                 && table_policies.iter().all(|record| {
-                    record["parquet_properties"].get(field) == requested
+                    record["parquet_properties"].get(field) == requested.as_ref()
                         && (!matches!(field, "column_index_truncate_length" | "statistics_truncate_length")
                             || record["parquet_column_options"].as_object().is_some_and(|columns| {
                                 columns.values().any(|column| {
@@ -306,14 +308,20 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         };
         if let Some((requested_field, observed_field)) = parquet_field {
             let Some(requested) = parquet_policy.as_ref().and_then(|policy| policy.get(requested_field))
-                .filter(|value| value.as_u64().is_some_and(|number| number > 0)) else {
+                .and_then(|value| if value.as_u64().is_some_and(|number| number > 0) {
+                    Some(value.clone())
+                } else if requested_field == "max_row_group_rows" && value.as_str() == Some("unlimited") {
+                    Some(Value::Null)
+                } else {
+                    None
+                }) else {
                 return true;
             };
             if tables_covered
                 && table_policies.iter().all(|policy| {
                     policy["parquet_properties"].get(requested_field).map_or_else(
-                        || policy["config"]["enabled"] == true && policy["config"][observed_field] == *requested,
-                        |actual| actual == requested,
+                        || policy["config"]["enabled"] == true && policy["config"][observed_field] == requested,
+                        |actual| *actual == requested,
                     )
                 })
             {

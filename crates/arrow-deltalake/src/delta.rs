@@ -3723,11 +3723,8 @@ impl LayoutReadback {
                 .collect::<Vec<_>>();
             config["detach_ratio"] = serde_json::json!(runtime_config()?.layout_detach_ratio);
             config["bloom_columns"] = serde_json::json!(bloom_columns);
-            config["row_group_rows"] = serde_json::json!(
-                properties
-                    .max_row_group_row_count()
-                    .context("missing Parquet row-group row limit")?
-            );
+            // `null` when parquet_writer.max_row_group_rows is "unlimited", which overrides the layout cap.
+            config["row_group_rows"] = serde_json::json!(properties.max_row_group_row_count());
             config["page_rows"] = serde_json::json!(properties.data_page_row_count_limit());
         } else {
             for name in [
@@ -7627,6 +7624,12 @@ mod layout_readback_tests {
         assert_eq!(event["config"]["bloom_columns"], serde_json::json!(["customer_id"]));
         assert_eq!(event["config"]["row_group_rows"], 3);
         assert_eq!(event["config"]["page_rows"], 1);
+        let unlimited: crate::writer::ParquetWriterConfig =
+            serde_json::from_value(serde_json::json!({"max_row_group_rows": "unlimited"}))?;
+        let uncapped = readback.test_event(&url, &unlimited)?;
+        assert_eq!(uncapped["applied"], true);
+        assert!(uncapped["config"]["row_group_rows"].is_null());
+        assert!(uncapped["parquet_properties"]["max_row_group_rows"].is_null());
         assert_eq!(
             event["parquet_column_options"]["customer_id"],
             serde_json::json!({
