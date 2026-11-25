@@ -31,6 +31,14 @@ The service enforces metadata, schema, and protobuf message limits in addition
 to tonic's decoding limit. `DrainController` stops new admission, waits for
 active work, and force-cancels only after a caller-selected graceful timeout.
 
+## Arrow IPC body compression
+
+Select `none` (default), `lz4_frame`, or `zstd` on the sender with
+`--ipc-compression`. The router forwards the body unchanged; the shared
+receiver reads the codec from IPC metadata. No router or receiver setting is
+needed. This is independent of gRPC compression. Keep the receiver's message
+limit large enough for the decoded batch, not just its compressed size.
+
 ## gRPC compression
 
 | Setting | Default | Effect |
