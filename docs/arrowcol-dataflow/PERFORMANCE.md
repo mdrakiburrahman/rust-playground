@@ -56,7 +56,9 @@ conflicting requests fail instead of silently ignoring the setting.
 `max_row_group_rows`, `max_row_group_bytes`, `column_index_truncate_length`
 and `statistics_truncate_length` accept a positive integer or the string
 `"unlimited"` (upstream `None`); omitting a field keeps the Parquet 58.4
-default. `bloom_filter_position` is `after_row_group` (default) or `end`.
+default, and explicit `null` is rejected. Under an applied layout, an unlimited
+`max_row_group_rows` overrides the layout's cap and reads back as
+`row_group_rows: null`. `bloom_filter_position` is `after_row_group` (default) or `end`.
 `skip_arrow_metadata: true` is accepted only when the physical schema has no
 metadata and every field round-trips through the Parquet schema unchanged.
 `coerce_types: true` is accepted only when coercion leaves the physical

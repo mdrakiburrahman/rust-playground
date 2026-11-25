@@ -25,6 +25,8 @@ test('writer gap knobs reject bad enums, types, ranges, nulls and illegal combin
     [{ maintenance: { parquet_writer: { coerce_types: null } } }, /maintenance\.parquet_writer\.coerce_types must be a boolean/],
     [{ parquet_writer: { max_row_group_bytes: 'Unlimited' } }, /max_row_group_bytes must be a positive integer or "unlimited"/],
     [{ parquet_writer: { statistics_truncate_length: 0 } }, /statistics_truncate_length/],
+    [{ parquet_writer: { max_row_group_rows: null } }, /max_row_group_rows must be a positive integer or "unlimited"; omit it/],
+    [{ maintenance: { parquet_writer: { statistics_truncate_length: null } } }, /maintenance\.parquet_writer\.statistics_truncate_length must be/],
     [{ parquet_writer: { content_defined_chunking: null } }, /content_defined_chunking must be an object/],
     [{ parquet_writer: { content_defined_chunking: { ...cdc, extra: 1 } } }, /content_defined_chunking\.extra is not a supported field/],
     [{ parquet_writer: { content_defined_chunking: { min_chunk_size: 1, max_chunk_size: 2 } } }, /norm_level is required/],

@@ -1147,6 +1147,10 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             .as_bool()
             .context("collector layout omitted enabled state")?;
         let mut policy = serde_json::Map::from_iter([("enabled".to_owned(), json!(enabled))]);
+        // parquet_writer.max_row_group_rows: "unlimited" overrides the layout cap and reads back as null.
+        let unlimited_row_groups = value["parquet_properties"]
+            .get("max_row_group_rows")
+            .is_some_and(Value::is_null);
         for field in [
             "sort_execution",
             "sort_columns",
@@ -1180,7 +1184,9 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
                 }) {
                     bail!("collector layout reported invalid column names");
                 }
-            } else if actual.as_u64().is_none_or(|value| value == 0) {
+            } else if actual.as_u64().is_none_or(|value| value == 0)
+                && !(field == "row_group_rows" && actual.is_null() && unlimited_row_groups)
+            {
                 bail!("collector layout reported invalid resolved limit");
             }
             policy.insert(field.to_owned(), actual.clone());
@@ -2452,6 +2458,23 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn enabled_layout_reports_null_row_groups_only_when_unlimited() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let mut event = json!({"component":"layout","scope":"table_effective","table_id":"a".repeat(64),
+            "parquet_properties":{"writer_version":"v1","max_row_group_bytes":null,"max_row_group_rows":null,"data_page_row_count_limit":8,"write_batch_size":8,"offset_index_enabled":true,"column_index_truncate_length":64,"statistics_truncate_length":64},
+            "table_name":canonical_dmv_table_name(&config.tables[0])?,
+            "config":{"enabled":true,"sort_execution":"verify_order","sort_columns":["customer_id"],"bloom_columns":[],"max_rows":65536,
+                "max_input_bytes":1048576,"row_group_rows":null,"page_rows":8}});
+        let records = collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n"))?;
+        assert!(records[0]["config"]["row_group_rows"].is_null());
+        event["parquet_properties"]["max_row_group_rows"] = json!(32);
+        assert!(collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n")).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn client_quiesce_readback_survives_into_completed_and_cancelled_table_evidence() -> Result<()> {
         for (tunables, effective_timeout) in [
             (json!({"transport":{"request_timeout_ms":1234}}), 1234_u64),
@@ -3625,6 +3648,66 @@ groups:
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
             observed.as_object_mut().context("startup readback must be an object")?.remove("parquet_writer");
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires built arrowcol-dataflow-rust"]
+    fn unlimited_writer_limits_promote_from_table_readback() -> Result<()> {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(format!("arrowcol-dataflow-rust{}", std::env::consts::EXE_SUFFIX));
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "parquet_writer":{"max_row_group_rows":"unlimited","max_row_group_bytes":"unlimited",
+                "column_index_truncate_length":"unlimited","statistics_truncate_length":"unlimited"},
+            "collector":{"layout":{"enabled":true, "sort_execution":"verify_order", "sort_columns":["customer_id","value"],
+                "bloom_columns":["value","customer_id"], "max_rows":65536, "max_input_bytes":1048576,
+                "row_group_rows":16384, "page_rows":2048}}}))?;
+        let output = std::process::Command::new(&binary)
+            .arg("--help")
+            .env_clear()
+            .envs(role_environment(&config, ComponentRole::Collector)?)
+            .output()
+            .context("launch collector for unlimited Parquet limits")?;
+        anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+        let observed = process_configurations(&String::from_utf8(output.stderr)?)?;
+        verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+        let events = config.tables.iter().map(|table| Ok(format!("arrowcol_effective_config {}\n", json!({
+            "component":"layout", "scope":"table_effective", "table_id":"a".repeat(64),
+            "table_name":canonical_dmv_table_name(table)?,
+            "config":{"enabled":true, "sort_execution":"verify_order", "sort_columns":["customer_id","value"],
+                "bloom_columns":["customer_id","value"], "max_rows":65536, "max_input_bytes":1048576,
+                "row_group_rows":null, "page_rows":2048},
+            "parquet_column_options":{
+                "value":{"encoding":"plain","dictionary_enabled":true,"dictionary_page_size_limit":2048,
+                    "data_page_size_limit":4096,"statistics":"chunk","write_page_header_statistics":true,
+                    "bloom_filter_enabled":true,"bloom_filter_fpp":0.05,"bloom_filter_ndv":1024,
+                    "data_page_v2_compression_ratio_threshold":1.5},
+                "customer_id":{"encoding":"delta_byte_array","dictionary_enabled":true,"dictionary_page_size_limit":1024,
+                    "data_page_size_limit":2048,"statistics":"page","write_page_header_statistics":false,
+                    "bloom_filter_enabled":true,"bloom_filter_fpp":0.1,"bloom_filter_ndv":512,
+                    "data_page_v2_compression_ratio_threshold":1.2}},
+            "parquet_properties":{"writer_version":"v1", "max_row_group_rows":null, "data_page_row_count_limit":2048,
+                "max_row_group_bytes":null, "write_batch_size":1024, "offset_index_enabled":true,
+                "column_index_truncate_length":null, "statistics_truncate_length":null}
+        })))).collect::<Result<String>>()?;
+        let process = json!({
+            "component":"collector", "instance_id":"collector-1", "log_complete":true,
+            "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
+            "effective_config":observed, "writer_policy_overrides":observed["parquet_writer"],
+            "layout_table_policies":collector_layout_records(&config, &events)?,
+        });
+        let mut evidence = tunable_leaf_evidence(&config)?;
+        promote_collector_readback(&config, &mut evidence, Some(&json!([process])), 1)?;
+        for path in ["parquet_writer.max_row_group_rows", "parquet_writer.max_row_group_bytes",
+            "parquet_writer.column_index_truncate_length", "parquet_writer.statistics_truncate_length"] {
+            assert!(evidence["consumer_verified"].as_array().context("missing verified fields")?
+                .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"),
+                "missing writer readback for {path}: {evidence}");
         }
         Ok(())
     }
