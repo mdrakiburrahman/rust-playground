@@ -56,6 +56,8 @@ async function fixture() {
       observed_at_unix_ms: now, exclusive_campaign_ownership: true, source_inventory_sha256: '',
       retirement: {
         observed_at_unix_ms: now, owned_launchers: 0, owned_jobs: 0, renewals: 0,
+        final_census: { observed_at_unix_ms: now - 750, sha256: '', ledgers: ['/original/ledger'],
+          inventory: [] as { ledger: string; name: string; sha256: string }[] },
         leases: ['old-lease', 'export-lease'].map(lease_id => ({
           lease_id, client_id: 'old-client', state: 'released', released_at_unix_ms: now - 500,
         })),
@@ -73,6 +75,8 @@ async function fixture() {
     const inventory = bundle.source.files.map(({ ledger, name, sha256 }) => ({ ledger, name, sha256 }))
       .sort((a, b) => `${a.ledger}/${a.name}`.localeCompare(`${b.ledger}/${b.name}`, 'en'));
     bundle.source.before_sha256 = bundle.source.after_sha256 = bundle.approval.source_inventory_sha256 = historySha256(JSON.stringify(inventory));
+    bundle.approval.retirement.final_census.inventory = inventory;
+    bundle.approval.retirement.final_census.sha256 = bundle.source.after_sha256;
     const bytes = JSON.stringify(bundle, null, 2) + '\n';
     await writeFile(path, bytes);
     return historySha256(bytes);
@@ -135,6 +139,9 @@ test('history rejects ambiguous admission, wrong stamp, missing cleanup and inco
     ['stale', f => { f.bundle.approval.safe_idle.observed_at_unix_ms -= 600_001; }, /stale/],
     ['lease', f => { f.bundle.approval.retirement.leases[0]!.state = 'active'; }, /not released/],
     ['missing lease', f => { f.bundle.approval.retirement.leases.pop(); }, /not been retired/],
+    ['premature release', f => { f.bundle.approval.retirement.final_census.observed_at_unix_ms = f.now; }, /follows source lease release/],
+    ['stale final census', f => { f.bundle.approval.retirement.final_census.observed_at_unix_ms = f.now - 2000; }, /predates export/],
+    ['incomplete final census', f => { f.bundle.approval.retirement.final_census.ledgers = []; }, /different source directories/],
     ['renewal', f => { f.bundle.approval.retirement.renewals = 1; }, /renewal still active/],
     ['owner', f => { f.bundle.destination.uid += 1; }, /destination uid mismatch/],
     ['capacity', f => { f.bundle.approval.safe_idle.benchmark_pools[0]!.count = 1; }, /not idle/],
@@ -152,6 +159,24 @@ test('history rejects ambiguous admission, wrong stamp, missing cleanup and inco
   }
 });
 
+test('a newly settled file in the final census still invalidates the entire export', async () => {
+  const f = await fixture();
+  try {
+    await f.save();
+    f.bundle.approval.retirement.final_census.inventory.push({
+      ledger: '/original/ledger', name: `${run}.json`, sha256: 'b'.repeat(64),
+    });
+    const bytes = JSON.stringify(f.bundle);
+    await writeFile(f.path, bytes);
+    await assert.rejects(importSettledHistory(f.path, historySha256(bytes), f.destination, validateSettledHistoryReceipt, () => {}, f.now), /frontier changed/);
+    f.bundle.approval.retirement.final_census.inventory.pop();
+    f.bundle.approval.retirement.final_census.sha256 = 'f'.repeat(64);
+    const wrongDigest = JSON.stringify(f.bundle);
+    await writeFile(f.path, wrongDigest);
+    await assert.rejects(importSettledHistory(f.path, historySha256(wrongDigest), f.destination, validateSettledHistoryReceipt, () => {}, f.now), /Final census digest/);
+    await assert.rejects(readFile(f.ledger + historyRequiredSuffix), { code: 'ENOENT' });
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
 test('empty, truncated, tampered, symlinked and duplicate handovers fail closed', async () => {
   const f = await fixture();
   const sha = await f.save();

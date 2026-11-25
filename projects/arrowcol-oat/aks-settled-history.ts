@@ -146,6 +146,11 @@ function validateBundle(bytes: Buffer, expectedSha: string, destination: Handove
   assert.equal(approval.source_inventory_sha256, inventorySha, 'Approval does not bind source census');
   assert.ok(time(approval.observed_at_unix_ms) >= time(source.observed_at_unix_ms), 'Approval predates source census');
   const retirement = object(approval.retirement);
+  const finalCensus = object(retirement.final_census);
+  assert.deepEqual(finalCensus.ledgers, source.ledgers, 'Final census covers different source directories');
+  assert.deepEqual(finalCensus.inventory, inventory, 'Source frontier changed before retirement');
+  assert.equal(finalCensus.sha256, inventorySha, 'Final census digest does not bind exported history');
+  assert.ok(time(finalCensus.observed_at_unix_ms) >= time(source.observed_at_unix_ms), 'Final census predates export');
   assert.ok(time(retirement.observed_at_unix_ms) <= time(approval.observed_at_unix_ms), 'Retirement observation follows approval');
   assert.equal(retirement.owned_launchers, 0, 'Predecessor launcher still active');
   assert.equal(retirement.owned_jobs, 0, 'Predecessor job still active');
@@ -159,8 +164,11 @@ function validateBundle(bytes: Buffer, expectedSha: string, destination: Handove
     leases.add(id);
     text(lease.client_id);
     assert.equal(lease.state, 'released', 'Predecessor lease not released');
-    assert.ok(time(lease.released_at_unix_ms) <= time(approval.observed_at_unix_ms), 'Retirement follows approval');
-    if (id === exportLease) assert.ok(time(lease.released_at_unix_ms) >= time(source.observed_at_unix_ms), 'Source export occurred after lease release');
+    assert.ok(time(lease.released_at_unix_ms) <= time(retirement.observed_at_unix_ms), 'Release follows retirement observation');
+    if (id === exportLease) {
+      const gap = time(lease.released_at_unix_ms) - time(finalCensus.observed_at_unix_ms);
+      assert.ok(gap >= 0 && gap <= maxEvidenceAgeMs, 'Final census is stale at release or follows source lease release');
+    }
   }
   assert.ok(sourceLeases.every(id => leases.has(id)), 'A source operator lease has not been retired');
   evidence(retirement.evidence);
