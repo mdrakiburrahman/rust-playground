@@ -68,7 +68,10 @@ mod override_tests {
             assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
             assert_eq!(options.preflight_lookup_mode, PreflightLookupMode::Grouped);
             assert_eq!(options.snapshot_list_mode, SnapshotListMode::FromCheckpoint);
-            assert_eq!(options.stage_snapshot_mode, arrow_deltalake::StageSnapshotMode::PerGroup);
+            assert_eq!(
+                options.stage_snapshot_mode,
+                arrow_deltalake::StageSnapshotMode::PerGroup
+            );
             assert_eq!(options.commit_attempts, 3);
             assert_eq!(options.commit_budget, Duration::from_secs(2));
         }
