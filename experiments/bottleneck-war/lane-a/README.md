@@ -3,7 +3,7 @@
 | Item | Contract |
 |---|---|
 | Subject | One collector, one synthetic DMV table, local filesystem Delta |
-| Rate | New Delta versions visible between start/end boundary scans; never client ACK rate |
+| Rate | New add-only Delta versions visible between boundary scans; requires `dataChange=true`, never client ACK rate |
 | Client | Replayed diagnostic corpus, zero interval, configurable workers/streams/processes |
 | Evidence | Per-cell JSONL, raw client and collector logs, metrics, pressure, commit boundary manifests |
 | Resources | Collector user/system CPU, minor/major faults, disk bytes and endpoint RSS |
@@ -52,3 +52,8 @@ Boundary scan lag is recorded; coarse, bursty commits require longer repeat runs
 The start/end scans record each table's latest JSON version and total regular-file
 bytes under its `_delta_log`, including checkpoint sidecars. A final inventory
 after owned services stop is recorded before the generated table is deleted.
+Non-data-changing adds are excluded from row/byte/file counters. Any new commit
+with a remove or non-data-changing add invalidates the ingestion score, including
+mixed rewrite/ingestion commits; the runner reports null plus an error.
+Missing or malformed add statistics and missing/nonboolean `dataChange` fail
+closed even for excluded adds. Boundary manifests retain rewrite counts.

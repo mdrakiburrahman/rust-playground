@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export type Commit = { rows: number; bytes: number; files: number; timestamp: number };
+export type Commit = { rows: number; bytes: number; files: number; timestamp: number;
+  nonDataChangingFiles: number; removes: number };
 type TableLog = { version: number | null; bytes: number };
 export type Snapshot = { observedAt: number; commits: Map<string, Commit>; checkpoints: Set<string>;
   tableLogs: Record<string, TableLog> };
@@ -44,17 +45,30 @@ export function snapshot(root: string): Snapshot {
         const version = Number(name.slice(0, 20));
         if (!Number.isSafeInteger(version)) throw new Error(`Unrepresentable Delta version ${name}`);
         table.version = Math.max(table.version ?? 0, version);
-        const commit = { rows: 0, bytes: 0, files: 0, timestamp: stat.mtimeMs };
+        const commit: Commit = { rows: 0, bytes: 0, files: 0, timestamp: stat.mtimeMs,
+          nonDataChangingFiles: 0, removes: 0 };
         for (const line of fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)) {
           const action = JSON.parse(line);
-          if (!action.add) continue;
-          const records = action.add.stats && JSON.parse(action.add.stats).numRecords;
-          if (!Number.isSafeInteger(records) || records < 0 || !Number.isSafeInteger(action.add.size)) {
+          if ('remove' in action) commit.removes++;
+          if (!('add' in action)) continue;
+          const records = typeof action.add?.stats === 'string' ? JSON.parse(action.add.stats)?.numRecords : undefined;
+          if (!Number.isSafeInteger(records) || records < 0 ||
+              !Number.isSafeInteger(action.add.size) || action.add.size < 0) {
             throw new Error(`Missing or invalid Delta add statistics: ${file}`);
+          }
+          if (typeof action.add.dataChange !== 'boolean') {
+            throw new Error(`Missing or invalid Delta add dataChange: ${file}`);
+          }
+          if (!action.add.dataChange) {
+            commit.nonDataChangingFiles++;
+            continue;
           }
           commit.rows += records;
           commit.bytes += action.add.size;
           commit.files++;
+          if (!Number.isSafeInteger(commit.rows) || !Number.isSafeInteger(commit.bytes)) {
+            throw new Error(`Unrepresentable Delta add totals: ${file}`);
+          }
         }
         commits.set(path.relative(root, file), commit);
       }
@@ -68,11 +82,19 @@ export function difference(start: Snapshot, end: Snapshot) {
   for (const key of start.commits.keys()) {
     if (!end.commits.has(key)) throw new Error(`Delta history disappeared during cell: ${key}`);
   }
-  const added = [...end.commits].filter(([key, c]) => !start.commits.has(key) && c.files > 0).map(([, c]) => c);
+  const newCommits = [...end.commits].filter(([key]) => !start.commits.has(key));
+  for (const [key, commit] of newCommits) {
+    if (commit.removes > 0 || commit.nonDataChangingFiles > 0) {
+      throw new Error(`Cannot score new ingestion from rewriting/mixed Delta commit: ${key} ` +
+        `(removes=${commit.removes}, nonDataChangingFiles=${commit.nonDataChangingFiles})`);
+    }
+  }
+  const added = newCommits.filter(([, c]) => c.files > 0).map(([, c]) => c);
   const sum = (field: 'rows' | 'bytes' | 'files') => added.reduce((total, c) => total + c[field], 0);
   const seconds = (end.observedAt - start.observedAt) / 1000;
   if (seconds <= 0) throw new Error('Nonpositive observed measurement interval');
   const rows = sum('rows'), bytes = sum('bytes'), files = sum('files');
+  if (![rows, bytes, files].every(Number.isSafeInteger)) throw new Error('Unrepresentable Delta window totals');
   return {
     rows, bytes, files, commits: added.length, seconds,
     committed_rps: rows / seconds,
@@ -83,7 +105,7 @@ export function difference(start: Snapshot, end: Snapshot) {
     checkpoint_files_added: [...end.checkpoints].filter((key) => !start.checkpoints.has(key)).length,
     table_logs_start: start.tableLogs, table_logs_end: end.tableLogs,
     start_observed_ms: start.observedAt, end_observed_ms: end.observedAt,
-    semantics: 'new_local_Delta_versions_visible_between_boundary_scans_not_client_ACKs',
+    semantics: 'new_data_changing_add_only_Delta_versions_between_boundary_scans_rewrites_rejected_not_client_ACKs',
   };
 }
 
