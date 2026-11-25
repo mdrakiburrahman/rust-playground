@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="372" font-family="Segoe UI, sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#ffffff"/><rect x="0.5" y="0.5" width="999" height="371" fill="none" stroke="#0078d4"/>
+<text x="16" y="28" font-size="16" font-weight="600" fill="#201f1e">Conditional probes (cond)</text>
+<text x="16" y="48" fill="#605e5c">bookend drift -18.19%; n=1 arm per cell, 45 s window</text>
+<text x="230" y="80" fill="#323130" font-weight="600">Committed rows/s vs bookend mean</text>
+<text x="700" y="80" text-anchor="middle" fill="#323130" font-weight="600">bytes/row</text>
+<text x="785" y="80" text-anchor="middle" fill="#323130" font-weight="600">user ns/row</text>
+<text x="865" y="80" text-anchor="middle" fill="#323130" font-weight="600">sys ns/row</text>
+<text x="945" y="80" text-anchor="middle" fill="#323130" font-weight="600">files/commit</text>
+<line x1="230" y1="88" x2="230" y2="308" stroke="#edebe9" stroke-width="1"/>
+<text x="230" y="322" text-anchor="middle" fill="#605e5c">0.6</text>
+<line x1="295.45454545454544" y1="88" x2="295.45454545454544" y2="308" stroke="#edebe9" stroke-width="1"/>
+<text x="295.45454545454544" y="322" text-anchor="middle" fill="#605e5c">0.7</text>
+<line x1="360.909090909091" y1="88" x2="360.909090909091" y2="308" stroke="#edebe9" stroke-width="1"/>
+<text x="360.909090909091" y="322" text-anchor="middle" fill="#605e5c">0.8</text>
+<line x1="426.36363636363643" y1="88" x2="426.36363636363643" y2="308" stroke="#edebe9" stroke-width="1"/>
+<text x="426.36363636363643" y="322" text-anchor="middle" fill="#605e5c">0.9</text>
+<line x1="491.81818181818187" y1="88" x2="491.81818181818187" y2="308" stroke="#605e5c" stroke-width="1.2"/>
+<text x="491.81818181818187" y="322" text-anchor="middle" fill="#605e5c">1.0</text>
+<line x1="557.2727272727274" y1="88" x2="557.2727272727274" y2="308" stroke="#edebe9" stroke-width="1"/>
+<text x="557.2727272727274" y="322" text-anchor="middle" fill="#605e5c">1.1</text>
+<rect x="8" y="92" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="108" text-anchor="end" fill="#201f1e">page_index-column_index_trunc16</text>
+<rect x="491.81818181818187" y="98" width="49.08778099853782" height="12" rx="2" fill="#8a8886"/>
+<text x="640" y="108" text-anchor="end" fill="#201f1e">1.075</text>
+<text x="700" y="108" text-anchor="middle" fill="#323130">0.996x</text>
+<text x="785" y="108" text-anchor="middle" fill="#323130">3279</text>
+<text x="865" y="108" text-anchor="middle" fill="#323130">1291</text>
+<text x="945" y="108" text-anchor="middle" fill="#323130">4.30</text>
+<text x="222" y="132" text-anchor="end" fill="#201f1e">page_index-stats_trunc16</text>
+<rect x="491.66987622428894" y="122" width="1" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="132" text-anchor="end" fill="#201f1e">1.000</text>
+<text x="700" y="132" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="132" text-anchor="middle" fill="#323130">3471</text>
+<text x="865" y="132" text-anchor="middle" fill="#323130">1586</text>
+<text x="945" y="132" text-anchor="middle" fill="#323130">4.00</text>
+<rect x="8" y="140" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="156" text-anchor="end" fill="#201f1e">page_index-offset_index_off</text>
+<rect x="483.6047693935368" y="146" width="8.213412424645071" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="156" text-anchor="end" fill="#201f1e">0.987</text>
+<text x="700" y="156" text-anchor="middle" fill="#323130">0.980x</text>
+<text x="785" y="156" text-anchor="middle" fill="#323130">3389</text>
+<text x="865" y="156" text-anchor="middle" fill="#323130">1676</text>
+<text x="945" y="156" text-anchor="middle" fill="#323130">3.95</text>
+<text x="222" y="180" text-anchor="end" fill="#201f1e">row_group_bytes-mib64</text>
+<rect x="483.5760511831876" y="170" width="8.242130634994282" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="180" text-anchor="end" fill="#201f1e">0.987</text>
+<text x="700" y="180" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="180" text-anchor="middle" fill="#323130">3556</text>
+<text x="865" y="180" text-anchor="middle" fill="#323130">1378</text>
+<text x="945" y="180" text-anchor="middle" fill="#323130">4.16</text>
+<rect x="8" y="188" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="204" text-anchor="end" fill="#201f1e">bloom_sizing-fpp001</text>
+<rect x="459.184869423487" y="194" width="32.63331239469488" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="204" text-anchor="end" fill="#201f1e">0.950</text>
+<text x="700" y="204" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="204" text-anchor="middle" fill="#323130">3640</text>
+<text x="865" y="204" text-anchor="middle" fill="#323130">1602</text>
+<text x="945" y="204" text-anchor="middle" fill="#323130">4.00</text>
+<text x="222" y="228" text-anchor="end" fill="#201f1e">page_index-header_stats</text>
+<rect x="453.36752358367283" y="218" width="38.450658234509035" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="228" text-anchor="end" fill="#201f1e">0.941</text>
+<text x="700" y="228" text-anchor="middle" fill="#323130">1.010x</text>
+<text x="785" y="228" text-anchor="middle" fill="#323130">3533</text>
+<text x="865" y="228" text-anchor="middle" fill="#323130">1838</text>
+<text x="945" y="228" text-anchor="middle" fill="#323130">3.90</text>
+<rect x="8" y="236" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="252" text-anchor="end" fill="#201f1e">v2_ratio-v2_zstd1</text>
+<rect x="443.6871436786305" y="242" width="48.13103813955138" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="252" text-anchor="end" fill="#201f1e">0.926</text>
+<text x="700" y="252" text-anchor="middle" fill="#323130">0.939x</text>
+<text x="785" y="252" text-anchor="middle" fill="#323130">3612</text>
+<text x="865" y="252" text-anchor="middle" fill="#323130">1806</text>
+<text x="945" y="252" text-anchor="middle" fill="#323130">3.68</text>
+<text x="222" y="276" text-anchor="end" fill="#201f1e">bloom_sizing-ndv65536</text>
+<rect x="434.3968615714685" y="266" width="57.42132024671338" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="276" text-anchor="end" fill="#201f1e">0.912</text>
+<text x="700" y="276" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="276" text-anchor="middle" fill="#323130">3626</text>
+<text x="865" y="276" text-anchor="middle" fill="#323130">2023</text>
+<text x="945" y="276" text-anchor="middle" fill="#323130">3.89</text>
+<rect x="8" y="284" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="300" text-anchor="end" fill="#201f1e">v2_ratio-v2_zstd1_ratio2</text>
+<rect x="409.18737477707515" y="290" width="82.63080704110672" height="12" rx="2" fill="#d2d0ce"/>
+<text x="640" y="300" text-anchor="end" fill="#201f1e">0.874</text>
+<text x="700" y="300" text-anchor="middle" fill="#323130">0.942x</text>
+<text x="785" y="300" text-anchor="middle" fill="#323130">3919</text>
+<text x="865" y="300" text-anchor="middle" fill="#323130">2049</text>
+<text x="945" y="300" text-anchor="middle" fill="#323130">3.88</text>
+<rect x="16" y="333" width="14" height="10" rx="2" fill="#8a8886"/><text x="36" y="342" fill="#323130">cond (refused, drift -18.2%)</text>
+<text x="16" y="362" font-style="italic" fill="#605e5c">Refused phase (drift above 5%): descriptive only.</text>
+</svg>

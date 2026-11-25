@@ -1,0 +1,49 @@
+{
+  "duration": 90,
+  "warmup": 20,
+  "common": {
+    "BWA_CORES": "12",
+    "BWA_CCPUS": "0-11",
+    "BWA_KCPUS": "12-15",
+    "BWA_NCLIENTS": "2",
+    "BWA_PD": "16",
+    "BWA_MCF": "24",
+    "BWA_CLIENT_SPW": "1",
+    "BWA_BUF_BYTES": "17200000000",
+    "BWA_GCAP_BYTES": "17200000000",
+    "BWA_TCAP_BYTES": "16000000000",
+    "BWA_BUF_ROWS": "100000000",
+    "BWA_GCAP_ROWS": "100000000",
+    "BWA_TCAP_ROWS": "100000000",
+    "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS": "1",
+    "BWA_MRPF": "2000000",
+    "BWA_TARGET": "33554432"
+  },
+  "cells": [
+    {
+      "id": "l0",
+      "grid": "headroom",
+      "x": "l0",
+      "y": "default",
+      "env": {
+        "BWA_ISOLATION": "l0"
+      }
+    },
+    {
+      "id": "l1",
+      "grid": "headroom",
+      "x": "l1",
+      "y": "default",
+      "env": {
+        "BWA_ISOLATION": "l1"
+      }
+    },
+    {
+      "id": "l5",
+      "grid": "headroom",
+      "x": "l5",
+      "y": "default",
+      "env": {}
+    }
+  ]
+}

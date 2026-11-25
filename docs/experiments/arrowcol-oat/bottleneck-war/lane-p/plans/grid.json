@@ -1,0 +1,155 @@
+{
+  "duration": 45,
+  "warmup": 20,
+  "common": {
+    "BWA_CORES": "12",
+    "BWA_CCPUS": "0-11",
+    "BWA_KCPUS": "12-15",
+    "BWA_NCLIENTS": "2",
+    "BWA_PD": "16",
+    "BWA_MCF": "24",
+    "BWA_CLIENT_SPW": "1",
+    "BWA_BUF_BYTES": "17200000000",
+    "BWA_GCAP_BYTES": "17200000000",
+    "BWA_TCAP_BYTES": "16000000000",
+    "BWA_BUF_ROWS": "100000000",
+    "BWA_GCAP_ROWS": "100000000",
+    "BWA_TCAP_ROWS": "100000000",
+    "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS": "1",
+    "BWA_MRPF": "2000000",
+    "BWA_TARGET": "33554432"
+  },
+  "cells": [
+    {
+      "id": "base",
+      "grid": "grid-codec-bloom",
+      "x": "baseline",
+      "y": "baseline",
+      "env": {}
+    },
+    {
+      "id": "codec-brotli1-bloom-baseline",
+      "grid": "grid-codec-bloom",
+      "x": "brotli1",
+      "y": "baseline",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"brotli\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "codec-zstd9-bloom-baseline",
+      "grid": "grid-codec-bloom",
+      "x": "zstd9",
+      "y": "baseline",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"zstd\",\"compression_level\":9}}"
+      }
+    },
+    {
+      "id": "codec-brotli1-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "brotli1",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"brotli\",\"compression_level\":1,\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-lz4_raw-bloom-baseline",
+      "grid": "grid-codec-bloom",
+      "x": "lz4_raw",
+      "y": "baseline",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"lz4_raw\"}}"
+      }
+    },
+    {
+      "id": "codec-baseline-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "baseline",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-snappy-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "snappy",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"snappy\",\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-gzip1-bloom-baseline",
+      "grid": "grid-codec-bloom",
+      "x": "gzip1",
+      "y": "baseline",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"gzip\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "codec-zstd1-bloom-baseline",
+      "grid": "grid-codec-bloom",
+      "x": "zstd1",
+      "y": "baseline",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "codec-zstd9-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "zstd9",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"zstd\",\"compression_level\":9,\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-gzip1-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "gzip1",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"gzip\",\"compression_level\":1,\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-snappy-bloom-baseline",
+      "grid": "grid-codec-bloom",
+      "x": "snappy",
+      "y": "baseline",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"snappy\"}}"
+      }
+    },
+    {
+      "id": "codec-zstd1-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "zstd1",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1,\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-lz4_raw-bloom-disabled",
+      "grid": "grid-codec-bloom",
+      "x": "lz4_raw",
+      "y": "disabled",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"lz4_raw\",\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "base-end",
+      "grid": "grid-codec-bloom",
+      "x": "baseline",
+      "y": "baseline",
+      "env": {}
+    }
+  ]
+}

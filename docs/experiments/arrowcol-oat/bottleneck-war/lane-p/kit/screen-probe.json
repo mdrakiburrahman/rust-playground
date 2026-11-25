@@ -1,0 +1,283 @@
+{
+  "duration": 15,
+  "warmup": 10,
+  "common": {
+    "BWA_CORES": "12",
+    "BWA_CCPUS": "0-11",
+    "BWA_KCPUS": "12-15",
+    "BWA_NCLIENTS": "2",
+    "BWA_PD": "16",
+    "BWA_MCF": "24",
+    "BWA_CLIENT_SPW": "1",
+    "BWA_BUF_BYTES": "17200000000",
+    "BWA_GCAP_BYTES": "17200000000",
+    "BWA_TCAP_BYTES": "16000000000",
+    "BWA_BUF_ROWS": "100000000",
+    "BWA_GCAP_ROWS": "100000000",
+    "BWA_TCAP_ROWS": "100000000",
+    "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS": "1",
+    "BWA_MRPF": "2000000",
+    "BWA_TARGET": "33554432"
+  },
+  "cells": [
+    {
+      "id": "base",
+      "grid": "probe",
+      "x": "baseline",
+      "y": "baseline",
+      "env": {}
+    },
+    {
+      "id": "statistics-chunk",
+      "grid": "probe",
+      "x": "chunk",
+      "y": "statistics",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"statistics\":\"chunk\"}}"
+      }
+    },
+    {
+      "id": "codec-zstd1",
+      "grid": "probe",
+      "x": "zstd1",
+      "y": "codec",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "row_group-rows65536",
+      "grid": "probe",
+      "x": "rows65536",
+      "y": "row_group",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"max_row_group_rows\":65536}"
+      }
+    },
+    {
+      "id": "write_batch-rows8192",
+      "grid": "probe",
+      "x": "rows8192",
+      "y": "write_batch",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"write_batch_size\":8192}"
+      }
+    },
+    {
+      "id": "delta_stats-disabled",
+      "grid": "probe",
+      "x": "disabled",
+      "y": "delta_stats",
+      "env": {
+        "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS": "[]"
+      }
+    },
+    {
+      "id": "encoding-delta",
+      "grid": "probe",
+      "x": "delta",
+      "y": "encoding",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"dictionary_enabled\":false},\"columns\":{\"customer_id\":{\"encoding\":\"delta_byte_array\"},\"sample_time_utc\":{\"encoding\":\"delta_binary_packed\"},\"sample_time_utc__unix_nanos\":{\"encoding\":\"delta_binary_packed\"},\"sql_server_instance_name\":{\"encoding\":\"delta_byte_array\"},\"machine_name\":{\"encoding\":\"delta_byte_array\"},\"availability_group_id\":{\"encoding\":\"delta_byte_array\"},\"availability_group_name\":{\"encoding\":\"delta_byte_array\"},\"replica_server_name\":{\"encoding\":\"delta_byte_array\"},\"replica_role\":{\"encoding\":\"delta_byte_array\"},\"operational_state_desc\":{\"encoding\":\"delta_byte_array\"},\"recovery_health_desc\":{\"encoding\":\"delta_byte_array\"},\"synchronization_health_desc\":{\"encoding\":\"delta_byte_array\"},\"connected_state_desc\":{\"encoding\":\"delta_byte_array\"},\"last_connect_error_number\":{\"encoding\":\"delta_binary_packed\"},\"last_connect_error_timestamp\":{\"encoding\":\"delta_binary_packed\"},\"last_connect_error_timestamp__unix_nanos\":{\"encoding\":\"delta_binary_packed\"},\"endpoint_url\":{\"encoding\":\"delta_byte_array\"},\"availability_mode_desc\":{\"encoding\":\"delta_byte_array\"},\"failover_mode_desc\":{\"encoding\":\"delta_byte_array\"},\"primary_role_allow_connections_desc\":{\"encoding\":\"delta_byte_array\"},\"secondary_role_allow_connections_desc\":{\"encoding\":\"delta_byte_array\"},\"availability_replica_create_date\":{\"encoding\":\"delta_binary_packed\"},\"availability_replica_create_date__unix_nanos\":{\"encoding\":\"delta_binary_packed\"},\"availability_replica_modify_date\":{\"encoding\":\"delta_binary_packed\"},\"availability_replica_modify_date__unix_nanos\":{\"encoding\":\"delta_binary_packed\"},\"seeding_mode_desc\":{\"encoding\":\"delta_byte_array\"}}}"
+      }
+    },
+    {
+      "id": "codec-zstd9",
+      "grid": "probe",
+      "x": "zstd9",
+      "y": "codec",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"zstd\",\"compression_level\":9}}"
+      }
+    },
+    {
+      "id": "statistics-none",
+      "grid": "probe",
+      "x": "none",
+      "y": "statistics",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"statistics\":\"none\"}}"
+      }
+    },
+    {
+      "id": "encoding-no_dictionary",
+      "grid": "probe",
+      "x": "no_dictionary",
+      "y": "encoding",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"dictionary_enabled\":false}}"
+      }
+    },
+    {
+      "id": "codec-snappy",
+      "grid": "probe",
+      "x": "snappy",
+      "y": "codec",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"snappy\"}}"
+      }
+    },
+    {
+      "id": "data_page_bytes-kib256",
+      "grid": "probe",
+      "x": "kib256",
+      "y": "data_page_bytes",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"data_page_size_limit\":262144}}"
+      }
+    },
+    {
+      "id": "codec-lz4_raw",
+      "grid": "probe",
+      "x": "lz4_raw",
+      "y": "codec",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"lz4_raw\"}}"
+      }
+    },
+    {
+      "id": "dictionary_bytes-kib256",
+      "grid": "probe",
+      "x": "kib256",
+      "y": "dictionary_bytes",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"dictionary_page_size_limit\":262144}}"
+      }
+    },
+    {
+      "id": "delta_stats-one_column",
+      "grid": "probe",
+      "x": "one_column",
+      "y": "delta_stats",
+      "env": {
+        "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS": "[\"customer_id\"]"
+      }
+    },
+    {
+      "id": "codec-brotli1",
+      "grid": "probe",
+      "x": "brotli1",
+      "y": "codec",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"brotli\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "page_rows-rows8192",
+      "grid": "probe",
+      "x": "rows8192",
+      "y": "page_rows",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"data_page_row_count_limit\":8192}"
+      }
+    },
+    {
+      "id": "bloom-disabled",
+      "grid": "probe",
+      "x": "disabled",
+      "y": "bloom",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"bloom_filter_enabled\":false}}"
+      }
+    },
+    {
+      "id": "version-v2",
+      "grid": "probe",
+      "x": "v2",
+      "y": "version",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"writer_version\":\"v2\"}"
+      }
+    },
+    {
+      "id": "codec-gzip1",
+      "grid": "probe",
+      "x": "gzip1",
+      "y": "codec",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"compression\":\"gzip\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "page_index-column_index_trunc16",
+      "grid": "probe",
+      "x": "column_index_trunc16",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"column_index_truncate_length\":16}"
+      }
+    },
+    {
+      "id": "v2_ratio-v2_zstd1_ratio2",
+      "grid": "probe",
+      "x": "v2_zstd1_ratio2",
+      "y": "v2_ratio",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"writer_version\":\"v2\",\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1,\"data_page_v2_compression_ratio_threshold\":2}}"
+      }
+    },
+    {
+      "id": "row_group_bytes-mib64",
+      "grid": "probe",
+      "x": "mib64",
+      "y": "row_group_bytes",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"max_row_group_bytes\":67108864}"
+      }
+    },
+    {
+      "id": "page_index-header_stats",
+      "grid": "probe",
+      "x": "header_stats",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"statistics\":\"page\",\"write_page_header_statistics\":true}}"
+      }
+    },
+    {
+      "id": "bloom_sizing-ndv65536",
+      "grid": "probe",
+      "x": "ndv65536",
+      "y": "bloom_sizing",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"columns\":{\"customer_id\":{\"bloom_filter_ndv\":65536}}}"
+      }
+    },
+    {
+      "id": "page_index-stats_trunc16",
+      "grid": "probe",
+      "x": "stats_trunc16",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"statistics_truncate_length\":16}"
+      }
+    },
+    {
+      "id": "bloom_sizing-fpp001",
+      "grid": "probe",
+      "x": "fpp001",
+      "y": "bloom_sizing",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"columns\":{\"customer_id\":{\"bloom_filter_fpp\":0.01}}}"
+      }
+    },
+    {
+      "id": "v2_ratio-v2_zstd1",
+      "grid": "probe",
+      "x": "v2_zstd1",
+      "y": "v2_ratio",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"writer_version\":\"v2\",\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "page_index-offset_index_off",
+      "grid": "probe",
+      "x": "offset_index_off",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"statistics\":\"chunk\"},\"offset_index_enabled\":false}"
+      }
+    }
+  ]
+}

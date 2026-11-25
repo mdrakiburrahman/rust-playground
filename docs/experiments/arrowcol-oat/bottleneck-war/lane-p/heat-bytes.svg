@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="902" height="206" font-family="Segoe UI, sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="16" y="26" font-size="16" font-weight="600" fill="#201f1e">Parquet bytes/row vs defaults</text>
+<text x="16" y="46" fill="#605e5c">codec (columns) x bloom (rows); n=1 screening arm per cell, 45s; bookend drift -3.61%</text>
+<text x="202" y="78" text-anchor="middle" fill="#323130">baseline</text>
+<text x="306" y="78" text-anchor="middle" fill="#323130">snappy</text>
+<text x="410" y="78" text-anchor="middle" fill="#323130">lz4_raw</text>
+<text x="514" y="78" text-anchor="middle" fill="#323130">zstd1</text>
+<text x="618" y="78" text-anchor="middle" fill="#323130">zstd9</text>
+<text x="722" y="78" text-anchor="middle" fill="#323130">gzip1</text>
+<text x="826" y="78" text-anchor="middle" fill="#323130">brotli1</text>
+<text x="142" y="107" text-anchor="end" fill="#323130">baseline</text>
+<rect x="150" y="86" width="102" height="32" fill="rgb(255,255,255)" stroke="#e1dfdd"/>
+<text x="202" y="107" text-anchor="middle" fill="#201f1e">1.000</text>
+<rect x="254" y="86" width="102" height="32" fill="rgb(220,236,249)" stroke="#e1dfdd"/>
+<text x="306" y="107" text-anchor="middle" fill="#201f1e">0.946</text>
+<rect x="358" y="86" width="102" height="32" fill="rgb(222,237,249)" stroke="#e1dfdd"/>
+<text x="410" y="107" text-anchor="middle" fill="#201f1e">0.949</text>
+<rect x="462" y="86" width="102" height="32" fill="rgb(216,235,248)" stroke="#e1dfdd"/>
+<text x="514" y="107" text-anchor="middle" fill="#201f1e">0.940</text>
+<rect x="566" y="86" width="102" height="32" fill="rgb(216,234,248)" stroke="#e1dfdd"/>
+<text x="618" y="107" text-anchor="middle" fill="#201f1e">0.940</text>
+<rect x="670" y="86" width="102" height="32" fill="rgb(254,254,255)" stroke="#e1dfdd"/>
+<text x="722" y="107" text-anchor="middle" fill="#201f1e">0.998</text>
+<rect x="774" y="86" width="102" height="32" fill="rgb(215,234,248)" stroke="#e1dfdd"/>
+<text x="826" y="107" text-anchor="middle" fill="#201f1e">0.939</text>
+<text x="142" y="141" text-anchor="end" fill="#323130">disabled</text>
+<rect x="150" y="120" width="102" height="32" fill="rgb(255,255,255)" stroke="#e1dfdd"/>
+<text x="202" y="141" text-anchor="middle" fill="#201f1e">1.000</text>
+<rect x="254" y="120" width="102" height="32" fill="rgb(220,236,249)" stroke="#e1dfdd"/>
+<text x="306" y="141" text-anchor="middle" fill="#201f1e">0.946</text>
+<rect x="358" y="120" width="102" height="32" fill="rgb(222,237,249)" stroke="#e1dfdd"/>
+<text x="410" y="141" text-anchor="middle" fill="#201f1e">0.949</text>
+<rect x="462" y="120" width="102" height="32" fill="rgb(216,235,248)" stroke="#e1dfdd"/>
+<text x="514" y="141" text-anchor="middle" fill="#201f1e">0.940</text>
+<rect x="566" y="120" width="102" height="32" fill="rgb(216,234,248)" stroke="#e1dfdd"/>
+<text x="618" y="141" text-anchor="middle" fill="#201f1e">0.940</text>
+<rect x="670" y="120" width="102" height="32" fill="rgb(254,254,255)" stroke="#e1dfdd"/>
+<text x="722" y="141" text-anchor="middle" fill="#201f1e">0.998</text>
+<rect x="774" y="120" width="102" height="32" fill="rgb(215,234,248)" stroke="#e1dfdd"/>
+<text x="826" y="141" text-anchor="middle" fill="#201f1e">0.939</text>
+<text x="16" y="190" font-style="italic" fill="#605e5c">Ratio to the mean of the grid's base/base-end bookends; baseline x baseline is the bookend mean. n/a = rejected by the pre-parser.</text>
+</svg>

@@ -1,0 +1,119 @@
+{
+  "duration": 45,
+  "warmup": 20,
+  "common": {
+    "BWA_CORES": "12",
+    "BWA_CCPUS": "0-11",
+    "BWA_KCPUS": "12-15",
+    "BWA_NCLIENTS": "2",
+    "BWA_PD": "16",
+    "BWA_MCF": "24",
+    "BWA_CLIENT_SPW": "1",
+    "BWA_BUF_BYTES": "17200000000",
+    "BWA_GCAP_BYTES": "17200000000",
+    "BWA_TCAP_BYTES": "16000000000",
+    "BWA_BUF_ROWS": "100000000",
+    "BWA_GCAP_ROWS": "100000000",
+    "BWA_TCAP_ROWS": "100000000",
+    "ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS": "1",
+    "BWA_MRPF": "2000000",
+    "BWA_TARGET": "33554432"
+  },
+  "cells": [
+    {
+      "id": "base",
+      "grid": "conditional",
+      "x": "baseline",
+      "y": "baseline",
+      "env": {}
+    },
+    {
+      "id": "page_index-column_index_trunc16",
+      "grid": "conditional",
+      "x": "column_index_trunc16",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"column_index_truncate_length\":16}"
+      }
+    },
+    {
+      "id": "v2_ratio-v2_zstd1_ratio2",
+      "grid": "conditional",
+      "x": "v2_zstd1_ratio2",
+      "y": "v2_ratio",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"writer_version\":\"v2\",\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1,\"data_page_v2_compression_ratio_threshold\":2}}"
+      }
+    },
+    {
+      "id": "row_group_bytes-mib64",
+      "grid": "conditional",
+      "x": "mib64",
+      "y": "row_group_bytes",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"max_row_group_bytes\":67108864}"
+      }
+    },
+    {
+      "id": "page_index-header_stats",
+      "grid": "conditional",
+      "x": "header_stats",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"statistics\":\"page\",\"write_page_header_statistics\":true}}"
+      }
+    },
+    {
+      "id": "bloom_sizing-ndv65536",
+      "grid": "conditional",
+      "x": "ndv65536",
+      "y": "bloom_sizing",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"columns\":{\"customer_id\":{\"bloom_filter_ndv\":65536}}}"
+      }
+    },
+    {
+      "id": "page_index-stats_trunc16",
+      "grid": "conditional",
+      "x": "stats_trunc16",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"statistics_truncate_length\":16}"
+      }
+    },
+    {
+      "id": "bloom_sizing-fpp001",
+      "grid": "conditional",
+      "x": "fpp001",
+      "y": "bloom_sizing",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"columns\":{\"customer_id\":{\"bloom_filter_fpp\":0.01}}}"
+      }
+    },
+    {
+      "id": "v2_ratio-v2_zstd1",
+      "grid": "conditional",
+      "x": "v2_zstd1",
+      "y": "v2_ratio",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"writer_version\":\"v2\",\"defaults\":{\"compression\":\"zstd\",\"compression_level\":1}}"
+      }
+    },
+    {
+      "id": "page_index-offset_index_off",
+      "grid": "conditional",
+      "x": "offset_index_off",
+      "y": "page_index",
+      "env": {
+        "ARROWCOL_PARQUET_CONFIG": "{\"defaults\":{\"statistics\":\"chunk\"},\"offset_index_enabled\":false}"
+      }
+    },
+    {
+      "id": "base-end",
+      "grid": "conditional",
+      "x": "baseline",
+      "y": "baseline",
+      "env": {}
+    }
+  ]
+}

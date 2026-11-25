@@ -1,0 +1,64 @@
+# Lane P kit offline validation, 2026-11-25T07:24:11Z, node v22.23.5, Windows; synthetic non-performance only; base 3259d8cd0fff5eeac77d77308898721cf696f7bd; amendment A1 applied
+node --check audit.mjs rc=0
+node --check confirm.mjs rc=0
+node --check policy.mjs rc=0
+node --check prepare-harness.mjs rc=0
+node --check screen-plan.mjs rc=0
+node --check fixture\audit.mjs rc=0
+node --check fixture\policy.mjs rc=0
+node --check test\kit.test.mjs rc=0
+node --check test\mutate.cjs rc=0
+node --experimental-strip-types --check fixture\score.ts rc=0
+node --experimental-strip-types --check fixture\measure.ts rc=0
+node prepare-harness.mjs reference <temp> rc=0; files differing from fixture\: 0
+$ node screen-plan.mjs validate <B> <F> screen-pilot.json screen-probe.json screen-headroom.json
+OK screen-pilot.json sha256=2f99b81dfc8f4759e2e0e6be65a856dbdd7e3e47f6d9e7b52225079159f130d8 cells=20 duration=45 warmup=20
+OK screen-probe.json sha256=7f8e3733318cee43d2a0bbecd13ed1564752eb5c46758d87203b0d250b01008f cells=29 duration=15 warmup=10
+OK screen-headroom.json sha256=c13c7161e2ba9877bdf272b4522dcfa09e7ff8950e8c3f91af78b002499fb9aa cells=3 duration=90 warmup=20
+Offline pre-parser only: it mirrors arrow-deltalake writer.rs and delta_stats.rs at 3259d8cd0fff5eeac77d77308898721cf696f7bd (crate unchanged since cb33bfa1) and adds stricter "kit rule" checks. The Rust parser, the OAT validator and the runtime readback and footer audit remain authoritative; passing here does not prove the collector accepts a plan.
+rc=0
+$ node --test --test-reporter=spec test\kit.test.mjs
+✔ synthetic pilot -> grid -> conditional -> select -> headroom -> register -> score -> heatmap -> readiness (18.3812ms)
+✔ pre-parser rejects plan, env and cell typos and forbidden names (2.8375ms)
+✔ pre-parser rejects bad writer enums, fallbacks, levels and combinations (3.8575ms)
+✔ pre-parser rejects bad Delta statistics column lists (0.6712ms)
+✔ ENV_RULES cover exactly the runner BWA names except BWA_ROOT and BWA_BIN (1.9074ms)
+✔ identity requires every field to be present and well shaped (2.1131ms)
+✔ resume refuses failed, foreign, reordered or replayed output (6.2945ms)
+✔ phase admission refuses incomplete, mismatched, drifting or failed evidence (44.9495ms)
+✔ screening CLI refuses real-mode use of synthetic rows, stale plans and unplanned or missing phases (1024.0742ms)
+✔ grid generation skips illegal combinations deterministically (21.4689ms)
+✔ registration refuses tampered selection, changed analyzer, stale fixture and unproven headroom (943.5042ms)
+✔ frozen scoring is inconclusive or refused on incomplete, failed, stale or tampered evidence (1354.539ms)
+✔ prepare-harness is deterministic, matches the kit fixture and refuses reuse or altered references (532.6603ms)
+✔ coverage map accounts for all 33 inventory rows without overstating exercise (9.583ms)
+✔ synthetic mode switch is strict (0.2917ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 15
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6275.41
+rc=0
+$ node test\mutate.cjs <kit>
+KILLED score ignores the footer hash <- phase admission refuses incomplete, mismatched, drifting or failed evidence | frozen scoring is inconclusive or refused on incomplete, failed, stale or tampered evidence
+KILLED resume accepts any prior output <- resume refuses failed, foreign, reordered or replayed output
+KILLED resume accepts failed cells <- resume refuses failed, foreign, reordered or replayed output
+KILLED resume accepts a different plan <- resume refuses failed, foreign, reordered or replayed output
+KILLED admission ignores row duration/warmup <- phase admission refuses incomplete, mismatched, drifting or failed evidence
+KILLED admission ignores the measured window <- phase admission refuses incomplete, mismatched, drifting or failed evidence
+KILLED admission accepts non-finite rates <- phase admission refuses incomplete, mismatched, drifting or failed evidence
+KILLED identity accepts a dirty tree <- identity requires every field to be present and well shaped
+KILLED identity accepts missing hashes <- identity requires every field to be present and well shaped | phase admission refuses incomplete, mismatched, drifting or failed evidence
+KILLED identity accepts malformed harness hashes <- identity requires every field to be present and well shaped
+CONTROL_OK IDENTITY (control: no change)
+KILLED admission ignores bookend drift <- phase admission refuses incomplete, mismatched, drifting or failed evidence
+KILLED register ignores the fixture footer <- registration refuses tampered selection, changed analyzer, stale fixture and unproven headroom
+KILLED plan accepts unknown fields <- pre-parser rejects plan, env and cell typos and forbidden names
+KILLED env accepts typos <- pre-parser rejects plan, env and cell typos and forbidden names | screening CLI refuses real-mode use of synthetic rows, stale plans and unplanned or missing phases
+KILLED codec level range unchecked <- pre-parser rejects bad writer enums, fallbacks, levels and combinations
+KILLED identity ignores provenance binary hashes <- identity requires every field to be present and well shaped
+rc=0
+$ bash -n live/phase.sh (checked remotely at staging)

@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="588" font-family="Segoe UI, sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#ffffff"/><rect x="0.5" y="0.5" width="999" height="587" fill="none" stroke="#0078d4"/>
+<text x="16" y="28" font-size="16" font-weight="600" fill="#201f1e">Pilot screening: one-factor arms vs defaults</text>
+<text x="16" y="48" fill="#605e5c">pilot3 (admitted, drift 3.67%); base user 3425 / sys 1302 ns/row; n=1 arm per cell, 45 s window, 20 s warm-up</text>
+<text x="230" y="80" fill="#323130" font-weight="600">Committed rows/s vs bookend mean</text>
+<text x="700" y="80" text-anchor="middle" fill="#323130" font-weight="600">bytes/row</text>
+<text x="785" y="80" text-anchor="middle" fill="#323130" font-weight="600">user ns/row</text>
+<text x="865" y="80" text-anchor="middle" fill="#323130" font-weight="600">sys ns/row</text>
+<text x="945" y="80" text-anchor="middle" fill="#323130" font-weight="600">files/commit</text>
+<line x1="230" y1="88" x2="230" y2="524" stroke="#edebe9" stroke-width="1"/>
+<text x="230" y="538" text-anchor="middle" fill="#605e5c">0.6</text>
+<line x1="295.45454545454544" y1="88" x2="295.45454545454544" y2="524" stroke="#edebe9" stroke-width="1"/>
+<text x="295.45454545454544" y="538" text-anchor="middle" fill="#605e5c">0.7</text>
+<line x1="360.909090909091" y1="88" x2="360.909090909091" y2="524" stroke="#edebe9" stroke-width="1"/>
+<text x="360.909090909091" y="538" text-anchor="middle" fill="#605e5c">0.8</text>
+<line x1="426.36363636363643" y1="88" x2="426.36363636363643" y2="524" stroke="#edebe9" stroke-width="1"/>
+<text x="426.36363636363643" y="538" text-anchor="middle" fill="#605e5c">0.9</text>
+<line x1="491.81818181818187" y1="88" x2="491.81818181818187" y2="524" stroke="#605e5c" stroke-width="1.2"/>
+<text x="491.81818181818187" y="538" text-anchor="middle" fill="#605e5c">1.0</text>
+<line x1="557.2727272727274" y1="88" x2="557.2727272727274" y2="524" stroke="#edebe9" stroke-width="1"/>
+<text x="557.2727272727274" y="538" text-anchor="middle" fill="#605e5c">1.1</text>
+<rect x="8" y="92" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="108" text-anchor="end" fill="#201f1e">statistics-none</text>
+<rect x="491.81818181818187" y="98" width="35.70468824635509" height="12" rx="2" fill="#0078d4"/>
+<text x="640" y="108" text-anchor="end" fill="#201f1e">1.055</text>
+<circle cx="521.5391934243933" cy="104" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 1.045</title></circle>
+<circle cx="520.6820863974851" cy="104" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 1.044</title></circle>
+<text x="700" y="108" text-anchor="middle" fill="#323130">0.985x</text>
+<text x="785" y="108" text-anchor="middle" fill="#323130">2928</text>
+<text x="865" y="108" text-anchor="middle" fill="#323130">1191</text>
+<text x="945" y="108" text-anchor="middle" fill="#323130">4.35</text>
+<text x="222" y="132" text-anchor="end" fill="#201f1e">delta_stats-disabled</text>
+<rect x="491.81818181818187" y="122" width="27.770778559092946" height="12" rx="2" fill="#0078d4"/>
+<text x="640" y="132" text-anchor="end" fill="#201f1e">1.042</text>
+<circle cx="470.76831869119934" cy="128" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.968</title></circle>
+<circle cx="528.9466717466881" cy="128" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 1.057</title></circle>
+<text x="700" y="132" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="132" text-anchor="middle" fill="#323130">2997</text>
+<text x="865" y="132" text-anchor="middle" fill="#323130">1313</text>
+<text x="945" y="132" text-anchor="middle" fill="#323130">4.30</text>
+<rect x="8" y="140" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="156" text-anchor="end" fill="#201f1e">page_rows-rows8192</text>
+<rect x="491.81818181818187" y="146" width="11.814127032740714" height="12" rx="2" fill="#0078d4"/>
+<text x="640" y="156" text-anchor="end" fill="#201f1e">1.018</text>
+<circle cx="512.8962704646145" cy="152" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 1.032</title></circle>
+<circle cx="421.4864814280874" cy="152" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.893</title></circle>
+<text x="700" y="156" text-anchor="middle" fill="#323130">0.979x</text>
+<text x="785" y="156" text-anchor="middle" fill="#323130">3355</text>
+<text x="865" y="156" text-anchor="middle" fill="#323130">1253</text>
+<text x="945" y="156" text-anchor="middle" fill="#323130">4.20</text>
+<text x="222" y="180" text-anchor="end" fill="#201f1e">dictionary_bytes-kib256</text>
+<rect x="487.8533216282261" y="170" width="3.9648601899557434" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="180" text-anchor="end" fill="#201f1e">0.994</text>
+<circle cx="485.53005293327504" cy="176" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.990</title></circle>
+<circle cx="495.77569846608924" cy="176" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 1.006</title></circle>
+<text x="700" y="180" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="180" text-anchor="middle" fill="#323130">3397</text>
+<text x="865" y="180" text-anchor="middle" fill="#323130">1467</text>
+<text x="945" y="180" text-anchor="middle" fill="#323130">4.32</text>
+<rect x="8" y="188" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="204" text-anchor="end" fill="#201f1e">statistics-chunk</text>
+<rect x="472.04191615246464" y="194" width="19.776265665717233" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="204" text-anchor="end" fill="#201f1e">0.970</text>
+<circle cx="504.37687160646243" cy="200" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 1.019</title></circle>
+<circle cx="536.9010526967202" cy="200" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 1.069</title></circle>
+<text x="700" y="204" text-anchor="middle" fill="#323130">0.985x</text>
+<text x="785" y="204" text-anchor="middle" fill="#323130">3449</text>
+<text x="865" y="204" text-anchor="middle" fill="#323130">1415</text>
+<text x="945" y="204" text-anchor="middle" fill="#323130">4.00</text>
+<text x="222" y="228" text-anchor="end" fill="#201f1e">row_group-rows65536</text>
+<rect x="464.6855734898736" y="218" width="27.132608328308265" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="228" text-anchor="end" fill="#201f1e">0.959</text>
+<circle cx="442.36666728898234" cy="224" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.924</title></circle>
+<circle cx="494.924178213626" cy="224" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 1.005</title></circle>
+<text x="700" y="228" text-anchor="middle" fill="#323130">1.172x</text>
+<text x="785" y="228" text-anchor="middle" fill="#323130">3582</text>
+<text x="865" y="228" text-anchor="middle" fill="#323130">1491</text>
+<text x="945" y="228" text-anchor="middle" fill="#323130">4.80</text>
+<rect x="8" y="236" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="252" text-anchor="end" fill="#201f1e">delta_stats-one_column</text>
+<rect x="456.09018476961927" y="242" width="35.7279970485626" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="252" text-anchor="end" fill="#201f1e">0.945</text>
+<circle cx="521.3567629068677" cy="248" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 1.045</title></circle>
+<circle cx="503.97736679441454" cy="248" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 1.019</title></circle>
+<text x="700" y="252" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="252" text-anchor="middle" fill="#323130">3188</text>
+<text x="865" y="252" text-anchor="middle" fill="#323130">1674</text>
+<text x="945" y="252" text-anchor="middle" fill="#323130">4.11</text>
+<text x="222" y="276" text-anchor="end" fill="#201f1e">data_page_bytes-kib256</text>
+<rect x="455.98021676437736" y="266" width="35.83796505380451" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="276" text-anchor="end" fill="#201f1e">0.945</text>
+<circle cx="462.08569133203935" cy="272" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.955</title></circle>
+<circle cx="479.45577130059087" cy="272" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.981</title></circle>
+<text x="700" y="276" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="276" text-anchor="middle" fill="#323130">3469</text>
+<text x="865" y="276" text-anchor="middle" fill="#323130">1705</text>
+<text x="945" y="276" text-anchor="middle" fill="#323130">4.11</text>
+<rect x="8" y="284" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="300" text-anchor="end" fill="#201f1e">write_batch-rows8192</text>
+<rect x="440.24986350465304" y="290" width="51.568318313528835" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="300" text-anchor="end" fill="#201f1e">0.921</text>
+<circle cx="521.2351965937248" cy="296" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 1.045</title></circle>
+<circle cx="463.072962749168" cy="296" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.956</title></circle>
+<text x="700" y="300" text-anchor="middle" fill="#323130">0.979x</text>
+<text x="785" y="300" text-anchor="middle" fill="#323130">3426</text>
+<text x="865" y="300" text-anchor="middle" fill="#323130">1728</text>
+<text x="945" y="300" text-anchor="middle" fill="#323130">4.00</text>
+<text x="222" y="324" text-anchor="end" fill="#201f1e">codec-lz4_raw</text>
+<rect x="440.1427056698864" y="314" width="51.675476148295445" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="324" text-anchor="end" fill="#201f1e">0.921</text>
+<circle cx="390.68789426961143" cy="320" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.845</title></circle>
+<circle cx="480.77999839605263" cy="320" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.983</title></circle>
+<text x="700" y="324" text-anchor="middle" fill="#323130">0.949x</text>
+<text x="785" y="324" text-anchor="middle" fill="#323130">3552</text>
+<text x="865" y="324" text-anchor="middle" fill="#323130">1864</text>
+<text x="945" y="324" text-anchor="middle" fill="#323130">3.84</text>
+<rect x="8" y="332" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="348" text-anchor="end" fill="#201f1e">version-v2</text>
+<rect x="424.21251388603935" y="338" width="67.60566793214252" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="348" text-anchor="end" fill="#201f1e">0.897</text>
+<circle cx="453.6970406128357" cy="344" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.942</title></circle>
+<circle cx="294.96762074519063" cy="344" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.699</title></circle>
+<text x="700" y="348" text-anchor="middle" fill="#323130">1.002x</text>
+<text x="785" y="348" text-anchor="middle" fill="#323130">3549</text>
+<text x="865" y="348" text-anchor="middle" fill="#323130">1851</text>
+<text x="945" y="348" text-anchor="middle" fill="#323130">3.89</text>
+<text x="222" y="372" text-anchor="end" fill="#201f1e">codec-zstd1</text>
+<rect x="423.8762436103027" y="362" width="67.94193820787916" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="372" text-anchor="end" fill="#201f1e">0.896</text>
+<circle cx="426.5740309549085" cy="368" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.900</title></circle>
+<circle cx="430.03073607365513" cy="368" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.906</title></circle>
+<text x="700" y="372" text-anchor="middle" fill="#323130">0.940x</text>
+<text x="785" y="372" text-anchor="middle" fill="#323130">3806</text>
+<text x="865" y="372" text-anchor="middle" fill="#323130">1628</text>
+<text x="945" y="372" text-anchor="middle" fill="#323130">3.89</text>
+<rect x="8" y="380" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="396" text-anchor="end" fill="#201f1e">codec-snappy</text>
+<rect x="406.50830073548934" y="386" width="85.30988108269253" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="396" text-anchor="end" fill="#201f1e">0.870</text>
+<circle cx="416.02377713930724" cy="392" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.884</title></circle>
+<circle cx="437.7258462100571" cy="392" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.917</title></circle>
+<text x="700" y="396" text-anchor="middle" fill="#323130">0.946x</text>
+<text x="785" y="396" text-anchor="middle" fill="#323130">3647</text>
+<text x="865" y="396" text-anchor="middle" fill="#323130">2101</text>
+<text x="945" y="396" text-anchor="middle" fill="#323130">3.78</text>
+<text x="222" y="420" text-anchor="end" fill="#201f1e">encoding-delta</text>
+<rect x="386.03944151359394" y="410" width="105.77874030458793" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="420" text-anchor="end" fill="#201f1e">0.838</text>
+<circle cx="421.644173629532" cy="416" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.893</title></circle>
+<circle cx="230" cy="416" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.568</title></circle>
+<text x="700" y="420" text-anchor="middle" fill="#323130">2.168x</text>
+<text x="785" y="420" text-anchor="middle" fill="#323130">3807</text>
+<text x="865" y="420" text-anchor="middle" fill="#323130">2141</text>
+<text x="945" y="420" text-anchor="middle" fill="#323130">8.17</text>
+<rect x="8" y="428" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="444" text-anchor="end" fill="#201f1e">bloom-disabled</text>
+<rect x="384.60304908662954" y="434" width="107.21513273155233" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="444" text-anchor="end" fill="#201f1e">0.836</text>
+<circle cx="496.1227821589524" cy="440" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 1.007</title></circle>
+<circle cx="345.25926609454325" cy="440" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.776</title></circle>
+<text x="700" y="444" text-anchor="middle" fill="#323130">1.000x</text>
+<text x="785" y="444" text-anchor="middle" fill="#323130">3866</text>
+<text x="865" y="444" text-anchor="middle" fill="#323130">1966</text>
+<text x="945" y="444" text-anchor="middle" fill="#323130">3.63</text>
+<text x="222" y="468" text-anchor="end" fill="#201f1e">codec-gzip1</text>
+<rect x="375.5342446018014" y="458" width="116.28393721638048" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="468" text-anchor="end" fill="#201f1e">0.822</text>
+<circle cx="419.42365010480387" cy="464" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.889</title></circle>
+<circle cx="368.97609105708335" cy="464" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.812</title></circle>
+<text x="700" y="468" text-anchor="middle" fill="#323130">0.998x</text>
+<text x="785" y="468" text-anchor="middle" fill="#323130">4356</text>
+<text x="865" y="468" text-anchor="middle" fill="#323130">2079</text>
+<text x="945" y="468" text-anchor="middle" fill="#323130">3.78</text>
+<rect x="8" y="476" width="984" height="24" fill="#f8f9fb"/>
+<text x="222" y="492" text-anchor="end" fill="#201f1e">codec-brotli1</text>
+<rect x="359.29029668089606" y="482" width="132.5278851372858" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="492" text-anchor="end" fill="#201f1e">0.798</text>
+<circle cx="313.5068149384906" cy="488" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.728</title></circle>
+<circle cx="260.42012770882064" cy="488" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.646</title></circle>
+<text x="700" y="492" text-anchor="middle" fill="#323130">0.939x</text>
+<text x="785" y="492" text-anchor="middle" fill="#323130">4781</text>
+<text x="865" y="492" text-anchor="middle" fill="#323130">2134</text>
+<text x="945" y="492" text-anchor="middle" fill="#323130">3.71</text>
+<text x="222" y="516" text-anchor="end" fill="#201f1e">codec-zstd9</text>
+<rect x="346.9663720978324" y="506" width="144.85180972034948" height="12" rx="2" fill="#9ec5ea"/>
+<text x="640" y="516" text-anchor="end" fill="#201f1e">0.779</text>
+<circle cx="417.28794879492693" cy="512" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"><title>pilot1 (refused, drift -1.2%): 0.886</title></circle>
+<circle cx="482.404577119628" cy="512" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"><title>pilot2 (refused, drift -8.5%): 0.986</title></circle>
+<text x="700" y="516" text-anchor="middle" fill="#323130">0.940x</text>
+<text x="785" y="516" text-anchor="middle" fill="#323130">4242</text>
+<text x="865" y="516" text-anchor="middle" fill="#323130">2533</text>
+<text x="945" y="516" text-anchor="middle" fill="#323130">3.39</text>
+<rect x="16" y="549" width="14" height="10" rx="2" fill="#0078d4"/><text x="36" y="558" fill="#323130">pilot3 (admitted, drift 3.7%)</text>
+<circle cx="260" cy="554" r="3.5" fill="#ffffff" stroke="#8a8886" stroke-width="1.6"/><text x="268" y="558" fill="#323130">pilot1 (refused, drift -1.2%)</text>
+<circle cx="510" cy="554" r="3.5" fill="#ffffff" stroke="#d13438" stroke-width="1.6"/><text x="518" y="558" fill="#323130">pilot2 (refused, drift -8.5%)</text>
+<text x="16" y="578" font-style="italic" fill="#605e5c">Screening only: single arms are candidates, not claims. Ratios use each phase's own base/base-end mean.</text>
+</svg>
