@@ -4,7 +4,7 @@ use arrow::datatypes::SchemaRef;
 use delta_kernel_default_engine::executor::TaskExecutor;
 use futures::future::join_all;
 use parquet::arrow::arrow_writer::{
-    ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory, ArrowWriter, compute_leaves,
+    ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory, ArrowWriter, ArrowWriterOptions, compute_leaves,
 };
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
@@ -25,11 +25,22 @@ pub(crate) struct ParallelArrowWriter<W: Write + Send + 'static> {
 }
 
 impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
+    #[cfg(test)]
     pub(crate) fn try_new(
         writer: W,
         schema: SchemaRef,
         properties: WriterProperties,
         column_workers: u8,
+    ) -> Result<Self> {
+        Self::try_new_with_options(writer, schema, properties, column_workers, false)
+    }
+
+    pub(crate) fn try_new_with_options(
+        writer: W,
+        schema: SchemaRef,
+        properties: WriterProperties,
+        column_workers: u8,
+        skip_arrow_metadata: bool,
     ) -> Result<Self> {
         ensure!(
             (1..=16).contains(&column_workers),
@@ -50,7 +61,13 @@ impl<W: Write + Send + 'static> ParallelArrowWriter<W> {
             "Parquet max row-group bytes must be positive"
         );
 
-        let arrow_writer = ArrowWriter::try_new(writer, Arc::clone(&schema), Some(properties))?;
+        let arrow_writer = ArrowWriter::try_new_with_options(
+            writer,
+            Arc::clone(&schema),
+            ArrowWriterOptions::new()
+                .with_properties(properties)
+                .with_skip_arrow_metadata(skip_arrow_metadata),
+        )?;
         let (file_writer, row_group_factory) = arrow_writer.into_serialized_writer()?;
         Ok(Self {
             file_writer: Some(file_writer),

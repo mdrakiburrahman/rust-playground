@@ -30,6 +30,7 @@ use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -3622,6 +3623,7 @@ impl DeltaTable {
             values: &bin.partition_values,
             logical: Arc::clone(&logical),
             properties,
+            skip_arrow_metadata: parquet_writer_config.skip_arrow_metadata(),
             config,
             upload_buffer_bytes,
             layout,
@@ -3933,6 +3935,7 @@ struct BinWriter<'a> {
     values: &'a BTreeMap<String, Option<String>>,
     logical: SchemaRef,
     properties: WriterProperties,
+    skip_arrow_metadata: bool,
     config: &'a OptimizeConfig,
     upload_buffer_bytes: Option<usize>,
     layout: Option<LayoutPolicy>,
@@ -4044,7 +4047,13 @@ impl BinWriter<'_> {
         let directory = local.parent().context("missing output directory")?;
         fs::create_dir_all(directory)?;
         let file = fs::OpenOptions::new().write(true).create_new(true).open(&local)?;
-        let writer = ArrowWriter::try_new(file, physical, Some(self.properties.clone()))?;
+        let writer = ArrowWriter::try_new_with_options(
+            file,
+            physical,
+            ArrowWriterOptions::new()
+                .with_properties(self.properties.clone())
+                .with_skip_arrow_metadata(self.skip_arrow_metadata),
+        )?;
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(OpenOutput {
             local,

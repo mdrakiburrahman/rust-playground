@@ -129,12 +129,17 @@ mod pin_init_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         for partitioned in [false, true] {
-            for columns in [None, Some(json!([])), Some(json!(["customer_id"]))] {
+            for (key, selection) in [
+                (None, None),
+                (Some("delta_stats_columns"), Some(json!([]))),
+                (Some("delta_stats_columns"), Some(json!(["customer_id"]))),
+                (Some("delta_stats_num_indexed_cols"), Some(json!(-1))),
+            ] {
                 let root = std::env::temp_dir().join(format!("local-stats-init-{}", uuid::Uuid::new_v4()));
                 fs::create_dir(&root)?;
                 let mut commit = json!({});
-                if let Some(columns) = &columns {
-                    commit["delta_stats_columns"] = columns.clone();
+                if let (Some(key), Some(selection)) = (key, &selection) {
+                    commit[key] = selection.clone();
                 }
                 config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
                     "collector": {"commit":commit, "runtime":{"parquet_column_workers":4}}
@@ -154,9 +159,8 @@ mod pin_init_tests {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 let metadata = actions.iter().find_map(|action| action.get("metaData")).context("committed metadata missing")?;
                 let properties = &metadata["configuration"];
-                if let Some(columns) = &columns {
-                    let columns = serde_json::from_value::<Vec<String>>(columns.clone())?;
-                    ensure!(delta_stats_properties_match(&columns, properties), "local committed stats selection differs");
+                if let Some(selection) = &selection {
+                    ensure!(delta_stats_properties_match(selection, properties), "local committed stats selection differs");
                     let text = String::from_utf8(output.stderr)?;
                     config.tables = vec![table.to_owned()];
                     assert_eq!(collector_delta_stats_records(&config, &text)?.len(), 1);

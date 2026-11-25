@@ -13,6 +13,7 @@ import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './ak
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 import { collectorBuildProfileHash, parseCollectorBuildProfile } from './collector-build-profile.js';
+import { validateWriterGapTunables } from './writer-tunables.js';
 import { assertHistoryPin, assertSettledHistory, handoverDestination, importSettledHistory } from './aks-settled-history.js';
 
 export interface OatRunStatus {
@@ -1841,6 +1842,7 @@ export async function readOatConfigForMode(
   parseDataFlowVerdictPolicy(parsed.dataflow_verdict_policy);
   const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
   const tunables = isRecord(parsed.tunables) ? parsed.tunables : {};
+  validateWriterGapTunables(tunables);
   const collectorProfile = parseCollectorBuildProfile(tunables.collector);
   if (collectorProfile) {
     const profileHash = collectorBuildProfileHash(collectorProfile);

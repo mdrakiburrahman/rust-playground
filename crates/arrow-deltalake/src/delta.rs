@@ -2569,6 +2569,9 @@ mod io_tests {
                 ("disabled", "[]"),
                 ("unknown", r#"["missing"]"#),
                 ("existing", "[]"),
+                ("first", "1"),
+                ("all", "-1"),
+                ("existing_count", "-1"),
             ] {
                 let output = std::process::Command::new(std::env::current_exe()?)
                     .args(["delta::io_tests::delta_stats_creation_selects_committed_stats_without_adopting_existing_properties",
@@ -2595,7 +2598,7 @@ mod io_tests {
             ("ignored", Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef),
             ("nested", Arc::new(nested) as ArrayRef),
         ])?;
-        if case == "existing" {
+        if case.starts_with("existing") {
             let url = Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
             let catalog = DeltaTable::open_catalog(url)?;
             catalog.commit_catalog(
@@ -2609,9 +2612,9 @@ mod io_tests {
         }
         let table = DeltaTable::open(directory.path())?;
         let creation = table.new_file(input.schema());
-        if matches!(case.as_str(), "unknown" | "existing") {
+        if matches!(case.as_str(), "unknown" | "existing" | "existing_count") {
             let error = creation.err().context("invalid stats policy unexpectedly adopted")?;
-            assert!(format!("{error:#}").contains("collector.commit.delta_stats_columns"));
+            assert!(format!("{error:#}").contains("collector.commit.delta_stats"));
             if case == "unknown" {
                 assert!(!directory.path().join("_delta_log").exists());
             } else {
@@ -2641,10 +2644,19 @@ mod io_tests {
             .context("missing committed Add")?;
         let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().context("missing committed stats")?)?;
         assert_eq!(stats["numRecords"], 1);
-        if case == "selected" {
+        if matches!(case.as_str(), "selected" | "first") {
             assert_eq!(stats["minValues"], serde_json::json!({"id":42}));
             assert_eq!(stats["maxValues"], serde_json::json!({"id":42}));
             assert_eq!(stats["nullCount"], serde_json::json!({"id":0}));
+        } else if case == "all" {
+            assert_eq!(
+                stats["minValues"],
+                serde_json::json!({"id":42,"ignored":7,"nested":{"value":9}})
+            );
+            assert_eq!(
+                stats["nullCount"],
+                serde_json::json!({"id":0,"ignored":0,"nested":{"value":0}})
+            );
         } else if case == "nested" {
             assert_eq!(stats["minValues"], serde_json::json!({"nested":{"value":9}}));
             assert_eq!(stats["maxValues"], serde_json::json!({"nested":{"value":9}}));

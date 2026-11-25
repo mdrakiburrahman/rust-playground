@@ -3,7 +3,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use delta_kernel_default_engine::executor::TaskExecutor;
 use parquet::arrow::arrow_writer::{
-    ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowRowGroupWriterFactory, ArrowWriter, compute_leaves,
+    ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowRowGroupWriterFactory, ArrowWriter, ArrowWriterOptions,
+    compute_leaves,
 };
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
@@ -187,11 +188,22 @@ struct RowGroupJob {
 }
 
 impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
+    #[cfg(test)]
     pub(crate) fn try_new(
         writer: W,
         schema: SchemaRef,
         properties: WriterProperties,
         column_workers: u8,
+    ) -> Result<Self> {
+        Self::try_new_with_options(writer, schema, properties, column_workers, false)
+    }
+
+    pub(crate) fn try_new_with_options(
+        writer: W,
+        schema: SchemaRef,
+        properties: WriterProperties,
+        column_workers: u8,
+        skip_arrow_metadata: bool,
     ) -> Result<Self> {
         ensure!(
             (2..=16).contains(&column_workers),
@@ -222,7 +234,13 @@ impl<W: Write + Send + 'static> PipelinedArrowWriter<W> {
             failed: false,
             state: Arc::clone(&state),
         };
-        let writer = ArrowWriter::try_new(sink, Arc::clone(&schema), Some(properties))?;
+        let writer = ArrowWriter::try_new_with_options(
+            sink,
+            Arc::clone(&schema),
+            ArrowWriterOptions::new()
+                .with_properties(properties)
+                .with_skip_arrow_metadata(skip_arrow_metadata),
+        )?;
         let (mut file_writer, factory) = writer.into_serialized_writer()?;
         file_writer.inner_mut().enabled = false;
         let columns = factory.create_column_writers(0)?;

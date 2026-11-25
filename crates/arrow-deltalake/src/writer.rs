@@ -3,11 +3,14 @@
 use anyhow::{Context, Result, ensure};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ArrowSchemaConverter;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{BrotliLevel, Compression, Encoding, GzipLevel, Type, ZstdLevel};
 use parquet::file::metadata::SortingColumn;
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder, WriterVersion};
-use parquet::schema::types::ColumnPath;
-use serde::{Deserialize, Serialize};
+use parquet::file::properties::{
+    BloomFilterPosition, CdcOptions, EnabledStatistics, WriterProperties, WriterPropertiesBuilder, WriterVersion,
+};
+use parquet::schema::types::{ColumnPath, SchemaDescriptor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -90,6 +93,156 @@ impl Statistics {
 pub enum Version {
     V1,
     V2,
+}
+
+/// A positive bound, or an explicit request to remove the Parquet limit (upstream `None`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    Bounded(usize),
+    Unlimited,
+}
+
+impl Limit {
+    #[must_use]
+    pub const fn as_option(self) -> Option<usize> {
+        match self {
+            Self::Bounded(value) => Some(value),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl Serialize for Limit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bounded(value) => value.serialize(serializer),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Limit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Limit;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a positive integer or \"unlimited\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Limit, E> {
+                usize::try_from(value)
+                    .map(Limit::Bounded)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Limit, E> {
+                let unsigned =
+                    u64::try_from(value).map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))?;
+                self.visit_u64(unsigned)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Limit, E> {
+                if value == "unlimited" {
+                    Ok(Limit::Unlimited)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BloomPosition {
+    AfterRowGroup,
+    End,
+}
+
+impl BloomPosition {
+    const fn parquet(self) -> BloomFilterPosition {
+        match self {
+            Self::AfterRowGroup => BloomFilterPosition::AfterRowGroup,
+            Self::End => BloomFilterPosition::End,
+        }
+    }
+}
+
+/// Parquet content-defined chunking. Every field is required when the object is present.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CdcConfig {
+    pub min_chunk_size: usize,
+    pub max_chunk_size: usize,
+    pub norm_level: i32,
+}
+
+impl CdcConfig {
+    const fn parquet(self) -> CdcOptions {
+        CdcOptions {
+            min_chunk_size: self.min_chunk_size,
+            max_chunk_size: self.max_chunk_size,
+            norm_level: self.norm_level,
+        }
+    }
+
+    /// Mirrors the upstream chunker mask derivation so invalid input fails at startup
+    /// instead of panicking in the builder or failing on the first column writer.
+    fn validate(self) -> Result<()> {
+        ensure!(
+            self.min_chunk_size > 0,
+            "content_defined_chunking.min_chunk_size must be positive"
+        );
+        ensure!(
+            self.max_chunk_size > self.min_chunk_size,
+            "content_defined_chunking.max_chunk_size must be greater than min_chunk_size"
+        );
+        let min = i64::try_from(self.min_chunk_size).context("content_defined_chunking.min_chunk_size is too large")?;
+        let max = i64::try_from(self.max_chunk_size).context("content_defined_chunking.max_chunk_size is too large")?;
+        let sum = min
+            .checked_add(max)
+            .context("content_defined_chunking min_chunk_size + max_chunk_size overflows i64")?;
+        let target = (sum / 2 - min) / 8;
+        let mask_bits = if target > 0 {
+            63 - i64::from(target.leading_zeros())
+        } else {
+            0
+        };
+        let effective = mask_bits - i64::from(self.norm_level);
+        ensure!(
+            (1..=63).contains(&effective),
+            "content_defined_chunking.norm_level={} leaves {effective} CDC mask bits for these chunk sizes; norm_level must be between {} and {}",
+            self.norm_level,
+            mask_bits - 63,
+            mask_bits - 1
+        );
+        Ok(())
+    }
+}
+
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+fn changed_leaves(plain: &SchemaDescriptor, coerced: &SchemaDescriptor) -> String {
+    if plain.num_columns() != coerced.num_columns() {
+        return format!("{} leaves become {}", plain.num_columns(), coerced.num_columns());
+    }
+    let changed: Vec<String> = plain
+        .columns()
+        .iter()
+        .zip(coerced.columns())
+        .filter(|(before, after)| before.path() != after.path() || before.self_type() != after.self_type())
+        .map(|(before, after)| format!("{} -> {}", before.path(), after.path()))
+        .collect();
+    if changed.is_empty() {
+        "group structure differs".to_owned()
+    } else {
+        changed.join(", ")
+    }
 }
 
 /// Missing fields inherit the caller's existing layout/Parquet defaults.
@@ -271,21 +424,33 @@ pub struct ParquetWriterConfig {
     pub defaults: ColumnOptions,
     pub columns: BTreeMap<String, ColumnOptions>,
     pub writer_version: Option<Version>,
-    pub max_row_group_rows: Option<usize>,
-    pub max_row_group_bytes: Option<usize>,
+    pub max_row_group_rows: Option<Limit>,
+    pub max_row_group_bytes: Option<Limit>,
     pub data_page_row_count_limit: Option<usize>,
     pub write_batch_size: Option<usize>,
     pub offset_index_enabled: Option<bool>,
-    pub column_index_truncate_length: Option<usize>,
-    pub statistics_truncate_length: Option<usize>,
+    pub column_index_truncate_length: Option<Limit>,
+    pub statistics_truncate_length: Option<Limit>,
     pub sorting_columns: Option<Vec<SortColumn>>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub bloom_filter_position: Option<BloomPosition>,
+    /// Omits the `ARROW:schema` footer hint; accepted only when the Parquet schema alone
+    /// reads back as the exact writer schema.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub skip_arrow_metadata: Option<bool>,
+    /// Accepted only when coercion leaves the physical Parquet schema unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub coerce_types: Option<bool>,
+    /// Sequential writers only; parallel and pipelined column encoders reject it.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub content_defined_chunking: Option<CdcConfig>,
 }
 
 impl ParquetWriterConfig {
     /// Validate numeric and codec constraints without a table schema.
     ///
     /// # Errors
-    /// Rejects invalid codec levels, page limits and Bloom filter settings.
+    /// Rejects invalid codec levels, page limits, chunking and Bloom filter settings.
     pub fn validate(&self) -> Result<()> {
         self.defaults.validate().context("Parquet defaults")?;
         for (path, column) in &self.columns {
@@ -293,18 +458,43 @@ impl ParquetWriterConfig {
             column.validate().with_context(|| format!("Parquet column {path}"))?;
         }
         for (name, value) in [
-            ("max_row_group_rows", self.max_row_group_rows),
-            ("max_row_group_bytes", self.max_row_group_bytes),
+            ("max_row_group_rows", self.max_row_group_rows.and_then(Limit::as_option)),
+            (
+                "max_row_group_bytes",
+                self.max_row_group_bytes.and_then(Limit::as_option),
+            ),
             ("data_page_row_count_limit", self.data_page_row_count_limit),
             ("write_batch_size", self.write_batch_size),
-            ("column_index_truncate_length", self.column_index_truncate_length),
-            ("statistics_truncate_length", self.statistics_truncate_length),
+            (
+                "column_index_truncate_length",
+                self.column_index_truncate_length.and_then(Limit::as_option),
+            ),
+            (
+                "statistics_truncate_length",
+                self.statistics_truncate_length.and_then(Limit::as_option),
+            ),
         ] {
             if let Some(value) = value {
                 ensure!(value > 0, "{name} must be positive");
             }
         }
+        if let Some(chunking) = self.content_defined_chunking {
+            chunking.validate()?;
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn skip_arrow_metadata(&self) -> bool {
+        self.skip_arrow_metadata == Some(true)
+    }
+
+    /// Arrow writer options for properties already resolved by [`Self::writer_properties`].
+    #[must_use]
+    pub fn arrow_writer_options(&self, properties: WriterProperties) -> ArrowWriterOptions {
+        ArrowWriterOptions::new()
+            .with_properties(properties)
+            .with_skip_arrow_metadata(self.skip_arrow_metadata())
     }
 
     /// Resolve validated properties against the actual physical writer schema.
@@ -318,9 +508,55 @@ impl ParquetWriterConfig {
         verified_sort: &[SortColumn],
     ) -> Result<WriterProperties> {
         self.validate()?;
+        let base_coerce = base.as_ref().is_some_and(WriterProperties::coerce_types);
         let descriptor = ArrowSchemaConverter::new()
-            .with_coerce_types(base.as_ref().is_some_and(WriterProperties::coerce_types))
+            .with_coerce_types(self.coerce_types.unwrap_or(base_coerce))
             .convert(schema)?;
+        if self.coerce_types == Some(true) {
+            let plain = ArrowSchemaConverter::new().with_coerce_types(false).convert(schema)?;
+            ensure!(
+                plain.root_schema() == descriptor.root_schema(),
+                "coerce_types=true changes the physical Parquet schema ({}); the written files would no longer match the table schema",
+                changed_leaves(&plain, &descriptor)
+            );
+        }
+        if self.skip_arrow_metadata() {
+            ensure!(
+                schema.metadata().is_empty(),
+                "skip_arrow_metadata=true would drop Arrow schema metadata keys {:?}",
+                schema.metadata().keys().collect::<Vec<_>>()
+            );
+            let restored = parquet::arrow::parquet_to_arrow_schema(&descriptor, None)?;
+            let changed: Vec<String> = schema
+                .fields()
+                .iter()
+                .zip(restored.fields().iter())
+                .filter(|(field, restored)| field != restored)
+                .map(|(field, restored)| {
+                    format!(
+                        "{}: {}{} reads back as {}{}",
+                        field.name(),
+                        field.data_type(),
+                        if field.metadata().is_empty() {
+                            ""
+                        } else {
+                            " with field metadata"
+                        },
+                        restored.data_type(),
+                        if restored.metadata().is_empty() {
+                            ""
+                        } else {
+                            " with field metadata"
+                        }
+                    )
+                })
+                .collect();
+            ensure!(
+                changed.is_empty() && schema.fields().len() == restored.fields().len(),
+                "skip_arrow_metadata=true would not round-trip the writer schema without the ARROW:schema hint: {}",
+                changed.join("; ")
+            );
+        }
         let leaves = descriptor.columns();
         let leaf_index = |path: &str| -> Result<usize> {
             let mut matching = leaves
@@ -372,10 +608,10 @@ impl ParquetWriterConfig {
             });
         }
         if let Some(rows) = self.max_row_group_rows {
-            builder = builder.set_max_row_group_row_count(Some(rows));
+            builder = builder.set_max_row_group_row_count(rows.as_option());
         }
         if let Some(bytes) = self.max_row_group_bytes {
-            builder = builder.set_max_row_group_bytes(Some(bytes));
+            builder = builder.set_max_row_group_bytes(bytes.as_option());
         }
         if let Some(rows) = self.data_page_row_count_limit {
             builder = builder.set_data_page_row_count_limit(rows);
@@ -387,10 +623,19 @@ impl ParquetWriterConfig {
             builder = builder.set_offset_index_disabled(!enabled);
         }
         if let Some(length) = self.column_index_truncate_length {
-            builder = builder.set_column_index_truncate_length(Some(length));
+            builder = builder.set_column_index_truncate_length(length.as_option());
         }
         if let Some(length) = self.statistics_truncate_length {
-            builder = builder.set_statistics_truncate_length(Some(length));
+            builder = builder.set_statistics_truncate_length(length.as_option());
+        }
+        if let Some(coerce) = self.coerce_types {
+            builder = builder.set_coerce_types(coerce);
+        }
+        if let Some(position) = self.bloom_filter_position {
+            builder = builder.set_bloom_filter_position(position.parquet());
+        }
+        if let Some(chunking) = self.content_defined_chunking {
+            builder = builder.set_content_defined_chunking(Some(chunking.parquet()));
         }
         let sorting = self.sorting_columns.as_deref().unwrap_or(verified_sort);
         ensure!(
@@ -463,16 +708,23 @@ impl ParquetWriterConfig {
         Ok(properties)
     }
 
-    fn verify_effective(
-        &self,
-        descriptor: &parquet::schema::types::SchemaDescriptor,
-        props: &WriterProperties,
-    ) -> Result<()> {
+    fn verify_effective(&self, descriptor: &SchemaDescriptor, props: &WriterProperties) -> Result<()> {
         macro_rules! check {
             ($field:ident, $actual:expr) => {
                 if let Some(expected) = self.$field {
                     ensure!(
                         Some(expected) == $actual,
+                        "requested Parquet {} differs from writer properties",
+                        stringify!($field)
+                    );
+                }
+            };
+        }
+        macro_rules! check_limit {
+            ($field:ident, $actual:expr) => {
+                if let Some(expected) = self.$field {
+                    ensure!(
+                        expected.as_option() == $actual,
                         "requested Parquet {} differs from writer properties",
                         stringify!($field)
                     );
@@ -486,13 +738,27 @@ impl ParquetWriterConfig {
                 WriterVersion::PARQUET_2_0 => Version::V2,
             })
         );
-        check!(max_row_group_rows, props.max_row_group_row_count());
-        check!(max_row_group_bytes, props.max_row_group_bytes());
+        check_limit!(max_row_group_rows, props.max_row_group_row_count());
+        check_limit!(max_row_group_bytes, props.max_row_group_bytes());
         check!(data_page_row_count_limit, Some(props.data_page_row_count_limit()));
         check!(write_batch_size, Some(props.write_batch_size()));
         check!(offset_index_enabled, Some(!props.offset_index_disabled()));
-        check!(column_index_truncate_length, props.column_index_truncate_length());
-        check!(statistics_truncate_length, props.statistics_truncate_length());
+        check_limit!(column_index_truncate_length, props.column_index_truncate_length());
+        check_limit!(statistics_truncate_length, props.statistics_truncate_length());
+        check!(coerce_types, Some(props.coerce_types()));
+        check!(
+            bloom_filter_position,
+            Some(match props.bloom_filter_position() {
+                BloomFilterPosition::AfterRowGroup => BloomPosition::AfterRowGroup,
+                BloomFilterPosition::End => BloomPosition::End,
+            })
+        );
+        if let Some(chunking) = self.content_defined_chunking {
+            ensure!(
+                props.content_defined_chunking() == Some(&chunking.parquet()),
+                "requested Parquet content_defined_chunking differs from writer properties"
+            );
+        }
         let empty = ColumnOptions::default();
         if self.columns.is_empty() && self.defaults == empty {
             return Ok(());
@@ -603,8 +869,16 @@ pub fn effective_startup_config_json() -> Result<String> {
     #[cfg(feature = "delta")]
     let value = {
         let mut value = value;
+        let runtime = crate::delta_io::runtime_config()?;
+        anyhow::ensure!(
+            process_config()?.content_defined_chunking.is_none()
+                || (runtime.parquet_column_workers <= 1
+                    && runtime.parquet_encode_mode != crate::ParquetEncodeMode::ColumnPipeline),
+            "parquet_writer.content_defined_chunking requires the sequential writer \
+             (parquet_column_workers=1 and parquet_encode_mode=column_waves)"
+        );
         value["layout"] = crate::delta::effective_layout_startup_config()?;
-        value["runtime"] = serde_json::to_value(crate::delta_io::runtime_config()?)?;
+        value["runtime"] = serde_json::to_value(runtime)?;
         value["commit_telemetry"] = serde_json::json!({
             "schema_version": 1,
             "scope": "new_ingestion_addfiles_after_sync",
@@ -845,6 +1119,233 @@ mod tests {
             let actual = arrow::compute::concat_batches(&schema, &batches)?;
             assert_eq!(actual, batch, "{codec}");
         }
+        Ok(())
+    }
+
+    fn write_and_read(
+        config: &ParquetWriterConfig,
+        batch: &RecordBatch,
+    ) -> Result<(RecordBatch, parquet::file::metadata::ParquetMetaData)> {
+        let schema = batch.schema();
+        let properties = config.writer_properties(&schema, None, &[])?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("knob.parquet");
+        let mut writer = ArrowWriter::try_new_with_options(
+            std::fs::File::create(&path)?,
+            Arc::clone(&schema),
+            config.arrow_writer_options(properties),
+        )?;
+        writer.write(batch)?;
+        writer.close()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
+        let metadata = builder.metadata().as_ref().clone();
+        let batches = builder.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((arrow::compute::concat_batches(&schema, &batches)?, metadata))
+    }
+
+    fn batch() -> Result<RecordBatch> {
+        Ok(RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int32Array::from((0..64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..64).map(|i| format!("v{}", i % 5)).collect::<Vec<_>>(),
+                )),
+            ],
+        )?)
+    }
+
+    #[test]
+    fn omitted_new_knobs_keep_default_properties_and_serialization() -> Result<()> {
+        let default = ParquetWriterConfig::default();
+        let json = serde_json::to_value(&default)?;
+        for key in [
+            "bloom_filter_position",
+            "skip_arrow_metadata",
+            "coerce_types",
+            "content_defined_chunking",
+        ] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
+        let actual = default.writer_properties(&schema(), None, &[])?;
+        let upstream = WriterProperties::builder().build();
+        assert_eq!(actual.coerce_types(), upstream.coerce_types());
+        assert_eq!(actual.bloom_filter_position(), upstream.bloom_filter_position());
+        assert_eq!(actual.content_defined_chunking(), None);
+        assert_eq!(actual.max_row_group_row_count(), upstream.max_row_group_row_count());
+        assert_eq!(actual.max_row_group_bytes(), upstream.max_row_group_bytes());
+        assert_eq!(
+            actual.column_index_truncate_length(),
+            upstream.column_index_truncate_length()
+        );
+        assert_eq!(
+            actual.statistics_truncate_length(),
+            upstream.statistics_truncate_length()
+        );
+        assert!(!default.skip_arrow_metadata());
+        Ok(())
+    }
+
+    #[test]
+    fn new_knobs_reject_null_bad_enums_and_illegal_values() -> Result<()> {
+        for json in [
+            r#"{"bloom_filter_position":null}"#,
+            r#"{"bloom_filter_position":"End"}"#,
+            r#"{"bloom_filter_position":"after-row-group"}"#,
+            r#"{"skip_arrow_metadata":null}"#,
+            r#"{"skip_arrow_metadata":"true"}"#,
+            r#"{"coerce_types":null}"#,
+            r#"{"coerce_types":1}"#,
+            r#"{"content_defined_chunking":null}"#,
+            r#"{"content_defined_chunking":{"min_chunk_size":1,"max_chunk_size":2}}"#,
+            r#"{"content_defined_chunking":{"min_chunk_size":1,"max_chunk_size":2,"norm_level":0,"x":1}}"#,
+            r#"{"content_defined_chunking":{"min_chunk_size":-1,"max_chunk_size":2,"norm_level":0}}"#,
+            r#"{"max_row_group_rows":"Unlimited"}"#,
+            r#"{"max_row_group_bytes":-1}"#,
+            r#"{"statistics_truncate_length":1.5}"#,
+            r#"{"column_index_truncate_length":"none"}"#,
+        ] {
+            assert!(serde_json::from_str::<ParquetWriterConfig>(json).is_err(), "{json}");
+        }
+        for (json, needle) in [
+            (
+                r#"{"content_defined_chunking":{"min_chunk_size":0,"max_chunk_size":1024,"norm_level":0}}"#,
+                "min_chunk_size must be positive",
+            ),
+            (
+                r#"{"content_defined_chunking":{"min_chunk_size":1024,"max_chunk_size":1024,"norm_level":0}}"#,
+                "greater than min_chunk_size",
+            ),
+            (
+                r#"{"content_defined_chunking":{"min_chunk_size":262144,"max_chunk_size":1048576,"norm_level":15}}"#,
+                "norm_level must be between -48 and 14",
+            ),
+            (
+                r#"{"content_defined_chunking":{"min_chunk_size":9223372036854775807,"max_chunk_size":9223372036854775808,"norm_level":0}}"#,
+                "too large",
+            ),
+            (r#"{"max_row_group_rows":0}"#, "must be positive"),
+        ] {
+            let error = serde_json::from_str::<ParquetWriterConfig>(json)?
+                .validate()
+                .err()
+                .context(json)?
+                .to_string();
+            assert!(error.contains(needle), "{json}: {error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unlimited_clears_base_limits_and_round_trips() -> Result<()> {
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"max_row_group_rows":"unlimited","max_row_group_bytes":"unlimited","column_index_truncate_length":"unlimited","statistics_truncate_length":"unlimited"}"#,
+        )?;
+        assert_eq!(
+            serde_json::from_value::<ParquetWriterConfig>(serde_json::to_value(&config)?)?,
+            config
+        );
+        let base = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(7))
+            .set_max_row_group_bytes(Some(1 << 20))
+            .build();
+        let properties = config.writer_properties(&schema(), Some(base), &[])?;
+        assert_eq!(properties.max_row_group_row_count(), None);
+        assert_eq!(properties.max_row_group_bytes(), None);
+        assert_eq!(properties.column_index_truncate_length(), None);
+        assert_eq!(properties.statistics_truncate_length(), None);
+        let (actual, metadata) = write_and_read(&config, &batch()?)?;
+        assert_eq!(actual, batch()?);
+        assert_eq!(metadata.num_row_groups(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn coerce_types_is_rejected_when_it_changes_the_physical_schema() -> Result<()> {
+        let config: ParquetWriterConfig = serde_json::from_str(r#"{"coerce_types":true}"#)?;
+        assert!(config.writer_properties(&schema(), None, &[])?.coerce_types());
+        let dated = Arc::new(Schema::new(vec![Field::new("at", DataType::Date64, false)]));
+        let error = config
+            .writer_properties(&dated, None, &[])
+            .err()
+            .context("Date64 coercion was accepted")?
+            .to_string();
+        assert!(
+            error.contains("coerce_types=true changes the physical Parquet schema"),
+            "{error}"
+        );
+        let base = WriterProperties::builder().set_coerce_types(true).build();
+        let disabled: ParquetWriterConfig = serde_json::from_str(r#"{"coerce_types":false}"#)?;
+        assert!(!disabled.writer_properties(&dated, Some(base), &[])?.coerce_types());
+        Ok(())
+    }
+
+    #[test]
+    fn skip_arrow_metadata_round_trips_or_rejects_lossy_schemas() -> Result<()> {
+        let config: ParquetWriterConfig = serde_json::from_str(r#"{"skip_arrow_metadata":true}"#)?;
+        let (actual, metadata) = write_and_read(&config, &batch()?)?;
+        assert_eq!(actual, batch()?);
+        assert!(
+            metadata
+                .file_metadata()
+                .key_value_metadata()
+                .is_none_or(|entries| entries.iter().all(|entry| entry.key != "ARROW:schema"))
+        );
+        let (_, metadata) = write_and_read(&ParquetWriterConfig::default(), &batch()?)?;
+        assert!(
+            metadata
+                .file_metadata()
+                .key_value_metadata()
+                .is_some_and(|entries| entries.iter().any(|entry| entry.key == "ARROW:schema"))
+        );
+        let dictionary = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let error = config
+            .writer_properties(&dictionary, None, &[])
+            .err()
+            .context("dictionary schema was accepted")?
+            .to_string();
+        assert!(error.contains("value: Dictionary"), "{error}");
+        let annotated = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false)
+                .with_metadata(std::collections::HashMap::from([("k".to_owned(), "v".to_owned())])),
+        ]));
+        assert!(config.writer_properties(&annotated, None, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bloom_position_and_content_defined_chunking_reach_the_file() -> Result<()> {
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"defaults":{"bloom_filter_enabled":true},"bloom_filter_position":"end","max_row_group_rows":16,
+                "content_defined_chunking":{"min_chunk_size":64,"max_chunk_size":256,"norm_level":0}}"#,
+        )?;
+        let properties = config.writer_properties(&schema(), None, &[])?;
+        assert_eq!(properties.bloom_filter_position(), BloomFilterPosition::End);
+        assert_eq!(
+            properties.content_defined_chunking(),
+            Some(&CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0
+            })
+        );
+        let (actual, metadata) = write_and_read(&config, &batch()?)?;
+        assert_eq!(actual, batch()?);
+        let first_data = metadata.row_group(0).column(0).data_page_offset();
+        let last_data = metadata
+            .row_group(metadata.num_row_groups() - 1)
+            .column(1)
+            .data_page_offset();
+        let first_bloom = metadata
+            .row_group(0)
+            .column(0)
+            .bloom_filter_offset()
+            .context("missing bloom filter")?;
+        assert!(metadata.num_row_groups() > 1 && first_bloom > last_data && first_bloom > first_data);
         Ok(())
     }
 }

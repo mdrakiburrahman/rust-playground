@@ -63,7 +63,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
     };
     let environment = role_environment(config, ComponentRole::Collector)?;
     let stats_columns = environment.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
-        .map(|value| serde_json::from_str::<Vec<String>>(value)).transpose()?;
+        .map(|value| requested_delta_stats(value)).transpose()?;
     let parquet_policy: Option<Value> = environment.get("ARROWCOL_PARQUET_CONFIG")
         .map(|value| serde_json::from_str(value)).transpose()?;
     let layout_policy = config.tunables.collector.as_ref().and_then(|collector| collector.layout.as_ref())
@@ -110,7 +110,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let Some(path) = entry["path"].as_str() else {
             return true;
         };
-        if path == "collector.commit.delta_stats_columns" {
+        if matches!(path, "collector.commit.delta_stats_columns" | "collector.commit.delta_stats_num_indexed_cols") {
             let policies = collectors.iter()
                 .flat_map(|process| process["delta_stats_table_metadata"].as_array().into_iter().flatten())
                 .collect::<Vec<_>>();

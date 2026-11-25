@@ -379,7 +379,7 @@ const proofReasonPaths: Readonly<Record<string, readonly string[]>> = {
     'client.pod_ordinal', 'client.guid_uniqueness', 'client.value_variation', 'client.string_width',
     'client.string_length_distribution', 'client.entropy', 'client.cardinality', 'client.seed', 'client.skew',
   ],
-  committed_table_metadata_readback: ['collector.commit.delta_stats_columns'],
+  committed_table_metadata_readback: ['collector.commit.delta_stats_columns', 'collector.commit.delta_stats_num_indexed_cols'],
   consumer_linux_thp_flag_readback: ['collector.thp_disabled'],
   consumer_glibc_tunables_startup_readback: [
     'collector.malloc.arena_max', 'collector.malloc.arena_test', 'collector.malloc.mmap_threshold',

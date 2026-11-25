@@ -1584,6 +1584,11 @@ pub struct CommitTunables {
         deserialize_with = "deserialize_delta_stats_columns"
     )]
     pub delta_stats_columns: Option<Vec<String>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_delta_stats_num_indexed_cols"
+    )]
+    pub delta_stats_num_indexed_cols: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub snapshot_cache_mode: Option<arrow_deltalake::SnapshotCacheMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
@@ -1631,6 +1636,15 @@ where
     Vec::<String>::deserialize(deserializer)
         .map(Some)
         .map_err(|_| serde::de::Error::custom("collector.commit.delta_stats_columns must be an array of column paths"))
+}
+
+fn deserialize_delta_stats_num_indexed_cols<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    i32::deserialize(deserializer).map(Some).map_err(|_| {
+        serde::de::Error::custom("collector.commit.delta_stats_num_indexed_cols must be an integer (-1 or positive)")
+    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

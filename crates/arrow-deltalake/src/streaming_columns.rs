@@ -82,9 +82,16 @@ impl StreamingColumnWriter {
         schema: SchemaRef,
         properties: WriterProperties,
         column_workers: u8,
+        skip_arrow_metadata: bool,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
-        let writer = PipelinedArrowWriter::try_new(ColumnSink(sender), schema, properties, column_workers)?;
+        let writer = PipelinedArrowWriter::try_new_with_options(
+            ColumnSink(sender),
+            schema,
+            properties,
+            column_workers,
+            skip_arrow_metadata,
+        )?;
         let upload = crate::delta_io::spawn_shared_io(async move { Ok(consume(sink, receiver).await?.observation()) })?;
         Ok(Self { writer, upload })
     }
