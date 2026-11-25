@@ -2,7 +2,8 @@
 
 | Interface | Effect | Timing |
 | --- | --- | --- |
-| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata | Startup |
+| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters and their position, pages, row groups, explicit `"unlimited"` limits, sorting metadata, `skip_arrow_metadata`, `coerce_types`, sequential-only `content_defined_chunking` | Startup |
+| `ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS` | Creation-only Delta statistics selection: a JSON array of column paths (`delta.dataSkippingStatsColumns`) or an integer `-1`/`1..` (`delta.dataSkippingNumIndexedCols`). Existing table metadata must match the request | Table creation |
 | `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
 | `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files`, `commit_attempts`, `commit_budget_secs` | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
@@ -52,6 +53,18 @@ Row-group byte and page limits are estimates, not process-memory ceilings.
 Disabling offset indexes requires `statistics: "none"` or `"chunk"` on every
 physical column; page statistics force offset indexes in Parquet 58.4, so
 conflicting requests fail instead of silently ignoring the setting.
+`max_row_group_rows`, `max_row_group_bytes`, `column_index_truncate_length`
+and `statistics_truncate_length` accept a positive integer or the string
+`"unlimited"` (upstream `None`); omitting a field keeps the Parquet 58.4
+default. `bloom_filter_position` is `after_row_group` (default) or `end`.
+`skip_arrow_metadata: true` is accepted only when the physical schema has no
+metadata and every field round-trips through the Parquet schema unchanged.
+`coerce_types: true` is accepted only when coercion leaves the physical
+schema unchanged. `content_defined_chunking` takes `min_chunk_size > 0`,
+`max_chunk_size > min_chunk_size` and `norm_level`, which must leave 1..63
+effective CDC mask bits; it requires the sequential writer
+(`parquet_column_workers=1`, `parquet_encode_mode=column_waves`). These new
+fields reject explicit `null`.
 
 Cross-publication coalescing is disabled by default. When enabled, replay IDs
 and all output files form one indivisible Delta commit unit. Already committed

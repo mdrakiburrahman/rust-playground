@@ -14,6 +14,7 @@ use arrow_deltalake::maintenance::{
     NegativeProbeConfig, OptimizeConfig, Outcome, PassProbeInventory, ProbeOperation, PruneConfig, PurgeConfig,
     VacuumConfig, error_kind, now_ms,
 };
+use arrow_deltalake::writer::Limit;
 use async_trait::async_trait;
 use delta_kernel::object_store::{
     self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -2402,10 +2403,10 @@ fn optimize_rejects_writer_config_drift_before_effects() -> Result<()> {
     let version = maintenance.version()?;
     let original_writer = arrow_deltalake::writer::process_config()?.clone();
     let mut changed_writer = original_writer.clone();
-    changed_writer.max_row_group_rows = Some(if original_writer.max_row_group_rows == Some(1) {
-        2
+    changed_writer.max_row_group_rows = Some(if original_writer.max_row_group_rows == Some(Limit::Bounded(1)) {
+        Limit::Bounded(2)
     } else {
-        1
+        Limit::Bounded(1)
     });
     let error = match maintenance.apply_prepared_optimize_with_writer_config(
         &prepared,

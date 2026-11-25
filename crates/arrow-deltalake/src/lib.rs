@@ -534,6 +534,7 @@ impl ParquetFileWriter {
 
     fn open_local(path: &Path, schema: SchemaRef, properties: WriterProperties) -> Result<Self> {
         let path = path.to_path_buf();
+        let parquet_config = writer::process_config()?;
         let durable_handle = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -546,28 +547,38 @@ impl ParquetFileWriter {
             let config = delta_io::runtime_config()?;
             let column_workers = config.parquet_column_workers;
             if config.parquet_encode_mode == ParquetEncodeMode::ColumnPipeline {
-                FileWriter::Pipelined(PipelinedArrowWriter::try_new(
+                FileWriter::Pipelined(PipelinedArrowWriter::try_new_with_options(
                     durable_handle.try_clone()?,
                     schema,
                     properties,
                     column_workers,
+                    parquet_config.skip_arrow_metadata(),
                 )?)
             } else if column_workers > 1 {
-                FileWriter::Parallel(ParallelArrowWriter::try_new(
+                FileWriter::Parallel(ParallelArrowWriter::try_new_with_options(
                     durable_handle.try_clone()?,
                     schema,
                     properties,
                     column_workers,
+                    parquet_config.skip_arrow_metadata(),
                 )?)
             } else {
                 let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-                FileWriter::Sequential(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+                FileWriter::Sequential(AsyncArrowWriter::try_new_with_options(
+                    output,
+                    schema,
+                    parquet_config.arrow_writer_options(properties),
+                )?)
             }
         };
         #[cfg(not(feature = "delta"))]
         let writer = {
             let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-            FileWriter::Sequential(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+            FileWriter::Sequential(AsyncArrowWriter::try_new_with_options(
+                output,
+                schema,
+                parquet_config.arrow_writer_options(properties),
+            )?)
         };
         Ok(Self {
             writer: Some(writer),
@@ -589,15 +600,21 @@ impl ParquetFileWriter {
     ) -> Result<Self> {
         let properties = Self::effective_properties(&schema, properties, true)?;
         let config = delta_io::runtime_config()?;
+        let parquet_config = writer::process_config()?;
         let writer = if config.parquet_encode_mode == ParquetEncodeMode::ColumnPipeline {
             FileWriter::StreamingColumns(StreamingColumnWriter::try_new(
                 sink,
                 schema,
                 properties.clone(),
                 config.parquet_column_workers,
+                parquet_config.skip_arrow_metadata(),
             )?)
         } else {
-            FileWriter::Streaming(AsyncArrowWriter::try_new(sink, schema, Some(properties.clone()))?)
+            FileWriter::Streaming(AsyncArrowWriter::try_new_with_options(
+                sink,
+                schema,
+                parquet_config.arrow_writer_options(properties.clone()),
+            )?)
         };
         Ok(Self {
             properties,

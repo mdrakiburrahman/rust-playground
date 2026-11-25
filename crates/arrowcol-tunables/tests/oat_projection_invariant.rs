@@ -523,6 +523,13 @@ fn fixture(path: &str, value: Value) -> Value {
         parent.push("compression");
         set(&mut input, &parent, json!("gzip"));
     }
+    if path.contains(".content_defined_chunking.") {
+        set(
+            &mut input,
+            &parts[..parts.len() - 1],
+            json!({"min_chunk_size": 262_144, "max_chunk_size": 1_048_576, "norm_level": 0}),
+        );
+    }
     set(&mut input, &parts, value);
     input
 }
@@ -570,8 +577,14 @@ fn candidates(path: &str) -> Vec<Value> {
     if path == "collector.commit.delta_stats_columns" {
         return vec![json!(["customer_id", "timestamp"])];
     }
+    if path == "collector.commit.delta_stats_num_indexed_cols" {
+        return vec![json!(-1), json!(3)];
+    }
     if path == "collector.runtime.timestamp_kernel" {
         return vec![json!("fused_checked")];
+    }
+    if path.ends_with("bloom_filter_position") {
+        return vec![json!("end")];
     }
     if path == "collector.layout.sort_execution" {
         return vec![json!("verify_order")];
@@ -675,7 +688,10 @@ fn scalar(value: &Value) -> String {
 }
 
 fn destination(path: &str, value: &Value) -> Result<(ComponentRole, String, Option<String>, String)> {
-    if path == "collector.commit.delta_stats_columns" {
+    if matches!(
+        path,
+        "collector.commit.delta_stats_columns" | "collector.commit.delta_stats_num_indexed_cols"
+    ) {
         return Ok((
             ComponentRole::Collector,
             "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS".to_owned(),

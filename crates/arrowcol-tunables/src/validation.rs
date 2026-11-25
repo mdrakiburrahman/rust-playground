@@ -310,6 +310,10 @@ const CAPABILITIES: &[Capability] = &[
         "collector.commit.delta_stats_columns",
         "existing Delta stats defaults; creation only"
     ),
+    capability!(
+        "collector.commit.delta_stats_num_indexed_cols",
+        "Delta default (32); creation only; -1 = all columns"
+    ),
     capability!("collector.limits.max_metadata_bytes", "16384"),
     capability!("collector.limits.grpc_accept_compression", "none"),
     capability!("collector.limits.grpc_send_compression", "none"),
@@ -485,6 +489,30 @@ const CAPABILITIES: &[Capability] = &[
     ),
     capability!("parquet_writer.statistics_truncate_length", "inherit component default"),
     capability!("parquet_writer.sorting_columns", "inherit verified table layout"),
+    capability!(
+        "parquet_writer.bloom_filter_position",
+        "after_row_group (upstream default)"
+    ),
+    capability!(
+        "parquet_writer.skip_arrow_metadata",
+        "false; true requires a lossless Parquet-only schema round-trip"
+    ),
+    capability!(
+        "parquet_writer.coerce_types",
+        "false (upstream default); true must not change the physical schema"
+    ),
+    capability!(
+        "parquet_writer.content_defined_chunking.min_chunk_size",
+        "disabled; sequential writer only"
+    ),
+    capability!(
+        "parquet_writer.content_defined_chunking.max_chunk_size",
+        "disabled; sequential writer only"
+    ),
+    capability!(
+        "parquet_writer.content_defined_chunking.norm_level",
+        "disabled; sequential writer only"
+    ),
     capability!(
         "collector.parquet_codec_support",
         "requires compiled codec features",
@@ -1106,14 +1134,35 @@ impl Tunables {
                 .as_ref()
                 .and_then(|runtime| runtime.parquet_encode_mode)
                 == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
-                && self
-                    .parquet_writer
-                    .as_ref()
-                    .is_some_and(|writer| writer.max_row_group_bytes.is_some())
+                && self.parquet_writer.as_ref().is_some_and(|writer| {
+                    matches!(
+                        writer.max_row_group_bytes,
+                        Some(arrow_deltalake::writer::Limit::Bounded(_))
+                    )
+                })
             {
                 bail!(
                     "collector.runtime.parquet_encode_mode=column_pipeline does not support parquet_writer.max_row_group_bytes"
                 );
+            }
+            if self
+                .parquet_writer
+                .as_ref()
+                .is_some_and(|writer| writer.content_defined_chunking.is_some())
+            {
+                let runtime = collector.runtime.as_ref();
+                if runtime.and_then(|runtime| runtime.parquet_encode_mode)
+                    == Some(arrow_deltalake::ParquetEncodeMode::ColumnPipeline)
+                {
+                    bail!(
+                        "parquet_writer.content_defined_chunking is unsupported with collector.runtime.parquet_encode_mode=column_pipeline"
+                    );
+                }
+                if runtime.and_then(|runtime| runtime.parquet_column_workers).unwrap_or(1) > 1 {
+                    bail!(
+                        "parquet_writer.content_defined_chunking requires collector.runtime.parquet_column_workers=1 (the sequential writer)"
+                    );
+                }
             }
             if collector
                 .batching
@@ -1332,6 +1381,9 @@ impl Tunables {
                             arrow_deltalake::delta_stats::ENVIRONMENT.to_owned(),
                             serde_json::to_string(&columns)?,
                         );
+                    }
+                    if let Some(count) = value.delta_stats_num_indexed_cols.take() {
+                        output.insert(arrow_deltalake::delta_stats::ENVIRONMENT.to_owned(), count.to_string());
                     }
                     insert_json_config("ARROWCOL_COLLECTOR_COMMIT_CONFIG", &value, &mut output)?;
                 }
@@ -2133,11 +2185,16 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     {
         bail!("collector.commit.commit_budget_secs must be in 1..=3600");
     }
+    if commit.delta_stats_columns.is_some() && commit.delta_stats_num_indexed_cols.is_some() {
+        bail!(
+            "collector.commit.delta_stats_columns and collector.commit.delta_stats_num_indexed_cols are mutually exclusive"
+        );
+    }
     if let Some(columns) = &commit.delta_stats_columns {
-        arrow_deltalake::delta_stats::DeltaStatsPolicy {
-            columns: columns.clone(),
-        }
-        .validate()?;
+        arrow_deltalake::delta_stats::DeltaStatsPolicy::Columns(columns.clone()).validate()?;
+    }
+    if let Some(count) = commit.delta_stats_num_indexed_cols {
+        arrow_deltalake::delta_stats::DeltaStatsPolicy::NumIndexedCols(count).validate()?;
     }
     validate_duration("collector.commit.batch_window", commit.batch_window.as_deref(), "10s")?;
     let files = commit.max_files_per_commit.unwrap_or(64);
@@ -2309,6 +2366,46 @@ fn delta_stats_selection_is_strict_and_projected_separately() -> Result<()> {
             .environment_for(ComponentRole::Collector)?
             .contains_key(arrow_deltalake::delta_stats::ENVIRONMENT)
     );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn delta_stats_num_indexed_cols_is_strict_exclusive_and_projected() -> Result<()> {
+    use arrow_deltalake::delta_stats::{DeltaStatsPolicy, ENVIRONMENT};
+    for count in [-1, 1, i32::MAX] {
+        let environment = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"delta_stats_num_indexed_cols": count}}
+        }))?
+        .environment_for(ComponentRole::Collector)?;
+        assert_eq!(environment[ENVIRONMENT], count.to_string());
+        assert_eq!(
+            DeltaStatsPolicy::from_json(&environment[ENVIRONMENT])?,
+            DeltaStatsPolicy::NumIndexedCols(count)
+        );
+        assert!(!environment.contains_key("ARROWCOL_COLLECTOR_COMMIT_CONFIG"));
+    }
+    for count in [
+        serde_json::json!(0),
+        serde_json::json!(-2),
+        serde_json::json!(2_147_483_648_i64),
+        serde_json::json!(1.5),
+        serde_json::json!("all"),
+        Value::Null,
+    ] {
+        let error = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"delta_stats_num_indexed_cols": count}}
+        }))
+        .err()
+        .context("invalid indexed-column count accepted")?;
+        assert!(format!("{error:#}").contains("collector.commit.delta_stats_num_indexed_cols"));
+    }
+    let error = Tunables::parse_oat_json(serde_json::json!({
+        "collector": {"commit": {"delta_stats_num_indexed_cols": 3, "delta_stats_columns": ["id"]}}
+    }))
+    .err()
+    .context("conflicting Delta stats selections accepted")?;
+    assert!(format!("{error:#}").contains("mutually exclusive"));
     Ok(())
 }
 
@@ -4192,6 +4289,74 @@ mod tests {
         let mut no_optimize = value;
         no_optimize["maintenance"]["operations"] = serde_json::json!(["vacuum"]);
         assert!(Tunables::parse_oat_json(no_optimize).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_gap_knobs_are_strict_and_projected() -> Result<()> {
+        let cdc = serde_json::json!({"min_chunk_size": 262_144, "max_chunk_size": 1_048_576, "norm_level": 0});
+        let writer = serde_json::json!({
+            "bloom_filter_position": "end",
+            "skip_arrow_metadata": true,
+            "coerce_types": false,
+            "max_row_group_rows": "unlimited",
+            "max_row_group_bytes": "unlimited",
+            "column_index_truncate_length": "unlimited",
+            "statistics_truncate_length": "unlimited",
+            "content_defined_chunking": cdc
+        });
+        let env = Tunables::parse_oat_json(serde_json::json!({"parquet_writer": writer}))?
+            .environment_for(ComponentRole::Collector)?;
+        let projected: Value = serde_json::from_str(&env["ARROWCOL_PARQUET_CONFIG"])?;
+        for (key, value) in writer.as_object().context("writer fixture must be an object")? {
+            assert_eq!(&projected[key], value, "{key}");
+        }
+        let chunking = |min: u64, max: u64, norm: i64| serde_json::json!({"min_chunk_size": min, "max_chunk_size": max, "norm_level": norm});
+        for (key, value) in [
+            ("bloom_filter_position", serde_json::json!("End")),
+            ("bloom_filter_position", Value::Null),
+            ("skip_arrow_metadata", serde_json::json!("true")),
+            ("skip_arrow_metadata", Value::Null),
+            ("coerce_types", serde_json::json!(1)),
+            ("coerce_types", Value::Null),
+            ("max_row_group_rows", serde_json::json!("Unlimited")),
+            ("max_row_group_bytes", serde_json::json!(0)),
+            ("statistics_truncate_length", serde_json::json!(-1)),
+            ("content_defined_chunking", Value::Null),
+            ("content_defined_chunking", chunking(0, 1, 0)),
+            ("content_defined_chunking", chunking(8, 8, 0)),
+            ("content_defined_chunking", chunking(262_144, 1_048_576, 15)),
+            ("content_defined_chunking", chunking(262_144, 1_048_576, 2_147_483_648)),
+            (
+                "content_defined_chunking",
+                serde_json::json!({"min_chunk_size": 262_144, "max_chunk_size": 1_048_576}),
+            ),
+            (
+                "content_defined_chunking",
+                serde_json::json!({"min_chunk_size": 262_144, "max_chunk_size": 1_048_576, "norm_level": 0, "extra": 1}),
+            ),
+        ] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({"parquet_writer": {key: value}})).is_err(),
+                "{key}={value}"
+            );
+        }
+        for runtime in [
+            serde_json::json!({"parquet_column_workers": 4}),
+            serde_json::json!({"parquet_column_workers": 4, "parquet_encode_mode": "column_pipeline"}),
+        ] {
+            let error = Tunables::parse_oat_json(serde_json::json!({
+                "parquet_writer": {"content_defined_chunking": cdc},
+                "collector": {"runtime": runtime}
+            }))
+            .err()
+            .context("content-defined chunking accepted with a parallel writer")?;
+            assert!(format!("{error:#}").contains("content_defined_chunking"), "{error:#}");
+        }
+        Tunables::parse_oat_json(serde_json::json!({
+            "parquet_writer": {"max_row_group_bytes": "unlimited"},
+            "collector": {"runtime": {"parquet_column_workers": 4, "parquet_encode_mode": "column_pipeline"}}
+        }))?;
         Ok(())
     }
 
