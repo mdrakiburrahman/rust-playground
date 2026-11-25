@@ -245,7 +245,7 @@ mod tests {
             }),
             location: location.into(),
             provider: "delta".into(),
-            properties: std::collections::HashMap::from([("arrowcol.optimize.minFiles".into(), "3".into())]),
+            properties: BTreeMap::from([("arrowcol.optimize.minFiles".into(), "3".into())]),
             ..Default::default()
         }
     }

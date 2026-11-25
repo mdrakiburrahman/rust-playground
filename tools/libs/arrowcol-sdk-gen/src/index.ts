@@ -146,6 +146,11 @@ export class SdkGenerationTool {
       resolve(validation, 'descriptors'),
       { recursive: true },
     );
+    cpSync(
+      resolve(this.#workspace, source, 'runtime'),
+      resolve(validation, 'runtime'),
+      { recursive: true },
+    );
 
     const rustManifest = `${root}/rust/Cargo.toml`;
     const typescriptConfig = `${root}/typescript/tsconfig.json`;
