@@ -556,6 +556,7 @@ fn candidates(path: &str) -> Vec<Value> {
             ];
         }
         "collector.commit.snapshot_cache_mode" => return vec![json!("checkpoint_aware"), json!("json_only")],
+        "collector.commit.snapshot_list_mode" => return vec![json!("from_checkpoint"), json!("full")],
         "collector.commit.preflight_lookup_mode" => return vec![json!("grouped"), json!("per_entry")],
         "collector.commit.checkpoint_mode" => return vec![json!("async"), json!("inline"), json!("external")],
         "collector.commit.checkpoint_interval" => return vec![json!(17)],
@@ -1458,6 +1459,23 @@ fn collector_json_envelopes_preserve_nested_values() -> Result<()> {
         let envelope: Value = serde_json::from_str(env.get(key).with_context(|| format!("missing {key}"))?)
             .with_context(|| format!("invalid JSON in {key}"))?;
         assert_eq!(envelope.pointer(pointer), Some(&expected), "{key}{pointer}");
+    }
+    Ok(())
+}
+
+#[test]
+fn adaptive_policy_refresh_interval_is_bounded_and_canonical() -> Result<()> {
+    for invalid in [json!("61m"), json!("-1s"), json!("soon"), json!(30), json!(true)] {
+        let input = json!({"collector":{"batching":{"adaptive_policy_refresh_interval":invalid}}});
+        assert!(Tunables::parse_oat_json(input.clone()).is_err(), "{input}");
+    }
+    for (input, expected) in [("0s", "0s"), ("90s", "1m 30s"), ("1h", "1h")] {
+        let tunables = Tunables::parse_oat_json(json!({"collector":{"batching":{
+            "adaptive_policy_refresh_interval":input
+        }}}))?;
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert_eq!(batching["adaptive_policy_refresh_interval"], expected);
     }
     Ok(())
 }

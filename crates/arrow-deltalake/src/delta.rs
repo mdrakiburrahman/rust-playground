@@ -2935,6 +2935,136 @@ mod io_tests {
         Ok(())
     }
 
+    #[derive(Debug, Default)]
+    struct UnboundedListCounter {
+        inner: object_store::memory::InMemory,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for UnboundedListCounter {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("unbounded list counter")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for UnboundedListCounter {
+        async fn put_opts(
+            &self,
+            path: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+            offset: &object_store::path::Path,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+
+    /// Scenario: an object-store table is refreshed repeatedly after a checkpoint is cached.
+    /// Guarantees: `from_checkpoint` lists only from the floor, so entries below it are not
+    /// observed, and the existence probe stops listing once the log has been seen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_floor_bounds_object_log_refresh_listing() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let (_, session) = ready_stage_session().await?;
+        let store = Arc::new(UnboundedListCounter::default());
+        let mut table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            vec![],
+            None,
+            Some(Arc::clone(&session)),
+            Some(Arc::<UnboundedListCounter>::clone(&store)),
+        )?;
+        enable_checkpoint_index(&mut table)?;
+        Arc::get_mut(&mut table)
+            .context("unique table owner")?
+            .snapshot_list_mode = crate::SnapshotListMode::FromCheckpoint;
+        table.new_file(input_batch()?.schema())?;
+        table.commit_files_with_transaction(&[], "own", 1)?;
+        let checkpoint = table.checkpoint()?;
+        let (adopted, lineage) = table.existing_snapshot_with_lineage()?.context("existing table")?;
+        assert_eq!(adopted.log_segment().checkpoint_version, Some(checkpoint));
+        let lineage = lineage.context("certified object snapshot")?;
+        let stray = table.object_path("_delta_log/00000000000000000000.crc")?;
+        store.inner.put(&stray, b"{}".to_vec().into()).await?;
+        store.lists.store(0, Ordering::SeqCst);
+        for _ in 0..3 {
+            let (snapshot, refreshed) = table.existing_snapshot_with_lineage()?.context("existing table")?;
+            assert!(Arc::ptr_eq(&snapshot, &adopted));
+            assert_eq!(refreshed, Some(lineage));
+        }
+        assert_eq!(store.lists.load(Ordering::SeqCst), 0);
+        let next = table.commit_files_with_transaction(&[], "own", 2)?;
+        let (snapshot, refreshed) = table.existing_snapshot_with_lineage()?.context("existing table")?;
+        assert_eq!((snapshot.version(), refreshed), (next, Some(lineage)));
+        drop(table);
+        session.close_after_drain_async().await?;
+        Ok(())
+    }
+
     /// Scenario: historical JSON is corrupted without changing its length or modification time.
     /// Guarantees: Unix identity/change-time checks invalidate the base and corruption remains visible.
     #[cfg(unix)]
@@ -3594,6 +3724,7 @@ pub struct DeltaTable {
     bootstrap_only: bool,
     pub(crate) txn_lookup_mode: crate::TxnLookupMode,
     pub(crate) snapshot_cache_mode: crate::SnapshotCacheMode,
+    pub(crate) snapshot_list_mode: crate::SnapshotListMode,
     pub(crate) preflight_lookup_mode: crate::PreflightLookupMode,
     pub(crate) commit_attempts: u32,
     pub(crate) commit_budget: Duration,
@@ -3601,6 +3732,7 @@ pub struct DeltaTable {
     txn_index: Mutex<Option<crate::publication_lookup::TxnIndex>>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     snapshot_lineages: std::sync::atomic::AtomicU64,
+    log_exists: std::sync::atomic::AtomicBool,
     layout_readback: Mutex<Option<serde_json::Value>>,
     stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
     reuse_snapshots: bool,
@@ -4379,6 +4511,7 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
+            snapshot_list_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
             commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
             commit_budget: DEFAULT_COMMIT_BUDGET,
@@ -4386,6 +4519,7 @@ impl DeltaTable {
             txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
             snapshot_lineages: Default::default(),
+            log_exists: Default::default(),
             layout_readback: Mutex::new(None),
             stats_readback: Mutex::new(None),
             reuse_snapshots: false,
@@ -4704,6 +4838,7 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
+            snapshot_list_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
             commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
             commit_budget: DEFAULT_COMMIT_BUDGET,
@@ -4711,6 +4846,7 @@ impl DeltaTable {
             txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
             snapshot_lineages: Default::default(),
+            log_exists: Default::default(),
             layout_readback: Mutex::new(None),
             stats_readback: Mutex::new(None),
             reuse_snapshots,
@@ -4765,12 +4901,15 @@ impl DeltaTable {
     }
 
     fn existing_snapshot_with_lineage(&self) -> Result<Option<(SnapshotRef, Option<u64>)>> {
+        use std::sync::atomic::Ordering;
         let exists = if self.url.scheme() == "file" {
             self.root.join("_delta_log").exists()
+        } else if self.log_exists.load(Ordering::Acquire) {
+            true
         } else {
             let store = Arc::clone(&self.store);
             let prefix = self.object_path("_delta_log/")?;
-            shared_executor()?.block_on(async move {
+            let found = shared_executor()?.block_on(async move {
                 use futures::StreamExt;
                 store
                     .list(Some(&prefix))
@@ -4778,7 +4917,11 @@ impl DeltaTable {
                     .await
                     .transpose()
                     .map(|entry| entry.is_some())
-            })?
+            })?;
+            if found {
+                self.log_exists.store(true, Ordering::Release);
+            }
+            found
         };
         if exists {
             Ok(Some(self.snapshot_with_lineage()?))
@@ -4836,7 +4979,7 @@ impl DeltaTable {
                 .filter(|((v, entry), _)| *v <= p.snapshot.version() || *entry != LogEntry::Commit)
                 .eq(p.files.iter())
         });
-        if base.is_none() && floor.is_some() {
+        if base.is_none() && floor.is_some() && self.snapshot_list_mode == crate::SnapshotListMode::Full {
             floor = None;
             let Some(all) = self.log_fingerprints(checkpoint_aware, None)? else {
                 return Ok((full_build()?, None));
@@ -4890,10 +5033,19 @@ impl DeltaTable {
         if self.url.scheme() != "file" {
             let store = Arc::clone(&self.store);
             let prefix = self.object_path("_delta_log/")?;
+            let offset = match (self.snapshot_list_mode, floor) {
+                (crate::SnapshotListMode::FromCheckpoint, Some(floor)) => {
+                    Some(self.object_path(&format!("_delta_log/{floor:020}"))?)
+                }
+                _ => None,
+            };
             return shared_executor()?.block_on(async move {
                 use futures::TryStreamExt;
                 let mut files = BTreeMap::new();
-                let mut entries = store.list(Some(&prefix));
+                let mut entries = match &offset {
+                    Some(offset) => store.list_with_offset(Some(&prefix), offset),
+                    None => store.list(Some(&prefix)),
+                };
                 while let Some(meta) = entries.try_next().await? {
                     let Some(name) = meta.location.filename().filter(|_| {
                         meta.location

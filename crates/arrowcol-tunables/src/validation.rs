@@ -263,6 +263,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.max_rows_per_flush", "1000000"),
     capability!("collector.batching.max_batches_per_flush", "512"),
     capability!("collector.batching.max_age", "5s in OAT YAML; 30s component default"),
+    capability!(
+        "collector.batching.adaptive_policy_refresh_interval",
+        "0s (re-read table writer policy every batch)"
+    ),
     capability!("collector.batching.max_concurrent_flushes", "4"),
     capability!("collector.batching.pipeline_depth", "1"),
     capability!("collector.batching.max_pending_commit_bytes", "0"),
@@ -604,6 +608,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.discovery_max_log_file_bytes", "67108864"),
     capability!("collector.isolation_level", "l5"),
     capability!("collector.commit.snapshot_cache_mode", "json_only"),
+    capability!("collector.commit.snapshot_list_mode", "full"),
     capability!("collector.commit.preflight_lookup_mode", "per_entry"),
     capability!("collector.commit.checkpoint_mode", "external"),
     capability!("collector.commit.checkpoint_interval", "10"),
@@ -1322,6 +1327,9 @@ impl Tunables {
                 if let Some(value) = &collector.batching {
                     let mut value = value.clone();
                     canonicalize_optional_duration(&mut value.max_age, "collector.batching.max_age")?;
+                    if let Some(interval) = &mut value.adaptive_policy_refresh_interval {
+                        *interval = humantime::format_duration(parse_policy_refresh_interval(interval)?).to_string();
+                    }
                     insert_json_config("ARROWCOL_COLLECTOR_BATCHING_CONFIG", &value, &mut output)?;
                 }
                 if let Some(value) = &collector.catalog {
@@ -1875,6 +1883,16 @@ fn canonicalize_optional_duration(value: &mut Option<String>, name: &str) -> Res
     Ok(())
 }
 
+fn parse_policy_refresh_interval(value: &str) -> Result<Duration> {
+    let name = "collector.batching.adaptive_policy_refresh_interval";
+    let duration =
+        humantime::parse_duration(value).with_context(|| format!("{name} must be a valid humantime duration"))?;
+    if duration > MAX_ADAPTIVE_POLICY_REFRESH_INTERVAL {
+        bail!("{name} must not exceed 1h");
+    }
+    Ok(duration)
+}
+
 fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
     let Some(layout) = layout else {
         return Ok(());
@@ -2102,6 +2120,9 @@ fn validate_batching(batching: Option<&BatchingTunables>, oat_defaults: bool) ->
         bail!("collector.batching.pipeline_depth > 1 requires coalesce_publications=true");
     }
     validate_duration("collector.batching.max_age", batching.max_age.as_deref(), "30s")?;
+    if let Some(interval) = batching.adaptive_policy_refresh_interval.as_deref() {
+        parse_policy_refresh_interval(interval)?;
+    }
     if flush_bytes > table_bytes || flush_rows > u64::from(table_rows) || flush_batches > u64::from(table_batches) {
         bail!("collector.batching flush limits must not exceed per_table_capacity");
     }
@@ -2184,6 +2205,7 @@ fn commit_modes_reject_invalid_inputs_by_field_name() -> Result<()> {
     for (field, misspelled) in [
         ("txn_lookup_mode", "Incremental"),
         ("snapshot_cache_mode", "checkpoint-aware"),
+        ("snapshot_list_mode", "from-checkpoint"),
         ("preflight_lookup_mode", "Grouped"),
         ("checkpoint_mode", "Async"),
     ] {

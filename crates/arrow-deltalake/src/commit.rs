@@ -28,6 +28,7 @@ pub struct CommitOptions {
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
     pub snapshot_cache_mode: crate::SnapshotCacheMode,
+    pub snapshot_list_mode: crate::SnapshotListMode,
     pub preflight_lookup_mode: crate::PreflightLookupMode,
     pub checkpoint_mode: crate::CheckpointMode,
     pub checkpoint_interval: u64,
@@ -45,6 +46,7 @@ impl Default for CommitOptions {
             max_pending_files: 256,
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
+            snapshot_list_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
             checkpoint_mode: Default::default(),
             checkpoint_interval: 10,
@@ -884,6 +886,7 @@ fn run_worker(
             let owner = Arc::get_mut(&mut table).context("new Delta worker table is already shared")?;
             owner.txn_lookup_mode = options.txn_lookup_mode;
             owner.snapshot_cache_mode = options.snapshot_cache_mode;
+            owner.snapshot_list_mode = options.snapshot_list_mode;
             owner.preflight_lookup_mode = options.preflight_lookup_mode;
             owner.commit_attempts = options.commit_attempts;
             owner.commit_budget = options.commit_budget;

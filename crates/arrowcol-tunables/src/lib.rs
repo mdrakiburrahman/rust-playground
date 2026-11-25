@@ -1497,6 +1497,9 @@ pub const MAX_QUEUE_CAPACITY_BYTES: u64 = if ((usize::MAX >> 3) as u64) < 9_007_
     9_007_199_254_740_991
 };
 
+/// Longest accepted interval between table writer-policy readbacks.
+pub const MAX_ADAPTIVE_POLICY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueCapacityTunables {
@@ -1538,6 +1541,8 @@ pub struct BatchingTunables {
     pub max_rows_per_flush: Option<u64>,
     pub max_batches_per_flush: Option<u64>,
     pub max_age: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_policy_refresh_interval: Option<String>,
     pub max_concurrent_flushes: Option<usize>,
     pub pipeline_depth: Option<usize>,
     #[serde(
@@ -1581,6 +1586,8 @@ pub struct CommitTunables {
     pub delta_stats_columns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub snapshot_cache_mode: Option<arrow_deltalake::SnapshotCacheMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub snapshot_list_mode: Option<arrow_deltalake::SnapshotListMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub preflight_lookup_mode: Option<arrow_deltalake::PreflightLookupMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]

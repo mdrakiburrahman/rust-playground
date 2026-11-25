@@ -533,7 +533,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
                 | "global_capacity.bytes" | "global_capacity.rows" | "global_capacity.batches"
                 | "per_table_capacity.bytes" | "per_table_capacity.rows" | "per_table_capacity.batches"
                 | "max_arrow_memory_per_flush" | "max_rows_per_flush" | "max_batches_per_flush"
-                | "max_age" | "max_concurrent_flushes" | "stage_file_concurrency" | "stage_files_per_group" | "max_pending_commit_bytes")
+                | "max_age" | "adaptive_policy_refresh_interval" | "max_concurrent_flushes" | "stage_file_concurrency" | "stage_files_per_group" | "max_pending_commit_bytes")
         {
             let pointer = format!("/{}", field.replace('.', "/"));
             if projected.get("ARROWCOL_COLLECTOR_BATCHING_CONFIG")
@@ -548,7 +548,8 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
         let (section, field, variable) = match path {
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode"
-            | "collector.commit.snapshot_cache_mode" | "collector.commit.preflight_lookup_mode"
+            | "collector.commit.snapshot_cache_mode" | "collector.commit.snapshot_list_mode"
+            | "collector.commit.preflight_lookup_mode"
             | "collector.commit.checkpoint_mode" | "collector.commit.checkpoint_interval"
             | "collector.commit.commit_attempts" | "collector.commit.commit_budget_secs"
             | "collector.commit.trigger" =>

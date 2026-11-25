@@ -812,7 +812,8 @@ async fn run_batch_worker(
         stage_file_concurrency: policy.stage_file_concurrency,
         stage_files_per_group: policy.stage_files_per_group,
         adaptive_defaults: policy.adaptive_file.build(),
-        adaptive_readback: Arc::new(Mutex::new(None)),
+        adaptive_readback: Arc::new(Mutex::new(AdaptivePolicyReadback::default())),
+        adaptive_policy_refresh_interval: policy.adaptive_policy_refresh_interval,
         pipeline_depth: policy.pipeline_depth,
         force_commit: policy.pipeline_depth == 1,
         pending_flush: None,
@@ -1011,7 +1012,8 @@ struct GroupPublisher<'a> {
     stage_file_concurrency: usize,
     stage_files_per_group: usize,
     adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
-    adaptive_readback: Arc<Mutex<Option<AdaptiveFileSizeConfig>>>,
+    adaptive_readback: Arc<Mutex<AdaptivePolicyReadback>>,
+    adaptive_policy_refresh_interval: std::time::Duration,
     pipeline_depth: usize,
     force_commit: bool,
     pending_flush: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1019,26 +1021,56 @@ struct GroupPublisher<'a> {
     in_flight: VecDeque<PipelinePublication>,
 }
 
+#[derive(Default)]
+struct AdaptivePolicyReadback {
+    config: Option<AdaptiveFileSizeConfig>,
+    refreshed_at: Option<Instant>,
+}
+
+fn install_estimator_config(
+    estimator: &mut AdaptiveFileSizeEstimator,
+    config: AdaptiveFileSizeConfig,
+) -> Result<(), ExportFailure> {
+    if estimator.config() != &config {
+        *estimator = AdaptiveFileSizeEstimator::new(config)
+            .map_err(|error| ExportFailure::Permanent(format!("invalid writer policy: {error}")))?;
+    }
+    Ok(())
+}
+
 impl GroupPublisher<'_> {
     fn retired(&self) -> bool {
         self.table.is_none()
     }
 
+    fn adaptive_readback(&self) -> Result<std::sync::MutexGuard<'_, AdaptivePolicyReadback>, ExportFailure> {
+        self.adaptive_readback
+            .lock()
+            .map_err(|_| ExportFailure::Permanent("adaptive policy readback lock poisoned".to_owned()))
+    }
+
     async fn refresh_estimator(&self, estimator: &mut AdaptiveFileSizeEstimator) -> Result<(), ExportFailure> {
         let table = self.table.as_ref().ok_or_else(retired_owner_failure)?;
+        if !self.adaptive_policy_refresh_interval.is_zero() {
+            let cached = {
+                let readback = self.adaptive_readback()?;
+                readback
+                    .refreshed_at
+                    .filter(|refreshed| refreshed.elapsed() < self.adaptive_policy_refresh_interval)
+                    .and(readback.config)
+            };
+            if let Some(config) = cached {
+                return install_estimator_config(estimator, config);
+            }
+        }
         let config = table
             .adaptive_file_config(self.adaptive_defaults)
             .await
             .map_err(|error| ExportFailure::Transient(format!("writer policy refresh failed: {error:#}")))?;
-        if estimator.config() != &config {
-            *estimator = AdaptiveFileSizeEstimator::new(config)
-                .map_err(|error| ExportFailure::Permanent(format!("invalid writer policy: {error}")))?;
-        }
-        let mut previous = self
-            .adaptive_readback
-            .lock()
-            .map_err(|_| ExportFailure::Permanent("adaptive policy readback lock poisoned".to_owned()))?;
-        if *previous != Some(config) {
+        install_estimator_config(estimator, config)?;
+        let mut readback = self.adaptive_readback()?;
+        readback.refreshed_at = Some(Instant::now());
+        if readback.config != Some(config) {
             let event = serde_json::json!({
                 "table_name": self.identity.to_string(),
                 "scope": "installed_estimator_not_full_run_history",
@@ -1053,7 +1085,7 @@ impl GroupPublisher<'_> {
                 }
             });
             eprintln!("arrowcol_adaptive_config {event}");
-            *previous = Some(config);
+            readback.config = Some(config);
         }
         Ok(())
     }
@@ -1125,6 +1157,7 @@ impl GroupPublisher<'_> {
         let stage_files_per_group = self.stage_files_per_group;
         let adaptive_defaults = self.adaptive_defaults;
         let adaptive_readback = Arc::clone(&self.adaptive_readback);
+        let adaptive_policy_refresh_interval = self.adaptive_policy_refresh_interval;
         let flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending_flush = Arc::clone(&flush);
         let task = arrow_deltalake::delta::spawn_shared_io(async move {
@@ -1142,6 +1175,7 @@ impl GroupPublisher<'_> {
                 stage_files_per_group,
                 adaptive_defaults,
                 adaptive_readback,
+                adaptive_policy_refresh_interval,
                 pipeline_depth: 1,
                 force_commit: false,
                 pending_flush: Some(pending_flush),
@@ -2783,32 +2817,7 @@ mod tests {
         let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
         tokio::time::timeout(std::time::Duration::from_secs(3), first.wait()).await??;
         let path = fixture.path().join("demo/generated/events");
-        let alter = |input: &str| -> anyhow::Result<()> {
-            let url = format!("file://{}/", path.display()).parse()?;
-            let catalog = arrow_deltalake::delta::DeltaTable::open_catalog(url)?;
-            let snapshot = catalog.catalog_snapshot()?.expect("catalog table");
-            let mut props = snapshot.properties;
-            props.insert("catalog.schemaHistory".into(), "[]".into());
-            for (key, value) in [
-                ("arrowcol.writer.targetFileSize", "262144"),
-                ("arrowcol.writer.minInputSize", input),
-                ("arrowcol.writer.maxInputSize", input),
-                ("arrowcol.writer.coldStartParquetRatio", "0.5"),
-                ("arrowcol.writer.ewmaWeight", "0.4"),
-                ("arrowcol.writer.minParquetRatio", "0.1"),
-                ("arrowcol.writer.maxParquetRatio", "2"),
-            ] {
-                props.insert(key.into(), value.into());
-            }
-            catalog.commit_catalog(
-                Some(snapshot.version),
-                snapshot.schema,
-                snapshot.partition_columns,
-                props,
-                snapshot.comment,
-            )?;
-            Ok(())
-        };
+        let alter = |input: &str| set_writer_input_policy(&path, input);
         tokio::task::block_in_place(|| alter("1024"))?;
         let retry = envelope_for(&lease);
         let publication = exporter.stage(envelope_pdata(retry.clone())).await?;
@@ -2854,6 +2863,65 @@ mod tests {
             3,
             "policy change must not change publication replay identity"
         );
+        Ok(())
+    }
+
+    fn set_writer_input_policy(path: &std::path::Path, input: &str) -> anyhow::Result<()> {
+        let url = format!("file://{}/", path.display()).parse()?;
+        let catalog = arrow_deltalake::delta::DeltaTable::open_catalog(url)?;
+        let snapshot = catalog.catalog_snapshot()?.expect("catalog table");
+        let mut props = snapshot.properties;
+        props.insert("catalog.schemaHistory".into(), "[]".into());
+        for (key, value) in [
+            ("arrowcol.writer.targetFileSize", "262144"),
+            ("arrowcol.writer.minInputSize", input),
+            ("arrowcol.writer.maxInputSize", input),
+            ("arrowcol.writer.coldStartParquetRatio", "0.5"),
+            ("arrowcol.writer.ewmaWeight", "0.4"),
+            ("arrowcol.writer.minParquetRatio", "0.1"),
+            ("arrowcol.writer.maxParquetRatio", "2"),
+        ] {
+            props.insert(key.into(), value.into());
+        }
+        catalog.commit_catalog(
+            Some(snapshot.version),
+            snapshot.schema,
+            snapshot.partition_columns,
+            props,
+            snapshot.comment,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exporter_reuses_adaptive_policy_within_refresh_interval() -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let mut batching = FileBatchConfig {
+            max_age: std::time::Duration::from_secs(60),
+            adaptive_policy_refresh_interval: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        };
+        batching.adaptive_file.min_input_bytes = 1;
+        batching.adaptive_file.max_input_bytes = 1;
+        let exporter = GenericDeltaExporter::with_batching(
+            fixture.path().to_path_buf(),
+            Arc::clone(&store) as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            batching,
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.wait()).await??;
+        let path = fixture.path().join("demo/generated/events");
+        tokio::task::block_in_place(|| set_writer_input_policy(&path, "1024"))?;
+        let next = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), next.wait())
+            .await
+            .map_err(|_| anyhow::anyhow!("cached one-byte policy must flush before the refresh interval elapses"))??;
         Ok(())
     }
 

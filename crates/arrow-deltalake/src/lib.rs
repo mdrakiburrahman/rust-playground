@@ -105,6 +105,28 @@ impl<'de> serde::Deserialize<'de> for SnapshotCacheMode {
     }
 }
 
+/// How an object-store snapshot refresh lists `_delta_log/` to certify its cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotListMode {
+    /// Lists the whole log on every refresh.
+    #[default]
+    Full,
+    /// Lists from the cached checkpoint version; entries below it are not observed.
+    FromCheckpoint,
+}
+
+impl<'de> serde::Deserialize<'de> for SnapshotListMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.snapshot_list_mode must be full or from_checkpoint";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("full") => Ok(Self::Full),
+            Ok("from_checkpoint") => Ok(Self::FromCheckpoint),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
 /// How coalesced preparation resolves the prior Delta transactions of its entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

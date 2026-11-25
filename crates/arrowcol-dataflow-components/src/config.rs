@@ -41,7 +41,9 @@ mod override_tests {
 
     #[test]
     fn commit_projection_preserves_yaml_and_reaches_table_options() -> Result<(), String> {
-        use arrow_deltalake::{CheckpointMode, PreflightLookupMode, SnapshotCacheMode, TxnLookupMode};
+        use arrow_deltalake::{
+            CheckpointMode, PreflightLookupMode, SnapshotCacheMode, SnapshotListMode, TxnLookupMode,
+        };
 
         let yaml: CommitConfig = serde_json::from_value(serde_json::json!({"snapshot_cache_mode":"checkpoint_aware"}))
             .map_err(|error| error.to_string())?;
@@ -52,7 +54,7 @@ mod override_tests {
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
                 "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental",
-                    "preflight_lookup_mode":"grouped","commit_attempts":3,"commit_budget_secs":2}}
+                    "preflight_lookup_mode":"grouped","snapshot_list_mode":"from_checkpoint","commit_attempts":3,"commit_budget_secs":2}}
             }))
             .map_err(|error| error.to_string())?;
             let environment = settings
@@ -65,6 +67,7 @@ mod override_tests {
             assert_eq!(options.checkpoint_interval, 17);
             assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
             assert_eq!(options.preflight_lookup_mode, PreflightLookupMode::Grouped);
+            assert_eq!(options.snapshot_list_mode, SnapshotListMode::FromCheckpoint);
             assert_eq!(options.commit_attempts, 3);
             assert_eq!(options.commit_budget, Duration::from_secs(2));
         }
@@ -199,6 +202,25 @@ mod override_tests {
                 .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn adaptive_policy_refresh_interval_validates_the_merged_config() {
+        let config = FileBatchConfig::default();
+        for (value, valid) in [
+            ("\"0s\"", true),
+            ("\"30s\"", true),
+            ("\"1h\"", true),
+            ("\"61m\"", false),
+            ("\"-1s\"", false),
+            ("\"soon\"", false),
+            ("30", false),
+            ("null", false),
+        ] {
+            let json = format!(r#"{{"adaptive_policy_refresh_interval":{value}}}"#);
+            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+            assert_eq!(result.is_ok(), valid, "{json}");
+        }
     }
 
     #[test]
@@ -1198,6 +1220,8 @@ pub struct CommitConfig {
     pub max_pending_files: usize,
     /// How the table owner reuses its Delta snapshot.
     pub snapshot_cache_mode: arrow_deltalake::SnapshotCacheMode,
+    /// How object-store snapshot refreshes list `_delta_log/`.
+    pub snapshot_list_mode: arrow_deltalake::SnapshotListMode,
     /// How coalesced preparation resolves prior Delta transactions.
     pub preflight_lookup_mode: arrow_deltalake::PreflightLookupMode,
     /// Whether the collector or an external service writes checkpoints.
@@ -1220,6 +1244,7 @@ impl Default for CommitConfig {
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
             snapshot_cache_mode: options.snapshot_cache_mode,
+            snapshot_list_mode: options.snapshot_list_mode,
             preflight_lookup_mode: options.preflight_lookup_mode,
             checkpoint_mode: options.checkpoint_mode,
             checkpoint_interval: options.checkpoint_interval,
@@ -1238,6 +1263,7 @@ impl CommitConfig {
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
             snapshot_cache_mode: self.snapshot_cache_mode,
+            snapshot_list_mode: self.snapshot_list_mode,
             preflight_lookup_mode: self.preflight_lookup_mode,
             checkpoint_mode: self.checkpoint_mode,
             checkpoint_interval: self.checkpoint_interval,
@@ -1338,6 +1364,9 @@ pub struct FileBatchConfig {
     /// Maximum age of the first batch in a file.
     #[serde(with = "humantime_serde")]
     pub max_age: Duration,
+    /// Minimum age of a table writer-policy readback before it is refreshed again; zero refreshes every batch.
+    #[serde(with = "humantime_serde")]
+    pub adaptive_policy_refresh_interval: Duration,
     /// Maximum simultaneous file publications.
     pub max_concurrent_flushes: usize,
     /// Maximum sibling files staged concurrently within one coalesced publication.
@@ -1372,6 +1401,7 @@ impl Default for FileBatchConfig {
             max_rows_per_flush: 1_000_000,
             max_batches_per_flush: 512,
             max_age: Duration::from_secs(30),
+            adaptive_policy_refresh_interval: Duration::ZERO,
             max_concurrent_flushes: 4,
             stage_file_concurrency: 1,
             stage_files_per_group: 1,
@@ -1386,6 +1416,9 @@ impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.max_pending_commit_bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES {
             return Err("max_pending_commit_bytes exceeds the exact byte capacity limit".to_owned());
+        }
+        if self.adaptive_policy_refresh_interval > arrowcol_tunables::MAX_ADAPTIVE_POLICY_REFRESH_INTERVAL {
+            return Err("adaptive_policy_refresh_interval must not exceed 1h".to_owned());
         }
         let global = self.global_capacity;
         let table = self.per_table_capacity;
