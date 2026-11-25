@@ -551,6 +551,9 @@ fn candidates(path: &str) -> Vec<Value> {
         "collector.commit.checkpoint_interval" => return vec![json!(17)],
         "collector.commit.trigger" => return vec![json!("eager"), json!("window")],
         "collector.runtime.cpu_dispatch" => return vec![json!("bounded_shards")],
+        "collector.runtime.local_directory_sync_policy" => {
+            return vec![json!("before_commit"), json!("per_file")];
+        }
         "collector.runtime.parquet_encode_mode" => return vec![json!("column_pipeline"), json!("column_waves")],
         "collector.runtime.cpu_placement" => return vec![json!("scatter_allowed")],
         "collector.batching.stage_file_concurrency" => return vec![json!(16)],

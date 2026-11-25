@@ -49,18 +49,34 @@ fn attach_collector_teardown_failures(
         return Ok(());
     }
     let mut failures = Vec::new();
-    for log in logs.unwrap_or_default().iter().filter(|log| log.role == ComponentRole::Collector) {
-        for line in log.text.lines().filter(|line| line.starts_with("arrowcol_teardown_failure ")) {
+    for log in logs
+        .unwrap_or_default()
+        .iter()
+        .filter(|log| log.role == ComponentRole::Collector)
+    {
+        for line in log
+            .text
+            .lines()
+            .filter(|line| line.starts_with("arrowcol_teardown_failure "))
+        {
             if !log.complete || log.instance_id.is_empty() {
                 bail!("collector teardown failure record has incomplete provenance");
             }
             let value: Value = serde_json::from_str(&line["arrowcol_teardown_failure ".len()..])
                 .context("invalid collector teardown failure record")?;
             let object = value.as_object().context("invalid collector teardown failure object")?;
-            let triggers = value["triggers"].as_array().context("missing teardown failure triggers")?;
-            if object.len() != 2 || value["kind"].as_str() != Some(arrowcol_protocol::DATAFLOW_DRAIN_INCOMPLETE)
-                || triggers.is_empty() || triggers.iter().any(|trigger| !matches!(trigger.as_str(),
-                    Some("unpublished_identities" | "retired_workers" | "ingress_failure")))
+            let triggers = value["triggers"]
+                .as_array()
+                .context("missing teardown failure triggers")?;
+            if object.len() != 2
+                || value["kind"].as_str() != Some(arrowcol_protocol::DATAFLOW_DRAIN_INCOMPLETE)
+                || triggers.is_empty()
+                || triggers.iter().any(|trigger| {
+                    !matches!(
+                        trigger.as_str(),
+                        Some("unpublished_identities" | "retired_workers" | "ingress_failure")
+                    )
+                })
                 || triggers.iter().filter_map(Value::as_str).collect::<BTreeSet<_>>().len() != triggers.len()
             {
                 bail!("invalid collector teardown failure kind or triggers");
@@ -221,7 +237,12 @@ fn filter_process_evidence_text(text: &str) -> Result<String> {
     let mut filtered = String::new();
     let mut retained_bytes = 0;
     for line in text.split_inclusive('\n') {
-        append_process_record(line.as_bytes(), &mut filtered, &mut retained_bytes, "process log filtering")?;
+        append_process_record(
+            line.as_bytes(),
+            &mut filtered,
+            &mut retained_bytes,
+            "process log filtering",
+        )?;
     }
     Ok(filtered)
 }
@@ -234,8 +255,8 @@ fn verify_run_image_source_revision(
     let Some(expected) = expected_source_revision else {
         return Ok(());
     };
-    let observed = observed_source_revision
-        .with_context(|| format!("{role} run image source revision label is missing"))?;
+    let observed =
+        observed_source_revision.with_context(|| format!("{role} run image source revision label is missing"))?;
     if observed != expected {
         bail!("{role} run image source revision does not match the requested source revision");
     }
@@ -350,10 +371,9 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.to_ascii_lowercase();
-                    let public_endpoint_limit = matches!(
-                        lower.as_str(),
-                        "endpoint_concurrency_limit" | "endpoint_buffer_size"
-                    ) && value.as_u64().is_some();
+                    let public_endpoint_limit =
+                        matches!(lower.as_str(), "endpoint_concurrency_limit" | "endpoint_buffer_size")
+                            && value.as_u64().is_some();
                     if !public_endpoint_limit
                         && !matches!(lower.as_str(), "authority_timeout" | "listener_tasks_per_fd")
                         && ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
@@ -381,9 +401,12 @@ fn process_configurations(text: &str) -> Result<Value> {
     let mut delta_io_runtime_build_seen = false;
     let mut client_build_profile_seen = false;
     for line in text.lines() {
-        let transport = [("OAT_CLIENT_APPLIED_TRANSPORT ", "applied_transport"),
-            ("OAT_CLIENT_FINAL_TRANSPORT ", "final_transport")]
-            .into_iter().find_map(|(prefix, key)| line.strip_prefix(prefix).map(|value| (key, value)));
+        let transport = [
+            ("OAT_CLIENT_APPLIED_TRANSPORT ", "applied_transport"),
+            ("OAT_CLIENT_FINAL_TRANSPORT ", "final_transport"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, key)| line.strip_prefix(prefix).map(|value| (key, value)));
         if let Some((key, value)) = transport {
             if configuration.get(key).is_some() {
                 bail!("duplicate OAT client transport readback");
@@ -413,15 +436,23 @@ fn process_configurations(text: &str) -> Result<Value> {
                 || sockets.iter().any(|socket| {
                     socket.as_object().is_none_or(|object| {
                         object.len() != 7
-                            || object.get("generation").and_then(Value::as_u64).is_none_or(|generation| generation == 0)
+                            || object
+                                .get("generation")
+                                .and_then(Value::as_u64)
+                                .is_none_or(|generation| generation == 0)
                             || ["send", "recv"].iter().any(|direction| {
-                                let effective = object.get(&format!("{direction}_buffer_bytes")).and_then(Value::as_u64);
+                                let effective =
+                                    object.get(&format!("{direction}_buffer_bytes")).and_then(Value::as_u64);
                                 let requested = object.get(&format!("requested_{direction}_buffer_bytes"));
                                 let clamped = object.get(&format!("{direction}_buffer_kernel_clamp_observed"));
-                                let Some(effective) = effective.filter(|value| *value > 0) else { return true; };
+                                let Some(effective) = effective.filter(|value| *value > 0) else {
+                                    return true;
+                                };
                                 match (requested, clamped) {
                                     (Some(Value::Null), Some(Value::Null)) => false,
-                                    (Some(requested), Some(clamped)) => requested.as_u64().filter(|value| *value > 0)
+                                    (Some(requested), Some(clamped)) => requested
+                                        .as_u64()
+                                        .filter(|value| *value > 0)
                                         .is_none_or(|requested| clamped.as_bool() != Some(effective / 2 < requested)),
                                     _ => true,
                                 }
@@ -440,7 +471,9 @@ fn process_configurations(text: &str) -> Result<Value> {
             }
             client_build_profile_seen = true;
             let value: Value = serde_json::from_str(value).context("invalid OAT client build-profile readback")?;
-            let profile = value.as_object().context("OAT client build-profile readback must be an object")?;
+            let profile = value
+                .as_object()
+                .context("OAT client build-profile readback must be an object")?;
             let lto = profile.get("lto").and_then(Value::as_str);
             let codegen_units = profile.get("codegen_units").and_then(Value::as_u64);
             let opt_level = profile.get("opt_level").and_then(Value::as_u64);
@@ -475,16 +508,29 @@ fn process_configurations(text: &str) -> Result<Value> {
             }
             delta_io_runtime_build_seen = true;
             let value: Value = serde_json::from_str(value).context("invalid Delta I/O runtime build readback")?;
-            let object = value.as_object().context("Delta I/O runtime build readback must be an object")?;
+            let object = value
+                .as_object()
+                .context("Delta I/O runtime build readback must be an object")?;
             if object.len() != 2 || value["version"] != 1 {
                 bail!("unsupported Delta I/O runtime build readback");
             }
-            let runtime = value.get("runtime").and_then(Value::as_object)
+            let runtime = value
+                .get("runtime")
+                .and_then(Value::as_object)
                 .context("Delta I/O runtime build readback omitted runtime settings")?;
-            let fields = ["event_interval", "global_queue_interval", "thread_stack_size", "thread_keep_alive_ms"];
-            if runtime.len() != fields.len() || fields.iter().any(|field| {
-                runtime.get(*field).is_none_or(|value| !value.is_null() && value.as_u64().is_none())
-            }) {
+            let fields = [
+                "event_interval",
+                "global_queue_interval",
+                "thread_stack_size",
+                "thread_keep_alive_ms",
+            ];
+            if runtime.len() != fields.len()
+                || fields.iter().any(|field| {
+                    runtime
+                        .get(*field)
+                        .is_none_or(|value| !value.is_null() && value.as_u64().is_none())
+                })
+            {
                 bail!("invalid Delta I/O runtime build settings");
             }
             configuration["delta_io_runtime_build"] = Value::Object(runtime.clone());
@@ -567,9 +613,14 @@ fn matches_collector_pressure(observed: &Value, requested: &Value) -> Result<boo
         let Some(actual) = observed.get(field) else {
             return Ok(false);
         };
-        if matches!(field.as_str(), "pressure_interval" | "heartbeat_interval" | "registration_ttl") {
+        if matches!(
+            field.as_str(),
+            "pressure_interval" | "heartbeat_interval" | "registration_ttl"
+        ) {
             let parse = |value: &Value| {
-                let value = value.as_str().with_context(|| format!("collector pressure {field} must be a duration string"))?;
+                let value = value
+                    .as_str()
+                    .with_context(|| format!("collector pressure {field} must be a duration string"))?;
                 arrowcol_tunables::parse_tunable_duration(field, value)
             };
             if parse(actual)? != parse(expected)? {
@@ -621,9 +672,15 @@ fn client_sentinel_value(
         "batch_rows" => json!(config.rows_per_table),
         "streams_per_worker" => json!(config.effective_dmv_concurrency()),
         "string_width" => {
-            let profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
+            let profile = config
+                .tunables
+                .client
+                .as_ref()
+                .and_then(|client| client.data_profile)
+                .unwrap_or_default();
             let profile = serde_json::to_value(profile)?;
-            if proof["requested"]["data_profile"] != profile || proof["resolved"]["data_profile"] != profile
+            if proof["requested"]["data_profile"] != profile
+                || proof["resolved"]["data_profile"] != profile
                 || observed["data_profile"] != profile
             {
                 bail!("client string_width resolution disagrees with data_profile");
@@ -710,7 +767,12 @@ fn router_readback_path(variable: &str) -> Result<String> {
 }
 
 fn verify_dmv_concurrency_readback(config: &OatConfig, observed: &Value) -> Result<Value> {
-    let requested_streams = config.tunables.client.as_ref().and_then(|client| client.streams_per_worker).unwrap_or(0);
+    let requested_streams = config
+        .tunables
+        .client
+        .as_ref()
+        .and_then(|client| client.streams_per_worker)
+        .unwrap_or(0);
     let concurrency = config.effective_dmv_concurrency();
     let (streams, source) = if requested_streams == 0 {
         (concurrency, "legacy_concurrency")
@@ -724,14 +786,21 @@ fn verify_dmv_concurrency_readback(config: &OatConfig, observed: &Value) -> Resu
         || proof["resolved"]["streams_per_worker"] != streams
         || proof["streams_per_worker_source"] != source
     {
-        bail!("dmv_concurrency / streams_per_worker consumer readback does not match the requested per-worker stream limit");
+        bail!(
+            "dmv_concurrency / streams_per_worker consumer readback does not match the requested per-worker stream limit"
+        );
     }
-    let workers = observed["workers"].as_u64().filter(|workers| *workers > 0)
+    let workers = observed["workers"]
+        .as_u64()
+        .filter(|workers| *workers > 0)
         .context("dmv_concurrency readback omitted the effective worker count")?;
-    let configured_slots = workers.checked_mul(u64::try_from(streams)?)
+    let configured_slots = workers
+        .checked_mul(u64::try_from(streams)?)
         .context("dmv_concurrency configured slot count overflow")?;
-    Ok(json!({"source": source, "streams_per_worker": streams, "workers": workers,
-        "configured_slots": configured_slots, "requested_dmv_concurrency": config.dmv_concurrency}))
+    Ok(
+        json!({"source": source, "streams_per_worker": streams, "workers": workers,
+        "configured_slots": configured_slots, "requested_dmv_concurrency": config.dmv_concurrency}),
+    )
 }
 
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
@@ -751,16 +820,26 @@ fn verify_process_configuration_recording(
         verify_maintenance_controls(config, observed)?;
     }
     if matches!(role, ComponentRole::Collector | ComponentRole::Client)
-        && config.tunables.collector.as_ref().and_then(|collector| collector.isolation_level).unwrap_or_default()
+        && config
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.isolation_level)
+            .unwrap_or_default()
             == arrowcol_tunables::IsolationLevel::L5
         && let Some(actual) = observed.get("isolation_level")
         && actual != "l5"
     {
         let name = if matches!(role, ComponentRole::Collector) {
             "ARROWCOL_COLLECTOR_ISOLATION_LEVEL"
-        } else { "ARROWCOL_CLIENT_ISOLATION_LEVEL" };
+        } else {
+            "ARROWCOL_CLIENT_ISOLATION_LEVEL"
+        };
         *diff = Some(startup_mismatch(role, name, &json!("l5"), Some(actual)));
-        bail!("{} startup readback conflicts with normal l5 operation", role_name(role));
+        bail!(
+            "{} startup readback conflicts with normal l5 operation",
+            role_name(role)
+        );
     }
     for (name, expected) in role_environment(config, role)? {
         if name.starts_with("ARROWCOL_WAL_") || name == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS" {
@@ -810,21 +889,11 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
             "ARROWCOL_COLLECTOR_ISOLATION_LEVEL" => "/isolation_level".to_owned(),
-            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE" => {
-                "/engine/channel_capacity/control_node".to_owned()
-            }
-            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE" => {
-                "/engine/channel_capacity/control_pipeline".to_owned()
-            }
-            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION" => {
-                "/engine/channel_capacity/control_completion".to_owned()
-            }
-            "ARROWCOL_COLLECTOR_CHANNEL_PDATA" => {
-                "/engine/channel_capacity/pdata".to_owned()
-            }
-            "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
-                "/engine/shutdown_drain_timeout_seconds".to_owned()
-            }
+            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_NODE" => "/engine/channel_capacity/control_node".to_owned(),
+            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_PIPELINE" => "/engine/channel_capacity/control_pipeline".to_owned(),
+            "ARROWCOL_COLLECTOR_CHANNEL_CONTROL_COMPLETION" => "/engine/channel_capacity/control_completion".to_owned(),
+            "ARROWCOL_COLLECTOR_CHANNEL_PDATA" => "/engine/channel_capacity/pdata".to_owned(),
+            "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => "/engine/shutdown_drain_timeout_seconds".to_owned(),
             "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
@@ -832,10 +901,12 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_LAYOUT_ENABLED" => "/layout/process_policy/enabled".to_owned(),
             "ARROWCOL_COLLECTOR_SORT_OPTIONS" => {
                 expected = serde_json::to_value(
-                    expected.as_str().context("collector sort options must be comma separated")?
+                    expected
+                        .as_str()
+                        .context("collector sort options must be comma separated")?
                         .split(',')
                         .map(arrow_deltalake::layout::SortKeyOptions::from_property)
-                        .collect::<Result<Vec<_>>>()?
+                        .collect::<Result<Vec<_>>>()?,
                 )?;
                 "/layout/process_policy/sort_options".to_owned()
             }
@@ -899,9 +970,7 @@ fn verify_process_configuration_recording(
             );
         }
     }
-    if matches!(role, ComponentRole::Router)
-        && !role_environment(config, role)?.contains_key("RUST_LOG")
-    {
+    if matches!(role, ComponentRole::Router) && !role_environment(config, role)?.contains_key("RUST_LOG") {
         if observed["log_filter_source"].as_str() != Some("config") {
             bail!("router inherited logging must come from its configuration file");
         }
@@ -931,9 +1000,7 @@ fn inherited_router_log_filter(config: &OatConfig) -> Result<String> {
             std::fs::read_to_string(&router_yaml_path)
                 .with_context(|| format!("read rendered local router config {}", router_yaml_path.display()))?
         }
-        crate::config::OatMode::Aks => {
-            include_str!("../../arrowcol-router-rust/config.docker.yaml").to_owned()
-        }
+        crate::config::OatMode::Aks => include_str!("../../arrowcol-router-rust/config.docker.yaml").to_owned(),
     };
     let yaml: Value = serde_yaml::from_str(&content).context("parse inherited router YAML")?;
     yaml.pointer("/telemetry/log_filter")
@@ -948,8 +1015,11 @@ fn parquet_column_readback(value: &Value) -> Option<Value> {
         return None;
     }
     for (name, settings) in columns {
-        if name.is_empty() || name.len() > 128
-            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
         {
             return None;
         }
@@ -975,29 +1045,52 @@ fn parquet_column_options_readback(value: &Value) -> Option<Value> {
         return None;
     }
     for (name, settings) in columns {
-        if name.is_empty() || name.len() > 128
-            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
         {
             return None;
         }
         let fields = settings.as_object()?;
         if fields.len() != 10
             || !matches!(fields.get("encoding")?, Value::Null)
-                && !matches!(fields.get("encoding")?.as_str(), Some("plain" | "rle" | "delta_binary_packed"
-                    | "delta_length_byte_array" | "delta_byte_array" | "byte_stream_split"))
+                && !matches!(
+                    fields.get("encoding")?.as_str(),
+                    Some(
+                        "plain"
+                            | "rle"
+                            | "delta_binary_packed"
+                            | "delta_length_byte_array"
+                            | "delta_byte_array"
+                            | "byte_stream_split"
+                    )
+                )
             || !matches!(fields.get("statistics")?.as_str(), Some("none" | "chunk" | "page"))
-            || ["dictionary_enabled", "write_page_header_statistics", "bloom_filter_enabled"]
-                .iter().any(|name| fields.get(*name).is_none_or(|value| !value.is_boolean()))
+            || [
+                "dictionary_enabled",
+                "write_page_header_statistics",
+                "bloom_filter_enabled",
+            ]
+            .iter()
+            .any(|name| fields.get(*name).is_none_or(|value| !value.is_boolean()))
             || ["dictionary_page_size_limit", "data_page_size_limit"]
-                .iter().any(|name| fields.get(*name).and_then(Value::as_u64).is_none_or(|value| value == 0))
-            || fields.get("data_page_v2_compression_ratio_threshold")?.as_f64().is_none_or(|value| !value.is_finite() || value <= 0.0)
+                .iter()
+                .any(|name| fields.get(*name).and_then(Value::as_u64).is_none_or(|value| value == 0))
+            || fields
+                .get("data_page_v2_compression_ratio_threshold")?
+                .as_f64()
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
         {
             return None;
         }
         let fpp = fields.get("bloom_filter_fpp")?;
         let ndv = fields.get("bloom_filter_ndv")?;
         if fields["bloom_filter_enabled"] == true {
-            if fpp.as_f64().is_none_or(|value| !value.is_finite() || !(0.0..1.0).contains(&value) || value == 0.0)
+            if fpp
+                .as_f64()
+                .is_none_or(|value| !value.is_finite() || !(0.0..1.0).contains(&value) || value == 0.0)
                 || ndv.as_u64().is_none_or(|value| value == 0)
             {
                 return None;
@@ -1010,28 +1103,58 @@ fn parquet_column_options_readback(value: &Value) -> Option<Value> {
 }
 
 fn collector_delta_stats_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
-    let tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
+    let tables = config
+        .tables
+        .iter()
+        .map(|table| canonical_dmv_table_name(table))
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
     let environment = role_environment(config, ComponentRole::Collector)?;
-    let requested = environment.get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
-        .map(|value| serde_json::from_str::<Vec<String>>(value)).transpose()?;
+    let requested = environment
+        .get("ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+        .map(|value| serde_json::from_str::<Vec<String>>(value))
+        .transpose()?;
     let mut records = Vec::new();
-    for line in text.lines().filter_map(|line| line.strip_prefix("arrowcol_delta_stats_config ")) {
-        let value: Value = serde_json::from_str(line).context("invalid collector.commit.delta_stats_columns readback")?;
-        let table = value["table_name"].as_str().context("Delta stats omitted table identity")?;
+    for line in text
+        .lines()
+        .filter_map(|line| line.strip_prefix("arrowcol_delta_stats_config "))
+    {
+        let value: Value =
+            serde_json::from_str(line).context("invalid collector.commit.delta_stats_columns readback")?;
+        let table = value["table_name"]
+            .as_str()
+            .context("Delta stats omitted table identity")?;
         if !tables.contains(table) {
             continue;
         }
-        ensure!(value["scope"] == "committed_table_metadata", "Delta stats readback is not committed metadata");
-        ensure!(value["table_id"].as_str().is_some_and(|id| !id.is_empty()), "Delta stats omitted committed table id");
-        ensure!(value["version"].as_u64().is_some(), "Delta stats omitted committed version");
-        let properties = value["properties"].as_object().context("Delta stats omitted committed properties")?;
-        ensure!(properties.iter().all(|(name, value)| {
-            matches!(name.as_str(), "delta.dataSkippingStatsColumns" | "delta.dataSkippingNumIndexedCols") && value.is_string()
-        }), "invalid committed Delta stats properties");
+        ensure!(
+            value["scope"] == "committed_table_metadata",
+            "Delta stats readback is not committed metadata"
+        );
+        ensure!(
+            value["table_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "Delta stats omitted committed table id"
+        );
+        ensure!(
+            value["version"].as_u64().is_some(),
+            "Delta stats omitted committed version"
+        );
+        let properties = value["properties"]
+            .as_object()
+            .context("Delta stats omitted committed properties")?;
+        ensure!(
+            properties.iter().all(|(name, value)| {
+                matches!(
+                    name.as_str(),
+                    "delta.dataSkippingStatsColumns" | "delta.dataSkippingNumIndexedCols"
+                ) && value.is_string()
+            }),
+            "invalid committed Delta stats properties"
+        );
         if let Some(columns) = &requested {
-            ensure!(delta_stats_properties_match(columns, &value["properties"]),
-                "collector.commit.delta_stats_columns differs from committed table metadata");
+            ensure!(
+                delta_stats_properties_match(columns, &value["properties"]),
+                "collector.commit.delta_stats_columns differs from committed table metadata"
+            );
         }
         if !records.contains(&value) {
             ensure!(records.len() < 256, "Delta stats metadata evidence exceeded its bound");
@@ -1051,12 +1174,20 @@ fn delta_stats_properties_match(columns: &[String], properties: &Value) -> bool 
 }
 
 fn collector_adaptive_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
-    let tables = config.tables.iter().map(|table| canonical_dmv_table_name(table))
+    let tables = config
+        .tables
+        .iter()
+        .map(|table| canonical_dmv_table_name(table))
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
     let mut records = Vec::new();
-    for line in text.lines().filter_map(|line| line.strip_prefix("arrowcol_adaptive_config ")) {
+    for line in text
+        .lines()
+        .filter_map(|line| line.strip_prefix("arrowcol_adaptive_config "))
+    {
         let value: Value = serde_json::from_str(line).context("invalid adaptive policy readback")?;
-        let table = value["table_name"].as_str().context("adaptive policy readback omitted table identity")?;
+        let table = value["table_name"]
+            .as_str()
+            .context("adaptive policy readback omitted table identity")?;
         if !tables.contains(table) {
             continue;
         }
@@ -1067,8 +1198,18 @@ fn collector_adaptive_records(config: &OatConfig, text: &str) -> Result<Vec<Valu
         if fields.len() != 7 {
             bail!("invalid adaptive policy fields");
         }
-        let integer = |name| fields.get(name).and_then(Value::as_u64).context("invalid adaptive policy integer");
-        let ratio = |name| fields.get(name).and_then(Value::as_f64).context("invalid adaptive policy ratio");
+        let integer = |name| {
+            fields
+                .get(name)
+                .and_then(Value::as_u64)
+                .context("invalid adaptive policy integer")
+        };
+        let ratio = |name| {
+            fields
+                .get(name)
+                .and_then(Value::as_f64)
+                .context("invalid adaptive policy ratio")
+        };
         let policy = arrow_deltalake::sizing::AdaptiveFileSizeConfig {
             target_parquet_bytes: integer("target_parquet_bytes")?,
             min_input_bytes: integer("min_input_bytes")?,
@@ -1173,21 +1314,36 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
             policy.insert("sort_options".to_owned(), json!(options));
         }
         if let Some(ratio) = value["config"].get("detach_ratio") {
-            anyhow::ensure!(enabled && ratio.as_u64().is_some_and(|ratio| (1..=8).contains(&ratio)), "invalid effective collector.layout.detach_ratio");
+            anyhow::ensure!(
+                enabled && ratio.as_u64().is_some_and(|ratio| (1..=8).contains(&ratio)),
+                "invalid effective collector.layout.detach_ratio"
+            );
             policy.insert("detach_ratio".to_owned(), ratio.clone());
         }
         let properties = &value["parquet_properties"];
         let valid_properties = properties.as_object().is_some_and(|object| {
-            (object.len() == 6 || (object.len() == 8
-                && object.get("max_row_group_rows").is_some_and(|value| value.is_null() || value.as_u64().is_some_and(|rows| rows > 0))
-                && properties["data_page_row_count_limit"].as_u64().is_some_and(|rows| rows > 0)))
+            (object.len() == 6
+                || (object.len() == 8
+                    && object
+                        .get("max_row_group_rows")
+                        .is_some_and(|value| value.is_null() || value.as_u64().is_some_and(|rows| rows > 0))
+                    && properties["data_page_row_count_limit"]
+                        .as_u64()
+                        .is_some_and(|rows| rows > 0)))
                 && matches!(properties["writer_version"].as_str(), Some("v1" | "v2"))
                 && properties["write_batch_size"].as_u64().is_some_and(|value| value > 0)
                 && properties["offset_index_enabled"].is_boolean()
-                && ["max_row_group_bytes", "column_index_truncate_length", "statistics_truncate_length"]
-                    .iter().all(|field| object.get(*field).is_some_and(|value| {
-                        value.is_null() || value.as_u64().is_some_and(|number| number > 0)
-                    }))
+                && [
+                    "max_row_group_bytes",
+                    "column_index_truncate_length",
+                    "statistics_truncate_length",
+                ]
+                .iter()
+                .all(|field| {
+                    object
+                        .get(*field)
+                        .is_some_and(|value| value.is_null() || value.as_u64().is_some_and(|number| number > 0))
+                })
         });
         let record = json!({"table_id":id,"table_name":table,"config":policy,
             "parquet_columns":parquet_column_readback(&value["parquet_columns"]),
@@ -1205,8 +1361,13 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
 }
 
 pub(crate) fn verify_oat_client_build_profile_readback(config: &OatConfig, observed: &Value) -> Result<()> {
-    let profile = observed.get("build_profile").context("OAT client omitted startup build-profile readback")?;
-    let expected_profile = config.tunables.client.as_ref()
+    let profile = observed
+        .get("build_profile")
+        .context("OAT client omitted startup build-profile readback")?;
+    let expected_profile = config
+        .tunables
+        .client
+        .as_ref()
         .and_then(|client| client.build_profile.as_ref())
         .map(|profile| profile.build_profile())
         .unwrap_or_default();
@@ -1223,9 +1384,16 @@ pub(crate) fn verify_oat_client_build_profile_readback(config: &OatConfig, obser
 }
 
 fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
-    if !matches!(role, ComponentRole::Collector) { return Ok(()); }
-    let Some(expected_hash) = config.collector_build_profile_hash() else { return Ok(()); };
-    let profile = config.tunables.collector.as_ref()
+    if !matches!(role, ComponentRole::Collector) {
+        return Ok(());
+    }
+    let Some(expected_hash) = config.collector_build_profile_hash() else {
+        return Ok(());
+    };
+    let profile = config
+        .tunables
+        .collector
+        .as_ref()
         .filter(|collector| collector.has_build_profile())
         .context("collector build-profile readback was requested without typed build-profile settings")?
         .build_profile();
@@ -1237,7 +1405,10 @@ fn verify_collector_build_profile_readback(config: &OatConfig, role: ComponentRo
         "opt_level": profile.opt_level.as_u8(),
         "target_cpu": profile.target_cpu.as_str(),
     });
-    for (field, value) in expected.as_object().context("expected build profile must be an object")? {
+    for (field, value) in expected
+        .as_object()
+        .context("expected build profile must be an object")?
+    {
         if observed.get(field) != Some(value) {
             bail!("collector startup build readback for {field} does not match the requested profile");
         }
@@ -1292,7 +1463,10 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             raw_log_lines: 1,
             stdout: String::new(),
             stderr: String::new(),
-            text: format!("arrowcol_router_effective_config {{\"log_filter\":{}}}\n", serde_json::to_string(&log_filter)?),
+            text: format!(
+                "arrowcol_router_effective_config {{\"log_filter\":{}}}\n",
+                serde_json::to_string(&log_filter)?
+            ),
         });
     }
     let mut evidence = process_evidence_for_cell(config, &logs, &[], &mut None)?;
@@ -1330,7 +1504,10 @@ fn process_evidence_for_cell(
                 bail!("maintenance operation log was truncated; safety outcomes cannot be established");
             }
             let resolved = process_configurations(&log.text)?;
-            let startup_source_revision = resolved.get("source_revision").and_then(Value::as_str).map(str::to_owned);
+            let startup_source_revision = resolved
+                .get("source_revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             verify_collector_build_profile_readback(config, role, &resolved)?;
             verify_process_configuration_recording(config, role, &resolved, diff)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
@@ -1401,7 +1578,9 @@ fn process_evidence_for_cell(
         name.starts_with("ARROWCOL_COLLECTOR_LAYOUT_")
             || matches!(
                 name.as_str(),
-                "ARROWCOL_COLLECTOR_SORT_COLUMNS" | "ARROWCOL_COLLECTOR_SORT_OPTIONS" | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS"
+                "ARROWCOL_COLLECTOR_SORT_COLUMNS"
+                    | "ARROWCOL_COLLECTOR_SORT_OPTIONS"
+                    | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS"
             )
     }) {
         let mut identities = std::collections::BTreeMap::new();
@@ -1427,16 +1606,25 @@ fn process_evidence_for_cell(
         let mut identities = std::collections::BTreeMap::new();
         for process in &result {
             for record in process["delta_stats_table_metadata"].as_array().into_iter().flatten() {
-                let table = record["table_name"].as_str().context("Delta stats table name missing")?;
+                let table = record["table_name"]
+                    .as_str()
+                    .context("Delta stats table name missing")?;
                 let id = record["table_id"].as_str().context("Delta stats table id missing")?;
-                ensure!(identities.insert(table, id).is_none_or(|previous| previous == id),
-                    "Delta stats table identity is ambiguous across processes");
-                ensure!(process["log_complete"] == true, "Delta stats metadata log is incomplete");
+                ensure!(
+                    identities.insert(table, id).is_none_or(|previous| previous == id),
+                    "Delta stats table identity is ambiguous across processes"
+                );
+                ensure!(
+                    process["log_complete"] == true,
+                    "Delta stats metadata log is incomplete"
+                );
             }
         }
         for table in &config.tables {
-            ensure!(identities.contains_key(canonical_dmv_table_name(table)?.as_str()),
-                "collector.commit.delta_stats_columns has no matching committed table metadata readback");
+            ensure!(
+                identities.contains_key(canonical_dmv_table_name(table)?.as_str()),
+                "collector.commit.delta_stats_columns has no matching committed table metadata readback"
+            );
         }
     }
     Ok(json!(result))
@@ -1464,7 +1652,10 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     if !baseline.complete || !log.complete {
         return unavailable("Maintenance process logs were truncated, so cell outcomes could not be isolated.");
     }
-    if [&baseline.stdout, &baseline.stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+    if [&baseline.stdout, &baseline.stderr]
+        .iter()
+        .any(|stream| !stream.is_empty() && !stream.ends_with('\n'))
+    {
         return unavailable("Maintenance baseline ended in a partial record; cell outcomes are unknown.");
     }
     let Some(stdout) = log.stdout.strip_prefix(&baseline.stdout) else {
@@ -1478,7 +1669,10 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     let mut retry_kind_counts = serde_json::Map::new();
     let mut error_kind_counts = serde_json::Map::new();
     let mut operations = serde_json::Map::new();
-    if [stdout, stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+    if [stdout, stderr]
+        .iter()
+        .any(|stream| !stream.is_empty() && !stream.ends_with('\n'))
+    {
         return unavailable("Maintenance log ended in a partial record; cell outcomes are unknown.");
     }
     for line in appended.lines() {
@@ -1491,9 +1685,10 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
         if value.get("operation").is_none() {
             continue;
         }
-        let Some(operation) = value["operation"].as_str().filter(|operation| {
-            ["optimize", "checkpoint", "purge", "vacuum", "prune_log"].contains(operation)
-        }) else {
+        let Some(operation) = value["operation"]
+            .as_str()
+            .filter(|operation| ["optimize", "checkpoint", "purge", "vacuum", "prune_log"].contains(operation))
+        else {
             return unavailable("A maintenance operation identity was missing or invalid.");
         };
         let record_outcome = maintenance_record_outcome(&value);
@@ -1501,19 +1696,29 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
             return unavailable("A maintenance operation record was partial; cell outcomes are unknown.");
         }
         operation_count = operation_count.saturating_add(1);
-        let operation_counts = operations.entry(operation.to_owned()).or_insert_with(|| json!({
-            "operation_count": 0, "retry_kind_counts": {}, "error_kind_counts": {},
-        }));
+        let operation_counts = operations.entry(operation.to_owned()).or_insert_with(|| {
+            json!({
+                "operation_count": 0, "retry_kind_counts": {}, "error_kind_counts": {},
+            })
+        });
         operation_counts["operation_count"] = json!(operation_counts["operation_count"].as_u64().unwrap_or(0) + 1);
         let error_kind = value.get("error_kind").and_then(Value::as_str);
         let failed = record_outcome != Some(MaintenanceRecordOutcome::Succeeded);
         if failed {
             let kind = sanitized_maintenance_error_kind(error_kind);
             let retry = record_outcome == Some(MaintenanceRecordOutcome::Retry);
-            let counts = if retry { &mut retry_kind_counts } else { &mut error_kind_counts };
+            let counts = if retry {
+                &mut retry_kind_counts
+            } else {
+                &mut error_kind_counts
+            };
             let count = counts.entry(kind.clone()).or_insert_with(|| json!(0));
             *count = json!(count.as_u64().unwrap_or(0).saturating_add(1));
-            let field = if retry { "retry_kind_counts" } else { "error_kind_counts" };
+            let field = if retry {
+                "retry_kind_counts"
+            } else {
+                "error_kind_counts"
+            };
             operation_counts[field][&kind] = json!(operation_counts[field][&kind].as_u64().unwrap_or(0) + 1);
         }
     }
@@ -1571,8 +1776,14 @@ fn log_counter(text: &str, marker: &str, field: &str) -> Option<u64> {
 }
 
 fn completed_durable_buffer_shutdowns(text: &str) -> Option<u64> {
-    let started = text.lines().filter(|line| line.contains("durable_buffer.shutdown.start")).count();
-    let completed = text.lines().filter(|line| line.contains("durable_buffer.shutdown.complete")).count();
+    let started = text
+        .lines()
+        .filter(|line| line.contains("durable_buffer.shutdown.start"))
+        .count();
+    let completed = text
+        .lines()
+        .filter(|line| line.contains("durable_buffer.shutdown.complete"))
+        .count();
     (started > 0 && started == completed).then_some(0)
 }
 
@@ -1791,7 +2002,9 @@ async fn local_process_logs_for_role(
             .iter()
             .find(|(candidate_role, _, _, _)| candidate_role == image_role)
             .and_then(|(_, _, revision, _)| revision.as_deref());
-        let observed_source_revision = container.pointer("/Config/Labels/org.opencontainers.image.revision").and_then(Value::as_str);
+        let observed_source_revision = container
+            .pointer("/Config/Labels/org.opencontainers.image.revision")
+            .and_then(Value::as_str);
         verify_run_image_source_revision(image_role, expected_source_revision, observed_source_revision)?;
         if role_filter.is_some_and(|filter| filter != role) {
             continue;
@@ -1931,10 +2144,19 @@ mod startup_readback_tests {
             } else {
                 json!({"delta.dataSkippingStatsColumns": "replica_id"})
             };
-            let log = config.tables.iter().map(|table| Ok(format!("arrowcol_delta_stats_config {}\n", json!({
-                "scope":"committed_table_metadata", "table_name":canonical_dmv_table_name(table)?,
-                "table_id":format!("{}-id", table), "version":0, "properties":properties
-            })))).collect::<Result<String>>()?;
+            let log = config
+                .tables
+                .iter()
+                .map(|table| {
+                    Ok(format!(
+                        "arrowcol_delta_stats_config {}\n",
+                        json!({
+                            "scope":"committed_table_metadata", "table_name":canonical_dmv_table_name(table)?,
+                            "table_id":format!("{}-id", table), "version":0, "properties":properties
+                        })
+                    ))
+                })
+                .collect::<Result<String>>()?;
             let records = collector_delta_stats_records(&config, &log)?;
             let process = json!({"component":"collector", "instance_id":"one", "log_complete":true,
                 "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
@@ -1942,9 +2164,14 @@ mod startup_readback_tests {
             let initial = tunable_leaf_evidence(&config)?;
             let mut complete = initial.clone();
             promote_collector_readback(&config, &mut complete, Some(&json!([process.clone()])), 1)?;
-            assert!(complete["consumer_verified"].as_array().context("verified fields")?.iter()
-                .any(|entry| entry["path"] == "collector.commit.delta_stats_columns"
-                    && entry["reason"] == "committed_table_metadata_readback"));
+            assert!(
+                complete["consumer_verified"]
+                    .as_array()
+                    .context("verified fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == "collector.commit.delta_stats_columns"
+                        && entry["reason"] == "committed_table_metadata_readback")
+            );
             for field in ["properties", "scope", "version", "table_id"] {
                 let mut bad = process.clone();
                 bad["delta_stats_table_metadata"][1][field] = Value::Null;
@@ -1953,7 +2180,10 @@ mod startup_readback_tests {
                 assert_eq!(evidence, initial, "{field}");
             }
             let mut missing = process.clone();
-            missing["delta_stats_table_metadata"].as_array_mut().context("metadata array")?.pop();
+            missing["delta_stats_table_metadata"]
+                .as_array_mut()
+                .context("metadata array")?
+                .pop();
             let mut evidence = initial.clone();
             promote_collector_readback(&config, &mut evidence, Some(&json!([missing])), 1)?;
             assert_eq!(evidence, initial);
@@ -1982,11 +2212,20 @@ mod startup_readback_tests {
         }))?;
         let env = role_environment(&config, ComponentRole::Collector)?;
         let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
-        let log = config.tables.iter().map(|table| Ok(format!("arrowcol_adaptive_config {}\n", json!({
-            "table_name":canonical_dmv_table_name(table)?,
-            "scope":"installed_estimator_not_full_run_history",
-            "config":policy
-        })))).collect::<Result<String>>()?;
+        let log = config
+            .tables
+            .iter()
+            .map(|table| {
+                Ok(format!(
+                    "arrowcol_adaptive_config {}\n",
+                    json!({
+                        "table_name":canonical_dmv_table_name(table)?,
+                        "scope":"installed_estimator_not_full_run_history",
+                        "config":policy
+                    })
+                ))
+            })
+            .collect::<Result<String>>()?;
         let records = collector_adaptive_records(&config, &log)?;
         let process = json!({"component":"collector", "instance_id":"one", "log_complete":true,
             "startup_tunables_verified":true, "effective_config_source":"consumer_startup_readback",
@@ -1996,23 +2235,41 @@ mod startup_readback_tests {
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
         for field in policy.as_object().context("policy object")?.keys() {
             let path = format!("collector.batching.adaptive_file.{field}");
-            assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
-                .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_adaptive_readback"));
+            assert!(
+                covered["consumer_verified"]
+                    .as_array()
+                    .context("missing verified fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_adaptive_readback")
+            );
             let mut changed = process.clone();
             changed["adaptive_table_policies"][1]["config"][field] = json!("wrong");
             let mut result = initial.clone();
             promote_collector_readback(&config, &mut result, Some(&json!([changed])), 1)?;
-            assert!(result["projection_only"].as_array().context("missing projection fields")?
-                .iter().any(|entry| entry["path"] == path));
+            assert!(
+                result["projection_only"]
+                    .as_array()
+                    .context("missing projection fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == path)
+            );
         }
         let mut overridden = process.clone();
         overridden["adaptive_table_policies"][1]["config"]["target_parquet_bytes"] = json!(2000);
         let mut result = initial.clone();
         promote_collector_readback(&config, &mut result, Some(&json!([overridden])), 1)?;
-        assert!(result["projection_only"].as_array().context("missing projection fields")?
-            .iter().any(|entry| entry["path"] == "collector.batching.adaptive_file.target_parquet_bytes"));
+        assert!(
+            result["projection_only"]
+                .as_array()
+                .context("missing projection fields")?
+                .iter()
+                .any(|entry| entry["path"] == "collector.batching.adaptive_file.target_parquet_bytes")
+        );
         let mut missing = process.clone();
-        missing["adaptive_table_policies"].as_array_mut().context("missing policies")?.pop();
+        missing["adaptive_table_policies"]
+            .as_array_mut()
+            .context("missing policies")?
+            .pop();
         let mut result = initial.clone();
         promote_collector_readback(&config, &mut result, Some(&json!([missing])), 1)?;
         assert_eq!(result, initial);
@@ -2034,9 +2291,7 @@ mod startup_readback_tests {
         config.platform.compose_file = None;
 
         let actual = inherited_router_log_filter(&config)?;
-        let image_config: Value = serde_yaml::from_str(include_str!(
-            "../../arrowcol-router-rust/config.docker.yaml"
-        ))?;
+        let image_config: Value = serde_yaml::from_str(include_str!("../../arrowcol-router-rust/config.docker.yaml"))?;
         assert_eq!(actual, image_config["telemetry"]["log_filter"]);
         Ok(())
     }
@@ -2093,14 +2348,25 @@ mod startup_readback_tests {
         let retried = maintenance_cell_outcome_evidence(&retry_log, std::slice::from_ref(&baseline));
         assert_eq!(retried["operation_failure"], false);
         assert_eq!(retried["error_kind_counts"], json!({}));
-        assert_eq!(retried["operations"]["vacuum"]["retry_kind_counts"], json!({"stale_plan":1}));
-        assert_eq!(maintenance_exit_classification(&retry_log, Some(0)), "operation_failure",
-            "a prior lifetime failure must not be hidden by cell-only retries");
+        assert_eq!(
+            retried["operations"]["vacuum"]["retry_kind_counts"],
+            json!({"stale_plan":1})
+        );
+        assert_eq!(
+            maintenance_exit_classification(&retry_log, Some(0)),
+            "operation_failure",
+            "a prior lifetime failure must not be hidden by cell-only retries"
+        );
         let mut only_retry = retry_log.clone();
         only_retry.stdout = format!("{retry}\n");
-        assert_eq!(maintenance_exit_classification(&only_retry, Some(1)), "nonzero_health_exit");
+        assert_eq!(
+            maintenance_exit_classification(&only_retry, Some(1)),
+            "nonzero_health_exit"
+        );
         let mut unhealthy = only_retry.clone();
-        unhealthy.text.push_str("delta-maintenance stale-plan starvation table=t operation=vacuum consecutive=8 limit=8\n");
+        unhealthy
+            .text
+            .push_str("delta-maintenance stale-plan starvation table=t operation=vacuum consecutive=8 limit=8\n");
         assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
         unhealthy.text = "delta-maintenance pending-table status failed: private discovery error\n".to_owned();
         assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
@@ -2113,7 +2379,9 @@ mod startup_readback_tests {
             assert_eq!(outcome["status"], "unavailable");
             assert!(outcome["operation_failure"].is_null() && outcome["error_kind_counts"].is_null());
         }
-        assert!(maintenance_cell_outcome_evidence(&baseline, std::slice::from_ref(&baseline))["operation_count"].is_null());
+        assert!(
+            maintenance_cell_outcome_evidence(&baseline, std::slice::from_ref(&baseline))["operation_count"].is_null()
+        );
 
         current.stderr = "rotated stderr\n".to_owned();
         let unavailable = maintenance_cell_outcome_evidence(&current, std::slice::from_ref(&baseline));
@@ -2125,15 +2393,27 @@ mod startup_readback_tests {
 
     #[test]
     fn maintenance_semantically_incomplete_success_is_unknown() -> Result<()> {
-        let producer: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/maintenance-operation-results.json"))?;
-        let success = producer["operation_results"].as_array().context("producer operations")?
-            .iter().find(|record| record["operation"] == "vacuum").context("producer vacuum")?.clone();
+        let producer: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/maintenance-operation-results.json"))?;
+        let success = producer["operation_results"]
+            .as_array()
+            .context("producer operations")?
+            .iter()
+            .find(|record| record["operation"] == "vacuum")
+            .context("producer vacuum")?
+            .clone();
         let baseline = ProcessLog {
-            role: ComponentRole::Maintenance, instance_id: "semantic-test".to_owned(),
-            image: None, image_id: None, source_revision: None, complete: true,
-            raw_log_bytes: 0, raw_log_lines: 0, stdout: String::new(),
-            stderr: String::new(), text: String::new(),
+            role: ComponentRole::Maintenance,
+            instance_id: "semantic-test".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            text: String::new(),
         };
         let observe = |record: &Value| {
             let mut log = baseline.clone();
@@ -2144,7 +2424,9 @@ mod startup_readback_tests {
         for field in ["report", "outcome", "interrupted", "error_kind", "error"] {
             let mut malformed = success.clone();
             match field {
-                "report" => { malformed.as_object_mut().context("record")?.remove(field); }
+                "report" => {
+                    malformed.as_object_mut().context("record")?.remove(field);
+                }
                 "outcome" | "interrupted" => {
                     malformed["report"].as_object_mut().context("report")?.remove(field);
                 }
@@ -2169,27 +2451,40 @@ mod startup_readback_tests {
 
     #[test]
     fn maintenance_nonzero_health_does_not_become_retry_success_after_recovery() -> Result<()> {
-        let producer: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/maintenance-operation-results.json"))?;
-        let operations = producer["operation_results"].as_array().context("producer operations")?;
+        let producer: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/maintenance-operation-results.json"))?;
+        let operations = producer["operation_results"]
+            .as_array()
+            .context("producer operations")?;
         let mut stale = operations[0].clone();
         stale.as_object_mut().context("record")?.remove("report");
         stale["error_kind"] = json!("stale_plan");
         for limit in [1, 8] {
             let mut log = ProcessLog {
-                role: ComponentRole::Maintenance, instance_id: "health-test".to_owned(),
-                image: None, image_id: None, source_revision: None, complete: true,
-                raw_log_bytes: 0, raw_log_lines: 0,
-                stdout: format!("{}\n{stale}\n",
-                    json!({"startup":{"max_consecutive_stale_plans":limit}})),
-                stderr: String::new(), text: String::new(),
+                role: ComponentRole::Maintenance,
+                instance_id: "health-test".to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: true,
+                raw_log_bytes: 0,
+                raw_log_lines: 0,
+                stdout: format!(
+                    "{}\n{stale}\n",
+                    json!({"startup":{"max_consecutive_stale_plans":limit}})
+                ),
+                stderr: String::new(),
+                text: String::new(),
             };
             for record in operations {
                 log.stdout.push_str(&format!("{record}\n"));
             }
             assert_eq!(maintenance_exit_classification(&log, Some(0)), "no_operation_failures");
-            assert_eq!(maintenance_exit_classification(&log, Some(1)), "nonzero_health_exit",
-                "limit {limit}: recovery or a benign retry cannot prove terminal health");
+            assert_eq!(
+                maintenance_exit_classification(&log, Some(1)),
+                "nonzero_health_exit",
+                "limit {limit}: recovery or a benign retry cannot prove terminal health"
+            );
         }
         Ok(())
     }
@@ -2203,17 +2498,10 @@ mod startup_readback_tests {
             cpu_pressure: Some(arrowcol_tunables::CpuPressureMode::Process),
             ..Default::default()
         });
-        verify_process_configuration(
-            &config,
-            ComponentRole::Collector,
-            &json!({"cpu_pressure":"process"}),
-        )?;
-        assert!(verify_process_configuration(
-            &config,
-            ComponentRole::Collector,
-            &json!({"cpu_pressure":"off"}),
-        )
-        .is_err());
+        verify_process_configuration(&config, ComponentRole::Collector, &json!({"cpu_pressure":"process"}))?;
+        assert!(
+            verify_process_configuration(&config, ComponentRole::Collector, &json!({"cpu_pressure":"off"}),).is_err()
+        );
         Ok(())
     }
 
@@ -2224,12 +2512,20 @@ mod startup_readback_tests {
         ))?;
         config.tunables = serde_json::from_value(json!({"collector":{"allocator":"mimalloc","lto":"thin",
             "codegen_units":8,"opt_level":2,"target_cpu":"x86-64-v3"}}))?;
-        let profile = config.tunables.collector.as_ref().context("collector tunables")?.build_profile();
+        let profile = config
+            .tunables
+            .collector
+            .as_ref()
+            .context("collector tunables")?
+            .build_profile();
         let hash = crate::config::collector_build_profile_hash(profile);
         config.platform.collector_build_profile_hash = Some(hash.clone());
-        let log = format!("arrowcol_effective_config {}\n", json!({"component":"build","config":{
+        let log = format!(
+            "arrowcol_effective_config {}\n",
+            json!({"component":"build","config":{
             "profile_hash":hash,"allocator":"mimalloc","lto":"thin","codegen_units":8,
-            "opt_level":2,"target_cpu":"x86-64-v3"}}));
+            "opt_level":2,"target_cpu":"x86-64-v3"}})
+        );
         let observed = process_configurations(&log)?;
         verify_collector_build_profile_readback(&config, ComponentRole::Collector, &observed)?;
         assert_eq!(observed["profile_hash"], hash);
@@ -2260,19 +2556,30 @@ mod startup_readback_tests {
             stderr: String::new(),
             text,
         };
-        let startup = format!("arrowcol_effective_config {}\n", json!({
-            "component": "build",
-            "config": {"source_revision": startup_revision}
-        }));
+        let startup = format!(
+            "arrowcol_effective_config {}\n",
+            json!({
+                "component": "build",
+                "config": {"source_revision": startup_revision}
+            })
+        );
         let evidence = process_evidence(&config, &[make_log(startup)])?;
-        let collector = evidence.as_array().context("missing process evidence rows")?
-            .iter().find(|entry| entry["component"] == "collector").context("missing collector evidence")?;
+        let collector = evidence
+            .as_array()
+            .context("missing process evidence rows")?
+            .iter()
+            .find(|entry| entry["component"] == "collector")
+            .context("missing collector evidence")?;
         assert_eq!(collector["startup_source_revision"], startup_revision);
         assert_eq!(collector["source_revision"], label_revision);
 
         let evidence = process_evidence(&config, &[make_log("unrelated startup output\n".to_owned())])?;
-        let collector = evidence.as_array().context("missing process evidence rows")?
-            .iter().find(|entry| entry["component"] == "collector").context("missing collector evidence")?;
+        let collector = evidence
+            .as_array()
+            .context("missing process evidence rows")?
+            .iter()
+            .find(|entry| entry["component"] == "collector")
+            .context("missing collector evidence")?;
         assert!(collector["startup_source_revision"].is_null());
         assert_eq!(collector["source_revision"], label_revision);
         Ok(())
@@ -2294,29 +2601,33 @@ mod startup_readback_tests {
             stderr: String::new(),
             text,
         };
-        let matching = format!("arrowcol_effective_config {}\n", json!({
-            "component": "build",
-            "config": {"source_revision": expected}
-        }));
+        let matching = format!(
+            "arrowcol_effective_config {}\n",
+            json!({
+                "component": "build",
+                "config": {"source_revision": expected}
+            })
+        );
         verify_collector_startup_source_revision(&expected, &[make_log(matching)])?;
 
-        assert!(verify_collector_startup_source_revision(
-            &expected,
-            &[make_log("unrelated startup output\n".to_owned())],
-        )
-        .is_err());
+        assert!(
+            verify_collector_startup_source_revision(&expected, &[make_log("unrelated startup output\n".to_owned())],)
+                .is_err()
+        );
 
         let mismatched = "b".repeat(40);
-        let mismatched_log = format!("arrowcol_effective_config {}\n", json!({
-            "component": "build",
-            "config": {"source_revision": mismatched}
-        }));
+        let mismatched_log = format!(
+            "arrowcol_effective_config {}\n",
+            json!({
+                "component": "build",
+                "config": {"source_revision": mismatched}
+            })
+        );
         assert!(verify_collector_startup_source_revision(&expected, &[make_log(mismatched_log)]).is_err());
-        assert!(verify_collector_startup_source_revision(
-            "local",
-            &[make_log("unrelated startup output\n".to_owned())],
-        )
-        .is_err());
+        assert!(
+            verify_collector_startup_source_revision("local", &[make_log("unrelated startup output\n".to_owned())],)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -2334,7 +2645,10 @@ mod startup_readback_tests {
         let mut wrong = observed.clone();
         wrong["layout"]["process_policy"]["sort_options"][0]["nulls"] = json!("last");
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
-        wrong["layout"]["process_policy"].as_object_mut().context("policy")?.remove("sort_options");
+        wrong["layout"]["process_policy"]
+            .as_object_mut()
+            .context("policy")?
+            .remove("sort_options");
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
         Ok(())
     }
@@ -2420,17 +2734,22 @@ mod startup_readback_tests {
     fn client_quiesce_readback_survives_into_completed_and_cancelled_table_evidence() -> Result<()> {
         for (tunables, effective_timeout) in [
             (json!({"transport":{"request_timeout_ms":1234}}), 1234_u64),
-            (json!({"transport":{"request_timeout_ms":1234},"client":{"quiesce_timeout_ms":2345}}), 2345_u64),
+            (
+                json!({"transport":{"request_timeout_ms":1234},"client":{"quiesce_timeout_ms":2345}}),
+                2345_u64,
+            ),
         ] {
             let mut config: OatConfig = serde_json::from_str(include_str!(
                 "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
             ))?;
             config.tunables = serde_json::from_value(tunables)?;
             config.dmv_concurrency = None;
-            let output = format!("OAT_CLIENT_BUILD_PROFILE {}\nOAT_CLIENT_EFFECTIVE_CONFIG {}\n",
+            let output = format!(
+                "OAT_CLIENT_BUILD_PROFILE {}\nOAT_CLIENT_EFFECTIVE_CONFIG {}\n",
                 json!({"lto":"off", "codegen_units":16, "opt_level":3, "target_cpu":"generic"}),
                 json!({"request_timeout_ms":1234, "quiesce_timeout_ms":effective_timeout, "workers":1, "streams_per_worker":4,
-                    "resolution":{"requested":{"streams_per_worker":0},"legacy":{"concurrency":4},"resolved":{"streams_per_worker":4},"streams_per_worker_source":"legacy_concurrency"}}));
+                    "resolution":{"requested":{"streams_per_worker":0},"legacy":{"concurrency":4},"resolved":{"streams_per_worker":4},"streams_per_worker_source":"legacy_concurrency"}})
+            );
             let mut evidence = CellEvidence::default();
             evidence.record_client(&config, "table-a", "client-a", &output)?;
             evidence.record_client(&config, "table-b", "client-b", &output)?;
@@ -2438,10 +2757,15 @@ mod startup_readback_tests {
             for (table, count) in [("table-a", 1), ("table-b", 2)] {
                 let serialized = serde_json::to_string(&evidence.for_table(table, None))?;
                 let row: Value = serde_json::from_str(&serialized)?;
-                let reports = row["client_phase_reports"].as_array().context("missing client phase reports")?;
+                let reports = row["client_phase_reports"]
+                    .as_array()
+                    .context("missing client phase reports")?;
                 assert_eq!(reports.len(), count);
                 for report in reports {
-                    assert_eq!(report["consumer_effective_config"]["quiesce_timeout_ms"], effective_timeout);
+                    assert_eq!(
+                        report["consumer_effective_config"]["quiesce_timeout_ms"],
+                        effective_timeout
+                    );
                     assert_eq!(report["consumer_effective_config"]["request_timeout_ms"], 1234);
                 }
             }
@@ -2533,7 +2857,8 @@ mod startup_readback_tests {
             raw_log_lines: 4,
             stdout: String::new(),
             stderr: String::new(),
-            text: "arrowcol_router_effective_config {\"workers\":2,\"log_filter\":\"warn,tiberius=error\"}\n".to_owned(),
+            text: "arrowcol_router_effective_config {\"workers\":2,\"log_filter\":\"warn,tiberius=error\"}\n"
+                .to_owned(),
         };
         let evidence = process_evidence(&config, &[log])?;
         assert_eq!(evidence[0]["raw_log_bytes"], 97);
@@ -2593,9 +2918,14 @@ mod startup_readback_tests {
         let readback = process_configurations(
             "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":1,\"secret_file\":\"private\",\"endpoint\":\"https://private\",\"endpoint_concurrency_limit\":12,\"endpoint_buffer_size\":14}\n",
         )?;
-        assert_eq!(readback, json!({"batch_rows":1,"endpoint_concurrency_limit":12,"endpoint_buffer_size":14}));
-        assert!(public_tuning_value(&json!({"endpoint_buffer_size":"https://private"}))
-            .is_some_and(|value| value == json!({})));
+        assert_eq!(
+            readback,
+            json!({"batch_rows":1,"endpoint_concurrency_limit":12,"endpoint_buffer_size":14})
+        );
+        assert!(
+            public_tuning_value(&json!({"endpoint_buffer_size":"https://private"}))
+                .is_some_and(|value| value == json!({}))
+        );
         Ok(())
     }
 
@@ -2603,12 +2933,20 @@ mod startup_readback_tests {
     fn delta_io_runtime_build_readback_is_unique_and_typed() -> Result<()> {
         let record = "ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":1,\"runtime\":{\"event_interval\":7,\"global_queue_interval\":13,\"thread_stack_size\":2097152,\"thread_keep_alive_ms\":3000}}\n";
         let observed = process_configurations(record)?;
-        assert_eq!(observed["delta_io_runtime_build"], json!({
-            "event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000
-        }));
+        assert_eq!(
+            observed["delta_io_runtime_build"],
+            json!({
+                "event_interval":7,"global_queue_interval":13,"thread_stack_size":2097152,"thread_keep_alive_ms":3000
+            })
+        );
         assert!(process_configurations(&format!("{record}{record}")).is_err());
         assert!(process_configurations("ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":2,\"runtime\":{}}\n").is_err());
-        assert!(process_configurations("ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":1,\"runtime\":{\"event_interval\":\"7\"}}\n").is_err());
+        assert!(
+            process_configurations(
+                "ARROWCOL_DELTA_IO_RUNTIME_BUILT {\"version\":1,\"runtime\":{\"event_interval\":\"7\"}}\n"
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -2624,14 +2962,21 @@ mod startup_readback_tests {
         let observed = json!({"log_filter": log_filter, "routing":{"excluded_admission_gauges":["cpu_utilization_bps","active_streams"]}});
         verify_process_configuration(&config, ComponentRole::Router, &observed)?;
         assert!(verify_process_configuration(&config, ComponentRole::Router, &json!({"routing":{}})).is_err());
-        assert!(verify_process_configuration(
-            &config, ComponentRole::Router, &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
-        ).is_err());
+        assert!(
+            verify_process_configuration(
+                &config,
+                ComponentRole::Router,
+                &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
+            )
+            .is_err()
+        );
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "router": {"excluded_admission_gauges": []}
         }))?;
         verify_process_configuration(
-            &config, ComponentRole::Router, &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}})
+            &config,
+            ComponentRole::Router,
+            &json!({"log_filter":log_filter,"routing":{"excluded_admission_gauges":[]}}),
         )?;
         Ok(())
     }
@@ -2646,7 +2991,9 @@ mod startup_readback_tests {
             "router": {"excluded_admission_gauges": ["cpu_utilization_bps", "active_streams"]}
         }))?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-        let binary = root.join("target").join("debug")
+        let binary = root
+            .join("target")
+            .join("debug")
             .join(format!("arrowcol-router-rust{}", std::env::consts::EXE_SUFFIX));
         let output = std::process::Command::new(binary)
             .env_clear()
@@ -2656,8 +3003,16 @@ mod startup_readback_tests {
             .arg("--validate-and-exit")
             .output()
             .context("launch actual router for startup propagation")?;
-        anyhow::ensure!(output.status.success(), "router validation failed: {}", String::from_utf8_lossy(&output.stderr));
-        let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
+        anyhow::ensure!(
+            output.status.success(),
+            "router validation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?
+        );
         let observed = process_configurations(&text)?;
         verify_process_configuration(&config, ComponentRole::Router, &observed)?;
         let process = json!({
@@ -2668,14 +3023,21 @@ mod startup_readback_tests {
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_router_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        assert_eq!(covered["consumer_verified"], json!([{
-            "path": "router.excluded_admission_gauges", "reason": "consumer_startup_readback"
-        }]));
+        assert_eq!(
+            covered["consumer_verified"],
+            json!([{
+                "path": "router.excluded_admission_gauges", "reason": "consumer_startup_readback"
+            }])
+        );
         let mut wrong = process.clone();
         wrong["effective_config"]["routing"]["excluded_admission_gauges"] = json!([]);
         for processes in [json!([]), json!([wrong]), json!([process.clone(), process])] {
             let mut uncovered = initial.clone();
-            let replicas = if processes.as_array().context("process array")?.len() == 2 { 2 } else { 1 };
+            let replicas = if processes.as_array().context("process array")?.len() == 2 {
+                2
+            } else {
+                1
+            };
             promote_router_readback(&config, &mut uncovered, Some(&processes), replicas)?;
             assert_eq!(uncovered, initial);
         }
@@ -2710,16 +3072,27 @@ mod startup_readback_tests {
             ))?;
             config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"parquet_writer":policy}))?;
             let output = std::process::Command::new(std::env::current_exe()?)
-                .args(["--exact", "runner::startup_readback_tests::parquet_policy_reaches_consumer_startup_configuration", "--nocapture"])
+                .args([
+                    "--exact",
+                    "runner::startup_readback_tests::parquet_policy_reaches_consumer_startup_configuration",
+                    "--nocapture",
+                ])
                 .env_clear()
                 .env(CHILD, "1")
                 .envs(role_environment(&config, ComponentRole::Collector)?)
                 .output()?;
             let stdout = String::from_utf8(output.stdout)?;
-            anyhow::ensure!(output.status.success(), "writer startup failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-            let observed: Value = serde_json::from_str(stdout.lines()
-                .find_map(|line| line.split_once(PREFIX).map(|(_, json)| json))
-                .context("writer startup readback missing")?)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "writer startup failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let observed: Value = serde_json::from_str(
+                stdout
+                    .lines()
+                    .find_map(|line| line.split_once(PREFIX).map(|(_, json)| json))
+                    .context("writer startup readback missing")?,
+            )?;
             verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
         }
@@ -2762,12 +3135,10 @@ mod startup_readback_tests {
             "maintenance": {"enabled": true, "operations": ["optimize"],
                 "parquet_writer": {"defaults": {"compression": "snappy"}}}
         }))?;
-        let collector: Value = serde_json::from_str(
-            &role_environment(&config, ComponentRole::Collector)?["ARROWCOL_PARQUET_CONFIG"],
-        )?;
-        let maintenance: Value = serde_json::from_str(
-            &role_environment(&config, ComponentRole::Maintenance)?["ARROWCOL_PARQUET_CONFIG"],
-        )?;
+        let collector: Value =
+            serde_json::from_str(&role_environment(&config, ComponentRole::Collector)?["ARROWCOL_PARQUET_CONFIG"])?;
+        let maintenance: Value =
+            serde_json::from_str(&role_environment(&config, ComponentRole::Maintenance)?["ARROWCOL_PARQUET_CONFIG"])?;
         verify_process_configuration(&config, ComponentRole::Collector, &json!({"parquet_writer": collector}))?;
         let observed = json!({
             "startup": {"apply": false, "operations": ["optimize"], "interval_secs": 60},
@@ -2832,7 +3203,10 @@ mod startup_readback_tests {
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
         }
         let mut missing = pressure.clone();
-        missing.as_object_mut().context("test pressure object")?.remove("registration_ttl");
+        missing
+            .as_object_mut()
+            .context("test pressure object")?
+            .remove("registration_ttl");
         assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({"pressure":missing})).is_err());
         verify_process_configuration(&config, ComponentRole::Collector, &json!({"pressure":pressure}))
     }
@@ -3002,18 +3376,20 @@ mod consumer_startup_projection_tests {
                 "socket":socket,
                 "runtime":{"file_mapping_cache":true,"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
                     "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4,"partition_grouping":"typed_runs",
+                    "local_directory_sync_policy":"before_commit",
+
                     "generated_partition_binding":"proven_constant"}
             }
         }))?;
-        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug/arrowcol-dataflow-rust");
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arrowcol-dataflow-rust");
         let mut text = None;
         for attempt in 0..3 {
             let flight = std::net::TcpListener::bind("127.0.0.1:0")?;
             let admin = std::net::TcpListener::bind("127.0.0.1:0")?;
             let flight_port = flight.local_addr()?.port();
             let admin_port = admin.local_addr()?.port();
-            let yaml = format!(r#"
+            let yaml = format!(
+                r#"
 version: otel_dataflow/v1
 engine:
   shutdown_drain_timeout_seconds: ${{env:ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS:-60}}
@@ -3063,17 +3439,22 @@ groups:
             to: durable
           - from: durable
             to: delta
-"#, root.0.display(), root.0.display());
+"#,
+                root.0.display(),
+                root.0.display()
+            );
             std::fs::write(&yaml_path, yaml)?;
             drop((flight, admin));
-            let mut child = Child(std::process::Command::new(&binary)
-                .args(["--num-cores", "2", "--config"])
-                .arg(&yaml_path)
-                .env_clear()
-                .envs(role_environment(&config, ComponentRole::Collector)?)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::fs::File::create(&log_path)?)
-                .spawn()?);
+            let mut child = Child(
+                std::process::Command::new(&binary)
+                    .args(["--num-cores", "2", "--config"])
+                    .arg(&yaml_path)
+                    .env_clear()
+                    .envs(role_environment(&config, ComponentRole::Collector)?)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::fs::File::create(&log_path)?)
+                    .spawn()?,
+            );
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let output = std::fs::read_to_string(&log_path)?;
@@ -3091,14 +3472,16 @@ groups:
                     std::net::TcpStream::connect_timeout(
                         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
                         Duration::from_millis(100),
-                    ).is_ok()
+                    )
+                    .is_ok()
                 });
                 if listening
                     && output.contains(r#""component":"receiver""#)
                     && output.contains(r#""component":"exporter""#)
                     && output.contains(r#""kind":"aggregate""#)
                     && output.contains(r#""scope":"accepted_flight_socket""#)
-                    && (!cfg!(target_os = "linux") || output.contains(r#""scope":"linux_flight_listener""#)) {
+                    && (!cfg!(target_os = "linux") || output.contains(r#""scope":"linux_flight_listener""#))
+                {
                     std::thread::sleep(Duration::from_millis(100));
                     if let Some(status) = child.0.try_wait()? {
                         let output = std::fs::read_to_string(&log_path)?;
@@ -3111,7 +3494,10 @@ groups:
                     text = Some(output);
                     break;
                 }
-                anyhow::ensure!(std::time::Instant::now() < deadline, "collector readback timed out: {output}");
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "collector readback timed out: {output}"
+                );
                 std::thread::sleep(Duration::from_millis(100));
             }
             if text.is_some() {
@@ -3125,15 +3511,28 @@ groups:
         assert_eq!(observed["commit"]["checkpoint_mode"], "async");
         assert_eq!(observed["commit"]["checkpoint_interval"], 17);
         assert_eq!(observed["commit"]["trigger"], "eager");
+        assert_eq!(observed["runtime"]["local_directory_sync_policy"], "before_commit");
+
         assert_eq!(observed["dfe_worker_concurrency"], 2);
         assert_eq!(observed["socket_effective"]["tcp_nodelay"], true);
         if cfg!(target_os = "linux") {
-            assert!(observed["socket_buffer_effective"]["recv_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
-            assert!(observed["socket_buffer_effective"]["send_buffer_bytes"].as_u64().is_some_and(|size| size >= 65536));
+            assert!(
+                observed["socket_buffer_effective"]["recv_buffer_bytes"]
+                    .as_u64()
+                    .is_some_and(|size| size >= 65536)
+            );
+            assert!(
+                observed["socket_buffer_effective"]["send_buffer_bytes"]
+                    .as_u64()
+                    .is_some_and(|size| size >= 65536)
+            );
         }
-        assert_eq!(observed["engine"]["channel_capacity"], json!({
-            "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
-        }));
+        assert_eq!(
+            observed["engine"]["channel_capacity"],
+            json!({
+                "control_node":11,"control_pipeline":12,"control_completion":13,"pdata":14
+            })
+        );
         assert_eq!(observed["limits"]["batch_channel_capacity"], json!(9));
         assert_eq!(observed["engine"]["shutdown_drain_timeout_seconds"], json!(17));
         assert_eq!(observed["authority_timeout"], json!("4s"));
@@ -3153,8 +3552,16 @@ groups:
         let initial = tunable_leaf_evidence(&config)?;
         let mut covered = initial.clone();
         promote_collector_readback(&config, &mut covered, Some(&json!([process.clone()])), 1)?;
-        let verified = covered["consumer_verified"].as_array().context("consumer_verified array")?;
-        assert_eq!(verified.len(), initial["projection_only"].as_array().context("projection_only array")?.len());
+        let verified = covered["consumer_verified"]
+            .as_array()
+            .context("consumer_verified array")?;
+        assert_eq!(
+            verified.len(),
+            initial["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .len()
+        );
         for path in [
             "collector.commit.txn_lookup_mode",
             "collector.commit.snapshot_cache_mode",
@@ -3164,6 +3571,7 @@ groups:
             "collector.commit.trigger",
             "collector.socket.tcp_nodelay",
             "collector.runtime.file_mapping_cache",
+            "collector.runtime.local_directory_sync_policy",
             "collector.runtime.partition_grouping",
             "collector.runtime.generated_partition_binding",
             "collector.channel_capacity.control_node",
@@ -3182,57 +3590,98 @@ groups:
             assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
         }
         if cfg!(target_os = "linux") {
-            for path in ["collector.socket.recv_buffer_bytes", "collector.socket.send_buffer_bytes"] {
+            for path in [
+                "collector.socket.recv_buffer_bytes",
+                "collector.socket.send_buffer_bytes",
+            ] {
                 assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");
             }
         }
-        assert_eq!(covered["inert_fields"], json!([{"path":"collector.shutdown_drain_timeout_seconds","reason":"collector_shutdown_after_measurement"}]));
-        assert!(covered["projection_only"].as_array().context("projection_only array")?.is_empty());
+        assert_eq!(
+            covered["inert_fields"],
+            json!([{"path":"collector.shutdown_drain_timeout_seconds","reason":"collector_shutdown_after_measurement"}])
+        );
+        assert!(
+            covered["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .is_empty()
+        );
         for replacement in [json!([]), json!([{"max_in_flight":8}]), json!([{}])] {
             let mut wrong = process.clone();
             wrong["effective_config"]["wal"]["instances"] = replacement;
             let mut uncovered = initial.clone();
             promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong])), 1)?;
-            assert!(uncovered["consumer_verified"].as_array().context("consumer_verified array")?.is_empty());
+            assert!(
+                uncovered["consumer_verified"]
+                    .as_array()
+                    .context("consumer_verified array")?
+                    .is_empty()
+            );
         }
         let mut incomplete = initial.clone();
         promote_collector_readback(&config, &mut incomplete, Some(&json!([process.clone()])), 2)?;
         assert_eq!(incomplete, initial);
         for field in [
-            "batch_channel_capacity", "put_result_channel_capacity", "grpc_accept_compression",
-            "grpc_send_compression", "max_metadata_bytes", "max_schema_bytes", "max_message_bytes",
+            "batch_channel_capacity",
+            "put_result_channel_capacity",
+            "grpc_accept_compression",
+            "grpc_send_compression",
+            "max_metadata_bytes",
+            "max_schema_bytes",
+            "max_message_bytes",
         ] {
             for missing in [false, true] {
                 let mut wrong = process.clone();
                 if missing {
-                    wrong["effective_config"]["limits"].as_object_mut().context("missing limits")?.remove(field);
+                    wrong["effective_config"]["limits"]
+                        .as_object_mut()
+                        .context("missing limits")?
+                        .remove(field);
                 } else {
                     wrong["effective_config"]["limits"][field] = json!(1);
                 }
                 let mut uncovered = initial.clone();
                 promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong])), 1)?;
-                assert!(uncovered["consumer_verified"].as_array().context("consumer_verified array")?.is_empty());
+                assert!(
+                    uncovered["consumer_verified"]
+                        .as_array()
+                        .context("consumer_verified array")?
+                        .is_empty()
+                );
             }
         }
         let mut wrong_process = process.clone();
         for pointer in ["/engine/shutdown_drain_timeout_seconds", "/authority_timeout"] {
             let mut wrong = process.clone();
-            *wrong["effective_config"].pointer_mut(pointer).context("missing timeout")? = json!("wrong");
+            *wrong["effective_config"]
+                .pointer_mut(pointer)
+                .context("missing timeout")? = json!("wrong");
             let mut uncovered = initial.clone();
             promote_collector_readback(&config, &mut uncovered, Some(&json!([wrong])), 1)?;
             assert_eq!(uncovered, initial);
         }
         wrong_process["effective_config"]["commit"]["max_files_per_commit"] = json!(8);
         let mut missing_process = process.clone();
-        missing_process["effective_config"]["pressure"].as_object_mut().context("pressure object")?.remove("buffered_rows_limit");
+        missing_process["effective_config"]["pressure"]
+            .as_object_mut()
+            .context("pressure object")?
+            .remove("buffered_rows_limit");
         let mut incomplete_process = process.clone();
         incomplete_process["log_complete"] = json!(false);
         for processes in [
-            json!([]), json!([wrong_process]), json!([missing_process]), json!([incomplete_process]),
+            json!([]),
+            json!([wrong_process]),
+            json!([missing_process]),
+            json!([incomplete_process]),
             json!([process.clone(), process.clone()]),
         ] {
             let mut uncovered = initial.clone();
-            let replicas = if processes.as_array().context("process array")?.len() == 2 { 2 } else { 1 };
+            let replicas = if processes.as_array().context("process array")?.len() == 2 {
+                2
+            } else {
+                1
+            };
             promote_collector_readback(&config, &mut uncovered, Some(&processes), replicas)?;
             assert_eq!(uncovered, initial);
         }
@@ -3295,21 +3744,31 @@ groups:
         ] {
             for field in fields {
                 let mut missing = observed.clone();
-                missing[group].as_object_mut().context("missing readback group")?
-                    .remove(*field).context("consumer omitted requested field")?;
-                anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
-                    "verifier accepted missing {group}.{field}");
+                missing[group]
+                    .as_object_mut()
+                    .context("missing readback group")?
+                    .remove(*field)
+                    .context("consumer omitted requested field")?;
+                anyhow::ensure!(
+                    verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
+                    "verifier accepted missing {group}.{field}"
+                );
                 let mut wrong = observed.clone();
                 wrong[group][*field] = json!("wrong");
-                anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err(),
-                    "verifier accepted wrong {group}.{field}");
+                anyhow::ensure!(
+                    verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err(),
+                    "verifier accepted wrong {group}.{field}"
+                );
             }
         }
         for capacity in ["global_capacity", "per_table_capacity"] {
             for field in ["bytes", "rows", "batches"] {
                 let mut missing = observed.clone();
-                missing["batching"][capacity].as_object_mut().context("missing capacity readback")?
-                    .remove(field).context("consumer omitted requested capacity")?;
+                missing["batching"][capacity]
+                    .as_object_mut()
+                    .context("missing capacity readback")?
+                    .remove(field)
+                    .context("consumer omitted requested capacity")?;
                 assert!(verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err());
                 let mut wrong = observed.clone();
                 wrong["batching"][capacity][field] = json!("wrong");
@@ -3378,7 +3837,11 @@ groups:
                 .envs(role_environment(&config, ComponentRole::Collector)?)
                 .output()
                 .context("launch collector for Parquet policy readback")?;
-            anyhow::ensure!(output.status.success(), "collector startup failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::ensure!(
+                output.status.success(),
+                "collector startup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             let mut observed = process_configurations(&String::from_utf8(output.stderr)?)?;
             verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
             if policy.get("max_row_group_rows").is_some() {
@@ -3430,37 +3893,73 @@ groups:
                     "page_rows",
                 ] {
                     let path = format!("collector.layout.{field}");
-                    assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
-                        .iter().any(|entry| entry["path"] == path), "missing table readback for {path}");
+                    assert!(
+                        covered["consumer_verified"]
+                            .as_array()
+                            .context("missing verified fields")?
+                            .iter()
+                            .any(|entry| entry["path"] == path),
+                        "missing table readback for {path}"
+                    );
                     let mut overridden = process.clone();
                     overridden["layout_table_policies"][1]["config"][field] = json!("wrong");
                     let mut result = initial.clone();
                     promote_collector_readback(&config, &mut result, Some(&json!([overridden])), 1)?;
-                    assert!(result["projection_only"].as_array().context("missing projected fields")?
-                        .iter().any(|entry| entry["path"] == path), "accepted override for {path}");
+                    assert!(
+                        result["projection_only"]
+                            .as_array()
+                            .context("missing projected fields")?
+                            .iter()
+                            .any(|entry| entry["path"] == path),
+                        "accepted override for {path}"
+                    );
                 }
-                for path in ["parquet_writer.max_row_group_rows", "parquet_writer.data_page_row_count_limit",
-                    "parquet_writer.writer_version", "parquet_writer.max_row_group_bytes",
-                    "parquet_writer.write_batch_size", "parquet_writer.offset_index_enabled",
-                    "parquet_writer.column_index_truncate_length", "parquet_writer.statistics_truncate_length",
-                    "parquet_writer.defaults.compression", "parquet_writer.defaults.compression_level",
-                    "parquet_writer.columns.customer_id.compression", "parquet_writer.columns.customer_id.compression_level",
-                    "parquet_writer.defaults.encoding", "parquet_writer.defaults.dictionary_enabled",
-                    "parquet_writer.defaults.dictionary_page_size_limit", "parquet_writer.defaults.data_page_size_limit",
+                for path in [
+                    "parquet_writer.max_row_group_rows",
+                    "parquet_writer.data_page_row_count_limit",
+                    "parquet_writer.writer_version",
+                    "parquet_writer.max_row_group_bytes",
+                    "parquet_writer.write_batch_size",
+                    "parquet_writer.offset_index_enabled",
+                    "parquet_writer.column_index_truncate_length",
+                    "parquet_writer.statistics_truncate_length",
+                    "parquet_writer.defaults.compression",
+                    "parquet_writer.defaults.compression_level",
+                    "parquet_writer.columns.customer_id.compression",
+                    "parquet_writer.columns.customer_id.compression_level",
+                    "parquet_writer.defaults.encoding",
+                    "parquet_writer.defaults.dictionary_enabled",
+                    "parquet_writer.defaults.dictionary_page_size_limit",
+                    "parquet_writer.defaults.data_page_size_limit",
                     "parquet_writer.defaults.statistics",
-                    "parquet_writer.defaults.bloom_filter_enabled", "parquet_writer.defaults.bloom_filter_fpp",
-                    "parquet_writer.defaults.bloom_filter_ndv", "parquet_writer.defaults.data_page_v2_compression_ratio_threshold",
-                    "parquet_writer.columns.customer_id.encoding", "parquet_writer.columns.customer_id.dictionary_enabled",
-                    "parquet_writer.columns.customer_id.dictionary_page_size_limit", "parquet_writer.columns.customer_id.data_page_size_limit",
-                    "parquet_writer.columns.customer_id.statistics", "parquet_writer.columns.customer_id.write_page_header_statistics",
-                    "parquet_writer.columns.customer_id.bloom_filter_enabled", "parquet_writer.columns.customer_id.bloom_filter_fpp",
-                    "parquet_writer.columns.customer_id.bloom_filter_ndv", "parquet_writer.columns.customer_id.data_page_v2_compression_ratio_threshold"] {
-                    assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
-                        .iter().any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"),
-                        "missing writer readback for {path}: {covered}");
+                    "parquet_writer.defaults.bloom_filter_enabled",
+                    "parquet_writer.defaults.bloom_filter_fpp",
+                    "parquet_writer.defaults.bloom_filter_ndv",
+                    "parquet_writer.defaults.data_page_v2_compression_ratio_threshold",
+                    "parquet_writer.columns.customer_id.encoding",
+                    "parquet_writer.columns.customer_id.dictionary_enabled",
+                    "parquet_writer.columns.customer_id.dictionary_page_size_limit",
+                    "parquet_writer.columns.customer_id.data_page_size_limit",
+                    "parquet_writer.columns.customer_id.statistics",
+                    "parquet_writer.columns.customer_id.write_page_header_statistics",
+                    "parquet_writer.columns.customer_id.bloom_filter_enabled",
+                    "parquet_writer.columns.customer_id.bloom_filter_fpp",
+                    "parquet_writer.columns.customer_id.bloom_filter_ndv",
+                    "parquet_writer.columns.customer_id.data_page_v2_compression_ratio_threshold",
+                ] {
+                    assert!(
+                        covered["consumer_verified"]
+                            .as_array()
+                            .context("missing verified fields")?
+                            .iter()
+                            .any(|entry| entry["path"] == path && entry["reason"] == "consumer_table_writer_readback"),
+                        "missing writer readback for {path}: {covered}"
+                    );
                 }
                 let projected = |evidence: &Value, path: &str| {
-                    evidence["projection_only"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
+                    evidence["projection_only"]
+                        .as_array()
+                        .is_some_and(|entries| entries.iter().any(|entry| entry["path"] == path))
                 };
                 for bloom in [
                     json!(["customer_id"]),
@@ -3476,18 +3975,21 @@ groups:
                     assert!(projected(&result, "collector.layout.bloom_columns"));
                 }
                 let mut reordered_sort = process.clone();
-                reordered_sort["layout_table_policies"][1]["config"]["sort_columns"] =
-                    json!(["value", "customer_id"]);
+                reordered_sort["layout_table_policies"][1]["config"]["sort_columns"] = json!(["value", "customer_id"]);
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([reordered_sort])), 1)?;
                 assert!(projected(&result, "collector.layout.sort_columns"));
-                assert!(projected(&covered, "parquet_writer.defaults.write_page_header_statistics"));
+                assert!(projected(
+                    &covered,
+                    "parquet_writer.defaults.write_page_header_statistics"
+                ));
                 let mut malformed_options = process["layout_table_policies"][0]["parquet_column_options"].clone();
                 malformed_options["value"]["dictionary_enabled"] = json!("true");
                 assert!(parquet_column_options_readback(&malformed_options).is_none());
                 let mut no_statistics = process.clone();
                 for column in ["value", "customer_id"] {
-                    no_statistics["layout_table_policies"][0]["parquet_column_options"][column]["statistics"] = json!("none");
+                    no_statistics["layout_table_policies"][0]["parquet_column_options"][column]["statistics"] =
+                        json!("none");
                 }
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([no_statistics])), 1)?;
@@ -3499,10 +4001,14 @@ groups:
                 promote_collector_readback(&config, &mut result, Some(&json!([missing_properties])), 1)?;
                 assert!(projected(&result, "parquet_writer.write_batch_size"));
                 let mut disabled_column = process.clone();
-                disabled_column["layout_table_policies"][0]["parquet_column_options"]["customer_id"]["dictionary_enabled"] = json!(false);
+                disabled_column["layout_table_policies"][0]["parquet_column_options"]["customer_id"]["dictionary_enabled"] =
+                    json!(false);
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([disabled_column])), 1)?;
-                assert!(projected(&result, "parquet_writer.columns.customer_id.dictionary_page_size_limit"));
+                assert!(projected(
+                    &result,
+                    "parquet_writer.columns.customer_id.dictionary_page_size_limit"
+                ));
                 let mut wrong_column = process.clone();
                 wrong_column["layout_table_policies"][1]["parquet_column_options"]["value"]["encoding"] = json!("rle");
                 let mut result = initial.clone();
@@ -3513,13 +4019,18 @@ groups:
                     json!({"compression":"uncompressed","compression_level":null});
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([uncompressed])), 1)?;
-                assert!(projected(&result, "parquet_writer.defaults.data_page_v2_compression_ratio_threshold"));
+                assert!(projected(
+                    &result,
+                    "parquet_writer.defaults.data_page_v2_compression_ratio_threshold"
+                ));
                 let mut conflicting_properties = process.clone();
                 conflicting_properties["layout_table_policies"][1]["parquet_properties"]["write_batch_size"] = json!(1);
                 let mut result = initial.clone();
                 promote_collector_readback(&config, &mut result, Some(&json!([conflicting_properties])), 1)?;
                 assert!(projected(&result, "parquet_writer.write_batch_size"));
-                assert!(parquet_column_readback(&json!({"value":{"compression":"zstd","compression_level":"3"}})).is_none());
+                assert!(
+                    parquet_column_readback(&json!({"value":{"compression":"zstd","compression_level":"3"}})).is_none()
+                );
                 for columns in [
                     Value::Null,
                     json!({"customer_id":{"compression":"gzip","compression_level":5}}),
@@ -3543,14 +4054,27 @@ groups:
                 process["layout_table_policies"][0]["config"]["row_group_rows"] = json!(1);
                 let mut uncovered = initial.clone();
                 promote_collector_readback(&config, &mut uncovered, Some(&json!([process.clone()])), 1)?;
-                assert!(uncovered["projection_only"].as_array().context("missing projection fields")?
-                    .iter().any(|entry| entry["path"] == "parquet_writer.max_row_group_rows"));
+                assert!(
+                    uncovered["projection_only"]
+                        .as_array()
+                        .context("missing projection fields")?
+                        .iter()
+                        .any(|entry| entry["path"] == "parquet_writer.max_row_group_rows")
+                );
                 process["layout_table_policies"][0]["parquet_columns"]["value"]["compression"] = json!("snappy");
                 let mut wrong_codec = initial.clone();
                 promote_collector_readback(&config, &mut wrong_codec, Some(&json!([process.clone()])), 1)?;
-                assert!(wrong_codec["projection_only"].as_array().context("missing projection fields")?
-                    .iter().any(|entry| entry["path"] == "parquet_writer.defaults.compression"));
-                process["layout_table_policies"].as_array_mut().context("missing table policies")?.remove(0);
+                assert!(
+                    wrong_codec["projection_only"]
+                        .as_array()
+                        .context("missing projection fields")?
+                        .iter()
+                        .any(|entry| entry["path"] == "parquet_writer.defaults.compression")
+                );
+                process["layout_table_policies"]
+                    .as_array_mut()
+                    .context("missing table policies")?
+                    .remove(0);
                 let mut missing = initial.clone();
                 promote_collector_readback(&config, &mut missing, Some(&json!([process])), 1)?;
                 assert_eq!(missing, initial);
@@ -3564,17 +4088,24 @@ groups:
                 for part in &path[..path.len() - 1] {
                     parent = parent.get_mut(part).context("missing policy parent")?;
                 }
-                parent.as_object_mut().context("policy parent must be an object")?
-                    .remove(&path[path.len() - 1]).context("consumer omitted requested policy leaf")?;
+                parent
+                    .as_object_mut()
+                    .context("policy parent must be an object")?
+                    .remove(&path[path.len() - 1])
+                    .context("consumer omitted requested policy leaf")?;
                 anyhow::ensure!(
                     verify_process_configuration(&config, ComponentRole::Collector, &missing).is_err(),
-                    "verifier accepted missing Parquet leaf {}", path.join(".")
+                    "verifier accepted missing Parquet leaf {}",
+                    path.join(".")
                 );
             }
             let mut wrong = observed.clone();
             wrong["parquet_writer"]["defaults"]["compression"] = json!("invalid-compression");
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
-            observed.as_object_mut().context("startup readback must be an object")?.remove("parquet_writer");
+            observed
+                .as_object_mut()
+                .context("startup readback must be an object")?
+                .remove("parquet_writer");
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
         }
         Ok(())
@@ -3582,7 +4113,9 @@ groups:
 
     #[test]
     fn dmv_concurrency_requires_matching_consumer_readback() -> Result<()> {
-        let mut config: OatConfig = serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json"))?;
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
         config.dmv_concurrency = Some(28);
         let mut observed = json!({"workers":14,"streams_per_worker":28,"resolution":{
             "requested":{"streams_per_worker":0},"legacy":{"concurrency":28},
@@ -3590,9 +4123,14 @@ groups:
         let proof = verify_dmv_concurrency_readback(&config, &observed)?;
         assert_eq!(proof["configured_slots"], 392);
         observed["streams_per_worker"] = json!(2);
-        assert!(matches!(verify_dmv_concurrency_readback(&config, &observed), Err(error) if error.to_string().contains("dmv_concurrency")));
+        assert!(
+            matches!(verify_dmv_concurrency_readback(&config, &observed), Err(error) if error.to_string().contains("dmv_concurrency"))
+        );
         config.dmv_concurrency = None;
-        config.tunables.client = Some(arrowcol_tunables::ClientTunables { streams_per_worker: Some(2), ..Default::default() });
+        config.tunables.client = Some(arrowcol_tunables::ClientTunables {
+            streams_per_worker: Some(2),
+            ..Default::default()
+        });
         observed["resolution"] = json!({"requested":{"streams_per_worker":2},"legacy":{"concurrency":4},
             "resolved":{"streams_per_worker":2},"streams_per_worker_source":"explicit_streams_per_worker"});
         let proof = verify_dmv_concurrency_readback(&config, &observed)?;
@@ -3645,8 +4183,14 @@ groups:
         // Startup alone cannot establish that the same sockets survived the run.
         let mut evidence = tunable_leaf_evidence(&config)?;
         promote_client_readback(&config, &mut evidence, Some(&vec![report.clone()]))?;
-        assert!(evidence["consumer_verified"].as_array().context("consumer_verified")?.is_empty());
-        report["consumer_effective_config"]["final_transport"] = report["consumer_effective_config"]["applied_transport"].clone();
+        assert!(
+            evidence["consumer_verified"]
+                .as_array()
+                .context("consumer_verified")?
+                .is_empty()
+        );
+        report["consumer_effective_config"]["final_transport"] =
+            report["consumer_effective_config"]["applied_transport"].clone();
         let readback = &report["consumer_effective_config"]["applied_transport"];
         let output = format!("OAT_CLIENT_APPLIED_TRANSPORT {readback}\nOAT_CLIENT_FINAL_TRANSPORT {readback}\n");
         let parsed = process_configurations(&output)?;
@@ -3659,24 +4203,43 @@ groups:
         promote_client_readback(&config, &mut evidence, Some(&vec![report.clone()]))?;
         let verified = evidence["consumer_verified"].as_array().context("consumer_verified")?;
         assert_eq!(verified.len(), 4);
-        let socket = verified.iter().find(|entry| entry["path"] == "transport.socket_send_buffer_bytes").context("socket evidence")?;
+        let socket = verified
+            .iter()
+            .find(|entry| entry["path"] == "transport.socket_send_buffer_bytes")
+            .context("socket evidence")?;
         assert_eq!(socket["readbacks"][0]["requested_bytes"], 4096);
         assert_eq!(socket["readbacks"][0]["connections"][0]["effective_bytes"], 4096);
         assert_eq!(socket["readbacks"][0]["connections"][0]["kernel_clamp_observed"], true);
-        assert_eq!(socket["readbacks"][0]["connections"].as_array().context("connections")?.len(), 4);
+        assert_eq!(
+            socket["readbacks"][0]["connections"]
+                .as_array()
+                .context("connections")?
+                .len(),
+            4
+        );
         let mut reconnected = report.clone();
         reconnected["consumer_effective_config"]["final_transport"]["socket_connections"][3]["generation"] = json!(2);
         let mut changed_buffer = report.clone();
-        changed_buffer["consumer_effective_config"]["final_transport"]["socket_connections"][0]["send_buffer_bytes"] = json!(8192);
+        changed_buffer["consumer_effective_config"]["final_transport"]["socket_connections"][0]["send_buffer_bytes"] =
+            json!(8192);
         let mut missing_socket = report.clone();
-        missing_socket["consumer_effective_config"]["final_transport"]["socket_connections"].as_array_mut().context("sockets")?.pop();
+        missing_socket["consumer_effective_config"]["final_transport"]["socket_connections"]
+            .as_array_mut()
+            .context("sockets")?
+            .pop();
         let mut wrong_request = report.clone();
-        wrong_request["consumer_effective_config"]["applied_transport"]["socket_connections"][0]["requested_send_buffer_bytes"] = json!(1024);
+        wrong_request["consumer_effective_config"]["applied_transport"]["socket_connections"][0]["requested_send_buffer_bytes"] =
+            json!(1024);
         for bad in [reconnected, changed_buffer, missing_socket, wrong_request] {
             let mut evidence = tunable_leaf_evidence(&config)?;
             promote_client_readback(&config, &mut evidence, Some(&vec![bad]))?;
-            assert!(!evidence["consumer_verified"].as_array().context("consumer_verified")?.iter()
-                .any(|entry| entry["path"] == "transport.socket_send_buffer_bytes"));
+            assert!(
+                !evidence["consumer_verified"]
+                    .as_array()
+                    .context("consumer_verified")?
+                    .iter()
+                    .any(|entry| entry["path"] == "transport.socket_send_buffer_bytes")
+            );
         }
         report["consumer_effective_config"]["applied_transport"]["max_frame_bytes"] = json!(16384);
         report["consumer_effective_config"]["applied_transport"]["socket_connections"] = json!([]);
@@ -3695,21 +4258,36 @@ groups:
     fn actual_client_startup(binary: &Path, config: &OatConfig) -> Result<Value> {
         let table = config.tables.first().context("startup fixture needs a table")?;
         let mut command = std::process::Command::new(binary);
-        command.env_clear().envs(role_environment(config, ComponentRole::Client)?);
+        command
+            .env_clear()
+            .envs(role_environment(config, ComponentRole::Client)?);
         command.args([
-            "--endpoint", "http://127.0.0.1:0", "--table", table,
-            "--rows", &config.rows_per_table.to_string(),
+            "--endpoint",
+            "http://127.0.0.1:0",
+            "--table",
+            table,
+            "--rows",
+            &config.rows_per_table.to_string(),
         ]);
         if let Some(concurrency) = config.dmv_concurrency {
             command.args(["--concurrency", &concurrency.to_string()]);
         }
         let output = command.output().context("launch actual client binary")?;
         anyhow::ensure!(!output.status.success(), "unreachable endpoint unexpectedly succeeded");
-        let text = format!("{}\n{}", String::from_utf8(output.stdout)?, String::from_utf8(output.stderr)?);
-        anyhow::ensure!(text.lines().any(|line| line.starts_with("OAT_CLIENT_EFFECTIVE_CONFIG ")),
-            "consumer omitted startup envelope");
-        anyhow::ensure!(text.lines().any(|line| line.starts_with("OAT_CLIENT_BUILD_PROFILE ")),
-            "consumer omitted build-profile startup readback");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?
+        );
+        anyhow::ensure!(
+            text.lines()
+                .any(|line| line.starts_with("OAT_CLIENT_EFFECTIVE_CONFIG ")),
+            "consumer omitted startup envelope"
+        );
+        anyhow::ensure!(
+            text.lines().any(|line| line.starts_with("OAT_CLIENT_BUILD_PROFILE ")),
+            "consumer omitted build-profile startup readback"
+        );
         process_configurations(&text)
     }
 
@@ -3719,7 +4297,10 @@ groups:
     #[ignore = "requires built arrowcol-dmv and an unreachable local endpoint"]
     fn client_leaf_adapters_use_actual_consumer_startup() -> Result<()> {
         let cases = [
-            (json!({"client":{"payload_customer_id":"synthetic-customer"}}), "payload_customer_id"),
+            (
+                json!({"client":{"payload_customer_id":"synthetic-customer"}}),
+                "payload_customer_id",
+            ),
             (json!({"client":{"corpus_rows":127}}), "corpus_rows"),
             (json!({"client":{"corpus_bytes":4096}}), "corpus_bytes"),
             (json!({"client":{"batch_rows":257}}), "batch_rows"),
@@ -3728,8 +4309,14 @@ groups:
             (json!({"client":{"data_mode":"independent"}}), "data_mode"),
             (json!({"client":{"data_profile":"realistic"}}), "data_profile"),
             (json!({"client":{"send_iter":"arc_cursor"}}), "send_iter"),
-            (json!({"client":{"data_profile":"realistic","identity_builder":"direct_utf8"}}), "identity_builder"),
-            (json!({"client":{"string_length_distribution":"uniform"}}), "string_length_distribution"),
+            (
+                json!({"client":{"data_profile":"realistic","identity_builder":"direct_utf8"}}),
+                "identity_builder",
+            ),
+            (
+                json!({"client":{"string_length_distribution":"uniform"}}),
+                "string_length_distribution",
+            ),
             (json!({"client":{"value_variation":"per_row"}}), "value_variation"),
             (json!({"client":{"guid_uniqueness":"per_row"}}), "guid_uniqueness"),
             (json!({"client":{"string_width":31}}), "string_width"),
@@ -3745,40 +4332,94 @@ groups:
             (json!({"client":{"streams_per_worker":7}}), "streams_per_worker"),
             (json!({"client":{"max_rows":129}}), "max_rows"),
             (json!({"client":{"pod_ordinal":3}}), "pod_ordinal"),
-            (json!({"client":{"stream_retry_max_attempts":3}}), "stream_retry_max_attempts"),
-            (json!({"client":{"stream_retry_base_backoff_ms":13}}), "stream_retry_base_backoff_ms"),
-            (json!({"client":{"stream_retry_max_backoff_ms":300}}), "stream_retry_max_backoff_ms"),
-            (json!({"transport":{"max_flight_data_bytes":1048576}}), "max_flight_data_bytes"),
+            (
+                json!({"client":{"stream_retry_max_attempts":3}}),
+                "stream_retry_max_attempts",
+            ),
+            (
+                json!({"client":{"stream_retry_base_backoff_ms":13}}),
+                "stream_retry_base_backoff_ms",
+            ),
+            (
+                json!({"client":{"stream_retry_max_backoff_ms":300}}),
+                "stream_retry_max_backoff_ms",
+            ),
+            (
+                json!({"transport":{"max_flight_data_bytes":1048576}}),
+                "max_flight_data_bytes",
+            ),
             (json!({"transport":{"max_message_bytes":8388608}}), "max_message_bytes"),
             (json!({"transport":{"max_frame_bytes":32768}}), "max_frame_bytes"),
-            (json!({"transport":{"grpc_send_compression":"gzip"}}), "grpc_send_compression"),
-            (json!({"transport":{"grpc_accept_compression":"zstd"}}), "grpc_accept_compression"),
+            (
+                json!({"transport":{"grpc_send_compression":"gzip"}}),
+                "grpc_send_compression",
+            ),
+            (
+                json!({"transport":{"grpc_accept_compression":"zstd"}}),
+                "grpc_accept_compression",
+            ),
             (json!({"transport":{"header_table_bytes":8192}}), "header_table_bytes"),
-            (json!({"transport":{"max_header_list_bytes":32768}}), "max_header_list_bytes"),
-            (json!({"transport":{"stream_window_bytes":2097152}}), "stream_window_bytes"),
-            (json!({"transport":{"connection_window_bytes":33554432}}), "connection_window_bytes"),
+            (
+                json!({"transport":{"max_header_list_bytes":32768}}),
+                "max_header_list_bytes",
+            ),
+            (
+                json!({"transport":{"stream_window_bytes":2097152}}),
+                "stream_window_bytes",
+            ),
+            (
+                json!({"transport":{"connection_window_bytes":33554432}}),
+                "connection_window_bytes",
+            ),
             (json!({"transport":{"adaptive_window":true}}), "adaptive_window"),
-            (json!({"transport":{"keepalive_interval_ms":2000}}), "keepalive_interval_ms"),
-            (json!({"transport":{"keepalive_timeout_ms":3000}}), "keepalive_timeout_ms"),
-            (json!({"transport":{"keepalive_while_idle":false}}), "keepalive_while_idle"),
+            (
+                json!({"transport":{"keepalive_interval_ms":2000}}),
+                "keepalive_interval_ms",
+            ),
+            (
+                json!({"transport":{"keepalive_timeout_ms":3000}}),
+                "keepalive_timeout_ms",
+            ),
+            (
+                json!({"transport":{"keepalive_while_idle":false}}),
+                "keepalive_while_idle",
+            ),
             (json!({"transport":{"connect_timeout_ms":1234}}), "connect_timeout_ms"),
             (json!({"transport":{"request_timeout_ms":1200}}), "request_timeout_ms"),
             (json!({"transport":{"tcp_nodelay":false}}), "tcp_nodelay"),
             (json!({"transport":{"tcp_keepalive_ms":1000}}), "tcp_keepalive_ms"),
-            (json!({"transport":{"tcp_keepalive_interval_ms":500}}), "tcp_keepalive_interval_ms"),
-            (json!({"transport":{"tcp_keepalive_retries":3}}), "tcp_keepalive_retries"),
+            (
+                json!({"transport":{"tcp_keepalive_interval_ms":500}}),
+                "tcp_keepalive_interval_ms",
+            ),
+            (
+                json!({"transport":{"tcp_keepalive_retries":3}}),
+                "tcp_keepalive_retries",
+            ),
             (json!({"transport":{"rate_limit_rps":123}}), "rate_limit_rps"),
-            (json!({"transport":{"rate_limit_rps":123,"rate_limit_period_ms":250}}), "rate_limit_period_ms"),
+            (
+                json!({"transport":{"rate_limit_rps":123,"rate_limit_period_ms":250}}),
+                "rate_limit_period_ms",
+            ),
             (json!({"transport":{"connect_retries":3}}), "connect_retries"),
-            (json!({"transport":{"connect_retries":1,"retry_backoff_ms":1}}), "retry_backoff_ms"),
-            (json!({"transport":{"endpoint_concurrency_limit":23}}), "endpoint_concurrency_limit"),
+            (
+                json!({"transport":{"connect_retries":1,"retry_backoff_ms":1}}),
+                "retry_backoff_ms",
+            ),
+            (
+                json!({"transport":{"endpoint_concurrency_limit":23}}),
+                "endpoint_concurrency_limit",
+            ),
             (json!({"transport":{"endpoint_buffer_size":37}}), "endpoint_buffer_size"),
             (json!({"transport":{"ipc_compression":"zstd"}}), "ipc_compression"),
             (json!({"arrow_ipc":{"compression":"zstd"}}), "ipc_compression"),
             (json!({"arrow_ipc":{"alignment":8}}), "ipc_alignment"),
         ];
         let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..").join("..").join("target").join("debug")
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("debug")
             .join(format!("arrowcol-dmv{}", std::env::consts::EXE_SUFFIX));
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -3801,32 +4442,87 @@ groups:
                 .with_context(|| format!("invalid startup fixture {input}"))?;
             let observed = actual_client_startup(&binary, &config)
                 .with_context(|| format!("read consumer startup for {input}"))?;
-            let actual = observed.get(field).with_context(|| format!("consumer omitted {field} for {input}"))?;
-            anyhow::ensure!(Some(actual) != baseline.get(field), "{field} did not differ from baseline for {input}");
+            let actual = observed
+                .get(field)
+                .with_context(|| format!("consumer omitted {field} for {input}"))?;
+            anyhow::ensure!(
+                Some(actual) != baseline.get(field),
+                "{field} did not differ from baseline for {input}"
+            );
             verify_process_configuration(&config, ComponentRole::Client, &observed)
                 .with_context(|| format!("verify real consumer startup for {input}"))?;
-            if matches!(field, "max_message_bytes" | "max_flight_data_bytes" | "max_frame_bytes"
-                | "payload_customer_id" | "corpus_rows" | "corpus_bytes"
-                | "workers" | "runtime_threads" | "batch_rows" | "connections_per_worker"
-                | "streams_per_worker" | "interval_us" | "quiesce_timeout_ms" | "data_mode" | "data_profile" | "send_iter" | "identity_builder" | "max_memory_bytes"
-                | "stream_retry_max_attempts" | "stream_retry_base_backoff_ms" | "stream_retry_max_backoff_ms"
-                | "header_table_bytes" | "max_header_list_bytes" | "adaptive_window"
-                | "stream_window_bytes" | "connection_window_bytes" | "keepalive_interval_ms"
-                | "keepalive_timeout_ms" | "keepalive_while_idle"
-                | "connect_timeout_ms" | "request_timeout_ms" | "tcp_nodelay"
-                | "tcp_keepalive_ms" | "tcp_keepalive_interval_ms" | "tcp_keepalive_retries"
-                | "rate_limit_period_ms" | "rate_limit_rps" | "connect_retries" | "retry_backoff_ms"
-                | "grpc_send_compression" | "grpc_accept_compression" | "ipc_compression" | "ipc_alignment"
-                | "endpoint_concurrency_limit" | "endpoint_buffer_size") {
+            if matches!(
+                field,
+                "max_message_bytes"
+                    | "max_flight_data_bytes"
+                    | "max_frame_bytes"
+                    | "payload_customer_id"
+                    | "corpus_rows"
+                    | "corpus_bytes"
+                    | "workers"
+                    | "runtime_threads"
+                    | "batch_rows"
+                    | "connections_per_worker"
+                    | "streams_per_worker"
+                    | "interval_us"
+                    | "quiesce_timeout_ms"
+                    | "data_mode"
+                    | "data_profile"
+                    | "send_iter"
+                    | "identity_builder"
+                    | "max_memory_bytes"
+                    | "stream_retry_max_attempts"
+                    | "stream_retry_base_backoff_ms"
+                    | "stream_retry_max_backoff_ms"
+                    | "header_table_bytes"
+                    | "max_header_list_bytes"
+                    | "adaptive_window"
+                    | "stream_window_bytes"
+                    | "connection_window_bytes"
+                    | "keepalive_interval_ms"
+                    | "keepalive_timeout_ms"
+                    | "keepalive_while_idle"
+                    | "connect_timeout_ms"
+                    | "request_timeout_ms"
+                    | "tcp_nodelay"
+                    | "tcp_keepalive_ms"
+                    | "tcp_keepalive_interval_ms"
+                    | "tcp_keepalive_retries"
+                    | "rate_limit_period_ms"
+                    | "rate_limit_rps"
+                    | "connect_retries"
+                    | "retry_backoff_ms"
+                    | "grpc_send_compression"
+                    | "grpc_accept_compression"
+                    | "ipc_compression"
+                    | "ipc_alignment"
+                    | "endpoint_concurrency_limit"
+                    | "endpoint_buffer_size"
+            ) {
                 config.clients_per_table = 1;
                 let report = json!({"client_id":"client-1", "consumer_effective_config":observed});
                 let initial = tunable_leaf_evidence(&config)?;
                 let mut covered = initial.clone();
                 promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
                 let path = if input.get("arrow_ipc").is_some() {
-                    format!("arrow_ipc.{}", if field == "ipc_compression" { "compression" } else { "alignment" })
+                    format!(
+                        "arrow_ipc.{}",
+                        if field == "ipc_compression" {
+                            "compression"
+                        } else {
+                            "alignment"
+                        }
+                    )
                 } else {
-                    format!("{}.{}", if input.get("client").is_some() { "client" } else { "transport" }, field)
+                    format!(
+                        "{}.{}",
+                        if input.get("client").is_some() {
+                            "client"
+                        } else {
+                            "transport"
+                        },
+                        field
+                    )
                 };
                 let verified = covered["consumer_verified"]
                     .as_array()
@@ -3851,13 +4547,20 @@ groups:
                 }
             }
             let mut missing = observed.clone();
-            missing.as_object_mut().context("consumer startup is not an object")?.remove(field);
-            anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &missing).is_err(),
-                "adapter accepted missing {field} for {input}");
+            missing
+                .as_object_mut()
+                .context("consumer startup is not an object")?
+                .remove(field);
+            anyhow::ensure!(
+                verify_process_configuration(&config, ComponentRole::Client, &missing).is_err(),
+                "adapter accepted missing {field} for {input}"
+            );
             let mut wrong = observed;
             wrong[field] = json!("intentional-mismatch");
-            anyhow::ensure!(verify_process_configuration(&config, ComponentRole::Client, &wrong).is_err(),
-                "adapter accepted wrong {field} for {input}");
+            anyhow::ensure!(
+                verify_process_configuration(&config, ComponentRole::Client, &wrong).is_err(),
+                "adapter accepted wrong {field} for {input}"
+            );
         }
         config.clients_per_table = 1;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":{"null_fraction":0.2}}))?;
@@ -3878,23 +4581,41 @@ groups:
         });
         let mut covered = initial.clone();
         promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
-        assert!(covered["inert_fields"].as_array().context("inert_fields array")?
-            .iter().any(|entry| entry["path"] == "client.null_fraction" && entry["reason"] == "no_nullable_generated_columns"));
+        assert!(
+            covered["inert_fields"]
+                .as_array()
+                .context("inert_fields array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.null_fraction"
+                    && entry["reason"] == "no_nullable_generated_columns")
+        );
         for case in ["missing", "eligible_columns", "wrong_table"] {
             let mut absent = report.clone();
             match case {
                 "missing" => absent["phase_counters"]["preparation"]["generator_applicability"] = Value::Null,
                 "eligible_columns" => {
-                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]["eligible_columns"] = json!(1);
-                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]["eligible_rows"] = json!(8);
-                },
+                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]
+                        ["eligible_columns"] = json!(1);
+                    absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["null_fraction"]
+                        ["eligible_rows"] = json!(8);
+                }
                 "wrong_table" => absent["table"] = json!("other"),
                 _ => unreachable!(),
             }
             let mut unverified = initial.clone();
             promote_client_readback(&config, &mut unverified, Some(&vec![absent]))?;
-            assert!(unverified["consumer_verified"].as_array().context("consumer_verified array")?.is_empty());
-            assert!(unverified["inert_fields"].as_array().context("inert_fields array")?.is_empty());
+            assert!(
+                unverified["consumer_verified"]
+                    .as_array()
+                    .context("consumer_verified array")?
+                    .is_empty()
+            );
+            assert!(
+                unverified["inert_fields"]
+                    .as_array()
+                    .context("inert_fields array")?
+                    .is_empty()
+            );
         }
         prepared["generator_applicability"]["tables"][0]["null_fraction"]["null_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
@@ -3911,8 +4632,7 @@ groups:
             json!({"eligible_columns":1,"eligible_rows":8});
         prepared["generator_applicability"]["tables"][0]["string_width"] =
             json!({"eligible_columns":1,"eligible_rows":8});
-        prepared["generator_applicability"]["tables"][0]["entropy"] =
-            json!({"eligible_columns":1,"eligible_rows":8});
+        prepared["generator_applicability"]["tables"][0]["entropy"] = json!({"eligible_columns":1,"eligible_rows":8});
         let preparation = client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?;
         let initial = tunable_leaf_evidence(&config)?;
         let report = json!({
@@ -3921,47 +4641,106 @@ groups:
         });
         let mut covered = initial.clone();
         promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.value_variation"));
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.string_width"));
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.string_length_distribution"));
-        assert!(covered["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.entropy"));
+        assert!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.pod_ordinal")
+        );
+        assert!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.guid_uniqueness")
+        );
+        assert!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.value_variation")
+        );
+        assert!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.string_width")
+        );
+        assert!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.string_length_distribution")
+        );
+        assert!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.entropy")
+        );
         let mut absent = report.clone();
         absent["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] = Value::Null;
         let mut uncovered = initial.clone();
         promote_client_readback(&config, &mut uncovered, Some(&vec![absent]))?;
-        assert!(uncovered["projection_only"].as_array().context("projection_only array")?
-            .iter().any(|entry| entry["path"] == "client.pod_ordinal"));
+        assert!(
+            uncovered["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.pod_ordinal")
+        );
         let mut no_body = report.clone();
         no_body["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["entropy"] =
             json!({"eligible_columns":0,"eligible_rows":0});
         let mut unproven = initial.clone();
         promote_client_readback(&config, &mut unproven, Some(&vec![no_body]))?;
-        assert!(unproven["projection_only"].as_array().context("projection_only array")?
-            .iter().any(|entry| entry["path"] == "client.entropy"));
+        assert!(
+            unproven["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.entropy")
+        );
         let mut zero = report;
         zero["phase_counters"]["preparation"]["generator_applicability"]["tables"][0]["pod_ordinal"] =
             json!({"eligible_columns":0,"eligible_rows":0});
         let mut inert = initial;
         promote_client_readback(&config, &mut inert, Some(&vec![zero.clone()]))?;
-        assert!(inert["inert_fields"].as_array().context("inert_fields array")?
-            .iter().any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_eligible_generated_rows"));
-        assert!(inert["consumer_verified"].as_array().context("consumer_verified array")?
-            .iter().any(|entry| entry["path"] == "client.guid_uniqueness"));
-        for (skew, target, reason) in [(1.0, "inert_fields", Some("all_values_skewed")), (0.5, "projection_only", None)] {
+        assert!(
+            inert["inert_fields"]
+                .as_array()
+                .context("inert_fields array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.pod_ordinal" && entry["reason"] == "no_eligible_generated_rows")
+        );
+        assert!(
+            inert["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.guid_uniqueness")
+        );
+        for (skew, target, reason) in [
+            (1.0, "inert_fields", Some("all_values_skewed")),
+            (0.5, "projection_only", None),
+        ] {
             let mut skewed = zero.clone();
             skewed["consumer_effective_config"]["skew"] = json!(skew);
             let mut classified = tunable_leaf_evidence(&config)?;
             promote_client_readback(&config, &mut classified, Some(&vec![skewed]))?;
-            assert!(classified[target].as_array().context("evidence array")?.iter().any(|entry|
-                entry["path"] == "client.value_variation" && reason.is_none_or(|reason| entry["reason"] == reason)));
+            assert!(
+                classified[target]
+                    .as_array()
+                    .context("evidence array")?
+                    .iter()
+                    .any(|entry| entry["path"] == "client.value_variation"
+                        && reason.is_none_or(|reason| entry["reason"] == reason))
+            );
         }
         prepared["generator_applicability"]["tables"][0]["pod_ordinal"]["eligible_rows"] = json!(9);
         assert!(client_preparation(Some(&prepared), ClientDataProfile::Diagnostic).is_err());
@@ -3971,12 +4750,22 @@ groups:
         }))?;
         let observed = actual_client_startup(&binary, &config)?;
         let mut width_one = tunable_leaf_evidence(&config)?;
-        promote_client_readback(&config, &mut width_one, Some(&vec![json!({
-            "client_id":"client-1","table":table,"consumer_effective_config":observed,
-            "phase_counters":{"preparation":client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?}
-        })]))?;
-        assert!(width_one["inert_fields"].as_array().context("inert_fields array")?.iter()
-            .any(|entry| entry["path"] == "client.string_length_distribution" && entry["reason"] == "one_byte_maximum_width"));
+        promote_client_readback(
+            &config,
+            &mut width_one,
+            Some(&vec![json!({
+                "client_id":"client-1","table":table,"consumer_effective_config":observed,
+                "phase_counters":{"preparation":client_preparation(Some(&prepared), ClientDataProfile::Diagnostic)?}
+            })]),
+        )?;
+        assert!(
+            width_one["inert_fields"]
+                .as_array()
+                .context("inert_fields array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.string_length_distribution"
+                    && entry["reason"] == "one_byte_maximum_width")
+        );
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "client":{"cardinality":31,"value_variation":"cardinality"}
         }))?;
@@ -3987,14 +4776,24 @@ groups:
         });
         let mut verified = tunable_leaf_evidence(&config)?;
         promote_client_readback(&config, &mut verified, Some(&vec![report.clone()]))?;
-        assert!(verified["consumer_verified"].as_array().context("consumer_verified array")?.iter()
-            .any(|entry| entry["path"] == "client.cardinality"));
+        assert!(
+            verified["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.cardinality")
+        );
         let mut partial = report;
         partial["consumer_effective_config"]["skew"] = json!(0.5);
         let mut projected = tunable_leaf_evidence(&config)?;
         promote_client_readback(&config, &mut projected, Some(&vec![partial]))?;
-        assert!(projected["projection_only"].as_array().context("projection_only array")?.iter()
-            .any(|entry| entry["path"] == "client.cardinality"));
+        assert!(
+            projected["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.cardinality")
+        );
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "client":{"seed":29,"value_variation":"per_row"}
         }))?;
@@ -4005,14 +4804,24 @@ groups:
         });
         let mut verified = tunable_leaf_evidence(&config)?;
         promote_client_readback(&config, &mut verified, Some(&vec![report.clone()]))?;
-        assert!(verified["consumer_verified"].as_array().context("consumer_verified array")?.iter()
-            .any(|entry| entry["path"] == "client.seed"));
+        assert!(
+            verified["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.seed")
+        );
         let mut skewed = report;
         skewed["consumer_effective_config"]["skew"] = json!(1.0);
         let mut projected = tunable_leaf_evidence(&config)?;
         promote_client_readback(&config, &mut projected, Some(&vec![skewed]))?;
-        assert!(projected["projection_only"].as_array().context("projection_only array")?.iter()
-            .any(|entry| entry["path"] == "client.seed"));
+        assert!(
+            projected["projection_only"]
+                .as_array()
+                .context("projection_only array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.seed")
+        );
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "client":{"skew":0.3,"value_variation":"per_row"}
         }))?;
@@ -4023,8 +4832,13 @@ groups:
         });
         let mut verified = tunable_leaf_evidence(&config)?;
         promote_client_readback(&config, &mut verified, Some(&vec![report]))?;
-        assert!(verified["consumer_verified"].as_array().context("consumer_verified array")?.iter()
-            .any(|entry| entry["path"] == "client.skew"));
+        assert!(
+            verified["consumer_verified"]
+                .as_array()
+                .context("consumer_verified array")?
+                .iter()
+                .any(|entry| entry["path"] == "client.skew")
+        );
         for profile in ["diagnostic", "realistic"] {
             config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
                 "client":{"string_width":0,"data_profile":profile}
@@ -4037,19 +4851,41 @@ groups:
             assert!(verify_process_configuration(&config, ComponentRole::Client, &incorrect).is_err());
         }
         for (input, inactive, active) in [
-            (json!({"corpus_rows":0,"corpus_bytes":4096}), "client.corpus_rows", "client.corpus_bytes"),
-            (json!({"corpus_rows":127,"corpus_bytes":0}), "client.corpus_bytes", "client.corpus_rows"),
+            (
+                json!({"corpus_rows":0,"corpus_bytes":4096}),
+                "client.corpus_rows",
+                "client.corpus_bytes",
+            ),
+            (
+                json!({"corpus_rows":127,"corpus_bytes":0}),
+                "client.corpus_bytes",
+                "client.corpus_rows",
+            ),
         ] {
             config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":input}))?;
             let observed = actual_client_startup(&binary, &config)?;
             let mut covered = tunable_leaf_evidence(&config)?;
-            promote_client_readback(&config, &mut covered, Some(&vec![json!({
-                "client_id":"client-1", "consumer_effective_config":observed
-            })]))?;
-            assert!(covered["projection_only"].as_array().context("missing projection fields")?
-                .iter().any(|entry| entry["path"] == inactive));
-            assert!(covered["consumer_verified"].as_array().context("missing verified fields")?
-                .iter().any(|entry| entry["path"] == active));
+            promote_client_readback(
+                &config,
+                &mut covered,
+                Some(&vec![json!({
+                    "client_id":"client-1", "consumer_effective_config":observed
+                })]),
+            )?;
+            assert!(
+                covered["projection_only"]
+                    .as_array()
+                    .context("missing projection fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == inactive)
+            );
+            assert!(
+                covered["consumer_verified"]
+                    .as_array()
+                    .context("missing verified fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == active)
+            );
         }
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"client":{
             "workers":0, "runtime_threads":0, "batch_rows":0, "streams_per_worker":0
@@ -4059,11 +4895,22 @@ groups:
         let mut covered = initial.clone();
         let mut report = json!({"client_id":"client-1", "consumer_effective_config":auto});
         promote_client_readback(&config, &mut covered, Some(&vec![report.clone()]))?;
-        assert_eq!(covered["consumer_verified"].as_array().context("missing verified fields")?.len(), 4);
+        assert_eq!(
+            covered["consumer_verified"]
+                .as_array()
+                .context("missing verified fields")?
+                .len(),
+            4
+        );
         report["consumer_effective_config"]["resolution"]["requested"]["workers"] = json!(1);
         let mut unverified = initial;
         promote_client_readback(&config, &mut unverified, Some(&vec![report]))?;
-        assert!(unverified["consumer_verified"].as_array().context("missing verified fields")?.is_empty());
+        assert!(
+            unverified["consumer_verified"]
+                .as_array()
+                .context("missing verified fields")?
+                .is_empty()
+        );
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"transport":{
             "adaptive_window":true, "stream_window_bytes":2097152, "connection_window_bytes":33554432,
             "keepalive_interval_ms":0, "keepalive_timeout_ms":3000, "keepalive_while_idle":false,
@@ -4072,17 +4919,36 @@ groups:
         }}))?;
         let observed = actual_client_startup(&binary, &config)?;
         let mut coverage = tunable_leaf_evidence(&config)?;
-        promote_client_readback(&config, &mut coverage, Some(&vec![json!({
-            "client_id":"client-1", "consumer_effective_config":observed
-        })]))?;
-        for field in ["transport.stream_window_bytes", "transport.connection_window_bytes",
-            "transport.keepalive_timeout_ms", "transport.keepalive_while_idle",
-            "transport.tcp_keepalive_interval_ms", "transport.tcp_keepalive_retries",
-            "transport.rate_limit_period_ms"] {
-            assert!(coverage["inert_fields"].as_array().context("missing inert fields")?
-                .iter().any(|entry| entry["path"] == field));
-            assert!(!coverage["consumer_verified"].as_array().context("missing verified fields")?
-                .iter().any(|entry| entry["path"] == field));
+        promote_client_readback(
+            &config,
+            &mut coverage,
+            Some(&vec![json!({
+                "client_id":"client-1", "consumer_effective_config":observed
+            })]),
+        )?;
+        for field in [
+            "transport.stream_window_bytes",
+            "transport.connection_window_bytes",
+            "transport.keepalive_timeout_ms",
+            "transport.keepalive_while_idle",
+            "transport.tcp_keepalive_interval_ms",
+            "transport.tcp_keepalive_retries",
+            "transport.rate_limit_period_ms",
+        ] {
+            assert!(
+                coverage["inert_fields"]
+                    .as_array()
+                    .context("missing inert fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == field)
+            );
+            assert!(
+                !coverage["consumer_verified"]
+                    .as_array()
+                    .context("missing verified fields")?
+                    .iter()
+                    .any(|entry| entry["path"] == field)
+            );
         }
         Ok(())
     }
