@@ -49,7 +49,7 @@ Every AKS launch holds an exclusive `flock` on `out/arrowcol-oat/deadline-receip
 For an existing stamp whose operator must move hosts, **retire the previous operators first** and independently review one complete history bundle. This is an explicit, exclusive-campaign operating procedure, **not an IAM fence or cross-host service**. A local lock cannot revoke another operator's cloud access. Do not copy a live ledger, invent missing producer metadata, omit failed attempts, or treat an empty replacement ledger as continuity.
 
 | Step | Required evidence or command |
-|---|---|
+| --- | --- |
 | Read-only source export | Under the independently cleared source lease, census **every** canonical and linked ledger entry twice; preserve original bytes privately as base64 and their SHA-256. Stop on any changed inventory, sidecar/unsupported entry, active/unknown admission, incomplete terminal proof or wrong stamp. Never restore receipts to export them: restoration can change expired deadline fields. |
 | Source retirement | Preserve the owned-launcher/job census, release receipts for **all** predecessor leases including the export lease, and proof that obsolete renewals are gone. Do not stop pre-existing processes or switch the primary checkout. |
 | Destination | An independently cleared, owned clone with an empty runtime ledger. Bind its `hostname`, canonical `workspace`, `ledger`, `git_common_dir`, Unix `uid`, `lease_id` and `client_id`. A linked worktree of the held primary is not a handover destination. |
@@ -60,7 +60,7 @@ For an existing stamp whose operator must move hosts, **retire the previous oper
 Bundle schema (`version: 1`, `kind: "aks-settled-history"`):
 
 | Field | Contract |
-|---|---|
+| --- | --- |
 | `stamp`, `subscription_id` | Exact existing stamp and subscription UUID. A receipt that originally lacks a subscription retains those exact bytes; the reviewed envelope and safe-idle witness supply that binding. |
 | `source` | `host`, `operator`, `observed_at_unix_ms`, all `lease_ids`, `export_lease_id`, complete absolute `ledgers`, `files`, `before_sha256`, `after_sha256`. Each file is `{ledger,name,sha256,content_base64}`; name must be its original invocation UUID plus `.json`. For test-generated no-submission receipts, retain their original bytes and add a `provenance` annotation to the file entry identifying the test source and original gate job/time window. An annotation is context, not proof of settlement. |
 | Inventory hashes | SHA-256 of compact `JSON.stringify` over `{ledger,name,sha256}` entries, sorted by `ledger + "/" + name` with `localeCompare(..., "en")`. Both census hashes and `approval.source_inventory_sha256` must equal it. Full-file hashes bind original bytes, not normalized JSON. The reviewer must check completeness against the actual source census; an internally consistent supplied list alone cannot prove it. |
