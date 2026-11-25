@@ -1165,6 +1165,9 @@ mod tests {
 
     #[tokio::test]
     async fn background_checkpoint_does_not_hold_durable_receipts() -> Result<()> {
+        // The checkpoint stays paused until released, so an async receipt that arrives at all was
+        // not held by it; the bounds are hang guards only.
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         for mode in [crate::CheckpointMode::Inline, crate::CheckpointMode::Async] {
             let directory = tempfile::tempdir()?;
             let root = directory.path().canonicalize()?;
@@ -1184,9 +1187,9 @@ mod tests {
             let (entered, release) = crate::sync_hook::pause_next(hint.clone());
             let second = table.submit(staged_file(&table, &input()?).await?, true).await?;
             let mut receipt = Box::pin(second.wait());
-            tokio::time::timeout(Duration::from_secs(20), entered).await??;
+            tokio::time::timeout(HANG_GUARD, entered).await??;
             let second = if mode == crate::CheckpointMode::Async {
-                let result = tokio::time::timeout(Duration::from_secs(5), receipt).await??;
+                let result = tokio::time::timeout(HANG_GUARD, receipt).await??;
                 release.send(())?;
                 result
             } else {
@@ -1253,7 +1256,8 @@ mod tests {
         assert!(futures::poll!(submitting.as_mut()).is_pending());
         drop(submitting);
         drop(slots);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Hang guard only: reclaim unlinks the staged files on the I/O pool.
+        tokio::time::timeout(Duration::from_secs(120), async {
             while paths.iter().any(|path| path.exists()) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -1359,6 +1363,10 @@ mod tests {
     #[tokio::test]
     async fn saturated_coalesced_publish_and_reclaim() -> Result<()> {
         const CHILD: &str = "ARROWCOL_TEST_SATURATED_STAGE";
+        // Hang guards only: progress is proven by the gated ordering inside the exercise. The
+        // child's guard expires first so a deadlock reports from where it happened.
+        const EXERCISE_HANG_GUARD: Duration = Duration::from_secs(120);
+        const CHILD_HANG_GUARD: Duration = Duration::from_secs(180);
         if std::env::var_os(CHILD).is_none() {
             // Runtime configuration is process-wide. Bound the child as well as its operations.
             let child = tokio::process::Command::new(std::env::current_exe()?)
@@ -1374,12 +1382,12 @@ mod tests {
                 .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", "2")
                 .kill_on_drop(true)
                 .output();
-            let output = tokio::time::timeout(Duration::from_secs(30), child).await??;
+            let output = tokio::time::timeout(CHILD_HANG_GUARD, child).await??;
             anyhow::ensure!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             return Ok(());
         }
-        tokio::time::timeout(Duration::from_secs(15), exercise_saturated_staging()).await?
+        tokio::time::timeout(EXERCISE_HANG_GUARD, exercise_saturated_staging()).await?
     }
 
     async fn exercise_saturated_staging() -> Result<()> {
@@ -1468,6 +1476,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn coalesced_preparation_progresses_while_prior_commit_is_fenced() -> Result<()> {
+        // The fence holds the first commit longer than any liveness guard, so a preparation that
+        // finishes before its guard expires cannot have waited for that commit.
+        const LIVENESS: Duration = Duration::from_secs(120);
+        const FENCE_HOLD: Duration = Duration::from_secs(240);
         struct Gate {
             entered: Mutex<Option<oneshot::Sender<()>>>,
             release: Mutex<std::sync::mpsc::Receiver<()>>,
@@ -1488,7 +1500,7 @@ mod tests {
                     self.release
                         .lock()
                         .map_err(|_| PublicationFenceError::check_failed("test release gate poisoned"))?
-                        .recv_timeout(Duration::from_secs(10))
+                        .recv_timeout(FENCE_HOLD)
                         .map_err(|_| PublicationFenceError::check_failed("test gate was not released"))?;
                 }
                 Ok(())
@@ -1506,11 +1518,11 @@ mod tests {
             .stage_coalesced_publications(vec![(input()?, "first".into(), 0, 10)])
             .await?;
         let first = table.submit_prepared_group(prepared, true).await?;
-        tokio::time::timeout(Duration::from_secs(3), observed)
+        tokio::time::timeout(LIVENESS, observed)
             .await
             .context("first append reached fence")??;
         let second = tokio::time::timeout(
-            Duration::from_secs(3),
+            LIVENESS,
             table.stage_coalesced_publications(vec![(input()?, "second".into(), 0, 20)]),
         )
         .await;
@@ -1530,6 +1542,10 @@ mod tests {
     /// queued cohort as the next version; window mode still holds a lone group until flushed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn eager_trigger_group_commits_queued_cohort_without_waiting_for_window() -> Result<()> {
+        // The window outlasts every liveness guard, so a commit observed before a guard expires
+        // can only come from the eager trigger, however slow the host's I/O is.
+        const WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+        const LIVENESS: Duration = Duration::from_secs(120);
         type Gates = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
         struct Gate(Mutex<Option<Gates>>);
         impl PublicationFence for Gate {
@@ -1546,16 +1562,15 @@ mod tests {
                 {
                     let _ = entered.send(());
                     release
-                        .recv_timeout(Duration::from_secs(10))
+                        .recv_timeout(LIVENESS)
                         .map_err(|_| PublicationFenceError::check_failed("test gate was not released"))?;
                 }
                 Ok(())
             }
         }
-        let bound = Duration::from_secs(3);
         let options = CommitOptions {
             trigger: CommitTrigger::Eager,
-            batch_window: Duration::from_secs(60),
+            batch_window: WINDOW,
             max_files_per_commit: 8,
             max_pending_files: 8,
             ..Default::default()
@@ -1577,7 +1592,7 @@ mod tests {
         let first = table
             .submit_prepared_group(groups.next().context("first group")?, false)
             .await?;
-        tokio::time::timeout(bound, observed)
+        tokio::time::timeout(LIVENESS, observed)
             .await
             .context("eager commit waited for the window")??;
         let mut queued = Vec::new();
@@ -1585,9 +1600,12 @@ mod tests {
             queued.push(table.submit_prepared_group(group, false).await?);
         }
         release.send(())?;
-        assert_eq!(tokio::time::timeout(bound, first.wait()).await??.version, 1);
+        assert_eq!(tokio::time::timeout(LIVENESS, first.wait()).await??.version, 1);
         for receipt in queued {
-            assert_eq!(tokio::time::timeout(bound, receipt.wait()).await??.version, 2);
+            let receipt = tokio::time::timeout(LIVENESS, receipt.wait())
+                .await
+                .context("eager queued cohort waited for the window")??;
+            assert_eq!(receipt.version, 2);
         }
         let log = std::fs::read_to_string(directory.path().join("_delta_log/00000000000000000002.json"))?;
         assert_eq!(log.lines().filter(|line| line.starts_with(r#"{"add""#)).count(), 2);
@@ -1608,7 +1626,7 @@ mod tests {
             "window trigger committed before its window or a flush"
         );
         table.flush_pending();
-        assert_eq!(tokio::time::timeout(bound, receipt).await???.version, 1);
+        assert_eq!(tokio::time::timeout(LIVENESS, receipt).await???.version, 1);
         Ok(())
     }
 
@@ -1657,11 +1675,15 @@ mod tests {
 
     #[tokio::test]
     async fn coalesced_groups_share_versions_without_replaying_overlapping_identities() -> Result<()> {
+        // Only the overlap cut and the final flush can commit before the window, so the versions
+        // below do not depend on how fast the host commits.
+        const WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         let directory = tempfile::tempdir()?;
         let table = BatchedTable::open(
             directory.path(),
             CommitOptions {
-                batch_window: Duration::from_secs(60),
+                batch_window: WINDOW,
                 max_files_per_commit: 2,
                 max_pending_files: 4,
                 ..Default::default()
@@ -1680,11 +1702,9 @@ mod tests {
         let a = table.submit_prepared_group(first, false).await?;
         let replay = table.submit_prepared_group(duplicate, false).await?;
         let b = table.submit_prepared_group(second, true).await?;
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), a.wait()).await??.version,
-            1
-        );
-        let (replay, b) = tokio::try_join!(replay.wait(), b.wait())?;
+        assert_eq!(tokio::time::timeout(HANG_GUARD, a.wait()).await??.version, 1);
+        let (replay, b) =
+            tokio::time::timeout(HANG_GUARD, async { tokio::try_join!(replay.wait(), b.wait()) }).await??;
         assert_eq!(replay.version, 2);
         assert_eq!(b.version, 2);
         assert!(replay.file_observations.is_empty());
@@ -1704,10 +1724,15 @@ mod tests {
     /// Guarantees: another submission remains asynchronous and cannot enter until capacity is released.
     #[tokio::test]
     async fn occupied_capacity_blocks_admission_until_released() -> Result<()> {
+        // The window outlasts the hang guards, so the shared version can only come from the full
+        // cohort, however long the second stage's fsync takes.
+        const WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         let directory = tempfile::tempdir()?;
         let table = BatchedTable::open(
             directory.path(),
             CommitOptions {
+                batch_window: WINDOW,
                 max_files_per_commit: 2,
                 max_pending_files: 2,
                 ..Default::default()
@@ -1726,8 +1751,8 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut b).await.is_err());
         drop(occupied);
         let b = b.await?;
-        let a = tokio::time::timeout(Duration::from_secs(3), a.wait()).await??;
-        let b = tokio::time::timeout(Duration::from_secs(3), b.wait()).await??;
+        let a = tokio::time::timeout(HANG_GUARD, a.wait()).await??;
+        let b = tokio::time::timeout(HANG_GUARD, b.wait()).await??;
         assert_eq!(a.version, 1);
         assert_eq!(b.version, 1);
         assert_eq!(
