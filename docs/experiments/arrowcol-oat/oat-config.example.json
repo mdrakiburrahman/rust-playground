@@ -10,7 +10,8 @@
       "bind_host": null,
       "setup_timeout_ms": 1260000,
       "endpoint_host": null,
-      "snapshot_root": null
+      "snapshot_root": null,
+      "collector_memory_limit_bytes": 4294967296
     }
   },
   "stamp": null,

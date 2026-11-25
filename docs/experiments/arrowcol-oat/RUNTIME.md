@@ -122,7 +122,8 @@ const config = JSON.parse(fs.readFileSync("docs/experiments/arrowcol-oat/oat-con
 Object.assign(config.platform, {
   compose_project: "oat-smoke", compose_state_root: `${root}/state`,
   local: { bind_host: process.env.OAT_DOCKER_BIND_HOST ?? null,
-    endpoint_host: process.env.OAT_DOCKER_ENDPOINT_HOST ?? null, snapshot_root: `${root}/snapshots` }
+    endpoint_host: process.env.OAT_DOCKER_ENDPOINT_HOST ?? null, snapshot_root: `${root}/snapshots`,
+    collector_memory_limit_bytes: config.platform.local.collector_memory_limit_bytes }
 });
 Object.assign(config, {
   tables: ["sqlserver_active_sessions"], replica_counts: [1], dfe_worker_concurrency: [1],
@@ -134,8 +135,13 @@ Object.assign(config, {
 });
 fs.writeFileSync(`${root}/config.json`, JSON.stringify(config), { flag: "wx" });
 '
-npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode local
+npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode local 2>&1 | tee "$OAT_SMOKE_ROOT/run.log"
 ```
+
+The overload guard is enabled by default and needs a finite collector cap, so the
+recipe keeps the example's `platform.local.collector_memory_limit_bytes` (4 GiB);
+without it the run fails before stack services start. `run.log` keeps the full
+console transcript beside the results.
 
 The one-second measurement still follows image/stack startup, trusted immutable
 pin initialization, whole-fleet preflight/QAP setup and the schedule lead.
