@@ -751,7 +751,10 @@ mod tests {
             buffer.batch_runs = true;
             assert!(buffer.try_push(&a)? && buffer.try_push(&b)?);
             assert_eq!(buffer.ordered_batch_runs()?, run_order);
-            assert_eq!(buffer.finish()?.column(1).as_ref(), &Int32Array::from(expected.to_vec()));
+            assert_eq!(
+                buffer.finish()?.column(1).as_ref(),
+                &Int32Array::from(expected.to_vec())
+            );
         }
         Ok(())
     }
