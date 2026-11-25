@@ -1,6 +1,4 @@
 const GUARD_WINDOW_MS: u64 = 30_000;
-const GUARD_MAX_GAP_MS: u64 = 5_000;
-const GUARD_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct GuardReadLeg<T> {
     result: Result<T>,
@@ -237,7 +235,9 @@ impl GuardEngine {
                 .request_start_ms
                 .checked_sub(previous)
                 .context("overload sample clock reversed")?;
-            if self.start.is_some_and(|start| reading.request_start_ms >= start) && gap > GUARD_MAX_GAP_MS {
+            if self.start.is_some_and(|start| reading.request_start_ms >= start)
+                && gap > self.settings.max_sampling_gap_ms
+            {
                 bail!("overload protection has a sampling gap");
             }
             self.proof["max_sampling_gap_ms"] = json!(
@@ -930,7 +930,7 @@ impl PreparedGuard {
         #[cfg(unix)]
         let local_memory = if platform.kind() == crate::config::OatMode::Local {
             Some(tokio::time::timeout(
-                GUARD_READ_TIMEOUT,
+                config.overload_guard.read_timeout(),
                 LocalGuardMemory::prepare(&log.instance_id, config.platform.local.collector_memory_limit_bytes,
                     config.overload_guard.container_memory_metric),
             ).await.context("Docker guard admission deadline exceeded")??)
@@ -957,7 +957,7 @@ impl PreparedGuard {
                 expected_scale_out_identity,
                 api,
                 local: platform.kind() == crate::config::OatMode::Local,
-                since_ms: unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS),
+                since_ms: unix_time_ms_u64()?.saturating_sub(config.overload_guard.max_sampling_gap_ms),
             },
             engine: GuardEngine::new(config.overload_guard.clone()),
         };
@@ -970,12 +970,12 @@ impl PreparedGuard {
             prepared.engine.proof["container_memory_source"] = json!("docker_one_shot_cgroup_with_identity_fence");
         }
         prepared.engine.proof["commit_log_sampling"] = json!({"mode":"incremental_since_with_dedupe",
-            "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
+            "overlap_ms":config.overload_guard.max_sampling_gap_ms,"capability_source":"initial_complete_startup_readback"});
         let expected = prepared.probe.expected_scale_out_identity.clone();
         let api = prepared.probe.api.clone();
         #[cfg(unix)]
         let local_memory = prepared.probe.local_memory.clone();
-        let deadline = tokio::time::Instant::now() + GUARD_READ_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + config.overload_guard.read_timeout();
         let (reading, backlog, identity) = guarded_composite_observation(
             prepared.probe.read(config, &prepared.scraper, diagnostics, deadline),
             prepared.scraper.scrape(),
@@ -1281,7 +1281,7 @@ impl GuardProbe {
             }
         }
         diagnostics["last_guard_read"]["status"] = json!("complete");
-        self.since_ms = request_start_ms.saturating_sub(GUARD_MAX_GAP_MS);
+        self.since_ms = request_start_ms.saturating_sub(config.overload_guard.max_sampling_gap_ms);
         Ok(GuardReading {
             request_start_ms,
             timestamp_ms,
@@ -1312,6 +1312,9 @@ enum GuardSignal {
 mod overload_guard_tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    const GUARD_MAX_GAP_MS: u64 = crate::config::DEFAULT_GUARD_MAX_SAMPLING_GAP_MS;
+    const GUARD_READ_TIMEOUT: Duration = Duration::from_millis(crate::config::DEFAULT_GUARD_READ_TIMEOUT_MS);
 
     async fn serve_readiness(listener: tokio::net::TcpListener) -> std::io::Result<()> {
         loop {
@@ -2790,6 +2793,42 @@ mod overload_guard_tests {
         }
         assert_eq!(stalled.stop.as_ref().map(|stop| &stop["window_index"]), Some(&json!(1)));
         assert_eq!(replayed.proof["complete_windows"][0]["ingestion_commits"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_guard_timing_fails_closed_on_late_or_gapped_samples() -> Result<()> {
+        let settings: crate::config::OverloadGuardConfig =
+            serde_json::from_value(json!({"read_timeout_ms":50,"max_sampling_gap_ms":1500}))?;
+        let mut gapped = GuardEngine::new(settings.clone());
+        let mut default = GuardEngine::new(Default::default());
+        for engine in [&mut gapped, &mut default] {
+            engine.arm(0, 90_000);
+            engine.record(Ok(reading(0, 100)), &pending(0, 0));
+            engine.record(Ok(reading(1500, 100)), &pending(1500, 0));
+            assert!(engine.failure().is_none());
+            engine.record(Ok(reading(3001, 100)), &pending(3001, 0));
+        }
+        assert_eq!(gapped.proof["status"], "unavailable");
+        assert!(gapped.failure().is_some());
+        assert_eq!(gapped.proof["max_sampling_gap_ms"], 1500);
+        assert_eq!((&gapped.proof["settings"]["read_timeout_ms"], &gapped.proof["settings"]["max_sampling_gap_ms"]),
+            (&json!(50), &json!(1500)));
+        assert!(default.failure().is_none());
+        assert_eq!(default.proof["max_sampling_gap_ms"], 1501);
+        assert!(default.proof["settings"].get("read_timeout_ms").is_none());
+        assert!(default.proof["settings"].get("max_sampling_gap_ms").is_none());
+
+        let late = guard_read_leg(tokio::time::Instant::now() + settings.read_timeout(), async {
+            tokio::time::sleep(settings.read_timeout() * 4).await;
+            Ok::<_, anyhow::Error>(reading(0, 100))
+        }).await;
+        assert_eq!(late.status, "timeout");
+        let mut engine = GuardEngine::new(settings);
+        engine.arm(0, 90_000);
+        engine.record(late.into_result(), &pending(0, 0));
+        assert_eq!(engine.proof["status"], "unavailable");
+        assert!(engine.failure().is_some());
         Ok(())
     }
 

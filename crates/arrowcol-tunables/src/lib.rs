@@ -1588,6 +1588,13 @@ pub struct CommitTunables {
         deserialize_with = "deserialize_present_u64"
     )]
     pub checkpoint_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub commit_attempts: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub commit_budget_secs: Option<u64>,
 }
 
 fn deserialize_present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {

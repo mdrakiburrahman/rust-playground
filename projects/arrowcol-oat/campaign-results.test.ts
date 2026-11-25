@@ -70,6 +70,13 @@ test('rejects incompatible frozen source, resource, or load baselines', () => {
       factorConfigPaths: ['codec', 'level'], officialRuns: [official('two', 2)], committedRowsPerSecond: 20 },
   ];
   assert.throws(() => renderCampaignResults(results, 'C1'), /incompatible frozen source\/resource\/load baselines/);
+  const guarded = (id: string, overloadGuard: Record<string, unknown>) =>
+    ({ ...official(id, 1), config: { tunables: { codec: id, level: 'default', frozen: 1 }, overload_guard: overloadGuard } });
+  const tightened = { read_timeout_ms: 2000, max_sampling_gap_ms: 4000 };
+  const paired = (baselineGuard: Record<string, unknown>) => [{ ...results[0]!,
+    officialRuns: [guarded('one', tightened)], baselineBefore: guarded('base', baselineGuard) }];
+  assert.doesNotThrow(() => renderCampaignResults(paired(tightened), 'C1'));
+  assert.throws(() => renderCampaignResults(paired({}), 'C1'), /incompatible frozen source\/resource\/load baselines/);
 });
 
 
@@ -728,6 +735,32 @@ test('requires live guard coverage and confirmed caps and nulls actual overload 
     run.rows[0]!.evidence_json = JSON.stringify(changed);
     assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
   }
+  const timing = { read_timeout_ms: 2000, max_sampling_gap_ms: 4000 };
+  Object.assign(run.config, { overload_guard: timing });
+  const tightened = structuredClone(original);
+  Object.assign(tightened.overload_guard.settings, timing);
+  run.rows[0]!.evidence_json = JSON.stringify(tightened);
+  assert.match(renderCampaignResults([result()], 'C1'), /provisional: commit-rate resolution unavailable/);
+  for (const change of [
+    (evidence: typeof tightened) => { Reflect.deleteProperty(evidence.overload_guard.settings, 'read_timeout_ms'); },
+    (evidence: typeof tightened) => { evidence.overload_guard.settings.max_sampling_gap_ms = 5000; },
+    (evidence: typeof tightened) => { evidence.overload_guard.max_sampling_gap_ms = 4001; },
+  ]) {
+    const changed = structuredClone(tightened);
+    change(changed);
+    run.rows[0]!.evidence_json = JSON.stringify(changed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  for (const invalid of [{ read_timeout_ms: 2000, max_sampling_gap_ms: 2000 }, { read_timeout_ms: 0 }, { read_timeout_ms: 3001 },
+    { max_sampling_gap_ms: 5001 }, { read_timeout_ms: '2000' }, { read_timeout_ms: 1.5 }, { max_sampling_gap_ms: null }]) {
+    Object.assign(run.config, { overload_guard: invalid });
+    const echoed = structuredClone(original);
+    Object.assign(echoed.overload_guard.settings, invalid);
+    run.rows[0]!.evidence_json = JSON.stringify(echoed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  Reflect.deleteProperty(run.config, 'overload_guard');
+  run.rows[0]!.evidence_json = JSON.stringify(original);
   Object.assign(run.config, { overload_guard: { container_memory_metric: 'working_set' },
     platform: { local: { collector_memory_limit_bytes: 8388608 } } });
   const working = structuredClone(original);

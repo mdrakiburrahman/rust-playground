@@ -926,10 +926,25 @@ function overloadStopIssue(evidence: RecordValue, config: RecordValue): string |
   return `above_ceiling: overload_stop ${String(stop.reason)} (${String(stop.metric)})`;
 }
 
+function guardTiming(config: RecordValue): { readTimeoutMs: number; maxSamplingGapMs: number } | undefined {
+  if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return undefined;
+  const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const readTimeoutMs = requested.read_timeout_ms === undefined ? 3000 : requested.read_timeout_ms;
+  const maxSamplingGapMs = requested.max_sampling_gap_ms === undefined ? 5000 : requested.max_sampling_gap_ms;
+  if (nonNegativeInteger(readTimeoutMs) === undefined || nonNegativeInteger(maxSamplingGapMs) === undefined) return undefined;
+  const timeout = Number(readTimeoutMs);
+  const gap = Number(maxSamplingGapMs);
+  if (timeout < 1 || timeout > 3000 || gap < 1 || gap > 5000 || timeout >= gap) return undefined;
+  return { readTimeoutMs: timeout, maxSamplingGapMs: gap };
+}
+
 function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: unknown, start: number, end: number): string | undefined {
   const invalid = 'overload_guard protection unavailable or invalid';
   if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return invalid;
   const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const timing = guardTiming(config);
+  if (!timing) return invalid;
+  const gap = timing.maxSamplingGapMs;
   const enabled = requested.enabled === undefined ? true : requested.enabled;
   const fraction = requested.cap_fraction === undefined ? 0.9 : requested.cap_fraction;
   const zeroWindows = requested.zero_progress_windows === undefined ? 2 : requested.zero_progress_windows;
@@ -964,10 +979,12 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
       !isRecord(guard.settings) || guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
       guard.settings.zero_progress_windows !== zeroWindows ||
       (guard.settings.memory_signal ?? 'process_rss') !== memorySignal ||
+      (guard.settings.read_timeout_ms ?? 3000) !== timing.readTimeoutMs ||
+      (guard.settings.max_sampling_gap_ms ?? 5000) !== gap ||
       nonNegativeInteger(guard.coverage_start_ms) === undefined || Number(guard.coverage_start_ms) > expectedStart ||
       nonNegativeInteger(guard.coverage_end_ms) === undefined || Number(guard.coverage_end_ms) < end ||
-      nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > 5000 ||
-      nonNegativeInteger(guard.sample_count) === undefined || Number(guard.sample_count) < Math.ceil((end - expectedStart) / 5000) + 1 ||
+      nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > gap ||
+      nonNegativeInteger(guard.sample_count) === undefined || Number(guard.sample_count) < Math.ceil((end - expectedStart) / gap) + 1 ||
       typeof guard.peak_cap_fraction !== 'number' || !Number.isFinite(guard.peak_cap_fraction) ||
       guard.peak_cap_fraction < 0 || guard.peak_cap_fraction >= fraction ||
       !Array.isArray(caps) || caps.length !== metrics.length ||

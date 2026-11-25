@@ -599,6 +599,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.preflight_lookup_mode", "per_entry"),
     capability!("collector.commit.checkpoint_mode", "external"),
     capability!("collector.commit.checkpoint_interval", "10"),
+    capability!("collector.commit.commit_attempts", "8"),
+    capability!("collector.commit.commit_budget_secs", "10"),
     capability!("collector.socket.h2_stream_window_bytes", "tonic default"),
     capability!("collector.socket.h2_connection_window_bytes", "tonic default"),
     capability!("collector.socket.h2_max_frame_bytes", "tonic default"),
@@ -2119,6 +2121,18 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     {
         bail!("collector.commit.checkpoint_interval must be in 1..=100000");
     }
+    if commit
+        .commit_attempts
+        .is_some_and(|value| !(1..=1_000).contains(&value))
+    {
+        bail!("collector.commit.commit_attempts must be in 1..=1000");
+    }
+    if commit
+        .commit_budget_secs
+        .is_some_and(|value| !(1..=3_600).contains(&value))
+    {
+        bail!("collector.commit.commit_budget_secs must be in 1..=3600");
+    }
     if let Some(columns) = &commit.delta_stats_columns {
         arrow_deltalake::delta_stats::DeltaStatsPolicy {
             columns: columns.clone(),
@@ -2195,6 +2209,40 @@ fn checkpoint_interval_is_a_bounded_integer_even_in_external_mode() -> Result<()
             "maintenance": {"enabled": true, "operations": ["checkpoint"]}
         });
         assert!(Tunables::parse_oat_json(config).is_err());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn commit_retry_policy_is_bounded_strict_and_projected() -> Result<()> {
+    for (field, too_large) in [("commit_attempts", 1_001), ("commit_budget_secs", 3_601)] {
+        for value in [
+            Value::from(0),
+            Value::from(too_large),
+            Value::from(-1),
+            Value::from(1.5),
+            Value::from("8"),
+            Value::Null,
+        ] {
+            let Err(error) = Tunables::parse_oat_json(serde_json::json!({
+                "collector": {"commit": {field: value}}
+            })) else {
+                bail!("invalid collector.commit.{field} accepted");
+            };
+            assert!(format!("{error:#}").contains(&format!("collector.commit.{field}")));
+        }
+    }
+    for (attempts, budget) in [(1, 1), (3, 2), (1_000, 3_600)] {
+        let settings = Tunables::parse_oat_json(serde_json::json!({
+            "collector": {"commit": {"commit_attempts": attempts, "commit_budget_secs": budget}}
+        }))?;
+        let environment = settings.environment_for(ComponentRole::Collector)?;
+        let commit: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"])?;
+        assert_eq!(
+            commit,
+            serde_json::json!({"commit_attempts": attempts, "commit_budget_secs": budget})
+        );
     }
     Ok(())
 }

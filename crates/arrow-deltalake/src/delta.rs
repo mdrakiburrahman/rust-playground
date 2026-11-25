@@ -410,6 +410,9 @@ fn physical_writer_schema(schema: &SchemaRef, partition_values: &BTreeMap<String
     ))
 }
 
+pub(crate) const DEFAULT_COMMIT_ATTEMPTS: u32 = 8;
+pub(crate) const DEFAULT_COMMIT_BUDGET: Duration = Duration::from_secs(10);
+
 pub(crate) fn collision_backoff(attempt: u32) {
     let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 17;
     std::thread::sleep(Duration::from_millis((5_u64 << attempt.min(6)) + jitter));
@@ -2696,6 +2699,78 @@ mod io_tests {
         Ok(())
     }
 
+    /// Scenario: every publication attempt loses to an external append.
+    /// Guarantees: the configured attempt limit and between-attempt budget end publication with an
+    /// error, without committing the identity, and the same identity later publishes exactly once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_commit_retry_policy_exhausts_then_identity_publishes_once() -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        struct ExternalCommits {
+            armed: AtomicBool,
+            checks: AtomicU32,
+        }
+        impl PublicationFence for ExternalCommits {
+            fn check_before_commit(
+                &self,
+                context: &PublicationFenceContext<'_>,
+            ) -> std::result::Result<(), PublicationFenceError> {
+                self.checks.fetch_add(1, Ordering::SeqCst);
+                if self.armed.load(Ordering::SeqCst) {
+                    let publish = || -> std::io::Result<()> {
+                        let log = context.table_path().join("_delta_log");
+                        let append = fs::read(log.join(format!("{:020}.json", context.read_version())))?;
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(log.join(format!("{:020}.json", context.proposed_version())))?;
+                        file.write_all(&append)?;
+                        file.sync_all()
+                    };
+                    publish().map_err(|error| PublicationFenceError::check_failed(error.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+        for (attempts, budget, expected_checks) in [(2, Duration::from_secs(3600), 2), (8, Duration::ZERO, 1)] {
+            let directory = tempfile::tempdir()?;
+            let fence = Arc::new(ExternalCommits {
+                armed: AtomicBool::new(false),
+                checks: AtomicU32::new(0),
+            });
+            let mut table = DeltaTable::open_with_fence(directory.path(), Arc::<ExternalCommits>::clone(&fence))?;
+            {
+                let owner = Arc::get_mut(&mut table).context("unique table owner")?;
+                owner.commit_attempts = attempts;
+                owner.commit_budget = budget;
+            }
+            let input = input_batch()?;
+            let mut first = table.new_file(input.schema())?;
+            first.write(&input).await?;
+            assert_eq!(first.finish().await?.version, 1);
+            fence.checks.store(0, Ordering::SeqCst);
+            fence.armed.store(true, Ordering::SeqCst);
+            let Err(error) = table.commit_files_with_transaction(&[], "mine", 7) else {
+                anyhow::bail!("every attempt must lose to an external append");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("({attempts} attempts / {} seconds)", budget.as_secs())),
+                "{error:#}"
+            );
+            assert_eq!(fence.checks.load(Ordering::SeqCst), expected_checks);
+            let head = table.version()?;
+            assert_eq!(head, 1 + u64::from(expected_checks));
+            fence.armed.store(false, Ordering::SeqCst);
+            assert_eq!(table.commit_files_with_transaction(&[], "mine", 7)?, head + 1);
+            assert_eq!(table.commit_files_with_transaction(&[], "mine", 7)?, head + 1);
+            assert_eq!(table.version()?, head + 1);
+        }
+        Ok(())
+    }
+
     /// Scenario: URL-significant characters occur in a physical Hive directory.
     /// Guarantees: local and ADLS request paths encode segments exactly once.
     #[test]
@@ -3520,6 +3595,8 @@ pub struct DeltaTable {
     pub(crate) txn_lookup_mode: crate::TxnLookupMode,
     pub(crate) snapshot_cache_mode: crate::SnapshotCacheMode,
     pub(crate) preflight_lookup_mode: crate::PreflightLookupMode,
+    pub(crate) commit_attempts: u32,
+    pub(crate) commit_budget: Duration,
     pub(crate) publication_cache: Mutex<crate::publication_lookup::PublicationCache>,
     txn_index: Mutex<Option<crate::publication_lookup::TxnIndex>>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
@@ -4303,6 +4380,8 @@ impl DeltaTable {
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
+            commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
+            commit_budget: DEFAULT_COMMIT_BUDGET,
             publication_cache: Default::default(),
             txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
@@ -4626,6 +4705,8 @@ impl DeltaTable {
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
+            commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
+            commit_budget: DEFAULT_COMMIT_BUDGET,
             publication_cache: Default::default(),
             txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
@@ -6188,7 +6269,7 @@ impl DeltaTable {
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         lock_timer.acquired();
         let started = Instant::now();
-        for attempt in 0..8 {
+        for attempt in 0..self.commit_attempts {
             if attempt != 0 {
                 evidence.mark(PublicationReason::Retry);
                 crate::telemetry::mark_terminal_commit_incomplete();
@@ -6604,13 +6685,17 @@ impl DeltaTable {
                     return Err(error.into());
                 }
             }
-            if started.elapsed() > Duration::from_secs(10) {
+            if started.elapsed() > self.commit_budget {
                 break;
             }
             collision_backoff(attempt);
         }
         observation.finish("exhausted");
-        bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")
+        bail!(
+            "Delta publication collision/retry budget exhausted ({} attempts / {} seconds)",
+            self.commit_attempts,
+            self.commit_budget.as_secs()
+        )
     }
 }
 

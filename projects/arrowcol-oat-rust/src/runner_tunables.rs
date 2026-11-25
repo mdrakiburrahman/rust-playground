@@ -550,6 +550,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode"
             | "collector.commit.snapshot_cache_mode" | "collector.commit.preflight_lookup_mode"
             | "collector.commit.checkpoint_mode" | "collector.commit.checkpoint_interval"
+            | "collector.commit.commit_attempts" | "collector.commit.commit_budget_secs"
             | "collector.commit.trigger" =>
                 ("commit", path.rsplit('.').next().unwrap_or_default(), "ARROWCOL_COLLECTOR_COMMIT_CONFIG"),
             "collector.pressure.max_concurrent_streams" | "collector.pressure.rss_limit_bytes"
@@ -1837,7 +1838,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     fn commit_modes_require_matching_startup_readback_from_every_collector() -> Result<()> {
         let mut config = config()?;
         let commit = json!({"snapshot_cache_mode":"checkpoint_aware","checkpoint_mode":"async",
-            "checkpoint_interval":17,"txn_lookup_mode":"incremental","preflight_lookup_mode":"grouped"});
+            "checkpoint_interval":17,"txn_lookup_mode":"incremental","preflight_lookup_mode":"grouped",
+            "commit_attempts":3,"commit_budget_secs":2});
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"collector":{"commit":commit}}))?;
         let first = json!({
             "component":"collector","instance_id":"collector-1","log_complete":true,
@@ -1856,6 +1858,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             "checkpoint_mode",
             "checkpoint_interval",
             "txn_lookup_mode",
+            "commit_attempts",
+            "commit_budget_secs",
         ] {
             let path = format!("collector.commit.{field}");
             assert!(verified.iter().any(|entry| entry["path"] == path), "{path}");

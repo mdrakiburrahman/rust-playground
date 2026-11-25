@@ -52,7 +52,7 @@ mod override_tests {
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
                 "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental",
-                    "preflight_lookup_mode":"grouped"}}
+                    "preflight_lookup_mode":"grouped","commit_attempts":3,"commit_budget_secs":2}}
             }))
             .map_err(|error| error.to_string())?;
             let environment = settings
@@ -65,9 +65,23 @@ mod override_tests {
             assert_eq!(options.checkpoint_interval, 17);
             assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
             assert_eq!(options.preflight_lookup_mode, PreflightLookupMode::Grouped);
+            assert_eq!(options.commit_attempts, 3);
+            assert_eq!(options.commit_budget, Duration::from_secs(2));
         }
-        for invalid in [0, 100_001] {
-            let raw = serde_json::json!({"checkpoint_interval": invalid}).to_string();
+        let defaults = CommitConfig::default().build()?;
+        assert_eq!(
+            (defaults.commit_attempts, defaults.commit_budget),
+            (8, Duration::from_secs(10))
+        );
+        for raw in [
+            serde_json::json!({"checkpoint_interval": 0}),
+            serde_json::json!({"checkpoint_interval": 100_001}),
+            serde_json::json!({"commit_attempts": 0}),
+            serde_json::json!({"commit_attempts": 1_001}),
+            serde_json::json!({"commit_budget_secs": 0}),
+            serde_json::json!({"commit_budget_secs": 3_601}),
+        ] {
+            let raw = raw.to_string();
             assert!(merge_config(&yaml, &raw, None)?.build().is_err(), "{raw}");
         }
         Ok(())
@@ -1125,6 +1139,10 @@ pub struct CommitConfig {
     pub checkpoint_mode: arrow_deltalake::CheckpointMode,
     /// Commit interval for collector-owned checkpoints.
     pub checkpoint_interval: u64,
+    /// Publication attempts per commit cohort, including the first.
+    pub commit_attempts: u32,
+    /// Elapsed publication retry budget in seconds, checked between attempts only.
+    pub commit_budget_secs: u64,
 }
 
 impl Default for CommitConfig {
@@ -1140,6 +1158,8 @@ impl Default for CommitConfig {
             preflight_lookup_mode: options.preflight_lookup_mode,
             checkpoint_mode: options.checkpoint_mode,
             checkpoint_interval: options.checkpoint_interval,
+            commit_attempts: options.commit_attempts,
+            commit_budget_secs: options.commit_budget.as_secs(),
         }
     }
 }
@@ -1156,6 +1176,8 @@ impl CommitConfig {
             preflight_lookup_mode: self.preflight_lookup_mode,
             checkpoint_mode: self.checkpoint_mode,
             checkpoint_interval: self.checkpoint_interval,
+            commit_attempts: self.commit_attempts,
+            commit_budget: Duration::from_secs(self.commit_budget_secs),
         };
         options.validate().map_err(|error| error.to_string())?;
         Ok(options)

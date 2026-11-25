@@ -276,6 +276,27 @@ pub struct OverloadGuardConfig {
         deserialize_with = "deserialize_container_memory_metric"
     )]
     pub container_memory_metric: arrowcol_tunables::ContainerMemoryMetric,
+    #[serde(skip_serializing_if = "is_default_guard_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    #[serde(skip_serializing_if = "is_default_guard_max_sampling_gap_ms")]
+    pub max_sampling_gap_ms: u64,
+}
+
+pub const DEFAULT_GUARD_READ_TIMEOUT_MS: u64 = 3_000;
+pub const DEFAULT_GUARD_MAX_SAMPLING_GAP_MS: u64 = 5_000;
+
+fn is_default_guard_read_timeout_ms(value: &u64) -> bool {
+    *value == DEFAULT_GUARD_READ_TIMEOUT_MS
+}
+
+fn is_default_guard_max_sampling_gap_ms(value: &u64) -> bool {
+    *value == DEFAULT_GUARD_MAX_SAMPLING_GAP_MS
+}
+
+impl OverloadGuardConfig {
+    pub fn read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.read_timeout_ms)
+    }
 }
 
 fn deserialize_container_memory_metric<'de, D>(
@@ -306,6 +327,8 @@ impl Default for OverloadGuardConfig {
             zero_progress_windows: 2,
             memory_signal: OverloadRssSignal::ProcessRss,
             container_memory_metric: arrowcol_tunables::ContainerMemoryMetric::Usage,
+            read_timeout_ms: DEFAULT_GUARD_READ_TIMEOUT_MS,
+            max_sampling_gap_ms: DEFAULT_GUARD_MAX_SAMPLING_GAP_MS,
         }
     }
 }
@@ -1493,6 +1516,21 @@ impl OatConfig {
         if !self.overload_guard.container_memory_metric.is_usage() && !self.overload_guard.enabled {
             bail!("overload_guard.container_memory_metric requires overload_guard.enabled=true");
         }
+        let guard = &self.overload_guard;
+        if !(1..=DEFAULT_GUARD_READ_TIMEOUT_MS).contains(&guard.read_timeout_ms)
+            || !(1..=DEFAULT_GUARD_MAX_SAMPLING_GAP_MS).contains(&guard.max_sampling_gap_ms)
+            || guard.read_timeout_ms >= guard.max_sampling_gap_ms
+        {
+            bail!(
+                "overload_guard requires read_timeout_ms in 1..=3000, max_sampling_gap_ms in 1..=5000 and read_timeout_ms < max_sampling_gap_ms"
+            );
+        }
+        if (guard.read_timeout_ms != DEFAULT_GUARD_READ_TIMEOUT_MS
+            || guard.max_sampling_gap_ms != DEFAULT_GUARD_MAX_SAMPLING_GAP_MS)
+            && !guard.enabled
+        {
+            bail!("overload_guard.read_timeout_ms and max_sampling_gap_ms require overload_guard.enabled=true");
+        }
         if self.overload_guard.enabled
             && self.platform.kind == OatMode::Local
             && (self.overload_guard.memory_signal == OverloadRssSignal::CgroupMemory
@@ -2389,6 +2427,13 @@ mod tests {
             json!({"memory_signal":false}),
             json!({"memory_signal":"other"}),
             json!({"unknown":true}),
+            json!({"read_timeout_ms":"2000"}),
+            json!({"read_timeout_ms":1.5}),
+            json!({"read_timeout_ms":-1}),
+            json!({"read_timeout_ms":null}),
+            json!({"max_sampling_gap_ms":"4000"}),
+            json!({"max_sampling_gap_ms":4000.0}),
+            json!({"max_sampling_gap_ms":true}),
         ] {
             assert!(serde_json::from_value::<OverloadGuardConfig>(value).is_err());
         }
@@ -2398,6 +2443,56 @@ mod tests {
             config.overload_guard.zero_progress_windows = windows;
             assert!(config.validate().is_err());
         }
+        config.overload_guard = OverloadGuardConfig::default();
+        assert!(
+            serde_json::to_value(&config.overload_guard)?
+                .get("read_timeout_ms")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&config.overload_guard)?
+                .get("max_sampling_gap_ms")
+                .is_none()
+        );
+        for (timeout, gap) in [
+            (0, 5_000),
+            (3_001, 5_000),
+            (1_000, 0),
+            (1_000, 5_001),
+            (2_000, 2_000),
+            (3_000, 2_000),
+        ] {
+            config.overload_guard.read_timeout_ms = timeout;
+            config.overload_guard.max_sampling_gap_ms = gap;
+            let Err(error) = config.validate() else {
+                anyhow::bail!("weakened or inverted guard timing must fail");
+            };
+            assert!(
+                error.to_string().contains("read_timeout_ms < max_sampling_gap_ms"),
+                "{error:#}"
+            );
+        }
+        config.overload_guard = serde_json::from_value(json!({"enabled":false,"read_timeout_ms":2_000}))?;
+        let Err(error) = config.validate() else {
+            anyhow::bail!("guard timing without the guard must fail");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("max_sampling_gap_ms require overload_guard.enabled=true"),
+            "{error:#}"
+        );
+        config.overload_guard = serde_json::from_value(json!({"read_timeout_ms":2_000,"max_sampling_gap_ms":4_000}))?;
+        config.validate()?;
+        assert_eq!(config.overload_guard.read_timeout(), std::time::Duration::from_secs(2));
+        let settings = serde_json::to_value(&config.overload_guard)?;
+        assert_eq!(
+            (
+                settings["read_timeout_ms"].as_u64(),
+                settings["max_sampling_gap_ms"].as_u64()
+            ),
+            (Some(2_000), Some(4_000))
+        );
         config.overload_guard = serde_json::from_value(json!({"cap_fraction":0.8,"zero_progress_windows":1}))?;
         config.validate()?;
         Ok(())

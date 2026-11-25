@@ -1600,7 +1600,7 @@ impl ResourceSampler {
                     };
                     let timeout_ms = publication_backlog_timeout_ms(request_start_unix_ms, start, end);
                     let other_timeout_ms = if guard.is_some() {
-                        PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64
+                        config.overload_guard.read_timeout_ms
                     } else {
                         timeout_ms
                     };
@@ -1693,7 +1693,15 @@ impl ResourceSampler {
                         }
                     };
                     if let Some((_, engine)) = &mut guard {
+                        // A tighter guard read timeout also bounds the backlog sample the guard consumes;
+                        // the backlog evidence itself keeps its own request budget.
+                        let backlog_late = config.overload_guard.read_timeout_ms < timeout_ms
+                            && request_end_unix_ms.saturating_sub(request_start_unix_ms)
+                                > config.overload_guard.read_timeout_ms;
                         let observation = match guard_result {
+                            Ok(Some(_)) if backlog_late => Err(anyhow::anyhow!(
+                                "publication backlog readback exceeded the overload guard read timeout"
+                            )),
                             Ok(Some(reading)) => Ok(reading),
                             Ok(None) => Err(anyhow::anyhow!("live cap or ingestion commit readback unavailable")),
                             Err(error) => Err(error),

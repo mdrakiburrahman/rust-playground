@@ -6709,7 +6709,7 @@ async fn run_clients_inner(
         prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
         prepared.engine.proof["run_id"] = json!(project_run_id);
         prepared.probe.since_ms = match unix_time_ms_u64() {
-            Ok(now) => now.saturating_sub(GUARD_MAX_GAP_MS),
+            Ok(now) => now.saturating_sub(config.overload_guard.max_sampling_gap_ms),
             Err(error) => {
                 let cleanup = cancel_clients(platform, config, &handles).await;
                 fail_prepared!(error, cleanup, qap_tables);

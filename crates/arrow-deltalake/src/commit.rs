@@ -31,6 +31,10 @@ pub struct CommitOptions {
     pub preflight_lookup_mode: crate::PreflightLookupMode,
     pub checkpoint_mode: crate::CheckpointMode,
     pub checkpoint_interval: u64,
+    /// Publication attempts for one commit cohort, including the first.
+    pub commit_attempts: u32,
+    /// Elapsed retry budget, checked between attempts; in-flight I/O is never preempted.
+    pub commit_budget: Duration,
 }
 
 impl Default for CommitOptions {
@@ -44,6 +48,8 @@ impl Default for CommitOptions {
             preflight_lookup_mode: Default::default(),
             checkpoint_mode: Default::default(),
             checkpoint_interval: 10,
+            commit_attempts: crate::delta::DEFAULT_COMMIT_ATTEMPTS,
+            commit_budget: crate::delta::DEFAULT_COMMIT_BUDGET,
             trigger: CommitTrigger::default(),
         }
     }
@@ -57,6 +63,12 @@ impl CommitOptions {
     pub fn validate(&self) -> Result<()> {
         if !(1..=100_000).contains(&self.checkpoint_interval) {
             bail!("collector.commit.checkpoint_interval must be in 1..=100000");
+        }
+        if !(1..=1_000).contains(&self.commit_attempts) {
+            bail!("collector.commit.commit_attempts must be in 1..=1000");
+        }
+        if !(Duration::from_secs(1)..=Duration::from_secs(3_600)).contains(&self.commit_budget) {
+            bail!("collector.commit.commit_budget_secs must be in 1..=3600");
         }
         if self.batch_window.is_zero()
             || Instant::now().checked_add(self.batch_window).is_none()
@@ -873,6 +885,8 @@ fn run_worker(
             owner.txn_lookup_mode = options.txn_lookup_mode;
             owner.snapshot_cache_mode = options.snapshot_cache_mode;
             owner.preflight_lookup_mode = options.preflight_lookup_mode;
+            owner.commit_attempts = options.commit_attempts;
+            owner.commit_budget = options.commit_budget;
             checkpoints = CheckpointSchedule::new(&table, &options)?;
             Ok(table)
         });
