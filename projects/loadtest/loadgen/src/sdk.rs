@@ -113,14 +113,12 @@ pub async fn prepare_tables(
             );
         }
         let artifacts = current.snapshot;
-        let proto_source = proto_source_for(head, &artifacts.protobuf_descriptor)
-            .with_context(|| format!("derive proto source from catalog history for {}", statement.identity))?;
         let table_artifacts = artifact_root.join(statement.identity.table().as_str());
-        replace_directory(&table_artifacts)?;
+        write_proto_sources(head, &artifacts.protobuf_descriptor, &table_artifacts)
+            .with_context(|| format!("export proto sources from catalog history for {}", statement.identity))?;
         fs::write(table_artifacts.join("manifest.json"), artifacts.manifest)?;
         fs::write(table_artifacts.join("schema.arrow"), artifacts.arrow_schema_ipc)?;
         fs::write(table_artifacts.join("descriptor.pb"), artifacts.protobuf_descriptor)?;
-        fs::write(table_artifacts.join("schema.proto"), proto_source)?;
 
         let table_generated = generated_root.join(statement.identity.table().as_str());
         invoke_generator(
@@ -187,7 +185,7 @@ fn safe_component(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-fn proto_source_for(schema: &CatalogSchemaVersion, descriptor: &[u8]) -> Result<Vec<u8>> {
+fn write_proto_sources(schema: &CatalogSchemaVersion, descriptor: &[u8], output: &Path) -> Result<()> {
     let canonical = generate_descriptor_artifacts(schema)?;
     if canonical.protobuf_descriptor() != descriptor {
         bail!(
@@ -195,7 +193,14 @@ fn proto_source_for(schema: &CatalogSchemaVersion, descriptor: &[u8]) -> Result<
             schema.identity()
         );
     }
-    Ok(canonical.protobuf_source()?.into_bytes())
+    let sources = canonical.protobuf_sources()?;
+    replace_directory(output)?;
+    for (relative, source) in sources {
+        let path = output.join(relative);
+        fs::create_dir_all(path.parent().context("protobuf source parent")?)?;
+        fs::write(path, source)?;
+    }
+    Ok(())
 }
 
 fn replace_directory(path: &Path) -> Result<()> {
@@ -352,7 +357,7 @@ mod tests {
     use arrowcol_catalog::{DdlCommand, DdlParser, deterministic_table_id};
 
     #[test]
-    fn proto_source_is_derived_from_catalog_history_and_bound_to_its_descriptor() -> Result<()> {
+    fn proto_export_includes_imports_and_is_bound_to_catalog_history() -> Result<()> {
         let DdlCommand::CreateTable(create) = DdlParser::default()
             .parse("CREATE TABLE telemetry.prod.sdk_artifact_probe (id BIGINT NOT NULL) USING DELTA")?
         else {
@@ -366,9 +371,20 @@ mod tests {
             create.canonical_ddl(),
         )?;
         let artifacts = generate_descriptor_artifacts(&schema)?;
-        let source = proto_source_for(&schema, artifacts.protobuf_descriptor())?;
-        assert_eq!(source, artifacts.protobuf_source()?.into_bytes());
-        assert!(proto_source_for(&schema, b"different descriptor").is_err());
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("artifacts");
+        write_proto_sources(&schema, artifacts.protobuf_descriptor(), &output)?;
+        for (relative, expected) in artifacts.protobuf_sources()? {
+            assert_eq!(fs::read_to_string(output.join(relative))?, expected);
+        }
+        assert!(output.join("options.proto").is_file());
+        assert!(output.join("google/protobuf/descriptor.proto").is_file());
+        assert!(write_proto_sources(&schema, b"different descriptor", &output).is_err());
+        assert_eq!(
+            fs::read(output.join("schema.proto"))?,
+            artifacts.protobuf_source()?.into_bytes(),
+            "a rejected descriptor must not replace the existing export"
+        );
         Ok(())
     }
 }

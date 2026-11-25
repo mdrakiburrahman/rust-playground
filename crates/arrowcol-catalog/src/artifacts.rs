@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_ipc::{
     convert::try_schema_from_flatbuffer_bytes,
@@ -14,10 +14,161 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CatalogError, CatalogErrorCode, CatalogField, CatalogResult, CatalogSchemaVersion, CatalogType, ProtobufType,
+    TableMetadata,
 };
 
 const ARTIFACT_MANIFEST_VERSION: u32 = 1;
 const MAX_PROTOBUF_FIELD_NUMBER: u32 = 536_870_911;
+
+// Compiled by build.rs from the authoritative, versioned proto2 vocabulary.
+// Keep the raw wire bytes: prost-types discards custom option extension fields.
+pub(crate) const OPTION_DESCRIPTORS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/options.pb"));
+const OPTION_SOURCE: &str = include_str!("../proto/options.proto");
+const DESCRIPTOR_SOURCE: &str = include_str!("../proto/google/protobuf/descriptor.proto");
+
+#[derive(Clone, PartialEq, Message)]
+struct RawDescriptorSet {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    file: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FileOptionCarrier {
+    #[prost(message, optional, tag = "8")]
+    options: Option<TableOptions>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RawFileMessages {
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    message_type: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MessageOptionCarrier {
+    #[prost(bytes = "vec", optional, tag = "7")]
+    options: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TableOptions {
+    #[prost(message, optional, tag = "50000")]
+    table: Option<PortableTableMetadata>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PortableTableMetadata {
+    #[prost(string, optional, tag = "1")]
+    provider: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    location: Option<String>,
+    #[prost(string, optional, tag = "3")]
+    comment: Option<String>,
+    #[prost(string, repeated, tag = "4")]
+    partition_columns: Vec<String>,
+    #[prost(message, repeated, tag = "5")]
+    properties: Vec<PortableTableProperty>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PortableTableProperty {
+    #[prost(string, optional, tag = "1")]
+    key: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    value: Option<String>,
+}
+
+fn descriptor_error(error: impl std::fmt::Display) -> CatalogError {
+    CatalogError::new(CatalogErrorCode::DescriptorGeneration, error.to_string())
+}
+
+/// Recovers table metadata solely from the custom option in an exported descriptor.
+///
+/// This decodes annotations, not runtime policy. Reserved-property validation
+/// remains the responsibility of the central property registry at admission.
+///
+/// # Errors
+///
+/// Rejects malformed descriptors, missing or ambiguous table options, and
+/// incomplete or duplicate property entries.
+pub fn protobuf_table_metadata(bytes: &[u8]) -> CatalogResult<TableMetadata> {
+    let descriptors = RawDescriptorSet::decode(bytes).map_err(descriptor_error)?;
+    let mut metadata = None;
+    for file in descriptors.file {
+        let carrier = FileOptionCarrier::decode(file.as_slice()).map_err(descriptor_error)?;
+        if let Some(table) = carrier.options.and_then(|options| options.table) {
+            if metadata.is_some() {
+                return Err(descriptor_error(
+                    "descriptor contains more than one table metadata option",
+                ));
+            }
+            let mut properties = BTreeMap::new();
+            for property in table.properties {
+                let key = property
+                    .key
+                    .ok_or_else(|| descriptor_error("table property has no key"))?;
+                let value = property
+                    .value
+                    .ok_or_else(|| descriptor_error("table property has no value"))?;
+                if properties.insert(key, value).is_some() {
+                    return Err(descriptor_error("duplicate table property key"));
+                }
+            }
+            metadata = Some(TableMetadata {
+                provider: table
+                    .provider
+                    .ok_or_else(|| descriptor_error("table metadata has no provider"))?,
+                location: table.location,
+                comment: table.comment,
+                partition_columns: table.partition_columns,
+                properties,
+            });
+        }
+    }
+    metadata.ok_or_else(|| descriptor_error("descriptor has no table metadata option"))
+}
+
+// Protobuf strings are bytes with C escapes, not JSON strings: JSON's \u0000
+// escape is not supported by every protoc/Buf parser. Fixed-width octal also
+// prevents adjacent digits from becoming part of an escape.
+pub(crate) fn protobuf_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for byte in value.bytes() {
+        match byte {
+            b'"' => output.push_str("\\\""),
+            b'\\' => output.push_str("\\\\"),
+            0x20..=0x7e => output.push(char::from(byte)),
+            _ => output.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn metadata_source(metadata: &TableMetadata) -> String {
+    let mut source = format!(
+        "option (arrowcol.metadata.v1.table) = {{\n  provider: {}\n",
+        protobuf_string(&metadata.provider)
+    );
+    if let Some(location) = &metadata.location {
+        source.push_str(&format!("  location: {}\n", protobuf_string(location)));
+    }
+    if let Some(comment) = &metadata.comment {
+        source.push_str(&format!("  comment: {}\n", protobuf_string(comment)));
+    }
+    for column in &metadata.partition_columns {
+        source.push_str(&format!("  partition_columns: {}\n", protobuf_string(column)));
+    }
+    for (key, value) in &metadata.properties {
+        source.push_str(&format!(
+            "  properties: {{ key: {} value: {} }}\n",
+            protobuf_string(key),
+            protobuf_string(value)
+        ));
+    }
+    source.push_str("};\n\n");
+    source
+}
 
 /// Persisted deterministic descriptor artifact kind.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -79,10 +230,30 @@ impl DescriptorArtifacts {
         let mut source = String::from(
             "syntax = \"proto2\";\n\n// TIMESTAMP: UTC microseconds; DECIMAL: base-10 string. Arrow Flight remains the wire.\n",
         );
-        for file in descriptors.file {
+        let raw = RawDescriptorSet::decode(self.protobuf_descriptor()).map_err(descriptor_error)?;
+        let mut found = false;
+        for (file, wire_file) in descriptors
+            .file
+            .into_iter()
+            .zip(raw.file)
+            .filter(|(file, _)| file.name() == "schema.proto")
+        {
+            if found {
+                return Err(descriptor_error("descriptor contains more than one schema.proto"));
+            }
+            found = true;
+            let raw_messages = RawFileMessages::decode(wire_file.as_slice()).map_err(descriptor_error)?;
             source.push_str(&format!("package {};\n\n", file.package.unwrap_or_default()));
-            for message in file.message_type {
+            source.push_str("import \"options.proto\";\n\n");
+            source.push_str(&metadata_source(&protobuf_table_metadata(self.protobuf_descriptor())?));
+            for (message, wire_message) in file.message_type.into_iter().zip(raw_messages.message_type) {
                 source.push_str(&format!("message {} {{\n", message.name.unwrap_or_default()));
+                if let Some(options) = MessageOptionCarrier::decode(wire_message.as_slice())
+                    .map_err(descriptor_error)?
+                    .options
+                {
+                    source.push_str(&crate::options::render_options(&options)?);
+                }
                 source.push_str("  // Protobuf implementation-reserved numbers 19000-19999 are never allocated.\n");
                 for field in message.field {
                     let label = if field.label == Some(Label::Repeated as i32) {
@@ -99,22 +270,40 @@ impl DescriptorArtifacts {
                             .trim_start_matches("TYPE_")
                             .to_ascii_lowercase()
                     };
-                    let json_name = serde_json::to_string(&field.json_name.unwrap_or_default()).map_err(|error| {
-                        CatalogError::new(
-                            CatalogErrorCode::DescriptorGeneration,
-                            format!("protobuf JSON name serialization failed: {error}"),
-                        )
-                    })?;
+                    let json_name = protobuf_string(&field.json_name.unwrap_or_default());
                     source.push_str(&format!(
                         "  {label} {data_type} {} = {} [json_name = {json_name}];\n",
                         field.name.unwrap_or_default(),
                         field.number.unwrap_or_default(),
                     ));
                 }
+                if !found {
+                    return Err(descriptor_error("descriptor is missing schema.proto"));
+                }
                 source.push_str("}\n\n");
             }
         }
         Ok(source)
+    }
+
+    /// Returns every source needed to compile `schema.proto` without the manifest.
+    ///
+    /// Paths are portable protobuf import paths relative to the export directory.
+    /// The standard descriptor source is vendored from protobuf v21.12, retaining
+    /// its license; the build compiles these exact sources with imports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted schema descriptor cannot be reconstructed.
+    pub fn protobuf_sources(&self) -> CatalogResult<BTreeMap<String, String>> {
+        Ok(BTreeMap::from([
+            ("schema.proto".to_owned(), self.protobuf_source()?),
+            ("options.proto".to_owned(), OPTION_SOURCE.to_owned()),
+            (
+                "google/protobuf/descriptor.proto".to_owned(),
+                DESCRIPTOR_SOURCE.to_owned(),
+            ),
+        ]))
     }
 
     /// Returns the canonical JSON manifest.
@@ -155,6 +344,9 @@ impl DescriptorArtifacts {
 /// Returns a structured descriptor error when the schema cannot be represented
 /// by protobuf, serialized, or round-tripped through Arrow IPC exactly.
 pub fn generate_descriptor_artifacts(schema: &CatalogSchemaVersion) -> CatalogResult<DescriptorArtifacts> {
+    // Admission materializes defaults explicitly; generation still rejects
+    // misspelled option keys rather than silently exporting unknown vocabulary.
+    crate::materialize_protobuf_properties(&schema.metadata().properties)?;
     let arrow_schema = schema.arrow_schema()?;
     let mut dictionary_tracker = DictionaryTracker::new(false);
     let encoded = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
@@ -181,7 +373,7 @@ pub fn generate_descriptor_artifacts(schema: &CatalogSchemaVersion) -> CatalogRe
         ));
     }
 
-    let protobuf_descriptor = protobuf_descriptor(schema)?.encode_to_vec();
+    let protobuf_descriptor = protobuf_descriptor(schema)?;
     let manifest = serde_json::to_vec(&ArtifactManifest {
         artifact_manifest_version: ARTIFACT_MANIFEST_VERSION,
         schema,
@@ -206,7 +398,7 @@ struct ArtifactManifest<'a> {
     schema: &'a CatalogSchemaVersion,
 }
 
-fn protobuf_descriptor(schema: &CatalogSchemaVersion) -> CatalogResult<FileDescriptorSet> {
+fn protobuf_descriptor(schema: &CatalogSchemaVersion) -> CatalogResult<Vec<u8>> {
     let package = format!(
         "arrowcol.{}.{}",
         protobuf_identifier(schema.identity().catalog().as_str(), IdentifierStyle::Snake),
@@ -215,29 +407,65 @@ fn protobuf_descriptor(schema: &CatalogSchemaVersion) -> CatalogResult<FileDescr
     let root_name = protobuf_identifier(schema.identity().table().as_str(), IdentifierStyle::Pascal);
     let mut messages = Vec::new();
     build_message(&package, &root_name, schema.fields(), &mut messages)?;
-    let file_name = format!(
-        "{}/{}/{}_v{}.proto",
-        protobuf_identifier(schema.identity().catalog().as_str(), IdentifierStyle::Snake),
-        protobuf_identifier(schema.identity().schema().as_str(), IdentifierStyle::Snake),
-        protobuf_identifier(schema.identity().table().as_str(), IdentifierStyle::Snake),
-        schema.version().get()
+    let options = crate::options::encode_options(&schema.metadata().properties)?;
+    let messages = messages
+        .into_iter()
+        .map(|message| {
+            let is_root = message.name() == root_name;
+            let mut bytes = message.encode_to_vec();
+            if is_root && !options.is_empty() {
+                bytes.extend(
+                    MessageOptionCarrier {
+                        options: Some(options.clone()),
+                    }
+                    .encode_to_vec(),
+                );
+            }
+            bytes
+        })
+        .collect();
+    let mut file = FileDescriptorProto {
+        name: Some("schema.proto".to_owned()),
+        package: Some(package),
+        dependency: vec!["options.proto".to_owned()],
+        public_dependency: Vec::new(),
+        weak_dependency: Vec::new(),
+        message_type: Vec::new(),
+        enum_type: Vec::new(),
+        service: Vec::new(),
+        extension: Vec::new(),
+        options: None,
+        source_code_info: None,
+        // protoc represents proto2 by absence, including when explicitly declared.
+        syntax: None,
+    }
+    .encode_to_vec();
+    file.extend(RawFileMessages { message_type: messages }.encode_to_vec());
+    let metadata = schema.metadata();
+    file.extend(
+        FileOptionCarrier {
+            options: Some(TableOptions {
+                table: Some(PortableTableMetadata {
+                    provider: Some(metadata.provider.clone()),
+                    location: metadata.location.clone(),
+                    comment: metadata.comment.clone(),
+                    partition_columns: metadata.partition_columns.clone(),
+                    properties: metadata
+                        .properties
+                        .iter()
+                        .map(|(key, value)| PortableTableProperty {
+                            key: Some(key.clone()),
+                            value: Some(value.clone()),
+                        })
+                        .collect(),
+                }),
+            }),
+        }
+        .encode_to_vec(),
     );
-    Ok(FileDescriptorSet {
-        file: vec![FileDescriptorProto {
-            name: Some(file_name),
-            package: Some(package),
-            dependency: Vec::new(),
-            public_dependency: Vec::new(),
-            weak_dependency: Vec::new(),
-            message_type: messages,
-            enum_type: Vec::new(),
-            service: Vec::new(),
-            extension: Vec::new(),
-            options: None,
-            source_code_info: None,
-            syntax: Some("proto2".to_owned()),
-        }],
-    })
+    let mut descriptors = RawDescriptorSet::decode(OPTION_DESCRIPTORS).map_err(descriptor_error)?;
+    descriptors.file.push(file);
+    Ok(descriptors.encode_to_vec())
 }
 
 fn build_message(

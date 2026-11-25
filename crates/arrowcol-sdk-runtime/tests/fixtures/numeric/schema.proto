@@ -1,0 +1,40 @@
+syntax = "proto2";
+
+// TIMESTAMP: UTC microseconds; DECIMAL: base-10 string. Arrow Flight remains the wire.
+package arrowcol.demo.public;
+
+import "options.proto";
+
+option (arrowcol.metadata.v1.table) = {
+  provider: "delta"
+};
+
+message NumericScalars {
+  // Protobuf implementation-reserved numbers 19000-19999 are never allocated.
+  optional bool boolean = 1 [json_name = "boolean"];
+  optional sint32 signed8 = 2 [json_name = "signed8"];
+  optional sint32 signed16 = 3 [json_name = "signed16"];
+  optional sint32 signed32 = 4 [json_name = "signed32"];
+  optional int64 signed64 = 5 [json_name = "signed64"];
+  optional uint32 unsigned8 = 6 [json_name = "unsigned8"];
+  optional uint32 unsigned16 = 7 [json_name = "unsigned16"];
+  optional uint32 unsigned32 = 8 [json_name = "unsigned32"];
+  optional uint64 unsigned64 = 9 [json_name = "unsigned64"];
+  optional float float32 = 10 [json_name = "float32"];
+  optional double float64 = 11 [json_name = "float64"];
+  optional string decimal = 12 [json_name = "decimal"];
+  optional sint32 date32 = 13 [json_name = "date32"];
+  optional int64 date64 = 14 [json_name = "date64"];
+  optional sint32 time_seconds = 15 [json_name = "time_seconds"];
+  optional sint32 time_millis = 16 [json_name = "time_millis"];
+  optional int64 time_micros = 17 [json_name = "time_micros"];
+  optional int64 time_nanos = 18 [json_name = "time_nanos"];
+  optional int64 timestamp_seconds = 19 [json_name = "timestamp_seconds"];
+  optional int64 timestamp_millis = 20 [json_name = "timestamp_millis"];
+  optional int64 timestamp_micros = 21 [json_name = "timestamp_micros"];
+  optional int64 timestamp_nanos = 22 [json_name = "timestamp_nanos"];
+  optional int64 duration_seconds = 23 [json_name = "duration_seconds"];
+  optional int64 duration_millis = 24 [json_name = "duration_millis"];
+  optional int64 duration_micros = 25 [json_name = "duration_micros"];
+  optional int64 duration_nanos = 26 [json_name = "duration_nanos"];
+}

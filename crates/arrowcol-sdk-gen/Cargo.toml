@@ -16,6 +16,7 @@ arrow-schema = { version = "58.4", default-features = false }
 arrowcol-catalog = { path = "../arrowcol-catalog" }
 arrowcol-catalog-client = { path = "../arrowcol-catalog-client" }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
+arrowcol-props = { path = "../arrowcol-props" }
 clap.workspace = true
 flate2 = "1"
 futures = "0.3"

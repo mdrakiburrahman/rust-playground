@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import {
   SdkGenerationTool,
   fixtureArtifacts,
   evolvedFixtureArtifacts,
+  evolvedGeneratedOutput,
   generatedOutput,
+  validationRoot,
   type CommandRunner,
 } from '../src/index.js';
 import { runCli } from '../src/cli.js';
@@ -50,11 +55,45 @@ test('compatibility compares consecutive versions and runs the real Buf WIRE_JSO
   assert.deepEqual(runner.calls[1], {
     command: 'npx',
     args: [
-      '--no-install', 'buf', 'breaking', `${evolvedFixtureArtifacts}/schema.proto`,
-      '--against', `${fixtureArtifacts}/schema.proto`, '--config', 'buf.yaml',
+      '--no-install', 'buf', 'breaking', `${evolvedFixtureArtifacts}/descriptor.pb#format=binpb`,
+      '--against', `${fixtureArtifacts}/descriptor.pb#format=binpb`, '--config', 'buf.yaml',
     ],
   });
 });
+
+test('generated validation stages the shared runtime beside both versioned clients', (t) => {
+  const workspace = mkdtempSync(join(tmpdir(), 'arrowcol-sdk-validation-'));
+  t.after(() => rmSync(workspace, { recursive: true, force: true }));
+  const versions = [
+    [generatedOutput, validationRoot],
+    [evolvedGeneratedOutput, `${validationRoot}-v2`],
+  ] as const;
+  for (const [source] of versions) {
+    for (const directory of ['rust', 'typescript', 'descriptors']) {
+      mkdirSync(join(workspace, source, directory), { recursive: true });
+    }
+    const runtime = join(workspace, source, 'runtime/arrowcol-sdk-runtime');
+    mkdirSync(join(runtime, 'src'), { recursive: true });
+    writeFileSync(join(workspace, source, 'rust/Cargo.toml'),
+      '[dependencies]\narrowcol-sdk-runtime = { path = "../runtime/arrowcol-sdk-runtime" }\n');
+    writeFileSync(join(runtime, 'Cargo.toml'), '[package]\nname = "arrowcol-sdk-runtime"\nversion = "0.1.0"\n');
+    writeFileSync(join(runtime, 'src/lib.rs'), `// Runtime packaged with ${source}\n`);
+  }
+
+  new SdkGenerationTool(workspace, new RecordingRunner()).testGenerated();
+
+  for (const [source, staged] of versions) {
+    const manifest = join(workspace, staged, 'rust/Cargo.toml');
+    const dependency = readFileSync(manifest, 'utf8').match(/path = "([^"]+)"/u)?.[1];
+    assert.ok(dependency, 'The staged client must reference its shared runtime');
+    const runtime = join(dirname(manifest), dependency);
+    for (const file of ['Cargo.toml', 'src/lib.rs']) {
+      assert.equal(readFileSync(join(runtime, file), 'utf8'),
+        readFileSync(join(workspace, source, 'runtime/arrowcol-sdk-runtime', file), 'utf8'));
+    }
+  }
+});
+
 test('check CLI delegates to deterministic check workflow', () => {
   const runner = new RecordingRunner();
   const tool = new SdkGenerationTool(process.cwd(), runner);

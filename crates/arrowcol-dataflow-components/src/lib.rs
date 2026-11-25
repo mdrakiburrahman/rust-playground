@@ -36,7 +36,7 @@ pub use envelope::{
 };
 pub use exporter::{ARROW_DELTALAKE_EXPORTER, ARROW_DELTALAKE_EXPORTER_URN, GenericDeltaExporter};
 pub use flight_exporter::{
-    ARROW_FLIGHT_EXPORTER, ARROW_FLIGHT_EXPORTER_URN, ArrowFlightExporter, FlightExporterConfig,
+    ARROW_FLIGHT_EXPORTER, ARROW_FLIGHT_EXPORTER_URN, ArrowFlightExporter, FlightExporterConfig, ForwardRegistration,
 };
 pub use metrics::{
     DashboardCapabilities, DashboardPressure, FlushReason, NativeQuiverCapability, PipelineStage, RuntimeMetrics,

@@ -1,0 +1,54 @@
+{
+  "name": "arrowcol-protoc",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-protoc/src",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --package arrowcol-protoc --package arrowcol-sdk-gen",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo test --locked --package arrowcol-protoc",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "build-contract": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/contract-cli.ts --codegen=protoc",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package arrowcol-protoc --all-targets -- -D warnings",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "e2e": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/test/protoc-backend.e2e.ts",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    }
+  },
+  "tags": ["scope:rust", "scope:tools", "type:generator"]
+}

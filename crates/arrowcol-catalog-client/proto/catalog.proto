@@ -45,12 +45,28 @@ message TableSnapshot {
   bytes arrow_schema_ipc = 9;
   bytes manifest = 10;
   bytes protobuf_descriptor = 11;
+  // Optional native registration receipt, produced after SDK verification.
+  // Never part of the frozen candidate or generated schema artifacts.
+  bytes native_receipt_json = 12;
 }
 message CatalogSnapshot {
   EventPosition position = 1;
   repeated TableSnapshot tables = 2;
 }
+message PrepareTableRequest {
+  // Exactly one managed CREATE TABLE. Preparation has no durable side effects.
+  string ddl = 1;
+}
+message PromoteTableRequest {
+  // Exact candidate from PrepareTable, including all identity and policy metadata.
+  TableSnapshot candidate = 1;
+}
 service SchemaCatalog {
+  // Freeze v1 IDs, physical schema, properties and managed location without registering.
+  rpc PrepareTable(PrepareTableRequest) returns (TableSnapshot);
+  // Compare the entire candidate and commit through the same Delta CAS as Flight SQL.
+  // Repeating the exact committed candidate is idempotent; a different table conflicts.
+  rpc PromoteTable(PromoteTableRequest) returns (TableSnapshot);
   rpc GetCurrentEventId(Empty) returns (EventPosition);
   // Strictly greater than from.event_id. OUT_OF_RANGE on epoch/gap mismatch.
   rpc GetEvents(EventsRequest) returns (EventsResponse);

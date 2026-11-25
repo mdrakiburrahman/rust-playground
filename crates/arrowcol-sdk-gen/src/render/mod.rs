@@ -1,4 +1,7 @@
+mod models;
+mod runtime;
 mod rust;
+mod stream;
 mod typescript;
 
 use std::{
@@ -49,10 +52,20 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
     let mut files = BTreeMap::new();
     files.extend(rust::render(&context)?);
     files.extend(typescript::render(&context)?);
+    files.extend(stream::render(&context, bundle)?);
+    if stream::supported(&context) {
+        let cpp_source = files
+            .get(&PathBuf::from("cpp/model/schema.proto"))
+            .ok_or_else(|| SdkGenError::Artifact("missing C++ model source".into()))?;
+        files.extend(models::render(&context, bundle, cpp_source)?);
+    }
     let requests = bundle
         .descriptors()
         .file
         .iter()
+        // Imports describe custom options, not table row types. prost cannot
+        // generate extension accessors and must not emit google.protobuf here.
+        .filter(|file| file.name() == "schema.proto")
         .map(|file| {
             (
                 prost_build::Module::from_protobuf_package_name(file.package()),
@@ -86,6 +99,12 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
     files.insert(
         PathBuf::from("descriptors/schema.proto"),
         bundle.protobuf_source().to_vec(),
+    );
+    files.extend(
+        bundle
+            .protobuf_imports()
+            .iter()
+            .map(|(path, bytes)| (PathBuf::from("descriptors").join(path), bytes.clone())),
     );
     files.insert(PathBuf::from("README.md"), generated_root_readme(&context).into_bytes());
 
@@ -436,6 +455,29 @@ fn sdk_manifest<'a>(
                 root: "typescript",
             },
         },
+        streams: StreamManifest {
+            available: stream::supported(context),
+            languages: if stream::supported(context) {
+                vec!["rust", "cpp", "csharp"]
+            } else {
+                Vec::new()
+            },
+            guide: "STREAMS.md",
+            runtime: "runtime/arrowcol-sdk-runtime",
+        },
+        distribution: serde_json::json!({
+            "format_version": 1,
+            "neutral_contract": "descriptors",
+            "models": if stream::supported(context) { Some("models/manifest.json") } else { None },
+            "sdks": {
+                "rust": "runtime/arrowcol-sdk-runtime",
+                "cpp": "runtime/cpp",
+                "csharp": "runtime/csharp"
+            },
+            "api": "descriptor-driven",
+            "legacy_generated_adapters": ["rust", "cpp", "csharp", "native"],
+            "legacy_arrow_builders": ["rust", "typescript"]
+        }),
         flight: FlightManifest {
             do_put_path: "/arrow.flight.protocol.FlightService/DoPut",
             descriptor_path: vec![
@@ -459,12 +501,15 @@ fn sdk_manifest<'a>(
 
 fn generated_root_readme(context: &RenderContext<'_>) -> String {
     format!(
-        "# Generated Arrowcol SDK\n\n\
+        "# Contract packages and Arrowcol SDK sources\n\n\
 This directory is a deterministic artifact for `{}` schema version `{}`.\n\
 It is replaced as one unit; do not edit files in place.\n\n\
-- Rust package: `{}` under `rust/`\n\
-- TypeScript package: `{}` under `typescript/`\n\
-- Catalog descriptors: `descriptors/`\n\
+- Language-neutral contract: `descriptors/`\n\
+- Independent protobuf models + contract: `models/` (flat schemas)\n\
+- Reusable per-language Arrowcol SDKs: `runtime/`\n\
+- Legacy generated Rust Arrow package: `{}` under `rust/`\n\
+- Legacy TypeScript Arrow package: `{}` under `typescript/`\n\
+- Generic protobuf stream APIs and package wiring: [STREAMS.md](STREAMS.md)\n\
 - Machine-readable integration manifest: `sdk-manifest.json`\n",
         context.schema.identity(),
         context.schema.version(),
@@ -480,8 +525,18 @@ struct SdkManifest<'a> {
     table: TableManifest<'a>,
     artifacts: ArtifactManifest<'a>,
     packages: PackageManifest<'a>,
+    streams: StreamManifest<'a>,
+    distribution: serde_json::Value,
     flight: FlightManifest<'a>,
     outputs: Vec<OutputFile>,
+}
+
+#[derive(Serialize)]
+struct StreamManifest<'a> {
+    available: bool,
+    languages: Vec<&'a str>,
+    guide: &'a str,
+    runtime: &'a str,
 }
 
 #[derive(Serialize)]

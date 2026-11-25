@@ -215,12 +215,13 @@ runs three middles into one gateway.
 | --- | --- |
 | `endpoint` | Downstream `http://host:port` Flight endpoint. |
 | `timeout` | Per-RPC deadline for DDL replay and each DoPut (default 30s). |
+| `registration` | `replay_ddl` by default; `shared_catalog` forwards only already-registered contracts, with both collectors configured for the same authority. |
 
 | Behavior | Contract |
 | --- | --- |
-| Schema | Before the first batch of a table version, replays that table's local catalog history through Flight SQL DDL and requires every downstream fingerprint to match. |
-| Completion | ACKs only after the downstream DoPut returns exactly one admission; the downstream receiver's delivery mode decides whether that is best-effort or durable. |
-| Failures | `InvalidArgument`, `PermissionDenied`, `Unauthenticated`, `Unimplemented` and schema divergence NACK permanently; everything else NACKs transiently and forces DDL replay on the next batch. |
+| Schema | Default mode replays local catalogue history on first use and checks fingerprints. Shared mode preserves the admitted version without CREATE/ALTER, version remapping or fallback registration. |
+| Completion | ACKs only after exactly one final admission matches the sent version, fingerprint and row count; the downstream receiver decides whether admission is best-effort or durable. |
+| Failures | `InvalidArgument`, `PermissionDenied`, `Unauthenticated`, `Unimplemented` and schema divergence NACK permanently; other failures NACK transiently and invalidate the default mode's replay cache. Shared mode never falls back to DDL. |
 
 `routing: { type: standalone }` on the receiver and Delta exporter makes a
 collector claim its own table leases in memory, without a router or control

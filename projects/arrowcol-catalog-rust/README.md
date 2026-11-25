@@ -5,6 +5,7 @@
 | Govern Arrow schemas, Delta metadata and SDK descriptors | Rust + Delta Kernel; no SQL catalog, JVM, Spark runtime or Thrift |
 | Submit Spark SQL DDL | Flight SQL `CommandStatementUpdate`, port `8817` |
 | Fetch schemas/artifacts and resume changes | gRPC `arrowcol.catalog.v1.SchemaCatalog` on the same endpoint |
+| Registration-last contract builds | Read-only `PrepareTable`, followed by exact-candidate `PromoteTable` after SDK verification |
 
 | Command | Expected result |
 | --- | --- |

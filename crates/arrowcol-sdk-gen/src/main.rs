@@ -11,6 +11,8 @@ use arrowcol_sdk_gen::{
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+mod contract_cli;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "arrowcol-sdk-gen",
@@ -23,6 +25,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate, register, inspect, or export real catalog contracts.
+    Catalog {
+        #[command(subcommand)]
+        command: contract_cli::CatalogCommand,
+    },
     /// Generate and atomically replace both language SDKs.
     Generate {
         /// Directory containing manifest.json, schema.arrow, and descriptor.pb.
@@ -102,6 +109,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = std::env::current_dir()?;
     match cli.command {
+        Command::Catalog { command } => contract_cli::run(command).await?,
         Command::Generate {
             artifacts,
             catalog_endpoint,

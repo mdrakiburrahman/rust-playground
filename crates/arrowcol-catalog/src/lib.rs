@@ -13,12 +13,13 @@ mod ddl;
 mod error;
 mod ir;
 mod memory;
+mod options;
 mod saga;
 mod store;
 mod validation;
 
 pub use arrowcol_sparksql::{Statement as SparkStatement, TableMetadata};
-pub use artifacts::{ArtifactKind, DescriptorArtifacts, generate_descriptor_artifacts};
+pub use artifacts::{ArtifactKind, DescriptorArtifacts, generate_descriptor_artifacts, protobuf_table_metadata};
 pub use ddl::{DdlCommand, DdlParser, FieldBlueprint, ParsedAddColumns, ParsedCreateTable};
 pub use error::{CatalogError, CatalogErrorCode, CatalogErrorOrigin, CatalogResult};
 pub use ir::{
@@ -27,6 +28,9 @@ pub use ir::{
     protobuf_field_number,
 };
 pub use memory::{FailurePoint, MemoryCatalogStore};
+pub use options::{
+    ProtobufOptionDefinition, ProtobufOptionDefinitions, materialize_protobuf_properties, protobuf_option_definitions,
+};
 pub use saga::{
     CatalogControlPlane, DdlCompletion, DdlCompletionDisposition, FlightSqlDdlHandler, FlightSqlDdlRequest,
     ReconciliationReport,

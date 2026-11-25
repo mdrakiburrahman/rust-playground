@@ -40,6 +40,17 @@ pub fn generate_sdk(bundle: &ArtifactBundle, output: &SafeOutputPath) -> SdkGenR
     Ok(result(output, &rendered))
 }
 
+/// Renders the canonical SDK file set without writing it.
+///
+/// Alternate compiler frontends must supply the same validated artifact bundle.
+///
+/// # Errors
+///
+/// Returns the same schema, identifier and rendering errors as [`generate_sdk`].
+pub fn render_sdk_files(bundle: &ArtifactBundle) -> SdkGenResult<BTreeMap<PathBuf, Vec<u8>>> {
+    Ok(render_sdk(bundle)?.files)
+}
+
 /// Verifies byte-for-byte deterministic regeneration without mutating output.
 ///
 /// # Errors
@@ -61,12 +72,18 @@ pub fn check_generated_sdk(bundle: &ArtifactBundle, output: &SafeOutputPath) -> 
 ///
 /// Returns an error for unsafe paths or filesystem failures.
 pub fn write_artifact_bundle(bundle: &ArtifactBundle, output: &SafeOutputPath) -> SdkGenResult<()> {
-    let files = BTreeMap::from([
+    let mut files = BTreeMap::from([
         (PathBuf::from("manifest.json"), bundle.manifest().to_vec()),
         (PathBuf::from("schema.arrow"), bundle.arrow_schema().to_vec()),
         (PathBuf::from("descriptor.pb"), bundle.protobuf_descriptor().to_vec()),
         (PathBuf::from("schema.proto"), bundle.protobuf_source().to_vec()),
     ]);
+    files.extend(
+        bundle
+            .protobuf_imports()
+            .iter()
+            .map(|(path, bytes)| (PathBuf::from(path), bytes.clone())),
+    );
     replace_directory(output, &files)
 }
 

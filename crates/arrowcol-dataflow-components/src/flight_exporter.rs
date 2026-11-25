@@ -57,6 +57,20 @@ pub struct FlightExporterConfig {
     /// Per-RPC deadline for DDL replay and batch forwarding.
     #[serde(default = "default_forward_timeout", with = "humantime_serde")]
     pub timeout: Duration,
+    /// Replay local DDL (legacy default), or only admit already-registered contracts from a shared authority.
+    #[serde(default)]
+    pub registration: ForwardRegistration,
+}
+
+/// How the downstream collector obtains its contract.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardRegistration {
+    /// Preserve existing independent-catalogue chaining.
+    #[default]
+    ReplayDdl,
+    /// Both collectors must resolve the same authority; never send CREATE/ALTER on the data path.
+    SharedCatalog,
 }
 
 impl FlightExporterConfig {
@@ -74,6 +88,7 @@ impl FlightExporterConfig {
 pub struct ArrowFlightExporter {
     endpoint: Endpoint,
     timeout: Duration,
+    registration: ForwardRegistration,
     downstream_versions: HashMap<(TableIdentity, SchemaVersion), SchemaVersion>,
 }
 
@@ -91,9 +106,10 @@ impl ArrowFlightExporter {
         };
         for decoded in decode_record_set(*records).map_err(ExportFailure::Envelope)? {
             let key = (decoded.envelope.table.clone(), decoded.envelope.target_schema_version);
-            let version = match self.downstream_versions.get(&key) {
-                Some(version) => *version,
-                None => {
+            let version = match (self.registration, self.downstream_versions.get(&key)) {
+                (ForwardRegistration::SharedCatalog, _) => decoded.envelope.target_schema_version,
+                (_, Some(version)) => *version,
+                (_, None) => {
                     let version = self.replay_ddl(client, &decoded.envelope).await?;
                     self.downstream_versions.insert(key.clone(), version);
                     version
@@ -173,6 +189,8 @@ impl ArrowFlightExporter {
         batch: RecordBatch,
     ) -> Result<(), ExportFailure> {
         let schema = batch.schema();
+        let expected_rows = batch.num_rows() as u64;
+        let expected_fingerprint = fingerprint_schema(schema.as_ref());
         let descriptor = FlightDescriptor {
             r#type: DescriptorType::Path as i32,
             cmd: Default::default(),
@@ -206,12 +224,32 @@ impl ArrowFlightExporter {
         let mut results = client.do_put(request).await.map_err(status_failure)?.into_inner();
         let mut admitted = false;
         while let Some(result) = results.message().await.map_err(status_failure)? {
+            if admitted {
+                return Err(ExportFailure::Transient(
+                    "downstream sent a result after final admission".to_owned(),
+                ));
+            }
             match PutResultMetadata::from_put_result(&result)
                 .map_err(|error| ExportFailure::Transient(error.to_string()))?
             {
                 PutResultMetadata::Progress { .. } => {}
-                PutResultMetadata::BestEffortAdmission { .. } | PutResultMetadata::DurableAdmission { .. }
-                    if !admitted =>
+                PutResultMetadata::BestEffortAdmission {
+                    source_schema_version,
+                    target_schema_version,
+                    schema_fingerprint,
+                    summary,
+                    ..
+                }
+                | PutResultMetadata::DurableAdmission {
+                    source_schema_version,
+                    target_schema_version,
+                    schema_fingerprint,
+                    summary,
+                    ..
+                } if source_schema_version == version
+                    && target_schema_version >= version
+                    && schema_fingerprint == expected_fingerprint
+                    && summary.rows() == expected_rows =>
                 {
                     admitted = true;
                 }
@@ -280,6 +318,7 @@ fn create_exporter(
     let exporter = ArrowFlightExporter {
         endpoint: config.endpoint().map_err(config_error)?,
         timeout: config.timeout,
+        registration: config.registration,
         downstream_versions: HashMap::new(),
     };
     Ok(ExporterWrapper::local(exporter, node, node_config, exporter_config))
@@ -330,7 +369,7 @@ mod tests {
         sender: Arc<CaptureSender>,
     }
 
-    async fn downstream() -> Result<Downstream> {
+    async fn downstream(allow_ddl: bool) -> Result<Downstream> {
         let catalog = Arc::new(MemoryCatalogStore::new());
         let control = Arc::new(CatalogControlPlane::new(
             DdlParser::default(),
@@ -357,14 +396,16 @@ mod tests {
             2,
             metrics,
         ));
-        let service = ArrowColFlightService::new(
+        let mut service = ArrowColFlightService::new(
             ImplementationPool::Dataflow,
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
             Arc::new(allow_all_authenticator().map_err(anyhow::Error::msg)?),
             admission as Arc<dyn BatchAdmission>,
             arrowcol_flight::RuntimeLimits::default(),
-        )?
-        .with_ddl_handler(control as Arc<dyn FlightSqlDdlHandler>);
+        )?;
+        if allow_ddl {
+            service = service.with_ddl_handler(control as Arc<dyn FlightSqlDdlHandler>);
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         drop(tokio::spawn(
@@ -422,6 +463,7 @@ mod tests {
         let config = FlightExporterConfig {
             endpoint: endpoint.to_owned(),
             timeout: Duration::from_secs(10),
+            registration: ForwardRegistration::ReplayDdl,
         };
         let endpoint = config.endpoint().map_err(anyhow::Error::msg)?;
         let client = FlightServiceClient::new(endpoint.connect_lazy());
@@ -429,6 +471,7 @@ mod tests {
             ArrowFlightExporter {
                 endpoint,
                 timeout: config.timeout,
+                registration: config.registration,
                 downstream_versions: HashMap::new(),
             },
             client,
@@ -441,7 +484,7 @@ mod tests {
     async fn forwards_batches_with_replayed_ddl_to_downstream_collector() -> Result<()> {
         let (table, schema) =
             upstream_table("CREATE TABLE chain.forward.events (id BIGINT NOT NULL, body STRING) USING DELTA").await?;
-        let downstream = downstream().await?;
+        let downstream = downstream(true).await?;
         let (mut exporter, mut client) = exporter(&downstream.endpoint)?;
 
         for ids in [vec![1, 2], vec![3]] {
@@ -494,7 +537,7 @@ mod tests {
             arrowcol_protocol::SchemaName::new("unknown")?,
             arrowcol_protocol::TableName::new("events")?,
         );
-        let downstream = downstream().await?;
+        let downstream = downstream(true).await?;
         let (mut exporter, mut client) = exporter(&downstream.endpoint)?;
         let error = exporter
             .forward(&mut client, &pdata(&unknown, &schema, vec![1])?)
@@ -502,6 +545,67 @@ mod tests {
             .expect_err("unknown table must fail");
         assert!(error.permanent());
         assert!(downstream.sender.sent.lock().expect("capture lock").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_authority_forwards_without_any_downstream_ddl_api() -> Result<()> {
+        let downstream = downstream(false).await?;
+        let control = CatalogControlPlane::new(
+            DdlParser::default(),
+            Arc::clone(&downstream.catalog) as Arc<dyn CatalogStore>,
+        );
+        let registered = control
+            .execute_ddl(FlightSqlDdlRequest::new(
+                "CREATE TABLE shared.forward.events (id BIGINT NOT NULL, body STRING) USING DELTA",
+            ))
+            .await?;
+        let table = registered.identity();
+        let schema = Arc::new(
+            downstream
+                .catalog
+                .current_schema(table)
+                .await?
+                .expect("registered schema")
+                .arrow_schema()?,
+        );
+        let (mut exporter, mut client) = exporter(&downstream.endpoint)?;
+        exporter.registration = ForwardRegistration::SharedCatalog;
+        exporter
+            .forward(&mut client, &pdata(table, &schema, vec![1, 2])?)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert!(
+            exporter.downstream_versions.is_empty(),
+            "shared mode must not replay or remap versions"
+        );
+        assert_eq!(
+            downstream
+                .sender
+                .sent
+                .lock()
+                .expect("capture")
+                .iter()
+                .map(|(_, pdata)| pdata.clone().num_items())
+                .sum::<usize>(),
+            2
+        );
+
+        let unknown = TableIdentity::new(
+            arrowcol_protocol::CatalogName::new("not_registered")?,
+            table.schema().clone(),
+            table.table().clone(),
+        );
+        assert!(
+            exporter
+                .forward(&mut client, &pdata(&unknown, &schema, vec![3])?)
+                .await
+                .is_err()
+        );
+        assert!(
+            downstream.catalog.current_schema(&unknown).await?.is_none(),
+            "must not create a missing contract"
+        );
         Ok(())
     }
 }

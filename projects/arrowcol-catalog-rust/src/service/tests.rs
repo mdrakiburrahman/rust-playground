@@ -55,6 +55,20 @@ struct GatedSchemaCatalog {
 impl SchemaCatalog for GatedSchemaCatalog {
     type WatchStream = super::EventStream;
 
+    async fn prepare_table(
+        &self,
+        request: Request<rpc::PrepareTableRequest>,
+    ) -> Result<Response<rpc::TableSnapshot>, Status> {
+        self.inner.prepare_table(request).await
+    }
+
+    async fn promote_table(
+        &self,
+        request: Request<rpc::PromoteTableRequest>,
+    ) -> Result<Response<rpc::TableSnapshot>, Status> {
+        self.inner.promote_table(request).await
+    }
+
     async fn get_current_event_id(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::EventPosition>, Status> {
         self.inner.get_current_event_id(request).await
     }
@@ -154,6 +168,202 @@ async fn ingestion_catalog_adopts_bootstrap_without_exposing_physical_columns() 
 }
 
 const CREATE: &str = "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, day STRING) USING DELTA PARTITIONED BY (day) COMMENT 'catalog test' TBLPROPERTIES ('vendor.setting' = 'original')";
+
+#[tokio::test]
+async fn prepared_contract_preserves_logical_schema_with_ingestion_layout() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut config = config(root.path());
+    config.ingestion_layout = true;
+    let service = CatalogService::open(config.clone()).await?;
+    assert!(
+        service
+            .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+            .await
+            .is_err()
+    );
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest {
+            ddl: "CREATE TABLE telemetry.prod.sdk_events (id BIGINT NOT NULL) USING DELTA".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!Path::new(&candidate.location).join("_delta_log").exists());
+    let mut committed = service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    committed.position = None;
+    assert_eq!(committed, candidate);
+    let physical = read_delta(&candidate.location)
+        .await?
+        .context("committed physical schema")?;
+    assert!(physical.schema.field_with_name(INGESTION).is_ok());
+    let logical: Vec<CatalogSchemaVersion> = serde_json::from_slice(&candidate.schema_history_json)?;
+    assert!(logical[0].arrow_schema()?.field_with_name(INGESTION).is_err());
+    let restarted = CatalogService::open(config).await?;
+    let mut repeated = restarted
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    repeated.position = None;
+    assert_eq!(repeated, candidate);
+    Ok(())
+}
+
+#[tokio::test]
+async fn prepared_contract_is_read_only_and_promotion_preserves_every_byte() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+        .await?
+        .into_inner();
+    assert!(service.state.lock().await.tables.is_empty());
+    assert_eq!(service.state.lock().await.event_id, 0);
+    assert!(!Path::new(&candidate.location).join("_delta_log").exists());
+    let definitions = arrowcol_catalog::protobuf_option_definitions()?;
+    let declared = definitions
+        .options
+        .iter()
+        .find(|option| option.declared_default.is_some())
+        .context("native default")?;
+    let prepared: Vec<CatalogSchemaVersion> = serde_json::from_slice(&candidate.schema_history_json)?;
+    assert_eq!(
+        prepared[0].metadata().properties.get(&declared.key),
+        declared.declared_default.as_ref()
+    );
+    assert!(
+        prepared[0].canonical_ddl().contains(&declared.key),
+        "freeze the effective default explicitly in DDL"
+    );
+    let mut tampered = candidate.clone();
+    tampered.properties.insert("vendor.setting".into(), "tampered".into());
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(tampered)
+            }))
+            .await
+            .is_err()
+    );
+    let mut wrong_identity = candidate.clone();
+    let mut history: serde_json::Value = serde_json::from_slice(&wrong_identity.schema_history_json)?;
+    history[0]["table_id"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+    wrong_identity.schema_history_json = serde_json::to_vec(&history)?;
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(wrong_identity),
+            }))
+            .await
+            .is_err(),
+        "matching schema bytes cannot substitute a different table identity"
+    );
+    assert!(service.state.lock().await.tables.is_empty());
+    let mut registered = service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    registered.position = None;
+    assert_eq!(registered, candidate);
+    assert_eq!(service.state.lock().await.event_id, 1);
+    service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?;
+    assert_eq!(
+        service.state.lock().await.event_id,
+        1,
+        "an exact promotion retry emits no duplicate event"
+    );
+    let restarted = CatalogService::open(config(root.path())).await?;
+    let mut after_restart = restarted
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    after_restart.position = None;
+    assert_eq!(after_restart, candidate);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_conflicts_on_policy_even_with_the_same_schema_fingerprint() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+        .await?
+        .into_inner();
+    let competing = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest {
+            ddl: CREATE.replace("'original'", "'competing'"),
+        }))
+        .await?
+        .into_inner();
+    let first: Vec<CatalogSchemaVersion> = serde_json::from_slice(&candidate.schema_history_json)?;
+    let second: Vec<CatalogSchemaVersion> = serde_json::from_slice(&competing.schema_history_json)?;
+    assert_eq!(first[0].fingerprint(), second[0].fingerprint());
+    assert_ne!(first[0], second[0]);
+    service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(competing.clone()),
+        }))
+        .await?;
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(candidate)
+            }))
+            .await
+            .is_err()
+    );
+    let mut actual = service
+        .get_table(Request::new(competing.table.clone().context("table")?))
+        .await?
+        .into_inner();
+    actual.position = None;
+    assert_eq!(actual, competing);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_reconciles_a_commit_before_publication_failure() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+        .await?
+        .into_inner();
+    service.fail_after_commit.store(true, Ordering::SeqCst);
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(candidate.clone())
+            }))
+            .await
+            .is_err()
+    );
+    assert_eq!(service.state.lock().await.event_id, 0);
+    let mut actual = service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    actual.position = None;
+    assert_eq!(actual, candidate);
+    assert_eq!(service.state.lock().await.event_id, 1);
+    Ok(())
+}
 
 #[tokio::test]
 async fn committed_delta_restart_and_concurrent_evolution() -> Result<()> {
@@ -426,6 +636,74 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
     assert!(service.store.current_schema(&identity).await?.is_some());
     let _ = shutdown.send(());
     server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn candidate_rpcs_require_signed_identity_before_preparing_or_promoting() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let ces = CatalogCesService::new(
+        service.clone(),
+        DdlIdentityPolicy::require_signed(DdlIdentityVerifier::from_secret(
+            b"catalog-integration-key-at-least-32-bytes".to_vec(),
+        )?),
+    );
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let properties = (0..20)
+        .map(|index| format!("'vendor.key{index}'='value{index}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prepare = rpc::PrepareTableRequest {
+        ddl: format!(
+            "CREATE TABLE telemetry.prod.signed (event_id BIGINT NOT NULL) USING DELTA TBLPROPERTIES ({properties})"
+        ),
+    };
+    let error = ces
+        .prepare_table(Request::new(prepare.clone()))
+        .await
+        .err()
+        .context("anonymous prepare")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    let mut request = Request::new(prepare);
+    signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/PrepareTable")?;
+    let candidate = ces.prepare_table(request).await?.into_inner();
+    let promote = rpc::PromoteTableRequest {
+        candidate: Some(candidate),
+    };
+    let error = ces
+        .promote_table(Request::new(promote.clone()))
+        .await
+        .err()
+        .context("anonymous promote")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.state.lock().await.tables.is_empty());
+    let mut request = Request::new(promote);
+    signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/PromoteTable")?;
+    let (metadata, extensions, message) = request.into_parts();
+    let wire = message.encode_to_vec();
+    let decoded = rpc::PromoteTableRequest::decode(wire.as_slice())?;
+    assert_eq!(
+        wire,
+        decoded.encode_to_vec(),
+        "signed candidate map encoding survives transport"
+    );
+    let mut tampered = decoded.clone();
+    tampered
+        .candidate
+        .as_mut()
+        .context("candidate")?
+        .properties
+        .insert("vendor.key0".into(), "changed".into());
+    let error = ces
+        .promote_table(Request::from_parts(metadata.clone(), extensions.clone(), tampered))
+        .await
+        .err()
+        .context("modified signed candidate")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    ces.promote_table(Request::from_parts(metadata, extensions, decoded))
+        .await?;
+    assert_eq!(service.state.lock().await.tables.len(), 1);
     Ok(())
 }
 

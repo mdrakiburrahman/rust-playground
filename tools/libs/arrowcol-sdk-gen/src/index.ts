@@ -115,8 +115,8 @@ export class SdkGenerationTool {
         ]),
         this.#command('npx', [
           '--no-install', 'buf', 'breaking',
-          `${evolvedFixtureArtifacts}/schema.proto`,
-          '--against', `${fixtureArtifacts}/schema.proto`,
+          `${evolvedFixtureArtifacts}/descriptor.pb#format=binpb`,
+          '--against', `${fixtureArtifacts}/descriptor.pb#format=binpb`,
           '--config', 'buf.yaml',
         ]),
       ],
@@ -144,6 +144,11 @@ export class SdkGenerationTool {
     cpSync(
       resolve(this.#workspace, source, 'descriptors'),
       resolve(validation, 'descriptors'),
+      { recursive: true },
+    );
+    cpSync(
+      resolve(this.#workspace, source, 'runtime'),
+      resolve(validation, 'runtime'),
       { recursive: true },
     );
 

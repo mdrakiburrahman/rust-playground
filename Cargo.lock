@@ -803,14 +803,17 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "clap",
+ "fs2",
  "futures",
  "hmac",
  "opentelemetry 0.31.0",
  "prost 0.14.4",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thrift",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -998,6 +1001,20 @@ name = "arrowcol-props"
 version = "0.1.0"
 
 [[package]]
+name = "arrowcol-protoc"
+version = "0.1.0"
+dependencies = [
+ "arrowcol-catalog",
+ "arrowcol-sdk-gen",
+ "clap",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arrowcol-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1067,6 +1084,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrowcol-sdk-ffi"
+version = "0.1.0"
+dependencies = [
+ "arrowcol-sdk-runtime",
+ "prost 0.14.4",
+ "prost-reflect",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "arrowcol-sdk-gen"
 version = "0.1.0"
 dependencies = [
@@ -1075,6 +1103,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "arrowcol-catalog",
  "arrowcol-catalog-client",
+ "arrowcol-props",
  "arrowcol-protocol",
  "clap",
  "flate2",
@@ -1091,6 +1120,28 @@ dependencies = [
  "tar",
  "thiserror 2.0.21",
  "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "arrowcol-sdk-runtime"
+version = "0.1.0"
+dependencies = [
+ "arrow-array 58.4.0",
+ "arrow-flight",
+ "arrow-ipc 58.4.0",
+ "arrow-schema 58.4.0",
+ "arrow-select 58.4.0",
+ "futures",
+ "prost 0.14.4",
+ "prost-reflect",
+ "prost-types 0.14.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -6643,6 +6694,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-reflect"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b80ea363c31af2de2b92e3c07ed1156628f7838c4afb4df75ee78a37fedbd1"
+dependencies = [
+ "prost 0.14.4",
+ "prost-reflect-derive",
+ "prost-types 0.14.4",
+]
+
+[[package]]
+name = "prost-reflect-derive"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30320eb03b43b7dfcaf9b361f808a4f1adad1e718ad219df1d7e4283e34e73f5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7575,9 +7648,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
@@ -8232,6 +8305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadpool"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
+dependencies = [
+ "num_cpus",
+]
+
+[[package]]
 name = "thrift"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8239,7 +8321,9 @@ checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
 dependencies = [
  "byteorder",
  "integer-encoding",
+ "log",
  "ordered-float",
+ "threadpool",
 ]
 
 [[package]]
