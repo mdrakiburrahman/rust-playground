@@ -1643,6 +1643,11 @@ pub struct LayoutTunables {
     pub detach_ratio: Option<u8>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_detach_kernel"
+    )]
+    pub detach_kernel: Option<arrow_deltalake::layout::DetachKernel>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present_sort_execution"
     )]
     pub sort_execution: Option<arrow_deltalake::layout::SortExecution>,
@@ -1902,6 +1907,12 @@ fn deserialize_present_sort_execution<'de, D: serde::Deserializer<'de>>(
     arrow_deltalake::layout::SortExecution::deserialize(deserializer)
         .map(Some)
         .map_err(|error| serde::de::Error::custom(format!("collector.layout.sort_execution: {error}")))
+}
+
+fn deserialize_detach_kernel<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::layout::DetachKernel>, D::Error> {
+    deserialize_mode(d, "collector.layout.detach_kernel")
 }
 
 fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

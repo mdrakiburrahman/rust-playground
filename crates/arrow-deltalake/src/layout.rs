@@ -18,12 +18,31 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DetachKernel {
+    #[default]
+    Take,
+    BulkFlat,
+}
+
+impl DetachKernel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Take => "take",
+            Self::BulkFlat => "bulk_flat",
+        }
+    }
+}
+
 /// Collector execution strategy; maintenance always uses its existing file sorter.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", try_from = "String")]
 pub enum SortExecution {
     #[default]
     Concatenate,
+    BatchRuns,
     StreamUnordered,
     VerifyOrder,
 }
@@ -33,6 +52,7 @@ impl std::str::FromStr for SortExecution {
     fn from_str(raw: &str) -> Result<Self> {
         match raw {
             "concatenate" => Ok(Self::Concatenate),
+            "batch_runs" => Ok(Self::BatchRuns),
             "stream_unordered" => Ok(Self::StreamUnordered),
             "verify_order" => Ok(Self::VerifyOrder),
             _ => anyhow::bail!("unknown collector layout sort_execution: {raw}"),
@@ -52,6 +72,7 @@ impl SortExecution {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Concatenate => "concatenate",
+            Self::BatchRuns => "batch_runs",
             Self::StreamUnordered => "stream_unordered",
             Self::VerifyOrder => "verify_order",
         }
@@ -62,6 +83,10 @@ impl SortExecution {
     pub fn validate(self, enabled: bool, has_keys: bool) -> Result<()> {
         match self {
             Self::Concatenate => (),
+            Self::BatchRuns => ensure!(
+                enabled && has_keys,
+                "batch_runs requires enabled layout with non-empty sort_columns"
+            ),
             Self::StreamUnordered => ensure!(
                 enabled && !has_keys,
                 "stream_unordered requires enabled layout with empty sort_columns"
@@ -337,6 +362,7 @@ pub struct FileSortBuffer {
     schema: SchemaRef,
     policy: LayoutPolicy,
     batches: Vec<RecordBatch>,
+    batch_runs: bool,
     rows: usize,
     input_bytes: usize,
 }
@@ -352,6 +378,7 @@ impl FileSortBuffer {
             schema,
             policy,
             batches: Vec::new(),
+            batch_runs: false,
             rows: 0,
             input_bytes: 0,
         })
@@ -417,6 +444,15 @@ impl FileSortBuffer {
     /// # Errors
     /// Returns Arrow concatenation, ordering, or permutation errors.
     pub fn finish(self) -> Result<RecordBatch> {
+        if self.batch_runs
+            && !self.batches.is_empty()
+            && let Some(order) = self.ordered_batch_runs()?
+        {
+            return Ok(concat_batches(
+                &self.schema,
+                order.into_iter().map(|i| &self.batches[i]),
+            )?);
+        }
         if self.batches.len() > 1
             && !self.policy.sort_columns.is_empty()
             && self.schema.fields().iter().all(|field| gatherable(field.data_type()))
@@ -438,6 +474,49 @@ impl FileSortBuffer {
             .map(|column| take(column, &indices, None))
             .collect::<arrow::error::Result<Vec<_>>>()?;
         Ok(RecordBatch::try_new(self.schema, arrays)?)
+    }
+
+    // A run is usable only if every row is ordered and its entire key range precedes the next.
+    fn ordered_batch_runs(&self) -> Result<Option<Vec<usize>>> {
+        let mut bounds = vec![Vec::new(); self.policy.sort_columns.len()];
+        for batch in &self.batches {
+            let keys = self.sort_columns(batch)?;
+            if !ordered_within(&keys, batch.num_rows())? {
+                return Ok(None);
+            }
+            if self.batches.len() == 1 {
+                return Ok(Some(vec![0]));
+            }
+            for (bound, key) in bounds.iter_mut().zip(keys) {
+                bound.push(key.values.slice(0, 1));
+                bound.push(key.values.slice(batch.num_rows() - 1, 1));
+            }
+        }
+        let bounds = bounds
+            .into_iter()
+            .enumerate()
+            .map(|(key, slices)| {
+                let chunks = slices.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+                Ok(SortColumn {
+                    values: concat(&chunks)?,
+                    options: Some(self.sort_options(key)),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cmp = arrow::compute::LexicographicalComparator::try_new(&bounds)?;
+        let mut runs: Vec<_> = (0..self.batches.len()).collect();
+        runs.sort_by(|a, b| {
+            cmp.compare(a * 2, b * 2)
+                .then_with(|| cmp.compare(a * 2 + 1, b * 2 + 1))
+        });
+        Ok(runs
+            .windows(2)
+            .all(|w| match cmp.compare(w[0] * 2 + 1, w[1] * 2) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => w[0] < w[1],
+                std::cmp::Ordering::Greater => false,
+            })
+            .then_some(runs))
     }
 
     /// Gather the sorted rows straight from the retained batches, so only the key columns are
@@ -518,13 +597,18 @@ impl FileSortBuffer {
 }
 
 /// Types whose concatenate-then-take and direct interleave results hold identical values.
-fn gatherable(data_type: &arrow::datatypes::DataType) -> bool {
+pub(crate) fn gatherable(data_type: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
     data_type.primitive_width().is_some()
         || matches!(
             data_type,
             DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
         )
+}
+
+fn ordered_within(keys: &[SortColumn], rows: usize) -> Result<bool> {
+    let cmp = arrow::compute::LexicographicalComparator::try_new(keys)?;
+    Ok((1..rows).all(|i| !cmp.compare(i - 1, i).is_gt()))
 }
 
 #[cfg(feature = "delta")]
@@ -538,8 +622,10 @@ pub(crate) struct PublicationSorter {
 impl PublicationSorter {
     pub(crate) fn new(schema: SchemaRef, policy: LayoutPolicy, mode: SortExecution) -> Result<Self> {
         mode.validate(true, !policy.sort_columns.is_empty())?;
+        let mut buffer = FileSortBuffer::new(schema, policy)?;
+        buffer.batch_runs = mode == SortExecution::BatchRuns;
         Ok(Self {
-            buffer: FileSortBuffer::new(schema, policy)?,
+            buffer,
             mode,
             last_keys: Vec::new(),
         })
@@ -547,7 +633,7 @@ impl PublicationSorter {
 
     /// Returns true when the admitted batch should be encoded immediately.
     pub(crate) fn admit(&mut self, batch: &RecordBatch) -> Result<bool> {
-        let buffered = self.mode == SortExecution::Concatenate;
+        let buffered = matches!(self.mode, SortExecution::Concatenate | SortExecution::BatchRuns);
         let admitted = if buffered {
             self.buffer.try_push(batch)?
         } else {
@@ -571,9 +657,8 @@ impl PublicationSorter {
                     std::cmp::Ordering::Greater => anyhow::bail!("verify_order: unsorted batch boundary"),
                 }
             }
-            let cmp = arrow::compute::LexicographicalComparator::try_new(&keys)?;
             ensure!(
-                (1..batch.num_rows()).all(|i| !cmp.compare(i - 1, i).is_gt()),
+                ordered_within(&keys, batch.num_rows())?,
                 "verify_order: unsorted rows within batch"
             );
             self.last_keys = keys
@@ -585,7 +670,7 @@ impl PublicationSorter {
     }
 
     pub(crate) fn into_buffer(self) -> Option<FileSortBuffer> {
-        (self.mode == SortExecution::Concatenate).then_some(self.buffer)
+        matches!(self.mode, SortExecution::Concatenate | SortExecution::BatchRuns).then_some(self.buffer)
     }
 }
 
@@ -643,6 +728,31 @@ mod tests {
         assert_eq!(sorted.schema(), a.schema());
         assert_eq!(sorted.column(0).as_ref(), &StringArray::from(vec!["a", "a", "z", "z"]));
         assert_eq!(sorted.column(1).as_ref(), &Int32Array::from(vec![1, 2, 3, 4]));
+        Ok(())
+    }
+
+    #[test]
+    fn batch_runs_reorders_disjoint_ranges_and_sorts_inversions() -> Result<()> {
+        let policy = LayoutPolicy {
+            sort_columns: vec!["customer_id".into(), "value".into()],
+            ..LayoutPolicy::default()
+        };
+        let make = |values: Vec<i32>| batch(vec!["same"; values.len()], values);
+        for (first, second, run_order, expected) in [
+            (vec![3, 4], vec![1, 2], Some(vec![1, 0]), [1, 2, 3, 4]),
+            (vec![1, 4], vec![2, 3], None, [1, 2, 3, 4]),
+            (vec![1, 3, 2], vec![4], None, [1, 2, 3, 4]),
+            (vec![2, 3], vec![1, 2], None, [1, 2, 2, 3]),
+            (vec![1, 2], vec![2, 3], Some(vec![0, 1]), [1, 2, 2, 3]),
+        ] {
+            let a = make(first)?;
+            let b = make(second)?;
+            let mut buffer = FileSortBuffer::new(a.schema(), policy.clone())?;
+            buffer.batch_runs = true;
+            assert!(buffer.try_push(&a)? && buffer.try_push(&b)?);
+            assert_eq!(buffer.ordered_batch_runs()?, run_order);
+            assert_eq!(buffer.finish()?.column(1).as_ref(), &Int32Array::from(expected.to_vec()));
+        }
         Ok(())
     }
 

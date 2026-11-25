@@ -563,6 +563,7 @@ fn candidates(path: &str) -> Vec<Value> {
         "collector.commit.checkpoint_interval" => return vec![json!(17)],
         "collector.commit.trigger" => return vec![json!("eager"), json!("window")],
         "collector.runtime.cpu_dispatch" => return vec![json!("bounded_shards")],
+        "collector.layout.detach_kernel" => return vec![json!("bulk_flat"), json!("take")],
         "collector.runtime.local_directory_sync_policy" => {
             return vec![json!("before_commit"), json!("per_file")];
         }
@@ -579,7 +580,7 @@ fn candidates(path: &str) -> Vec<Value> {
         return vec![json!("fused_checked")];
     }
     if path == "collector.layout.sort_execution" {
-        return vec![json!("verify_order")];
+        return vec![json!("verify_order"), json!("batch_runs")];
     }
     if matches!(
         path,
@@ -877,8 +878,16 @@ fn duration_run_classifies_one_shot_max_rows_as_inert() -> Result<()> {
 }
 
 #[test]
-fn cpu_modes_and_stage_concurrency_require_typed_named_values() -> Result<()> {
+fn collector_modes_and_stage_concurrency_require_typed_named_values() -> Result<()> {
     for (path, invalid) in [
+        (
+            "collector.layout.detach_kernel",
+            vec![Value::Null, json!("BulkFlat"), json!({"bulk_flat":null})],
+        ),
+        (
+            "collector.layout.sort_execution",
+            vec![Value::Null, json!("BatchRuns"), json!({"batch_runs":null})],
+        ),
         (
             "collector.runtime.cpu_dispatch",
             vec![

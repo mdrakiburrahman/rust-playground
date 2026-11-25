@@ -60,6 +60,8 @@ pub struct DeltaRuntimeConfig {
     /// Detach sorted input from its parent allocation above this charged/logical size ratio.
     #[serde(default = "default_detach_ratio")]
     pub layout_detach_ratio: usize,
+    #[serde(default)]
+    pub layout_detach_kernel: crate::layout::DetachKernel,
     /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
     /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
@@ -147,6 +149,7 @@ impl DeltaRuntimeConfig {
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
             blocking_fs_reserve: 1,
             layout_detach_ratio: default_detach_ratio(),
+            layout_detach_kernel: Default::default(),
             upload_limit: 32,
             upload_mode: UploadMode::PutCreate,
             staging_mode: Default::default(),
@@ -242,6 +245,11 @@ impl DeltaRuntimeConfig {
         let name = "ARROWCOL_COLLECTOR_TIMESTAMP_KERNEL";
         if let Some(raw) = lookup(name)? {
             config.timestamp_kernel =
+                serde_json::from_value(serde_json::Value::String(raw)).with_context(|| format!("parse {name}"))?;
+        }
+        let name = "ARROWCOL_COLLECTOR_LAYOUT_DETACH_KERNEL";
+        if let Some(raw) = lookup(name)? {
+            config.layout_detach_kernel =
                 serde_json::from_value(serde_json::Value::String(raw)).with_context(|| format!("parse {name}"))?;
         }
         let name = "ARROWCOL_COLLECTOR_CPU_DISPATCH";

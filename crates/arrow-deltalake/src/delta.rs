@@ -3,7 +3,7 @@
 pub(crate) mod streaming_sink;
 pub use crate::delta_io::spawn_shared_io;
 use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executor};
-use crate::layout::{PublicationSorter, SortExecution};
+use crate::layout::{DetachKernel, PublicationSorter, SortExecution};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
@@ -617,12 +617,18 @@ mod io_tests {
     fn fitting_sort_chunk_preserves_ownership_and_exact_budget_behavior() -> Result<()> {
         use arrow::array::{ArrayRef, StringArray, UInt32Array};
 
-        fn original(batch: &RecordBatch, start: usize, rows: usize, bytes: usize) -> Result<Option<RecordBatch>> {
+        fn original(
+            batch: &RecordBatch,
+            start: usize,
+            rows: usize,
+            bytes: usize,
+            kernel: DetachKernel,
+        ) -> Result<Option<RecordBatch>> {
             let mut low = 0;
             let mut high = rows.min(batch.num_rows().saturating_sub(start));
             while low < high {
                 let mid = low + (high - low).div_ceil(2);
-                if owned_for_sort(batch.slice(start, mid), 2)?.get_array_memory_size() <= bytes {
+                if owned_for_sort(batch.slice(start, mid), 2, kernel)?.get_array_memory_size() <= bytes {
                     low = mid;
                 } else {
                     high = mid - 1;
@@ -631,7 +637,7 @@ mod io_tests {
             if low == 0 {
                 Ok(None)
             } else {
-                Ok(Some(owned_for_sort(batch.slice(start, low), 2)?))
+                Ok(Some(owned_for_sort(batch.slice(start, low), 2, kernel)?))
             }
         }
 
@@ -640,8 +646,10 @@ mod io_tests {
             (0..2048).map(|i| (i % 7 != 0).then(|| format!("{i:04}-{}", "x".repeat(128)))),
         )) as ArrayRef;
         let compact = RecordBatch::try_from_iter(vec![("id", Arc::clone(&ids))])?.slice(0, 1024);
-        let retained = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 8)?.context("retain slice")?;
-        let detached = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 1)?.context("detach slice")?;
+        let retained = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 8, DetachKernel::Take)?
+            .context("retain slice")?;
+        let detached = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 1, DetachKernel::Take)?
+            .context("detach slice")?;
         assert_eq!(retained, detached);
         assert_eq!(
             retained.column(0).to_data().buffers()[0].as_ptr(),
@@ -654,7 +662,7 @@ mod io_tests {
         let batch = RecordBatch::try_from_iter(vec![("id", ids), ("text", strings)])?.slice(1000, 128);
         let (logical, bound) = flat_take_prefix_bound(&batch).context("flat bound")?;
         assert!(batch.get_array_memory_size() > logical * 2);
-        let full = fitting_sort_chunk(&batch, 0, 128, bound, 2)?.context("full chunk")?;
+        let full = fitting_sort_chunk(&batch, 0, 128, bound, 2, DetachKernel::Take)?.context("full chunk")?;
         assert_eq!(full, batch);
         assert!(full.get_array_memory_size() < batch.get_array_memory_size());
         assert_ne!(
@@ -663,10 +671,10 @@ mod io_tests {
         );
         for rows in 1..=128 {
             let (_, upper) = flat_take_prefix_bound(&batch.slice(0, rows)).context("prefix bound")?;
-            assert!(owned_for_sort(batch.slice(0, rows), 2)?.get_array_memory_size() <= upper);
+            assert!(owned_for_sort(batch.slice(0, rows), 2, DetachKernel::Take)?.get_array_memory_size() <= upper);
         }
-        let one_row = owned_for_sort(batch.slice(0, 1), 2)?.get_array_memory_size();
-        let almost_full = owned_for_sort(batch.slice(0, 127), 2)?.get_array_memory_size();
+        let one_row = owned_for_sort(batch.slice(0, 1), 2, DetachKernel::Take)?.get_array_memory_size();
+        let almost_full = owned_for_sort(batch.slice(0, 127), 2, DetachKernel::Take)?.get_array_memory_size();
         for budget in [
             0,
             one_row - 1,
@@ -679,11 +687,13 @@ mod io_tests {
             usize::MAX,
         ] {
             for rows in [1, 63, 128] {
-                let actual = fitting_sort_chunk(&batch, 0, rows, budget, 2)?;
-                let expected = original(&batch, 0, rows, budget)?;
-                assert_eq!(actual, expected);
-                if let Some(actual) = actual {
-                    assert!(actual.get_array_memory_size() <= budget);
+                for kernel in [DetachKernel::Take, DetachKernel::BulkFlat] {
+                    let actual = fitting_sort_chunk(&batch, 0, rows, budget, 2, kernel)?;
+                    let expected = original(&batch, 0, rows, budget, DetachKernel::Take)?;
+                    assert_eq!(actual, expected);
+                    if let Some(actual) = actual {
+                        assert!(actual.get_array_memory_size() <= budget);
+                    }
                 }
             }
         }
@@ -696,9 +706,76 @@ mod io_tests {
         assert!(flat_take_prefix_bound(&nested).is_none());
         for budget in [0, 512, usize::MAX] {
             assert_eq!(
-                fitting_sort_chunk(&nested, 0, 128, budget, 2)?,
-                original(&nested, 0, 128, budget)?
+                fitting_sort_chunk(&nested, 0, 128, budget, 2, DetachKernel::BulkFlat)?,
+                original(&nested, 0, 128, budget, DetachKernel::Take)?
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_flat_detaches_sliced_nullable_buffers_with_identical_parquet_bytes() -> Result<()> {
+        use arrow::array::{ArrayRef, BooleanArray, Int64Array, LargeBinaryArray, StringArray};
+        use parquet::arrow::ArrowWriter;
+
+        fn parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
+            let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), None)?;
+            writer.write(batch)?;
+            Ok(writer.into_inner()?)
+        }
+
+        let rows = 0..2048;
+        let prefix = RecordBatch::try_from_iter([
+            (
+                "label",
+                Arc::new(StringArray::from_iter_values(rows.clone().map(|i| format!("v{i}")))) as ArrayRef,
+            ),
+            (
+                "key_bytes",
+                Arc::new(LargeBinaryArray::from_iter_values(rows.clone().map(|_| &b"k"[..]))) as ArrayRef,
+            ),
+            (
+                "key",
+                Arc::new(StringArray::from_iter(
+                    rows.clone().map(|i| (i % 5 != 0).then(|| i.to_string())),
+                )) as ArrayRef,
+            ),
+            (
+                "n",
+                Arc::new(Int64Array::from_iter(rows.clone().map(|i| (i % 7 != 0).then_some(i)))) as ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(BooleanArray::from_iter(
+                    rows.clone().map(|i| (i % 3 != 0).then_some(i % 2 == 0)),
+                )) as ArrayRef,
+            ),
+            (
+                "bytes",
+                Arc::new(LargeBinaryArray::from_iter(
+                    rows.map(|i| (i % 4 != 0).then_some(&b"abc"[..])),
+                )) as ArrayRef,
+            ),
+        ])?
+        .slice(39, 251);
+        let bulk = owned_for_sort(prefix.clone(), 1, DetachKernel::BulkFlat)?;
+        let taken = owned_for_sort(prefix.clone(), 1, DetachKernel::Take)?;
+        assert_eq!(bulk, prefix);
+        assert_eq!(parquet(&bulk)?, parquet(&taken)?);
+        for rows in 1..=prefix.num_rows() {
+            let slice = prefix.slice(0, rows);
+            let taken = owned_for_sort(slice.clone(), 1, DetachKernel::Take)?;
+            let bulk = owned_for_sort(slice, 1, DetachKernel::BulkFlat)?;
+            assert_eq!(
+                taken.get_array_memory_size(),
+                bulk.get_array_memory_size(),
+                "prefix of {rows} rows"
+            );
+        }
+        for (source, result) in prefix.columns().iter().zip(bulk.columns()) {
+            for (a, b) in source.to_data().buffers().iter().zip(result.to_data().buffers()) {
+                assert_ne!(a.data_ptr(), b.data_ptr());
+            }
         }
         Ok(())
     }
@@ -3691,19 +3768,12 @@ pub(crate) fn reclaim_abandoned_group(files: Vec<StagedAppend>) {
 // array headers, an extra byte-array offset and rounded bitmap allocations.
 // Nested and other types use the exact materializing search below.
 fn flat_take_prefix_bound(batch: &RecordBatch) -> Option<(usize, usize)> {
-    use arrow::datatypes::DataType;
-
     let alignment = arrow::alloc::ALIGNMENT;
     let mut logical = 0usize;
     let mut bound = 0usize;
     for column in batch.columns() {
         let ty = column.data_type();
-        if ty.primitive_width().is_none()
-            && !matches!(
-                ty,
-                DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-            )
-        {
+        if !crate::layout::gatherable(ty) {
             return None;
         }
         let bytes = column.to_data().get_slice_memory_size().ok()?;
@@ -3726,6 +3796,7 @@ fn fitting_sort_chunk(
     max_rows: usize,
     max_bytes: usize,
     detach_ratio: usize,
+    kernel: DetachKernel,
 ) -> Result<Option<RecordBatch>> {
     let remaining = batch.num_rows().saturating_sub(start);
     let mut low = 0;
@@ -3737,7 +3808,7 @@ fn fitting_sort_chunk(
             // A prefix either keeps the original buffers or is copied. If the
             // full slice is copied, all shorter flat prefixes are copied too.
             if copy_bound <= max_bytes && (charged <= max_bytes || charged > logical.saturating_mul(detach_ratio)) {
-                let candidate = owned_for_sort(full, detach_ratio)?;
+                let candidate = owned_for_sort(full, detach_ratio, kernel)?;
                 if candidate.get_array_memory_size() <= max_bytes {
                     return Ok(Some(candidate));
                 }
@@ -3746,7 +3817,7 @@ fn fitting_sort_chunk(
     }
     while low < high {
         let rows = low + (high - low).div_ceil(2);
-        let candidate = owned_for_sort(batch.slice(start, rows), detach_ratio)?;
+        let candidate = owned_for_sort(batch.slice(start, rows), detach_ratio, kernel)?;
         if candidate.get_array_memory_size() <= max_bytes {
             low = rows;
         } else {
@@ -3756,7 +3827,7 @@ fn fitting_sort_chunk(
     if low == 0 {
         return Ok(None);
     }
-    Ok(Some(owned_for_sort(batch.slice(start, low), detach_ratio)?))
+    Ok(Some(owned_for_sort(batch.slice(start, low), detach_ratio, kernel)?))
 }
 
 /// Local table ownership and Kernel engine. Hold one instance per table.
@@ -3891,6 +3962,7 @@ impl LayoutReadback {
                 .map(|column| column.path().string())
                 .collect::<Vec<_>>();
             config["detach_ratio"] = serde_json::json!(runtime_config()?.layout_detach_ratio);
+            config["detach_kernel"] = serde_json::json!(runtime_config()?.layout_detach_kernel);
             config["bloom_columns"] = serde_json::json!(bloom_columns);
             config["row_group_rows"] = serde_json::json!(
                 properties
@@ -5927,8 +5999,14 @@ impl DeltaTable {
                     let row_capacity = policy.max_rows.saturating_sub(partition.file_rows[file]);
                     let byte_capacity = policy.max_input_bytes.saturating_sub(partition.file_bytes[file]);
                     let sort_started = Instant::now();
-                    let chunk =
-                        fitting_sort_chunk(&batch, start, row_capacity, byte_capacity, runtime.layout_detach_ratio);
+                    let chunk = fitting_sort_chunk(
+                        &batch,
+                        start,
+                        row_capacity,
+                        byte_capacity,
+                        runtime.layout_detach_ratio,
+                        runtime.layout_detach_kernel,
+                    );
                     preparation_sort += sort_started.elapsed();
                     let chunk = chunk?;
                     let Some(chunk) = chunk else {
@@ -7107,15 +7185,56 @@ impl StagedAppend {
 /// slice bytes, copy rows into fresh buffers: the parent is released instead of retained
 /// and the unchanged sort-budget guard then measures real memory. Batches built with
 /// their own buffers are retained without a copy.
-fn owned_for_sort(batch: RecordBatch, detach_ratio: usize) -> Result<RecordBatch> {
+fn owned_for_sort(batch: RecordBatch, detach_ratio: usize, kernel: DetachKernel) -> Result<RecordBatch> {
     let charged = u64::try_from(batch.get_array_memory_size()).context("Arrow memory charge exceeds u64")?;
     let logical = crate::record_batch_logical_bytes(&batch)?;
     if charged <= logical.saturating_mul(u64::try_from(detach_ratio)?) {
         return Ok(batch);
     }
     let rows = u32::try_from(batch.num_rows()).context("sorted batch row count exceeds u32")?;
+    if kernel == DetachKernel::BulkFlat {
+        use arrow::array::{ArrayRef, AsArray, UInt32Array};
+        use arrow::datatypes::DataType;
+        let mut indices = None;
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|col| -> Result<ArrayRef> {
+                if col.null_count() == 0 {
+                    match col.data_type() {
+                        DataType::Utf8 => return bulk_byte_slice(col.as_string::<i32>()),
+                        DataType::LargeUtf8 => return bulk_byte_slice(col.as_string::<i64>()),
+                        DataType::Binary => return bulk_byte_slice(col.as_binary::<i32>()),
+                        DataType::LargeBinary => return bulk_byte_slice(col.as_binary::<i64>()),
+                        _ => {}
+                    }
+                }
+                let indices = indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
+                Ok(arrow::compute::take(col.as_ref(), indices, None)?)
+            })
+            .collect::<Result<_>>()?;
+        return Ok(RecordBatch::try_new(batch.schema(), columns)?);
+    }
     let indices = arrow::array::UInt32Array::from_iter_values(0..rows);
     Ok(arrow::compute::take_record_batch(&batch, &indices)?)
+}
+
+fn bulk_byte_slice<T: arrow::datatypes::ByteArrayType>(
+    array: &arrow::array::GenericByteArray<T>,
+) -> Result<arrow::array::ArrayRef> {
+    use arrow::datatypes::ArrowNativeType;
+    let offsets = array.value_offsets();
+    let first = offsets[0];
+    let end = offsets[offsets.len() - 1].as_usize();
+    // Match take's exact Vec capacities: even a rounded allocation can change a budgeted file boundary.
+    let mut rebased = Vec::with_capacity(offsets.len());
+    rebased.extend(offsets.iter().map(|&offset| offset - first));
+    let values = array.value_data()[first.as_usize()..end].to_vec();
+    Ok(Arc::new(arrow::array::GenericByteArray::<T>::try_new(
+        arrow::buffer::OffsetBuffer::new(rebased.into()),
+        values.into(),
+        None,
+    )?))
 }
 
 impl StagedAppend {
@@ -7435,7 +7554,8 @@ impl DeltaFileWriter {
         self.stage_timings.build += build_started.elapsed();
         let encode = if let Some(sorter) = &mut self.sorter {
             let sort_started = Instant::now();
-            let physical = owned_for_sort(physical, runtime_config()?.layout_detach_ratio)?;
+            let runtime = runtime_config()?;
+            let physical = owned_for_sort(physical, runtime.layout_detach_ratio, runtime.layout_detach_kernel)?;
             let encode = sorter.admit(&physical)?;
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
             encode.then_some(physical)

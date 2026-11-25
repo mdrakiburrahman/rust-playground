@@ -309,6 +309,7 @@ const CAPABILITIES: &[Capability] = &[
         "customer_id (comma-separated; empty disables Bloom filters)"
     ),
     capability!("collector.layout.detach_ratio", "2"),
+    capability!("collector.layout.detach_kernel", "take"),
     capability!("collector.layout.max_rows", "262144"),
     capability!("collector.layout.max_input_bytes", "67108864"),
     capability!("collector.layout.row_group_rows", "16384"),
@@ -1414,6 +1415,9 @@ impl Tunables {
                     if let Some(mode) = layout.sort_execution {
                         output.insert("ARROWCOL_COLLECTOR_LAYOUT_SORT_EXECUTION".into(), mode.as_str().into());
                     }
+                    if let Some(kernel) = layout.detach_kernel {
+                        output.insert("ARROWCOL_COLLECTOR_LAYOUT_DETACH_KERNEL".into(), kernel.as_str().into());
+                    }
                     if let Some(options) = &layout.sort_options {
                         output.insert(
                             "ARROWCOL_COLLECTOR_SORT_OPTIONS".to_owned(),
@@ -1906,6 +1910,7 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
         );
     }
     let has_overrides = layout.sort_execution.is_some()
+        || layout.detach_kernel.is_some()
         || layout.sort_columns.is_some()
         || layout.sort_options.is_some()
         || layout.bloom_columns.is_some()

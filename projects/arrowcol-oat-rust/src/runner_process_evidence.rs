@@ -831,6 +831,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
             "ARROWCOL_COLLECTOR_LAYOUT_DETACH_RATIO" => "/runtime/layout_detach_ratio".to_owned(),
+            "ARROWCOL_COLLECTOR_LAYOUT_DETACH_KERNEL" => "/runtime/layout_detach_kernel".to_owned(),
             "ARROWCOL_COLLECTOR_LAYOUT_ENABLED" => "/layout/process_policy/enabled".to_owned(),
             "ARROWCOL_COLLECTOR_SORT_OPTIONS" => {
                 expected = serde_json::to_value(
@@ -1177,6 +1178,12 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
         if let Some(ratio) = value["config"].get("detach_ratio") {
             anyhow::ensure!(enabled && ratio.as_u64().is_some_and(|ratio| (1..=8).contains(&ratio)), "invalid effective collector.layout.detach_ratio");
             policy.insert("detach_ratio".to_owned(), ratio.clone());
+        }
+        if let Some(kernel) = value["config"].get("detach_kernel") {
+            anyhow::ensure!(enabled && kernel.is_string(), "invalid effective collector.layout.detach_kernel");
+            let kernel: arrow_deltalake::layout::DetachKernel =
+                serde_json::from_value(kernel.clone()).context("invalid effective collector.layout.detach_kernel")?;
+            policy.insert("detach_kernel".to_owned(), json!(kernel));
         }
         let properties = &value["parquet_properties"];
         let valid_properties = properties.as_object().is_some_and(|object| {
@@ -2346,13 +2353,15 @@ mod startup_readback_tests {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
-        let policy = json!({"enabled":true,"sort_execution":"verify_order","sort_columns":["customer_id"],
+        let policy = json!({"enabled":true,"sort_execution":"verify_order","sort_columns":["customer_id"],"detach_kernel":"bulk_flat",
             "sort_options":[{"column":"customer_id","direction":"descending","nulls":"first"}],"bloom_columns":[],
             "max_rows":777,"max_input_bytes":1_048_576,"row_group_rows":123,"page_rows":17});
         config.tunables = serde_json::from_value(json!({"collector":{"layout":policy}}))?;
+        let mut process_policy = policy.clone();
+        process_policy.as_object_mut().context("layout object")?.remove("detach_kernel");
         let startup = format!(
             "arrowcol_effective_config {}\n",
-            json!({"layout":{"process_policy":policy,"table_properties_override":true}})
+            json!({"layout":{"process_policy":process_policy,"table_properties_override":true},"runtime":{"layout_detach_kernel":"bulk_flat"}})
         );
         let readback = process_configurations(&startup)?;
         verify_process_configuration(&config, ComponentRole::Collector, &readback)?;
@@ -2376,7 +2385,7 @@ mod startup_readback_tests {
             "arrowcol_effective_config {event}\narrowcol_effective_config {event}\n"
         ));
         let readback = process_configurations(&log.text)?;
-        assert_eq!(readback["layout"]["process_policy"], policy);
+        assert_eq!(readback["layout"]["process_policy"], process_policy);
         assert!(readback.get("table_id").is_none());
         let evidence = process_evidence(&config, std::slice::from_ref(&log))?;
         assert_eq!(
