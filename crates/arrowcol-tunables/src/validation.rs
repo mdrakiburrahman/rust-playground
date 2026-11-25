@@ -609,6 +609,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.isolation_level", "l5"),
     capability!("collector.commit.snapshot_cache_mode", "json_only"),
     capability!("collector.commit.snapshot_list_mode", "full"),
+    capability!("collector.commit.stage_snapshot_mode", "per_file"),
     capability!("collector.commit.preflight_lookup_mode", "per_entry"),
     capability!("collector.commit.checkpoint_mode", "external"),
     capability!("collector.commit.checkpoint_interval", "10"),
@@ -2206,6 +2207,7 @@ fn commit_modes_reject_invalid_inputs_by_field_name() -> Result<()> {
         ("txn_lookup_mode", "Incremental"),
         ("snapshot_cache_mode", "checkpoint-aware"),
         ("snapshot_list_mode", "from-checkpoint"),
+        ("stage_snapshot_mode", "per-group"),
         ("preflight_lookup_mode", "Grouped"),
         ("checkpoint_mode", "Async"),
     ] {

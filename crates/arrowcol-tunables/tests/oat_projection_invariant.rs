@@ -557,6 +557,7 @@ fn candidates(path: &str) -> Vec<Value> {
         }
         "collector.commit.snapshot_cache_mode" => return vec![json!("checkpoint_aware"), json!("json_only")],
         "collector.commit.snapshot_list_mode" => return vec![json!("from_checkpoint"), json!("full")],
+        "collector.commit.stage_snapshot_mode" => return vec![json!("per_group"), json!("per_file")],
         "collector.commit.preflight_lookup_mode" => return vec![json!("grouped"), json!("per_entry")],
         "collector.commit.checkpoint_mode" => return vec![json!("async"), json!("inline"), json!("external")],
         "collector.commit.checkpoint_interval" => return vec![json!(17)],

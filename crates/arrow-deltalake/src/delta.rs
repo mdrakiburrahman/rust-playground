@@ -2308,6 +2308,43 @@ mod io_tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_stage_snapshot_fences_metadata_changes_but_not_data_commits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(dir.path())?;
+        Arc::get_mut(&mut table).context("shared table")?.stage_snapshot_mode = crate::StageSnapshotMode::PerGroup;
+        let batch = input_batch()?;
+        let stage = |id: &str| {
+            let entries = (0..2).map(|i| (batch.clone(), format!("{id}-{i}"), 0, 0)).collect();
+            table.stage_coalesced_publications(entries, 2, 2, 2)
+        };
+        let (files, ids, _, _, _) = stage("first").await?;
+        table.commit_files_with_transaction(&[], "peer", 0)?;
+        let group = |identities| {
+            [CoalescedCommitGroup {
+                start: 0,
+                end: 2,
+                identities,
+            }]
+        };
+        let (version, _, _, _) = table.commit_files_with_groups_timed(&files, &group(ids))?;
+        let (files, ids, _, _, _) = stage("second").await?;
+        let catalog = DeltaTable::open_catalog(table.url.clone())?;
+        let update = catalog.commit_catalog(
+            Some(version),
+            batch.schema(),
+            vec![],
+            BTreeMap::from([("arrowcol.writer.targetFileSize".into(), "123456".into())]),
+            None,
+        )?;
+        let Err(error) = table.commit_files_with_groups_timed(&files, &group(ids)) else {
+            bail!("stale staged definition was published");
+        };
+        assert!(format!("{error:#}").contains("metadata or protocol changed"));
+        assert_eq!(table.version()?, update.version);
+        Ok(())
+    }
+
     fn input_batch() -> Result<RecordBatch> {
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -3565,10 +3602,21 @@ struct PreparedWrite {
 
 struct CoalescedStagePolicy {
     schema: SchemaRef,
+    group_snapshot: Option<GroupStageSnapshot>,
     table_properties: BTreeMap<String, String>,
     resolved: arrowcol_props::ResolvedProps,
     layout: Option<crate::layout::LayoutPolicy>,
     mode: SortExecution,
+}
+
+struct GroupStageSnapshot {
+    snapshot: SnapshotRef,
+    definition: Arc<StagedDefinition>,
+}
+
+struct StagedDefinition {
+    metadata: delta_kernel::actions::Metadata,
+    protocol: delta_kernel::actions::Protocol,
 }
 
 type PublicationIds = Vec<(String, i64, i64)>;
@@ -3725,6 +3773,7 @@ pub struct DeltaTable {
     pub(crate) txn_lookup_mode: crate::TxnLookupMode,
     pub(crate) snapshot_cache_mode: crate::SnapshotCacheMode,
     pub(crate) snapshot_list_mode: crate::SnapshotListMode,
+    pub(crate) stage_snapshot_mode: crate::StageSnapshotMode,
     pub(crate) preflight_lookup_mode: crate::PreflightLookupMode,
     pub(crate) commit_attempts: u32,
     pub(crate) commit_budget: Duration,
@@ -4512,6 +4561,7 @@ impl DeltaTable {
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
             snapshot_list_mode: Default::default(),
+            stage_snapshot_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
             commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
             commit_budget: DEFAULT_COMMIT_BUDGET,
@@ -4839,6 +4889,7 @@ impl DeltaTable {
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
             snapshot_list_mode: Default::default(),
+            stage_snapshot_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
             commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
             commit_budget: DEFAULT_COMMIT_BUDGET,
@@ -5955,11 +6006,23 @@ impl DeltaTable {
         if identities.is_empty() && committed_identities.is_empty() {
             bail!("coalesced publications produced no replay identities");
         }
+        let group_snapshot = if self.stage_snapshot_mode == crate::StageSnapshotMode::PerGroup && planned_files > 1 {
+            let snapshot = self.ensure_schema(Arc::clone(&schema))?;
+            let config = snapshot.table_configuration();
+            let definition = Arc::new(StagedDefinition {
+                metadata: config.metadata().clone(),
+                protocol: config.protocol().clone(),
+            });
+            Some(GroupStageSnapshot { snapshot, definition })
+        } else {
+            None
+        };
         let preparation_build = preparation_started.elapsed().saturating_sub(preparation_sort);
         Ok(CoalescedPlan {
             output,
             policy: CoalescedStagePolicy {
                 schema,
+                group_snapshot,
                 table_properties,
                 resolved,
                 layout,
@@ -5980,6 +6043,10 @@ impl DeltaTable {
         first: bool,
     ) -> Result<StagedAppend> {
         let table = Arc::clone(self);
+        let group_definition = policy
+            .group_snapshot
+            .as_ref()
+            .map(|group| Arc::clone(&group.definition));
         let writer = crate::delta_io::run_cpu_async(move || {
             let executor = shared_executor()?;
             let _guard = executor.enter();
@@ -5988,7 +6055,11 @@ impl DeltaTable {
                 .as_ref()
                 .map(|layout| layout.writer_properties(&physical_writer_schema(&policy.schema, &values)))
                 .transpose()?;
-            let mut writer = table.new_file_bound(Arc::clone(&policy.schema), values, properties, true)?;
+            let mut writer = if let Some(group) = &policy.group_snapshot {
+                table.new_file_from_snapshot(&group.snapshot, values, properties, true)?
+            } else {
+                table.new_file_bound(Arc::clone(&policy.schema), values, properties, true)?
+            };
             let configured = (|| -> Result<()> {
                 anyhow::ensure!(
                     writer.table_properties == policy.table_properties,
@@ -6028,7 +6099,9 @@ impl DeltaTable {
                 prepared_writer.encode_batch(prepared?).await?;
                 writer = prepared_writer;
             }
-            writer.stage().await
+            let mut append = writer.stage().await?;
+            append.group_definition = group_definition;
+            Ok(append)
         }
         .await;
         if result.is_err() {
@@ -6102,9 +6175,19 @@ impl DeltaTable {
         canonical_input: bool,
     ) -> Result<DeltaFileWriter> {
         let snapshot = self.ensure_schema(normalized)?;
+        self.new_file_from_snapshot(&snapshot, values, properties, canonical_input)
+    }
+
+    fn new_file_from_snapshot(
+        self: &Arc<Self>,
+        snapshot: &SnapshotRef,
+        values: BTreeMap<String, Option<String>>,
+        properties: Option<WriterProperties>,
+        canonical_input: bool,
+    ) -> Result<DeltaFileWriter> {
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
         let kernel_schema = snapshot.schema();
-        let transaction = Arc::clone(&snapshot).transaction(self.committer(), &self.engine)?;
+        let transaction = Arc::clone(snapshot).transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
         let mut builder = state.write_context_builder();
         if !values.is_empty() {
@@ -6571,6 +6654,12 @@ impl DeltaTable {
             // reclaim of the same borrowed stage either already won (refused here) or
             // must keep it.
             for append in &pending {
+                if let Some(definition) = &append.group_definition {
+                    let current = snapshot.table_configuration();
+                    if &definition.metadata != current.metadata() || &definition.protocol != current.protocol() {
+                        bail!("table metadata or protocol changed after group staging; retry the publication");
+                    }
+                }
                 append.claim_submission()?;
             }
             let (rows, input_bytes, parquet_bytes, min_ingested_at_ms, max_ingested_at_ms) = pending.iter().try_fold(
@@ -6949,6 +7038,7 @@ pub struct FileStageTimings {
 /// are durable; `before_commit` defers directory-entry durability until publication.
 pub struct StagedAppend {
     pub(crate) table: Arc<DeltaTable>,
+    group_definition: Option<Arc<StagedDefinition>>,
     pub(crate) schema: SchemaRef,
     context: BoundWriteContext,
     pub(crate) file: CompletedFile,
@@ -7466,6 +7556,7 @@ impl DeltaFileWriter {
         self.table.check_publication_async().await?;
         Ok(StagedAppend {
             table: self.table,
+            group_definition: None,
             schema: self.schema,
             context: self.context,
             file,

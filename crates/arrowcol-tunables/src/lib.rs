@@ -1589,6 +1589,8 @@ pub struct CommitTunables {
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub snapshot_list_mode: Option<arrow_deltalake::SnapshotListMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub stage_snapshot_mode: Option<arrow_deltalake::StageSnapshotMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub preflight_lookup_mode: Option<arrow_deltalake::PreflightLookupMode>,
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
     pub checkpoint_mode: Option<arrow_deltalake::CheckpointMode>,

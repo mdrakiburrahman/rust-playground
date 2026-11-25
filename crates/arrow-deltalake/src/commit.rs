@@ -29,6 +29,7 @@ pub struct CommitOptions {
     pub max_pending_files: usize,
     pub snapshot_cache_mode: crate::SnapshotCacheMode,
     pub snapshot_list_mode: crate::SnapshotListMode,
+    pub stage_snapshot_mode: crate::StageSnapshotMode,
     pub preflight_lookup_mode: crate::PreflightLookupMode,
     pub checkpoint_mode: crate::CheckpointMode,
     pub checkpoint_interval: u64,
@@ -47,6 +48,7 @@ impl Default for CommitOptions {
             txn_lookup_mode: Default::default(),
             snapshot_cache_mode: Default::default(),
             snapshot_list_mode: Default::default(),
+            stage_snapshot_mode: Default::default(),
             preflight_lookup_mode: Default::default(),
             checkpoint_mode: Default::default(),
             checkpoint_interval: 10,
@@ -887,6 +889,7 @@ fn run_worker(
             owner.txn_lookup_mode = options.txn_lookup_mode;
             owner.snapshot_cache_mode = options.snapshot_cache_mode;
             owner.snapshot_list_mode = options.snapshot_list_mode;
+            owner.stage_snapshot_mode = options.stage_snapshot_mode;
             owner.preflight_lookup_mode = options.preflight_lookup_mode;
             owner.commit_attempts = options.commit_attempts;
             owner.commit_budget = options.commit_budget;

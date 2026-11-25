@@ -54,7 +54,7 @@ mod override_tests {
         ] {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
                 "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental",
-                    "preflight_lookup_mode":"grouped","snapshot_list_mode":"from_checkpoint","commit_attempts":3,"commit_budget_secs":2}}
+                    "preflight_lookup_mode":"grouped","snapshot_list_mode":"from_checkpoint","stage_snapshot_mode":"per_group","commit_attempts":3,"commit_budget_secs":2}}
             }))
             .map_err(|error| error.to_string())?;
             let environment = settings
@@ -68,6 +68,7 @@ mod override_tests {
             assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
             assert_eq!(options.preflight_lookup_mode, PreflightLookupMode::Grouped);
             assert_eq!(options.snapshot_list_mode, SnapshotListMode::FromCheckpoint);
+            assert_eq!(options.stage_snapshot_mode, arrow_deltalake::StageSnapshotMode::PerGroup);
             assert_eq!(options.commit_attempts, 3);
             assert_eq!(options.commit_budget, Duration::from_secs(2));
         }
@@ -1222,6 +1223,8 @@ pub struct CommitConfig {
     pub snapshot_cache_mode: arrow_deltalake::SnapshotCacheMode,
     /// How object-store snapshot refreshes list `_delta_log/`.
     pub snapshot_list_mode: arrow_deltalake::SnapshotListMode,
+    /// Whether coalesced files bind their write schema separately or as a group.
+    pub stage_snapshot_mode: arrow_deltalake::StageSnapshotMode,
     /// How coalesced preparation resolves prior Delta transactions.
     pub preflight_lookup_mode: arrow_deltalake::PreflightLookupMode,
     /// Whether the collector or an external service writes checkpoints.
@@ -1245,6 +1248,7 @@ impl Default for CommitConfig {
             max_pending_files: options.max_pending_files,
             snapshot_cache_mode: options.snapshot_cache_mode,
             snapshot_list_mode: options.snapshot_list_mode,
+            stage_snapshot_mode: options.stage_snapshot_mode,
             preflight_lookup_mode: options.preflight_lookup_mode,
             checkpoint_mode: options.checkpoint_mode,
             checkpoint_interval: options.checkpoint_interval,
@@ -1264,6 +1268,7 @@ impl CommitConfig {
             max_pending_files: self.max_pending_files,
             snapshot_cache_mode: self.snapshot_cache_mode,
             snapshot_list_mode: self.snapshot_list_mode,
+            stage_snapshot_mode: self.stage_snapshot_mode,
             preflight_lookup_mode: self.preflight_lookup_mode,
             checkpoint_mode: self.checkpoint_mode,
             checkpoint_interval: self.checkpoint_interval,

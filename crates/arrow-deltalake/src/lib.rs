@@ -127,6 +127,27 @@ impl<'de> serde::Deserialize<'de> for SnapshotListMode {
     }
 }
 
+/// How coalesced preparation binds output files to the table schema.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageSnapshotMode {
+    #[default]
+    PerFile,
+    PerGroup,
+}
+
+impl<'de> serde::Deserialize<'de> for StageSnapshotMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_file") => Ok(Self::PerFile),
+            Ok("per_group") => Ok(Self::PerGroup),
+            _ => Err(serde::de::Error::custom(
+                "collector.commit.stage_snapshot_mode must be per_file or per_group",
+            )),
+        }
+    }
+}
+
 /// How coalesced preparation resolves the prior Delta transactions of its entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

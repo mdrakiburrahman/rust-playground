@@ -549,7 +549,7 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.commit.batch_window" | "collector.commit.max_files_per_commit"
             | "collector.commit.max_pending_files" | "collector.commit.txn_lookup_mode"
             | "collector.commit.snapshot_cache_mode" | "collector.commit.snapshot_list_mode"
-            | "collector.commit.preflight_lookup_mode"
+            | "collector.commit.preflight_lookup_mode" | "collector.commit.stage_snapshot_mode"
             | "collector.commit.checkpoint_mode" | "collector.commit.checkpoint_interval"
             | "collector.commit.commit_attempts" | "collector.commit.commit_budget_secs"
             | "collector.commit.trigger" =>
