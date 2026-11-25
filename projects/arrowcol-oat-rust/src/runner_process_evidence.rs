@@ -100,6 +100,8 @@ fn is_process_evidence_line(line: &str) -> bool {
         "arrowcol_router_effective_config ",
         "arrowcol_wal_effective_config ",
         "arrowcol_layout_",
+        "arrowcol_adaptive_config ",
+        "arrowcol_delta_stats_config ",
         "arrowcol_data_commit ",
         "arrowcol_teardown_failure ",
         "arrowcol_shutdown ",
@@ -2626,6 +2628,13 @@ mod startup_readback_tests {
         let marker = "arrowcol_shutdown {\"event\":\"drain_complete\"}";
         let input = format!("unrelated line\n{marker}\n");
         assert_eq!(filter_process_evidence_text(&input)?, format!("{marker}\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_log_filter_retains_collector_table_policy_readbacks() -> Result<()> {
+        let records = "arrowcol_adaptive_config {}\narrowcol_delta_stats_config {}\n";
+        assert_eq!(filter_process_evidence_text(&format!("unrelated line\n{records}"))?, records);
         Ok(())
     }
 
