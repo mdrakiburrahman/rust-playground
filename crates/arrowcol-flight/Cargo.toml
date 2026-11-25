@@ -12,7 +12,7 @@ readme = "README.md"
 [dependencies]
 arrow-array = { version = "58.3", default-features = false }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
-arrow-ipc = { version = "58.3", default-features = false }
+arrow-ipc = { version = "58.3", default-features = false, features = ["lz4", "zstd"] }
 arrow-schema = { version = "58.3", default-features = false }
 arrowcol-catalog = { path = "../arrowcol-catalog" }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
