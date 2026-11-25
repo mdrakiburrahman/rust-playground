@@ -281,6 +281,14 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.catalog.maximum_cache_age", "10s; remote catalog only"),
     capability!("collector.routing.connect_timeout", "15s; SQL Server routing only"),
     capability!("collector.routing.command_timeout", "30s; SQL Server routing only"),
+    capability!(
+        "collector.routing.pool_max_size",
+        "0 (unpooled); SQL Server routing only"
+    ),
+    capability!(
+        "collector.routing.pool_acquire_timeout",
+        "5s; requires collector.routing.pool_max_size > 0"
+    ),
     capability!("collector.exporter.authority_timeout", "10s"),
     capability!(
         "collector.layout.enabled",
@@ -1381,6 +1389,10 @@ impl Tunables {
                     let mut value = value.clone();
                     canonicalize_optional_duration(&mut value.connect_timeout, "collector.routing.connect_timeout")?;
                     canonicalize_optional_duration(&mut value.command_timeout, "collector.routing.command_timeout")?;
+                    canonicalize_optional_duration(
+                        &mut value.pool_acquire_timeout,
+                        "collector.routing.pool_acquire_timeout",
+                    )?;
                     insert_json_config("ARROWCOL_COLLECTOR_ROUTING_CONFIG", &value, &mut output)?;
                 }
                 if let Some(layout) = &collector.layout {
@@ -1993,6 +2005,22 @@ fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
             routing.command_timeout.as_deref(),
             "30s",
         )?;
+        if routing.pool_max_size.is_some_and(|size| size > 1_024) {
+            bail!("collector.routing.pool_max_size must be between 0 and 1024");
+        }
+        if routing.pool_acquire_timeout.is_some() {
+            let timeout = validate_millisecond_duration(
+                "collector.routing.pool_acquire_timeout",
+                routing.pool_acquire_timeout.as_deref(),
+                "5s",
+            )?;
+            if timeout > Duration::from_secs(600) {
+                bail!("collector.routing.pool_acquire_timeout must be at most 600s");
+            }
+            if routing.pool_max_size.unwrap_or(0) == 0 {
+                bail!("collector.routing.pool_acquire_timeout requires collector.routing.pool_max_size greater than 0");
+            }
+        }
     }
     if let Some(exporter) = &collector.exporter {
         validate_millisecond_duration(
@@ -5064,6 +5092,8 @@ mod tests {
                 routing: Some(RoutingTunables {
                     connect_timeout: Some("15000ms".to_owned()),
                     command_timeout: Some("30000ms".to_owned()),
+                    pool_max_size: Some(16),
+                    pool_acquire_timeout: Some("2500ms".to_owned()),
                 }),
                 ..Default::default()
             }),
@@ -5089,6 +5119,25 @@ mod tests {
         assert_eq!(pressure["registration_ttl"], "20s");
         assert_eq!(routing["connect_timeout"], "15s");
         assert_eq!(routing["command_timeout"], "30s");
+        assert_eq!(routing["pool_max_size"], 16);
+        assert_eq!(routing["pool_acquire_timeout"], "2s 500ms");
+        for invalid in [
+            r#"{"collector":{"routing":{"pool_max_size":1025}}}"#,
+            r#"{"collector":{"routing":{"pool_acquire_timeout":"2s"}}}"#,
+            r#"{"collector":{"routing":{"pool_max_size":0,"pool_acquire_timeout":"2s"}}}"#,
+            r#"{"collector":{"routing":{"pool_max_size":8,"pool_acquire_timeout":"0s"}}}"#,
+            r#"{"collector":{"routing":{"pool_max_size":8,"pool_acquire_timeout":"601s"}}}"#,
+        ] {
+            let config: Tunables = serde_json::from_str(invalid)?;
+            assert!(config.validate_for_oat().is_err(), "{invalid}");
+        }
+        for malformed in [
+            r#"{"collector":{"routing":{"pool_max_size":-1}}}"#,
+            r#"{"collector":{"routing":{"pool_max_size":1.5}}}"#,
+            r#"{"collector":{"routing":{"pool_max_size":"8"}}}"#,
+        ] {
+            assert!(serde_json::from_str::<Tunables>(malformed).is_err(), "{malformed}");
+        }
 
         let invalid = Tunables {
             collector: Some(CollectorTunables {

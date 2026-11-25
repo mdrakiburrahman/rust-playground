@@ -2792,7 +2792,8 @@ mod startup_readback_tests {
                 "sql_pool_max_size":32,"sql_pool_acquire_timeout_ms":3000},
             "logging":{"router":"debug"},
             "collector":{"catalog":{"maximum_cache_age":"13000ms"},
-                "routing":{"connect_timeout":"17000ms","command_timeout":"31000ms"},
+                "routing":{"connect_timeout":"17000ms","command_timeout":"31000ms",
+                    "pool_max_size":24,"pool_acquire_timeout":"3000ms"},
                 "exporter":{"authority_timeout":"19000ms"},
                 "pressure":{"heartbeat_interval":"6000ms","registration_ttl":"24000ms"}}
         }))?;
@@ -2803,8 +2804,8 @@ mod startup_readback_tests {
         verify_process_configuration(&config, ComponentRole::Router, &router)?;
         assert!(router.get("listen").is_none());
         let collector = process_configurations(concat!(
-            "arrowcol_effective_config {\"component\":\"receiver\",\"config\":{\"catalog\":{\"type\":\"remote\",\"maximum_cache_age\":\"13s\"},\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\"},\"pressure\":{\"heartbeat_interval\":\"6s\",\"registration_ttl\":\"24s\"}}}\n",
-            "arrowcol_effective_config {\"component\":\"exporter\",\"config\":{\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\"},\"authority_timeout\":\"19s\"}}\n"
+            "arrowcol_effective_config {\"component\":\"receiver\",\"config\":{\"catalog\":{\"type\":\"remote\",\"maximum_cache_age\":\"13s\"},\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\",\"pool_max_size\":24,\"pool_acquire_timeout\":\"3s\"},\"pressure\":{\"heartbeat_interval\":\"6s\",\"registration_ttl\":\"24s\"}}}\n",
+            "arrowcol_effective_config {\"component\":\"exporter\",\"config\":{\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\",\"pool_max_size\":24,\"pool_acquire_timeout\":\"3s\"},\"authority_timeout\":\"19s\"}}\n"
         ))?;
         verify_process_configuration(&config, ComponentRole::Collector, &collector)?;
         Ok(())

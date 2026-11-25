@@ -1480,6 +1480,8 @@ pub struct CatalogTunables {
 pub struct RoutingTunables {
     pub connect_timeout: Option<String>,
     pub command_timeout: Option<String>,
+    pub pool_max_size: Option<usize>,
+    pub pool_acquire_timeout: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

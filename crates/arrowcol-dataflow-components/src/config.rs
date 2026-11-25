@@ -334,8 +334,30 @@ mod override_tests {
         let effective = routing.effective_config_json();
         assert_eq!(effective["connect_timeout"], "2s");
         assert_eq!(effective["command_timeout"], "30s");
+        assert_eq!(effective["pool_max_size"], 0);
         assert!(!effective.to_string().contains("password"));
         assert!(routing.apply_override(r#"{"host":"replacement"}"#).is_err());
+        routing.apply_override(r#"{"pool_max_size":8,"pool_acquire_timeout":"2s"}"#)?;
+        routing.validate()?;
+        let effective = routing.effective_config_json();
+        assert_eq!(effective["pool_max_size"], 8);
+        assert_eq!(effective["pool_acquire_timeout"], "2s");
+        for invalid in [
+            r#"{"pool_max_size":-1}"#,
+            r#"{"pool_max_size":1.5}"#,
+            r#"{"pool_max_size":"8"}"#,
+            r#"{"pool_size":8}"#,
+        ] {
+            assert!(routing.apply_override(invalid).is_err(), "{invalid}");
+        }
+        routing.apply_override(r#"{"pool_max_size":1025}"#)?;
+        assert!(routing.validate().is_err());
+        routing.apply_override(r#"{"pool_max_size":8,"pool_acquire_timeout":"0s"}"#)?;
+        assert!(routing.validate().is_err());
+        routing.apply_override(r#"{"pool_acquire_timeout":"601s"}"#)?;
+        assert!(routing.validate().is_err());
+        routing.apply_override(r#"{"pool_max_size":0}"#)?;
+        routing.validate()?;
         routing.apply_override(r#"{"command_timeout":"0s"}"#)?;
         assert!(routing.validate().is_err());
         Ok(())
@@ -488,6 +510,9 @@ struct RoutingOverrides {
     connect_timeout: Duration,
     #[serde(with = "humantime_serde")]
     command_timeout: Duration,
+    pool_max_size: usize,
+    #[serde(with = "humantime_serde")]
+    pool_acquire_timeout: Duration,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -558,6 +583,13 @@ fn default_command_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_pool_acquire_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+const MAX_ROUTING_POOL_SIZE: usize = 1_024;
+const MAX_ROUTING_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn default_heartbeat_interval() -> Duration {
     Duration::from_secs(5)
 }
@@ -617,6 +649,12 @@ pub struct SqlServerConnectionConfig {
     /// SQL command timeout.
     #[serde(default = "default_command_timeout", with = "humantime_serde")]
     pub command_timeout: Duration,
+    /// Maximum pooled routing connections; 0 opens one connection per operation.
+    #[serde(default)]
+    pub pool_max_size: usize,
+    /// Wait bound for a pooled routing connection when `pool_max_size > 0`.
+    #[serde(default = "default_pool_acquire_timeout", with = "humantime_serde")]
+    pub pool_acquire_timeout: Duration,
 }
 
 impl SqlServerConnectionConfig {
@@ -635,6 +673,17 @@ impl SqlServerConnectionConfig {
         }
         validate_duration("connect_timeout", self.connect_timeout)?;
         validate_duration("command_timeout", self.command_timeout)?;
+        if self.pool_max_size > MAX_ROUTING_POOL_SIZE {
+            return Err(format!("pool_max_size must be at most {MAX_ROUTING_POOL_SIZE}"));
+        }
+        if self.pool_max_size > 0 {
+            validate_duration("pool_acquire_timeout", self.pool_acquire_timeout)?;
+            if self.pool_acquire_timeout > MAX_ROUTING_POOL_ACQUIRE_TIMEOUT {
+                return Err(format!(
+                    "pool_acquire_timeout must be at most {MAX_ROUTING_POOL_ACQUIRE_TIMEOUT:?}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -776,15 +825,19 @@ impl RoutingStoreConfig {
                     &RoutingOverrides {
                         connect_timeout: connection.connect_timeout,
                         command_timeout: connection.command_timeout,
+                        pool_max_size: connection.pool_max_size,
+                        pool_acquire_timeout: connection.pool_acquire_timeout,
                     },
                     json,
                     None,
                 )?;
                 connection.connect_timeout = resolved.connect_timeout;
                 connection.command_timeout = resolved.command_timeout;
+                connection.pool_max_size = resolved.pool_max_size;
+                connection.pool_acquire_timeout = resolved.pool_acquire_timeout;
                 Ok(())
             }
-            Self::Memory | Self::Standalone => Err("routing timeout override requires SQL Server routing".to_owned()),
+            Self::Memory | Self::Standalone => Err("routing override requires SQL Server routing".to_owned()),
         }
     }
 
@@ -801,7 +854,9 @@ impl RoutingStoreConfig {
             Self::SqlServer { connection } => serde_json::json!({
                 "type": "sql_server",
                 "connect_timeout": format!("{:?}", connection.connect_timeout),
-                "command_timeout": format!("{:?}", connection.command_timeout)
+                "command_timeout": format!("{:?}", connection.command_timeout),
+                "pool_max_size": connection.pool_max_size,
+                "pool_acquire_timeout": format!("{:?}", connection.pool_acquire_timeout)
             }),
             Self::Memory => serde_json::json!({"type": "memory"}),
             Self::Standalone => serde_json::json!({"type": "standalone"}),
@@ -823,10 +878,20 @@ impl RoutingStoreConfig {
         match self {
             Self::Memory => Ok(Arc::new(MemoryRoutingStore::default())),
             Self::Standalone => Ok(Arc::clone(&*STANDALONE_ROUTING) as Arc<dyn RoutingStore>),
-            Self::SqlServer { connection } => connection
-                .routing_config()
-                .map(|config| Arc::new(SqlServerRoutingStore::new(config)) as Arc<dyn RoutingStore>)
-                .map_err(|error| error.to_string()),
+            Self::SqlServer { connection } => {
+                let config = connection.routing_config().map_err(|error| error.to_string())?;
+                let store = if connection.pool_max_size == 0 {
+                    SqlServerRoutingStore::new(config)
+                } else {
+                    let pool = config
+                        .create_pool(connection.pool_max_size, connection.pool_acquire_timeout)
+                        .map_err(|error| error.to_string())?;
+                    SqlServerRoutingStore::new(config)
+                        .with_pool(pool)
+                        .map_err(|error| error.to_string())?
+                };
+                Ok(Arc::new(store) as Arc<dyn RoutingStore>)
+            }
         }
     }
 }

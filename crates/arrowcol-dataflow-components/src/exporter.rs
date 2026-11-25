@@ -4563,6 +4563,8 @@ mod tests {
             trust_server_certificate: true,
             connect_timeout: std::time::Duration::from_secs(15),
             command_timeout: std::time::Duration::from_secs(30),
+            pool_max_size: 0,
+            pool_acquire_timeout: std::time::Duration::from_secs(5),
         };
         let catalog_config = CatalogConfig::Remote {
             endpoint: std::env::var("ARROWCOL_CATALOG_ENDPOINT")

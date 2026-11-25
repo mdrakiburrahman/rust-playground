@@ -476,6 +476,9 @@ fn fixture(path: &str, value: Value) -> Value {
     if path == "router.sql_pool_acquire_timeout_ms" {
         input["router"] = json!({"sql_pool_max_size": 1});
     }
+    if path == "collector.routing.pool_acquire_timeout" {
+        input["collector"] = json!({"routing": {"pool_max_size": 1}});
+    }
     if path == "client.identity_builder" {
         input["client"] = json!({"data_profile": "realistic"});
     }

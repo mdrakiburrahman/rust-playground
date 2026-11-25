@@ -8,7 +8,7 @@
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
 | `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | Stream/RSS/buffered limits, pressure/heartbeat intervals and registration TTL; no identities/endpoints | Startup |
 | `ARROWCOL_COLLECTOR_CATALOG_CONFIG` | Remote catalog `maximum_cache_age`; rejects memory catalog | Startup |
-| `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout` and `command_timeout` for receiver/exporter; rejects other backends | Startup |
+| `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout`, `command_timeout`, `pool_max_size` (default `0`: one connection per lease lookup; at most `1024`) and `pool_acquire_timeout` (default `5s`, at most `600s`, used only when pooled) for receiver/exporter; rejects other backends | Startup |
 | `ARROWCOL_COLLECTOR_EXPORTER_CONFIG` | Exporter `authority_timeout` | Startup |
 | `ARROWCOL_COLLECTOR_RUNTIME_WORKERS`, `BLOCKING_WORKERS`, `UPLOAD_LIMIT`, `TASK_LIMIT`, `READ_AHEAD`, `BATCH_ROWS`, `CPU_WORKERS` | Independently bounded Delta async, blocking, upload, Kernel task, scan and dedicated CPU resources; each suffix uses the full `ARROWCOL_COLLECTOR_` prefix | Startup |
 | `ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH` | Strict `true`/`false`; default `false`. Reuses arrays when a coalesced publication has only the internally generated ingestion partition. Supplied or multiple partition columns retain the normal grouping path. | Startup |
@@ -26,8 +26,8 @@ Pressure overrides also accept `heartbeat_interval` and `registration_ttl`.
 Resolved TTL must exceed heartbeat and fit the millisecond lease clock; all
 control-plane durations must be positive and clock-representable. These
 overrides cannot change identities, endpoints, authentication or fencing.
-Readback includes safe catalog/routing backend names and resolved timeouts,
-never backend addresses or credentials.
+Readback includes safe catalog/routing backend names, resolved timeouts and the
+routing pool size, never backend addresses or credentials.
 
 Example (workload-dependent, not a universal performance recommendation):
 
