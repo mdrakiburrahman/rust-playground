@@ -821,7 +821,9 @@ fn outer_custody_kills_and_reaps_hung_driver_descendants() -> Result<()> {
                 .args([CUSTODY_TEST, "--exact", "--test-threads=1"])
                 .env(ROLE, "sleeper")
                 .spawn()?;
-            fs::write(root.join("grandchild.pid"), grandchild.id().to_string())?;
+            let tmp = root.join("grandchild.pid.tmp");
+            fs::write(&tmp, grandchild.id().to_string())?;
+            fs::rename(tmp, root.join("grandchild.pid"))?;
             // Deliberately never waits: only the outer custody can reclaim it.
             std::mem::forget(grandchild);
             sleep();
