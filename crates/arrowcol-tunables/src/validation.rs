@@ -358,6 +358,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
     capability!("collector.runtime.cpu_dispatch", "shared_fifo"),
+    capability!("collector.runtime.local_directory_sync_policy", "per_file"),
     capability!("collector.runtime.cpu_placement", "os"),
     capability!("collector.runtime.parquet_column_workers", "1"),
     capability!("collector.runtime.parquet_encode_mode", "column_waves"),
@@ -1373,6 +1374,13 @@ impl Tunables {
                     if let Some(dispatch) = runtime.cpu_dispatch {
                         output.insert("ARROWCOL_COLLECTOR_CPU_DISPATCH".into(), dispatch.as_str().into());
                     }
+                    if let Some(policy) = runtime.local_directory_sync_policy {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_LOCAL_DIRECTORY_SYNC_POLICY".into(),
+                            policy.as_str().into(),
+                        );
+                    }
+
                     if let Some(placement) = runtime.cpu_placement {
                         output.insert("ARROWCOL_COLLECTOR_CPU_PLACEMENT".into(), placement.as_str().into());
                     }
@@ -3384,6 +3392,33 @@ mod tests {
             let value = serde_json::json!({"collector":{"runtime":{"timestamp_kernel":bad}}});
             assert!(error_text(Tunables::parse_oat_json(value)).contains("timestamp_kernel"));
         }
+    }
+
+    #[test]
+    fn local_directory_sync_policy_is_strict_and_projects() -> Result<()> {
+        for policy in ["per_file", "before_commit"] {
+            let config = serde_json::json!({"collector":{"runtime":{
+                "local_directory_sync_policy":policy
+            }}});
+            let env = Tunables::parse_oat_json(config)?.environment_for(ComponentRole::Collector)?;
+            assert_eq!(env["ARROWCOL_COLLECTOR_LOCAL_DIRECTORY_SYNC_POLICY"], policy);
+        }
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!("batched"),
+            serde_json::json!({"before_commit":null}),
+        ] {
+            let config = serde_json::json!({"collector":{"runtime":{
+                "local_directory_sync_policy":bad
+            }}});
+            let error = error_text(Tunables::parse_oat_json(config));
+            assert!(
+                error.contains("collector.runtime.local_directory_sync_policy"),
+                "{error}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

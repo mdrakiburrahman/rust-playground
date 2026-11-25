@@ -3002,6 +3002,8 @@ mod consumer_startup_projection_tests {
                 "socket":socket,
                 "runtime":{"file_mapping_cache":true,"workers":3,"blocking_workers":6,"blocking_fs_reserve":2,
                     "task_limit":77,"read_ahead":5,"batch_rows":12000,"cpu_workers":3,"cpu_queue_jobs":4,"partition_grouping":"typed_runs",
+                    "local_directory_sync_policy":"before_commit",
+
                     "generated_partition_binding":"proven_constant"}
             }
         }))?;
@@ -3125,6 +3127,8 @@ groups:
         assert_eq!(observed["commit"]["checkpoint_mode"], "async");
         assert_eq!(observed["commit"]["checkpoint_interval"], 17);
         assert_eq!(observed["commit"]["trigger"], "eager");
+        assert_eq!(observed["runtime"]["local_directory_sync_policy"], "before_commit");
+
         assert_eq!(observed["dfe_worker_concurrency"], 2);
         assert_eq!(observed["socket_effective"]["tcp_nodelay"], true);
         if cfg!(target_os = "linux") {
@@ -3164,6 +3168,8 @@ groups:
             "collector.commit.trigger",
             "collector.socket.tcp_nodelay",
             "collector.runtime.file_mapping_cache",
+            "collector.runtime.local_directory_sync_policy",
+
             "collector.runtime.partition_grouping",
             "collector.runtime.generated_partition_binding",
             "collector.channel_capacity.control_node",

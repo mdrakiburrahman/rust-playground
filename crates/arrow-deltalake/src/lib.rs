@@ -205,6 +205,38 @@ impl TryFrom<String> for StagingMode {
     }
 }
 
+/// Local directory durability policy; file contents remain fsynced in both modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum LocalDirectorySyncPolicy {
+    /// Sync each output directory chain while staging the file.
+    #[default]
+    PerFile,
+    /// Sync unique output directory chains immediately before publishing a commit.
+    BeforeCommit,
+}
+
+impl LocalDirectorySyncPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PerFile => "per_file",
+            Self::BeforeCommit => "before_commit",
+        }
+    }
+}
+
+impl TryFrom<String> for LocalDirectorySyncPolicy {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "per_file" => Ok(Self::PerFile),
+            "before_commit" => Ok(Self::BeforeCommit),
+            _ => Err("local_directory_sync_policy must be per_file or before_commit"),
+        }
+    }
+}
+
 /// Scheduling of Parquet column encoders; one column worker stays sequential.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]

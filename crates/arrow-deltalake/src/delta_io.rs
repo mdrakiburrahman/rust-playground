@@ -67,6 +67,10 @@ pub struct DeltaRuntimeConfig {
     /// File-backed staging by default; streaming is for remote multipart output.
     #[serde(default)]
     pub staging_mode: crate::StagingMode,
+    /// Directory durability for local Delta outputs; file contents are always synced.
+    #[serde(default)]
+    pub local_directory_sync_policy: crate::LocalDirectorySyncPolicy,
+
     /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 1..=64 MiB when multipart is enabled.
     pub upload_buffer_capacity_bytes: usize,
     /// In-flight multipart requests per upload: default 2; allowed 1..=16.
@@ -146,6 +150,8 @@ impl DeltaRuntimeConfig {
             upload_limit: 32,
             upload_mode: UploadMode::PutCreate,
             staging_mode: Default::default(),
+            local_directory_sync_policy: crate::LocalDirectorySyncPolicy::default(),
+
             upload_buffer_capacity_bytes: DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES,
             upload_request_concurrency: DEFAULT_UPLOAD_REQUEST_CONCURRENCY,
             task_limit: cores.saturating_mul(4).clamp(64, 256),
@@ -268,6 +274,12 @@ impl DeltaRuntimeConfig {
                 .try_into()
                 .map_err(|message: &str| anyhow::anyhow!("{name}: {message}"))?;
         }
+        let name = "ARROWCOL_COLLECTOR_LOCAL_DIRECTORY_SYNC_POLICY";
+        if let Some(raw) = lookup(name)? {
+            config.local_directory_sync_policy =
+                raw.try_into().map_err(|why: &str| anyhow::anyhow!("{name}: {why}"))?;
+        }
+
         let mode_name = "ARROWCOL_COLLECTOR_UPLOAD_MODE";
         if let Some(raw) = lookup(mode_name)? {
             config.upload_mode = match raw.as_str() {
@@ -1119,6 +1131,26 @@ mod tests {
         }
         for raw in ["", "TYPED_RUNS", "typed_runs ", "auto"] {
             assert!(DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned()))).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_directory_sync_policy_env_is_strict() -> Result<()> {
+        let name = "ARROWCOL_COLLECTOR_LOCAL_DIRECTORY_SYNC_POLICY";
+        assert_eq!(
+            DeltaRuntimeConfig::from_lookup(|_| Ok(None))?.local_directory_sync_policy,
+            crate::LocalDirectorySyncPolicy::PerFile
+        );
+        for raw in ["per_file", "before_commit"] {
+            let config = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))?;
+            assert_eq!(config.local_directory_sync_policy.as_str(), raw);
+        }
+        for raw in ["", "batched", "BEFORE_COMMIT", "before_commit "] {
+            let error = DeltaRuntimeConfig::from_lookup(|key| Ok((key == name).then(|| raw.to_owned())))
+                .err()
+                .context("invalid directory sync policy unexpectedly accepted")?;
+            assert!(format!("{error:#}").contains(name));
         }
         Ok(())
     }

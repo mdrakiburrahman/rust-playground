@@ -427,6 +427,11 @@ fn promote_collector_readback(config: &OatConfig, evidence: &mut Value, processe
             "collector.runtime.batch_rows" => Some(("batch_rows", "ARROWCOL_COLLECTOR_BATCH_ROWS")),
             "collector.runtime.cpu_workers" => Some(("cpu_workers", "ARROWCOL_COLLECTOR_CPU_WORKERS")),
             "collector.runtime.cpu_dispatch" => Some(("cpu_dispatch", "ARROWCOL_COLLECTOR_CPU_DISPATCH")),
+            "collector.runtime.local_directory_sync_policy" => Some((
+                "local_directory_sync_policy",
+                "ARROWCOL_COLLECTOR_LOCAL_DIRECTORY_SYNC_POLICY",
+            )),
+
             "collector.runtime.cpu_placement" => Some(("cpu_placement", "ARROWCOL_COLLECTOR_CPU_PLACEMENT")),
             "collector.runtime.partition_grouping" => {
                 Some(("partition_grouping", "ARROWCOL_COLLECTOR_PARTITION_GROUPING"))

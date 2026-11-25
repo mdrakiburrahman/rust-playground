@@ -1333,6 +1333,12 @@ pub struct RuntimeTunables {
     pub cpu_dispatch: Option<arrow_deltalake::CpuDispatch>,
     #[serde(
         skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_local_directory_sync_policy"
+    )]
+    pub local_directory_sync_policy: Option<arrow_deltalake::LocalDirectorySyncPolicy>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_cpu_placement"
     )]
     pub cpu_placement: Option<arrow_deltalake::CpuPlacement>,
@@ -1425,6 +1431,12 @@ fn deserialize_cpu_dispatch<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<arrow_deltalake::CpuDispatch>, D::Error> {
     deserialize_mode(d, "collector.runtime.cpu_dispatch")
+}
+
+fn deserialize_local_directory_sync_policy<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::LocalDirectorySyncPolicy>, D::Error> {
+    deserialize_mode(d, "collector.runtime.local_directory_sync_policy")
 }
 
 fn deserialize_parquet_encode_mode<'de, D: serde::Deserializer<'de>>(
