@@ -13,6 +13,7 @@ import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './ak
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 import { collectorBuildProfileHash, parseCollectorBuildProfile } from './collector-build-profile.js';
+import { assertHistoryPin, assertSettledHistory, handoverDestination, importSettledHistory } from './aks-settled-history.js';
 
 export interface OatRunStatus {
   id: string;
@@ -61,7 +62,7 @@ const launcherDeadlineReceiptPath = 'out/arrowcol-oat/deadline-receipts';
 const launcherDeadlineReceiptRoot = resolve(workspaceRoot, launcherDeadlineReceiptPath);
 const launcherDeadlineMaxSeconds = 600;
 const localCancellationCleanupMs = 10 * 60 * 1000;
-const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds', '--aks-history-sha256']);
 
 export class OatCliError extends Error {
   readonly exitCode = 2;
@@ -102,6 +103,10 @@ Options:
   --viewer-only        Serve existing local results without running a benchmark
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
+  --import-aks-history <bundle-path> <reviewed-sha256>
+                       Import settled history once, without launching or recovering work
+  --aks-history-sha256 <reviewed-sha256>
+                       Require the installed, destination-bound AKS history at admission
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
   --recover-failed-local <invocation-id> <ownership-marker-path>
   --reconcile-failed-local <invocation-id> <ownership-marker-path>
@@ -517,6 +522,47 @@ function isLauncherTerminalObservation(value: unknown): value is LauncherTermina
     typeof status.progress === 'string' && typeof status.result_count === 'number' &&
     (status.error === null || typeof status.error === 'string') &&
     (status.config_sha256 === null || typeof status.config_sha256 === 'string');
+}
+
+export function validateSettledHistoryReceipt(value: unknown, stamp: string, subscription: string): { invocationId: string; runId: string | null } {
+  if (!isLauncherDeadlineReceipt(value) || !legacyUuid.test(value.invocation_id) ||
+      value.cleanup_state !== 'confirmed' || value.config_binding_error !== null ||
+      !Number.isSafeInteger(value.started_at_unix_ms) || value.started_at_unix_ms <= 0 ||
+      !Number.isFinite(value.started_at_monotonic_ms) || value.started_at_monotonic_ms < 0 ||
+      value.cancellation_attempts < 0) throw new Error('Invalid or unsettled historical receipt');
+  for (const timestamp of [value.deadline_at_unix_ms, value.cleanup_deadline_at_unix_ms, value.overrun_at_unix_ms]) {
+    if (timestamp !== null && (!Number.isSafeInteger(timestamp) || timestamp < value.started_at_unix_ms)) {
+      throw new Error('Invalid original historical deadline');
+    }
+    if ((value.deadline_seconds === null) !== (value.deadline_at_unix_ms === null) ||
+        (value.deadline_seconds === null) !== (value.deadline_at_monotonic_ms === null) ||
+        (value.deadline_seconds !== null && (!Number.isSafeInteger(value.deadline_seconds) || value.deadline_seconds <= 0 ||
+          value.deadline_at_unix_ms !== value.started_at_unix_ms + value.deadline_seconds * 1000 ||
+          value.deadline_at_monotonic_ms !== value.started_at_monotonic_ms + value.deadline_seconds * 1000))) {
+      throw new Error('Invalid original historical deadline binding');
+    }
+  }
+  if (value.submitted_config_body !== null) {
+    const config: unknown = JSON.parse(value.submitted_config_body);
+    if (!isRecord(config) || !isRecord(config.platform) || config.platform.kind !== 'aks' ||
+        config.stamp !== stamp || (config.subscriptionId !== undefined && config.subscriptionId !== subscription)) {
+      throw new Error('Historical receipt belongs to a different stamp or platform');
+    }
+  }
+  const noEffect = value.creation_state === 'not_started' && value.run_state === 'not_started' &&
+    value.run_id === null && value.server_url === null && value.server_pid == null &&
+    value.server_start_ticks == null && value.server_executable == null && value.terminal_observation == null &&
+    value.cancellation_attempts === 0 && value.last_cancel_result === null;
+  const observed = value.terminal_observation;
+  const terminal = value.creation_state === 'accepted' && value.submitted_config_body !== null &&
+    value.run_id !== null && legacyUuid.test(value.run_id) && observed != null &&
+    Number.isSafeInteger(observed.status.finished_at_unix_ms) &&
+    observed.status.finished_at_unix_ms! >= value.started_at_unix_ms &&
+    observed.observed_at_unix_ms >= observed.status.finished_at_unix_ms! &&
+    ['succeeded', 'failed', 'cancelled'].includes(value.run_state) &&
+    (value.run_state !== 'failed' || hasConfirmedAksFailure(observed.status));
+  if (!noEffect && !terminal) throw new Error('Historical admission is active, uncertain or lacks terminal cleanup proof');
+  return { invocationId: value.invocation_id, runId: value.run_id };
 }
 
 function isLocalOatServerUrl(value: string): boolean {
@@ -2252,6 +2298,17 @@ export async function main(
     console.log(aksDispositionMessage(kind));
     return;
   }
+  if (args[0] === '--import-aks-history') {
+    if (args.length !== 3 || !args[1] || !args[2]) throw new OatCliError('--import-aks-history requires exactly a bundle path and its reviewed SHA-256');
+    const ledger = receiptRoot === launcherDeadlineReceiptRoot ? (await resolveAksReceiptLedger(workspaceRoot)).root : receiptRoot;
+    const destination = await handoverDestination(workspaceRoot, ledger);
+    const lock = await acquireAksSubmitterLock(ledger);
+    try {
+      await importSettledHistory(resolve(args[1]), args[2], destination, validateSettledHistoryReceipt, () => lock.assertHeld());
+      console.log(`Installed immutable settled AKS history ${args[2]}; no run submitted.`);
+    } finally { await lock.release(); }
+    return;
+  }
   validateArguments(args);
   const option = (name: string): string | undefined => {
     const index = args.indexOf(name);
@@ -2263,6 +2320,11 @@ export async function main(
   const requestedMode = option('--mode');
   if (requestedMode !== undefined && requestedMode !== 'local' && requestedMode !== 'aks') {
     throw new OatCliError('--mode must be local or aks');
+  }
+  const historySha = option('--aks-history-sha256');
+  if (historySha !== undefined && (requestedMode !== 'aks' || !/^[0-9a-f]{64}$/.test(historySha) ||
+      args.filter(arg => arg === '--aks-history-sha256').length !== 1)) {
+    throw new OatCliError('--aks-history-sha256 requires --mode aks and exactly one reviewed SHA-256');
   }
   const requestedServerUrl = option('--server');
   const deadlineOptionCount = args.filter((argument) => argument === '--deadline-seconds').length;
@@ -2280,6 +2342,7 @@ export async function main(
   const viewerOnly = args.includes('--viewer-only');
   const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  if (historySha && preflightOnly) throw new OatCliError('--aks-history-sha256 requires an admission, not --preflight-only');
   const prelaunchOnly = args.includes('--diagnostic-prelaunch-only');
   const diagnosticParity = process.env.OAT_DARWIN_PARITY_PRECHECK === '1';
   if (prelaunchOnly && (!diagnosticParity || requestedMode === 'aks' || viewerOnly || preflightOnly || cleanupRunId !== undefined)) {
@@ -2363,6 +2426,16 @@ export async function main(
   }
   if (transitionRoot) receiptRoot = transitionRoot;
   const submitterLock = mode === 'aks' ? await acquireAksSubmitterLock(receiptRoot) : undefined;
+  if (mode === 'aks') {
+    try {
+      await assertHistoryPin(receiptRoot, historySha);
+      if (historySha) await assertSettledHistory(receiptRoot, await handoverDestination(workspaceRoot, receiptRoot),
+        validateSettledHistoryReceipt, historySha, String(config.stamp), String(config.subscriptionId));
+    } catch (error) {
+      await submitterLock?.release();
+      throw error;
+    }
+  }
   if (diagnosticParity && mode === 'local' && !transitionRoot) {
     const names = await readdir(receiptRoot).catch((error: unknown) => {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];

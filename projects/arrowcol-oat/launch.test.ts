@@ -29,6 +29,16 @@ const status = (state: OatRunStatus['state']) => ({
   state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
 });
 
+test('AKS history pin cannot be silently ignored in local or preflight-only mode', async () => {
+  const pin = 'a'.repeat(64);
+  for (const args of [
+    ['--mode', 'local', '--aks-history-sha256', pin],
+    ['--mode', 'aks', '--aks-history-sha256', 'not-a-digest'],
+    ['--mode', 'aks', '--aks-history-sha256', pin, '--aks-history-sha256', pin],
+    ['--mode', 'aks', '--preflight-only', '--aks-history-sha256', pin],
+  ]) await assert.rejects(main(args), /--aks-history-sha256 requires/);
+});
+
 async function bindLocalReceipt(deadline: OatLauncherDeadline): Promise<void> {
   const submitted_config_body = '{"platform":{"kind":"local"}}';
   await deadline.setSubmissionBinding({
