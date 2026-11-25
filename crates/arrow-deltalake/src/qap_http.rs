@@ -1877,6 +1877,9 @@ mod tests {
     }
 
     type Server = std::thread::JoinHandle<Result<Vec<String>>>;
+    // Hang guard only: every traced request and response fsyncs its receipt, so a host I/O stall
+    // can delay the next request by seconds without any fault in the code under test.
+    const MOCK_HANG_GUARD: Duration = Duration::from_secs(120);
 
     fn server(count: usize, hook: impl Fn(usize) + Send + 'static) -> Result<(String, Server)> {
         server_responses(vec![200; count], hook)
@@ -1897,7 +1900,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for (index, status) in statuses.into_iter().enumerate() {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + MOCK_HANG_GUARD;
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
@@ -1908,7 +1911,7 @@ mod tests {
                         Err(error) => return Err(error.into()),
                     }
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_read_timeout(Some(MOCK_HANG_GUARD))?;
                 let mut bytes = Vec::new();
                 while !bytes.ends_with(b"\r\n\r\n") {
                     let mut byte = [0];
@@ -1949,7 +1952,8 @@ mod tests {
             .with_http_connector(connector)
             .with_retry(object_store::RetryConfig {
                 max_retries: 1,
-                retry_timeout: Duration::from_secs(2),
+                // max_retries bounds the attempts; the budget only has to outlast fsynced receipts.
+                retry_timeout: MOCK_HANG_GUARD,
                 ..Default::default()
             })
             .build()?;

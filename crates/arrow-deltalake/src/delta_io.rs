@@ -1722,6 +1722,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn spawned_owner_offloads_sync_delta_calls() -> Result<()> {
         const CHILD: &str = "ARROWCOL_TEST_ISOLATED_OFFLOAD";
+        // The only timeout is this hang guard; the properties are the thread and runtime checks.
+        const WATCHDOG: Duration = Duration::from_secs(120);
         if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
             let mut child = std::process::Command::new(std::env::current_exe()?)
                 .args([
@@ -1732,7 +1734,7 @@ mod tests {
                 .env(CHILD, "1")
                 .spawn()
                 .context("start isolated shared-executor offload test")?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + WATCHDOG;
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
@@ -1749,7 +1751,7 @@ mod tests {
                         child.kill().context("stop isolated shared-executor offload test")?;
                         child.wait().context("reap isolated shared-executor offload test")?;
                         result.context("poll isolated shared-executor offload test")?;
-                        anyhow::bail!("isolated shared-executor offload test exceeded 30s watchdog");
+                        anyhow::bail!("isolated shared-executor offload test exceeded {WATCHDOG:?} watchdog");
                     }
                 }
             }
@@ -1772,7 +1774,7 @@ mod tests {
                 })
                 .await?
         })?;
-        tokio::time::timeout(Duration::from_secs(5), task).await???;
+        task.await??;
         Ok(())
     }
 

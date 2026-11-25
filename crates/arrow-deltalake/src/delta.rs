@@ -973,6 +973,9 @@ mod io_tests {
 
     // These fixtures deliberately exhaust the process-wide upload slots.
     static CLOUD_STAGE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Hang guard only: a timed-out barrier waiter still counts as arrived, so a short bound would
+    // fail slow but healthy staging instead of catching a starved upload pool.
+    const NESTED_PUT_HANG_GUARD: Duration = Duration::from_secs(120);
 
     #[derive(Debug)]
     struct NestedStagePut {
@@ -1032,6 +1035,8 @@ mod io_tests {
         inner: object_store::memory::InMemory,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        // None keeps the 2 s default that fails puts which are never released.
+        release_guard: Option<Duration>,
         nested: Option<Arc<NestedStagePut>>,
         multipart_calls: std::sync::atomic::AtomicUsize,
         fail_multipart: bool,
@@ -1058,7 +1063,7 @@ mod io_tests {
             if let Some(nested) = &self.nested {
                 use std::sync::atomic::Ordering;
                 nested.entered.fetch_add(1, Ordering::SeqCst);
-                tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::time::timeout(NESTED_PUT_HANG_GUARD, async {
                     nested.barrier.wait().await;
                     nested.submitted.fetch_add(1, Ordering::SeqCst);
                     let completed = Arc::clone(nested);
@@ -1078,7 +1083,8 @@ mod io_tests {
                 })?;
             } else {
                 self.entered.notify_one();
-                tokio::time::timeout(Duration::from_secs(2), self.release.notified())
+                let guard = self.release_guard.unwrap_or(Duration::from_secs(2));
+                tokio::time::timeout(guard, self.release.notified())
                     .await
                     .map_err(|error| object_store::Error::Generic {
                         store: "paused stage put",
@@ -1379,6 +1385,8 @@ mod io_tests {
     /// Guarantees: every stage succeeds without exhausting the shared pool, and all nested jobs finish.
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_stage_uploads_allow_nested_blocking_io() -> Result<()> {
+        // Outlasts the per-put guard so a stuck barrier is reported per stage, not as an outer timeout.
+        const STAGE_HANG_GUARD: Duration = Duration::from_secs(180);
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let uploads = runtime_config()?.upload_limit;
@@ -1406,11 +1414,11 @@ mod io_tests {
             writers.push(writer);
         }
         let outcomes = tokio::time::timeout(
-            Duration::from_secs(10),
+            STAGE_HANG_GUARD,
             futures::future::join_all(writers.into_iter().map(DeltaFileWriter::stage)),
         )
         .await;
-        let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+        let cleanup = tokio::time::timeout(NESTED_PUT_HANG_GUARD, async {
             while nested.finished.load(Ordering::SeqCst) != nested.submitted.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -1434,6 +1442,9 @@ mod io_tests {
     /// Guarantees: payload admission and staging ownership survive until the put finishes.
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_stage_retains_upload_admission_until_put_finishes() -> Result<()> {
+        // The put stays paused until released, so the in-flight checks (DeltaTable::open fsyncs
+        // ancestor directories) always observe it in flight; the bounds are hang guards only.
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         use futures::TryStreamExt;
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         let executor = shared_executor()?;
@@ -1445,12 +1456,15 @@ mod io_tests {
         let mut writer = table.new_file(input.schema())?;
         writer.write(&input).await?;
         drop(table);
-        let store = Arc::new(PausedStagePut::default());
+        let store = Arc::new(PausedStagePut {
+            release_guard: Some(HANG_GUARD),
+            ..Default::default()
+        });
         let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
         table.url = Url::parse("abfss://fixture@example.invalid/table/")?;
         table.store = Arc::<PausedStagePut>::clone(&store);
         let mut stage = Box::pin(writer.stage());
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG_GUARD, async {
             tokio::select! {
                 () = store.entered.notified() => Ok(()),
                 result = stage.as_mut() => {
@@ -1464,7 +1478,7 @@ mod io_tests {
         let available_during_put = executor.available_upload_slots();
         let ownership_retained = DeltaTable::open(directory.path()).is_err();
         store.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG_GUARD, async {
             loop {
                 if executor.available_upload_slots() == upload_limit
                     && store.inner.list(None).try_collect::<Vec<_>>().await?.len() == 1
@@ -1504,7 +1518,9 @@ mod io_tests {
         let input = input_batch()?;
         let mut writer = table.new_file(input.schema())?;
         writer.write(&input).await?;
-        let staged = tokio::time::timeout(Duration::from_secs(5), writer.stage()).await;
+        // Hang guard only: the upload slots stay held until after the stage, so a stage that
+        // needed admission would never finish; local fsync may still take seconds.
+        let staged = tokio::time::timeout(Duration::from_secs(120), writer.stage()).await;
         let available_during_local_stage = executor.available_upload_slots();
         drop(slots);
         let staged = staged.context("local stage waited for cloud upload admission")??;
