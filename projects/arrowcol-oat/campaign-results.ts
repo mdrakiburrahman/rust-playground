@@ -959,7 +959,8 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
       nonNegativeInteger(zeroWindows) === undefined || Number(zeroWindows) < 1 || Number(zeroWindows) > 2 ||
       warmup === undefined || start < warmup * 1000) return invalid;
   const guard = evidence.overload_guard;
-  if (!isRecord(guard) || !guardContainerMemoryMatches(config, guard)) return invalid;
+  if (!isRecord(guard) || !isRecord(guard.settings) || !guardContainerMemoryMatches(config, guard)) return invalid;
+  const { read_timeout_ms: readTimeoutMs = 3000, max_sampling_gap_ms: maxSamplingGapMs = 5000 } = guard.settings;
   const caps = guard.last_caps;
   const platform = isRecord(config.platform) ? config.platform : undefined;
   const local = platform && isRecord(platform.local) ? platform.local : undefined;
@@ -976,11 +977,10 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
   const expectedStart = start - warmup * 1000;
   if (guard.status !== 'complete' || guard.run_id !== runId ||
       guard.run_start_ms !== expectedStart || guard.measurement_end_ms !== end ||
-      !isRecord(guard.settings) || guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
+      guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
       guard.settings.zero_progress_windows !== zeroWindows ||
       (guard.settings.memory_signal ?? 'process_rss') !== memorySignal ||
-      (guard.settings.read_timeout_ms ?? 3000) !== timing.readTimeoutMs ||
-      (guard.settings.max_sampling_gap_ms ?? 5000) !== gap ||
+      readTimeoutMs !== timing.readTimeoutMs || maxSamplingGapMs !== gap ||
       nonNegativeInteger(guard.coverage_start_ms) === undefined || Number(guard.coverage_start_ms) > expectedStart ||
       nonNegativeInteger(guard.coverage_end_ms) === undefined || Number(guard.coverage_end_ms) < end ||
       nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > gap ||

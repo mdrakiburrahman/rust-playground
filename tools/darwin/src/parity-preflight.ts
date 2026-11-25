@@ -13,6 +13,10 @@ function object(value: unknown, name: string): JsonObject {
 
 export type ParityProfile = "historical-parity-diagnostic" | "bounded-table-2500m-diagnostic";
 
+export function hasHistoricalGuardTiming({ read_timeout_ms = 3000, max_sampling_gap_ms = 5000 }: JsonObject): boolean {
+  return read_timeout_ms === 3000 && max_sampling_gap_ms === 5000;
+}
+
 export function parseParityProfile(value: string): ParityProfile {
   if (value !== "historical-parity-diagnostic" && value !== "bounded-table-2500m-diagnostic") {
     throw new Error("unsupported parity profile");
@@ -52,7 +56,7 @@ export function parityLadderConfig(
     if (global.bytes !== 4_290_000_000 || table.bytes !== 4_000_000_000
       || batching.max_arrow_memory_per_flush !== 1_073_741_824
       || guard.enabled !== true || guard.cap_fraction !== 0.9
-      || (guard.read_timeout_ms ?? 3000) !== 3000 || (guard.max_sampling_gap_ms ?? 5000) !== 5000) {
+      || !hasHistoricalGuardTiming(guard)) {
       throw new Error("bounded profile requires the unchanged historical guard and capacity seed");
     }
     table.bytes = 2_500_000_000;
@@ -192,7 +196,7 @@ export function assertParityEvidence(seed: unknown, input: unknown, allowWriterO
   if (signal !== "process_rss" && signal !== "cgroup_memory") throw new Error("invalid guard memory signal");
   if (guard.status !== "complete" || guard.requested_container_memory_limit_bytes !== local.collector_memory_limit_bytes
     || settings.enabled !== true || settings.cap_fraction !== 0.9 || settings.zero_progress_windows !== 2
-    || (settings.read_timeout_ms ?? 3000) !== 3000 || (settings.max_sampling_gap_ms ?? 5000) !== 5000
+    || !hasHistoricalGuardTiming(requestedGuard) || !hasHistoricalGuardTiming(settings)
     || (settings.memory_signal ?? "process_rss") !== signal
     || !Array.isArray(guard.last_caps)) throw new Error("overload guard evidence is unavailable or inconsistent");
   const caps = guard.last_caps.map((value) => object(value, "guard cap"))

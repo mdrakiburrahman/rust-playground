@@ -1,6 +1,6 @@
 import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { parityLadderConfig } from "./parity-preflight.js";
+import { hasHistoricalGuardTiming, parityLadderConfig } from "./parity-preflight.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -42,7 +42,7 @@ export function realisticDiagnosticConfig(seed: unknown): JsonObject {
     || commit.max_files_per_commit !== 128 || commit.max_pending_files !== 512 || runtime.cpu_workers !== 32
     || local.collector_memory_limit_bytes !== COLLECTOR_MEMORY || pressure.rss_limit_bytes !== COLLECTOR_MEMORY
     || guard.enabled !== true || guard.cap_fraction !== 0.9 || guard.zero_progress_windows !== 2
-    || (guard.read_timeout_ms ?? 3000) !== 3000 || (guard.max_sampling_gap_ms ?? 5000) !== 5000
+    || !hasHistoricalGuardTiming(guard)
     || config.warmup_seconds !== 60 || config.measure_seconds !== 150 || client.streams_per_worker !== 2) {
     throw new Error("frozen parity pressure, guard, timing or topology changed");
   }

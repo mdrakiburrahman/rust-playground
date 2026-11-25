@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { checkTypedCompressionCandidate, type CompressionSpec } from "./compression-policy.js";
+import { hasHistoricalGuardTiming } from "./parity-preflight.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -42,7 +43,7 @@ export function bindCodeArm(
     || local.collector_memory_limit_bytes !== COLLECTOR_MEMORY_BYTES
     || pressure.rss_limit_bytes !== COLLECTOR_MEMORY_BYTES
     || guard.enabled !== true || guard.cap_fraction !== 0.9 || guard.zero_progress_windows !== 2
-    || (guard.read_timeout_ms ?? 3000) !== 3000 || (guard.max_sampling_gap_ms ?? 5000) !== 5000
+    || !hasHistoricalGuardTiming(guard)
     || config.warmup_seconds !== 60 || config.measure_seconds !== 150
     || !isDeepStrictEqual(config.replica_counts, [1])
     || !isDeepStrictEqual(config.tables, ["sqlserver_availability_replica_states"])

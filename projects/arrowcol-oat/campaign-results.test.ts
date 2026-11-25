@@ -726,6 +726,8 @@ test('requires live guard coverage and confirmed caps and nulls actual overload 
     (evidence: typeof original) => { evidence.overload_guard = null; },
     (evidence: typeof original) => { evidence.overload_guard.status = 'unavailable'; },
     (evidence: typeof original) => { evidence.overload_guard.last_caps[0].confirmed = false; },
+    (evidence: typeof original) => { evidence.overload_guard.settings.read_timeout_ms = null; },
+    (evidence: typeof original) => { evidence.overload_guard.settings.max_sampling_gap_ms = null; },
     (evidence: typeof original) => { evidence.overload_guard.requested_container_memory_limit_bytes = 8388608; },
     (evidence: typeof original) => { evidence.overload_guard.max_sampling_gap_ms = 5001; },
     (evidence: typeof original) => { evidence.overload_guard.coverage_start_ms = 1_000_001; },
