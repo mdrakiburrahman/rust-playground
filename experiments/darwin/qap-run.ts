@@ -1,6 +1,6 @@
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseEnv } from "node:util";
 import { fileURLToPath } from "node:url";
 import { canonical, parseCandidateText, sha256 } from "./qap-contract.js";
@@ -23,6 +23,17 @@ export async function main(args: string[]) {
   const copilotPath = process.env.COPILOT_CLI_PATH;
   if (copilotPath && (!isAbsolute(copilotPath) || realpathSync(copilotPath) !== copilotPath ||
       !lstatSync(copilotPath).isFile())) throw new Error("copilot-runtime-path");
+  const libraryPath = process.env.DARWIN_LIBRARY_PATH;
+  const runtimeLibraries: Record<string, string> = {};
+  if (libraryPath) {
+    if (!isAbsolute(libraryPath) || realpathSync(libraryPath) !== libraryPath ||
+        !lstatSync(libraryPath).isDirectory()) throw new Error("runtime-library-path");
+    for (const name of ["libssl.so.3", "libcrypto.so.3", "libsqlite3.so.0"]) {
+      const file = realpathSync(join(libraryPath, name));
+      if (relative(libraryPath, file).startsWith(`..${sep}`) || !lstatSync(file).isFile()) throw new Error("runtime-library-escape");
+      runtimeLibraries[name] = sha256(readFileSync(file));
+    }
+  }
   if (!/^out\/qap-[a-z0-9-]+$/.test(output)) throw new Error("output-must-be-new-out-qap-name");
   const root = resolve(repo, output);
   if (existsSync(root)) throw new Error("output-already-exists");
@@ -74,9 +85,11 @@ export async function main(args: string[]) {
     schemaVersion: 1, kind: "darwin-screening-run", sourceCommit, seedCommit,
     binarySha256: sha256(readFileSync(binary)), trustedManifestSha256: sha256(readFileSync(join(trusted, "manifest.json"))),
     copilotRuntimeSha256: copilotPath ? sha256(readFileSync(copilotPath)) : null,
+    runtimeLibraries,
     candidateSeedSha256: sha256(seedText), deadlineMs, maxIterations: 4, maxEvaluations: 16,
     environment: ["PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "COPILOT_GITHUB_TOKEN",
-      ...(copilotPath ? ["COPILOT_CLI_PATH"] : []), "DARWIN_CONFINE_AGENTS", "DARWIN_DISABLE_BANNER"],
+      ...(copilotPath ? ["COPILOT_CLI_PATH"] : []), ...(libraryPath ? ["LD_LIBRARY_PATH"] : []),
+      "DARWIN_CONFINE_AGENTS", "DARWIN_DISABLE_BANNER"],
     qualification: "screening-only; no Azure requests or measured performance",
   };
   write(join(root, "run.json"), `${canonical(metadata)}\n`);
@@ -92,6 +105,7 @@ export async function main(args: string[]) {
       HOME: home, TMPDIR: scratch, XDG_CONFIG_HOME: join(home, ".config"),
       COPILOT_GITHUB_TOKEN: token,
       ...(copilotPath ? { COPILOT_CLI_PATH: copilotPath } : {}),
+      ...(libraryPath ? { LD_LIBRARY_PATH: libraryPath } : {}),
       DARWIN_CONFINE_AGENTS: "1", DARWIN_DISABLE_BANNER: "1",
     },
   });
@@ -123,8 +137,10 @@ export async function main(args: string[]) {
   if (proposals.length) write(join(root, "best-screening-plan.json"), `${canonical(proposals[0].proposalPlan)}\n`, 0o444);
   const afterCommit = run("git", ["rev-parse", "HEAD"], repo);
   const unchangedTree = afterCommit === sourceCommit && run("git", ["status", "--porcelain"], repo) === "";
+  const unchangedRuntimeLibraries = !libraryPath || Object.entries(runtimeLibraries).every(([name, hash]) =>
+    sha256(readFileSync(join(libraryPath, name))) === hash);
   const result = {
-    ...metadata, exit, errorCode, timedOut, elapsedMs: Date.now() - started, unchangedTree,
+    ...metadata, exit, errorCode, timedOut, elapsedMs: Date.now() - started, unchangedTree, unchangedRuntimeLibraries,
     evaluations: receipts.length, acceptedEvaluations: proposals.length,
     distinctPlans: new Set(proposals.map((r) => r.planSha256)).size,
     bestScreeningScore: proposals[0]?.combined_score ?? null,
@@ -132,7 +148,7 @@ export async function main(args: string[]) {
   };
   write(join(root, "result.json"), `${canonical(result)}\n`, 0o444);
   console.log(JSON.stringify(result, null, 2));
-  if (exit !== 0 || timedOut || !unchangedTree || result.distinctPlans < 2) {
+  if (exit !== 0 || timedOut || !unchangedTree || !unchangedRuntimeLibraries || result.distinctPlans < 2) {
     throw new Error("darwin-run-not-confirmed-see-private-result-and-log");
   }
 }

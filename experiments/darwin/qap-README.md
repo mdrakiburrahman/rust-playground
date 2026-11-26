@@ -18,6 +18,14 @@ set `COPILOT_CLI_PATH=/absolute/path/to/copilot` on the run command. The runner
 validates this trusted executable path and records its hash; it does not expose
 the path in candidate files. Do not substitute an unverified runtime.
 
+The tested staticx Darwin0.3.0 binary also needs ABI-compatible SSL and SQLite
+libraries on Ubuntu24.04: its bundled glibc cannot load the host versions.
+`DARWIN_LIBRARY_PATH=/absolute/private/library/directory` permits the trusted
+controller to provide `libssl.so.3`, `libcrypto.so.3`, and `libsqlite3.so.0`.
+The runner validates containment and records/rechecks all three hashes. Use
+official distribution packages extracted under ignored `out/`; **never replace
+host libraries**. This is a runtime dependency workaround, not a candidate knob.
+
 ## Boundary and receipts
 
 The runner materializes a candidate-only Git seed from committed HEAD. It never
