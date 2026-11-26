@@ -179,6 +179,21 @@ test('Delta Add window retries one append that races its initial snapshot', asyn
   assert.equal(result.active_rows, 60);
 });
 
+test('QAP source evidence retains the exact active files and refuses to label a physical rewrite append-only', async () => {
+  const s = new Storage().seed(add('seed.parquet', 10));
+  s.put(1, info('INSERT'), add('ingested.parquet', 20));
+  const append = await readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard);
+  assert.equal(append.append_only, true);
+  assert.deepEqual(append.source_reference.active_files.map(file => [file.path, file.num_records]),
+    [['ingested.parquet', 20], ['seed.parquet', 10]]);
+  s.put(2, info('OPTIMIZE'), remove('seed.parquet', false), remove('ingested.parquet', false),
+    add('compact.parquet', 30, false));
+  const rewrite = await readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard);
+  assert.equal(rewrite.active_rows, 30);
+  assert.equal(rewrite.append_only, false);
+  assert.deepEqual(rewrite.source_reference.active_files.map(file => file.path), ['compact.parquet']);
+});
+
 test('Delta Add window retries a conditional GET that loses to a concurrent checkpoint rewrite', async () => {
   const s = new Storage().seed(add('seed.parquet', 10));
   s.put(1, info('INSERT'), add('first.parquet', 20));

@@ -128,6 +128,23 @@ export class DirectQapObserver {
     return false;
   }
 
+  async captureMetrics(startedAtMs: number, endedAtMs: number): Promise<void> {
+    const timespan = `${new Date(startedAtMs).toISOString()}/${new Date(endedAtMs).toISOString()}`;
+    try {
+      const response = await this.azure.arm('GET', this.azure.c.cluster_id +
+        '/providers/microsoft.insights/metrics?metricnames=CPU,CacheUtilization,InstanceCount' +
+        `&timespan=${encodeURIComponent(timespan)}&interval=PT1M&aggregation=Average,Minimum,Maximum`,
+      undefined, false, '2018-01-01');
+      await writePrivateFile(resolve(this.runDir, 'qap-azure-metrics.json'), JSON.stringify({
+        requestedAt: new Date().toISOString(), startedAtMs, endedAtMs, response,
+      }) + '\n');
+    } catch (error) {
+      console.warn('Azure CPU/cache/node metric receipt unavailable; no metric values will be inferred.');
+      await writePrivateFile(resolve(this.runDir, 'qap-azure-metrics-error.txt'),
+        this.azure.c.redact(error instanceof Error ? error.message : String(error)) + '\n');
+    }
+  }
+
   async close(): Promise<void> {
     const signal = AbortSignal.timeout(120_000);
     const rows = tableRows(primary(await this.kusto.management('.show external tables', signal)));

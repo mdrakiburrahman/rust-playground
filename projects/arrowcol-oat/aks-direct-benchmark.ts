@@ -920,6 +920,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         }) + '\n');
         qapTerminalReady = await qap.drain({ version: window.delta_version, rows: window.active_rows },
           options.mode === 'smoke' ? 5 * 60_000 : 15 * 60_000);
+        await qap.captureMetrics(measurementStart - 60_000, Date.now());
       }
     });
   } catch (error) {
