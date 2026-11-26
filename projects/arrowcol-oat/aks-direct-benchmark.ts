@@ -13,7 +13,7 @@ import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
 import { canonicalDeltaWindow, collectWriterCommitRecords, readDeltaAddWindow, type CanonicalDeltaWindow,
   type WriterCommitRecord } from './aks-delta-preservation.js';
-import { DirectQapObserver, clockErrorBound } from './aks-qap-observer.js';
+import { DirectQapObserver, captureWriterShutdown, clockErrorBound } from './aks-qap-observer.js';
 
 const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
 const namespacePrefix = 'arrow-collector-';
@@ -894,6 +894,26 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       podPlacement = await readBenchmarkPlacement(config, namespace);
       await assertWriterStable(config, namespace, loadWriter);
       await verifyNamespace(config, namespace, runId, owner, ownedUid);
+      let writerStoppedAtMs: number | undefined;
+      if (qap) {
+        const finalLogs = await captureWriterShutdown(['kubectl', '--context', config.cluster, 'logs',
+          `pod/${loadWriter.name}`, '-c', 'dataflow', '-n', namespace, '--follow=true'], async () => {
+          await verifyNamespace(config, namespace, runId, owner, ownedUid);
+          await assertWriterStable(config, namespace, loadWriter);
+          const deployment = requireRecord(await getObject(config, 'deployment', namespace, 'arrowcol'), 'Writer deployment');
+          const metadata = requireRecord(deployment.metadata, 'Writer deployment metadata');
+          if (typeof metadata.resourceVersion !== 'string') throw new Error('Writer resource version is unavailable.');
+          await kubectl(config, ['scale', 'deployment/arrowcol', '-n', namespace, '--replicas=0',
+            '--current-replicas=1', `--resource-version=${metadata.resourceVersion}`], 'Stop the post-window writer');
+          await waitUntil('post-window writer termination', 6 * 60_000, async () =>
+            await getObject(config, 'pod', namespace, loadWriter.name) ? undefined : true, 1000);
+        });
+        collectWriterCommitRecords(finalLogs, writerCommits);
+        writerStoppedAtMs = Date.now();
+        await writePrivateFile(resolve(runDir, 'qap-writer-stop.json'), JSON.stringify({
+          writerUid: loadWriter.uid, writerStoppedAtMs, finalRecords: writerCommits.size,
+        }) + '\n');
+      }
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
       let verifiedAt = 0;
       const window = await readDeltaAddWindow(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
@@ -903,8 +923,10 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
           verifiedAt = Date.now();
         }, Date.now() + 20 * 60_000);
       await verifyNamespace(config, namespace, runId, owner, ownedUid);
-      await assertWriterStable(config, namespace, loadWriter);
-      await sampleWriterCommits(true);
+      if (!qap) {
+        await assertWriterStable(config, namespace, loadWriter);
+        await sampleWriterCommits(true);
+      }
       await writePrivateFile(resolve(runDir, 'writer-commits.json'), `${JSON.stringify({
         measurement_start_unix_ms: measurementStart, measurement_end_unix_ms: measurementEnd, delta_adds: window.commits,
         writer_records: [...writerCommits.values()].sort((a, b) => a.version - b.version),
@@ -916,7 +938,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         await writePrivateFile(resolve(runDir, 'qap-source.json'), JSON.stringify({
           measurementStartMs: measurementStart, measurementEndMs: measurementEnd,
           warmupMs: 60_000, steadyStateStartMs: measurementStart + 120_000,
-          source: window, writerRecords: [...writerCommits.values()], clocks: qap.clocks,
+          source: window, writerRecords: [...writerCommits.values()], clocks: qap.clocks, writerStoppedAtMs,
         }) + '\n');
         qapTerminalReady = await qap.drain({ version: window.delta_version, rows: window.active_rows },
           options.mode === 'smoke' ? 5 * 60_000 : 15 * 60_000);

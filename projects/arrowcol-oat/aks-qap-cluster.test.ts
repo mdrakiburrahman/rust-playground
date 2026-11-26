@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { observedQapPressure, profileFromCluster, profileMatches, validateClusterProfile } from './aks-qap-cluster.js';
-import { clockErrorBound } from './aks-qap-observer.js';
+import { captureWriterShutdown, clockErrorBound } from './aks-qap-observer.js';
 
 const fixed = { sku: 'Standard_E8ads_v5', nodes: 4, autoscale: { enabled: false, minimum: 4, maximum: 4 } };
 
@@ -55,4 +58,30 @@ test('producer clock uncertainty includes both request endpoints and never manuf
     { startedAtMs: 2000, endedAtMs: 2180, producerAtMs: 1950 }]), 230);
   assert.throws(() => clockErrorBound([{ startedAtMs: 1000, endedAtMs: 999, producerAtMs: 1000 },
     { startedAtMs: 2000, endedAtMs: 2180, producerAtMs: 2100 }]), /Invalid/);
+});
+
+test('terminal source capture retains records emitted while the post-window writer stops', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'qap-stop-'));
+  try {
+    const marker = join(directory, 'stop');
+    const logs = await captureWriterShutdown([process.execPath, '-e', `
+      const fs = require('node:fs');
+      console.log('before stop');
+      const timer = setInterval(() => {
+        if (!fs.existsSync(process.argv[1])) return;
+        console.log('late durable commit');
+        clearInterval(timer);
+      }, 10);
+    `, marker], () => writeFile(marker, 'stop'));
+    assert.equal(logs, 'before stop\nlate durable commit\n');
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('unavailable or incomplete final log capture fails rather than stopping or certifying the source', async () => {
+  let stopped = false;
+  await assert.rejects(captureWriterShutdown([process.execPath, '-e', 'process.exit(1)'],
+    async () => { stopped = true; }), /Writer log capture failed/);
+  assert.equal(stopped, false);
+  await assert.rejects(captureWriterShutdown([process.execPath, '-e',
+    'console.log("before stop"); setInterval(() => {}, 1000)'], async () => {}, 100), /abort/i);
 });

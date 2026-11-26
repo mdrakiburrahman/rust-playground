@@ -1,4 +1,5 @@
 import { appendFile, readFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { Azure, identity_principal } from '../../infra/azure/bootstrap.js';
 import { Kusto, identifier, kql, object, parseSample, primary, ready, tableRows,
@@ -22,6 +23,55 @@ export interface QapObservation {
 }
 
 export interface ClockObservation { startedAtMs: number; endedAtMs: number; producerAtMs: number }
+
+export async function captureWriterShutdown(followArgs: string[], stop: () => Promise<void>,
+  timeoutMs = 7 * 60_000): Promise<string> {
+  if (!followArgs.length || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1)
+    throw new Error('Invalid writer log capture command or deadline.');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let output = '', errorOutput = '', bytes = 0;
+  let markReady!: () => void, failReady!: (error: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => { markReady = resolve; failReady = reject; });
+  const child = spawn(followArgs[0]!, followArgs.slice(1), {
+    stdio: ['ignore', 'pipe', 'pipe'], signal: controller.signal,
+  });
+  const finished = new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.stdout.once('error', reject);
+    child.stderr.once('error', reject);
+    child.once('close', (code, signal) => {
+      if (code !== 0 || signal) reject(new Error(`Writer log capture failed (${code ?? signal}): ${errorOutput}`));
+      else if (!output.includes('\n')) reject(new Error('Writer log capture ended without any complete records; producer was not stopped.'));
+      else resolve();
+    });
+    child.stdout.on('data', (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > 16 * 1024 * 1024) {
+        reject(new Error('Writer shutdown logs exceeded the 16 MiB capture limit.'));
+        controller.abort();
+        return;
+      }
+      output += chunk.toString('utf8');
+      if (output.includes('\n')) markReady();
+    });
+    child.stderr.on('data', (chunk: Buffer) => { errorOutput = (errorOutput + chunk.toString('utf8')).slice(-8192); });
+  }).then(() => ({ ok: true as const }), error => {
+    failReady(error);
+    return { ok: false as const, error };
+  });
+  try {
+    await ready;
+    await stop();
+    const outcome = await finished;
+    if (!outcome.ok) throw outcome.error;
+    return output;
+  } catch (error) {
+    controller.abort();
+    await finished;
+    throw error;
+  } finally { clearTimeout(timer); }
+}
 
 export function clockErrorBound(observations: ClockObservation[]): number | null {
   if (observations.length < 2) return null;
