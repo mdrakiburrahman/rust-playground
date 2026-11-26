@@ -2,7 +2,7 @@ import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, rea
 import { randomBytes, randomInt } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonical, parseCandidateText, parsePlan, proposalHash, record, screen, sha256 } from "./qap-contract.js";
+import { canonical, parseCandidateText, parsePlan, parsePressureAttestation, proposalHash, record, screen, sha256 } from "./qap-contract.js";
 
 export function readRegular(path: string, maxBytes: number): string {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -17,13 +17,13 @@ export function readRegular(path: string, maxBytes: number): string {
   } finally { closeSync(fd); }
 }
 
-export function loadCandidate(directory: string) {
+export function loadCandidate(directory: string, pressureAttested = false) {
   const root = resolve(directory);
   if (realpathSync(root) !== root || !lstatSync(root).isDirectory()) throw new Error("unsafe-candidate-root");
   const entries = readdirSync(root).sort();
   if (entries.join("\0") !== [".git", "candidate.json"].join("\0")) throw new Error("candidate-tree-mutated");
   if (lstatSync(join(root, ".git")).isSymbolicLink()) throw new Error("candidate-git-symlink");
-  return parseCandidateText(readRegular(join(root, "candidate.json"), 16_384));
+  return parseCandidateText(readRegular(join(root, "candidate.json"), 16_384), pressureAttested);
 }
 
 function evaluate(manifestPath: string) {
@@ -31,13 +31,21 @@ function evaluate(manifestPath: string) {
   if (trusted !== dirname(fileURLToPath(import.meta.url))) throw new Error("wrong-trust-root");
   const manifestText = readRegular(join(trusted, "manifest.json"), 65_536);
   const manifest = record(JSON.parse(manifestText), [
-    "schemaVersion", "files", "receiptFile", "deadlineMs", "maxEvaluations", "sourceCommit",
+    "schemaVersion", "files", "receiptFile", "deadlineMs", "maxEvaluations", "sourceCommit", "pressureAttestationSha256",
   ]);
   if (manifest.schemaVersion !== 1 || typeof manifest.deadlineMs !== "number" ||
       Date.now() >= manifest.deadlineMs || manifest.maxEvaluations !== 16) throw new Error("evaluation-budget");
   const files = record(manifest.files, ["qap-contract.js", "qap-evaluator.js"]);
   for (const [name, expected] of Object.entries(files)) {
     if (sha256(readRegular(join(trusted, name), 1_048_576)) !== expected) throw new Error("trusted-code-mutated");
+  }
+  const pressureHash = manifest.pressureAttestationSha256;
+  const pressureAttested = pressureHash !== null;
+  if (pressureAttested) {
+    if (typeof pressureHash !== "string" || !/^[a-f0-9]{64}$/.test(pressureHash)) throw new Error("pressure-binding");
+    const text = readRegular(join(trusted, "pressure-attestation.json"), 16_384);
+    if (sha256(text) !== pressureHash) throw new Error("pressure-attestation-mutated");
+    parsePressureAttestation(JSON.parse(text));
   }
   const receiptFile = join(dirname(trusted), "receipts.jsonl");
   if (manifest.receiptFile !== receiptFile) throw new Error("receipt-path");
@@ -50,27 +58,33 @@ function evaluate(manifestPath: string) {
     const start = performance.now();
     let receipt: Record<string, unknown>;
     try {
-      const candidate = loadCandidate(process.cwd());
+      const candidate = loadCandidate(process.cwd(), pressureAttested);
       // Fresh private negative cases are generated after admission, never given to the evolution agent.
       const nonce = randomBytes(32).toString("hex");
-      for (let i = 0; i < 24; i++) {
+      const privateCases = pressureAttested ? 36 : 24;
+      for (let i = 0; i < privateCases; i++) {
         const bad = structuredClone(candidate) as unknown as Record<string, unknown>;
-        if (i % 2 === 0) bad[`unknown_${randomBytes(8).toString("hex")}`] = randomInt(1, 100);
+        if (pressureAttested && i % 3 === 2) {
+          const p = structuredClone(candidate.proposals[0]);
+          bad.proposals = [{ ...p, queryAccelerationCapacity: {
+            clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: 0.75,
+          } }];
+        } else if (i % 2 === 0) bad[`unknown_${randomBytes(8).toString("hex")}`] = randomInt(1, 100);
         else {
           const p = structuredClone(candidate.proposals[0]);
           p.cluster.autoscale.maxNodes = randomInt(9, 1000);
           bad.proposals = [p];
         }
         let rejected = false;
-        try { parsePlan(bad); } catch { rejected = true; }
+        try { parsePlan(bad, pressureAttested); } catch { rejected = true; }
         if (!rejected) throw new Error("private-admission-case-failed");
       }
-      const screening = screen(candidate);
+      const screening = screen(candidate, pressureAttested);
       receipt = {
         schemaVersion: 1, kind: "screening", qualified: false, valid: 1,
         ...screening, planSha256: sha256(canonical(candidate)),
         proposalSha256s: candidate.proposals.map(proposalHash), proposalPlan: candidate,
-        freshPrivateCases: 24, privateCaseNonceSha256: sha256(nonce), reasons: [],
+        freshPrivateCases: privateCases, privateCaseNonceSha256: sha256(nonce), reasons: [],
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "invalid-candidate";
@@ -78,6 +92,8 @@ function evaluate(manifestPath: string) {
       receipt = { schemaVersion: 1, kind: "screening", qualified: false, valid: 0, combined_score: 0, reasons: [reason] };
     }
     receipt.trustedManifestSha256 = sha256(manifestText);
+    receipt.screeningMode = pressureAttested ? "pressure-attested" : "topology";
+    receipt.pressureAttestationSha256 = pressureHash;
     receipt.elapsedMs = performance.now() - start;
     receipt.evaluation = prior.length + 1;
     writeSync(fd, `${canonical(receipt)}\n`);

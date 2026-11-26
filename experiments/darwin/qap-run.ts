@@ -3,7 +3,8 @@ import { spawn, execFileSync } from "node:child_process";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseEnv } from "node:util";
 import { fileURLToPath } from "node:url";
-import { canonical, parseCandidateText, sha256 } from "./qap-contract.js";
+import { canonical, parseCandidateText, parsePressureAttestation, sha256 } from "./qap-contract.js";
+import { readRegular } from "./qap-evaluator.js";
 
 function run(command: string, args: string[], cwd: string): string {
   return execFileSync(command, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 4_194_304 }).trim();
@@ -14,11 +15,23 @@ function write(path: string, data: string, mode = 0o600) {
 }
 
 export async function main(args: string[]) {
-  if (args.length !== 2) throw new Error("usage: qap-run.ts <absolute-darwin-binary> <new-out/qap-run-name>");
+  if (args.length !== 2 && (args.length !== 4 || args[2] !== "--pressure-attestation")) {
+    throw new Error("usage: qap-run.ts <absolute-darwin-binary> <new-out/qap-run-name> [--pressure-attestation <absolute-file>]");
+  }
   const repo = realpathSync(process.cwd());
   if (run("git", ["rev-parse", "--show-toplevel"], repo) !== repo) throw new Error("run-from-repository-root");
   if (run("git", ["status", "--porcelain"], repo)) throw new Error("commit-clean-tree-before-evolution");
   const [binary, output] = args;
+  let pressureText: string | null = null;
+  if (args.length === 4) {
+    const path = args[3];
+    if (!isAbsolute(path) || realpathSync(path) !== path) throw new Error("pressure-attestation-path");
+    const text = readRegular(path, 16_384);
+    const attestation = parsePressureAttestation(JSON.parse(text));
+    if (text !== `${canonical(attestation)}\n`) throw new Error("pressure-attestation-must-be-canonical");
+    pressureText = text;
+  }
+  const pressureAttestationSha256 = pressureText === null ? null : sha256(pressureText);
   if (!isAbsolute(binary) || realpathSync(binary) !== binary || !lstatSync(binary).isFile()) throw new Error("binary-path");
   const copilotPath = process.env.COPILOT_CLI_PATH;
   if (copilotPath && (!isAbsolute(copilotPath) || realpathSync(copilotPath) !== copilotPath ||
@@ -49,7 +62,8 @@ export async function main(args: string[]) {
   const committed = (path: string) => execFileSync("git", ["show", `${sourceCommit}:${path}`], { cwd: repo, encoding: "utf8" });
   const seedText = committed("experiments/darwin/qap-candidate.json");
   parseCandidateText(seedText);
-  const yaml = committed("experiments/darwin/qap-screening.yaml");
+  const yaml = committed(pressureText === null ? "experiments/darwin/qap-screening.yaml" :
+    "experiments/darwin/qap-pressure-screening.yaml");
   if (yaml.split('"@TRUSTED_COMMAND@"').length !== 2) throw new Error("command-template");
   const dotenv = existsSync(join(repo, ".env")) ? parseEnv(readFileSync(join(repo, ".env"), "utf8")) : {};
   const token = process.env.COPILOT_GITHUB_TOKEN || dotenv.COPILOT_GITHUB_TOKEN;
@@ -81,7 +95,8 @@ export async function main(args: string[]) {
   }
   const receiptFile = join(root, "receipts.jsonl");
   write(receiptFile, "");
-  const manifest = { schemaVersion: 1, files, receiptFile, deadlineMs, maxEvaluations: 16, sourceCommit };
+  if (pressureText !== null) write(join(trusted, "pressure-attestation.json"), pressureText, 0o444);
+  const manifest = { schemaVersion: 1, files, receiptFile, deadlineMs, maxEvaluations: 16, sourceCommit, pressureAttestationSha256 };
   write(join(trusted, "manifest.json"), `${canonical(manifest)}\n`, 0o444);
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   const command = [process.execPath, join(trusted, "qap-evaluator.js"), join(trusted, "manifest.json")].map(quote).join(" ");
@@ -89,6 +104,7 @@ export async function main(args: string[]) {
   chmodSync(trusted, 0o555);
   const metadata = {
     schemaVersion: 1, kind: "darwin-screening-run", sourceCommit, seedCommit,
+    screeningMode: pressureText === null ? "topology" : "pressure-attested", pressureAttestationSha256,
     binarySha256: sha256(readFileSync(binary)), trustedManifestSha256: sha256(readFileSync(join(trusted, "manifest.json"))),
     copilotRuntimeSha256: copilotPath ? sha256(readFileSync(copilotPath)) : null,
     runtimeLibraries,
@@ -149,8 +165,13 @@ export async function main(args: string[]) {
     (canonical(Object.keys(runtimeLibraries).sort()) ===
       canonical(readdirSync(libraryPath).filter((name) => /\.so(?:\.|$)/.test(name)).sort()) &&
       Object.entries(runtimeLibraries).every(([name, hash]) => sha256(readFileSync(join(libraryPath, name))) === hash));
+  const coverage = proposals[0]?.coverage;
+  const pressureComparisonComplete = pressureText === null ? null : Boolean(coverage?.baselinePresent &&
+    coverage.matchedCapacityComparisons.length >= 1 && coverage.matchedCoreBudgets.length >= 1 &&
+    coverage.autoscaleComparisons.length >= 1);
   const result = {
     ...metadata, exit, errorCode, timedOut, elapsedMs: Date.now() - started, unchangedTree, unchangedRuntimeLibraries,
+    pressureComparisonComplete,
     evaluations: receipts.length, acceptedEvaluations: proposals.length,
     distinctPlans: new Set(proposals.map((r) => r.planSha256)).size,
     bestScreeningScore: proposals[0]?.combined_score ?? null,
@@ -160,6 +181,9 @@ export async function main(args: string[]) {
   console.log(JSON.stringify(result, null, 2));
   if (exit !== 0 || timedOut || !unchangedTree || !unchangedRuntimeLibraries || result.distinctPlans < 2) {
     throw new Error("darwin-run-not-confirmed-see-private-result-and-log");
+  }
+  if (pressureComparisonComplete === false) {
+    throw new Error("pressure-run-missing-matched-comparison");
   }
 }
 

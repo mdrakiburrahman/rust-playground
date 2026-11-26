@@ -7,14 +7,30 @@ export interface Proposal {
     autoscale: { enabled: boolean; minNodes: number; maxNodes: number };
   };
   queryAccelerationCapacity: null | {
-    clusterMaximumConcurrentOperations: number;
-    coreUtilizationCoefficient: number;
+    clusterMaximumConcurrentOperations: 100;
+    coreUtilizationCoefficient: 0.5 | 1;
   };
 }
 
 export interface CandidatePlan {
   schemaVersion: 1;
   proposals: Proposal[];
+}
+
+export interface PressureAttestation {
+  schemaVersion: 1;
+  kind: "controller-attested-qap-pressure";
+  sampleCount: number;
+  durationSeconds: number;
+  queryAcceleration: { total: number; consumed: number; remaining: number };
+  pendingFiles: number;
+  acceleratedRows: number;
+  baseline: {
+    coresPerNode: 4;
+    nodes: 2;
+    clusterMaximumConcurrentOperations: 100;
+    coreUtilizationCoefficient: 0.5;
+  };
 }
 
 export interface LiveObservation {
@@ -77,6 +93,24 @@ export function proposalHash(value: Proposal): string {
   return sha256(canonical(value));
 }
 
+export function parsePressureAttestation(value: unknown): PressureAttestation {
+  const p = record(value, ["schemaVersion", "kind", "sampleCount", "durationSeconds",
+    "queryAcceleration", "pendingFiles", "acceleratedRows", "baseline"]);
+  if (p.schemaVersion !== 1 || p.kind !== "controller-attested-qap-pressure") throw new Error("pressure-attestation-version");
+  number(p.sampleCount, 5, 1000);
+  number(p.durationSeconds, 40, 600, false);
+  number(p.pendingFiles, 1, Number.MAX_SAFE_INTEGER);
+  number(p.acceleratedRows, 0, Number.MAX_SAFE_INTEGER);
+  const q = record(p.queryAcceleration, ["total", "consumed", "remaining"]);
+  const b = record(p.baseline, ["coresPerNode", "nodes",
+    "clusterMaximumConcurrentOperations", "coreUtilizationCoefficient"]);
+  if (b.coresPerNode !== 4 || b.nodes !== 2 || b.clusterMaximumConcurrentOperations !== 100 ||
+      b.coreUtilizationCoefficient !== 0.5 || q.total !== 4 || q.consumed !== 4 || q.remaining !== 0) {
+    throw new Error("pressure-attestation-not-matched-saturation");
+  }
+  return structuredClone(value) as PressureAttestation;
+}
+
 export function parseProposal(value: unknown, pressureImplicated = false): Proposal {
   const p = record(value, ["cluster", "queryAccelerationCapacity"]);
   const c = record(p.cluster, ["coresPerNode", "nodes", "autoscale"]);
@@ -92,8 +126,9 @@ export function parseProposal(value: unknown, pressureImplicated = false): Propo
   if (p.queryAccelerationCapacity !== null) {
     if (!pressureImplicated) throw new Error("capacity-pressure-not-established");
     const q = record(p.queryAccelerationCapacity, ["clusterMaximumConcurrentOperations", "coreUtilizationCoefficient"]);
-    number(q.clusterMaximumConcurrentOperations, 1, 100);
-    number(q.coreUtilizationCoefficient, 0.1, 1, false);
+    if (q.clusterMaximumConcurrentOperations !== 100 || ![0.5, 1].includes(q.coreUtilizationCoefficient as number)) {
+      throw new Error("capacity-policy-outside-attested-bounds");
+    }
   }
   return structuredClone(value) as Proposal;
 }
@@ -121,9 +156,10 @@ export function qapCapacity(nodes: number, coresPerNode: number, cap: number, co
   return Math.min(cap, nodes * Math.max(1, coresPerNode * coefficient));
 }
 
-export function screen(plan: CandidatePlan) {
+export function screen(plan: CandidatePlan, pressureAttested = false) {
   const matchedCoreBudgets = new Set<number>();
   const autoscaleComparisons = new Set<string>();
+  const matchedCapacityComparisons = new Set<string>();
   let baselinePresent = false;
   for (const a of plan.proposals) {
     const x = a.cluster;
@@ -132,6 +168,12 @@ export function screen(plan: CandidatePlan) {
         auto.maxNodes === 4 && a.queryAccelerationCapacity === null) baselinePresent = true;
     for (const b of plan.proposals) {
       const y = b.cluster;
+      if (pressureAttested && a.queryAccelerationCapacity?.clusterMaximumConcurrentOperations === 100 &&
+          b.queryAccelerationCapacity?.clusterMaximumConcurrentOperations === 100 &&
+          a.queryAccelerationCapacity.coreUtilizationCoefficient === 0.5 &&
+          b.queryAccelerationCapacity.coreUtilizationCoefficient === 1 && canonical(x) === canonical(y)) {
+        matchedCapacityComparisons.add(canonical(x));
+      }
       if (canonical(a.queryAccelerationCapacity) !== canonical(b.queryAccelerationCapacity)) continue;
       if (!auto.enabled && !y.autoscale.enabled && x.coresPerNode !== y.coresPerNode &&
           x.coresPerNode * x.nodes === y.coresPerNode * y.nodes) {
@@ -147,11 +189,16 @@ export function screen(plan: CandidatePlan) {
     baselinePresent,
     matchedCoreBudgets: [...matchedCoreBudgets].sort((a, b) => a - b),
     autoscaleComparisons: [...autoscaleComparisons].sort(),
+    matchedCapacityComparisons: [...matchedCapacityComparisons].sort(),
     proposals: plan.proposals.length,
   };
   // Experimental-design coverage, never a model of latency, throughput, cost, or Azure availability.
-  const score = (baselinePresent ? 20 : 0) + 15 * Math.min(3, matchedCoreBudgets.size) +
-    15 * Math.min(2, autoscaleComparisons.size) + 5 / plan.proposals.length;
+  const score = pressureAttested ?
+    (baselinePresent ? 10 : 0) + 15 * Math.min(2, matchedCoreBudgets.size) +
+      15 * Math.min(1, autoscaleComparisons.size) + 40 * Math.min(1, matchedCapacityComparisons.size) +
+      5 / plan.proposals.length :
+    (baselinePresent ? 20 : 0) + 15 * Math.min(3, matchedCoreBudgets.size) +
+      15 * Math.min(2, autoscaleComparisons.size) + 5 / plan.proposals.length;
   return { combined_score: score, coverage };
 }
 

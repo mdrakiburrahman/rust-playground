@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assessLiveObservation, canonical, parseCandidateText, parsePlan, parseProposal, proposalHash, qapCapacity, screen, sha256, type Proposal } from "./qap-contract.js";
+import { assessLiveObservation, canonical, parseCandidateText, parsePlan, parsePressureAttestation, parseProposal, proposalHash, qapCapacity, screen, sha256, type Proposal } from "./qap-contract.js";
 import { loadCandidate } from "./qap-evaluator.js";
 
 const fixed = (cores: 4 | 8 | 16 | 32, nodes: number): Proposal => ({
@@ -16,6 +16,62 @@ const baseline: Proposal = {
   queryAccelerationCapacity: null,
 };
 const plan = () => ({ schemaVersion: 1 as const, proposals: [structuredClone(baseline)] });
+const pressureFixture = () => ({
+  schemaVersion: 1, kind: "controller-attested-qap-pressure", sampleCount: 5, durationSeconds: 40,
+  queryAcceleration: { total: 4, consumed: 4, remaining: 0 }, pendingFiles: 1, acceleratedRows: 0,
+  baseline: { coresPerNode: 4, nodes: 2, clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: 0.5 },
+});
+
+test("pressure admission requires trusted matched saturation and exact approved policy values", () => {
+  assert.deepEqual(parsePressureAttestation(pressureFixture()), pressureFixture());
+  for (const modify of [
+    (p: any) => { p.sampleCount = 4; },
+    (p: any) => { p.durationSeconds = 39; },
+    (p: any) => { p.pendingFiles = 0; },
+    (p: any) => { p.queryAcceleration.consumed = 3; p.queryAcceleration.remaining = 1; },
+    (p: any) => { p.baseline.coresPerNode = 8; },
+    (p: any) => { p.baseline.coreUtilizationCoefficient = 1; },
+    (p: any) => { p.authorized = true; },
+  ]) {
+    const value = pressureFixture(); modify(value);
+    assert.throws(() => parsePressureAttestation(value));
+  }
+  for (const coefficient of [0.5, 1] as const) {
+    const p = fixed(8, 4);
+    p.queryAccelerationCapacity = { clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: coefficient };
+    assert.throws(() => parseProposal(p), /pressure-not-established/);
+    assert.deepEqual(parseProposal(p, true), p);
+    for (const cap of [1, 99, 101]) {
+      assert.throws(() => parseProposal({ ...p, queryAccelerationCapacity: {
+        ...p.queryAccelerationCapacity, clusterMaximumConcurrentOperations: cap,
+      } }, true), /attested-bounds/);
+    }
+  }
+  for (const coefficient of [0, 0.1, 0.75, 1.5, "0.5", true]) {
+    const p = { ...fixed(8, 4), queryAccelerationCapacity: {
+      clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: coefficient,
+    } };
+    assert.throws(() => parseProposal(p, true), /attested-bounds/);
+  }
+  assert.throws(() => parsePlan({ ...plan(), pressureAttested: true }, true), /field/);
+});
+
+test("pressure coverage requires an explicit matched control and never equates null with coefficient0.5", () => {
+  const low = fixed(8, 4);
+  low.queryAccelerationCapacity = { clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: 0.5 };
+  const high = structuredClone(low);
+  high.queryAccelerationCapacity!.coreUtilizationCoefficient = 1;
+  const matched = parsePlan({ schemaVersion: 1, proposals: [low, high] }, true);
+  assert.equal(screen(matched, true).coverage.matchedCapacityComparisons.length, 1);
+  assert.equal(screen(matched).coverage.matchedCapacityComparisons.length, 0);
+  const noControl = parsePlan({ schemaVersion: 1, proposals: [fixed(8, 4), high] }, true);
+  assert.equal(screen(noControl, true).coverage.matchedCapacityComparisons.length, 0);
+  const differentTopology = structuredClone(high);
+  differentTopology.cluster = fixed(16, 2).cluster;
+  assert.equal(screen(parsePlan({ schemaVersion: 1, proposals: [low, differentTopology] }, true), true)
+    .coverage.matchedCapacityComparisons.length, 0);
+  assert.ok(screen(matched, true).combined_score > screen(noControl, true).combined_score);
+});
 
 test("strict data boundary rejects unknown, executable, aliased and overbudget proposals", () => {
   assert.deepEqual(parseCandidateText(`${canonical(plan())}\n`), plan());
@@ -41,8 +97,9 @@ test("strict data boundary rejects unknown, executable, aliased and overbudget p
   const pressure = fixed(8, 4);
   pressure.queryAccelerationCapacity = { clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: 0.5 };
   assert.deepEqual(parseProposal(pressure, true), pressure);
-  pressure.queryAccelerationCapacity.coreUtilizationCoefficient = Number.NaN;
-  assert.throws(() => parseProposal(pressure, true));
+  assert.throws(() => parseProposal({ ...pressure, queryAccelerationCapacity: {
+    ...pressure.queryAccelerationCapacity, coreUtilizationCoefficient: Number.NaN,
+  } }, true));
 });
 
 test("screening rewards matched-core and matched-peak autoscale comparisons, not large machines alone", () => {
@@ -137,7 +194,7 @@ test("absolute trusted evaluator emits zero for mutations and refuses tampered s
       [name, sha256(readFileSync(join(trusted, name)))]));
     const manifestPath = join(trusted, "manifest.json");
     const manifest = { schemaVersion: 1, files, receiptFile, deadlineMs: Date.now() + 60_000,
-      maxEvaluations: 16, sourceCommit: "a".repeat(40) };
+      maxEvaluations: 16, sourceCommit: "a".repeat(40), pressureAttestationSha256: null };
     writeFileSync(manifestPath, canonical(manifest));
     const invoke = () => spawnSync(process.execPath, [join(trusted, "qap-evaluator.js"), manifestPath],
       { cwd: source, encoding: "utf8", timeout: 10_000 });
@@ -155,6 +212,27 @@ test("absolute trusted evaluator emits zero for mutations and refuses tampered s
     assert.equal(invalid.status, 0);
     assert.equal(JSON.parse(invalid.stdout.trim().slice(8)).combined_score, 0);
     rmSync(join(source, "workload.json"));
+    const pressureText = `${canonical(pressureFixture())}\n`;
+    const pressurePath = join(trusted, "pressure-attestation.json");
+    const pressureManifest = { ...manifest, pressureAttestationSha256: sha256(pressureText) };
+    writeFileSync(pressurePath, pressureText);
+    const policy = fixed(8, 4);
+    policy.queryAccelerationCapacity = { clusterMaximumConcurrentOperations: 100, coreUtilizationCoefficient: 1 };
+    writeFileSync(join(source, "candidate.json"), `${canonical({ schemaVersion: 1, proposals: [policy] })}\n`);
+    assert.equal(JSON.parse(invoke().stdout.trim().slice(8)).valid, 0);
+    writeFileSync(manifestPath, canonical(pressureManifest));
+    const pressure = invoke();
+    assert.equal(pressure.status, 0, pressure.stderr);
+    const pressureReceipt = JSON.parse(pressure.stdout.trim().slice(8));
+    assert.equal(pressureReceipt.valid, 1);
+    assert.equal(pressureReceipt.screeningMode, "pressure-attested");
+    assert.equal(pressureReceipt.pressureAttestationSha256, sha256(pressureText));
+    assert.equal(pressureReceipt.freshPrivateCases, 36);
+    writeFileSync(pressurePath, `${pressureText} `);
+    const mutatedPressure = invoke();
+    assert.notEqual(mutatedPressure.status, 0);
+    assert.equal(mutatedPressure.stdout, "");
+    writeFileSync(pressurePath, pressureText);
     writeFileSync(manifestPath, canonical({ ...manifest, deadlineMs: 0 }));
     const expired = invoke();
     assert.notEqual(expired.status, 0);
