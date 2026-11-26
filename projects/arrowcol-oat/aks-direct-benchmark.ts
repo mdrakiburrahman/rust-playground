@@ -13,6 +13,7 @@ import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
 import { canonicalDeltaWindow, collectWriterCommitRecords, readDeltaAddWindow, type CanonicalDeltaWindow,
   type WriterCommitRecord } from './aks-delta-preservation.js';
+import { DirectQapObserver, clockErrorBound } from './aks-qap-observer.js';
 
 const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
 const namespacePrefix = 'arrow-collector-';
@@ -641,6 +642,13 @@ interface BenchmarkReport {
   namespace_removed: boolean;
   run_fic_removed: boolean;
   workload_pools_at_zero: boolean;
+  qap?: {
+    observation_count: number;
+    terminal_state_ready: boolean;
+    table_removed: boolean;
+    clock_error_bound_ms: number | null;
+    evidence_file: string;
+  };
 }
 
 async function ensureFreshRunDirectory(runDir: string): Promise<void> {
@@ -704,7 +712,8 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string 
   }
 }
 
-async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string; mode: 'full' | 'smoke' }): Promise<BenchmarkReport> {
+async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string;
+  mode: 'full' | 'smoke'; qap?: boolean }): Promise<BenchmarkReport> {
   const runId = (options.runId ?? randomUUID()).toLowerCase();
   const measurementSeconds = options.mode === 'smoke' ? 60 : 600;
   if (!uuidPattern.test(runId)) throw new Error('--run-id must be a UUID. Generate a new UUID for every run.');
@@ -775,6 +784,24 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   let canonical: CanonicalDeltaWindow | undefined;
   const writerCommits = new Map<number, WriterCommitRecord>();
   let podPlacement: BenchmarkReport['pod_placement'] = [];
+  let qap: DirectQapObserver | undefined;
+  let qapTerminalReady = false;
+  let qapTableRemoved = false;
+  const observeClock = async (loadWriter: WriterIdentity): Promise<void> => {
+    if (!qap) return;
+    const startedAtMs = Date.now();
+    try {
+      const output = await kubectl(config, ['exec', loadWriter.name, '-c', 'dataflow', '-n', namespace, '--',
+        'date', '+%s%3N'], 'Observe producer clock', 30);
+      const endedAtMs = Date.now();
+      if (!/^\d{13}$/.test(output)) throw new Error('Producer clock was not a millisecond Unix timestamp.');
+      qap.clocks.push({ startedAtMs, endedAtMs, producerAtMs: Number(output) });
+    } catch (error) {
+      console.warn('Producer clock bound unavailable; latency will remain unqualified.');
+      await writePrivateFile(resolve(runDir, 'qap-clock-error.txt'),
+        config.redact(error instanceof Error ? error.message : String(error)) + '\n');
+    }
+  };
   console.log('Run ' + runId + ': namespace ' + namespace + '; report ' + reportPath);
   try {
     await runStage('AKS preflight', 5 * 60_000, async () => {
@@ -824,6 +851,10 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await verifyRegistration(config, namespace, runId, deltaRoot);
       await assertWriterStable(config, namespace, writer);
     });
+    if (options.qap) {
+      qap = new DirectQapObserver(new Azure(config, 90), runId, runDir);
+      await runStage('create owned QAP table', 3 * 60_000, () => qap!.create(`${deltaRoot}/${tablePath}`));
+    }
     await runStage('load and Delta reconciliation', 45 * 60_000, async () => {
       if (!writer || !namespaceUid) throw new Error('Writer or owned namespace readiness was not established.');
       const loadWriter = writer, ownedUid = namespaceUid;
@@ -848,13 +879,18 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         logsReadAt = startedAt;
       };
       await sampleWriterCommits(true);
+      await observeClock(loadWriter);
       const scheduleStart = Date.now() + 130_000;
       if (scheduleStart - Date.now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
       await kubectl(config, ['patch', 'configmap', 'direct-schedule-confirmwide', '-n', namespace, '--type', 'merge',
         '-p', JSON.stringify({ data: { start: String(scheduleStart) } })], 'Schedule benchmark load');
       measurementStart = scheduleStart + 60_000;
       measurementEnd = measurementStart + measurementSeconds * 1000;
-      await waitForLoad(config, namespace, loadWriter, 22 * 60_000, () => sampleWriterCommits(false));
+      await waitForLoad(config, namespace, loadWriter, 22 * 60_000, async () => {
+        await sampleWriterCommits(false);
+        if (qap) await qap.sample();
+      });
+      await observeClock(loadWriter);
       podPlacement = await readBenchmarkPlacement(config, namespace);
       await assertWriterStable(config, namespace, loadWriter);
       await verifyNamespace(config, namespace, runId, owner, ownedUid);
@@ -876,11 +912,26 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       if (window.window_rows <= 0 || window.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
       canonical = canonicalDeltaWindow(window.commits, writerCommits, measurementStart, measurementEnd);
       metrics = window;
+      if (qap) {
+        await writePrivateFile(resolve(runDir, 'qap-source.json'), JSON.stringify({
+          measurementStartMs: measurementStart, measurementEndMs: measurementEnd,
+          warmupMs: 60_000, steadyStateStartMs: measurementStart + 120_000,
+          source: window, writerRecords: [...writerCommits.values()], clocks: qap.clocks,
+        }) + '\n');
+        qapTerminalReady = await qap.drain({ version: window.delta_version, rows: window.active_rows },
+          options.mode === 'smoke' ? 5 * 60_000 : 15 * 60_000);
+      }
     });
   } catch (error) {
     primaryError = error;
   } finally {
     const rememberCleanupError = (error: unknown) => cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+    if (qap) {
+      try {
+        await runStage('cleanup owned QAP table', 3 * 60_000, () => qap!.close());
+        qapTableRemoved = true;
+      } catch (error) { rememberCleanupError(error); }
+    }
     try {
       await runStage('cleanup owned namespace', 12 * 60_000, async () => {
         if (!kubeAuthReady) throw new Error('AKS API access was not established; namespace ownership cannot be verified.');
@@ -952,6 +1003,11 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     namespace_removed: namespaceRemoved,
     run_fic_removed: ficRemoved,
     workload_pools_at_zero: poolsAtZero,
+    ...(qap ? { qap: {
+      observation_count: qap.observations.length, terminal_state_ready: qapTerminalReady,
+      table_removed: qapTableRemoved, clock_error_bound_ms: clockErrorBound(qap.clocks),
+      evidence_file: 'qap-observations.jsonl',
+    } } : {}),
   } : undefined;
   if (report) await writePrivateFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   if (primaryError || cleanupErrors.length || !report || !namespaceRemoved || !ficRemoved || !poolsAtZero) {
@@ -971,27 +1027,30 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       'stamp-config': { type: 'string', default: resolve(ROOT, 'infra/azure/stamp.yaml') },
       'run-id': { type: 'string' },
       mode: { type: 'string', default: 'full' },
+      qap: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     } });
     if (values.help) {
       console.log('Usage: npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts check [--env-file PATH] [--stamp-config YAML]');
-      console.log('       npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run [--mode full|smoke] [--env-file PATH] [--stamp-config YAML] [--run-id UUID]');
+      console.log('       npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run [--mode full|smoke] [--qap] [--env-file PATH] [--stamp-config YAML] [--run-id UUID]');
       return 0;
     }
     if (positionals.length !== 1) throw new Error('Choose check or run.');
     const inputs = { envFile: resolve(values['env-file']!), stampConfigPath: resolve(values['stamp-config']!) };
     if (positionals[0] === 'check') {
-      if (values.mode !== 'full' || values['run-id']) throw new Error('check does not accept --mode or --run-id.');
+      if (values.mode !== 'full' || values['run-id'] || values.qap) throw new Error('check does not accept --mode, --qap or --run-id.');
       await executeCheck(inputs);
       return 0;
     }
     if (positionals[0] !== 'run') throw new Error('Choose check or run.');
     if (values.mode !== 'full' && values.mode !== 'smoke') throw new Error('--mode must be full or smoke.');
-    const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode });
+    const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode, qap: values.qap });
     console.log('PASS ' + report.canonical_rows_per_second.toFixed(2) + ' canonical durable rows/s; ' + report.canonical_rows +
       ' rows in ' + report.measurement_seconds + ' seconds; Delta v' + report.canonical_first_delta_version + '-v' +
       report.canonical_last_delta_version + '; commit-timestamp window ' + report.committed_rows_per_second.toFixed(2) +
       ' rows/s; report ' + resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', report.run_id.replaceAll('-', ''), 'report.json'));
+    if (report.qap) console.log('QAP evidence collected; terminal state ready=' + report.qap.terminal_state_ready +
+      '. This is not an accelerated-throughput or latency qualification; score the cohort evidence separately.');
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

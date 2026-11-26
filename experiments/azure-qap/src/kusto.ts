@@ -15,6 +15,12 @@ export interface AccelerationSample {
   lastIngestionAt?: string;
 }
 export interface Target { version: number; rows: number }
+export interface QueryEvidence {
+  startedAtMs: number;
+  endedAtMs: number;
+  clientRequestId: string;
+  response: unknown;
+}
 export interface ExtentRecord { partition: string; extent: string; rows: number }
 export const UNACCELERATED_EXTENT = '00000000-0000-0000-0000-000000000000';
 const COMPLETION_LEVELS: Record<number, string> = { 3: 'Warning', 4: 'Info', 5: 'Verbose', 6: 'Stats' };
@@ -148,7 +154,7 @@ function checked(name: string): string {
 export const kql = {
   create: (table: string, source: string) => `.create-or-alter external table ${identifier(table)} kind=delta (h@'${source}')`,
   policy: (table: string, principal: string) => `.alter external table ${identifier(table)} policy query_acceleration '${
-    JSON.stringify({ IsEnabled: true, Hot: '7.00:00:00', MaxAgeOverride: '00:01:00', ManagedIdentity: principal })}'`,
+    JSON.stringify({ IsEnabled: true, Hot: '7.00:00:00', MaxAge: '00:05:00', ManagedIdentity: principal })}'`,
   details: (table: string) => `.show external table ${identifier(table)} details`,
   statistics: (table: string) => `.show external table ${identifier(table)} operations query_acceleration statistics`,
   drop: (table: string) => `.drop external table ${identifier(table)} ifexists`,
@@ -250,6 +256,16 @@ export class Kusto {
     return primary(response).rows;
   }
 
+  async queryEvidence(csl: string, signal: AbortSignal): Promise<QueryEvidence> {
+    const startedAtMs = Date.now();
+    const clientRequestId = `ArrowColQapEvidence;${this.runId};${randomUUID()}`;
+    const response = await this.post('/v2/rest/query', { db: this.database, csl,
+      properties: JSON.stringify({ Options: { query_results_cache_max_age: '00:00:00', servertimeout: '00:00:15' } }) },
+    signal, clientRequestId);
+    this.recordWarnings(response);
+    return { startedAtMs, endedAtMs: Date.now(), clientRequestId, response };
+  }
+
   async capacity(signal: AbortSignal): Promise<Row | undefined> {
     return tableRows(primary(await this.management(kql.capacity(), signal))).find(row => row.Resource === 'QueryAcceleration');
   }
@@ -296,13 +312,14 @@ export class Kusto {
     }
   }
 
-  private async post(path: string, body: Row, signal: AbortSignal): Promise<unknown> {
+  private async post(path: string, body: Row, signal: AbortSignal,
+    clientRequestId = `ArrowColQapDemo;${this.runId};${randomUUID()}`): Promise<unknown> {
     for (let attempt = 1; ; attempt++) {
       signal.throwIfAborted();
       try {
         const [data] = await this.azure.request('POST', this.azure.c.uri + path, 'https://kusto.kusto.windows.net',
           JSON.stringify(body), { 'Content-Type': 'application/json', Accept: 'application/json',
-            'x-ms-client-request-id': `ArrowColQapDemo;${this.runId};${randomUUID()}` });
+            'x-ms-client-request-id': clientRequestId });
         if (!data) throw new Error('Empty Kusto response.');
         return JSON.parse(data.toString()) as unknown;
       } catch (error) {

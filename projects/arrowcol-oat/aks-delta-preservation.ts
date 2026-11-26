@@ -544,7 +544,8 @@ const DELTA_SNAPSHOT_ATTEMPTS = 10;
 
 export async function readDeltaAddWindow(azure: Azure, relativePath: string, startUnixMs: number, endUnixMs: number,
   assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000):
-  Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
+  Promise<DeltaAddWindow & { delta_version: number; active_rows: number; source_reference: DeltaPresentReference;
+    append_only: boolean }> {
   let snapshot: Awaited<ReturnType<typeof capture>> | undefined;
   for (let attempt = 1; !snapshot; attempt++) {
     try {
@@ -562,7 +563,10 @@ export async function readDeltaAddWindow(azure: Azure, relativePath: string, sta
   const adds = reconcileDeltaAdds(commits, startUnixMs, endUnixMs);
   if (adds.total_rows !== reference.row_count)
     throw new ReplayError('Delta Add row totals do not reconcile with the final active-file snapshot');
-  return { ...adds, delta_version: reference.version, active_rows: reference.row_count };
+  const appendOnly = [...commits.values()].every(actions => actions.every(action =>
+    !action.remove && (!action.add || object(action.add, 'Delta Add').dataChange === true)));
+  return { ...adds, delta_version: reference.version, active_rows: reference.row_count,
+    source_reference: reference, append_only: appendOnly };
 }
 
 export interface WriterCommitRecord { version: number; finished_at_unix_ms: number; rows: number; files: number; table_id: string }
