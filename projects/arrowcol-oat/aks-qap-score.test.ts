@@ -80,6 +80,7 @@ test('the adapter joins exact durable cohorts to contiguous snapshots and raw vi
   const result = buildCoverageInput(source, [], observations, true);
   assert.deepEqual(result.sourceSnapshots.map(snapshot => [snapshot.version, snapshot.rows, snapshot.files]),
     [[0, 0, 0], [1, 0, 0], [2, 10, 1], [3, 20, 2]]);
+  assert.ok(!analyzeCoverage(result).reasons.some(reason => reason.startsWith('SOURCE_FILE_INVENTORY_MISMATCH')));
   assert.deepEqual(result.cohorts.map(cohort => cohort.commitBounds),
     [{ lowerMs: 970_000, upperMs: 980_001 }, { lowerMs: 1_099_000, upperMs: 1_100_001 }]);
   assert.equal(result.clockErrorMs, null);

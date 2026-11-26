@@ -176,7 +176,8 @@ export function buildCoverageInput(sourceValue: unknown, observationValues: unkn
     const cohort = byVersion.get(version);
     rows = safeSum([rows, cohort?.rows ?? 0]); count = safeSum([count, cohort?.files ?? 0]);
     bytes = safeSum([bytes, cohort?.bytes ?? 0]);
-    sourceSnapshots.push({ version, rows, files: count, bytes, maxFileBytes, removeCount: 0,
+    // Neither the final file maximum nor the prefix's total bytes can understate its largest file.
+    sourceSnapshots.push({ version, rows, files: count, bytes, maxFileBytes: Math.min(bytes, maxFileBytes), removeCount: 0,
       inventoryComplete: fileRows.every(value => value > 0) });
   }
   requireThat(rows === reference.row_count && count === files.length && bytes === reference.active_bytes,
