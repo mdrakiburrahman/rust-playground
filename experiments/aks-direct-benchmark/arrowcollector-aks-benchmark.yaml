@@ -200,7 +200,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: sqlserver
-          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:bb8f334a5287326345be56fb5722c28c6995051b8ee5aff4426bc3e38acd5b97
+          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:aff04c8f796e13d1789dabd2c019efc0f313bfc87c372d641a2ef8f546b468a3
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -296,7 +296,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: migrate
-          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:bb8f334a5287326345be56fb5722c28c6995051b8ee5aff4426bc3e38acd5b97
+          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:aff04c8f796e13d1789dabd2c019efc0f313bfc87c372d641a2ef8f546b468a3
           command:
             - /usr/local/bin/arrowcol-migrate
           securityContext:
@@ -339,7 +339,7 @@ spec:
       restartPolicy: Never
       initContainers:
         - name: bootstrap
-          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:bb8f334a5287326345be56fb5722c28c6995051b8ee5aff4426bc3e38acd5b97
+          image: BENCHREGISTRY/arrowcol-sqlserver@sha256:aff04c8f796e13d1789dabd2c019efc0f313bfc87c372d641a2ef8f546b468a3
           command:
             - /usr/local/bin/database-bootstrap
           securityContext:
@@ -633,7 +633,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: catalog
-          image: BENCHREGISTRY/arrowcol-catalog-rust@sha256:7c9030311da40ed3098574ff87bc47fb87bd596525d02fe654645ca555cdf300
+          image: BENCHREGISTRY/arrowcol-catalog-rust@sha256:18145cc2012cc82a5d23b1107e3c5850a520244cd15a23baf41c3be4b3ab6247
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -761,7 +761,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: router
-          image: BENCHREGISTRY/arrowcol-router-rust@sha256:f2d41fe2c672f8ad8d932acef9c41102899af353b873a92a62ac1c2c84e1be70
+          image: BENCHREGISTRY/arrowcol-router-rust@sha256:ca3ea23a471f4c2199c8b25f0acfe737aa3056c09a474616222fa7ac033a24ec
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -943,7 +943,7 @@ spec:
       terminationGracePeriodSeconds: 4800
       containers:
         - name: maintenance
-          image: BENCHREGISTRY/delta-maintenance@sha256:93969473da125879ffdb4a66d235e946799497959eafb8190adf61e040205cf5
+          image: BENCHREGISTRY/delta-maintenance@sha256:270d5f378c55cdd5cca04c94645bd7ac4d59f38d9d90ddf6eb28d9e30c2a6739
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -1070,7 +1070,7 @@ spec:
       terminationGracePeriodSeconds: 360
       containers:
         - name: dataflow
-          image: BENCHREGISTRY/arrowcol-dataflow-rust@sha256:427eeba2b2eb1b90d0d88f48b3b6463d88f5bdbca619a26328d881f5c326d8c0
+          image: BENCHREGISTRY/arrowcol-dataflow-rust@sha256:2951ebc62cd6ebe5c528a1388cdf184b3286706e7d9c59a01cec98a97b4c889e
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -1246,7 +1246,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pin-init
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:17d19c6c4aa592882306f3272ae442af634934bf64a55a15f055ee2948cb95ed
           command:
             - /usr/local/bin/arrowcol-oat-pin-init
           args:
@@ -1359,7 +1359,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: register
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:f84be43a9fcf0c1c98071477ae9f20159caf4d294ac6b06986634093611dd892
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:17d19c6c4aa592882306f3272ae442af634934bf64a55a15f055ee2948cb95ed
           args:
             - --register-only-config
             - /run/arrowcol-oat/register.json
@@ -1453,7 +1453,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: generator
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:17d19c6c4aa592882306f3272ae442af634934bf64a55a15f055ee2948cb95ed
           args:
             - --endpoint
             - http://arrowcol-router:50050

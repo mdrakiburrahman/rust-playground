@@ -122,6 +122,8 @@ npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run \
 
 ## Images
 
+The manifest pins the six image digests from both 600 s confirmations. The dataflow digest `sha256:2951ebc62cd6ebe5c528a1388cdf184b3286706e7d9c59a01cec98a97b4c889e` has the registry tag `oat-d629e5705344f32d7b56d1f116c18b4c56836a9b-pcc540c67621826f74a21a3cbf5051d7443a22dfff1ab6dee75a3f7e2a296e3ca`; the five companion digests have the tag `oat-a14d852b4dd177f283fc226449bb2b61d507a856`. These pins reproduce the campaign binaries, not later source changes. A run against them cannot qualify a new build.
+
 The run pulls the manifest's pinned images from the stamp ACR; it never builds. To re-pin after changing collector, router, catalog, SQL, maintenance or client code, publish all six images from a clean checkout. Setup builds the dataflow image with the AKS collector build profile above, tags it `oat-<revision>-p<profile-hash>`, and reuses images already published for the same revision. The fat-LTO, single-codegen-unit dataflow build is slow and memory-heavy; use a large devbox.
 
 ```bash
