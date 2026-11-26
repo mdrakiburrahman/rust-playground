@@ -904,8 +904,11 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await verifyNamespace(config, namespace, runId, owner, ownedUid);
       let writerStoppedAtMs: number | undefined;
       if (qap) {
+        await sampleWriterCommits(true);
+        if (logsReadAt === undefined) throw new Error('No successful writer log read to anchor shutdown capture.');
+        const followSince = Math.ceil((Date.now() - logsReadAt) / 1000) + 30;
         const finalLogs = await captureWriterShutdown(['kubectl', '--context', config.cluster, 'logs',
-          `pod/${loadWriter.name}`, '-c', 'dataflow', '-n', namespace, '--follow=true'], async () => {
+          `pod/${loadWriter.name}`, '-c', 'dataflow', '-n', namespace, `--since=${followSince}s`, '--follow=true'], async () => {
           await verifyNamespace(config, namespace, runId, owner, ownedUid);
           await assertWriterStable(config, namespace, loadWriter);
           const deployment = requireRecord(await getObject(config, 'deployment', namespace, 'arrowcol'), 'Writer deployment');
