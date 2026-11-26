@@ -1,0 +1,65 @@
+name: qap-screening
+executor:
+  parallelism: 1
+  termination:
+    max_iterations: 4
+container:
+  provider: passthrough
+agents:
+  - provider: copilot
+    timeout: 180
+    models:
+      - name: claude-sonnet-4.6
+samplers:
+  - provider: islands
+prompt:
+  provider: default
+  system: |
+    Optimize only candidate.json, a non-executable canonical JSON experimental-design proposal matrix.
+    No cloud operations, credentials, URLs, shell scripts, workload changes, or evaluator changes.
+    Do not inspect environment variables, home directories, other workspaces, private evaluator or logs.
+    Do not edit .git metadata. Do not add files. No package installation or network commands.
+    This is offline screening ONLY, not an Azure result or a performance simulator.
+    The trusted evaluator is outside your workspace. You cannot modify its commands, scores, or cases.
+  agent: |
+    Improve candidate.json to propose an informative bounded real-world ADX QAP comparison matrix.
+    JSON shape: {"schemaVersion":1,"proposals":[{"cluster":{"coresPerNode":4,"nodes":2,"autoscale":{"enabled":true,"minNodes":2,"maxNodes":4}},"queryAccelerationCapacity":null}]}.
+    Use exactly these fields. coresPerNode is 4,8,16,32. Every nodes/minNodes/maxNodes is an integer 2..8.
+    minNodes <= nodes <= maxNodes; coresPerNode * maxNodes <=64. When autoscale.enabled=false all three node counts equal.
+    Keep queryAccelerationCapacity null: no capacity pressure has been established.
+    At most 8 unique proposals. SKU names are deliberately absent: a separate trusted controller verifies availability.
+    Serialize recursively sorted object keys, no whitespace except exactly one final newline.
+    Scores measure comparison COVERAGE, not performance: 20 points for retaining baseline 4cores x2 autoscale2..4;
+    15 points per distinct total-core budget with two fixed topologies differing cores/node (up to3 budgets);
+    15 points per distinct (coresPerNode,maxNodes) with both fixed-at-max and nontrivial optimized-autoscale shapes (up to2);
+    plus 5 divided by proposal count. Match capacity settings between comparisons.
+    Cover matched cores/node vs node count, and fixed vs optimized autoscale, without claiming a winner.
+    Public QAP capacity is min(cluster cap,nodes*max(1,coresPerNode*coefficient)); baseline cap100/coefficient0.5.
+    QueryAccelerationCapacity is not IngestionCapacity. MaxAge is fallback age, not refresh cadence, and isn't mutable here.
+    Actual qualification requires unchanged PR134 producer 10.6M durable Delta rows/s sustained600s,
+    non-growing steady-state backlog, exact terminal parity, and proven commit-to-fully-accelerated p95.
+    None of those are measured by this screening run.
+evaluator:
+  timeout: 30
+  retries: 0
+  builtin_metrics: []
+  imports: [json, math]
+  commands:
+    - "@TRUSTED_COMMAND@"
+  metrics:
+    combined_score: !exec |
+      nonempty = [line for line in stdout if line.strip()]
+      records = [line[8:] for line in nonempty if line.startswith("@RESULT ")]
+      if len(records) != 1 or not nonempty[-1].startswith("@RESULT "):
+          raise ValueError("expected one terminal trusted result")
+      result = json.loads(records[0])
+      if type(result) is not dict or result.get("kind") != "screening" or result.get("qualified") is not False:
+          raise ValueError("screening result required")
+      valid = result.get("valid")
+      score = result.get("combined_score")
+      if type(valid) is not int or valid not in (0,1) or type(score) not in (float,int) or not math.isfinite(score):
+          raise ValueError("invalid metric types")
+      if score < 0 or score > 100 or (valid == 0 and score != 0) or (valid == 1 and score <= 0):
+          raise ValueError("inconsistent screening score")
+      return float(score)
+    valid: !eval 'json.loads(next(line for line in reversed(stdout) if line.startswith("@RESULT "))[8:])["valid"]'
