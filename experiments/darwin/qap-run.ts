@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseEnv } from "node:util";
@@ -28,7 +28,11 @@ export async function main(args: string[]) {
   if (libraryPath) {
     if (!isAbsolute(libraryPath) || realpathSync(libraryPath) !== libraryPath ||
         !lstatSync(libraryPath).isDirectory()) throw new Error("runtime-library-path");
-    for (const name of ["libssl.so.3", "libcrypto.so.3", "libsqlite3.so.0"]) {
+    const names = readdirSync(libraryPath).filter((name) => /\.so(?:\.|$)/.test(name)).sort();
+    for (const required of ["libssl.so.3", "libcrypto.so.3", "libsqlite3.so.0", "libstdc++.so.6"]) {
+      if (!names.includes(required)) throw new Error("runtime-library-missing");
+    }
+    for (const name of names) {
       const file = realpathSync(join(libraryPath, name));
       if (relative(libraryPath, file).startsWith(`..${sep}`) || !lstatSync(file).isFile()) throw new Error("runtime-library-escape");
       runtimeLibraries[name] = sha256(readFileSync(file));
@@ -137,8 +141,10 @@ export async function main(args: string[]) {
   if (proposals.length) write(join(root, "best-screening-plan.json"), `${canonical(proposals[0].proposalPlan)}\n`, 0o444);
   const afterCommit = run("git", ["rev-parse", "HEAD"], repo);
   const unchangedTree = afterCommit === sourceCommit && run("git", ["status", "--porcelain"], repo) === "";
-  const unchangedRuntimeLibraries = !libraryPath || Object.entries(runtimeLibraries).every(([name, hash]) =>
-    sha256(readFileSync(join(libraryPath, name))) === hash);
+  const unchangedRuntimeLibraries = !libraryPath ||
+    (canonical(Object.keys(runtimeLibraries).sort()) ===
+      canonical(readdirSync(libraryPath).filter((name) => /\.so(?:\.|$)/.test(name)).sort()) &&
+      Object.entries(runtimeLibraries).every(([name, hash]) => sha256(readFileSync(join(libraryPath, name))) === hash));
   const result = {
     ...metadata, exit, errorCode, timedOut, elapsedMs: Date.now() - started, unchangedTree, unchangedRuntimeLibraries,
     evaluations: receipts.length, acceptedEvaluations: proposals.length,
