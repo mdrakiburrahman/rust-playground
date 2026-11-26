@@ -12,6 +12,7 @@
 | Evidence | Private ignored output: `result.json`, `receipts.jsonl`, `best-screening-plan.json`, `run.json`, `darwin.log`, and Darwin `state/`. Do not publish raw logs. |
 | Verified run | [`qap-run-proof.json`](qap-run-proof.json): four completed real Darwin iterations, five accepted distinct plans; screening score25→95.625. Database program refs were reconciled with actual Git blobs and evaluator receipts. |
 | Proposed matrix | [`qap-proposed-matrix.json`](qap-proposed-matrix.json): real evolved eight-proposal matrix for the parent to qualify, **not an Azure winner**. Original baseline seed remains unchanged. |
+| Pressure opt-in | [`qap-pressure.md`](qap-pressure.md): separately hash-bound controller attestation enables only cap100/coefficient0.5 or1 and an explicit matched policy comparison. |
 | Limits | Four iterations, serial evaluator, 16 total evaluations, 180s agent/30s evaluator, 20 minute outer wall budget. Refuses runs inside the campaign's final hour (2026-11-27 12:00Z onward). No automatic retries. |
 
 For Enterprise Cloud credentials, set `COPILOT_GH_HOST` to the token's issuing
@@ -95,7 +96,7 @@ cannot establish exact contents or an unchanged producer.
 | [Query acceleration policy](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-policy?view=azure-data-explorer) | Caches external Delta data; not producer ingestion. MaxAge is fallback age, not refresh cadence. |
 | [Capacity policy](https://learn.microsoft.com/en-us/kusto/management/capacity-policy?view=azure-data-explorer) | QueryAccelerationCapacity is `min(cap, nodes * max(1, coresPerNode * coefficient))`; **do not subtract an ingestion admin node**. |
 | Baseline supplied by controller | E4ads_v5, two nodes, optimized autoscale2..4; cap100/coefficient0.5 gives four operations at two nodes. |
-| Capacity proposals | Schema supports only the two documented fields, conservatively bounded cap1..100/coefficient0.1..1. They remain disabled in screening. Service support/readback is the parent's responsibility. |
+| Capacity proposals | Schema supports only the two documented fields, bounded cap100/coefficient0.5 or1. Disabled by default; the separate pressure-attested mode admits them. Service support/readback is the parent's responsibility. |
 
 This standalone lane deliberately does not change the existing ten-lane manifest
 or the non-qualifying throughput/compression contracts. The parent owns all Azure

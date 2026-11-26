@@ -1,0 +1,78 @@
+name: qap-pressure-screening
+executor:
+  parallelism: 1
+  termination:
+    max_iterations: 4
+container:
+  provider: passthrough
+agents:
+  - provider: copilot
+    timeout: 180
+    models:
+      - name: auto
+samplers:
+  - provider: islands
+    options:
+      num_islands: 1
+      feature_dimensions: [combined_score]
+prompt:
+  provider: default
+  system: |
+    Optimize only candidate.json, a non-executable canonical JSON experimental-design proposal matrix.
+    No cloud operations, credentials, URLs, shell scripts, workload changes, or evaluator changes.
+    Do not inspect environment variables, home directories, other workspaces, private evaluator, attestation or logs.
+    Do not edit .git metadata. Do not add files. No package installation or network commands.
+    This is offline screening ONLY, not an Azure result or performance simulator.
+    A trusted controller has separately attested sustained QAP capacity saturation and pending work.
+    This only authorizes a bounded policy comparison. It does not predict any latency or throughput improvement.
+    The trusted evaluator and attestation are outside your workspace and cannot be changed by candidates.
+  agent: |
+    Improve candidate.json to propose an informative bounded real-world ADX QAP comparison matrix.
+    JSON shape: {"schemaVersion":1,"proposals":[{"cluster":{"coresPerNode":4,"nodes":2,"autoscale":{"enabled":true,"minNodes":2,"maxNodes":4}},"queryAccelerationCapacity":null}]}.
+    Use exactly these fields. coresPerNode is 4,8,16,32. Every nodes/minNodes/maxNodes is an integer 2..8.
+    minNodes <= nodes <= maxNodes; coresPerNode * maxNodes <=64. When autoscale.enabled=false all three node counts equal.
+    queryAccelerationCapacity may be null (no change), or exactly
+    {"clusterMaximumConcurrentOperations":100,"coreUtilizationCoefficient":0.5}
+    or {"clusterMaximumConcurrentOperations":100,"coreUtilizationCoefficient":1}.
+    No other cap or coefficient values. No pressure field, attestation, mode, scripts, paths or extra keys in the candidate.
+    At most 8 unique proposals. SKU availability, mutations, readback and restore belong only to the separate controller.
+    Serialize recursively sorted object keys, no whitespace except exactly one final newline.
+    Scores measure comparison COVERAGE only: 10 points for retaining baseline 4cores x2 autoscale2..4 with null policy;
+    15 points per distinct total-core budget with two fixed topologies differing cores/node (up to2 budgets);
+    15 points for a fixed-at-max vs nontrivial optimized-autoscale comparison at identical coresPerNode and maximum nodes;
+    40 points for a matched explicit policy pair at identical cluster settings, one cap100/coefficient0.5 and one cap100/coefficient1;
+    plus 5 divided by proposal count. Null is NOT an explicit coefficient0.5 control.
+    Match capacity settings exactly for topology and autoscale comparisons; match all cluster fields exactly for policy comparisons.
+    Include a matched64-core topology comparison if possible alongside smaller-core and autoscale controls.
+    The public capacity formula is min(cap,nodes*max(1,coresPerNode*coefficient)).
+    More nominal slots are NOT a measured speedup. QueryAccelerationCapacity is not IngestionCapacity.
+    MaxAge is fallback age, not refresh cadence, and is not mutable here.
+    Actual qualification still requires unchanged PR134 producer 10.6M durable Delta rows/s sustained600s,
+    non-growing steady-state backlog, exact terminal parity, and proven commit-to-fully-accelerated p95.
+    None of those are measured by this screening run.
+evaluator:
+  timeout: 30
+  retries: 0
+  builtin_metrics: []
+  imports: [json, math]
+  commands:
+    - "@TRUSTED_COMMAND@"
+  metrics:
+    combined_score: !exec |
+      nonempty = [line for line in stdout if line.strip()]
+      records = [line[8:] for line in nonempty if line.startswith("@RESULT ")]
+      if len(records) != 1 or not nonempty[-1].startswith("@RESULT "):
+          raise ValueError("expected one terminal trusted result")
+      result = json.loads(records[0])
+      if type(result) is not dict or result.get("kind") != "screening" or result.get("qualified") is not False:
+          raise ValueError("screening result required")
+      if result.get("screeningMode") != "pressure-attested" or type(result.get("pressureAttestationSha256")) is not str:
+          raise ValueError("trusted pressure binding required")
+      valid = result.get("valid")
+      score = result.get("combined_score")
+      if type(valid) is not int or valid not in (0,1) or type(score) not in (float,int) or not math.isfinite(score):
+          raise ValueError("invalid metric types")
+      if score < 0 or score > 100 or (valid == 0 and score != 0) or (valid == 1 and score <= 0):
+          raise ValueError("inconsistent screening score")
+      return float(score)
+    valid: !eval 'json.loads(next(line for line in reversed(stdout) if line.startswith("@RESULT "))[8:])["valid"]'
