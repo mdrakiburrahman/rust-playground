@@ -12,6 +12,11 @@
 | Evidence | Private ignored output: `result.json`, `receipts.jsonl`, `best-screening-plan.json`, `run.json`, `darwin.log`, and Darwin `state/`. Do not publish raw logs. |
 | Limits | Four iterations, serial evaluator, 16 total evaluations, 180s agent/30s evaluator, 20 minute outer wall budget. Refuses runs inside the campaign's final hour (2026-11-27 12:00Z onward). No automatic retries. |
 
+For Enterprise Cloud credentials, set `COPILOT_GH_HOST` to the token's issuing
+`*.ghe.com` host (or include it in the bootstrap-synced `.env`). The default is
+`github.com`; tokens are never retried against a different identity or host.
+Copilot auto-update is disabled so the verified runtime stays pinned.
+
 If the standalone Darwin downloader cannot fetch its pinned Copilot CLI runtime,
 download that exact official release with its published SHA256 checksums, then
 set `COPILOT_CLI_PATH=/absolute/path/to/copilot` on the run command. The runner

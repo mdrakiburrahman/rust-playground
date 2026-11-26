@@ -54,6 +54,8 @@ export async function main(args: string[]) {
   const dotenv = existsSync(join(repo, ".env")) ? parseEnv(readFileSync(join(repo, ".env"), "utf8")) : {};
   const token = process.env.COPILOT_GITHUB_TOKEN || dotenv.COPILOT_GITHUB_TOKEN;
   if (!token) throw new Error("copilot-token-missing-bootstrap-sync-required");
+  const copilotHost = process.env.COPILOT_GH_HOST || dotenv.COPILOT_GH_HOST || "github.com";
+  if (!/^(github\.com|[a-z0-9-]+\.ghe\.com)$/.test(copilotHost)) throw new Error("unsupported-copilot-auth-host");
   mkdirSync(root, { mode: 0o700 });
   const source = join(root, "source");
   const trusted = join(root, "trusted");
@@ -91,7 +93,8 @@ export async function main(args: string[]) {
     copilotRuntimeSha256: copilotPath ? sha256(readFileSync(copilotPath)) : null,
     runtimeLibraries,
     candidateSeedSha256: sha256(seedText), deadlineMs, maxIterations: 4, maxEvaluations: 16,
-    environment: ["PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "COPILOT_GITHUB_TOKEN",
+    copilotHost,
+    environment: ["PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "COPILOT_GITHUB_TOKEN", "COPILOT_GH_HOST", "COPILOT_AUTO_UPDATE",
       ...(copilotPath ? ["COPILOT_CLI_PATH"] : []), ...(libraryPath ? ["LD_LIBRARY_PATH"] : []),
       "DARWIN_CONFINE_AGENTS", "DARWIN_DISABLE_BANNER"],
     qualification: "screening-only; no Azure requests or measured performance",
@@ -108,6 +111,7 @@ export async function main(args: string[]) {
       PATH: process.env.PATH,
       HOME: home, TMPDIR: scratch, XDG_CONFIG_HOME: join(home, ".config"),
       COPILOT_GITHUB_TOKEN: token,
+      COPILOT_GH_HOST: copilotHost, COPILOT_AUTO_UPDATE: "false",
       ...(copilotPath ? { COPILOT_CLI_PATH: copilotPath } : {}),
       ...(libraryPath ? { LD_LIBRARY_PATH: libraryPath } : {}),
       DARWIN_CONFINE_AGENTS: "1", DARWIN_DISABLE_BANNER: "1",
