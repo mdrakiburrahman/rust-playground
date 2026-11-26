@@ -10,6 +10,7 @@ One collector, one table and one load client on stamp `68590`, using the AKS def
 | Measurement | Canonical durable Delta rows/s: rows in `dataChange` Adds of ingestion commits whose writer-reported finish time is in `[measurement_start, measurement_end)`, divided by the window. Every Delta version must join exactly one successful `arrowcol_data_commit` writer record; missing or conflicting records fail the run. |
 | Cleanup | Remove only the run's UID-verified namespace and FIC; scale each empty workload pool to zero, then restore autoscaling min 0/max 1 |
 | Duration | Plan about 30 minutes per full run. The load and Delta reconciliation stage is bounded at 45 minutes. |
+| Optional ADX observation | [`run --qap`](AKS_QAP.md#direct-aks-ingestion-latency) measures acceleration separately without rebuilding or retuning the producer. |
 
 ## AKS defaults
 

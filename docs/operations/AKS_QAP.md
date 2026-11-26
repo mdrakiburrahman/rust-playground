@@ -4,6 +4,80 @@ The AKS mode runs the existing Azure QAP experiment runtime as a Kubernetes Job.
 It does not deploy the unrelated SQL Server/Hive Compose stack and does not
 replace the devcontainer mode.
 
+## Direct AKS ingestion latency
+
+| Item | Contract |
+| --- | --- |
+| Producer | The [direct benchmark](DIRECT_AKS_BENCHMARK.md) with its historical six image digests, one 48-core collector and a separate load client. The QAP observer does not rebuild images or change file layout. |
+| Run | One operator and one disposable sandbox stamp at a time. Use a clean committed checkout, complete the direct benchmark's private input setup and obtain server dry-run confirmation. The operator also needs access to create, sample and drop the run's external table and read cluster metrics. |
+| Evidence | `report.json` measures durable Delta production. `qap-score.json` independently reports acceleration, terminal inventory parity, p50/p95/p99 bounds, censored cohorts and post-input-stop drain. A producer `PASS` is not a QAP pass. |
+| Qualification | The 600-second run must produce at least 10.6M durable Delta rows/s and show accelerated throughput keeping pace without growing backlog over the predeclared steady window, beginning 120 seconds into measurement. It must also prove exact terminal version, row and file parity. A smoke or post-stop catch-up alone cannot qualify. |
+| Tuning | [Darwin screening](../../experiments/darwin/qap-README.md) proposes typed comparisons. Screening scores are not Azure latency results. Compare actual Azure readbacks and observations under the same workload. |
+
+```bash
+qap_run="$(cat /proc/sys/kernel/random/uuid)"
+npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run --qap \
+  --env-file "$ENV_FILE" --stamp-config "$STAMP_CONFIG" --run-id "$qap_run"
+npx --no-install tsx projects/arrowcol-oat/aks-qap-score.ts \
+  "out/arrowcol-oat/direct-benchmark/${qap_run//-/}"
+```
+
+For a functional smoke, add `--mode smoke`; expect an explicit `NOT QUALIFIED`.
+The scorer reports measured misses separately from malformed evidence, which
+fails. Keep the raw evidence and cloud receipts private. The benchmark stops
+its own writer after input ends to capture final committed versions, removes
+its own QAP table in addition to ordinary per-run cleanup, and retains Delta.
+
+The scorer brackets durable commit visibility using complete, contiguous
+Delta-log listings on the observer clock. It certifies a source prefix only
+when exact inventory, healthy zero-pending state and a complete native-extent
+query agree. External fallback, partial results, unbounded observation gaps,
+removes and ineligible large files do not count. Inventory parity is not a
+row-content hash. The steady-window result is separate from terminal drain
+and uses conservative bounds rather than writer-clock point estimates.
+
+### Managed ADX comparisons
+
+**These commands can change sandbox-wide ADX topology and QAP capacity.**
+Run only against an authorized idle sandbox with no other writer, preserve
+the original receipt outside the devcontainer, and reserve time for restoration.
+The controller limits actual and maximum topology to 64 engine vCPUs and
+eight nodes. It checks the live supported SKUs, campaign ownership, QAP
+pressure and unchanged idle background inventory before mutations. Do not
+modify unrelated tables or retry an uncertain write.
+
+```bash
+qap_cluster=(npx --no-install tsx projects/arrowcol-oat/aks-qap-cluster.ts)
+qap_args=(--env-file "$ENV_FILE" --stamp-config "$STAMP_CONFIG" --receipt "$QAP_RECEIPT")
+"${qap_cluster[@]}" snapshot "${qap_args[@]}" --deadline "$QAP_DEADLINE_UTC"
+"${qap_cluster[@]}" status "${qap_args[@]}"
+```
+
+For an approved candidate, `apply` accepts `--profile` (SKU, node count and
+autoscale bounds), `--capacity` (only the two `QueryAccelerationCapacity`
+fields), or both, with `--pressure` pointing to the earlier run's raw QAP
+observations. Use one change at a time for comparisons of two policies on
+the same topology. Read the configuration and effective slots back before
+running the same workload. Report scale events only when observed.
+
+The scorer can estimate Canada Central Eadsv5 engine cost for complete
+sampled minutes from Azure `InstanceCount` and a fixed USD retail rate
+($0.072 per vCPU-hour for VM compute plus $0.11 for ADX standard engine).
+This is not an Azure bill and excludes data management, storage, network,
+out-of-window provisioning and discounts.
+
+```bash
+"${qap_cluster[@]}" restore "${qap_args[@]}"
+"${qap_cluster[@]}" status "${qap_args[@]}"
+```
+
+Require `restored: true` and independently verify the run's table, namespace
+and federated credential are absent and both workload pools are back at zero.
+See [query acceleration policy](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-policy?view=azure-data-explorer)
+and [capacity policy](https://learn.microsoft.com/en-us/kusto/management/capacity-policy?view=azure-data-explorer).
+`MaxAge` controls fallback behavior, not refresh cadence. Ingestion capacity
+is not query-acceleration capacity.
+
 ## Existing-stamp OAT setup
 
 Use the ignored private YAML for the intended stamp; the tracked example/default may describe a different region or stamp. Pass the same path to setup, standalone preflight and the run:

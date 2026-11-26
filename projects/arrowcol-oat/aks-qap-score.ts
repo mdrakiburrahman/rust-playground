@@ -230,11 +230,15 @@ export function resourceTrace(observations: unknown[], startMs: number, endMs: n
   const reasons: string[] = [];
   const clusters: { startedAtMs: number; atMs: number; profile: ClusterProfile }[] = [];
   const capacity: { atMs: number; total: number; consumed: number }[] = [];
+  const locations = new Set<string>();
   try {
     for (const value of observations) {
       const row = object(value);
-      if (row.cluster) clusters.push({ startedAtMs: integer(row.startedAtMs, 'Cluster sample start'),
-        atMs: integer(row.endedAtMs, 'Cluster sample end'), profile: profileFromCluster(row.cluster) });
+      if (row.cluster) {
+        locations.add(String(object(row.cluster).location));
+        clusters.push({ startedAtMs: integer(row.startedAtMs, 'Cluster sample start'),
+          atMs: integer(row.endedAtMs, 'Cluster sample end'), profile: profileFromCluster(row.cluster) });
+      }
       if (row.capacity) {
         const frame = tables(row.capacity)[0];
         const records = frame ? tableRows(frame).filter(item => item.Resource === 'QueryAcceleration') : [];
@@ -251,6 +255,7 @@ export function resourceTrace(observations: unknown[], startMs: number, endMs: n
   if (!covers(scoped(clusters).map(row => row.atMs), 90_000)) reasons.push('CLUSTER_TRACE_INCOMPLETE');
   if (!covers(scoped(capacity).map(row => row.atMs), 45_000)) reasons.push('QAP_CAPACITY_TRACE_INCOMPLETE');
   const metricSummaries: { name: string; samples: number; average: number | null; maximum: number | null }[] = [];
+  let engineCost = null;
   try {
     requireThat(metricsValue !== undefined, 'AZURE_METRICS_MISSING');
     const envelope = object(metricsValue), metrics = array(object(envelope.response).value, 'Azure metrics').map(object);
@@ -270,6 +275,27 @@ export function resourceTrace(observations: unknown[], startMs: number, endMs: n
       metricSummaries.push({ name, samples: valid.length,
         average: valid.length ? valid.reduce((sum, point) => sum + Number(point.average), 0) / valid.length : null,
         maximum: valid.length ? Math.max(...valid.map(point => Number(point.maximum))) : null });
+      if (name === 'InstanceCount' && locations.size === 1 && locations.has('canadacentral') &&
+          !reasons.includes('CLUSTER_TRACE_INCOMPLETE')) {
+        const sku = scoped(clusters)[0]?.profile.sku;
+        const cores = /^Standard_E(4|8|16|32)ads_v5$/.exec(sku ?? '')?.[1];
+        const fullStart = Math.ceil(startMs / 60_000) * 60_000, fullEnd = Math.floor(endMs / 60_000) * 60_000;
+        const fullPoints = valid.filter(point => {
+          const at = Date.parse(String(point.timeStamp));
+          return at >= fullStart && at < fullEnd;
+        });
+        if (cores && scoped(clusters).every(sample => sample.profile.sku === sku) &&
+            fullPoints.length > 0 && fullPoints.length === (fullEnd - fullStart) / 60_000 &&
+            fullPoints.every((point, index) => Date.parse(String(point.timeStamp)) === fullStart + index * 60_000 &&
+              Number(point.average) >= 2 && Number(point.average) <= Number(point.maximum) &&
+              Number(point.maximum) <= Math.min(8, 64 / Number(cores)))) {
+          const nodeSeconds = fullPoints.reduce((sum, point) => sum + Number(point.average) * 60, 0);
+          const usdPerVcpuHour = 0.182;
+          engineCost = { startMs: fullStart, endMs: fullEnd, nodeSeconds, usdPerVcpuHour,
+            estimatedUsd: nodeSeconds * Number(cores) * usdPerVcpuHour / 3600,
+            basis: 'Canada Central Eadsv5 consumption VM plus standard ADX engine markup; full sampled minutes only, not a bill.' };
+        }
+      }
     }
   } catch (error) { reasons.push(error instanceof Error ? error.message : 'Azure metrics are unavailable.'); }
   const nodeTransitions = clusters.slice(1).flatMap((sample, index) => {
@@ -278,7 +304,7 @@ export function resourceTrace(observations: unknown[], startMs: number, endMs: n
       lowerMs: previous.startedAtMs, upperMs: sample.atMs, before: previous.profile, after: sample.profile,
     }];
   });
-  return { complete: reasons.length === 0, reasons, clusters, capacity, nodeTransitions,
+  return { complete: reasons.length === 0, reasons, clusters, capacity, nodeTransitions, engineCost,
     balancingEvidence: 'Per-node balancing is not exposed by the collected cluster metrics.', metricSummaries };
 }
 

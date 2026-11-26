@@ -105,7 +105,7 @@ test('missing warmup absence, mismatched writer records and incomplete replay ca
 test('resource qualification requires the actual QAP resource, bounded cluster trace and complete metric window', () => {
   const observations = Array.from({ length: 21 }, (_, index) => ({
     startedAtMs: index * 30_000, endedAtMs: index * 30_000 + 1,
-    cluster: { sku: { name: 'Standard_E4ads_v5', capacity: 2 }, properties: {
+    cluster: { location: 'canadacentral', sku: { name: 'Standard_E4ads_v5', capacity: 2 }, properties: {
       state: 'Running', provisioningState: 'Succeeded', optimizedAutoscale: { isEnabled: true, minimum: 2, maximum: 4 },
     } },
     capacity: { Tables: [{ Columns: ['Resource', 'Total', 'Consumed'].map(ColumnName => ({ ColumnName })),
@@ -113,10 +113,17 @@ test('resource qualification requires the actual QAP resource, bounded cluster t
   }));
   const metrics = { response: { value: ['CPU', 'CacheUtilization', 'InstanceCount'].map(name => ({
     name: { value: name }, timeseries: [{ data: Array.from({ length: 11 }, (_, index) => ({
-      timeStamp: new Date(index * 60_000).toISOString(), average: 1, maximum: 2,
+      timeStamp: new Date(index * 60_000).toISOString(), average: name === 'InstanceCount' ? 2 : 1, maximum: 2,
     })) }],
   })) } };
   assert.equal(resourceTrace(observations, 0, 600_000, metrics).complete, true);
+  const cost = resourceTrace(observations, 1_000, 599_000, metrics).engineCost;
+  assert.equal(cost?.startMs, 60_000);
+  assert.equal(cost?.endMs, 540_000);
+  assert.equal(cost?.nodeSeconds, 960);
+  assert.ok(Math.abs(cost!.estimatedUsd - (1.456 * 8 / 60)) < 1e-12);
+  metrics.response.value[2]!.timeseries[0]!.data.splice(4, 1);
+  assert.equal(resourceTrace(observations, 1_000, 599_000, metrics).engineCost, null);
   assert.equal(resourceTrace(observations.slice(0, 4), 0, 600_000, metrics).complete, false);
   assert.equal(resourceTrace(observations, 0, 600_000).complete, false);
   observations[0]!.capacity.Tables[0]!.Rows[0]![0] = 'Ingestions';
