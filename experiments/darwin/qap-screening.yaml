@@ -12,6 +12,9 @@ agents:
       - name: auto
 samplers:
   - provider: islands
+    options:
+      num_islands: 1
+      feature_dimensions: [combined_score]
 prompt:
   provider: default
   system: |
