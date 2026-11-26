@@ -63,9 +63,11 @@ builders. Those schemas include a neutral bundle and a stream capability note.
 Run the standalone tool next to a running local catalog. With no `--ddl` it
 registers the 32 canonical public DMV tables; supply a repeatable `--ddl <file>`
 for explicit managed `CREATE TABLE` definitions, one statement per file instead.
-Set `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE` to the authorized key file for a
-signed catalog. Use the catalog service and collector with the same writable
-warehouse path, and enable the catalog's `--ingestion-layout` for the DFE writer.
+Set `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE` for the signed catalog, seed
+tool, and collector. Use the same writable warehouse path in both services.
+If the catalog uses `--ingestion-layout`, set `ARROWCOL_PARTITION_GRANULARITY`
+on the collector to `minute`, `hour`, or `day`; otherwise the collector can
+admit rows but cannot commit the partitioned table.
 
 ```bash
 arrowcol-sdk-gen catalog seed --endpoint http://127.0.0.1:8817 --out target/dmv-contracts
