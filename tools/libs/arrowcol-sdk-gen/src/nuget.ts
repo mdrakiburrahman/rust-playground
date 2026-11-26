@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadEnvFile } from 'node:process';
 import { parseArgs } from 'node:util';
+import { generateDmvPackageInputs } from './nuget-dmv.js';
 
 const root = process.cwd();
 const { positionals, values } = parseArgs({
@@ -27,12 +28,21 @@ function pack(version: string): void {
     env: { ...process.env, CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: 'x86_64-w64-mingw32-gcc-posix' },
   });
   const native = resolve(process.env.CARGO_TARGET_DIR ?? join(root, 'target'));
-  command('dotnet', [
-    'pack', 'crates/arrowcol-sdk-runtime/bindings/dotnet/Rust.Playground.csproj', '--configuration', 'Release',
-    '--output', out, '--artifacts-path', join(out, 'build'), `-p:PackageVersion=${version}`,
-    `-p:ArrowcolLinuxNative=${join(native, 'x86_64-unknown-linux-gnu/release/libarrowcol_sdk_ffi.so')}`,
-    `-p:ArrowcolWindowsNative=${join(native, windowsTarget, 'release/arrowcol_sdk_ffi.dll')}`,
-  ]);
+  command('cargo', ['build', '--locked', '--release', '--package', 'arrowcol-sdk-gen']);
+  mkdirSync(out, { recursive: true });
+  const generated = mkdtempSync(join(out, 'dmv-'));
+  try {
+    generateDmvPackageInputs(join(native, 'release/arrowcol-sdk-gen'), generated);
+    command('dotnet', [
+      'pack', 'crates/arrowcol-sdk-runtime/bindings/dotnet/Rust.Playground.csproj', '--configuration', 'Release',
+      '--output', out, '--artifacts-path', join(generated, 'build'), `-p:PackageVersion=${version}`,
+      `-p:ArrowcolDmvRoot=${generated}`,
+      `-p:ArrowcolLinuxNative=${join(native, 'x86_64-unknown-linux-gnu/release/libarrowcol_sdk_ffi.so')}`,
+      `-p:ArrowcolWindowsNative=${join(native, windowsTarget, 'release/arrowcol_sdk_ffi.dll')}`,
+    ]);
+  } finally {
+    rmSync(generated, { recursive: true, force: true });
+  }
 }
 
 function publish(version: string): void {
