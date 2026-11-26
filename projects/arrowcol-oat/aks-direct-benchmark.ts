@@ -611,6 +611,7 @@ async function deleteOwnedNamespace(config: Config, namespace: string, runId: st
 
 interface BenchmarkReport {
   schema_version: 1;
+  benchmark_revision?: string;
   run_id: string;
   tested_at_utc: string;
   delta_root: string;
@@ -714,6 +715,13 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string 
 
 async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string;
   mode: 'full' | 'smoke'; qap?: boolean }): Promise<BenchmarkReport> {
+  let benchmarkRevision: string | undefined;
+  if (options.qap) {
+    if ((await command(['git', 'status', '--porcelain', '--untracked-files=normal'], 'Verify committed QAP harness')).trim())
+      throw new Error('QAP runs require a committed, unchanged harness revision.');
+    benchmarkRevision = (await command(['git', 'rev-parse', 'HEAD'], 'Read QAP harness revision')).trim();
+    if (!/^[a-f0-9]{40,64}$/.test(benchmarkRevision)) throw new Error('QAP harness revision is unavailable.');
+  }
   const runId = (options.runId ?? randomUUID()).toLowerCase();
   const measurementSeconds = options.mode === 'smoke' ? 60 : 600;
   if (!uuidPattern.test(runId)) throw new Error('--run-id must be a UUID. Generate a new UUID for every run.');
@@ -938,9 +946,11 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       if (qap) {
         await writePrivateFile(resolve(runDir, 'qap-source.json'), JSON.stringify({
           measurementStartMs: measurementStart, measurementEndMs: measurementEnd,
+          inputStoppedAtMs: measurementEnd,
           warmupMs: 60_000, steadyStateStartMs: measurementStart + 120_000,
           source: window, writerRecords: [...writerCommits.values()], clocks: qap.clocks, writerStoppedAtMs,
           sourceVisibility: qap.sourceVisibility,
+          benchmarkRevision, manifestSha256: manifestSha,
         }) + '\n');
         qapTerminalReady = await qap.drain({ version: window.delta_version, rows: window.active_rows },
           options.mode === 'smoke' ? 5 * 60_000 : 15 * 60_000);
@@ -997,6 +1007,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
 
   const report: BenchmarkReport | undefined = metrics && canonical && writer ? {
     schema_version: 1,
+    ...(benchmarkRevision ? { benchmark_revision: benchmarkRevision } : {}),
     run_id: runId,
     tested_at_utc: new Date().toISOString(),
     delta_root: deltaRoot,
