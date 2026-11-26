@@ -74,7 +74,7 @@ arrowcol-sdk-gen catalog seed --endpoint http://127.0.0.1:8817 --out target/dmv-
 ```
 
 The tool is also included in the catalog image (`--entrypoint
-/usr/local/bin/arrowcol-sdk-gen`). It writes one SDK directory per
+/usr/local/bin/arrowcol-sdk-gen`). The seed command writes one C# models directory per
 `catalog.schema.table`; the JSON result lists the pinned v1 fingerprint and
 `models/csharp` path for each. Existing exact definitions are reused, while
 schema drift is rejected. Each table is committed separately; if the operation

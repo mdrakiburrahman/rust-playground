@@ -11,7 +11,9 @@ use arrowcol_catalog::{
 };
 use arrowcol_catalog_client::{InternalRequestSigner, rpc};
 use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
-use arrowcol_sdk_gen::{ArtifactBundle, SafeOutputPath, bundle_from_snapshot, generate_sdk, write_artifact_bundle};
+use arrowcol_sdk_gen::{
+    ArtifactBundle, SafeOutputPath, bundle_from_snapshot, generate_csharp_models, generate_sdk, write_artifact_bundle,
+};
 use clap::Subcommand;
 use prost::Message;
 use serde_json::json;
@@ -32,14 +34,14 @@ pub enum CatalogCommand {
         #[arg(long)]
         ddl: PathBuf,
     },
-    /// Register the bundled public DMV definitions or explicit CREATE TABLE files and generate pinned SDK models.
+    /// Register the bundled public DMV definitions or explicit CREATE TABLE files and generate pinned C# models.
     Seed {
         #[arg(long)]
         endpoint: String,
         /// A file containing one managed CREATE TABLE. Repeat for multiple definitions; omit to use the public DMVs.
         #[arg(long)]
         ddl: Vec<PathBuf>,
-        /// Workspace-relative output below .temp or target, with an SDK directory per table.
+        /// Workspace-relative output below .temp or target, with a model directory per table.
         #[arg(long)]
         out: PathBuf,
     },
@@ -200,7 +202,7 @@ async fn seed(
         verify_seed_schema(&create, &bundle)?;
         let path = out.join(&table);
         let sdk = SafeOutputPath::new(workspace.clone(), path.clone())?;
-        generate_sdk(&bundle, &sdk)?;
+        generate_csharp_models(&bundle, &sdk)?;
 
         if created {
             let committed = client

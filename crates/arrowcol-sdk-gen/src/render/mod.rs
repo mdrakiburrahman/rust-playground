@@ -57,8 +57,9 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
         let cpp_source = files
             .get(&PathBuf::from("cpp/model/schema.proto"))
             .ok_or_else(|| SdkGenError::Artifact("missing C++ model source".into()))?;
-        files.extend(models::render(&context, bundle, cpp_source)?);
+        files.extend(models::render(&context, bundle, Some(cpp_source))?);
     }
+
     let requests = bundle
         .descriptors()
         .file
@@ -117,6 +118,16 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
         rust_package: context.rust_package,
         typescript_package: context.typescript_package,
     })
+}
+
+pub(crate) fn render_csharp_models(bundle: &ArtifactBundle) -> SdkGenResult<BTreeMap<PathBuf, Vec<u8>>> {
+    let context = RenderContext::new(bundle.schema())?;
+    if !stream::supported(&context) {
+        return Err(SdkGenError::Artifact(
+            "C# stream models require flat scalar fields".into(),
+        ));
+    }
+    models::render(&context, bundle, None)
 }
 
 impl<'a> RenderContext<'a> {
