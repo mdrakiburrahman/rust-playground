@@ -3,7 +3,7 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
   "sourceRoot": "projects/arrowcol-catalog-rust/src",
-  "implicitDependencies": ["arrowcol-catalog", "arrowcol-catalog-client", "arrow-deltalake", "arrowcol-protocol", "arrowcol-props", "arrowcol-sparksql"],
+  "implicitDependencies": ["arrowcol-catalog", "arrowcol-catalog-client", "arrow-deltalake", "arrowcol-protocol", "arrowcol-props", "arrowcol-sparksql", "arrowcol-sdk-gen"],
   "namedInputs": {
     "default": [
       "{projectRoot}/**/*",

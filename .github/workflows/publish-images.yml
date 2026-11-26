@@ -12,6 +12,7 @@ on:
       - projects/arrowcol-dataflow-rust/**
       - projects/arrowcol-router-rust/**
       - projects/arrowcol-catalog-rust/**
+      - projects/loadtest/schemas/sqlserver.sql
       - projects/kusto-explorer/**
       - infra/docker/**
       - projects/arrowcol-infra/migrations/**
