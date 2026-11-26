@@ -82,8 +82,9 @@ With an authorized NuGet source configured, check the package's native ABI on
 the current RID (not ingestion or Delta commit):
 
 ```bash
-dotnet run --project examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj \
+dotnet build examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj \
   --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.1
+dotnet target/arrowcol-nuget/smoke/bin/NuGetSmoke/debug/NuGetSmoke.dll
 ```
 
 ## Minimal application APIs
