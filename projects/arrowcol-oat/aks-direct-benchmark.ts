@@ -910,6 +910,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         });
         collectWriterCommitRecords(finalLogs, writerCommits);
         writerStoppedAtMs = Date.now();
+        await qap.finishSourceSampling();
         await writePrivateFile(resolve(runDir, 'qap-writer-stop.json'), JSON.stringify({
           writerUid: loadWriter.uid, writerStoppedAtMs, finalRecords: writerCommits.size,
         }) + '\n');
@@ -939,6 +940,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
           measurementStartMs: measurementStart, measurementEndMs: measurementEnd,
           warmupMs: 60_000, steadyStateStartMs: measurementStart + 120_000,
           source: window, writerRecords: [...writerCommits.values()], clocks: qap.clocks, writerStoppedAtMs,
+          sourceVisibility: qap.sourceVisibility,
         }) + '\n');
         qapTerminalReady = await qap.drain({ version: window.delta_version, rows: window.active_rows },
           options.mode === 'smoke' ? 5 * 60_000 : 15 * 60_000);
