@@ -79,12 +79,12 @@ pub enum CatalogCommand {
     },
 }
 
-fn read_definition(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn definition(path: &Path) -> Result<ParsedCreateTable, Box<dyn std::error::Error>> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() {
         return Err("definition must be a regular non-symlink SQL file".into());
     }
-    Ok(fs::read_to_string(path)?)
+    parse_definition(&fs::read_to_string(path)?)
 }
 
 fn parse_definition(text: &str) -> Result<ParsedCreateTable, Box<dyn std::error::Error>> {
@@ -100,11 +100,6 @@ fn parse_definition(text: &str) -> Result<ParsedCreateTable, Box<dyn std::error:
         return Err("contract creation uses the selected catalog's managed warehouse, not LOCATION".into());
     }
     Ok(create)
-}
-
-fn definition(path: &Path) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let create = parse_definition(&read_definition(path)?)?;
-    Ok((create.identity().to_string(), create.canonical_ddl().to_owned()))
 }
 
 async fn channel(endpoint: String) -> Result<Channel, Box<dyn std::error::Error>> {
@@ -156,9 +151,7 @@ async fn seed(
             .map(parse_definition)
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        ddl.iter()
-            .map(|path| parse_definition(&read_definition(path)?))
-            .collect::<Result<Vec<_>, _>>()?
+        ddl.iter().map(|path| definition(path)).collect::<Result<Vec<_>, _>>()?
     };
     let mut identities = BTreeSet::new();
     for create in &definitions {
@@ -261,22 +254,23 @@ pub async fn run(command: CatalogCommand) -> Result<(), Box<dyn std::error::Erro
             serde_json::to_value(protobuf_table_metadata(&fs::read(descriptor)?)?)?
         }
         CatalogCommand::Validate { ddl } => {
-            let (table, ddl) = definition(&ddl)?;
-            json!({ "table": table, "ddl": ddl })
+            let create = definition(&ddl)?;
+            json!({ "table": create.identity().to_string(), "ddl": create.canonical_ddl() })
         }
         CatalogCommand::Seed { endpoint, ddl, out } => seed(endpoint, ddl, out).await?,
         CatalogCommand::Prepare { endpoint, ddl, out } => {
-            let (table, ddl) = definition(&ddl)?;
+            let create = definition(&ddl)?;
+            let ddl = create.canonical_ddl().to_owned();
             let snapshot = rpc::schema_catalog_client::SchemaCatalogClient::new(channel(endpoint).await?)
                 .prepare_table(catalog_request(rpc::PrepareTableRequest { ddl }, "PrepareTable")?)
                 .await?
                 .into_inner();
-            let bundle = bundle_from_snapshot(&snapshot, &identity(&table)?, Some(SchemaVersion::FIRST))?;
+            let bundle = bundle_from_snapshot(&snapshot, create.identity(), Some(SchemaVersion::FIRST))?;
             let output = SafeOutputPath::new(std::env::current_dir()?, out)?;
             write_artifact_bundle(&bundle, &output)?;
             fs::write(output.absolute().join("candidate.pb"), snapshot.encode_to_vec())?;
             json!({
-                "table": table,
+                "table": create.identity().to_string(),
                 "tableId": bundle.schema().table_id().to_string(),
                 "version": bundle.schema().version().get(),
                 "fingerprint": bundle.schema().fingerprint().to_string()

@@ -20,8 +20,7 @@ library. The neutral bundle is available as a separate download for other tools.
 Contract workflow distributions are immutable **source archives with Cargo, .NET and
 CMake project manifests**. Use the local project/path references below and build
 native SDK binaries for the application's OS/architecture, or use the C# NuGet
-runtime below. Identical SDK source produces
-identical SDK package digests across contracts; contract/model digests change
+runtime below. SDK digests are stable across contracts; contract/model digests change
 independently. `packages.json` records the standalone neutral bundle digest.
 
 Applications construct protobuf events; the SDK validates them, builds Arrow
@@ -60,45 +59,32 @@ builders. Those schemas include a neutral bundle and a stream capability note.
 
 ### Local catalog seed
 
-Run the standalone tool next to a running local catalog. With no `--ddl` it
-registers the 32 canonical public DMV tables; supply a repeatable `--ddl <file>`
-for explicit managed `CREATE TABLE` definitions, one statement per file instead.
-Set `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE` for the signed catalog, seed
-tool, and collector. Use the same writable warehouse path in both services.
-If the catalog uses `--ingestion-layout`, set `ARROWCOL_PARTITION_GRANULARITY`
-on the collector to `minute`, `hour`, or `day`; otherwise the collector can
-admit rows but cannot commit the partitioned table.
-
-```bash
-arrowcol-sdk-gen catalog seed --endpoint http://127.0.0.1:8817 --out target/dmv-contracts
-```
-
-The tool is also included in the catalog image (`--entrypoint
-/usr/local/bin/arrowcol-sdk-gen`). The seed command writes one C# models directory per
-`catalog.schema.table`; the JSON result lists the pinned v1 fingerprint and
-`models/csharp` path for each. Existing exact definitions are reused, while
-schema drift is rejected. Each table is committed separately; if the operation
-fails, correct the failure and rerun. Mount the output directory inside the
-tool's working directory; keep private DDL and its output local.
+| Command or setting | Requirements / result |
+| --- | --- |
+| `arrowcol-sdk-gen catalog seed --endpoint http://127.0.0.1:8817 --out target/dmv-contracts` | Registers 32 public DMV tables. Repeat `--ddl <file>` instead for one managed `CREATE TABLE` per file. |
+| Catalog image | Use `--entrypoint /usr/local/bin/arrowcol-sdk-gen` and mount output inside the tool's working directory. |
+| Output and reruns | Reports the v1 fingerprint and writes `models/csharp` per table. Exact definitions are reused; schema drift is rejected. Each table commits separately. Keep private DDL and its output local. |
+| Signed admission | Set `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE` for the catalog, seed tool, and collector. |
+| Local Delta | Give both services the same writable warehouse path. With catalog `--ingestion-layout`, set collector `ARROWCOL_PARTITION_GRANULARITY` to `minute`, `hour`, or `day`, or admitted rows cannot commit. |
 
 ### C# NuGet runtime
 
-`Rust.Playground` provides the `Arrowcol.Client` runtime for .NET 8,
-with native assets for Windows x64 and Linux x64 (glibc 2.34 or later).
-Reference a version from your approved Azure Artifacts source and reference the
-generated `Models.csproj` separately; no Rust toolchain is needed by consumers.
-The model's `contract/` directory must travel with the application.
+Reference `Rust.Playground` from your approved Azure Artifacts source for .NET 8
+on Windows x64 or Linux x64 (glibc 2.34+). Reference the generated `Models.csproj`
+separately and deploy its `contract/` directory. No Rust toolchain is needed.
 
 | Producer command | Requirements / result |
 | --- | --- |
 | `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-pack -- --package-version 0.1.0-alpha.1` | Linux x64 devcontainer, .NET 8 SDK, `x86_64-pc-windows-gnu` Rust target and MinGW POSIX linker; outputs the exact `.nupkg` under `target/arrowcol-nuget/` |
 | `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-publish -- --package-version 0.1.0-alpha.1` | Explicit upload of a previously packed version. Supply the Azure Artifacts NuGet v3 `NUGET_URL` and packaging-write `NUGET_PAT` using private devbox settings or the ignored `.env`; do not commit them. The publishing identity needs feed publisher access. |
 
-To check the package without a source project reference, run
-`examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj` with
-`-p:ArrowcolPackageVersion=<version>` and an authorized source or the local
-package directory. This checks native library resolution on the executing RID,
-not collector admission or Delta commit.
+With an authorized NuGet source configured, check the package's native ABI on
+the current RID (not ingestion or Delta commit):
+
+```bash
+dotnet run --project examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj \
+  --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.1
+```
 
 ## Minimal application APIs
 
