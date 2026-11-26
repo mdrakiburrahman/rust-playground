@@ -12,6 +12,12 @@
 | Evidence | Private ignored output: `result.json`, `receipts.jsonl`, `best-screening-plan.json`, `run.json`, `darwin.log`, and Darwin `state/`. Do not publish raw logs. |
 | Limits | Four iterations, serial evaluator, 16 total evaluations, 180s agent/30s evaluator, 20 minute outer wall budget. Refuses runs inside the campaign's final hour (2026-11-27 12:00Z onward). No automatic retries. |
 
+If the standalone Darwin downloader cannot fetch its pinned Copilot CLI runtime,
+download that exact official release with its published SHA256 checksums, then
+set `COPILOT_CLI_PATH=/absolute/path/to/copilot` on the run command. The runner
+validates this trusted executable path and records its hash; it does not expose
+the path in candidate files. Do not substitute an unverified runtime.
+
 ## Boundary and receipts
 
 The runner materializes a candidate-only Git seed from committed HEAD. It never

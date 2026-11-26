@@ -20,6 +20,9 @@ export async function main(args: string[]) {
   if (run("git", ["status", "--porcelain"], repo)) throw new Error("commit-clean-tree-before-evolution");
   const [binary, output] = args;
   if (!isAbsolute(binary) || realpathSync(binary) !== binary || !lstatSync(binary).isFile()) throw new Error("binary-path");
+  const copilotPath = process.env.COPILOT_CLI_PATH;
+  if (copilotPath && (!isAbsolute(copilotPath) || realpathSync(copilotPath) !== copilotPath ||
+      !lstatSync(copilotPath).isFile())) throw new Error("copilot-runtime-path");
   if (!/^out\/qap-[a-z0-9-]+$/.test(output)) throw new Error("output-must-be-new-out-qap-name");
   const root = resolve(repo, output);
   if (existsSync(root)) throw new Error("output-already-exists");
@@ -70,8 +73,10 @@ export async function main(args: string[]) {
   const metadata = {
     schemaVersion: 1, kind: "darwin-screening-run", sourceCommit, seedCommit,
     binarySha256: sha256(readFileSync(binary)), trustedManifestSha256: sha256(readFileSync(join(trusted, "manifest.json"))),
+    copilotRuntimeSha256: copilotPath ? sha256(readFileSync(copilotPath)) : null,
     candidateSeedSha256: sha256(seedText), deadlineMs, maxIterations: 4, maxEvaluations: 16,
-    environment: ["PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "COPILOT_GITHUB_TOKEN", "DARWIN_CONFINE_AGENTS", "DARWIN_DISABLE_BANNER"],
+    environment: ["PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "COPILOT_GITHUB_TOKEN",
+      ...(copilotPath ? ["COPILOT_CLI_PATH"] : []), "DARWIN_CONFINE_AGENTS", "DARWIN_DISABLE_BANNER"],
     qualification: "screening-only; no Azure requests or measured performance",
   };
   write(join(root, "run.json"), `${canonical(metadata)}\n`);
@@ -86,6 +91,7 @@ export async function main(args: string[]) {
       PATH: process.env.PATH,
       HOME: home, TMPDIR: scratch, XDG_CONFIG_HOME: join(home, ".config"),
       COPILOT_GITHUB_TOKEN: token,
+      ...(copilotPath ? { COPILOT_CLI_PATH: copilotPath } : {}),
       DARWIN_CONFINE_AGENTS: "1", DARWIN_DISABLE_BANNER: "1",
     },
   });
