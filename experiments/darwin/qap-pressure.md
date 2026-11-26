@@ -10,6 +10,8 @@
 | Fitness | Baseline10; up to two matched-core budgets15 each; one fixed/autoscale pair15; one matched policy pair40; plus5/proposal count. Experimental-design coverage only. |
 | Private checks | Each accepted pressure evaluation generates36 fresh rejection cases, including disallowed coefficients. |
 | Exit gate | A successful run must contain an evolved plan with baseline, topology, autoscale and explicit policy comparisons. |
+| Verified run | [`qap-pressure-run-proof.json`](qap-pressure-run-proof.json): four completed real Darwin iterations, five accepted evaluations, four distinct plans,180 fresh private cases; pressure coverage15→95.71428571428571. |
+| Actual proposal | [`qap-pressure-proposed-matrix.json`](qap-pressure-proposed-matrix.json): seven arms covering16/64-core topology pairs, fixed/autoscale and explicit cap100/coefficient0.5 versus1 at the same baseline cluster settings. No Azure winner. |
 
 The attestation is a controller assertion about its independently retained
 observations, **not cryptographic proof of a service response**. The trusted
@@ -30,3 +32,8 @@ other capacity-policy sections, restore state, and qualify the unchanged
 The original topology-only YAML, seed, proposal matrix, run proof and archived
 receipts remain separate. Pressure scores must not be compared with the earlier
 topology scoring scale, or with any live p95-derived fitness.
+
+The evolved policy pair retains optimized autoscale2..4 on two four-core nodes
+initially. Its configuration is matched, not its future observed node trajectory:
+the live controller must record that trajectory and may not attribute a latency
+change solely to the coefficient if engine resources differed.
