@@ -12,7 +12,7 @@ use arrowcol_catalog::{
 use arrowcol_catalog_client::{InternalRequestSigner, rpc};
 use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
 use arrowcol_sdk_gen::{
-    ArtifactBundle, SafeOutputPath, bundle_from_snapshot, generate_csharp_models, generate_sdk, write_artifact_bundle,
+    ArtifactBundle, SafeOutputPath, bundle_from_snapshot, generate_csharp_models, write_artifact_bundle,
 };
 use clap::Subcommand;
 use prost::Message;
