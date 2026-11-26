@@ -8,6 +8,10 @@ container:
 agents:
   - provider: copilot
     timeout: 180
+    auth:
+      provider: github
+      options:
+        source: env
     models:
       - name: claude-sonnet-4.6
 samplers:
