@@ -17,7 +17,6 @@
         "connections_per_worker": "auto",
         "streams_per_worker": "auto",
         "rows_per_table": "auto",
-        "dmv_concurrency": "auto",
         "corpus_bytes": "auto",
         "max_memory_bytes": "auto"
       }
@@ -41,14 +40,12 @@
   "dfe_pod_selector": "app=arrowcol",
   "arrowcol_endpoint": "http://arrowcol-router.arrow-collector.svc.cluster.local:50050",
   "router_metrics_endpoint": "http://arrowcol-router.arrow-collector.svc.cluster.local:15050/metrics",
-  "dmv_client_binary": "target/debug/arrowcol-dmv",
   "dmv_client_image": "arrowcollector00000.azurecr.io/arrowcol-oat-client@sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "edge_secret_file": "/run/secrets/edge-hmac",
   "edge_secret_name": "arrowcol-router-auth",
   "tables": ["sqlserver_availability_replica_states"],
   "rows_per_table": 1,
   "clients_per_table": 1,
-  "dmv_concurrency": 1,
   "qap_endpoint": "https://arrow-collector-00000.canadacentral.kusto.windows.net",
   "qap_database": null,
   "qap_timeout_seconds": 180,

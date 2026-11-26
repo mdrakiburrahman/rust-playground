@@ -30,6 +30,7 @@ use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -362,6 +363,16 @@ pub fn error_kind(error: &anyhow::Error) -> Option<MaintenanceErrorKind> {
     error_details(error).map(|details| details.kind)
 }
 
+/// Monotonic time source for deadlines; `Instant::now` unless injected.
+#[derive(Clone, Default)]
+struct DeadlineClock(Option<Arc<dyn Fn() -> Instant + Send + Sync>>);
+
+impl std::fmt::Debug for DeadlineClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "injected" } else { "system" })
+    }
+}
+
 /// Cooperative cancellation and deadline shared with the caller.
 #[derive(Clone, Debug)]
 pub struct MaintenanceControl {
@@ -369,6 +380,7 @@ pub struct MaintenanceControl {
     deadline: Option<Instant>,
     commit_attempts: u32,
     commit_budget: Duration,
+    clock: DeadlineClock,
 }
 
 impl Default for MaintenanceControl {
@@ -385,7 +397,21 @@ impl MaintenanceControl {
             deadline,
             commit_attempts: MAX_COMMIT_ATTEMPTS,
             commit_budget: COMMIT_BUDGET,
+            clock: DeadlineClock(None),
         }
+    }
+
+    /// Read deadlines from `now` instead of the system monotonic clock.
+    #[must_use]
+    pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = DeadlineClock(Some(Arc::new(now)));
+        self
+    }
+
+    /// The current instant on this control's deadline clock.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        self.clock.0.as_ref().map_or_else(Instant::now, |now| now())
     }
 
     /// Add a hard deadline without extending an existing operation deadline.
@@ -414,7 +440,7 @@ impl MaintenanceControl {
     /// True once cancellation was requested or the deadline passed.
     #[must_use]
     pub fn interrupted(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst) || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        self.cancel.load(Ordering::SeqCst) || self.deadline.is_some_and(|deadline| self.now() >= deadline)
     }
 
     /// Fail with a distinct error when the signal or deadline interrupts work.
@@ -422,7 +448,7 @@ impl MaintenanceControl {
     /// # Errors
     /// Returns a cancellation error after signal cancellation or a deadline error after expiry.
     pub fn check(&self) -> Result<()> {
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if self.deadline.is_some_and(|deadline| self.now() >= deadline) {
             return Err(fail(
                 MaintenanceErrorKind::DeadlineExceeded,
                 "maintenance operation deadline exceeded",
@@ -2219,6 +2245,212 @@ mod optimize_upload_tests {
     use super::*;
     use object_store::memory::InMemory;
 
+    #[derive(Debug)]
+    struct ProbeStore {
+        inner: Arc<dyn ObjectStore>,
+        probe_reads: bool,
+        barrier: Arc<tokio::sync::Barrier>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::fmt::Display for ProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "probe store")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProbeUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        barrier: Arc<tokio::sync::Barrier>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for ProbeUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            let part = self.inner.put_part(data);
+            let barrier = Arc::clone(&self.barrier);
+            let entered = Arc::clone(&self.entered);
+            let active = Arc::clone(&self.active);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                if entered.fetch_add(1, Ordering::SeqCst) < 2 {
+                    barrier.wait().await;
+                }
+                let result = part.await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                result
+            })
+        }
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            self.inner.complete().await
+        }
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn put_opts(
+            &self,
+            p: &object_store::path::Path,
+            v: object_store::PutPayload,
+            o: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(p, v, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &object_store::path::Path,
+            o: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Ok(Box::new(ProbeUpload {
+                inner: self.inner.put_multipart_opts(p, o).await?,
+                barrier: Arc::clone(&self.barrier),
+                entered: Arc::clone(&self.entered),
+                active: Arc::clone(&self.active),
+                peak: Arc::clone(&self.peak),
+            }))
+        }
+        async fn get_opts(
+            &self,
+            p: &object_store::path::Path,
+            o: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.probe_reads {
+                use std::sync::atomic::Ordering;
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                if self.entered.fetch_add(1, Ordering::SeqCst) < 2 {
+                    tokio::time::timeout(Duration::from_secs(2), self.barrier.wait())
+                        .await
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "probe",
+                            source: Box::new(error),
+                        })?;
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            p: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(p)
+        }
+        fn list(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(
+            &self,
+            a: &object_store::path::Path,
+            b: &object_store::path::Path,
+            o: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(a, b, o).await
+        }
+        async fn rename_opts(
+            &self,
+            a: &object_store::path::Path,
+            b: &object_store::path::Path,
+            o: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(a, b, o).await
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_consumer_respects_configured_concurrency() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let peak = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(ProbeStore {
+            inner: Arc::new(InMemory::new()),
+            probe_reads: false,
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            entered: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+        let file = tempfile::NamedTempFile::new()?;
+        let bytes = vec![0x5a; 512 * 1024];
+        fs::write(file.path(), &bytes)?;
+        let path = object_store::path::Path::from("concurrent.parquet");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            upload_staged_output(
+                Arc::clone(&store),
+                path.clone(),
+                file.path().to_path_buf(),
+                bytes.len() as u64,
+                Some(32 * 1024),
+                2,
+            ),
+        )
+        .await??;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(store.get(&path).await?.bytes().await?.as_ref(), bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_prefetch_consumer_overlaps_reads_in_order() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = object_store::path::Path::from("a");
+        let b = object_store::path::Path::from("b");
+        inner.put_opts(&a, vec![1_u8, 2].into(), PutMode::Create.into()).await?;
+        inner.put_opts(&b, vec![3_u8, 4].into(), PutMode::Create.into()).await?;
+        let peak = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(ProbeStore {
+            inner,
+            probe_reads: true,
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            entered: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+        let mut observed = Vec::new();
+        prefetch_inputs(
+            store,
+            vec![(0, a, 2), (1, b, 2)],
+            2,
+            3,
+            &MaintenanceControl::default(),
+            |key, bytes| {
+                observed.push((*key, bytes.to_vec()));
+                Ok(())
+            },
+        )?;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(observed, vec![(0, vec![1, 2]), (1, vec![3, 4])]);
+        let unsafe_config = OptimizeConfig {
+            input_prefetch_files: 2,
+            bin_concurrency: 8,
+            ..OptimizeConfig::default()
+        };
+        assert!(unsafe_config.validate().is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn staged_file_is_complete_when_streaming_upload_returns() -> Result<()> {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2233,6 +2465,7 @@ mod optimize_upload_tests {
             local.path().to_path_buf(),
             bytes.len() as u64,
             Some(32 * 1024),
+            2,
         )
         .await?;
 
@@ -2252,11 +2485,12 @@ mod optimize_upload_tests {
         let replacement = vec![4_u8, 5, 6];
         fs::write(local.path(), &replacement)?;
 
-        let error =
-            match upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None).await {
-                Err(error) => error,
-                Ok(()) => anyhow::bail!("create-only upload replaced an existing object"),
-            };
+        let error = match upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None, 1)
+            .await
+        {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("create-only upload replaced an existing object"),
+        };
         assert!(matches!(
             error.downcast_ref::<object_store::Error>(),
             Some(object_store::Error::AlreadyExists { .. })
@@ -2338,6 +2572,92 @@ mod optimize_upload_tests {
 pub const MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_OPTIMIZE_UPLOAD_CONCURRENCY: usize = 16;
+pub const MAX_OPTIMIZE_BIN_CONCURRENCY: usize = 8;
+pub const MAX_OPTIMIZE_PREFETCH_BYTES: u64 = 512 * 1024 * 1024;
+
+async fn fetch_prefetched_input(
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    expected: u64,
+    limit: u64,
+) -> Result<Bytes> {
+    let object = store.get(&path).await?;
+    if object.meta.size != expected || object.meta.size >= limit {
+        return Err(fail(
+            MaintenanceErrorKind::StalePlan,
+            "input object size differs from the planned size",
+        ));
+    }
+    let mut stream = object.into_stream();
+    // Reserve the verified size once; geometric growth can exceed the encoded-input budget.
+    let mut bytes = bytes::BytesMut::with_capacity(usize::try_from(expected)?);
+    while let Some(chunk) = stream.try_next().await? {
+        let size = u64::try_from(bytes.len())?
+            .checked_add(u64::try_from(chunk.len())?)
+            .context("prefetched input size overflow")?;
+        if size > expected {
+            return Err(fail(
+                MaintenanceErrorKind::StalePlan,
+                "input object grew during prefetch",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if u64::try_from(bytes.len())? != expected {
+        return Err(fail(
+            MaintenanceErrorKind::StalePlan,
+            "input object was truncated during prefetch",
+        ));
+    }
+    Ok(bytes.freeze())
+}
+
+fn prefetch_inputs<T>(
+    store: Arc<dyn ObjectStore>,
+    inputs: Vec<(T, object_store::path::Path, u64)>,
+    concurrency: u8,
+    limit: u64,
+    control: &MaintenanceControl,
+    mut consume: impl FnMut(&T, Bytes) -> Result<()>,
+) -> Result<()> {
+    let executor = shared_executor()?;
+    let mut inputs = inputs.into_iter();
+    let mut pending = std::collections::VecDeque::new();
+    let result = (|| -> Result<()> {
+        control.check()?;
+        for (key, path, expected) in inputs.by_ref().take(usize::from(concurrency)) {
+            let task =
+                crate::delta_io::spawn_shared_io(fetch_prefetched_input(Arc::clone(&store), path, expected, limit))?;
+            pending.push_back((key, task));
+        }
+        while !pending.is_empty() {
+            control.check()?;
+            let Some((key, task)) = pending.pop_front() else { break };
+            let bytes = executor.block_on(async move { task.await.context("input prefetch task failed")? })?;
+            control.check()?;
+            consume(&key, bytes)?;
+            if let Some((key, path, expected)) = inputs.next() {
+                control.check()?;
+                let task = crate::delta_io::spawn_shared_io(fetch_prefetched_input(
+                    Arc::clone(&store),
+                    path,
+                    expected,
+                    limit,
+                ))?;
+                pending.push_back((key, task));
+            }
+        }
+        Ok(())
+    })();
+    for (_, task) in pending {
+        task.abort();
+        executor.block_on(async move {
+            let _ = task.await;
+        });
+    }
+    result
+}
 
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
@@ -2372,6 +2692,10 @@ pub struct OptimizeConfig {
     pub batch_rows: usize,
     /// Input buffering strategy; spool uses temporary local disk.
     pub input_read_strategy: InputReadStrategy,
+    /// Maximum in-flight or buffered inputs per bin, including the file being decoded.
+    pub input_prefetch_files: u8,
+    pub upload_concurrency: usize,
+    pub bin_concurrency: usize,
     pub max_output_file_bytes: u64,
     pub max_active_files: usize,
     /// Whole-output sort using the shared layout helper.
@@ -2405,6 +2729,9 @@ impl Default for OptimizeConfig {
             max_batch_bytes: 64 * 1024 * 1024,
             batch_rows: 8192,
             input_read_strategy: InputReadStrategy::Memory,
+            input_prefetch_files: 1,
+            upload_concurrency: 1,
+            bin_concurrency: 1,
             max_output_file_bytes: 1023 * 1024 * 1024,
             max_active_files: 1_000_000,
             layout: None,
@@ -2450,6 +2777,28 @@ impl OptimizeConfig {
         }
         if self.output_row_group_rows == 0 {
             return invalid("output row-group rows must be positive");
+        }
+        if !(1..=MAX_OPTIMIZE_BIN_CONCURRENCY).contains(&self.bin_concurrency) {
+            return invalid("bin_concurrency must be within 1..=8");
+        }
+        if !(1..=8).contains(&self.input_prefetch_files) {
+            return invalid("input_prefetch_files must be within 1..=8");
+        }
+        if self.input_prefetch_files > 1 {
+            if self.input_read_strategy != InputReadStrategy::Memory {
+                return invalid("input_prefetch_files above 1 requires memory input_read_strategy");
+            }
+            if self
+                .small_file_bytes
+                .checked_mul(u64::from(self.input_prefetch_files))
+                .and_then(|bytes| bytes.checked_mul(self.bin_concurrency as u64))
+                .is_none_or(|bytes| bytes > MAX_OPTIMIZE_PREFETCH_BYTES)
+            {
+                return invalid("input_prefetch_files encoded input budget exceeds 512 MiB");
+            }
+        }
+        if !(1..=MAX_OPTIMIZE_UPLOAD_CONCURRENCY).contains(&self.upload_concurrency) {
+            return invalid("upload_concurrency must be within 1..=16");
         }
         Ok(())
     }
@@ -2987,6 +3336,25 @@ impl DeltaTable {
         writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
+        if upload_buffer_bytes.is_none() && config.upload_concurrency != 1 {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "upload_concurrency requires buffered multipart upload",
+            ));
+        }
+        if let Some(buffer_bytes) = upload_buffer_bytes
+            && (config.upload_concurrency > 1 || config.bin_concurrency > 1)
+        {
+            let budget = buffer_bytes
+                .checked_mul(config.upload_concurrency + 1)
+                .and_then(|bytes| bytes.checked_mul(config.bin_concurrency));
+            if budget.is_none_or(|bytes| bytes > 536_870_912) {
+                return Err(fail(
+                    MaintenanceErrorKind::InvalidPlan,
+                    "upload_concurrency and bin_concurrency buffer budget exceeds 512 MiB",
+                ));
+            }
+        }
         let state = self.validated_active_state(prepared, config.max_active_files)?;
         let writer_config = match writer_config {
             Some(config) => config,
@@ -3040,9 +3408,7 @@ impl DeltaTable {
             .output_policy_fingerprint
             .as_deref()
             .context("missing output policy fingerprint")?;
-        let mut outputs = Vec::new();
-        let mut kept: Vec<&OptimizeBin> = Vec::new();
-        let mut actions = 0_usize;
+        let mut candidates = Vec::new();
         for bin in &plan.bins {
             let proof = reuse_no_benefit_proofs
                 .then(|| optimize_no_benefit_proof(&state, bin, output_policy_fingerprint, config.batch_rows))
@@ -3055,55 +3421,121 @@ impl DeltaTable {
                 report.nonbeneficial_bins += 1;
                 continue;
             }
-            let written = match self.rewrite_bin(
-                &state.snapshot,
-                bin,
-                config,
-                control,
-                upload_buffer_bytes,
-                Some(writer_config),
-            ) {
-                Ok(written) => written,
-                Err(error) => return Err(self.discard_after(&outputs, error, &mut report)),
+            candidates.push((bin, proof));
+        }
+        let mut outputs = Vec::new();
+        let mut kept: Vec<&OptimizeBin> = Vec::new();
+        let mut actions = 0_usize;
+        for batch in candidates.chunks(config.bin_concurrency) {
+            let mut rewrites = std::collections::VecDeque::new();
+            let mut error = None;
+            let results = if config.bin_concurrency == 1 {
+                vec![self.rewrite_bin(
+                    &state.snapshot,
+                    batch[0].0,
+                    config,
+                    control,
+                    upload_buffer_bytes,
+                    Some(writer_config),
+                )]
+            } else {
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::new();
+                    let mut spawn_error = None;
+                    let snapshot = &state.snapshot;
+                    for (bin, _) in batch {
+                        match std::thread::Builder::new().spawn_scoped(scope, move || {
+                            self.rewrite_bin(snapshot, bin, config, control, upload_buffer_bytes, Some(writer_config))
+                        }) {
+                            Ok(handle) => handles.push(handle),
+                            Err(error) => {
+                                spawn_error = Some(fail(
+                                    MaintenanceErrorKind::ResourceLimit,
+                                    format!("bin_concurrency worker spawn failed: {error}"),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    let mut results: Vec<_> = handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle.join().unwrap_or_else(|_| {
+                                Err(fail(
+                                    MaintenanceErrorKind::Uncertain,
+                                    "OPTIMIZE bin worker panicked; unpublished outputs may remain",
+                                ))
+                            })
+                        })
+                        .collect();
+                    if let Some(error) = spawn_error {
+                        results.push(Err(error));
+                    }
+                    results
+                })
             };
-            let expected: Option<u64> = bin.files.iter().map(|file| file.rows).sum();
-            if expected.is_some_and(|rows| rows != written.iter().map(|output| output.rows).sum::<u64>()) {
-                outputs.extend(written);
-                let error = fail(
-                    MaintenanceErrorKind::StalePlan,
-                    "rewritten row count differs from input statistics",
-                );
+            for result in results {
+                match result {
+                    Ok(written) => rewrites.push_back(written),
+                    Err(cause) => {
+                        if error.is_none() || error_kind(&cause) == Some(MaintenanceErrorKind::Uncertain) {
+                            error = Some(cause);
+                        }
+                    }
+                }
+            }
+            if let Some(error) = error {
+                outputs.extend(rewrites.into_iter().flatten());
                 return Err(self.discard_after(&outputs, error, &mut report));
             }
-            // Verify the actual outputs: never commit a rewrite that does not
-            // reduce the file count or that exceeds the per-commit action budget.
-            let cost = bin.files.len() + written.len();
-            let beneficial = written.len() < bin.files.len();
-            if !beneficial || actions + cost > config.max_actions_per_commit {
-                if beneficial {
-                    report.backlog_files += bin.files.len() as u64;
-                } else {
-                    report.nonbeneficial_bins += 1;
-                }
-                if let Err(cleanup) = self.discard_outputs(&written) {
+            for (bin, proof) in batch {
+                let Some(written) = rewrites.pop_front() else {
+                    let error = fail(MaintenanceErrorKind::Uncertain, "missing OPTIMIZE bin worker result");
+                    return Err(self.discard_after(&outputs, error, &mut report));
+                };
+                let expected: Option<u64> = bin.files.iter().map(|file| file.rows).sum();
+                if expected.is_some_and(|rows| rows != written.iter().map(|output| output.rows).sum::<u64>()) {
                     outputs.extend(written);
+                    outputs.extend(rewrites.into_iter().flatten());
                     let error = fail(
-                        MaintenanceErrorKind::Uncertain,
-                        format!("dropping an unpublishable rewrite failed: {cleanup}"),
+                        MaintenanceErrorKind::StalePlan,
+                        "rewritten row count differs from input statistics",
                     );
                     return Err(self.discard_after(&outputs, error, &mut report));
                 }
-                if !beneficial
-                    && let Some(proof) = proof
-                    && let Err(error) = self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof)
-                {
-                    return Err(self.discard_after(&outputs, error, &mut report));
+                // Verify the actual outputs: never commit a rewrite that does not
+                // reduce the file count or that exceeds the per-commit action budget.
+                let cost = bin.files.len() + written.len();
+                let beneficial = written.len() < bin.files.len();
+                if !beneficial || actions + cost > config.max_actions_per_commit {
+                    if beneficial {
+                        report.backlog_files += bin.files.len() as u64;
+                    } else {
+                        report.nonbeneficial_bins += 1;
+                    }
+                    if let Err(cleanup) = self.discard_outputs(&written) {
+                        outputs.extend(written);
+                        outputs.extend(rewrites.into_iter().flatten());
+                        let error = fail(
+                            MaintenanceErrorKind::Uncertain,
+                            format!("dropping an unpublishable rewrite failed: {cleanup}"),
+                        );
+                        return Err(self.discard_after(&outputs, error, &mut report));
+                    }
+                    if !beneficial
+                        && let Some(proof) = proof
+                        && let Err(error) =
+                            self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof.clone())
+                    {
+                        outputs.extend(rewrites.into_iter().flatten());
+                        return Err(self.discard_after(&outputs, error, &mut report));
+                    }
+                    continue;
                 }
-                continue;
+                actions += cost;
+                kept.push(bin);
+                outputs.extend(written);
             }
-            actions += cost;
-            kept.push(bin);
-            outputs.extend(written);
         }
         let inputs: BTreeSet<String> = kept
             .iter()
@@ -3191,6 +3623,7 @@ impl DeltaTable {
             values: &bin.partition_values,
             logical: Arc::clone(&logical),
             properties,
+            skip_arrow_metadata: parquet_writer_config.skip_arrow_metadata(),
             config,
             upload_buffer_bytes,
             layout,
@@ -3201,14 +3634,39 @@ impl DeltaTable {
         };
         let result = (|| -> Result<()> {
             let mut decoded = 0_u64;
-            for file in &bin.files {
-                control.check()?;
-                let rows = self.read_input(file, config, &mut decoded, &logical, &mut writer)?;
-                if file.rows.is_some_and(|expected| expected != rows) {
-                    return Err(fail(
-                        MaintenanceErrorKind::StalePlan,
-                        format!("{} row count differs from statistics", file.path),
-                    ));
+            if config.input_prefetch_files > 1 {
+                let inputs = bin
+                    .files
+                    .iter()
+                    .map(|file| Ok((file, self.safe_object_path(&file.path)?, file.size)))
+                    .collect::<Result<Vec<_>>>()?;
+                prefetch_inputs(
+                    Arc::clone(&self.store),
+                    inputs,
+                    config.input_prefetch_files,
+                    config.small_file_bytes,
+                    control,
+                    |file, bytes| {
+                        let rows = self.decode_input(bytes, file, config, &mut decoded, &logical, &mut writer)?;
+                        if file.rows.is_some_and(|expected| expected != rows) {
+                            return Err(fail(
+                                MaintenanceErrorKind::StalePlan,
+                                format!("{} row count differs from statistics", file.path),
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                for file in &bin.files {
+                    control.check()?;
+                    let rows = self.read_input(file, config, &mut decoded, &logical, &mut writer)?;
+                    if file.rows.is_some_and(|expected| expected != rows) {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            format!("{} row count differs from statistics", file.path),
+                        ));
+                    }
                 }
             }
             control.check()?;
@@ -3477,6 +3935,7 @@ struct BinWriter<'a> {
     values: &'a BTreeMap<String, Option<String>>,
     logical: SchemaRef,
     properties: WriterProperties,
+    skip_arrow_metadata: bool,
     config: &'a OptimizeConfig,
     upload_buffer_bytes: Option<usize>,
     layout: Option<LayoutPolicy>,
@@ -3588,7 +4047,13 @@ impl BinWriter<'_> {
         let directory = local.parent().context("missing output directory")?;
         fs::create_dir_all(directory)?;
         let file = fs::OpenOptions::new().write(true).create_new(true).open(&local)?;
-        let writer = ArrowWriter::try_new(file, physical, Some(self.properties.clone()))?;
+        let writer = ArrowWriter::try_new_with_options(
+            file,
+            physical,
+            ArrowWriterOptions::new()
+                .with_properties(self.properties.clone())
+                .with_skip_arrow_metadata(self.skip_arrow_metadata),
+        )?;
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(OpenOutput {
             local,
@@ -3646,8 +4111,11 @@ impl BinWriter<'_> {
         };
         self.outputs.push(staged);
         let index = self.outputs.len() - 1;
-        self.table
-            .upload_output(&mut self.outputs[index], self.upload_buffer_bytes)?;
+        self.table.upload_output(
+            &mut self.outputs[index],
+            self.upload_buffer_bytes,
+            self.config.upload_concurrency,
+        )?;
         Ok(())
     }
 
@@ -3679,7 +4147,7 @@ impl BinWriter<'_> {
 
 impl DeltaTable {
     /// Upload a staged cloud output to its UUID-named path; local outputs are already in place.
-    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: Option<usize>) -> Result<()> {
+    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: Option<usize>, concurrency: usize) -> Result<()> {
         if self.url.scheme() == "file" {
             return Ok(());
         }
@@ -3691,6 +4159,7 @@ impl DeltaTable {
             output.local.clone(),
             output.bytes,
             buffer_bytes,
+            concurrency,
         ))?;
         output.uploaded = true;
         match fs::remove_file(&output.local) {
@@ -3707,9 +4176,10 @@ async fn upload_staged_output(
     local: PathBuf,
     expected_bytes: u64,
     buffer_bytes: Option<usize>,
+    concurrency: usize,
 ) -> Result<()> {
     match buffer_bytes {
-        Some(buffer_bytes) => stream_staged_output(store, path, local, expected_bytes, buffer_bytes).await,
+        Some(buffer_bytes) => stream_staged_output(store, path, local, expected_bytes, buffer_bytes, concurrency).await,
         None => {
             let bytes = tokio::fs::read(local).await?;
             if bytes.len() as u64 != expected_bytes {
@@ -3730,6 +4200,7 @@ async fn stream_staged_output(
     local: PathBuf,
     expected_bytes: u64,
     buffer_bytes: usize,
+    concurrency: usize,
 ) -> Result<()> {
     let mut reader = tokio::fs::File::from_std(File::open(local)?);
     if reader.metadata().await?.len() != expected_bytes {
@@ -3739,7 +4210,7 @@ async fn stream_staged_output(
         ));
     }
     let mut writer =
-        object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes).with_max_concurrency(1);
+        object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes).with_max_concurrency(concurrency);
     let copied = match tokio::io::copy(&mut reader, &mut writer).await {
         Ok(copied) => copied,
         Err(error) => {

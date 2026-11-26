@@ -101,6 +101,53 @@ async fn wire_ingest_request(
 }
 
 #[tokio::test]
+async fn diagnostic_flight_requires_matching_endpoints_and_never_admits_rows() -> Result<()> {
+    use arrowcol_protocol::IsolationLevel::{L0, L1, L5};
+    let fixture = Fixture::with_current(false).await?;
+    let batch = v1_batch(&fixture.v1, 0)?;
+    for (server, client) in [(L5, L0), (L1, L5), (L0, L1), (L0, L0), (L1, L1)] {
+        let admission = MockAdmission::new(TestCompletion::BestEffort, None);
+        let service = fixture
+            .service(ImplementationPool::Dataflow, admission.clone())?
+            .with_isolation(server, None)?;
+        let mut messages = encode_ingest(&fixture.v1, vec![batch.clone()]).await?;
+        if client != L5 {
+            messages[0]
+                .flight_descriptor
+                .as_mut()
+                .context("missing descriptor")?
+                .path
+                .push(client.as_str().to_owned());
+        }
+        let mut request = Request::new(stream::iter(messages.into_iter().map(Ok)));
+        insert_ingest_metadata(
+            request.metadata_mut(),
+            &fixture.v1,
+            ImplementationPool::Dataflow,
+            fixture.v1.fingerprint(),
+        )?;
+        let response = service.handle_do_put(request).await;
+        if server == client {
+            let results = response?.into_inner().try_collect::<Vec<_>>().await?;
+            assert_eq!(results.len(), 1);
+            let receipt: arrowcol_flight::DiagnosticReceipt = serde_json::from_slice(&results[0].app_metadata)?;
+            assert_eq!(receipt.rows, batch.num_rows() as u64);
+            assert_eq!(receipt.diagnostic_discard, server);
+            assert!(PutResultMetadata::from_put_result(&results[0]).is_err());
+            assert_eq!(admission.begin_count(), 1);
+        } else {
+            assert_eq!(
+                response.err().context("mismatched isolation accepted")?.code(),
+                Code::InvalidArgument
+            );
+            assert_eq!(admission.begin_count(), 0);
+        }
+        assert!(admission.batches().await.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn loopback_compression_negotiates_requests_and_responses_independently() -> Result<()> {
     for (request_encoding, response_encoding, client_accept) in [
         (None, None, None),

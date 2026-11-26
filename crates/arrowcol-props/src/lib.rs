@@ -30,6 +30,7 @@ pub enum Validator {
     Minimum(u64),
     Range(f64, f64),
     OneOf(&'static [&'static str]),
+    SortOptions,
 }
 
 /// One registry entry. Add entries here rather than duplicating consumer validation.
@@ -297,6 +298,13 @@ pub static REGISTRY: &[PropKey] = &[
         "customer_id",
         Validator::Any,
         "Comma-separated sort columns; empty disables sorting and names must exist in the table schema."
+    ),
+    key!(
+        "arrowcol.layout.sortOptions",
+        StringList,
+        "",
+        Validator::SortOptions,
+        "Ordered column, direction, and null placement entries; must match sortColumns."
     ),
     key!(
         "arrowcol.layout.bloomColumns",
@@ -744,6 +752,16 @@ impl PropKey {
             Validator::Minimum(min) => matches!(&value, PropValue::Unsigned(n) if *n >= min),
             Validator::Range(min, max) => number.is_some_and(|n| n >= min && n <= max),
             Validator::OneOf(choices) => choices.contains(&raw),
+            Validator::SortOptions => match &value {
+                PropValue::StringList(options) => options.iter().all(|option| {
+                    let parts = option.split(':').collect::<Vec<_>>();
+                    parts.len() == 3
+                        && !parts[0].is_empty()
+                        && matches!(parts[1], "ascending" | "descending")
+                        && matches!(parts[2], "first" | "last")
+                }),
+                _ => false,
+            },
         };
         if !valid {
             return Err(error(self.name, format!("value violates {:?}", self.validator)));
@@ -873,6 +891,20 @@ pub fn resolve(
         );
     }
     let result = ResolvedProps { values, raw };
+    let columns = result.string_list("arrowcol.layout.sortColumns")?;
+    let options = result.string_list("arrowcol.layout.sortOptions")?;
+    if !options.is_empty()
+        && (options.len() != columns.len()
+            || options
+                .iter()
+                .zip(columns)
+                .any(|(option, column)| option.split(':').next() != Some(column.as_str())))
+    {
+        return Err(error(
+            "arrowcol.layout.sortOptions",
+            "must match sortColumns exactly in order",
+        ));
+    }
     for (min, max) in [
         ("arrowcol.writer.minInputSize", "arrowcol.writer.maxInputSize"),
         ("arrowcol.vacuum.retention", "delta.deletedFileRetentionDuration"),

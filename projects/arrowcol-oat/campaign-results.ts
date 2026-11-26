@@ -16,6 +16,13 @@ export interface CampaignMeasurement {
   expectedRepeats: number | null;
   factorConfigPaths?: [string, string];
   officialRuns?: OfficialRun[];
+  baselineBefore?: OfficialRun;
+  baselineAfter?: OfficialRun;
+  pairOrder?: 'AB' | 'BA';
+  evidenceState?: 'configured' | 'projected' | 'consumer-verified' | 'physically-observed' | 'measured';
+  disposition?: string;
+  outcome?: string;
+  status?: string;
   diedFirst?: string | null;
   comment?: string | null;
   downstreamStatus?: 'unavailable' | 'observed_or_not_attempted';
@@ -34,11 +41,13 @@ interface OfficialRun {
 }
 
 type RecordValue = Record<string, unknown>;
-type Cell = { x: string; y: string; rates: number[] };
+type FactorCoverage = { status: 'active' | 'projection_only' | 'unknown' | 'inert'; reason: string };
+type Cell = { x: string; y: string; rates: number[]; coverage: FactorCoverage; failures: string[]; notes: string[] };
 type Summary = {
   candidate: string;
   rates: number[];
   mean: number;
+  normalizedMean: number | null;
   min: number;
   max: number;
   completedRepeats: number;
@@ -46,11 +55,32 @@ type Summary = {
   status: 'qualified' | 'collector-only' | 'failed' | 'unqualified';
   reason: string;
 };
-type OfficialWindow = { rate: number };
-type RepeatAssessment = { qualified: boolean; rates: number[]; reason: string };
+type OfficialWindow = { rate: number; resolution: number | null };
+type RepeatAssessment = { qualified: boolean; rates: number[]; reason: string; ratio?: number; pairRatio?: number; candidateBytes?: number; baselineBytes?: number; pairedBaselineRate?: number };
+type RankedObservation = {
+  rate: number; resolution: number; bytesPerRow: number | null;
+  commitCount: number; maxCommitRows: number; slope: number | null;
+};
 
 function isRecord(value: unknown): value is RecordValue {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function parseLocalCollectorCpuQuota(value: unknown, hostCpus?: number): {
+  source: 'platform.local.collector_cpu_quota' | 'coupled_to_dfe_worker_concurrency';
+  requested_quota: number | 'unlimited' | null;
+} {
+  const field = 'platform.local.collector_cpu_quota';
+  if (value == null) return { source: 'coupled_to_dfe_worker_concurrency', requested_quota: null };
+  if (value !== 'unlimited' && (typeof value !== 'number' || !Number.isFinite(value) || value < 0.01 || value > 4096 ||
+      (String(value).split('.')[1]?.length ?? 0) > 9)) {
+    throw new Error(`${field} must be a finite CPU quota from 0.01 to 4096 with at most nanocore precision, or "unlimited"`);
+  }
+  if (hostCpus !== undefined && (!Number.isSafeInteger(hostCpus) || hostCpus < 1 ||
+      (typeof value === 'number' && value > hostCpus))) {
+    throw new Error(`${field} exceeds or cannot validate Docker host logical CPUs (${hostCpus})`);
+  }
+  return { source: field, requested_quota: value as number | 'unlimited' };
 }
 
 function requiredText(value: unknown, field: string): string {
@@ -82,6 +112,11 @@ function parseOfficialRun(value: unknown, field: string): OfficialRun {
     return row;
   });
   if (value.mode !== 'local' && value.mode !== 'aks') throw new Error(field + ' mode must be local or aks');
+  if (value.mode === 'local') {
+    const platform = isRecord(value.config.platform) ? value.config.platform : undefined;
+    const local = platform && isRecord(platform.local) ? platform.local : undefined;
+    parseLocalCollectorCpuQuota(local?.collector_cpu_quota);
+  }
   return {
     status: { id: status.id, config_sha256: typeof status.config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(status.config_sha256) ? status.config_sha256 : null,
       state, progress: status.progress, result_count: Number(status.result_count), error: status.error },
@@ -101,7 +136,7 @@ function numberLabel(value: number): string {
   return value.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
-export function validateCampaignMeasurements(value: unknown): CampaignMeasurement[] {
+function parseCampaignMeasurements(value: unknown): CampaignMeasurement[] {
   if (!Array.isArray(value) || value.length === 0) throw new Error('results must be a non-empty array');
   const identities = new Set<string>();
   const candidates = new Map<string, { factorX: string; valueX: string; factorY: string; valueY: string; expectedRepeats: number | null }>();
@@ -167,6 +202,44 @@ export function validateCampaignMeasurements(value: unknown): CampaignMeasuremen
       qapPendingArtifacts: kustainerDied ? null : qapPendingArtifacts,
       qapUnhealthyCatalogs: kustainerDied ? null : qapUnhealthyCatalogs,
       collectorOnly: kustainerDied || downstreamStatus === 'unavailable',
+    };
+  });
+}
+
+export function validateCampaignMeasurements(value: unknown): CampaignMeasurement[] {
+  if (!Array.isArray(value)) throw new Error('results must be a non-empty array');
+  const rows = parseCampaignMeasurements(value);
+  return rows.map((row, index) => {
+    const raw = value[index] as RecordValue;
+    const before = raw.baselineBefore === undefined ? undefined : parseOfficialRun(raw.baselineBefore, `result ${index} baselineBefore`);
+    const after = raw.baselineAfter === undefined ? undefined : parseOfficialRun(raw.baselineAfter, `result ${index} baselineAfter`);
+    const disposition = raw.disposition == null ? undefined : requiredText(raw.disposition, `result ${index} disposition`);
+    const outcome = raw.outcome === undefined ? undefined : requiredText(raw.outcome, `result ${index} outcome`);
+    const status = raw.status === undefined ? undefined : requiredText(raw.status, `result ${index} status`);
+    if (raw.pairOrder !== undefined && raw.pairOrder !== 'AB' && raw.pairOrder !== 'BA') {
+      throw new Error(`result ${index} pairOrder must be AB or BA`);
+    }
+    if (raw.evidenceState !== undefined && !['configured', 'projected', 'consumer-verified', 'physically-observed', 'measured'].includes(String(raw.evidenceState))) {
+      throw new Error(`result ${index} evidenceState is invalid`);
+    }
+    const downstream = row.officialRuns?.flatMap(run => run.rows).map(evidenceForRow)
+      .find(evidence => evidence?.downstream_status === 'unavailable');
+    const officialRuns = row.officialRuns?.map(run => ({
+      ...run,
+      rows: run.rows.map(result => evidenceForRow(result)?.downstream_status === 'unavailable' ? {
+        ...result, qap_completion_percent: null, qap_pending_artifacts: null, qap_cached_bytes: null,
+        qap_unhealthy_catalogs: null, qap_lag_seconds: null, qap_observation_complete: 0, qap_observed_tables: 0,
+      } : result),
+    }));
+    return {
+      ...row, officialRuns, baselineBefore: before, baselineAfter: after, pairOrder: raw.pairOrder,
+      evidenceState: raw.evidenceState as CampaignMeasurement['evidenceState'], disposition, outcome, status,
+      ...(downstream ? {
+        downstreamStatus: 'unavailable' as const, collectorOnly: true,
+        qapCompletionPercent: null, qapPendingArtifacts: null, qapUnhealthyCatalogs: null,
+        comment: typeof downstream.downstream_comment === 'string' && downstream.downstream_comment.trim() ? downstream.downstream_comment :
+          typeof downstream.downstream_reason === 'string' ? downstream.downstream_reason : row.comment ?? 'QAP observation unavailable',
+      } : {}),
     };
   });
 }
@@ -258,11 +331,12 @@ function officialImageIds(run: OfficialRun): string[] | null {
 function assertCompatibleBaselines(rows: CampaignMeasurement[], cohort: string): void {
   let source: string | undefined;
   let configFingerprint: string | undefined;
+  let imageFingerprint: string | undefined;
   let mode: string | undefined;
   for (const row of rows) {
     if (!row.officialRuns?.length) continue;
-    if (!row.factorConfigPaths) throw new Error('official evidence requires factorConfigPaths to compare frozen baselines');
-    for (const run of row.officialRuns) {
+    if (!row.factorConfigPaths) continue;
+    for (const run of [...row.officialRuns, ...(row.baselineBefore ? [row.baselineBefore] : []), ...(row.baselineAfter ? [row.baselineAfter] : [])]) {
       if (factorPathsOverlap(run.config, row.factorConfigPaths[0], row.factorConfigPaths[1]) ||
           !resolveFactorLeaf(run.config, row.factorConfigPaths[0]) || !resolveFactorLeaf(run.config, row.factorConfigPaths[1])) {
         throw new Error('cohort ' + cohort + ' factorConfigPaths must identify distinct scalar or array config leaves');
@@ -271,19 +345,228 @@ function assertCompatibleBaselines(rows: CampaignMeasurement[], cohort: string):
       if (!removeFactorPath(config, row.factorConfigPaths[0]) || !removeFactorPath(config, row.factorConfigPaths[1])) {
         throw new Error('cohort ' + cohort + ' factorConfigPaths do not resolve in official config');
       }
-      const fingerprint = stableJson({ config, collectorImages: officialImageIds(run) });
-      if (source !== undefined && (source !== run.expectedSha || configFingerprint !== fingerprint || mode !== run.mode)) {
+      const fingerprint = stableJson(config);
+      const images = officialImageIds(run);
+      const image = images ? stableJson(images) : undefined;
+      if (source !== undefined && (source !== run.expectedSha || configFingerprint !== fingerprint || mode !== run.mode) ||
+          image !== undefined && imageFingerprint !== undefined && image !== imageFingerprint) {
         throw new Error('cohort ' + cohort + ' has incompatible frozen source/resource/load baselines');
       }
       source = run.expectedSha;
       configFingerprint = fingerprint;
+      if (image !== undefined) imageFingerprint = image;
       mode = run.mode;
     }
   }
 }
 
+function canonicalFactorPath(path: string): string | undefined {
+  const parts = path.split('.');
+  if (parts.some(part => part.trim() === '' || part !== part.trim())) return undefined;
+  if (parts[0] === 'tunables') parts.shift();
+  return parts.length ? parts.join('.') : undefined;
+}
+
+const proofReasonPaths: Readonly<Record<string, readonly string[]>> = {
+  no_nullable_generated_columns: ['client.null_fraction'],
+  no_eligible_generated_rows: [
+    'client.pod_ordinal', 'client.guid_uniqueness', 'client.value_variation',
+    'client.string_width', 'client.string_length_distribution',
+  ],
+  all_values_skewed: ['client.value_variation', 'client.cardinality'],
+  one_byte_maximum_width: ['client.string_length_distribution'],
+  consumer_startup_and_prepared_corpus: [
+    'client.pod_ordinal', 'client.guid_uniqueness', 'client.value_variation', 'client.string_width',
+    'client.string_length_distribution', 'client.entropy', 'client.cardinality', 'client.seed', 'client.skew',
+  ],
+  committed_table_metadata_readback: ['collector.commit.delta_stats_columns', 'collector.commit.delta_stats_num_indexed_cols'],
+  consumer_linux_thp_flag_readback: ['collector.thp_disabled'],
+  consumer_glibc_tunables_startup_readback: [
+    'collector.malloc.arena_max', 'collector.malloc.arena_test', 'collector.malloc.mmap_threshold',
+    'collector.malloc.mmap_max', 'collector.malloc.trim_threshold', 'collector.malloc.top_pad', 'collector.malloc.mxfast',
+    'collector.malloc.tcache_count', 'collector.malloc.tcache_max', 'collector.malloc.tcache_unsorted_limit',
+    'collector.malloc.hugetlb',
+  ],
+  consumer_mimalloc_option_readback: [
+    'collector.mimalloc.purge_delay_ms', 'collector.mimalloc.purge_decommits', 'collector.mimalloc.arena_eager_commit',
+    'collector.mimalloc.allow_large_os_pages', 'collector.mimalloc.reserve_huge_os_pages',
+    'collector.mimalloc.reserve_os_memory_kib', 'collector.mimalloc.arena_reserve_kib',
+    'collector.mimalloc.arena_purge_mult', 'collector.mimalloc.minimal_purge_size_kib',
+    'collector.mimalloc.page_commit_on_demand', 'collector.mimalloc.page_max_candidates',
+    'collector.mimalloc.page_full_retain', 'collector.mimalloc.generic_collect',
+    'collector.mimalloc.page_reclaim_on_free', 'collector.mimalloc.page_max_reclaim',
+    'collector.mimalloc.page_cross_thread_max_reclaim', 'collector.mimalloc.use_numa_nodes',
+  ],
+  consumer_linux_listener_buffer_readback: ['collector.socket.recv_buffer_bytes', 'collector.socket.send_buffer_bytes'],
+  consumer_accepted_socket_readback: ['collector.socket.tcp_nodelay'],
+  consumer_cpu_pool_readback: ['collector.runtime.cpu_thread_stack_size'],
+};
+
+function factorCoverage(row: CampaignMeasurement): FactorCoverage {
+  const unknown: FactorCoverage = { status: 'unknown', reason: 'varied factor coverage unknown' };
+  if (!row.factorConfigPaths || !row.officialRuns?.length) return unknown;
+  const paths = row.factorConfigPaths.map(canonicalFactorPath);
+  if (paths.some(path => !path) || new Set(paths).size !== paths.length) return unknown;
+  const matches = (entryPath: string): boolean => {
+    const canonical = canonicalFactorPath(entryPath);
+    return canonical !== undefined && paths.includes(canonical);
+  };
+  let incomplete = false;
+  const inert: string[] = [];
+  const projected: string[] = [];
+  for (const run of row.officialRuns) {
+    if (row.factorConfigPaths.some(path => !resolveFactorLeaf(run.config, path)) || !run.rows.length) incomplete = true;
+    for (const result of run.rows) {
+      let evidence: unknown;
+      try { evidence = typeof result.evidence_json === 'string' ? JSON.parse(result.evidence_json) : null; } catch { evidence = null; }
+      if (!isRecord(evidence)) { incomplete = true; continue; }
+      const seen = new Set<string>();
+      for (const [field, reasons, allowedReasons] of [
+        ['inert_fields', inert, ['maintenance_disabled', 'dictionary_disabled', 'duration_based_run', 'collector_shutdown_after_measurement', 'connection_retries_disabled', 'stream_retries_disabled', 'http2_keepalive_disabled', 'adaptive_http2_window', 'tcp_keepalive_disabled', 'rate_limit_disabled', 'no_nullable_generated_columns', 'no_eligible_generated_rows', 'all_values_skewed', 'one_byte_maximum_width']],
+        ['projection_only', projected, ['consumer_startup_proof_unverified']],
+        ['runner_controls', undefined, ['maintenance_runner_control', 'router_log_filter_inheritance']],
+        ['consumer_verified', undefined, ['consumer_startup_readback', 'consumer_table_writer_readback', 'consumer_table_adaptive_readback', 'consumer_linux_thp_flag_readback', 'consumer_glibc_tunables_startup_readback', 'consumer_mimalloc_option_readback', 'consumer_linux_listener_buffer_readback', 'consumer_accepted_socket_readback', 'consumer_cpu_pool_readback', 'consumer_startup_and_prepared_corpus', 'committed_table_metadata_readback']],
+      ] as const) {
+        const entries = evidence[field];
+        if (!Array.isArray(entries)) { incomplete = true; continue; }
+        for (const entry of entries) {
+          if (!isRecord(entry) || typeof entry.path !== 'string') {
+            incomplete = true;
+            continue;
+          }
+          const path = canonicalFactorPath(entry.path);
+          if (!path) { incomplete = true; continue; }
+          if (seen.has(path)) incomplete = true;
+          seen.add(path);
+          if (typeof entry.reason !== 'string' || !(allowedReasons as readonly string[]).includes(entry.reason) ||
+              (Object.hasOwn(proofReasonPaths, entry.reason) && !proofReasonPaths[entry.reason]!.includes(path))) {
+            incomplete = true;
+            continue;
+          }
+          if (reasons && matches(entry.path)) reasons.push(entry.path + ': ' + entry.reason);
+        }
+      }
+      if (paths.some(path => !seen.has(path!))) incomplete = true;
+    }
+  }
+  if (inert.length) return {
+    status: 'inert',
+    reason: 'inert: ' + [...new Set(inert)].join('; ') + (incomplete ? '; varied factor coverage unknown' : ''),
+  };
+  if (incomplete) return unknown;
+  if (projected.length) return {
+    status: 'projection_only',
+    reason: 'consumption unproven; applicability unknown: ' + [...new Set(projected)].join('; '),
+  };
+  return { status: 'active', reason: 'factor coverage complete' };
+}
+
+function combineCoverage(coverages: FactorCoverage[]): FactorCoverage {
+  for (const status of ['inert', 'unknown', 'projection_only', 'active'] as const) {
+    const matching = coverages.filter(coverage => coverage.status === status);
+    if (matching.length) return { status, reason: [...new Set(matching.map(coverage => coverage.reason))].join('; ') };
+  }
+  return { status: 'unknown', reason: 'varied factor coverage unknown' };
+}
+
 function nonNegativeInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function evidenceForRow(row: RecordValue): RecordValue | undefined {
+  if (typeof row.evidence_json !== 'string') return undefined;
+  try {
+    const evidence: unknown = JSON.parse(row.evidence_json);
+    return isRecord(evidence) ? evidence : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rankedObservation(run: OfficialRun): RankedObservation | undefined {
+  const evidence = evidenceForRow(run.rows[0] ?? {});
+  const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+  const reconciliation = isRecord(durable?.delta_log_reconciliation) ? durable.delta_log_reconciliation : undefined;
+  const csv = isRecord(reconciliation?.csv) ? reconciliation.csv : undefined;
+  const reconciled = csv;
+  const screen = isRecord(evidence?.screen_v1) ? evidence.screen_v1 : undefined;
+  const observed = screen;
+  if (!observed || !reconciled || stableJson(observed) !== stableJson(reconciled)) return undefined;
+  const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+  const seconds = output?.window_seconds;
+  const rate = observed.durable_rows_per_s;
+  const outputRate = output?.rows_per_second;
+  const resolution = observed.rate_resolution_rows_per_second;
+  const count = nonNegativeInteger(observed.window_commit_count);
+  const maximum = nonNegativeInteger(observed.max_commit_rows);
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0 ||
+      typeof outputRate !== 'number' || !Number.isFinite(outputRate) ||
+      Math.abs(rate - outputRate) > 1e-9 ||
+      typeof resolution !== 'number' || !Number.isFinite(resolution) || resolution <= 0 ||
+      typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0 ||
+      count === undefined || count === 0 || maximum === undefined || maximum === 0 ||
+      Math.abs(resolution - maximum / seconds) > Math.max(1e-9, resolution * 1e-9)) return undefined;
+  const bytes = observed.bytes_per_row;
+  const slope = observed.slope_rows_per_second;
+  return {
+    rate, resolution, commitCount: count, maxCommitRows: maximum,
+    slope: typeof slope === 'number' && Number.isFinite(slope) ? slope : null,
+    bytesPerRow: typeof bytes === 'number' && Number.isFinite(bytes) && bytes > 0 ? bytes : null,
+  };
+}
+
+function cellFailure(row: CampaignMeasurement): string | undefined {
+  for (const result of row.officialRuns?.flatMap(run => run.rows) ?? []) {
+    const evidence = evidenceForRow(result);
+    if (evidence?.screen_v1_csv_reason === 'cell_failed') return 'screen_v1: cell_failed';
+    for (const key of ['pre_teardown_reconciliation', 'reconciliation']) {
+      const reconciliation = evidence?.[key];
+      if (isRecord(reconciliation) && reconciliation.exact_match_required === true && reconciliation.exact_match === false) {
+        return typeof reconciliation.reason === 'string' ? reconciliation.reason : 'delta_exact_match_failed';
+      }
+    }
+  }
+  if (row.committedRowsPerSecond === null) return row.comment ?? 'committed rate unavailable';
+  if (row.status !== undefined && row.status !== 'succeeded') return row.comment ?? 'result status is ' + row.status;
+  if (row.disposition?.endsWith('_quarantined_not_settled')) return row.comment ?? row.disposition;
+  if (row.outcome !== undefined && row.outcome !== 'ok' && row.outcome !== 'succeeded' && row.outcome !== 'kustainer-null') {
+    return row.comment ?? 'outcome: ' + row.outcome;
+  }
+  if (row.diedFirst && row.diedFirst.toLowerCase() !== 'kustainer') {
+    return row.comment ?? 'component failure: ' + row.diedFirst;
+  }
+  for (const run of row.officialRuns ?? []) {
+    const stop = officialOverloadStop(run);
+    if (stop) return stop;
+    for (const result of run.rows) {
+      const evidence = evidenceForRow(result);
+      const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+      const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+      if (typeof output?.rows_per_second === 'number' && Number.isFinite(output.rows_per_second) &&
+          Math.abs(output.rows_per_second - row.committedRowsPerSecond) > 1e-9) {
+        return 'committed rate disagrees with official measurement';
+      }
+      for (const value of [result.disposition, evidence?.disposition]) {
+        if (typeof value === 'string' && value.endsWith('_quarantined_not_settled')) return row.comment ?? value;
+      }
+      if (Array.isArray(evidence?.teardown_failures) && evidence.teardown_failures.some(
+        failure => isRecord(failure) && failure.kind === 'dataflow_drain_incomplete',
+      )) return row.comment ?? 'dataflow_drain_incomplete';
+      if (evidence?.teardown_outcome === 'failed' || evidence?.teardown_outcome === 'not_started') {
+        return row.comment ?? 'teardown ' + evidence.teardown_outcome;
+      }
+      if (result.status !== 'succeeded') return row.comment ?? 'result status is ' + String(result.status);
+      if ((row.collectorOnly || evidence?.downstream_status === 'unavailable') &&
+          (!isRecord(evidence?.reconciliation) || evidence.reconciliation.exact_match !== true)) {
+        return 'QAP unavailable; exact Delta reconciliation not established';
+      }
+      if (run.status.state !== 'succeeded') return row.comment ?? 'run state is ' + run.status.state;
+    }
+    const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
+    if (verdict.ingestPass !== true) return 'official campaign ingest evidence did not pass: ' + verdict.reasons.join('; ');
+  }
+  if (row.collectorOnly && !row.officialRuns?.length) return 'QAP unavailable; exact Delta reconciliation not established';
+  return undefined;
 }
 
 
@@ -598,13 +881,41 @@ export function publicationBacklogIssue(value: unknown, start: number, end: numb
   return undefined;
 }
 
-const guardCapMetrics = ['container_memory_bytes', 'collector_rss_bytes', 'collector_buffered_bytes'];
+export function guardContainerMemoryMetric(config: RecordValue): 'container_memory_bytes' | 'container_working_set_bytes' | undefined {
+  if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return undefined;
+  const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const selection = requested.container_memory_metric === undefined ? 'usage' : requested.container_memory_metric;
+  if (selection === 'usage') return 'container_memory_bytes';
+  if (selection === 'working_set') return 'container_working_set_bytes';
+  return undefined;
+}
 
-function overloadStopIssue(evidence: RecordValue): string | undefined {
+export function guardContainerMemoryMatches(config: RecordValue, guard: RecordValue): boolean {
+  const metric = guardContainerMemoryMetric(config);
+  if (!metric) return false;
+  const selection = metric === 'container_memory_bytes' ? 'usage' : 'working_set';
+  if (guard.settings !== undefined && (!isRecord(guard.settings) ||
+      (guard.settings.container_memory_metric === undefined ? 'usage' : guard.settings.container_memory_metric) !== selection)) return false;
+  if (guard.settings === undefined && selection !== 'usage') return false;
+  if (guard.container_memory_metric !== undefined && guard.container_memory_metric !== selection) return false;
+  if (guard.last_caps !== undefined && (!Array.isArray(guard.last_caps) || guard.last_caps.some(cap =>
+      isRecord(cap) && (cap.metric === 'container_memory_bytes' || cap.metric === 'container_working_set_bytes') && cap.metric !== metric))) return false;
+  return true;
+}
+
+const guardCapMetrics = ['container_memory_bytes', 'container_working_set_bytes', 'collector_rss_bytes',
+  'collector_cgroup_memory_bytes', 'collector_buffered_bytes'];
+
+function overloadStopIssue(evidence: RecordValue, config: RecordValue): string | undefined {
   const stop = evidence.overload_stop;
   if (stop === undefined || stop === null) return undefined;
   if (!isRecord(stop) || nonNegativeInteger(stop.timestamp_ms) === undefined ||
       nonNegativeInteger(stop.window_index) === undefined) return 'overload_stop evidence is invalid';
+  const selectedMetric = guardContainerMemoryMetric(config);
+  if (!selectedMetric || ((stop.metric === 'container_memory_bytes' || stop.metric === 'container_working_set_bytes') &&
+      stop.metric !== selectedMetric) || (isRecord(evidence.overload_guard) && !guardContainerMemoryMatches(config, evidence.overload_guard))) {
+    return 'overload_stop evidence is invalid';
+  }
   const hardCap = stop.reason === 'hard_cap_fraction' && guardCapMetrics.includes(String(stop.metric)) &&
     nonNegativeInteger(stop.observed_value) !== undefined && nonNegativeInteger(stop.cap) !== undefined &&
     Number(stop.cap) > 0 && typeof stop.fraction === 'number' && Number.isFinite(stop.fraction) &&
@@ -615,40 +926,72 @@ function overloadStopIssue(evidence: RecordValue): string | undefined {
   return `above_ceiling: overload_stop ${String(stop.reason)} (${String(stop.metric)})`;
 }
 
+function guardTiming(config: RecordValue): { readTimeoutMs: number; maxSamplingGapMs: number } | undefined {
+  if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return undefined;
+  const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const readTimeoutMs = requested.read_timeout_ms === undefined ? 3000 : requested.read_timeout_ms;
+  const maxSamplingGapMs = requested.max_sampling_gap_ms === undefined ? 5000 : requested.max_sampling_gap_ms;
+  if (nonNegativeInteger(readTimeoutMs) === undefined || nonNegativeInteger(maxSamplingGapMs) === undefined) return undefined;
+  const timeout = Number(readTimeoutMs);
+  const gap = Number(maxSamplingGapMs);
+  if (timeout < 1 || timeout > 3000 || gap < 1 || gap > 5000 || timeout >= gap) return undefined;
+  return { readTimeoutMs: timeout, maxSamplingGapMs: gap };
+}
+
 function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: unknown, start: number, end: number): string | undefined {
   const invalid = 'overload_guard protection unavailable or invalid';
   if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return invalid;
   const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const timing = guardTiming(config);
+  if (!timing) return invalid;
+  const gap = timing.maxSamplingGapMs;
   const enabled = requested.enabled === undefined ? true : requested.enabled;
   const fraction = requested.cap_fraction === undefined ? 0.9 : requested.cap_fraction;
   const zeroWindows = requested.zero_progress_windows === undefined ? 2 : requested.zero_progress_windows;
+  const memorySignal = requested.memory_signal === undefined ? 'process_rss' : requested.memory_signal;
+  if (memorySignal !== 'process_rss' && memorySignal !== 'cgroup_memory') return invalid;
+  const selectedMetric = guardContainerMemoryMetric(config);
+  if (!selectedMetric) return invalid;
+  const metrics = [selectedMetric, memorySignal === 'cgroup_memory' ?
+    'collector_cgroup_memory_bytes' : 'collector_rss_bytes', 'collector_buffered_bytes'];
   const warmup = nonNegativeInteger(config.warmup_seconds);
   if (enabled !== true || typeof fraction !== 'number' || !Number.isFinite(fraction) || fraction <= 0 || fraction > 0.9 ||
       nonNegativeInteger(zeroWindows) === undefined || Number(zeroWindows) < 1 || Number(zeroWindows) > 2 ||
       warmup === undefined || start < warmup * 1000) return invalid;
   const guard = evidence.overload_guard;
-  if (!isRecord(guard)) return invalid;
+  if (!isRecord(guard) || !isRecord(guard.settings) || !guardContainerMemoryMatches(config, guard)) return invalid;
+  const { read_timeout_ms: readTimeoutMs = 3000, max_sampling_gap_ms: maxSamplingGapMs = 5000 } = guard.settings;
   const caps = guard.last_caps;
   const platform = isRecord(config.platform) ? config.platform : undefined;
   const local = platform && isRecord(platform.local) ? platform.local : undefined;
   const requestedCap = local?.collector_memory_limit_bytes;
+  const tunables = isRecord(config.tunables) ? config.tunables : undefined;
+  const collector = tunables && isRecord(tunables.collector) ? tunables.collector : undefined;
+  const pressure = collector && isRecord(collector.pressure) ? collector.pressure : undefined;
+  const requestedRssCap = pressure?.rss_limit_bytes;
+  if (memorySignal === 'cgroup_memory' &&
+      (nonNegativeInteger(requestedRssCap) === undefined || Number(requestedRssCap) === 0)) return invalid;
   if (requestedCap !== undefined && requestedCap !== null &&
       (nonNegativeInteger(requestedCap) === undefined || Number(requestedCap) < 8388608 || Number(requestedCap) > 1099511627776)) return invalid;
   if (guard.requested_container_memory_limit_bytes !== (requestedCap ?? null)) return invalid;
   const expectedStart = start - warmup * 1000;
   if (guard.status !== 'complete' || guard.run_id !== runId ||
       guard.run_start_ms !== expectedStart || guard.measurement_end_ms !== end ||
-      !isRecord(guard.settings) || guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
+      guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
       guard.settings.zero_progress_windows !== zeroWindows ||
+      (guard.settings.memory_signal ?? 'process_rss') !== memorySignal ||
+      readTimeoutMs !== timing.readTimeoutMs || maxSamplingGapMs !== gap ||
       nonNegativeInteger(guard.coverage_start_ms) === undefined || Number(guard.coverage_start_ms) > expectedStart ||
       nonNegativeInteger(guard.coverage_end_ms) === undefined || Number(guard.coverage_end_ms) < end ||
-      nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > 5000 ||
-      nonNegativeInteger(guard.sample_count) === undefined || Number(guard.sample_count) < Math.ceil((end - expectedStart) / 5000) + 1 ||
+      nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > gap ||
+      nonNegativeInteger(guard.sample_count) === undefined || Number(guard.sample_count) < Math.ceil((end - expectedStart) / gap) + 1 ||
       typeof guard.peak_cap_fraction !== 'number' || !Number.isFinite(guard.peak_cap_fraction) ||
       guard.peak_cap_fraction < 0 || guard.peak_cap_fraction >= fraction ||
-      !Array.isArray(caps) || caps.length !== guardCapMetrics.length ||
-      requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === 'container_memory_bytes' && cap.cap === requestedCap) ||
-      !guardCapMetrics.every(metric =>
+      !Array.isArray(caps) || caps.length !== metrics.length ||
+      requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === selectedMetric && cap.cap === requestedCap) ||
+      memorySignal === 'cgroup_memory' && !caps.some(cap => isRecord(cap) && cap.metric === 'collector_cgroup_memory_bytes' &&
+        cap.cap === requestedRssCap && typeof cap.observed_value === 'number' && cap.observed_value > 0) ||
+      !metrics.every(metric =>
         caps.filter(cap => isRecord(cap) && cap.metric === metric && cap.confirmed === true &&
           nonNegativeInteger(cap.observed_value) !== undefined && nonNegativeInteger(cap.cap) !== undefined &&
           Number(cap.cap) > 0 && Number(cap.observed_value) / Number(cap.cap) < fraction).length === 1) ||
@@ -670,7 +1013,7 @@ function officialOverloadStop(run: OfficialRun): string | undefined {
     let evidence: unknown;
     try { evidence = JSON.parse(row.evidence_json); } catch { continue; }
     if (isRecord(evidence)) {
-      const reason = overloadStopIssue(evidence);
+      const reason = overloadStopIssue(evidence, run.config);
       if (reason) return reason;
     }
   }
@@ -680,6 +1023,7 @@ function officialOverloadStop(run: OfficialRun): string | undefined {
 function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
   const stop = officialOverloadStop(run);
   if (stop) return { reason: stop };
+  if (!officialImageIds(run)) return { reason: 'official collector image evidence is missing' };
   const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
   if (verdict.ingestPass !== true || verdict.rows.length !== 1) return { reason: 'official campaign ingest evidence did not pass: ' + verdict.reasons.join('; ') };
   const row = verdict.rows[0]!;
@@ -729,7 +1073,8 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
       return { reason: 'official commit buckets must be positive, complete, contiguous 30-second windows' };
     }
     bucketRowsTotal += bucketRows;
-    windows.push({ rate: bucketRate });
+    const resolution = rawBucket.rate_resolution_rows_per_second;
+    windows.push({ rate: bucketRate, resolution: typeof resolution === 'number' && Number.isFinite(resolution) && resolution > 0 ? resolution : null });
   }
   if (bucketRowsTotal > outputRows || (durationMs % 30_000 === 0 && bucketRowsTotal !== outputRows)) {
     return { reason: 'complete commit buckets do not reconcile to the exact-window run output total' };
@@ -769,9 +1114,11 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
 }
 
 function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
+  const failure = cellFailure(row);
+  if (failure) return { qualified: false, rates: [], reason: failure };
+  if (row.outcome === 'kustainer-null') return { qualified: false, rates: [], reason: 'downstream unavailable; outcome is not succeeded' };
   const overloadStop = row.officialRuns?.map(officialOverloadStop).find(reason => reason !== undefined);
   if (overloadStop) return { qualified: false, rates: [], reason: overloadStop };
-  if (row.diedFirst) return { qualified: false, rates: [], reason: row.collectorOnly ? 'collector-only downstream failure' : 'a component died during the run' };
   if (!row.expectedRepeats || !row.factorConfigPaths || !row.officialRuns || row.officialRuns.length !== 1) {
     return { qualified: false, rates: [], reason: 'each repeat must contain exactly one official sustained run' };
   }
@@ -783,10 +1130,93 @@ function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
     return { qualified: false, rates, reason: 'official window range exceeds 5% of the mean' };
   }
   if (inspected.reason) return { qualified: false, rates, reason: inspected.reason };
-  return { qualified: true, rates, reason: 'protocol evidence complete' };
+  if (inspected.windows.some(window => window.resolution === null)) {
+    return { qualified: false, rates, reason: 'provisional: commit-rate resolution unavailable' };
+  }
+  const ranked = rankedObservation(row.officialRuns[0]!);
+  if (!ranked) return { qualified: false, rates, reason: 'provisional: reconciled ranked rate or resolution unavailable' };
+  if (row.evidenceState !== 'physically-observed' && row.evidenceState !== 'measured') {
+    return { qualified: false, rates, reason: 'provisional: physical factor evidence unavailable' };
+  }
+  if (!row.baselineBefore || !row.baselineAfter || !row.pairOrder) {
+    return { qualified: false, rates, reason: 'provisional: adjacent baseline evidence or pair order unavailable' };
+  }
+  const baselineRuns = [row.baselineBefore, row.baselineAfter];
+  const baselines = baselineRuns.map(run => {
+    const baselineEvidence = evidenceForRow(run.rows[0] ?? {});
+    const durable = isRecord(baselineEvidence?.durable_commits) ? baselineEvidence.durable_commits : undefined;
+    const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+    const baselineRate = typeof output?.rows_per_second === 'number' ? output.rows_per_second : null;
+    const failure = cellFailure({ ...row, committedRowsPerSecond: baselineRate, officialRuns: [run], diedFirst: null, collectorOnly: false });
+    return failure ? { reason: failure } : inspectOfficialRun(run);
+  });
+  if (baselines.some(baseline => !baseline.windows || baseline.reason)) {
+    return { qualified: false, rates, reason: 'invalid adjacent baseline: ' + (baselines.find(baseline => !baseline.windows || baseline.reason)?.reason ?? 'missing windows') };
+  }
+  const [before, after] = baselines.map(baseline => baseline.windows!);
+  if (before!.some(window => window.resolution === null) || after!.some(window => window.resolution === null)) {
+    return { qualified: false, rates, reason: 'provisional: baseline commit-rate resolution unavailable' };
+  }
+  const baselineRanked = baselineRuns.map(rankedObservation);
+  if (baselineRanked.some(observation => !observation)) {
+    return { qualified: false, rates, reason: 'provisional: reconciled baseline rate or resolution unavailable' };
+  }
+  const baselineRates = baselineRanked.map(observation => observation!.rate);
+  const baselineMean = average(baselineRates);
+  if ([before!, after!].some(windows => {
+    const values = windows.map(window => window.rate);
+    return (Math.max(...values) - Math.min(...values)) / average(values) > 0.05;
+  })) return { qualified: false, rates, reason: 'invalid A/A: baseline window range exceeds 5%' };
+  if (Math.abs(baselineRates[1]! - baselineRates[0]!) > baselineRates[0]! * 0.05 + Number.EPSILON * baselineMean * 4) {
+    return { qualified: false, rates, reason: 'invalid A/A: adjacent baselines differ by more than 5%' };
+  }
+  const baselineResolution = Math.max(...baselineRanked.map(observation => observation!.resolution));
+  if (Math.max(
+    baselineRanked[0]!.resolution / baselineRates[0]!,
+    baselineRanked[1]!.resolution / baselineRates[1]!,
+  ) > 0.01) {
+    return { qualified: false, rates, reason: 'invalid A/A: commit-rate resolution exceeds 1%' };
+  }
+  const resolution = Math.max(ranked.resolution, baselineResolution);
+  if (Math.abs(ranked.rate - baselineMean) < resolution) {
+    return { qualified: false, rates, reason: 'unresolved: difference is smaller than commit-rate resolution' };
+  }
+  const output = (run: OfficialRun): RecordValue | undefined => {
+    const evidence = evidenceForRow(run.rows[0] ?? {});
+    return isRecord(evidence?.durable_commits) && isRecord(evidence.durable_commits.output_throughput)
+      ? evidence.durable_commits.output_throughput : undefined;
+  };
+  const beforeOutput = output(row.baselineBefore);
+  const afterOutput = output(row.baselineAfter);
+  const candidateOutput = output(row.officialRuns[0]!);
+  if (!beforeOutput || !afterOutput || !candidateOutput ||
+      typeof beforeOutput.measurement_end_unix_ms !== 'number' ||
+      typeof candidateOutput.measurement_start_unix_ms !== 'number' ||
+      typeof candidateOutput.measurement_end_unix_ms !== 'number' ||
+      typeof afterOutput.measurement_start_unix_ms !== 'number' ||
+      beforeOutput.measurement_end_unix_ms > candidateOutput.measurement_start_unix_ms ||
+      candidateOutput.measurement_end_unix_ms > afterOutput.measurement_start_unix_ms ||
+      new Set([row.baselineBefore.status.id, row.officialRuns[0]!.status.id, row.baselineAfter.status.id]).size !== 3) {
+    return { qualified: false, rates, reason: 'invalid adjacent baseline ordering' };
+  }
+  if (Math.abs(ranked.rate - baselineRates[row.pairOrder === 'AB' ? 0 : 1]!) < resolution) {
+    return { qualified: false, rates, reason: 'unresolved: paired difference is smaller than commit-rate resolution' };
+  }
+  const candidateBytes = ranked.bytesPerRow;
+  const baselineBytes = baselineRanked[row.pairOrder === 'AB' ? 0 : 1]!.bytesPerRow;
+  if (typeof candidateBytes !== 'number' || !Number.isFinite(candidateBytes) || candidateBytes <= 0 ||
+      typeof baselineBytes !== 'number' || !Number.isFinite(baselineBytes) || baselineBytes <= 0) {
+    return { qualified: false, rates, reason: 'provisional: paired bytes per row unavailable' };
+  }
+  return {
+    qualified: true, rates: [ranked.rate], ratio: ranked.rate / baselineMean,
+    pairRatio: ranked.rate / baselineRates[row.pairOrder === 'AB' ? 0 : 1]!,
+    candidateBytes, baselineBytes, pairedBaselineRate: baselineRates[row.pairOrder === 'AB' ? 0 : 1]!,
+    reason: 'normalized to adjacent baseline mean; resolution ' + numberLabel(resolution) + ' rows/s',
+  };
 }
 
-function summarizeCandidates(rows: CampaignMeasurement[]): Summary[] {
+function summarizeCandidates(rows: CampaignMeasurement[], cells: Map<string, Cell>): Summary[] {
   const groups = new Map<string, CampaignMeasurement[]>();
   for (const row of rows) {
     const group = groups.get(row.candidate) ?? [];
@@ -800,21 +1230,144 @@ function summarizeCandidates(rows: CampaignMeasurement[]): Summary[] {
     const repeatIds = new Set(group.map(row => row.repeat));
     const completeSet = expectedRepeats !== null && repeatIds.size === expectedRepeats &&
       Array.from({ length: expectedRepeats }, (_, index) => repeatIds.has(index + 1)).every(Boolean);
-    const qualified = expectedRepeats !== null && expectedRepeats >= 3 && completeSet && completed.length === expectedRepeats;
+    const coverage = cells.get(JSON.stringify([group[0]!.valueX, group[0]!.valueY]))!.coverage;
+    const ordered = [...group].sort((a, b) => a.repeat - b.repeat);
+    const pairOrderValid = ordered.map(row => row.pairOrder).join(',') === 'AB,BA,AB';
+    const pairSpans = ordered.map(row => {
+      const candidate = row.officialRuns?.[0];
+      const baseline = row.pairOrder === 'AB' ? row.baselineBefore : row.baselineAfter;
+      const interval = (run: OfficialRun | undefined): [number, number] | undefined => {
+        const evidence = run && evidenceForRow(run.rows[0] ?? {});
+        const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+        const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+        return typeof output?.measurement_start_unix_ms === 'number' && typeof output.measurement_end_unix_ms === 'number'
+          ? [output.measurement_start_unix_ms, output.measurement_end_unix_ms] : undefined;
+      };
+      const a = interval(baseline);
+      const b = interval(candidate);
+      return a && b ? [Math.min(a[0], b[0]), Math.max(a[1], b[1])] : undefined;
+    });
+    const sequenceValid = pairSpans.length === 3 && pairSpans.every((span, index) =>
+      span !== undefined && (index === 0 || pairSpans[index - 1]![1]! <= span[0]!));
+    const runIds = group.flatMap(row => row.officialRuns?.map(run => run.status.id) ?? []);
+    const pairedBaselineIds = group.flatMap(row =>
+      (row.pairOrder === 'AB' ? row.baselineBefore : row.baselineAfter)?.status.id ?? []);
+    const paired = completed.map(item => item.evidence);
+    const logs = paired.map(item => Math.log(item.pairRatio!));
+    const logMean = logs.length ? average(logs) : 0;
+    const logSd = logs.length === 3 ? Math.sqrt(logs.reduce((sum, value) => sum + (value - logMean) ** 2, 0) / 2) : 0;
+    const pairedT = logSd === 0 ? (logMean > 0 ? Infinity : 0) : logMean / (logSd / Math.sqrt(3));
+    const bytesRatio = paired.length === 3 ? average(paired.map(item => item.candidateBytes!)) /
+      average(paired.map(item => item.baselineBytes!)) : Infinity;
+    const logCandidates = paired.map(item => Math.log(average(item.rates)));
+    const logBaselines = paired.map(item => Math.log(item.pairedBaselineRate!));
+    const variance = (values: number[]) => values.reduce((sum, value) => sum + (value - average(values)) ** 2, 0) / (values.length - 1);
+    const welchDenominator = paired.length === 3 ? Math.sqrt((variance(logCandidates) + variance(logBaselines)) / 3) : NaN;
+    const welch = welchDenominator === 0 ? (logMean > 0 ? Infinity : 0) :
+      (average(logCandidates) - average(logBaselines)) / welchDenominator;
+    const stats = paired.length === 3 ? 'paired effect ' + numberLabel(Math.exp(logMean)) + ', t ' + numberLabel(pairedT) +
+      ', bytes/row B/A ' + numberLabel(bytesRatio) + ', Welch t (reference) ' + numberLabel(welch) : '';
+    const winner = paired.length === 3 && pairOrderValid && sequenceValid && new Set(runIds).size === 3 && new Set(pairedBaselineIds).size === 3 &&
+      Math.exp(logMean) >= 1.05 && pairedT >= 4.303 &&
+      bytesRatio <= 1.10;
+    const qualified = coverage.status === 'active' && expectedRepeats === 3 && completeSet && completed.length === 3 && winner;
     const officialRepeatRates = completed.map(item => average(item.evidence.rates));
-    const observedRates = group.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
+    const observedRates = coverage.status !== 'active' || cells.get(JSON.stringify([group[0]!.valueX, group[0]!.valueY]))!.failures.length ? [] :
+      group.flatMap(row => row.committedRowsPerSecond === null || cellFailure(row) ? [] : [row.committedRowsPerSecond]);
     const rates = qualified ? officialRepeatRates : observedRates;
     const deaths = group.map(row => row.diedFirst).filter((value): value is string => value !== null && value !== undefined);
-    const status = qualified ? 'qualified' : deaths.some(value => value.toLowerCase() !== 'kustainer') ? 'failed' :
+    const status = qualified ? 'qualified' : group.some(row => cellFailure(row)) ? 'failed' :
+      deaths.some(value => value.toLowerCase() !== 'kustainer') ? 'failed' :
       deaths.length || group.some(row => row.collectorOnly) ? 'collector-only' : 'unqualified';
     return {
       candidate, rates, mean: rates.length ? average(rates) : 0,
+      normalizedMean: qualified ? average(paired.map(item => item.ratio!)) : null,
       min: rates.length ? Math.min(...rates) : 0,
       max: rates.length ? Math.max(...rates) : 0,
       completedRepeats: completed.length, expectedRepeats, status,
-      reason: qualified ? 'protocol evidence complete' : assessments.find(item => !item.evidence.qualified)?.evidence.reason ?? 'protocol evidence incomplete',
+      reason: qualified ? stats : [
+        ...(coverage.status === 'active' ? [] : [coverage.reason]),
+        assessments.find(item => !item.evidence.qualified)?.evidence.reason ??
+          (pairOrderValid && sequenceValid ? 'paired winner thresholds not met' : 'AB/BA/AB pair order missing or out of sequence'),
+        ...(stats ? [stats] : []),
+      ].join('; '),
     };
   });
+}
+
+function normalizedRatio(row: CampaignMeasurement): number | undefined {
+  if (cellFailure(row) || !row.officialRuns?.[0] || !row.baselineBefore || !row.baselineAfter) return undefined;
+  for (const baseline of [row.baselineBefore, row.baselineAfter]) {
+    const evidence = evidenceForRow(baseline.rows[0] ?? {});
+    const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+    const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+    const rate = typeof output?.rows_per_second === 'number' ? output.rows_per_second : null;
+    if (cellFailure({ ...row, committedRowsPerSecond: rate, officialRuns: [baseline], diedFirst: null, collectorOnly: false })) return undefined;
+  }
+  const runs = [row.officialRuns[0], row.baselineBefore, row.baselineAfter].map(inspectOfficialRun);
+  if (runs.some(run => !run.windows)) return undefined;
+  const observations = [row.officialRuns[0], row.baselineBefore, row.baselineAfter].map(rankedObservation);
+  if (observations.some(observation => !observation)) return undefined;
+  return observations[0]!.rate / average([observations[1]!.rate, observations[2]!.rate]);
+}
+
+function lowCommitWindowLabels(evidence: RecordValue | undefined): string[] {
+  const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+  const windows = Array.isArray(durable?.complete_30_second_commit_windows) ? durable.complete_30_second_commit_windows : [];
+  return windows.flatMap((window, index) => {
+    const count = isRecord(window) ? nonNegativeInteger(window.window_commit_count) : undefined;
+    return count !== undefined && count < 100 ? [String(index + 1) + ' (' + count + ')'] : [];
+  });
+}
+
+function measurementDetails(row: CampaignMeasurement): string {
+  const failure = cellFailure(row);
+  if (failure) return row.candidate + ' #' + row.repeat + ': null — ' + failure;
+  const result = row.officialRuns?.[0]?.rows[0];
+  const evidence = result && evidenceForRow(result);
+  const durable = isRecord(evidence?.durable_commits) ? evidence.durable_commits : undefined;
+  const output = isRecord(durable?.output_throughput) ? durable.output_throughput : undefined;
+  const lowCommitWindows = lowCommitWindowLabels(evidence);
+  const baselineWarnings = ([['before', row.baselineBefore], ['after', row.baselineAfter]] as const).flatMap(([name, run]) => {
+    const labels = lowCommitWindowLabels(run ? evidenceForRow(run.rows[0] ?? {}) : undefined);
+    return labels.length ? ['; baseline ' + name + ' low-commit windows (<100): ' + labels.join(', ')] : [];
+  }).join('');
+  const ranked = row.officialRuns?.[0] ? rankedObservation(row.officialRuns[0]) : undefined;
+  const rate = typeof output?.rows_per_second === 'number' && Number.isFinite(output.rows_per_second) && output.rows_per_second > 0 ? output.rows_per_second : null;
+  const collector = result && typeof result.cpu_millicores === 'number' && Number.isFinite(result.cpu_millicores) && result.cpu_millicores >= 0 && rate
+    ? result.cpu_millicores / 1000 / rate * 1_000_000 : null;
+  const reports = evidence?.client_phase_reports;
+  const clientCores = Array.isArray(reports) && reports.length ? reports.map(report => {
+    const phase = isRecord(report) && isRecord(report.phase_counters) ? report.phase_counters : undefined;
+    const window = isRecord(phase?.measurement_window) ? phase.measurement_window : undefined;
+    const resources = isRecord(window?.client_resources) ? window.client_resources : undefined;
+    return typeof resources?.cpu_core_equivalents === 'number' && Number.isFinite(resources.cpu_core_equivalents) &&
+      resources.cpu_core_equivalents >= 0 ? resources.cpu_core_equivalents : null;
+  }) : [];
+  const client = rate && clientCores.length && clientCores.every(value => value !== null)
+    ? (clientCores as number[]).reduce((sum, value) => sum + value, 0) / rate * 1_000_000 : null;
+  let concurrency: number | null = null;
+  let quotaError = false;
+  if (typeof result?.tunables_json === 'string') {
+    try {
+      const tunables: unknown = JSON.parse(result.tunables_json);
+      const quota = isRecord(tunables) && isRecord(tunables.cpu_quota) ? tunables.cpu_quota : undefined;
+      const quotaClient = isRecord(quota?.client) ? quota.client : undefined;
+      if (typeof quotaClient?.concurrency_per_cpu_core === 'number' && Number.isFinite(quotaClient.concurrency_per_cpu_core) &&
+          quotaClient.concurrency_per_cpu_core >= 0) concurrency = quotaClient.concurrency_per_cpu_core;
+    } catch { quotaError = true; }
+  }
+  const label = (value: number | null | undefined) => value == null ? 'null' : numberLabel(value);
+  return row.candidate + ' #' + row.repeat + ': normalized ' + label(normalizedRatio(row)) +
+    ', resolution ' + label(ranked?.resolution) + ' rows/s, commits ' + label(ranked?.commitCount) +
+    ', max commit rows ' + label(ranked?.maxCommitRows) + ', slope ' + label(ranked?.slope) +
+    ' rows/s, concurrency/core ' + label(concurrency) +
+    (quotaError ? ' (invalid tunables JSON)' : '') +
+    '; CPU s/M rows (estimated): collector ' + label(collector) +
+    ', DFE null, client ' + label(client) +
+    (lowCommitWindows.length ? '; low-commit windows (<100): ' + lowCommitWindows.join(', ') : '') +
+    baselineWarnings +
+    (row.comment ? '; ' + row.comment : '');
 }
 
 export function sortCampaignLeaderboard<T extends { candidate: string; mean: number }>(items: T[]): T[] {
@@ -833,18 +1386,34 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   assertCompatibleBaselines(rows, cohort);
   const xValues = [...new Set(rows.map(row => row.valueX))].sort();
   const yValues = [...new Set(rows.map(row => row.valueY))].sort();
+  const factorPairs = new Set(rows.flatMap(row => {
+    if (!row.factorConfigPaths) return [];
+    const paths = row.factorConfigPaths.map(canonicalFactorPath);
+    return paths.every(path => path !== undefined) ? [JSON.stringify(paths)] : [];
+  }));
   const cells = new Map<string, Cell>();
   for (const row of rows) {
     const key = JSON.stringify([row.valueX, row.valueY]);
-    const cell = cells.get(key) ?? { x: row.valueX, y: row.valueY, rates: [] };
-    if (row.committedRowsPerSecond !== null) cell.rates.push(row.committedRowsPerSecond);
+    const coverage = combineCoverage([
+      factorCoverage(row),
+      ...(factorPairs.size > 1 ?
+        [{ status: 'unknown' as const, reason: 'varied factor coverage unknown: inconsistent factor paths in cohort' }] : []),
+    ]);
+    const cell = cells.get(key) ?? { x: row.valueX, y: row.valueY, rates: [], coverage, failures: [], notes: [] };
+    cell.coverage = combineCoverage([cell.coverage, coverage]);
+    cell.notes.push(measurementDetails(row));
+    const failure = cellFailure(row);
+    if (failure) cell.failures.push(failure);
+    else if (row.committedRowsPerSecond !== null) cell.rates.push(row.committedRowsPerSecond);
     cells.set(key, cell);
   }
-  const rates = rows.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
+  const rates = [...cells.values()].flatMap(cell =>
+    cell.coverage.status !== 'active' || cell.failures.length ? [] : cell.rates);
   const minimum = rates.length ? Math.min(...rates) : 0;
   const maximum = rates.length ? Math.max(...rates) : 0;
-  const summaries = summarizeCandidates(rows);
-  const leaderboard = sortCampaignLeaderboard(summaries.filter(item => item.status === 'qualified'));
+  const summaries = summarizeCandidates(rows, cells);
+  const leaderboard = summaries.filter(item => item.status === 'qualified').sort((a, b) =>
+    b.normalizedMean! - a.normalizedMean! || (a.candidate < b.candidate ? -1 : a.candidate > b.candidate ? 1 : 0));
   const exploratory = summaries.filter(item => item.status !== 'qualified');
   const maxMean = Math.max(1, ...leaderboard.map(item => item.mean));
   const deaths = rows.filter(row => row.diedFirst);
@@ -856,11 +1425,12 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   const leaderboardX = 610;
   const noteY = Math.max(heatY + yValues.length * cellHeight + 70, 145 + leaderboard.length * 38);
   const exploratoryY = noteY + 45 + Math.min(deaths.length, 8) * 23;
-  const height = Math.max(540, 145 + leaderboard.length * 38, exploratoryY + 45 + exploratory.length * 24);
+  const detailsY = exploratoryY + 55 + exploratory.length * 24;
+  const height = Math.max(540, 145 + leaderboard.length * 38, detailsY + 25 + rows.length * 20);
   const parts: string[] = [
     '<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '">',
     '<title id="title">' + escapeXml(cohort + ' throughput heatmap and sustainable leaderboard') + '</title>',
-    '<desc id="desc">Committed new rows per second; repeat ranges are ranked only with complete official campaign evidence. Unqualified rates remain exploratory and null rates are not plotted as zero.</desc>',
+    '<desc id="desc">Committed new rows per second; repeat ranges are ranked only with complete official campaign evidence. Projection-only factors render null until independent applicability proof is available. Null rates are not plotted as zero.</desc>',
     '<rect width="100%" height="100%" fill="#ffffff"/>',
     '<g fill="#1f2328" font-family="Segoe UI, Arial, sans-serif">',
     svgText(40, 42, cohort + ' | committed new rows/s', 22, 'bold'),
@@ -875,23 +1445,24 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     xValues.forEach((x, columnIndex) => {
       const cell = cells.get(JSON.stringify([x, value]));
       const xPosition = heatX + 120 + columnIndex * cellWidth;
-      if (!cell || !cell.rates.length) {
-        parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="#f6f8fa" stroke="#d0d7de"/>');
+      if (!cell || !cell.rates.length || cell.coverage.status !== 'active' || cell.failures.length) {
+        const note = cell ? [...cell.failures, cell.coverage.reason, ...cell.notes].join('; ') : 'no observation';
+        parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="#f6f8fa" stroke="#d0d7de"><title>' + escapeXml(note) + '</title></rect>');
         parts.push(svgText(xPosition + 8, y + 22, 'null', 11));
       } else {
         const mean = average(cell.rates);
-        parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="' + cellColor(mean, minimum, maximum) + '" stroke="#8c959f"/>');
+        parts.push('<rect x="' + xPosition + '" y="' + y + '" width="' + (cellWidth - 4) + '" height="34" rx="4" fill="' + cellColor(mean, minimum, maximum) + '" stroke="#8c959f"><title>' + escapeXml(cell.notes.join('; ')) + '</title></rect>');
         parts.push(svgText(xPosition + 8, y + 22, numberLabel(mean), 11, 'bold'));
       }
     });
   });
-  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | observed repeat means; null = unavailable', 11));
+  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | null includes projection-only: consumption unproven; applicability unknown', 11));
   const barStart = leaderboardX + 190;
   const barWidth = 300;
   if (!leaderboard.length) parts.push(svgText(leaderboardX, 112, 'No qualified winner: complete official evidence is missing or invalid.', 12, 'bold'));
   leaderboard.forEach((item, index) => {
     const y = 112 + index * 38;
-    parts.push(svgText(leaderboardX, y + 13, item.candidate + ' (' + item.completedRepeats + '/' + item.expectedRepeats + ')', 12));
+    parts.push('<g><title>' + escapeXml(item.reason) + '</title>' + svgText(leaderboardX, y + 13, item.candidate + ' (' + item.completedRepeats + '/' + item.expectedRepeats + ')', 12) + '</g>');
     const meanWidth = item.mean / maxMean * barWidth;
     const minX = barStart + item.min / maxMean * barWidth;
     const maxX = barStart + item.max / maxMean * barWidth;
@@ -899,12 +1470,14 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     parts.push('<line x1="' + minX + '" y1="' + (y + 9) + '" x2="' + maxX + '" y2="' + (y + 9) + '" stroke="#1f2328" stroke-width="2"/>');
     parts.push('<line x1="' + minX + '" y1="' + (y + 4) + '" x2="' + minX + '" y2="' + (y + 14) + '" stroke="#1f2328"/>');
     parts.push('<line x1="' + maxX + '" y1="' + (y + 4) + '" x2="' + maxX + '" y2="' + (y + 14) + '" stroke="#1f2328"/>');
-    parts.push(svgText(barStart + barWidth + 12, y + 13, numberLabel(item.mean) + ' (' + numberLabel(item.min) + '–' + numberLabel(item.max) + ')', 11));
+    parts.push(svgText(barStart + barWidth + 12, y + 13, numberLabel(item.mean) + ' (' + numberLabel(item.min) + '–' + numberLabel(item.max) + '), ' + numberLabel(item.normalizedMean!) + '×', 11));
   });
   parts.push(svgText(40, noteY, 'What died first', 16, 'bold'));
   if (!deaths.length) parts.push(svgText(40, noteY + 25, 'No failure recorded in these rows.', 12));
   deaths.slice(0, 8).forEach((row, index) => {
-    const rate = row.committedRowsPerSecond === null ? 'committed rows/s: null' : 'committed rows/s: ' + numberLabel(row.committedRowsPerSecond);
+    const coverage = cells.get(JSON.stringify([row.valueX, row.valueY]))!.coverage;
+    const rate = row.committedRowsPerSecond === null || coverage.status !== 'active' || cellFailure(row) ?
+      'committed rows/s: null' : 'committed rows/s: ' + numberLabel(row.committedRowsPerSecond);
     const status = row.collectorOnly ? 'collector-only; downstream metrics: null; ' : '';
     const comment = row.comment ? ' — ' + row.comment : '';
     parts.push(svgText(40, noteY + 25 + index * 23, row.candidate + ' repeat ' + row.repeat + ': ' + row.diedFirst + ' (' + status + rate + ')' + comment, 11));
@@ -917,6 +1490,8 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     parts.push(svgText(40, exploratoryY + 25 + index * 24,
       item.candidate + ': ' + item.status + ', ' + item.completedRepeats + '/' + expected + ' protocol-complete repeats; ' + observed + ' (' + item.reason + ')', 11));
   });
+  parts.push(svgText(40, detailsY, 'Per-repeat evidence', 16, 'bold'));
+  rows.forEach((row, index) => parts.push(svgText(40, detailsY + 22 + index * 20, measurementDetails(row), 11)));
   parts.push('</g></svg>');
   return parts.join('\n');
 }

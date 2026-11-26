@@ -1,7 +1,9 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
+pub(crate) mod streaming_sink;
 pub use crate::delta_io::spawn_shared_io;
 use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executor};
+use crate::layout::{DetachKernel, PublicationSorter, SortExecution};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
@@ -35,11 +37,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
+pub use streaming_sink::StreamingUploadError;
 use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 type FileCommitObservations = Vec<(usize, CompletedFileObservation)>;
-type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations)>;
+type PublishedFiles = (u64, Option<Duration>, FileCommitObservations);
+type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations, PublicationEvidence)>;
+use crate::{PublicationEvidence, PublicationOutcome, PublicationReason, TxnLookupMode};
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
     read_process_writer_properties(Some(schema))
@@ -56,6 +61,11 @@ pub const PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES: &[(&str, &str, &str)] = &
         "ARROWCOL_LAYOUT_SORT_COLUMNS",
         "ARROWCOL_COLLECTOR_SORT_COLUMNS",
         "arrowcol.layout.sortColumns",
+    ),
+    (
+        "ARROWCOL_LAYOUT_SORT_OPTIONS",
+        "ARROWCOL_COLLECTOR_SORT_OPTIONS",
+        "arrowcol.layout.sortOptions",
     ),
     (
         "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
@@ -149,8 +159,12 @@ fn layout_startup_config(process: &BTreeMap<String, String>) -> Result<serde_jso
         .contains_key("arrowcol.layout.enabled")
         .then(|| properties.boolean("arrowcol.layout.enabled"))
         .transpose()?;
+    let mode = collector_sort_execution()?;
+    mode.validate(enabled != Some(false), !policy.sort_columns.is_empty())?;
+    let mut config = policy.config_json(enabled);
+    config["sort_execution"] = serde_json::json!(mode);
     Ok(serde_json::json!({
-        "process_policy": policy.config_json(enabled),
+        "process_policy": config,
         "table_properties_override": true,
     }))
 }
@@ -190,6 +204,27 @@ fn resolve_adaptive_file_config(
     crate::sizing::AdaptiveFileSizeConfig::from_properties(&props)
 }
 
+fn collector_sort_execution() -> Result<SortExecution> {
+    match std::env::var("ARROWCOL_COLLECTOR_LAYOUT_SORT_EXECUTION") {
+        Ok(raw) => raw.parse(),
+        Err(std::env::VarError::NotPresent) => Ok(SortExecution::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn collector_publication_layout(
+    schema: &SchemaRef,
+    properties: &arrowcol_props::ResolvedProps,
+    mode: SortExecution,
+) -> Result<Option<crate::layout::LayoutPolicy>> {
+    let layout = publication_layout(schema, properties)?;
+    mode.validate(
+        layout.is_some(),
+        layout.as_ref().is_some_and(|policy| !policy.sort_columns.is_empty()),
+    )?;
+    Ok(layout)
+}
+
 fn publication_layout(
     schema: &SchemaRef,
     properties: &arrowcol_props::ResolvedProps,
@@ -205,6 +240,26 @@ fn publication_layout(
 pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
     let properties = arrowcol_props::resolve(&BTreeMap::new(), &process_writer_properties(schema)?)?;
     publication_layout(schema, &properties)
+}
+
+/// Process-level ingestion properties for a diagnostic file containing one unsorted input batch.
+/// No table is opened and no sort order is asserted for data that did not pass the layout sorter.
+///
+/// # Errors
+/// Returns invalid layout, Parquet configuration or physical schema errors.
+pub fn diagnostic_writer_properties(schema: &SchemaRef) -> Result<WriterProperties> {
+    let base = configured_publication_layout(schema)?
+        .map(|mut layout| {
+            layout.sort_columns.clear();
+            layout.sort_options = None;
+            layout.writer_properties(schema)
+        })
+        .transpose()?;
+    let properties = crate::writer::process_config()?.writer_properties(schema, base, &[])?;
+    let physical = parquet::arrow::ArrowSchemaConverter::new()
+        .with_coerce_types(properties.coerce_types())
+        .convert(schema)?;
+    crate::footer::stamp(&physical, properties)
 }
 
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
@@ -355,6 +410,9 @@ fn physical_writer_schema(schema: &SchemaRef, partition_values: &BTreeMap<String
     ))
 }
 
+pub(crate) const DEFAULT_COMMIT_ATTEMPTS: u32 = 8;
+pub(crate) const DEFAULT_COMMIT_BUDGET: Duration = Duration::from_secs(10);
+
 pub(crate) fn collision_backoff(attempt: u32) {
     let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 17;
     std::thread::sleep(Duration::from_millis((5_u64 << attempt.min(6)) + jitter));
@@ -458,6 +516,269 @@ mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    #[test]
+    fn grouped_preflight_resolves_a_group_with_one_lookup_and_keeps_fences() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )?;
+        let entries = |old: i64| {
+            vec![
+                (batch.clone(), "old".to_owned(), old, 0),
+                (batch.clone(), "new".to_owned(), 1, 0),
+            ]
+        };
+        for (mode, lookups) in [
+            (crate::PreflightLookupMode::PerEntry, 0),
+            (crate::PreflightLookupMode::Grouped, 1),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let mut table = DeltaTable::open(dir.path())?;
+            Arc::get_mut(&mut table)
+                .context("new table is shared")?
+                .preflight_lookup_mode = mode;
+            table.new_file(Arc::clone(&schema))?;
+            table.commit_files_with_transaction_evidence(&[], "old", 711)?;
+            let executor = shared_executor()?;
+            let _guard = executor.enter();
+            crate::publication_lookup::LOOKUPS.set(0);
+            let plan = table.plan_coalesced_publications(entries(711), 8, 1)?;
+            assert_eq!(crate::publication_lookup::LOOKUPS.get(), lookups, "{mode:?}");
+            assert_eq!(plan.committed_identities, vec![("old".to_owned(), 711, 0)]);
+            assert_eq!(plan.identities, vec![("new".to_owned(), 1, 0)]);
+            let fenced = table
+                .plan_coalesced_publications(entries(710), 8, 1)
+                .err()
+                .context("expected fence")?;
+            assert!(
+                format!("{fenced:#}").contains("fenced by newer application version"),
+                "{mode:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_publication_one_lookup_preserves_exact_versions_and_partial_group_fence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let table = DeltaTable::open(dir.path())?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        table.new_file(schema)?;
+        let (one, first) = table.commit_files_with_transaction_evidence(&[], "old", 711)?;
+        assert!(first.clean);
+        let group = |items: &[(&str, i64)]| CoalescedCommitGroup {
+            start: 0,
+            end: 0,
+            identities: items.iter().map(|&(id, v)| (id.to_owned(), v, 0)).collect(),
+        };
+        crate::publication_lookup::LOOKUPS.set(0);
+        let (two, _, _, mixed) =
+            table.commit_files_with_groups_timed(&[], &[group(&[("old", 711)]), group(&[("new", 913)])])?;
+        assert_eq!(crate::publication_lookup::LOOKUPS.get(), 1);
+        assert!(!mixed.clean);
+        assert_eq!(
+            mixed.outcomes[&("old".into(), 711)],
+            PublicationOutcome::AlreadyCommitted(one)
+        );
+        assert_eq!(
+            mixed.outcomes[&("new".into(), 913)],
+            PublicationOutcome::CommittedNow(two)
+        );
+        assert_eq!(two, one + 1);
+        let err = table
+            .commit_files_with_groups_timed(&[], &[group(&[("new", 913), ("absent", 10)])])
+            .err()
+            .context("expected publication rejection")?;
+        assert!(err.downcast_ref::<PartialPublicationGroup>().is_some());
+        let partial = err
+            .downcast_ref::<PublicationEvidence>()
+            .context("missing partial evidence")?;
+        assert!(!partial.clean && partial.reasons.contains(&PublicationReason::PartialGroup));
+        let err = table
+            .commit_files_with_transaction_evidence(&[], "old", 710)
+            .err()
+            .context("expected publication rejection")?;
+        let fenced = err
+            .downcast_ref::<PublicationEvidence>()
+            .context("missing fence evidence")?;
+        assert!(!fenced.clean && fenced.reasons.contains(&PublicationReason::Fenced));
+        let (_, replay) = table.commit_files_with_transaction_evidence(&[], "old", 711)?;
+        assert_eq!(
+            replay.outcomes[&("old".into(), 711)],
+            PublicationOutcome::Unknown(PublicationReason::NoCommitProvenance)
+        );
+        assert_eq!(table.version()?, two);
+        Ok(())
+    }
+
+    #[test]
+    fn fitting_sort_chunk_preserves_ownership_and_exact_budget_behavior() -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray, UInt32Array};
+
+        fn original(
+            batch: &RecordBatch,
+            start: usize,
+            rows: usize,
+            bytes: usize,
+            kernel: DetachKernel,
+        ) -> Result<Option<RecordBatch>> {
+            let mut low = 0;
+            let mut high = rows.min(batch.num_rows().saturating_sub(start));
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if owned_for_sort(batch.slice(start, mid), 2, kernel)?.get_array_memory_size() <= bytes {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            if low == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(owned_for_sort(batch.slice(start, low), 2, kernel)?))
+            }
+        }
+
+        let ids = Arc::new(UInt32Array::from_iter_values(0..2048)) as ArrayRef;
+        let strings = Arc::new(StringArray::from_iter(
+            (0..2048).map(|i| (i % 7 != 0).then(|| format!("{i:04}-{}", "x".repeat(128)))),
+        )) as ArrayRef;
+        let compact = RecordBatch::try_from_iter(vec![("id", Arc::clone(&ids))])?.slice(0, 1024);
+        let retained = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 8, DetachKernel::Take)?
+            .context("retain slice")?;
+        let detached = fitting_sort_chunk(&compact, 0, compact.num_rows(), usize::MAX, 1, DetachKernel::Take)?
+            .context("detach slice")?;
+        assert_eq!(retained, detached);
+        assert_eq!(
+            retained.column(0).to_data().buffers()[0].as_ptr(),
+            compact.column(0).to_data().buffers()[0].as_ptr()
+        );
+        assert_ne!(
+            retained.column(0).to_data().buffers()[0].as_ptr(),
+            detached.column(0).to_data().buffers()[0].as_ptr()
+        );
+        let batch = RecordBatch::try_from_iter(vec![("id", ids), ("text", strings)])?.slice(1000, 128);
+        let (logical, bound) = flat_take_prefix_bound(&batch).context("flat bound")?;
+        assert!(batch.get_array_memory_size() > logical * 2);
+        let full = fitting_sort_chunk(&batch, 0, 128, bound, 2, DetachKernel::Take)?.context("full chunk")?;
+        assert_eq!(full, batch);
+        assert!(full.get_array_memory_size() < batch.get_array_memory_size());
+        assert_ne!(
+            full.column(0).to_data().buffers()[0].as_ptr(),
+            batch.column(0).to_data().buffers()[0].as_ptr()
+        );
+        for rows in 1..=128 {
+            let (_, upper) = flat_take_prefix_bound(&batch.slice(0, rows)).context("prefix bound")?;
+            assert!(owned_for_sort(batch.slice(0, rows), 2, DetachKernel::Take)?.get_array_memory_size() <= upper);
+        }
+        let one_row = owned_for_sort(batch.slice(0, 1), 2, DetachKernel::Take)?.get_array_memory_size();
+        let almost_full = owned_for_sort(batch.slice(0, 127), 2, DetachKernel::Take)?.get_array_memory_size();
+        for budget in [
+            0,
+            one_row - 1,
+            one_row,
+            almost_full - 1,
+            almost_full,
+            bound - 1,
+            bound,
+            batch.get_array_memory_size() - 1,
+            usize::MAX,
+        ] {
+            for rows in [1, 63, 128] {
+                for kernel in [DetachKernel::Take, DetachKernel::BulkFlat] {
+                    let actual = fitting_sort_chunk(&batch, 0, rows, budget, 2, kernel)?;
+                    let expected = original(&batch, 0, rows, budget, DetachKernel::Take)?;
+                    assert_eq!(actual, expected);
+                    if let Some(actual) = actual {
+                        assert!(actual.get_array_memory_size() <= budget);
+                    }
+                }
+            }
+        }
+
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::UInt32, false)),
+            Arc::clone(batch.column(0)),
+        )]);
+        let nested = RecordBatch::try_from_iter(vec![("nested", Arc::new(nested) as ArrayRef)])?;
+        assert!(flat_take_prefix_bound(&nested).is_none());
+        for budget in [0, 512, usize::MAX] {
+            assert_eq!(
+                fitting_sort_chunk(&nested, 0, 128, budget, 2, DetachKernel::BulkFlat)?,
+                original(&nested, 0, 128, budget, DetachKernel::Take)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_flat_detaches_sliced_nullable_buffers_with_identical_parquet_bytes() -> Result<()> {
+        use arrow::array::{ArrayRef, BooleanArray, Int64Array, LargeBinaryArray, StringArray};
+        use parquet::arrow::ArrowWriter;
+
+        fn parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
+            let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), None)?;
+            writer.write(batch)?;
+            Ok(writer.into_inner()?)
+        }
+
+        let rows = 0..2048;
+        let prefix = RecordBatch::try_from_iter([
+            (
+                "label",
+                Arc::new(StringArray::from_iter_values(rows.clone().map(|i| format!("v{i}")))) as ArrayRef,
+            ),
+            (
+                "key_bytes",
+                Arc::new(LargeBinaryArray::from_iter_values(rows.clone().map(|_| &b"k"[..]))) as ArrayRef,
+            ),
+            (
+                "key",
+                Arc::new(StringArray::from_iter(
+                    rows.clone().map(|i| (i % 5 != 0).then(|| i.to_string())),
+                )) as ArrayRef,
+            ),
+            (
+                "n",
+                Arc::new(Int64Array::from_iter(rows.clone().map(|i| (i % 7 != 0).then_some(i)))) as ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(BooleanArray::from_iter(
+                    rows.clone().map(|i| (i % 3 != 0).then_some(i % 2 == 0)),
+                )) as ArrayRef,
+            ),
+            (
+                "bytes",
+                Arc::new(LargeBinaryArray::from_iter(
+                    rows.map(|i| (i % 4 != 0).then_some(&b"abc"[..])),
+                )) as ArrayRef,
+            ),
+        ])?
+        .slice(39, 251);
+        let bulk = owned_for_sort(prefix.clone(), 1, DetachKernel::BulkFlat)?;
+        let taken = owned_for_sort(prefix.clone(), 1, DetachKernel::Take)?;
+        assert_eq!(bulk, prefix);
+        assert_eq!(parquet(&bulk)?, parquet(&taken)?);
+        for rows in 1..=prefix.num_rows() {
+            let slice = prefix.slice(0, rows);
+            let taken = owned_for_sort(slice.clone(), 1, DetachKernel::Take)?;
+            let bulk = owned_for_sort(slice, 1, DetachKernel::BulkFlat)?;
+            assert_eq!(
+                taken.get_array_memory_size(),
+                bulk.get_array_memory_size(),
+                "prefix of {rows} rows"
+            );
+        }
+        for (source, result) in prefix.columns().iter().zip(bulk.columns()) {
+            for (a, b) in source.to_data().buffers().iter().zip(result.to_data().buffers()) {
+                assert_ne!(a.data_ptr(), b.data_ptr());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn delta_target_root_redacts_credentials_query_and_fragment() {
@@ -572,13 +893,8 @@ mod io_tests {
         }
     }
 
-    /// Scenario: a registered publisher stages through an injected cloud-shaped data store.
-    /// Guarantees: authority checks work off the caller runtime without synchronous I/O-worker re-entry.
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_backed_cloud_stage_uses_async_authority_checks() -> Result<()> {
-        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
-        use crate::publisher::{MetadataSnapshot, PublisherSession, SessionMode};
-        use futures::TryStreamExt;
+    async fn ready_stage_session() -> Result<(Arc<StageControl>, Arc<PublisherSession>)> {
+        use crate::publisher::{MetadataSnapshot, SessionMode};
         const SANDBOX: &str = "0123456789ab";
         const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
         let control = Arc::new(StageControl(std::sync::Mutex::new(MetadataSnapshot {
@@ -603,6 +919,118 @@ mod io_tests {
             Some(GENERATION),
         )
         .await?;
+        Ok((control, session))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_publication_commits_without_a_local_file_and_fences_replay() -> Result<()> {
+        const CHILD: &str = "ARROWCOL_TEST_STREAMING_STAGE";
+        if std::env::var_os(CHILD).is_none() {
+            for (mode, workers) in [("column_waves", "1"), ("column_pipeline", "4")] {
+                let run = std::process::Command::new(std::env::current_exe()?)
+                    .args([
+                        "--exact",
+                        "delta::io_tests::streaming_publication_commits_without_a_local_file_and_fences_replay",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("ARROWCOL_COLLECTOR_UPLOAD_STAGING_MODE", "streaming")
+                    .env("ARROWCOL_COLLECTOR_UPLOAD_MODE", "buffered_multipart")
+                    .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", workers)
+                    .env("ARROWCOL_COLLECTOR_PARQUET_ENCODE_MODE", mode)
+                    .env("ARROWCOL_PARQUET_CONFIG", r#"{"max_row_group_rows":1}"#)
+                    .output()?;
+                anyhow::ensure!(
+                    run.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&run.stdout),
+                    String::from_utf8_lossy(&run.stderr)
+                );
+            }
+            return Ok(());
+        }
+        let (control, session) = ready_stage_session().await?;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            vec![],
+            None,
+            Some(Arc::clone(&session)),
+            Some(Arc::<object_store::memory::InMemory>::clone(&store)),
+        )?;
+        let input = input_batch()?;
+        for (index, identity) in ["stream-a", "stream-a", "stream-b"].iter().enumerate() {
+            let mut writer = table
+                .new_file(input.schema())?
+                .with_transaction(identity.to_string(), 1)?;
+            writer.write(&input).await?;
+            let staged = writer.stage().await?;
+            assert!(!staged.file.path.try_exists()?);
+            let relative = staged
+                .file
+                .path
+                .strip_prefix(&table.root)?
+                .to_str()
+                .context("fixture path")?;
+            let bytes = store.get(&table.object_path(relative)?).await?.bytes().await?;
+            assert_eq!(bytes.len() as u64, staged.file.bytes);
+            let mut read = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+            assert_eq!(read.next().context("missing Parquet rows")??, input);
+            if index == 2 {
+                control
+                    .0
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .metadata
+                    .insert("resetstate".into(), "fenced-v1".into());
+                assert!(table.commit_files(&[staged]).is_err());
+            } else {
+                assert_eq!(table.commit_files(&[staged])?, 1);
+            }
+        }
+        assert_eq!(table.version()?, 1);
+        assert_eq!(table.lookup_txn("stream-a")?, Some(1));
+        assert_eq!(table.lookup_txn("stream-b")?, None);
+        session.close_after_drain_async().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_upload_aborts_instead_of_publishing_a_truncated_writer() -> Result<()> {
+        let store = Arc::new(PausedStagePut {
+            fail_part_at: Some(usize::MAX),
+            ..Default::default()
+        });
+        let path = object_store::path::Path::from("incomplete.parquet");
+        let (sender, expected) = tokio::sync::oneshot::channel::<u64>();
+        drop(sender);
+        let error = upload_multipart(
+            Arc::<PausedStagePut>::clone(&store),
+            path.clone(),
+            &b"no-footer"[..],
+            async { expected.await.context("Parquet stream ended without a finished footer") },
+            3,
+            2,
+        )
+        .await
+        .err()
+        .context("truncated input published")?;
+        assert!(error.to_string().contains("without a finished footer"));
+        assert_eq!(store.abort_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            store.inner.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    /// Scenario: a registered publisher stages through an injected cloud-shaped data store.
+    /// Guarantees: authority checks work off the caller runtime without synchronous I/O-worker re-entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_backed_cloud_stage_uses_async_authority_checks() -> Result<()> {
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        use futures::TryStreamExt;
+        let (_, session) = ready_stage_session().await?;
         let directory = tempfile::tempdir()?;
         let table = DeltaTable::open(directory.path())?;
         let input = input_batch()?;
@@ -625,6 +1053,9 @@ mod io_tests {
 
     // These fixtures deliberately exhaust the process-wide upload slots.
     static CLOUD_STAGE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Hang guard only: a timed-out barrier waiter still counts as arrived, so a short bound would
+    // fail slow but healthy staging instead of catching a starved upload pool.
+    const NESTED_PUT_HANG_GUARD: Duration = Duration::from_secs(120);
 
     #[derive(Debug)]
     struct NestedStagePut {
@@ -684,6 +1115,8 @@ mod io_tests {
         inner: object_store::memory::InMemory,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        // None keeps the 2 s default that fails puts which are never released.
+        release_guard: Option<Duration>,
         nested: Option<Arc<NestedStagePut>>,
         multipart_calls: std::sync::atomic::AtomicUsize,
         fail_multipart: bool,
@@ -710,7 +1143,7 @@ mod io_tests {
             if let Some(nested) = &self.nested {
                 use std::sync::atomic::Ordering;
                 nested.entered.fetch_add(1, Ordering::SeqCst);
-                tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::time::timeout(NESTED_PUT_HANG_GUARD, async {
                     nested.barrier.wait().await;
                     nested.submitted.fetch_add(1, Ordering::SeqCst);
                     let completed = Arc::clone(nested);
@@ -730,7 +1163,8 @@ mod io_tests {
                 })?;
             } else {
                 self.entered.notify_one();
-                tokio::time::timeout(Duration::from_secs(2), self.release.notified())
+                let guard = self.release_guard.unwrap_or(Duration::from_secs(2));
+                tokio::time::timeout(guard, self.release.notified())
                     .await
                     .map_err(|error| object_store::Error::Generic {
                         store: "paused stage put",
@@ -970,6 +1404,32 @@ mod io_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn sibling_failure_stops_admission_but_drains_the_inflight_file() -> Result<()> {
+        use std::cell::Cell;
+        use tokio::sync::oneshot;
+        let (finish_first, first) = oneshot::channel::<Result<()>>();
+        let (fail_second, second) = oneshot::channel();
+        let (_finish_third, third) = oneshot::channel();
+        let started = Cell::new(0);
+        let mut stage = Box::pin(stage_bounded([first, second, third].into_iter(), 2, |wait| {
+            started.set(started.get() + 1);
+            async move { wait.await? }
+        }));
+        assert!(futures::poll!(stage.as_mut()).is_pending());
+        assert_eq!(started.get(), 2);
+        assert!(fail_second.send(Err(anyhow::anyhow!("file failed"))).is_ok());
+        assert!(futures::poll!(stage.as_mut()).is_pending());
+        assert_eq!(started.get(), 2);
+        assert!(finish_first.send(Ok(())).is_ok());
+        assert_eq!(
+            stage.await.err().context("missing file error")?.to_string(),
+            "file failed"
+        );
+        assert_eq!(started.get(), 2);
+        Ok(())
+    }
+
     /// Scenario: staging awaits a real, paused object-store put from a current-thread runtime.
     /// Guarantees: another caller task progresses and releases the put before its independent deadline.
     #[tokio::test(flavor = "current_thread")]
@@ -1005,6 +1465,8 @@ mod io_tests {
     /// Guarantees: every stage succeeds without exhausting the shared pool, and all nested jobs finish.
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_stage_uploads_allow_nested_blocking_io() -> Result<()> {
+        // Outlasts the per-put guard so a stuck barrier is reported per stage, not as an outer timeout.
+        const STAGE_HANG_GUARD: Duration = Duration::from_secs(180);
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let uploads = runtime_config()?.upload_limit;
@@ -1032,11 +1494,11 @@ mod io_tests {
             writers.push(writer);
         }
         let outcomes = tokio::time::timeout(
-            Duration::from_secs(10),
+            STAGE_HANG_GUARD,
             futures::future::join_all(writers.into_iter().map(DeltaFileWriter::stage)),
         )
         .await;
-        let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+        let cleanup = tokio::time::timeout(NESTED_PUT_HANG_GUARD, async {
             while nested.finished.load(Ordering::SeqCst) != nested.submitted.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -1060,6 +1522,9 @@ mod io_tests {
     /// Guarantees: payload admission and staging ownership survive until the put finishes.
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_stage_retains_upload_admission_until_put_finishes() -> Result<()> {
+        // The put stays paused until released, so the in-flight checks (DeltaTable::open fsyncs
+        // ancestor directories) always observe it in flight; the bounds are hang guards only.
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         use futures::TryStreamExt;
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         let executor = shared_executor()?;
@@ -1071,12 +1536,15 @@ mod io_tests {
         let mut writer = table.new_file(input.schema())?;
         writer.write(&input).await?;
         drop(table);
-        let store = Arc::new(PausedStagePut::default());
+        let store = Arc::new(PausedStagePut {
+            release_guard: Some(HANG_GUARD),
+            ..Default::default()
+        });
         let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
         table.url = Url::parse("abfss://fixture@example.invalid/table/")?;
         table.store = Arc::<PausedStagePut>::clone(&store);
         let mut stage = Box::pin(writer.stage());
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG_GUARD, async {
             tokio::select! {
                 () = store.entered.notified() => Ok(()),
                 result = stage.as_mut() => {
@@ -1090,7 +1558,7 @@ mod io_tests {
         let available_during_put = executor.available_upload_slots();
         let ownership_retained = DeltaTable::open(directory.path()).is_err();
         store.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(HANG_GUARD, async {
             loop {
                 if executor.available_upload_slots() == upload_limit
                     && store.inner.list(None).try_collect::<Vec<_>>().await?.len() == 1
@@ -1130,7 +1598,9 @@ mod io_tests {
         let input = input_batch()?;
         let mut writer = table.new_file(input.schema())?;
         writer.write(&input).await?;
-        let staged = tokio::time::timeout(Duration::from_secs(5), writer.stage()).await;
+        // Hang guard only: the upload slots stay held until after the stage, so a stage that
+        // needed admission would never finish; local fsync may still take seconds.
+        let staged = tokio::time::timeout(Duration::from_secs(120), writer.stage()).await;
         let available_during_local_stage = executor.available_upload_slots();
         drop(slots);
         let staged = staged.context("local stage waited for cloud upload admission")??;
@@ -1139,6 +1609,96 @@ mod io_tests {
         assert_eq!(executor.available_upload_slots(), upload_limit);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn batched_local_directory_sync_precedes_commit_and_deduplicates() -> Result<()> {
+        use crate::sync_hook;
+        use arrow::array::{Int32Array, StringArray};
+        let base = tempfile::tempdir()?;
+        let base_path = fs::canonicalize(base.path())?;
+        let root = base_path.join("table");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("p1", DataType::Utf8, false),
+            Field::new("p2", DataType::Utf8, false),
+        ]));
+        let columns = || vec!["p1".to_owned(), "p2".to_owned()];
+        let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
+        let mut table = DeltaTable::open_url(url.clone(), Arc::clone(&schema), columns())?;
+        Arc::get_mut(&mut table)
+            .context("table is unexpectedly shared")?
+            .local_directory_sync_policy = crate::LocalDirectorySyncPolicy::BeforeCommit;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec!["b"])),
+            ],
+        )?;
+        let values = BTreeMap::from([
+            ("p1".to_owned(), Some("a".to_owned())),
+            ("p2".to_owned(), Some("b".to_owned())),
+        ]);
+        let mut staged = Vec::new();
+        for _ in 0..2 {
+            let mut file = table.new_file_partitioned(Arc::clone(&schema), values.clone())?;
+            file.write(&batch).await?;
+            staged.push(file.stage().await?);
+        }
+        let intermediate = root.join("p1=a");
+        let leaf = intermediate.join("p2=b");
+        assert!(!sync_hook::synced_under(&base_path).contains(&leaf));
+        let publisher = DeltaTable::open_url(url, Arc::clone(&schema), columns())?;
+        sync_hook::reset(&base_path);
+        let committed = publisher.commit_files(&staged)?;
+        let events = sync_hook::synced_under(&base_path);
+        let log = root.join("_delta_log").join(format!("{committed:020}.json"));
+        let commit_index = events
+            .iter()
+            .position(|path| path == &log)
+            .context("Delta commit file was not synced")?;
+        let before_commit = &events[..commit_index];
+        let positions = [&leaf, &intermediate, &root].map(|directory| {
+            let found = before_commit
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| (path == directory).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected one pre-commit sync for {}",
+                directory.display()
+            );
+            found[0]
+        });
+        assert!(positions[0] < positions[1] && positions[1] < positions[2]);
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .any(|(index, path)| index > commit_index && path == &root),
+            "the existing post-commit root sync must remain"
+        );
+
+        let mut failed_file = table.new_file_partitioned(Arc::clone(&schema), values)?;
+        failed_file.write(&batch).await?;
+        let failed_file = failed_file.stage().await?;
+        sync_hook::reset(&base_path);
+        sync_hook::fail_on(&leaf);
+        assert!(publisher.commit_files(&[failed_file]).is_err());
+        assert_eq!(publisher.version()?, committed);
+        assert!(
+            !root
+                .join("_delta_log")
+                .join(format!("{:020}.json", committed + 1))
+                .exists()
+        );
+        sync_hook::reset(&base_path);
+        Ok(())
+    }
+
     /// Scenario: a new nested two-column Hive table publishes locally, with injected fsync faults.
     /// Guarantees: root ancestry, leaf/intermediate partitions and the checkpoint hint are fsynced
     /// before success; any fsync failure propagates and publishes nothing.
@@ -1233,6 +1793,73 @@ mod io_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn publication_execution_preserves_physical_rows_counts_and_sort_claims() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        for (mode, values, ordered) in [
+            (SortExecution::Concatenate, [2, 4, 1, 3], true),
+            (SortExecution::VerifyOrder, [1, 2, 3, 4], true),
+            (SortExecution::StreamUnordered, [2, 4, 1, 3], false),
+        ] {
+            let policy = crate::layout::LayoutPolicy {
+                sort_columns: if ordered { vec!["id".into()] } else { vec![] },
+                bloom_columns: vec![],
+                max_rows: 4,
+                row_group_rows: 2,
+                ..Default::default()
+            };
+            let open = || {
+                table.new_file_with_publication_policy(
+                    Arc::clone(&schema),
+                    "test".into(),
+                    0,
+                    0,
+                    Some(policy.clone()),
+                    mode,
+                    false,
+                    "day",
+                )
+            };
+            let mut writer = open()?;
+            let mut bytes = 0;
+            for chunk in values.chunks(2) {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(arrow::array::Int32Array::from(chunk.to_vec()))],
+                )?;
+                writer.write(&batch).await?;
+                bytes += record_batch_logical_bytes(&batch)?;
+            }
+            let staged = writer.stage().await?;
+            assert_eq!((staged.file.rows, staged.file.input_bytes), (4, bytes));
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged.file.path)?)?;
+            for group in reader.metadata().row_groups() {
+                assert_eq!(group.sorting_columns().is_some(), ordered);
+            }
+            let rows = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+            let output = arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
+            let expected = if ordered { vec![1, 2, 3, 4] } else { values.to_vec() };
+            assert_eq!(output.column(0).as_ref(), &arrow::array::Int32Array::from(expected));
+            let mut rejected = open()?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]))],
+            )?;
+            rejected.write(&batch).await?;
+            let next = if mode == SortExecution::VerifyOrder {
+                batch.slice(0, 1)
+            } else {
+                batch
+            };
+            assert!(rejected.write(&next).await.is_err());
+            assert!(rejected.stage().await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn publication_refreshes_delta_writer_properties() -> Result<()> {
         struct Fixture(PathBuf);
         impl Drop for Fixture {
@@ -1320,7 +1947,46 @@ mod io_tests {
         let staged = writer.stage().await?;
         let reader =
             parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged.file.path)?)?;
+        let codec_readback = table
+            .layout_readback
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .as_ref()
+            .context("missing table writer readback")?
+            .clone();
+        let expected_codec = codec_readback["parquet_columns"]["id"]["compression"]
+            .as_str()
+            .context("missing codec readback")?;
+        assert_eq!(codec_readback["config"]["enabled"], true);
+        assert_eq!(codec_readback["config"]["sort_columns"], serde_json::json!(["id"]));
+        assert_eq!(codec_readback["config"]["bloom_columns"], serde_json::json!(["id"]));
+        assert_eq!(codec_readback["config"]["max_rows"], 3);
+        assert_eq!(codec_readback["config"]["row_group_rows"], 2);
+        assert_eq!(codec_readback["config"]["page_rows"], 1);
+        for group in reader.metadata().row_groups() {
+            let actual = match group.column(0).compression() {
+                parquet::basic::Compression::UNCOMPRESSED => "uncompressed",
+                parquet::basic::Compression::SNAPPY => "snappy",
+                parquet::basic::Compression::GZIP(_) => "gzip",
+                parquet::basic::Compression::BROTLI(_) => "brotli",
+                parquet::basic::Compression::LZ4 => "lz4",
+                parquet::basic::Compression::LZ4_RAW => "lz4_raw",
+                parquet::basic::Compression::ZSTD(_) => "zstd",
+                parquet::basic::Compression::LZO => "lzo",
+            };
+            assert_eq!(actual, expected_codec);
+        }
         assert_eq!(reader.metadata().num_row_groups(), 2);
+        let row_group_limit = codec_readback["config"]["row_group_rows"]
+            .as_i64()
+            .context("missing row-group limit")?;
+        assert!(
+            reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .all(|group| group.num_rows() <= row_group_limit)
+        );
         assert!(
             reader
                 .metadata()
@@ -1364,6 +2030,15 @@ mod io_tests {
             Some("1970-01-01-01-00")
         );
         assert!(writer.sorter.is_none());
+        let disabled_readback = table
+            .layout_readback
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .as_ref()
+            .context("missing disabled layout readback")?
+            .clone();
+        assert_eq!(disabled_readback["config"]["enabled"], false);
+        assert!(disabled_readback["config"]["sort_columns"].is_null());
         assert_eq!(writer.adaptive_file_config(&defaults)?.target_parquet_bytes, 64);
         drop(writer);
         properties.insert("arrowcol.layout.rowGroupRows".into(), "0".into());
@@ -1566,11 +2241,443 @@ mod io_tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesced_generated_ingestion_preserves_rows_and_rejects_mismatches() -> Result<()> {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+
+        // Runtime configuration and OTel instruments are process-wide. Use a fresh
+        // process per arm so the real writer and its counters see the selected mode.
+        if std::env::var_os("G7_BINDING_TEST_CHILD").is_none() {
+            for mode in ["revalidate_rows", "proven_constant"] {
+                for fast_path in ["false", "true"] {
+                    let output = std::process::Command::new(std::env::current_exe()?)
+                        .args([
+                            "--exact",
+                            "delta::io_tests::coalesced_generated_ingestion_preserves_rows_and_rejects_mismatches",
+                        ])
+                        .env("G7_BINDING_TEST_CHILD", "1")
+                        .env("ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING", mode)
+                        .env("ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH", fast_path)
+                        .output()?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    anyhow::ensure!(
+                        output.status.success() && stdout.contains("1 passed;"),
+                        "{mode}/{fast_path}: {stdout} {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        let directory = tempfile::tempdir()?;
+        let url = Url::from_directory_path(fs::canonicalize(directory.path())?)
+            .map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let catalog = DeltaTable::open_catalog(url.clone())?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let partitions = vec![INGESTION_PARTITION.to_owned()];
+        let props = BTreeMap::from([("arrowcol.partition.granularity".into(), "day".into())]);
+        catalog.commit_catalog(None, Arc::clone(&schema), partitions.clone(), props, None)?;
+        let table = DeltaTable::open_url(url, Arc::clone(&schema), partitions)?;
+        let (staged, identities, committed, _, _) = table
+            .stage_coalesced_publications(
+                vec![
+                    (input_batch()?, "first".into(), 0, 3_600_000),
+                    (
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(arrow::array::Int32Array::from(vec![43])),
+                                Arc::new(arrow::array::StringArray::from(vec!["1970-01-01"])),
+                            ],
+                        )?,
+                        "second".into(),
+                        0,
+                        3_600_000,
+                    ),
+                ],
+                2,
+                2,
+                1,
+            )
+            .await?;
+        assert_eq!(identities.len(), 2);
+        assert!(committed.is_empty());
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].file.rows, 2);
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged[0].file.path)?)?;
+        let decoded = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(decoded.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        let ids = decoded[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .context("ids")?;
+        assert_eq!(ids.values(), &[42, 43]);
+        provider.force_flush()?;
+        let mut paths = BTreeMap::new();
+        for resource in exporter.get_finished_metrics()? {
+            for metric in resource.scope_metrics().flat_map(|scope| scope.metrics()) {
+                if metric.name() == "delta.partition.binding.batches"
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    for point in sum.data_points() {
+                        let attribute = point
+                            .attributes()
+                            .find(|kv| kv.key.as_str() == "path")
+                            .context("binding path")?;
+                        paths.insert(attribute.value.as_str().into_owned(), point.value());
+                    }
+                }
+            }
+        }
+        if std::env::var("ARROWCOL_COLLECTOR_GENERATED_PARTITION_BINDING")? == "proven_constant" {
+            assert_eq!(
+                paths,
+                BTreeMap::from([("proven_constant".into(), 1), ("fallback_revalidate_rows".into(), 1)])
+            );
+        } else {
+            assert!(paths.is_empty());
+        }
+        table.commit_files(&staged)?;
+        let log = fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;
+        assert!(log.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|entry| entry["add"]["partitionValues"][INGESTION_PARTITION] == "1970-01-01")
+        }));
+        let supplied = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["1970-01-01", "1970-01-02"])),
+            ],
+        )?;
+        // Binding the correct first-row value through the public API is not proof.
+        let mut direct = table.new_file_partitioned(
+            supplied.schema(),
+            BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some("1970-01-01".to_owned()))]),
+        )?;
+        let error = direct
+            .write(&supplied)
+            .await
+            .err()
+            .context("accepted a mixed partition")?;
+        assert!(error.to_string().contains("differs from bound write context"));
+        drop(direct);
+        let error = match table
+            .stage_coalesced_publications(vec![(supplied, "third".into(), 0, 3_600_000)], 2, 2, 1)
+            .await
+        {
+            Ok(_) => bail!("mismatched ingestion partition was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match its admission stamp"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_stage_snapshot_fences_metadata_changes_but_not_data_commits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(dir.path())?;
+        Arc::get_mut(&mut table).context("shared table")?.stage_snapshot_mode = crate::StageSnapshotMode::PerGroup;
+        let batch = input_batch()?;
+        let stage = |id: &str| {
+            let entries = (0..2).map(|i| (batch.clone(), format!("{id}-{i}"), 0, 0)).collect();
+            table.stage_coalesced_publications(entries, 2, 2, 2)
+        };
+        let (files, ids, _, _, _) = stage("first").await?;
+        table.commit_files_with_transaction(&[], "peer", 0)?;
+        let group = |identities| {
+            [CoalescedCommitGroup {
+                start: 0,
+                end: 2,
+                identities,
+            }]
+        };
+        let (version, _, _, _) = table.commit_files_with_groups_timed(&files, &group(ids))?;
+        let (files, ids, _, _, _) = stage("second").await?;
+        let catalog = DeltaTable::open_catalog(table.url.clone())?;
+        let update = catalog.commit_catalog(
+            Some(version),
+            batch.schema(),
+            vec![],
+            BTreeMap::from([("arrowcol.writer.targetFileSize".into(), "123456".into())]),
+            None,
+        )?;
+        let Err(error) = table.commit_files_with_groups_timed(&files, &group(ids)) else {
+            bail!("stale staged definition was published");
+        };
+        assert!(format!("{error:#}").contains("metadata or protocol changed"));
+        assert_eq!(table.version()?, update.version);
+        Ok(())
+    }
+
     fn input_batch() -> Result<RecordBatch> {
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
         )?)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn column_worker_files_are_byte_identical() -> Result<()> {
+        const OUTPUT: &str = "ARROWCOL_TEST_COLUMN_OUTPUT";
+        let Some(output) = std::env::var_os(OUTPUT) else {
+            let directory = tempfile::tempdir()?;
+            for workers in [1, 2, 4, 8, 16] {
+                let arm = directory.path().join(workers.to_string());
+                fs::create_dir(&arm)?;
+                let run = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "delta::io_tests::column_worker_files_are_byte_identical"])
+                    .env(OUTPUT, &arm)
+                    .env("ARROWCOL_COLLECTOR_PARQUET_COLUMN_WORKERS", workers.to_string())
+                    .env(crate::writer::PARQUET_CONFIG_ENV, r#"{"defaults":{"compression":"zstd","compression_level":7,"statistics":"page"},"columns":{"id":{"compression":"snappy","dictionary_enabled":false,"encoding":"delta_binary_packed"}},"writer_version":"v2","max_row_group_rows":4,"data_page_row_count_limit":2,"write_batch_size":1}"#)
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&run.stdout);
+                anyhow::ensure!(
+                    run.status.success() && stdout.contains("1 passed;"),
+                    "{workers}: {stdout} {}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                for name in ["single", "bucket=a", "bucket=b"] {
+                    let actual = fs::read(arm.join(name))?;
+                    let expected = fs::read(directory.path().join("1").join(name))?;
+                    anyhow::ensure!(
+                        actual == expected,
+                        "{name}: complete file differs with {workers} column workers"
+                    );
+                }
+            }
+            return Ok(());
+        };
+        let output = PathBuf::from(output);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from_iter_values(0..16)),
+                Arc::new(arrow::array::StringArray::from_iter(
+                    (0..16).map(|i| (i % 3 != 0).then_some("repeated")),
+                )),
+            ],
+        )?;
+        let single = DeltaTable::open(output.join("single-table"))?;
+        let mut writer = single.new_file_with_publication(Arc::clone(&schema), "single".into(), 0, 1000)?;
+        writer.write(&input).await?;
+        let staged = writer.stage().await?;
+        let save = |file: &StagedAppend, name: &str| -> Result<()> {
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&file.file.path)?)?;
+            assert!(reader.metadata().num_row_groups() > 1);
+            let mut footer = crate::footer::FooterEvidence::default();
+            footer.observe(reader.metadata())?;
+            let evidence = serde_json::to_value(footer)?;
+            assert_eq!(evidence["files_with_writer_declaration"], 1);
+            assert_eq!(evidence["samples"][0]["physical_codec"], "snappy");
+            assert!(evidence["samples"][0]["writer_declared_level"].is_null());
+            assert_eq!(evidence["samples"][1]["physical_codec"], "zstd");
+            assert_eq!(evidence["samples"][1]["writer_declared_level"], 7);
+            for group in reader.metadata().row_groups() {
+                assert_eq!(group.num_columns(), 2);
+                for col in group.columns() {
+                    assert!(col.column_index_offset().is_some() && col.offset_index_offset().is_some());
+                    match col.column_path().string().as_str() {
+                        "id" => assert_eq!(col.compression(), parquet::basic::Compression::SNAPPY),
+                        "label" => assert!(matches!(col.compression(), parquet::basic::Compression::ZSTD(_))),
+                        path => anyhow::bail!("unexpected column {path}"),
+                    }
+                }
+            }
+            let event = file.table.layout_readback.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let event = event.as_ref().context("missing table properties")?;
+            assert_eq!(
+                event["parquet_columns"]["label"],
+                serde_json::json!({"compression":"zstd","compression_level":7})
+            );
+            fs::copy(&file.file.path, output.join(name))?;
+            Ok(())
+        };
+        save(&staged, "single")?;
+        let multi_root = output.join("multi-table");
+        fs::create_dir(&multi_root)?;
+        let url = Url::from_directory_path(&multi_root).map_err(|()| anyhow::anyhow!("invalid fixture URL"))?;
+        let schema = Arc::new(Schema::new(vec![
+            schema.field(0).clone(),
+            schema.field(1).clone(),
+            Field::new("bucket", DataType::Utf8, false),
+        ]));
+        let mut columns = input.columns().to_vec();
+        columns.push(Arc::new(arrow::array::StringArray::from_iter_values(
+            (0..16).map(|i| if i % 2 == 0 { "a" } else { "b" }),
+        )));
+        let input = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        let partitions = vec!["bucket".to_owned()];
+        DeltaTable::open_catalog(url.clone())?.commit_catalog(
+            None,
+            Arc::clone(&schema),
+            partitions.clone(),
+            BTreeMap::new(),
+            None,
+        )?;
+        let table = DeltaTable::open_url(url, schema, partitions)?;
+        let (files, _, _, _, _) = table
+            .stage_coalesced_publications(
+                vec![
+                    (input.slice(0, 7), "first".into(), 0, 1000),
+                    (input.slice(7, 9), "second".into(), 0, 1000),
+                ],
+                2,
+                2,
+                1,
+            )
+            .await?;
+        assert_eq!(files.len(), 2);
+        for file in files {
+            let partition = file
+                .file
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .context("missing partition")?;
+            save(&file, partition)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delta_stats_creation_selects_committed_stats_without_adopting_existing_properties() -> Result<()> {
+        use arrow::array::ArrayRef;
+        const CASE: &str = "ARROWCOL_TEST_DELTA_STATS_CASE";
+        let Ok(case) = std::env::var(CASE) else {
+            for (case, columns) in [
+                ("selected", r#"["id"]"#),
+                ("nested", r#"["nested.value"]"#),
+                ("disabled", "[]"),
+                ("unknown", r#"["missing"]"#),
+                ("existing", "[]"),
+                ("first", "1"),
+                ("all", "-1"),
+                ("existing_count", "-1"),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe()?)
+                    .args(["delta::io_tests::delta_stats_creation_selects_committed_stats_without_adopting_existing_properties",
+                        "--exact", "--nocapture"])
+                    .env(CASE, case)
+                    .env(crate::delta_stats::ENVIRONMENT, columns)
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(());
+        };
+        let directory = tempfile::tempdir()?;
+        let nested = arrow::array::StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            Arc::new(arrow::array::Int32Array::from(vec![9])) as ArrayRef,
+        )]);
+        let input = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(arrow::array::Int32Array::from(vec![42])) as ArrayRef),
+            ("ignored", Arc::new(arrow::array::Int32Array::from(vec![7])) as ArrayRef),
+            ("nested", Arc::new(nested) as ArrayRef),
+        ])?;
+        if case.starts_with("existing") {
+            let url = Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+            let catalog = DeltaTable::open_catalog(url)?;
+            catalog.commit_catalog(
+                None,
+                input.schema(),
+                Vec::new(),
+                BTreeMap::from([(crate::delta_stats::COLUMNS_PROPERTY.to_owned(), "id".to_owned())]),
+                None,
+            )?;
+            drop(catalog);
+        }
+        let table = DeltaTable::open(directory.path())?;
+        let creation = table.new_file(input.schema());
+        if matches!(case.as_str(), "unknown" | "existing" | "existing_count") {
+            let error = creation.err().context("invalid stats policy unexpectedly adopted")?;
+            assert!(format!("{error:#}").contains("collector.commit.delta_stats"));
+            if case == "unknown" {
+                assert!(!directory.path().join("_delta_log").exists());
+            } else {
+                assert_eq!(table.version()?, 0);
+                let metadata = table
+                    .snapshot()?
+                    .table_configuration()
+                    .metadata()
+                    .configuration()
+                    .clone();
+                assert_eq!(metadata[crate::delta_stats::COLUMNS_PROPERTY], "id");
+                assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
+            }
+            return Ok(());
+        }
+        let mut writer = creation?;
+        writer.write(&input).await?;
+        assert_eq!(writer.finish().await?.version, 1);
+        let log = fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;
+        let actions = log
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let add = actions
+            .iter()
+            .find_map(|action| action.get("add"))
+            .context("missing committed Add")?;
+        let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().context("missing committed stats")?)?;
+        assert_eq!(stats["numRecords"], 1);
+        if matches!(case.as_str(), "selected" | "first") {
+            assert_eq!(stats["minValues"], serde_json::json!({"id":42}));
+            assert_eq!(stats["maxValues"], serde_json::json!({"id":42}));
+            assert_eq!(stats["nullCount"], serde_json::json!({"id":0}));
+        } else if case == "all" {
+            assert_eq!(
+                stats["minValues"],
+                serde_json::json!({"id":42,"ignored":7,"nested":{"value":9}})
+            );
+            assert_eq!(
+                stats["nullCount"],
+                serde_json::json!({"id":0,"ignored":0,"nested":{"value":0}})
+            );
+        } else if case == "nested" {
+            assert_eq!(stats["minValues"], serde_json::json!({"nested":{"value":9}}));
+            assert_eq!(stats["maxValues"], serde_json::json!({"nested":{"value":9}}));
+            assert_eq!(stats["nullCount"], serde_json::json!({"nested":{"value":0}}));
+        } else {
+            for field in ["minValues", "maxValues", "nullCount"] {
+                assert!(stats[field].is_null() || stats[field].as_object().is_some_and(|fields| fields.is_empty()));
+            }
+        }
+        let snapshot = table.snapshot()?;
+        let policy = crate::delta_stats::DeltaStatsPolicy::from_env()?.context("missing policy")?;
+        policy.verify_metadata(
+            &snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )?;
+        Ok(())
     }
 
     /// Scenario: a concurrent subprocess inherits the writer's descriptor before exec.
@@ -1718,6 +2825,78 @@ mod io_tests {
         Ok(())
     }
 
+    /// Scenario: every publication attempt loses to an external append.
+    /// Guarantees: the configured attempt limit and between-attempt budget end publication with an
+    /// error, without committing the identity, and the same identity later publishes exactly once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_commit_retry_policy_exhausts_then_identity_publishes_once() -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        struct ExternalCommits {
+            armed: AtomicBool,
+            checks: AtomicU32,
+        }
+        impl PublicationFence for ExternalCommits {
+            fn check_before_commit(
+                &self,
+                context: &PublicationFenceContext<'_>,
+            ) -> std::result::Result<(), PublicationFenceError> {
+                self.checks.fetch_add(1, Ordering::SeqCst);
+                if self.armed.load(Ordering::SeqCst) {
+                    let publish = || -> std::io::Result<()> {
+                        let log = context.table_path().join("_delta_log");
+                        let append = fs::read(log.join(format!("{:020}.json", context.read_version())))?;
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(log.join(format!("{:020}.json", context.proposed_version())))?;
+                        file.write_all(&append)?;
+                        file.sync_all()
+                    };
+                    publish().map_err(|error| PublicationFenceError::check_failed(error.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+        for (attempts, budget, expected_checks) in [(2, Duration::from_secs(3600), 2), (8, Duration::ZERO, 1)] {
+            let directory = tempfile::tempdir()?;
+            let fence = Arc::new(ExternalCommits {
+                armed: AtomicBool::new(false),
+                checks: AtomicU32::new(0),
+            });
+            let mut table = DeltaTable::open_with_fence(directory.path(), Arc::<ExternalCommits>::clone(&fence))?;
+            {
+                let owner = Arc::get_mut(&mut table).context("unique table owner")?;
+                owner.commit_attempts = attempts;
+                owner.commit_budget = budget;
+            }
+            let input = input_batch()?;
+            let mut first = table.new_file(input.schema())?;
+            first.write(&input).await?;
+            assert_eq!(first.finish().await?.version, 1);
+            fence.checks.store(0, Ordering::SeqCst);
+            fence.armed.store(true, Ordering::SeqCst);
+            let Err(error) = table.commit_files_with_transaction(&[], "mine", 7) else {
+                anyhow::bail!("every attempt must lose to an external append");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("({attempts} attempts / {} seconds)", budget.as_secs())),
+                "{error:#}"
+            );
+            assert_eq!(fence.checks.load(Ordering::SeqCst), expected_checks);
+            let head = table.version()?;
+            assert_eq!(head, 1 + u64::from(expected_checks));
+            fence.armed.store(false, Ordering::SeqCst);
+            assert_eq!(table.commit_files_with_transaction(&[], "mine", 7)?, head + 1);
+            assert_eq!(table.commit_files_with_transaction(&[], "mine", 7)?, head + 1);
+            assert_eq!(table.version()?, head + 1);
+        }
+        Ok(())
+    }
+
     /// Scenario: URL-significant characters occur in a physical Hive directory.
     /// Guarantees: local and ADLS request paths encode segments exactly once.
     #[test]
@@ -1734,6 +2913,281 @@ mod io_tests {
             let relative = url.as_str().strip_prefix(table.url.as_str()).context("relative path")?;
             assert_eq!(table.relative_url(relative)?, url);
         }
+        Ok(())
+    }
+
+    fn enable_checkpoint_index(table: &mut Arc<DeltaTable>) -> Result<()> {
+        let table = Arc::get_mut(table).context("unique table owner")?;
+        table.snapshot_cache_mode = crate::SnapshotCacheMode::CheckpointAware;
+        table.txn_lookup_mode = TxnLookupMode::Incremental;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_aware_preflight_never_deduplicates_a_replaced_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        let ids = [("mine".into(), 7), ("peer".into(), 7)];
+        assert_eq!(table.lookup_publications(&ids)?, [false, false]);
+        let version = table.commit_files_with_transaction(&[], "mine", 7)?;
+        let path = directory.path().join(format!("_delta_log/{version:020}.json"));
+        let log = fs::read_to_string(&path)?;
+        let replace = |old: &str, new: &str| -> Result<()> {
+            let contents = log.replace(old, new);
+            anyhow::ensure!(contents != log);
+            let replacement = directory.path().join("replacement");
+            fs::write(&replacement, contents)?;
+            let times = std::fs::FileTimes::new().set_modified(fs::metadata(&path)?.modified()?);
+            File::open(&replacement)?.set_times(times)?;
+            fs::rename(replacement, &path)?;
+            Ok(())
+        };
+        // Same table UUID, log version, length and mtime. No refresh has yet seen our commit.
+        replace("\"mine\"", "\"peer\"")?;
+        assert_eq!(table.lookup_publications(&ids)?, [false, true]);
+        let (_, first) = table.snapshot_with_lineage()?;
+        replace("\"mine\"", "\"next\"")?;
+        assert_eq!(table.lookup_publications(&ids)?, [false, false]);
+        let (_, second) = table.snapshot_with_lineage()?;
+        assert!(first.is_some() && second.is_some() && first != second);
+        assert_eq!(table.commit_files_with_transaction(&[], "mine", 7)?, version + 1);
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_preflight_propagates_transaction_index_poison() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        std::thread::scope(|scope| {
+            let panicked = scope.spawn(|| {
+                let _index = table.txn_index.lock();
+                panic!("interrupted index update");
+            });
+            assert!(panicked.join().is_err());
+        });
+        let error = table
+            .lookup_publications(&[("id".into(), 1)])
+            .err()
+            .context("preflight bypassed a poisoned transaction index")?;
+        assert!(error.to_string().contains("transaction index poisoned"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_aware_index_tracks_foreign_transactions_across_checkpoint_cleanup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        let ids = [("own".into(), 7), ("foreign".into(), 9)];
+        let own = table.commit_files_with_transaction(&[], "own", 7)?;
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        let log = directory.path().join("_delta_log");
+        let foreign = own + 1;
+        fs::write(
+            log.join(format!("{foreign:020}.json")),
+            r#"{"txn":{"appId":"foreign","version":9}}"#,
+        )?;
+        let checkpoint = foreign + 1;
+        fs::write(
+            log.join(format!("{checkpoint:020}.json")),
+            r#"{"txn":{"appId":"another","version":1}}"#,
+        )?;
+        assert_eq!(table.checkpoint()?, checkpoint);
+        let (adopted, lineage) = table.snapshot_with_lineage()?;
+        assert_eq!(adopted.log_segment().checkpoint_version, Some(checkpoint));
+        assert!(lineage.is_some());
+        for v in 0..checkpoint {
+            fs::remove_file(log.join(format!("{v:020}.json")))?;
+        }
+        let (pruned, pruned_lineage) = table.snapshot_with_lineage()?;
+        assert!(Arc::ptr_eq(&adopted, &pruned));
+        assert_eq!(pruned_lineage, lineage);
+        assert_eq!(table.lookup_publications(&ids)?, [true, true]);
+        assert_eq!(table.commit_files_with_transaction(&[], "foreign", 9)?, checkpoint);
+        assert!(table.lookup_publications(&[("foreign".into(), 8)]).is_err());
+        let next = checkpoint + 1;
+        fs::write(
+            log.join(format!("{next:020}.json")),
+            r#"{"txn":{"appId":"foreign","version":3}}"#,
+        )?;
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        assert_eq!(table.lookup_publications(&[("foreign".into(), 3)])?, [true]);
+        assert_eq!(table.snapshot_with_lineage()?.1, lineage);
+        fs::write(
+            log.join(format!("{checkpoint:020}.checkpoint.parquet")),
+            b"bad checkpoint",
+        )?;
+        assert!(table.lookup_publications(&ids).is_err());
+        assert!(table.commit_files_with_transaction(&[], "own", 7).is_err());
+        assert!(!log.join(format!("{:020}.json", next + 1)).exists());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_aware_object_index_invalidates_same_version_replacement() -> Result<()> {
+        let (_, session) = ready_stage_session().await?;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let mut table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            vec![],
+            None,
+            Some(Arc::clone(&session)),
+            Some(Arc::<object_store::memory::InMemory>::clone(&store)),
+        )?;
+        enable_checkpoint_index(&mut table)?;
+        table.new_file(input_batch()?.schema())?;
+        let path = table.object_path("_delta_log/00000000000000000001.json")?;
+        store
+            .put(&path, br#"{"txn":{"appId":"old","version":4}}"#.to_vec().into())
+            .await?;
+        let ids = [("old".into(), 4), ("new".into(), 4)];
+        assert_eq!(table.lookup_publications(&ids)?, [true, false]);
+        let old = table.snapshot_with_lineage()?.1.context("certified object snapshot")?;
+        store
+            .put(&path, br#"{"txn":{"appId":"new","version":4}}"#.to_vec().into())
+            .await?;
+        assert_eq!(table.lookup_publications(&ids)?, [false, true]);
+        assert_ne!(table.snapshot_with_lineage()?.1, Some(old));
+        drop(table);
+        session.close_after_drain_async().await?;
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct UnboundedListCounter {
+        inner: object_store::memory::InMemory,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for UnboundedListCounter {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("unbounded list counter")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for UnboundedListCounter {
+        async fn put_opts(
+            &self,
+            path: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+            offset: &object_store::path::Path,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+
+    /// Scenario: an object-store table is refreshed repeatedly after a checkpoint is cached.
+    /// Guarantees: `from_checkpoint` lists only from the floor, so entries below it are not
+    /// observed, and the existence probe stops listing once the log has been seen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_floor_bounds_object_log_refresh_listing() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let (_, session) = ready_stage_session().await?;
+        let store = Arc::new(UnboundedListCounter::default());
+        let mut table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            vec![],
+            None,
+            Some(Arc::clone(&session)),
+            Some(Arc::<UnboundedListCounter>::clone(&store)),
+        )?;
+        enable_checkpoint_index(&mut table)?;
+        Arc::get_mut(&mut table)
+            .context("unique table owner")?
+            .snapshot_list_mode = crate::SnapshotListMode::FromCheckpoint;
+        table.new_file(input_batch()?.schema())?;
+        table.commit_files_with_transaction(&[], "own", 1)?;
+        let checkpoint = table.checkpoint()?;
+        let (adopted, lineage) = table.existing_snapshot_with_lineage()?.context("existing table")?;
+        assert_eq!(adopted.log_segment().checkpoint_version, Some(checkpoint));
+        let lineage = lineage.context("certified object snapshot")?;
+        let stray = table.object_path("_delta_log/00000000000000000000.crc")?;
+        store.inner.put(&stray, b"{}".to_vec().into()).await?;
+        store.lists.store(0, Ordering::SeqCst);
+        for _ in 0..3 {
+            let (snapshot, refreshed) = table.existing_snapshot_with_lineage()?.context("existing table")?;
+            assert!(Arc::ptr_eq(&snapshot, &adopted));
+            assert_eq!(refreshed, Some(lineage));
+        }
+        assert_eq!(store.lists.load(Ordering::SeqCst), 0);
+        let next = table.commit_files_with_transaction(&[], "own", 2)?;
+        let (snapshot, refreshed) = table.existing_snapshot_with_lineage()?.context("existing table")?;
+        assert_eq!((snapshot.version(), refreshed), (next, Some(lineage)));
+        drop(table);
+        session.close_after_drain_async().await?;
         Ok(())
     }
 
@@ -1898,7 +3352,6 @@ mod io_tests {
                 }
                 assert_eq!(table.version()?, version);
             }
-            #[cfg(target_os = "linux")]
             crate::delta_io::assert_worker_bound()?;
             drop(tables);
             tables = Vec::new();
@@ -1925,7 +3378,6 @@ mod io_tests {
                 tables.push(table);
             }
             assert_eq!(tables.len(), 13);
-            #[cfg(target_os = "linux")]
             crate::delta_io::assert_worker_bound()?;
         }
         Ok(())
@@ -1979,7 +3431,6 @@ mod io_tests {
         let results = tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(operations)).await?;
         let tables = results.into_iter().collect::<Result<Vec<_>>>()?;
         assert_eq!(tables.len(), 13);
-        #[cfg(target_os = "linux")]
         crate::delta_io::assert_worker_bound()?;
         for index in 0..13 {
             let log = directory.path().join(index.to_string()).join("_delta_log");
@@ -2187,11 +3638,168 @@ impl Display for CoalescedGroupCapacityExceeded {
 
 impl Error for CoalescedGroupCapacityExceeded {}
 
+// Travels with one input (or a row selection of it), never with the whole file:
+// a caller-supplied column can land in the very same partition as a generated one.
+#[derive(Clone)]
+struct GeneratedIngestion(Arc<str>);
+
 struct CoalescedPartitionOutput {
     values: BTreeMap<String, Option<String>>,
-    files: Vec<Vec<RecordBatch>>,
+    files: Vec<Vec<(RecordBatch, Option<GeneratedIngestion>)>>,
     file_rows: Vec<usize>,
     file_bytes: Vec<usize>,
+}
+
+impl CoalescedPartitionOutput {
+    fn split_unsorted(&mut self, width: usize) -> Result<()> {
+        let rows = *self.file_rows.first().context("missing coalesced partition rows")?;
+        let width = width.min(rows);
+        anyhow::ensure!(width > 0 && self.files.len() == 1, "invalid unsorted partition split");
+        let batches = self.files.pop().context("missing coalesced partition batches")?;
+        let targets = (0..width)
+            .map(|index| rows / width + usize::from(index < rows % width))
+            .collect::<Vec<_>>();
+        self.files = (0..width).map(|_| Vec::new()).collect();
+        self.file_rows = vec![0; width];
+        self.file_bytes = vec![0; width];
+        let mut file = 0;
+        for (batch, proof) in batches {
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let remaining = targets[file] - self.file_rows[file];
+                let take = remaining.min(batch.num_rows() - offset);
+                self.files[file].push((batch.slice(offset, take), proof.clone()));
+                self.file_rows[file] += take;
+                offset += take;
+                if self.file_rows[file] == targets[file] && file + 1 < width {
+                    file += 1;
+                }
+            }
+        }
+        anyhow::ensure!(self.file_rows == targets, "coalesced partition split lost rows");
+        Ok(())
+    }
+}
+
+struct PreparedWrite {
+    encode: Option<RecordBatch>,
+    batch_rows: usize,
+    input_bytes: u64,
+    rows: usize,
+    bytes: u64,
+}
+
+struct CoalescedStagePolicy {
+    schema: SchemaRef,
+    group_snapshot: Option<GroupStageSnapshot>,
+    table_properties: BTreeMap<String, String>,
+    resolved: arrowcol_props::ResolvedProps,
+    layout: Option<crate::layout::LayoutPolicy>,
+    mode: SortExecution,
+}
+
+struct GroupStageSnapshot {
+    snapshot: SnapshotRef,
+    definition: Arc<StagedDefinition>,
+}
+
+struct StagedDefinition {
+    metadata: delta_kernel::actions::Metadata,
+    protocol: delta_kernel::actions::Protocol,
+}
+
+type PublicationIds = Vec<(String, i64, i64)>;
+
+struct CoalescedPlan {
+    output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput>,
+    policy: CoalescedStagePolicy,
+    identities: PublicationIds,
+    committed_identities: PublicationIds,
+    build: Duration,
+    sort: Duration,
+}
+
+// Each admitted file task owns this guard until it has finished registering its output,
+// even if the group caller drops its join handle.
+#[derive(Default)]
+struct UnpublishedStages(Mutex<BTreeMap<usize, StagedAppend>>);
+
+async fn stage_bounded<I, F, Fut>(mut jobs: I, width: usize, mut start: F) -> Result<()>
+where
+    I: Iterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use futures::StreamExt;
+    let mut pending = futures::stream::FuturesUnordered::new();
+    let mut first_error = None;
+    loop {
+        while first_error.is_none() && pending.len() < width {
+            let Some(job) = jobs.next() else { break };
+            pending.push(start(job));
+        }
+        match pending.next().await {
+            Some(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Some(Ok(())) => {}
+            None => return first_error.map_or(Ok(()), Err),
+        }
+    }
+}
+
+impl UnpublishedStages {
+    fn take(&self) -> Vec<StagedAppend> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+            .into_values()
+            .collect()
+    }
+
+    async fn reclaim(files: Vec<StagedAppend>) {
+        for append in files {
+            if let Some(relative) = append.claim_reclaim_for(&append.table) {
+                DeltaTable::report_reclaim(append.table.remove_unsubmitted(&append.file.path, &relative).await);
+            }
+        }
+    }
+}
+
+impl Drop for UnpublishedStages {
+    fn drop(&mut self) {
+        reclaim_abandoned_group(self.take());
+    }
+}
+
+pub(crate) fn reclaim_abandoned_group(files: Vec<StagedAppend>) {
+    if !files.is_empty() {
+        let _cleanup = spawn_shared_io(UnpublishedStages::reclaim(files));
+    }
+}
+
+// Bound every prefix produced by Arrow's flat-array take kernels, including
+// array headers, an extra byte-array offset and rounded bitmap allocations.
+// Nested and other types use the exact materializing search below.
+fn flat_take_prefix_bound(batch: &RecordBatch) -> Option<(usize, usize)> {
+    let alignment = arrow::alloc::ALIGNMENT;
+    let mut logical = 0usize;
+    let mut bound = 0usize;
+    for column in batch.columns() {
+        let ty = column.data_type();
+        if !crate::layout::gatherable(ty) {
+            return None;
+        }
+        let bytes = column.to_data().get_slice_memory_size().ok()?;
+        let header = column
+            .get_array_memory_size()
+            .checked_sub(column.get_buffer_memory_size())?;
+        logical = logical.checked_add(bytes)?;
+        bound = bound
+            .checked_add(bytes)?
+            .checked_add(header)?
+            .checked_add(alignment.checked_mul(3)?)?
+            .checked_add(8)?;
+    }
+    Some((logical, bound))
 }
 
 fn fitting_sort_chunk(
@@ -2199,13 +3807,29 @@ fn fitting_sort_chunk(
     start: usize,
     max_rows: usize,
     max_bytes: usize,
+    detach_ratio: usize,
+    kernel: DetachKernel,
 ) -> Result<Option<RecordBatch>> {
     let remaining = batch.num_rows().saturating_sub(start);
     let mut low = 0;
     let mut high = max_rows.min(remaining);
+    if high > 0 && u32::try_from(high).is_ok() {
+        let full = batch.slice(start, high);
+        if let Some((logical, copy_bound)) = flat_take_prefix_bound(&full) {
+            let charged = full.get_array_memory_size();
+            // A prefix either keeps the original buffers or is copied. If the
+            // full slice is copied, all shorter flat prefixes are copied too.
+            if copy_bound <= max_bytes && (charged <= max_bytes || charged > logical.saturating_mul(detach_ratio)) {
+                let candidate = owned_for_sort(full, detach_ratio, kernel)?;
+                if candidate.get_array_memory_size() <= max_bytes {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
     while low < high {
         let rows = low + (high - low).div_ceil(2);
-        let candidate = owned_for_sort(batch.slice(start, rows))?;
+        let candidate = owned_for_sort(batch.slice(start, rows), detach_ratio, kernel)?;
         if candidate.get_array_memory_size() <= max_bytes {
             low = rows;
         } else {
@@ -2215,7 +3839,7 @@ fn fitting_sort_chunk(
     if low == 0 {
         return Ok(None);
     }
-    Ok(Some(owned_for_sort(batch.slice(start, low))?))
+    Ok(Some(owned_for_sort(batch.slice(start, low), detach_ratio, kernel)?))
 }
 
 /// Local table ownership and Kernel engine. Hold one instance per table.
@@ -2229,14 +3853,28 @@ pub struct DeltaTable {
     partition_columns: Vec<String>,
     session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
+    pub(crate) txn_lookup_mode: crate::TxnLookupMode,
+    pub(crate) snapshot_cache_mode: crate::SnapshotCacheMode,
+    pub(crate) snapshot_list_mode: crate::SnapshotListMode,
+    pub(crate) stage_snapshot_mode: crate::StageSnapshotMode,
+    pub(crate) preflight_lookup_mode: crate::PreflightLookupMode,
+    pub(crate) commit_attempts: u32,
+    pub(crate) commit_budget: Duration,
+    pub(crate) publication_cache: Mutex<crate::publication_lookup::PublicationCache>,
+    txn_index: Mutex<Option<crate::publication_lookup::TxnIndex>>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
-    layout_readback: Mutex<Option<LayoutReadback>>,
+    snapshot_lineages: std::sync::atomic::AtomicU64,
+    log_exists: std::sync::atomic::AtomicBool,
+    layout_readback: Mutex<Option<serde_json::Value>>,
+    stats_readback: Mutex<Option<(String, BTreeMap<String, String>)>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
+    local_directory_sync_policy: crate::LocalDirectorySyncPolicy,
 }
 
 #[derive(PartialEq, Eq)]
 struct LayoutReadback {
+    mode: SortExecution,
     schema: SchemaRef,
     enabled: bool,
     policy: crate::layout::LayoutPolicy,
@@ -2249,8 +3887,10 @@ impl LayoutReadback {
         properties: &arrowcol_props::ResolvedProps,
         table: &BTreeMap<String, String>,
         enabled: bool,
+        mode: SortExecution,
     ) -> Result<Self> {
         Ok(Self {
+            mode,
             schema,
             enabled,
             policy: crate::layout::LayoutPolicy::from_properties(properties)?,
@@ -2262,28 +3902,82 @@ impl LayoutReadback {
         })
     }
 
-    fn event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
+    #[cfg(test)]
+    fn test_event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
+        let base = if self.enabled {
+            Some(self.policy.writer_properties(&self.schema)?)
+        } else {
+            None
+        };
+        let properties = parquet_config.writer_properties(
+            &self.schema,
+            base.clone(),
+            &crate::writer::sorting_from_properties(&self.schema, base.as_ref())?,
+        )?;
+        self.event(url, &properties)
+    }
+
+    fn event(&self, url: &Url, properties: &WriterProperties) -> Result<serde_json::Value> {
         let mut config = self.policy.config_json(Some(self.enabled));
+        config["sort_execution"] = serde_json::json!(self.enabled.then_some(self.mode));
+        let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
+        let mut parquet_columns = serde_json::Map::new();
+        let mut parquet_column_options = serde_json::Map::new();
+        let mut columns_unavailable = descriptor.columns().len() > 256;
+        for column in descriptor.columns().iter().take(256) {
+            let (codec, level) = crate::footer::codec(properties.compression(column.path()));
+            if parquet_columns
+                .insert(
+                    column.path().string(),
+                    serde_json::json!({"compression":codec,"compression_level":level}),
+                )
+                .is_some()
+            {
+                columns_unavailable = true;
+            }
+            use parquet::basic::Encoding;
+            use parquet::file::properties::EnabledStatistics;
+            let path = column.path();
+            let encoding = match properties.encoding(path) {
+                Some(Encoding::PLAIN) => Some("plain"),
+                Some(Encoding::RLE) => Some("rle"),
+                Some(Encoding::DELTA_BINARY_PACKED) => Some("delta_binary_packed"),
+                Some(Encoding::DELTA_LENGTH_BYTE_ARRAY) => Some("delta_length_byte_array"),
+                Some(Encoding::DELTA_BYTE_ARRAY) => Some("delta_byte_array"),
+                Some(Encoding::BYTE_STREAM_SPLIT) => Some("byte_stream_split"),
+                _ => None,
+            };
+            let statistics = match properties.statistics_enabled(path) {
+                EnabledStatistics::None => "none",
+                EnabledStatistics::Chunk => "chunk",
+                EnabledStatistics::Page => "page",
+            };
+            let bloom = properties.bloom_filter_properties(path);
+            parquet_column_options.insert(path.string(), serde_json::json!({
+                "encoding":encoding,
+                "dictionary_enabled":properties.dictionary_enabled(path),
+                "dictionary_page_size_limit":properties.column_dictionary_page_size_limit(path),
+                "data_page_size_limit":properties.column_data_page_size_limit(path),
+                "statistics":statistics,
+                "write_page_header_statistics":properties.write_page_header_statistics(path),
+                "bloom_filter_enabled":bloom.is_some(),
+                "bloom_filter_fpp":bloom.map(|value| value.fpp),
+                "bloom_filter_ndv":bloom.map(|value| value.ndv),
+                "data_page_v2_compression_ratio_threshold":properties.column_data_page_v2_compression_ratio_threshold(path),
+            }));
+        }
         if self.enabled {
-            let base = Some(self.policy.writer_properties(&self.schema)?);
-            let properties = parquet_config.writer_properties(
-                &self.schema,
-                base.clone(),
-                &crate::writer::sorting_from_properties(&self.schema, base.as_ref())?,
-            )?;
-            let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
             let bloom_columns = descriptor
                 .columns()
                 .iter()
                 .filter(|column| properties.bloom_filter_properties(column.path()).is_some())
                 .map(|column| column.path().string())
                 .collect::<Vec<_>>();
+            config["detach_ratio"] = serde_json::json!(runtime_config()?.layout_detach_ratio);
+            config["detach_kernel"] = serde_json::json!(runtime_config()?.layout_detach_kernel);
             config["bloom_columns"] = serde_json::json!(bloom_columns);
-            config["row_group_rows"] = serde_json::json!(
-                properties
-                    .max_row_group_row_count()
-                    .context("missing Parquet row-group row limit")?
-            );
+            // `null` when parquet_writer.max_row_group_rows is "unlimited", which overrides the layout cap.
+            config["row_group_rows"] = serde_json::json!(properties.max_row_group_row_count());
             config["page_rows"] = serde_json::json!(properties.data_page_row_count_limit());
         } else {
             for name in [
@@ -2296,6 +3990,9 @@ impl LayoutReadback {
             ] {
                 config[name] = serde_json::Value::Null;
             }
+            if config.get("sort_options").is_some() {
+                config["sort_options"] = serde_json::Value::Null;
+            }
         }
         Ok(serde_json::json!({
             "component": "layout",
@@ -2304,12 +4001,27 @@ impl LayoutReadback {
             "table_name": telemetry_table_name(url),
             "applied": self.enabled,
             "inactive_controls": if self.enabled { Vec::<&str>::new() } else {
-                vec!["sort_columns", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
+                vec!["sort_execution", "sort_columns", "sort_options", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
             },
             "precedence": ["table_properties", "process_policy", "registry_defaults"],
             "encoding_precedence": ["parquet_config", "resolved_layout", "parquet_defaults"],
             "table_property_overrides": self.table_property_overrides,
             "config": config,
+            "parquet_columns": (!columns_unavailable).then_some(parquet_columns),
+            "parquet_column_options": (!columns_unavailable).then_some(parquet_column_options),
+            "parquet_properties": {
+                "writer_version": match properties.writer_version() {
+                    parquet::file::properties::WriterVersion::PARQUET_1_0 => "v1",
+                    parquet::file::properties::WriterVersion::PARQUET_2_0 => "v2",
+                },
+                "max_row_group_rows": properties.max_row_group_row_count(),
+                "data_page_row_count_limit": properties.data_page_row_count_limit(),
+                "max_row_group_bytes": properties.max_row_group_bytes(),
+                "write_batch_size": properties.write_batch_size(),
+                "offset_index_enabled": !properties.offset_index_disabled(),
+                "column_index_truncate_length": properties.column_index_truncate_length(),
+                "statistics_truncate_length": properties.statistics_truncate_length(),
+            },
         }))
     }
 }
@@ -2325,19 +4037,58 @@ impl Drop for WriterLock {
     }
 }
 
-type LogFingerprints = BTreeMap<u64, LogFingerprint>;
+type LogFingerprints = BTreeMap<(u64, LogEntry), LogFingerprint>;
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LogEntry {
+    Commit,
+    Checkpoint,
+    Hint,
+}
 
 struct CachedSnapshot {
     snapshot: SnapshotRef,
     files: LogFingerprints,
+    lineage: u64,
+}
+
+fn log_entry(name: &str, checkpoint_aware: bool) -> Option<(u64, LogEntry)> {
+    if checkpoint_aware && name == "_last_checkpoint" {
+        return Some((0, LogEntry::Hint));
+    }
+    let (digits, suffix) = name.split_at_checked(20)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let entry = match suffix {
+        ".json" => LogEntry::Commit,
+        ".checkpoint.parquet" if checkpoint_aware => LogEntry::Checkpoint,
+        // CRCs, compacted commits and sidecars can change what Kernel replays.
+        // Never certify a layout whose complete set of dependencies we don't track.
+        _ => return None,
+    };
+    Some((digits.parse().ok()?, entry))
+}
+
+fn retained_log_entry((version, entry): &(u64, LogEntry), floor: Option<u64>) -> bool {
+    floor.is_none_or(|floor| match entry {
+        LogEntry::Commit | LogEntry::Checkpoint => *version >= floor,
+        LogEntry::Hint => true,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct LogFingerprint {
-    length: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
+enum LogFingerprint {
+    Local {
+        length: u64,
+        modified: std::time::SystemTime,
+        #[cfg(unix)]
+        identity: (u64, u64, i64, i64),
+    },
+    Object {
+        etag: Option<String>,
+        version: Option<String>,
+    },
 }
 
 pub(crate) struct DurableCommitter;
@@ -2392,6 +4143,38 @@ pub struct FreshTableReceipt {
     pub partition_columns: Vec<String>,
     /// Must be zero; initialization does not publish data.
     pub active_files: usize,
+    /// Actual committed Delta configuration, not requested process defaults.
+    pub properties: BTreeMap<String, String>,
+}
+
+/// Literal properties applied only while creating fresh version-zero metadata.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InitialDeltaProperties {
+    /// Compressed-byte target; explicit writer or optimize table policy takes precedence.
+    pub target_file_size_bytes: Option<u64>,
+    /// Commits of checkpoint debt required by checkpoint maintenance.
+    pub checkpoint_interval: Option<u64>,
+}
+
+impl InitialDeltaProperties {
+    /// Return validated literal Delta properties without performing storage I/O.
+    ///
+    /// # Errors
+    /// Rejects zero-valued targets or checkpoint intervals.
+    pub fn properties(&self) -> Result<BTreeMap<String, String>> {
+        let mut properties = BTreeMap::new();
+        for (key, value) in [
+            ("delta.targetFileSize", self.target_file_size_bytes),
+            ("delta.checkpointInterval", self.checkpoint_interval),
+        ] {
+            if let Some(value) = value {
+                properties.insert(key.to_owned(), value.to_string());
+            }
+        }
+        arrowcol_props::validate_table_properties(&properties)?;
+        Ok(properties)
+    }
 }
 
 /// Explicit transport provenance for fresh initialization. Opaque retries are refused.
@@ -2549,6 +4332,32 @@ impl DeltaTable {
         publication_fence: Arc<dyn PublicationFence>,
         data: FreshTableTransport,
     ) -> Result<FreshTableReceipt> {
+        Self::initialize_fresh_url_with_session_and_properties(
+            url,
+            schema,
+            partition_columns,
+            session,
+            publication_fence,
+            data,
+            &InitialDeltaProperties::default(),
+        )
+    }
+
+    /// Create fresh metadata atomically with explicit literal Delta properties.
+    ///
+    /// # Errors
+    /// Rejects invalid properties, existing objects, unsafe transport, failed fencing
+    /// or committed metadata that differs from the requested configuration.
+    pub fn initialize_fresh_url_with_session_and_properties(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+        publication_fence: Arc<dyn PublicationFence>,
+        data: FreshTableTransport,
+        properties: &InitialDeltaProperties,
+    ) -> Result<FreshTableReceipt> {
+        let requested_properties = properties.properties()?;
         if session.mode() != SessionMode::Publisher
             || data.mutation_retries != crate::publisher::MutationRetries::Disabled
         {
@@ -2570,7 +4379,7 @@ impl DeltaTable {
         if nonempty {
             bail!("fresh table target is not empty; existing objects are never adopted");
         }
-        table.create_schema(Arc::clone(&incoming), Some(publication_fence))?;
+        table.create_schema_with_properties(Arc::clone(&incoming), Some(publication_fence), properties)?;
         let prefix = table.object_path("")?;
         let store = Arc::clone(&table.store);
         let objects: Vec<_> = shared_executor()?.block_on(async move {
@@ -2582,6 +4391,17 @@ impl DeltaTable {
         }
         let snapshot = table.snapshot()?;
         let metadata = snapshot.table_configuration().metadata();
+        let committed_properties: BTreeMap<String, String> = metadata
+            .configuration()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if requested_properties
+            .iter()
+            .any(|(key, value)| committed_properties.get(key) != Some(value))
+        {
+            bail!("fresh table property readback differs from creation");
+        }
         let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
         if snapshot.version() != 0 || existing != *incoming || metadata.partition_columns() != table.partition_columns {
             bail!("fresh table schema/version/partition readback differs from creation");
@@ -2607,6 +4427,7 @@ impl DeltaTable {
             schema_json: metadata.schema_string().to_string(),
             partition_columns: metadata.partition_columns().to_vec(),
             active_files: 0,
+            properties: committed_properties,
         })
     }
 
@@ -2818,10 +4639,23 @@ impl DeltaTable {
             partition_columns,
             _lock: None,
             commit_lock: Mutex::new(()),
+            txn_lookup_mode: Default::default(),
+            snapshot_cache_mode: Default::default(),
+            snapshot_list_mode: Default::default(),
+            stage_snapshot_mode: Default::default(),
+            preflight_lookup_mode: Default::default(),
+            commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
+            commit_budget: DEFAULT_COMMIT_BUDGET,
+            publication_cache: Default::default(),
+            txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
+            snapshot_lineages: Default::default(),
+            log_exists: Default::default(),
             layout_readback: Mutex::new(None),
+            stats_readback: Mutex::new(None),
             reuse_snapshots: false,
             publication_fence,
+            local_directory_sync_policy: config.local_directory_sync_policy,
             session,
             bootstrap_only,
         });
@@ -2863,17 +4697,28 @@ impl DeltaTable {
     /// # Errors
     /// Rejects invalid IDs, newer committed versions, expired transaction history, or read failures.
     pub fn lookup_publications(&self, publications: &[(String, i64)]) -> Result<Vec<bool>> {
-        let snapshot = self.snapshot()?;
+        let (snapshot, lineage) = self.snapshot_with_lineage()?;
         Self::validate_retention(&snapshot)?;
         let mut unique = std::collections::HashSet::with_capacity(publications.len());
+        for (app_id, version) in publications {
+            validate_transaction_id(app_id, *version)?;
+            if !unique.insert(app_id.as_str()) {
+                bail!("duplicate application identity in publication lookup");
+            }
+        }
+        let indexed = if self.txn_lookup_mode == TxnLookupMode::Incremental {
+            Some(self.publication_versions(&snapshot, lineage, &unique.into_iter().collect::<Vec<_>>())?)
+        } else {
+            None
+        };
         publications
             .iter()
             .map(|(app_id, version)| {
-                validate_transaction_id(app_id, *version)?;
-                if !unique.insert(app_id.as_str()) {
-                    bail!("duplicate application identity in publication lookup");
-                }
-                match snapshot.get_app_id_version(app_id, &self.engine)? {
+                let previous = match &indexed {
+                    Some(versions) => versions[app_id.as_str()],
+                    None => snapshot.get_app_id_version(app_id, &self.engine)?,
+                };
+                match previous {
                     Some(previous) if previous > *version => {
                         bail!("publication transaction fenced by newer application version")
                     }
@@ -2904,6 +4749,20 @@ impl DeltaTable {
         control.check()?;
         self.check_publication()?;
         let snapshot = self.snapshot()?;
+        self.write_checkpoint(control, snapshot)
+    }
+
+    pub(crate) fn checkpoint_detached(&self, last: Option<u64>) -> Result<u64> {
+        self.check_publication()?;
+        // Do not hold the publication thread's cache lock during checkpoint replay or I/O.
+        let snapshot = Snapshot::builder_for(self.url.as_str()).build(&self.engine)?;
+        if Some(snapshot.version()) == last {
+            return Ok(snapshot.version());
+        }
+        self.write_checkpoint(&crate::maintenance::MaintenanceControl::default(), snapshot)
+    }
+
+    fn write_checkpoint(&self, control: &crate::maintenance::MaintenanceControl, snapshot: SnapshotRef) -> Result<u64> {
         Self::validate_retention(&snapshot)?;
         control.check()?;
         let writer = Arc::clone(&snapshot).create_checkpoint_writer(&self.engine)?;
@@ -2998,7 +4857,9 @@ impl DeltaTable {
 
     fn prepare_upload(&self, file: &CompletedFile) -> Result<Option<object_store::path::Path>> {
         if self.url.scheme() == "file" {
-            self.sync_local_output(&file.path)?;
+            if self.local_directory_sync_policy == crate::LocalDirectorySyncPolicy::PerFile {
+                self.sync_local_output(&file.path)?;
+            }
             return Ok(None);
         }
         if file.bytes > 512 * 1024 * 1024 {
@@ -3106,10 +4967,23 @@ impl DeltaTable {
                 Vec::new()
             },
             commit_lock: Mutex::new(()),
+            txn_lookup_mode: Default::default(),
+            snapshot_cache_mode: Default::default(),
+            snapshot_list_mode: Default::default(),
+            stage_snapshot_mode: Default::default(),
+            preflight_lookup_mode: Default::default(),
+            commit_attempts: DEFAULT_COMMIT_ATTEMPTS,
+            commit_budget: DEFAULT_COMMIT_BUDGET,
+            publication_cache: Default::default(),
+            txn_index: Mutex::new(None),
             snapshot_cache: Mutex::new(None),
+            snapshot_lineages: Default::default(),
+            log_exists: Default::default(),
             layout_readback: Mutex::new(None),
+            stats_readback: Mutex::new(None),
             reuse_snapshots,
             publication_fence,
+            local_directory_sync_policy: config.local_directory_sync_policy,
             session: None,
             bootstrap_only: false,
         };
@@ -3129,36 +5003,45 @@ impl DeltaTable {
 
     fn record_layout_readback(
         &self,
-        physical: SchemaRef,
+        writer: &DeltaFileWriter,
         properties: &arrowcol_props::ResolvedProps,
         table: &BTreeMap<String, String>,
         enabled: bool,
+        mode: SortExecution,
     ) -> Result<()> {
-        let next = LayoutReadback::new(physical, properties, table, enabled)?;
+        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+        let event = LayoutReadback::new(physical, properties, table, enabled, mode)?
+            .event(&self.url, &writer.parquet.properties)?;
         let mut previous = self
             .layout_readback
             .lock()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        if previous.as_ref() != Some(&next) {
-            let event = next.event(&self.url, crate::writer::process_config()?)?;
+        if previous.as_ref() != Some(&event) {
             eprintln!("arrowcol_effective_config {event}");
             tracing::info!(
                 component = "layout",
                 effective_config = %event,
                 "arrowcol_effective_config"
             );
-            *previous = Some(next);
+            *previous = Some(event);
         }
         Ok(())
     }
 
     fn existing_snapshot(&self) -> Result<Option<SnapshotRef>> {
+        Ok(self.existing_snapshot_with_lineage()?.map(|(snapshot, _)| snapshot))
+    }
+
+    fn existing_snapshot_with_lineage(&self) -> Result<Option<(SnapshotRef, Option<u64>)>> {
+        use std::sync::atomic::Ordering;
         let exists = if self.url.scheme() == "file" {
             self.root.join("_delta_log").exists()
+        } else if self.log_exists.load(Ordering::Acquire) {
+            true
         } else {
             let store = Arc::clone(&self.store);
             let prefix = self.object_path("_delta_log/")?;
-            shared_executor()?.block_on(async move {
+            let found = shared_executor()?.block_on(async move {
                 use futures::StreamExt;
                 store
                     .list(Some(&prefix))
@@ -3166,80 +5049,168 @@ impl DeltaTable {
                     .await
                     .transpose()
                     .map(|entry| entry.is_some())
-            })?
+            })?;
+            if found {
+                self.log_exists.store(true, Ordering::Release);
+            }
+            found
         };
-        if exists { Ok(Some(self.snapshot()?)) } else { Ok(None) }
+        if exists {
+            Ok(Some(self.snapshot_with_lineage()?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
+        self.snapshot_with_lineage().map(|(snapshot, _)| snapshot)
+    }
+
+    /// The latest snapshot and, when it extends the cached chain, the lineage shared by
+    /// every snapshot derived from one certified full build.
+    pub(crate) fn snapshot_with_lineage(&self) -> Result<(SnapshotRef, Option<u64>)> {
         let full_build = || {
             Snapshot::builder_for(self.url.as_str())
                 .build(&self.engine)
                 .map_err(anyhow::Error::new)
         };
-        // Injected stores need not reflect filesystem metadata faithfully.
-        if !self.reuse_snapshots || !cfg!(unix) {
-            return full_build();
+        let checkpoint_aware = self.snapshot_cache_mode == crate::SnapshotCacheMode::CheckpointAware;
+        // Injected local stores need not reflect filesystem metadata faithfully.
+        let can_certify = if self.url.scheme() == "file" {
+            self.reuse_snapshots && cfg!(unix)
+        } else {
+            checkpoint_aware
+        };
+        if !can_certify {
+            return Ok((full_build()?, None));
         }
         let mut cache = self
             .snapshot_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta snapshot cache lock poisoned"))?;
         let previous = cache.take();
-        let before = self.log_fingerprints()?;
-        let base = previous.filter(|previous| {
-            before.as_ref().is_some_and(|files| {
-                previous
-                    .files
-                    .iter()
-                    .all(|(version, fingerprint)| files.get(version) == Some(fingerprint))
-            })
+        let mut floor = previous
+            .as_ref()
+            .and_then(|p| p.snapshot.log_segment().checkpoint_version);
+        let Some(mut before) = self.log_fingerprints(checkpoint_aware, floor)? else {
+            return Ok((full_build()?, None));
+        };
+        if let Some(base) = &previous
+            && checkpoint_aware
+            && before == base.files
+        {
+            let latest = (Arc::clone(&base.snapshot), Some(base.lineage));
+            *cache = previous;
+            return Ok(latest);
+        }
+        // Only plain JSON strictly past the certified version can extend the lineage.
+        // A checkpoint (even at the same version) can replace the replay baseline.
+        let base = previous.filter(|p| {
+            before
+                .iter()
+                .filter(|((v, entry), _)| *v <= p.snapshot.version() || *entry != LogEntry::Commit)
+                .eq(p.files.iter())
         });
-        // JSON-only bases need only the new listing tail. Both integrity scans
-        // still cover all history; a newly appearing checkpoint forces full loading.
-        // No pinned version or connector-supplied freshness is used.
+        if base.is_none() && floor.is_some() && self.snapshot_list_mode == crate::SnapshotListMode::Full {
+            floor = None;
+            let Some(all) = self.log_fingerprints(checkpoint_aware, None)? else {
+                return Ok((full_build()?, None));
+            };
+            before = all;
+        }
         let snapshot = match &base {
             Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot))
                 .skip_new_checkpoints()
                 .build(&self.engine)?,
             None => full_build()?,
         };
-        let after = self.log_fingerprints()?;
-        if let (Some(before), Some(mut after)) = (before, after) {
-            after.retain(|version, _| *version <= snapshot.version());
-            if before.range(..=snapshot.version()).eq(after.iter()) {
-                *cache = Some(CachedSnapshot {
-                    snapshot: Arc::clone(&snapshot),
-                    files: after,
-                });
-                return Ok(snapshot);
+        if self.log_fingerprints(checkpoint_aware, floor)?.as_ref() != Some(&before) {
+            // Mutation during either a full or incremental load: do not publish a
+            // lineage assembled from different generations of the same log.
+            return Ok((full_build()?, None));
+        }
+        let adopted = snapshot.log_segment().checkpoint_version;
+        let version = snapshot.version();
+        let mut commits = 0_u64;
+        before.retain(|key, _| {
+            let retain = key.0 <= version && retained_log_entry(key, adopted);
+            if retain && key.1 == LogEntry::Commit && Some(key.0) != adopted {
+                commits += 1;
             }
+            retain
+        });
+        // A file seen only by Kernel between the two scans must not become a
+        // permanent phantom head. Require the checkpoint and every subsequent JSON.
+        if adopted.is_some_and(|v| !before.contains_key(&(v, LogEntry::Checkpoint)))
+            || Some(commits) != adopted.map_or_else(|| version.checked_add(1), |v| version.checked_sub(v))
+        {
+            return Ok((full_build()?, None));
         }
-        // Mutation during an incremental load invalidates its historical baseline.
-        // Never retain a snapshot with fingerprints captured after that mutation.
-        if base.is_some() {
-            return full_build();
-        }
-        Ok(snapshot)
+        let lineage = base.as_ref().map_or_else(
+            || {
+                self.snapshot_lineages
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            |p| p.lineage,
+        );
+        *cache = Some(CachedSnapshot {
+            snapshot: Arc::clone(&snapshot),
+            files: before,
+            lineage,
+        });
+        Ok((snapshot, Some(lineage)))
     }
 
-    fn log_fingerprints(&self) -> Result<Option<LogFingerprints>> {
+    fn log_fingerprints(&self, checkpoint_aware: bool, floor: Option<u64>) -> Result<Option<LogFingerprints>> {
+        if self.url.scheme() != "file" {
+            let store = Arc::clone(&self.store);
+            let prefix = self.object_path("_delta_log/")?;
+            let offset = match (self.snapshot_list_mode, floor) {
+                (crate::SnapshotListMode::FromCheckpoint, Some(floor)) => {
+                    Some(self.object_path(&format!("_delta_log/{floor:020}"))?)
+                }
+                _ => None,
+            };
+            return shared_executor()?.block_on(async move {
+                use futures::TryStreamExt;
+                let mut files = BTreeMap::new();
+                let mut entries = match &offset {
+                    Some(offset) => store.list_with_offset(Some(&prefix), offset),
+                    None => store.list(Some(&prefix)),
+                };
+                while let Some(meta) = entries.try_next().await? {
+                    let Some(name) = meta.location.filename().filter(|_| {
+                        meta.location
+                            .prefix_match(&prefix)
+                            .is_some_and(|mut parts| parts.nth(1).is_none())
+                    }) else {
+                        return Ok(None);
+                    };
+                    let Some(key) = log_entry(name, checkpoint_aware) else {
+                        return Ok(None);
+                    };
+                    if retained_log_entry(&key, floor) {
+                        let etag = meta.e_tag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/"));
+                        let version = meta.version.filter(|version| !version.is_empty());
+                        if etag.is_none() && version.is_none() {
+                            return Ok(None);
+                        }
+                        files.insert(key, LogFingerprint::Object { etag, version });
+                    }
+                }
+                Ok(Some(files))
+            });
+        }
         let mut files = BTreeMap::new();
         for entry in fs::read_dir(self.root.join("_delta_log"))? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(version) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".json"))
-                .filter(|version| version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit()))
-            else {
-                // Checkpoints, CRCs, and nonstandard log layouts keep the existing
-                // full-build behavior rather than adding cache rules for them.
+            let Some(key) = name.to_str().and_then(|name| log_entry(name, checkpoint_aware)) else {
                 return Ok(None);
             };
-            let Ok(version) = version.parse::<u64>() else {
-                return Ok(None);
-            };
+            if !retained_log_entry(&key, floor) {
+                continue;
+            }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3254,8 +5225,8 @@ impl DeltaTable {
                 (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
             };
             files.insert(
-                version,
-                LogFingerprint {
+                key,
+                LogFingerprint::Local {
                     length: metadata.len(),
                     modified: metadata.modified()?,
                     #[cfg(unix)]
@@ -3267,6 +5238,7 @@ impl DeltaTable {
     }
 
     fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
+        let stats_policy = crate::delta_stats::DeltaStatsPolicy::from_env()?;
         let mut schema_guard = None;
         loop {
             let existing = self.existing_snapshot()?;
@@ -3292,6 +5264,7 @@ impl DeltaTable {
                 None => self.snapshot()?,
             };
             Self::validate_retention(&snapshot)?;
+            self.verify_stats_readback(&snapshot, stats_policy.as_ref())?;
             if !self.partition_columns.is_empty()
                 && snapshot.table_configuration().metadata().partition_columns() != self.partition_columns
             {
@@ -3345,16 +5318,34 @@ impl DeltaTable {
     }
 
     fn create_schema(&self, incoming: SchemaRef, fresh_fence: Option<Arc<dyn PublicationFence>>) -> Result<()> {
+        self.create_schema_with_properties(incoming, fresh_fence, &InitialDeltaProperties::default())
+    }
+
+    fn create_schema_with_properties(
+        &self,
+        incoming: SchemaRef,
+        fresh_fence: Option<Arc<dyn PublicationFence>>,
+        initial: &InitialDeltaProperties,
+    ) -> Result<()> {
+        let mut properties = initial.properties()?;
+        let stats_policy = crate::delta_stats::DeltaStatsPolicy::from_env()?;
+        if let Some(policy) = &stats_policy {
+            policy.validate_schema(&incoming)?;
+        }
         let schema = Arc::new(StructType::try_from_arrow(incoming)?);
         let mut builder =
             delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake");
+        if let Some(policy) = &stats_policy {
+            builder = builder.with_table_properties(policy.properties());
+            properties.extend(policy.properties());
+        }
         if !self.partition_columns.is_empty() {
             builder = builder.with_data_layout(delta_kernel::transaction::data_layout::DataLayout::partitioned(
                 self.partition_columns.clone(),
             ));
         }
         let strict = fresh_fence.is_some();
-        let committer: Box<dyn Committer> = if let Some(fence) = fresh_fence {
+        let mut committer: Box<dyn Committer> = if let Some(fence) = fresh_fence {
             Box::new(FreshSchemaCommitter {
                 inner: GuardedCommitter {
                     session: self.session.clone(),
@@ -3365,6 +5356,16 @@ impl DeltaTable {
         } else {
             self.committer()
         };
+        if initial.target_file_size_bytes.is_some() || initial.checkpoint_interval.is_some() {
+            // Kernel's CREATE allowlist excludes these protocol-neutral properties.
+            // Reuse catalog's validated pre-publication metadata augmentation.
+            committer = Box::new(crate::catalog::MetadataCommitter {
+                inner: committer,
+                properties,
+                comment: None,
+                merge_properties: true,
+            });
+        }
         let transaction = builder.build(&self.engine, committer)?;
         let result = transaction.commit(&self.engine)?;
         if strict {
@@ -3378,6 +5379,45 @@ impl DeltaTable {
                 }
             }
         }
+        self.verify_stats_readback(&self.snapshot()?, stats_policy.as_ref())?;
+        Ok(())
+    }
+
+    fn verify_stats_readback(
+        &self,
+        snapshot: &SnapshotRef,
+        policy: Option<&crate::delta_stats::DeltaStatsPolicy>,
+    ) -> Result<()> {
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+        let schema: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
+        policy.validate_schema(&schema)?;
+        let metadata = snapshot.table_configuration().metadata();
+        let properties = metadata
+            .configuration()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        policy.verify_metadata(&properties)?;
+        let properties = properties
+            .into_iter()
+            .filter(|(key, _)| key == crate::delta_stats::COLUMNS_PROPERTY || key == crate::delta_stats::COUNT_PROPERTY)
+            .collect::<BTreeMap<_, _>>();
+        let next = (metadata.id().to_owned(), properties.clone());
+        let mut previous = self.stats_readback.lock().map_err(|error| anyhow::anyhow!("{error}"))?;
+        if previous.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        let event = serde_json::json!({
+            "scope": "committed_table_metadata",
+            "table_name": telemetry_table_name(&self.url),
+            "table_id": metadata.id(),
+            "version": snapshot.version(),
+            "properties": properties,
+        });
+        eprintln!("arrowcol_delta_stats_config {event}");
+        *previous = Some(next);
         Ok(())
     }
 
@@ -3432,22 +5472,26 @@ impl DeltaTable {
                 .collect()
         });
         let properties = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized)?)?;
-        let layout = publication_layout(&normalized, &properties)?;
+        let mode = collector_sort_execution()?;
+        let layout = collector_publication_layout(&normalized, &properties, mode)?;
         let enabled = layout.is_some();
         let partitioned = self.partition_columns == [INGESTION_PARTITION];
         let granularity = properties.text("arrowcol.partition.granularity")?;
-        let writer =
-            self.new_file_with_publication_policy(input, app_id, version, stamp, layout, partitioned, granularity)?;
+        let writer = self.new_file_with_publication_policy(
+            input,
+            app_id,
+            version,
+            stamp,
+            layout,
+            mode,
+            partitioned,
+            granularity,
+        )?;
         if writer.table_properties != table_properties {
             writer.discard_empty()?;
             bail!("table properties changed while preparing publication; retry with refreshed policy");
         }
-        self.record_layout_readback(
-            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-            &properties,
-            &table_properties,
-            enabled,
-        )?;
+        self.record_layout_readback(&writer, &properties, &table_properties, enabled, mode)?;
         Ok(writer)
     }
 
@@ -3483,6 +5527,7 @@ impl DeltaTable {
             version,
             stamp,
             layout,
+            SortExecution::Concatenate,
             partitioned,
             properties.text("arrowcol.partition.granularity")?,
         )?;
@@ -3501,6 +5546,7 @@ impl DeltaTable {
         version: i64,
         stamp: i64,
         layout: Option<crate::layout::LayoutPolicy>,
+        mode: SortExecution,
         partitioned: bool,
         granularity: &str,
     ) -> Result<DeltaFileWriter> {
@@ -3531,7 +5577,7 @@ impl DeltaTable {
         let mut writer = self.new_file_partitioned_inner(input, values, properties)?;
         if let Some(policy) = layout {
             let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-            writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy)?);
+            writer.sorter = Some(PublicationSorter::new(physical, policy, mode)?);
         }
         writer.with_transaction(app_id, version)?.with_ingestion_time(stamp)
     }
@@ -3557,7 +5603,7 @@ impl DeltaTable {
                 batch,
             )]);
         }
-        let normalized = normalize::batch(&batch)?;
+        let normalized = normalize::batch_with_kernel(&batch, runtime_config()?.timestamp_kernel)?;
         let snapshot = match self.existing_snapshot()? {
             Some(snapshot) => snapshot,
             None => {
@@ -3582,7 +5628,8 @@ impl DeltaTable {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized.schema())?)?;
-        let layout = publication_layout(&normalized.schema(), &resolved)?;
+        let mode = collector_sort_execution()?;
+        let layout = collector_publication_layout(&normalized.schema(), &resolved, mode)?;
         if let Some(policy) = &layout {
             for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
                 if partitions.contains(name) {
@@ -3590,7 +5637,12 @@ impl DeltaTable {
                 }
             }
         }
-        let groups = crate::partition::split(&normalized, partitions)?;
+        let groups = crate::partition::split_with_new_partition(
+            &normalized,
+            partitions,
+            runtime_config()?.partition_grouping,
+            |_| Ok(()),
+        )?;
         let mut files: Vec<(DeltaFileWriter, RecordBatch)> = Vec::with_capacity(groups.len());
         for (batch, values) in groups {
             let result = (|| -> Result<DeltaFileWriter> {
@@ -3607,7 +5659,7 @@ impl DeltaTable {
                 }
                 if let Some(policy) = layout.clone() {
                     let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                    match crate::layout::FileSortBuffer::new(physical, policy) {
+                    match PublicationSorter::new(physical, policy, mode) {
                         Ok(sorter) => writer.sorter = Some(sorter),
                         Err(error) => {
                             writer.discard_empty()?;
@@ -3630,12 +5682,7 @@ impl DeltaTable {
             }
         }
         if let Some((writer, _)) = files.first() {
-            self.record_layout_readback(
-                Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-                &resolved,
-                &table_properties,
-                layout.is_some(),
-            )?;
+            self.record_layout_readback(writer, &resolved, &table_properties, layout.is_some(), mode)?;
         }
         Ok(files)
     }
@@ -3644,6 +5691,8 @@ impl DeltaTable {
         self: &Arc<Self>,
         entries: Vec<(RecordBatch, String, i64, i64)>,
         max_files: usize,
+        concurrency: usize,
+        files_per_group: usize,
     ) -> Result<(
         Vec<StagedAppend>,
         Vec<(String, i64, i64)>,
@@ -3651,12 +5700,74 @@ impl DeltaTable {
         Duration,
         Duration,
     )> {
+        anyhow::ensure!(
+            (1..=16).contains(&concurrency),
+            "stage_file_concurrency must be in 1..=16"
+        );
+        anyhow::ensure!(
+            (1..=16).contains(&files_per_group),
+            "stage_files_per_group must be in 1..=16"
+        );
+        let table = Arc::clone(self);
+        let plan = crate::delta_io::run_cpu_async(move || {
+            let executor = shared_executor()?;
+            let _guard = executor.enter();
+            table.plan_coalesced_publications(entries, max_files, files_per_group)
+        })
+        .await??;
+        let policy = Arc::new(plan.policy);
+        let staged = Arc::new(UnpublishedStages::default());
+        let jobs = plan.output.into_values().flat_map(|partition| {
+            partition
+                .files
+                .into_iter()
+                .map(move |batches| (partition.values.clone(), batches))
+        });
+        let result = stage_bounded(jobs.enumerate(), concurrency, |(index, (values, batches))| {
+            let staged = Arc::clone(&staged);
+            let table = Arc::clone(self);
+            let policy = Arc::clone(&policy);
+            async move {
+                spawn_shared_io(async move {
+                    let append = table.stage_coalesced_file(policy, values, batches, index == 0).await?;
+                    staged
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(index, append);
+                    Ok(())
+                })?
+                .await?
+            }
+        })
+        .await;
+        if let Err(error) = result {
+            spawn_shared_io(UnpublishedStages::reclaim(staged.take()))?.await?;
+            return Err(error);
+        }
+        Ok((
+            staged.take(),
+            plan.identities,
+            plan.committed_identities,
+            plan.build,
+            plan.sort,
+        ))
+    }
+
+    fn plan_coalesced_publications(
+        &self,
+        entries: Vec<(RecordBatch, String, i64, i64)>,
+        max_files: usize,
+        files_per_group: usize,
+    ) -> Result<CoalescedPlan> {
         let preparation_started = Instant::now();
         let mut preparation_sort = Duration::ZERO;
         let Some((first_batch, _, _, _)) = entries.first() else {
             bail!("coalesced publication group requires at least one entry");
         };
-        let snapshot = self.existing_snapshot()?;
+        let (snapshot, lineage) = self
+            .existing_snapshot_with_lineage()?
+            .map_or((None, None), |(snapshot, lineage)| (Some(snapshot), lineage));
         let partitions = snapshot.as_ref().map_or_else(
             || self.partition_columns.clone(),
             |snapshot| snapshot.table_configuration().metadata().partition_columns().to_vec(),
@@ -3670,9 +5781,14 @@ impl DeltaTable {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect()
         });
-        let first = normalize::batch(first_batch)?;
+        let first = normalize::batch_with_kernel(first_batch, runtime_config()?.timestamp_kernel)?;
         let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&first.schema())?)?;
-        let layout = publication_layout(&first.schema(), &resolved)?;
+        let mode = collector_sort_execution()?;
+        let layout = collector_publication_layout(&first.schema(), &resolved, mode)?;
+        anyhow::ensure!(
+            files_per_group == 1 || layout.is_none(),
+            "stage_files_per_group > 1 is only supported for unsorted layouts; sorted layouts use their row and byte limits"
+        );
         if let Some(policy) = &layout {
             for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
                 if partitions.contains(name) {
@@ -3682,6 +5798,29 @@ impl DeltaTable {
         }
         let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
         let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
+        let runtime = runtime_config()?;
+        // Entry identities are their application IDs here, so one lookup serves the group.
+        let prefetched = match &snapshot {
+            Some(snapshot)
+                if self.preflight_lookup_mode == crate::PreflightLookupMode::Grouped
+                    && (partitions.is_empty() || partitions == [INGESTION_PARTITION]) =>
+            {
+                let mut ids = entries
+                    .iter()
+                    .map(|(_, app_id, _, _)| app_id.as_str())
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids.dedup();
+                let found = self.publication_versions(snapshot, lineage, &ids)?;
+                Some(
+                    found
+                        .into_iter()
+                        .map(|(id, version)| (id.to_owned(), version))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+            }
+            _ => None,
+        };
         let mut identities = Vec::with_capacity(entries.len());
         let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
@@ -3694,13 +5833,15 @@ impl DeltaTable {
             if stamp < 0 || !unique.insert(app_id.clone()) {
                 bail!("invalid or duplicate coalesced publication identity");
             }
-            batch = normalize::batch(&batch)?;
+            batch = normalize::batch_with_kernel(&batch, runtime_config()?.timestamp_kernel)?;
             let identity_schema = batch.schema();
             let expected_ingestion = if partitioned_ingestion {
                 Some(format_ingestion_partition(stamp, &granularity)?)
             } else {
                 None
             };
+            let mut generated_ingestion = false;
+            let mut proof = None;
             if let Some(expected) = &expected_ingestion
                 && batch.schema().field_with_name(INGESTION_PARTITION).is_err()
             {
@@ -3716,6 +5857,12 @@ impl DeltaTable {
                     batch.num_rows()
                 ])));
                 batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
+                generated_ingestion = true;
+                if runtime.generated_partition_binding == crate::GeneratedPartitionBinding::ProvenConstant
+                    && partitions == [INGESTION_PARTITION]
+                {
+                    proof = Some(GeneratedIngestion(Arc::from(expected.as_str())));
+                }
             }
             if let Some(schema) = &schema {
                 if schema.as_ref() != batch.schema().as_ref() {
@@ -3740,11 +5887,14 @@ impl DeltaTable {
                     } else {
                         crate::partition::publication_id(&app_id, values, identity_schema.as_ref())?
                     };
-                    let previous = snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
-                        .transpose()?
-                        .flatten();
+                    let previous = match prefetched.as_ref().and_then(|found| found.get(&identity)) {
+                        Some(&found) => found,
+                        None => snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
+                            .transpose()?
+                            .flatten(),
+                    };
                     if let Some(previous) = previous
                         && previous > version
                     {
@@ -3773,7 +5923,13 @@ impl DeltaTable {
                     register_partition(&values)?;
                     vec![(batch, values)]
                 } else {
-                    crate::partition::split_with_new_partition(&batch, &partitions, &mut register_partition)?
+                    crate::partition::split_with_generated_partition(
+                        &batch,
+                        &partitions,
+                        (runtime.generated_partition_fast_path && generated_ingestion).then_some(INGESTION_PARTITION),
+                        runtime.partition_grouping,
+                        &mut register_partition,
+                    )?
                 }
             };
             if splits.is_empty() && batch_rows == 0 && !partitions.is_empty() {
@@ -3786,6 +5942,7 @@ impl DeltaTable {
                 if let Some(previous) = previous
                     && previous == version
                 {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     committed_identities.push((identity, version, stamp));
                     continue;
                 }
@@ -3822,7 +5979,7 @@ impl DeltaTable {
                             .context("coalesced output file count overflow")?;
                     }
                     let rows = batch.num_rows();
-                    partition.files[0].push(batch);
+                    partition.files[0].push((batch, proof.clone()));
                     partition.file_rows[0] = partition.file_rows[0]
                         .checked_add(rows)
                         .context("coalesced partition row count overflow")?;
@@ -3851,7 +6008,14 @@ impl DeltaTable {
                     let row_capacity = policy.max_rows.saturating_sub(partition.file_rows[file]);
                     let byte_capacity = policy.max_input_bytes.saturating_sub(partition.file_bytes[file]);
                     let sort_started = Instant::now();
-                    let chunk = fitting_sort_chunk(&batch, start, row_capacity, byte_capacity);
+                    let chunk = fitting_sort_chunk(
+                        &batch,
+                        start,
+                        row_capacity,
+                        byte_capacity,
+                        runtime.layout_detach_ratio,
+                        runtime.layout_detach_kernel,
+                    );
                     preparation_sort += sort_started.elapsed();
                     let chunk = chunk?;
                     let Some(chunk) = chunk else {
@@ -3882,12 +6046,29 @@ impl DeltaTable {
                     partition.file_bytes[file] = partition.file_bytes[file]
                         .checked_add(bytes)
                         .context("coalesced partition memory count overflow")?;
-                    partition.files[file].push(chunk);
+                    partition.files[file].push((chunk, proof.clone()));
                     start += rows;
                 }
             }
         }
         let schema = schema.context("coalesced publication has no input schema")?;
+        if files_per_group > 1 {
+            planned_files = output
+                .values()
+                .try_fold(0_usize, |total, partition| {
+                    total.checked_add(partition.file_rows[0].min(files_per_group))
+                })
+                .context("coalesced output file count overflow")?;
+            if planned_files > max_files {
+                return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                    required_files: planned_files,
+                    max_files,
+                }));
+            }
+            for partition in output.values_mut() {
+                partition.split_unsorted(files_per_group)?;
+            }
+        }
         let counted_files = output
             .values()
             .try_fold(0_usize, |total, partition| total.checked_add(partition.files.len()))
@@ -3912,55 +6093,115 @@ impl DeltaTable {
         if identities.is_empty() && committed_identities.is_empty() {
             bail!("coalesced publications produced no replay identities");
         }
+        let group_snapshot = if self.stage_snapshot_mode == crate::StageSnapshotMode::PerGroup && planned_files > 1 {
+            let snapshot = self.ensure_schema(Arc::clone(&schema))?;
+            let config = snapshot.table_configuration();
+            let definition = Arc::new(StagedDefinition {
+                metadata: config.metadata().clone(),
+                protocol: config.protocol().clone(),
+            });
+            Some(GroupStageSnapshot { snapshot, definition })
+        } else {
+            None
+        };
         let preparation_build = preparation_started.elapsed().saturating_sub(preparation_sort);
-        let mut staged = Vec::with_capacity(planned_files);
-        for partition in output.into_values() {
-            for batches in partition.files {
-                let properties = layout
-                    .as_ref()
-                    .map(|policy| policy.writer_properties(&physical_writer_schema(&schema, &partition.values)))
-                    .transpose()?;
-                let result = async {
-                    let mut writer =
-                        self.new_file_bound(Arc::clone(&schema), partition.values.clone(), properties, true)?;
-                    if writer.table_properties != table_properties {
-                        writer.discard_empty()?;
-                        bail!("table properties changed while preparing coalesced publication; retry");
-                    }
-                    if let Some(policy) = &layout {
-                        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                        writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
-                    }
-                    if staged.is_empty() {
-                        self.record_layout_readback(
-                            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-                            &resolved,
-                            &table_properties,
-                            layout.is_some(),
-                        )?;
-                    }
-                    for batch in &batches {
-                        writer.write(batch).await?;
-                    }
-                    writer.stage().await
-                }
-                .await;
-                match result {
-                    Ok(append) => staged.push(append),
-                    Err(error) => {
-                        self.reclaim_unsubmitted(&staged);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        Ok((
-            staged,
+        Ok(CoalescedPlan {
+            output,
+            policy: CoalescedStagePolicy {
+                schema,
+                group_snapshot,
+                table_properties,
+                resolved,
+                layout,
+                mode,
+            },
             identities,
             committed_identities,
-            preparation_build,
-            preparation_sort,
-        ))
+            build: preparation_build,
+            sort: preparation_sort,
+        })
+    }
+
+    async fn stage_coalesced_file(
+        self: &Arc<Self>,
+        policy: Arc<CoalescedStagePolicy>,
+        values: crate::partition::PartitionValues,
+        batches: Vec<(RecordBatch, Option<GeneratedIngestion>)>,
+        first: bool,
+    ) -> Result<StagedAppend> {
+        let table = Arc::clone(self);
+        let group_definition = policy
+            .group_snapshot
+            .as_ref()
+            .map(|group| Arc::clone(&group.definition));
+        let writer = crate::delta_io::run_cpu_async(move || {
+            let executor = shared_executor()?;
+            let _guard = executor.enter();
+            let properties = policy
+                .layout
+                .as_ref()
+                .map(|layout| layout.writer_properties(&physical_writer_schema(&policy.schema, &values)))
+                .transpose()?;
+            let mut writer = if let Some(group) = &policy.group_snapshot {
+                table.new_file_from_snapshot(&group.snapshot, values, properties, true)?
+            } else {
+                table.new_file_bound(Arc::clone(&policy.schema), values, properties, true)?
+            };
+            let configured = (|| -> Result<()> {
+                anyhow::ensure!(
+                    writer.table_properties == policy.table_properties,
+                    "table properties changed while preparing coalesced publication; retry"
+                );
+                if let Some(layout) = &policy.layout {
+                    let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                    writer.sorter = Some(PublicationSorter::new(physical, layout.clone(), policy.mode)?);
+                }
+                if first {
+                    table.record_layout_readback(
+                        &writer,
+                        &policy.resolved,
+                        &policy.table_properties,
+                        policy.layout.is_some(),
+                        policy.mode,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = configured {
+                writer.discard_empty()?;
+                return Err(error);
+            }
+            Ok(writer)
+        })
+        .await??;
+        let local = writer.parquet.path.clone();
+        let result = async {
+            let mut writer = writer;
+            for (batch, proof) in batches {
+                let (mut prepared_writer, prepared) = crate::delta_io::run_cpu_async(move || {
+                    let prepared = writer.prepare_batch(&batch, proof.as_ref());
+                    (writer, prepared)
+                })
+                .await?;
+                prepared_writer.encode_batch(prepared?).await?;
+                writer = prepared_writer;
+            }
+            let mut append = writer.stage().await?;
+            append.group_definition = group_definition;
+            Ok(append)
+        }
+        .await;
+        if result.is_err() {
+            // No transaction ever received this writer. Don't assume ownership
+            // of a remote object on an ambiguous upload failure.
+            if let Err(error) = self.remove_stage_local(&local).await {
+                tracing::warn!(
+                    failure = cleanup_failure_class(&error),
+                    "failed to reclaim incomplete stage"
+                );
+            }
+        }
+        result
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
@@ -4021,9 +6262,19 @@ impl DeltaTable {
         canonical_input: bool,
     ) -> Result<DeltaFileWriter> {
         let snapshot = self.ensure_schema(normalized)?;
+        self.new_file_from_snapshot(&snapshot, values, properties, canonical_input)
+    }
+
+    fn new_file_from_snapshot(
+        self: &Arc<Self>,
+        snapshot: &SnapshotRef,
+        values: BTreeMap<String, Option<String>>,
+        properties: Option<WriterProperties>,
+        canonical_input: bool,
+    ) -> Result<DeltaFileWriter> {
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
         let kernel_schema = snapshot.schema();
-        let transaction = Arc::clone(&snapshot).transaction(self.committer(), &self.engine)?;
+        let transaction = Arc::clone(snapshot).transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
         let mut builder = state.write_context_builder();
         if !values.is_empty() {
@@ -4043,6 +6294,11 @@ impl DeltaTable {
             builder = builder.with_partition_values(typed);
         }
         let context = builder.build()?;
+        let mapping = if runtime_config()?.file_mapping_cache {
+            Some(FileMapping::new(&schema, &context, &self.engine)?)
+        } else {
+            None
+        };
         let mut directory = self.root.clone();
         for (name, value) in &values {
             let value = value.as_deref().unwrap_or("__HIVE_DEFAULT_PARTITION__");
@@ -4052,12 +6308,28 @@ impl DeltaTable {
                 crate::partition::component(value)
             ));
         }
-        fs::create_dir_all(&directory)?;
         let path = directory.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));
         let physical = Arc::new(context.physical_data_schema().as_ref().try_into_arrow()?);
-        let parquet = ParquetFileWriter::create_with_properties(path, physical, properties)?;
+        let parquet = if self.url.scheme() != "file" && runtime_config()?.staging_mode == crate::StagingMode::Streaming
+        {
+            let relative = path
+                .strip_prefix(&self.root)?
+                .to_str()
+                .context("invalid data file path")?;
+            let destination = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
+            ParquetFileWriter::streaming(
+                path,
+                physical,
+                properties,
+                streaming_sink::StreamingSink::new(Arc::clone(self), destination),
+            )?
+        } else {
+            fs::create_dir_all(&directory)?;
+            ParquetFileWriter::create_with_codec_evidence(path, physical, properties)?
+        };
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(DeltaFileWriter {
+            mapping,
             table: Arc::clone(self),
             schema,
             context,
@@ -4116,7 +6388,7 @@ impl DeltaTable {
 
     #[cfg(test)]
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
-        self.commit_files_timed(files).map(|(version, _, _)| version)
+        self.commit_files_timed(files).map(|(version, _, _, _)| version)
     }
 
     pub(crate) fn commit_files_timed(&self, files: &[StagedAppend]) -> TimedCommitResult {
@@ -4142,18 +6414,24 @@ impl DeltaTable {
     /// # Errors
     /// Rejects stale/fenced identities, changed schemas and exhausted collision budgets.
     pub fn commit_files_with_transaction(&self, files: &[StagedAppend], app_id: &str, version: i64) -> Result<u64> {
-        validate_transaction_id(app_id, version)?;
-        self.commit_files_inner(files, Some((app_id, version)), &[])
+        self.commit_files_with_transaction_evidence(files, app_id, version)
+            .map(|(head, _)| head)
     }
 
-    fn commit_files_inner(
+    /// Publish with a stable identity and return per-identity evidence separately from the observed head.
+    ///
+    /// # Errors
+    /// Returns validation, fencing, durability, or publication errors. Publication errors
+    /// carry a downcastable [PublicationEvidence] alongside their original cause.
+    pub fn commit_files_with_transaction_evidence(
         &self,
         files: &[StagedAppend],
-        identity: Option<(&str, i64)>,
-        groups: &[CoalescedCommitGroup],
-    ) -> Result<u64> {
-        self.commit_files_inner_timed(files, identity, groups)
-            .map(|(version, _, _)| version)
+        app_id: &str,
+        version: i64,
+    ) -> Result<(u64, PublicationEvidence)> {
+        validate_transaction_id(app_id, version)?;
+        self.commit_files_inner_timed(files, Some((app_id, version)), &[])
+            .map(|(head, _, _, evidence)| (head, evidence))
     }
 
     fn commit_files_inner_timed(
@@ -4162,9 +6440,36 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> TimedCommitResult {
-        let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
+        let ids = identity
+            .into_iter()
+            .chain(
+                groups
+                    .iter()
+                    .flat_map(|g| g.identities.iter().map(|(id, v, _)| (id.as_str(), *v))),
+            )
+            .chain(
+                files
+                    .iter()
+                    .filter_map(|a| a.publication.as_ref().map(|(id, v)| (id.as_str(), *v))),
+            );
+        let mut evidence = PublicationEvidence::new(ids.clone());
+        let ids = ids
+            .map(|(id, _)| id)
+            .chain([PURGE_WATERMARK])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (version, commit_duration, file_observations) =
+            match self.publish_files(files, identity, groups, &ids, &mut evidence) {
+                Ok(result) => result,
+                Err(error) => {
+                    evidence.fail(PublicationReason::Error);
+                    let message = error.to_string();
+                    return Err(error.context(evidence).context(message));
+                }
+            };
         self.reclaim_unsubmitted(files);
-        Ok((version, commit_duration, file_observations))
+        Ok((version, commit_duration, file_observations, evidence))
     }
 
     /// After a successful publication call, delete staged files that no commit attempt
@@ -4175,45 +6480,97 @@ impl DeltaTable {
     /// and counted as `orphan_cleanup_failed`, and the file stays on disk.
     fn reclaim_unsubmitted(&self, files: &[StagedAppend]) {
         for append in files {
-            // Only this table's own stages fall under its cleanup guard: a foreign stage
-            // (another table, possibly nested under this root) keeps its state and file.
-            if append.table.url != self.url {
-                continue;
+            if let Some(relative) = append.claim_reclaim_for(self) {
+                let table = Arc::clone(&append.table);
+                let path = append.file.path.clone();
+                Self::report_reclaim(
+                    shared_executor()
+                        .and_then(|io| io.block_on(async move { table.remove_unsubmitted(&path, &relative).await })),
+                );
             }
-            let Some(relative) = append
-                .file
-                .path
-                .strip_prefix(&self.root)
-                .ok()
-                .and_then(Path::to_str)
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if !append.claim_reclaim() {
-                continue;
+        }
+    }
+
+    async fn remove_stage_local(&self, path: &Path) -> Result<()> {
+        if self.url.scheme() == "file" {
+            self.check_publication_async().await?;
+        }
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn remove_unsubmitted(&self, local: &Path, relative: &str) -> Result<()> {
+        let url = self.staged_url(relative)?;
+        self.remove_stage_local(local).await?;
+        if self.url.scheme() == "file" {
+            if let Some(parent) = local.parent() {
+                let parent = parent.to_path_buf();
+                shared_executor()?
+                    .spawn_blocking(move || sync_directory(&parent))
+                    .await??;
             }
-            let reclaimed = (|| -> Result<()> {
-                let url = self.staged_url(&relative)?;
-                self.discard_output(&append.file.path, &url, self.url.scheme() != "file")?;
-                if self.url.scheme() == "file"
-                    && let Some(parent) = append.file.path.parent()
-                {
-                    sync_directory(parent)?;
-                }
-                Ok(())
-            })();
-            match reclaimed {
-                Ok(()) => crate::telemetry::publication_event("orphan_reclaimed"),
-                Err(error) => {
-                    crate::telemetry::publication_event("orphan_cleanup_failed");
-                    // Paths and error text can carry storage URLs or service responses;
-                    // only a fixed failure class leaves this boundary.
-                    tracing::warn!(
-                        failure = cleanup_failure_class(&error),
-                        "deduplicated staged file retained: cleanup failed"
-                    );
-                }
+        } else {
+            let path = object_store::path::Path::from_url_path(url.path())?;
+            self.check_publication_async().await?;
+            match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn report_reclaim(reclaimed: Result<()>) {
+        match reclaimed {
+            Ok(()) => crate::telemetry::publication_event("orphan_reclaimed"),
+            Err(error) => {
+                crate::telemetry::publication_event("orphan_cleanup_failed");
+                // Paths and error text can carry storage URLs or service responses;
+                // only a fixed failure class leaves this boundary.
+                tracing::warn!(
+                    failure = cleanup_failure_class(&error),
+                    "deduplicated staged file retained: cleanup failed"
+                );
+            }
+        }
+    }
+
+    fn publication_versions<'a>(
+        &self,
+        snapshot: &SnapshotRef,
+        lineage: Option<u64>,
+        ids: &[&'a str],
+    ) -> Result<std::collections::HashMap<&'a str, Option<i64>>> {
+        match self.txn_lookup_mode {
+            TxnLookupMode::PerId => ids
+                .iter()
+                .map(|&id| Ok((id, snapshot.get_app_id_version(id, &self.engine)?)))
+                .collect(),
+            TxnLookupMode::Batched => Ok(crate::publication_lookup::get_app_id_versions(
+                snapshot,
+                &self.engine,
+                ids.iter().copied(),
+            )?),
+            TxnLookupMode::BatchedCached => Ok(self
+                .publication_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication cache poisoned"))?
+                .lookup(snapshot, &self.engine, ids)?),
+            TxnLookupMode::Incremental => {
+                let mut index = self
+                    .txn_index
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("transaction index poisoned"))?;
+                Ok(crate::publication_lookup::TxnIndex::lookup(
+                    &mut index,
+                    snapshot,
+                    lineage,
+                    &self.engine,
+                    ids,
+                )?)
             }
         }
     }
@@ -4223,26 +6580,58 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> TimedCommitResult {
+        ids: &[&str],
+        evidence: &mut PublicationEvidence,
+    ) -> Result<PublishedFiles> {
         let mut observation = crate::telemetry::PublicationObservation::start();
+        let mut lock_timer = crate::telemetry::PublicationLockTimer::start();
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
+        lock_timer.acquired();
         let started = Instant::now();
-        for attempt in 0..8 {
+        for attempt in 0..self.commit_attempts {
+            if attempt != 0 {
+                evidence.mark(PublicationReason::Retry);
+                crate::telemetry::mark_terminal_commit_incomplete();
+            }
+            for outcome in evidence.outcomes.values_mut() {
+                *outcome = PublicationOutcome::Unknown(PublicationReason::NotSubmitted);
+            }
             observation.event("attempt");
             self.check_publication()?;
-            let snapshot = self.snapshot()?;
+            let (snapshot, lineage) = crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())?;
             Self::validate_retention(&snapshot)?;
+            let versions =
+                crate::telemetry::publication_phase("lookup", || self.publication_versions(&snapshot, lineage, ids))?;
+            let replay = |id: &str, v: i64, evidence: &mut PublicationEvidence| {
+                evidence.mark(PublicationReason::Deduplicated);
+                let proven = self
+                    .publication_cache
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.proven(&snapshot, id, v));
+                evidence.outcomes.insert(
+                    (id.to_owned(), v),
+                    proven.map_or(
+                        PublicationOutcome::Unknown(PublicationReason::NoCommitProvenance),
+                        PublicationOutcome::AlreadyCommitted,
+                    ),
+                );
+            };
             if let Some((app_id, version)) = identity
-                && let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)?
+                && let Some(previous) = versions[app_id]
             {
                 if previous > version {
+                    evidence.fail(PublicationReason::Fenced);
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
-                    self.sync_replayed_local_state(snapshot.version())?;
+                    replay(app_id, version, evidence);
+                    crate::telemetry::mark_terminal_commit_incomplete();
+                    crate::telemetry::publication_phase("sync", || self.sync_replayed_local_state(snapshot.version()))
+                        .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                     observation.finish("deduplicated");
                     return Ok((snapshot.version(), None, Vec::new()));
                 }
@@ -4253,7 +6642,7 @@ impl DeltaTable {
             let mut skipped = std::collections::HashSet::new();
             let mut group_pending_indices = std::collections::HashSet::new();
             let mut group_transaction_ids = Vec::new();
-            let purge_before = snapshot.get_app_id_version(PURGE_WATERMARK, &self.engine)?;
+            let purge_before = versions[PURGE_WATERMARK];
             let mut previous_end = 0;
             for group in groups {
                 if group.start < previous_end
@@ -4271,22 +6660,27 @@ impl DeltaTable {
                     if *stamp < 0 || !group_ids.insert(app_id.as_str()) {
                         bail!("invalid or duplicate coalesced publication identity");
                     }
-                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                    if let Some(previous) = versions[app_id.as_str()] {
                         if previous > *version {
+                            evidence.fail(PublicationReason::Fenced);
                             bail!("publication transaction fenced by newer application version");
                         }
                         if previous == *version {
+                            replay(app_id, *version, evidence);
                             committed += 1;
                         }
                     }
                 }
                 if committed != 0 && committed != group.identities.len() {
+                    evidence.fail(PublicationReason::PartialGroup);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     return Err(anyhow::Error::new(PartialPublicationGroup {
                         committed,
                         total: group.identities.len(),
                     }));
                 }
                 if committed == group.identities.len() {
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     skipped.extend(group.start..group.end);
                     continue;
                 }
@@ -4294,6 +6688,7 @@ impl DeltaTable {
                     if let Some(cutoff) = purge_before
                         && *stamp < cutoff
                     {
+                        evidence.fail(PublicationReason::Fenced);
                         bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
                     }
                 }
@@ -4313,11 +6708,14 @@ impl DeltaTable {
                     if !identities.insert(app_id.as_str()) {
                         bail!("duplicate application identity in commit");
                     }
-                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                    if let Some(previous) = versions[app_id.as_str()] {
                         if previous > *version {
+                            evidence.fail(PublicationReason::Fenced);
                             bail!("publication transaction fenced by newer application version");
                         }
                         if previous == *version {
+                            replay(app_id, *version, evidence);
+                            crate::telemetry::mark_terminal_commit_incomplete();
                             continue;
                         }
                     }
@@ -4325,13 +6723,17 @@ impl DeltaTable {
                 if let (Some(stamp), Some(cutoff)) = (append.ingested_at_ms, purge_before)
                     && stamp < cutoff
                 {
+                    evidence.fail(PublicationReason::Fenced);
                     bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
                 }
                 pending.push(append);
                 pending_indices.push(index);
             }
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
-                self.sync_replayed_local_state(snapshot.version())?;
+                evidence.mark(PublicationReason::Deduplicated);
+                crate::telemetry::mark_terminal_commit_incomplete();
+                crate::telemetry::publication_phase("sync", || self.sync_replayed_local_state(snapshot.version()))
+                    .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
                 observation.finish("deduplicated");
                 return Ok((snapshot.version(), None, Vec::new()));
             }
@@ -4339,6 +6741,12 @@ impl DeltaTable {
             // reclaim of the same borrowed stage either already won (refused here) or
             // must keep it.
             for append in &pending {
+                if let Some(definition) = &append.group_definition {
+                    let current = snapshot.table_configuration();
+                    if &definition.metadata != current.metadata() || &definition.protocol != current.protocol() {
+                        bail!("table metadata or protocol changed after group staging; retry the publication");
+                    }
+                }
                 append.claim_submission()?;
             }
             let (rows, input_bytes, parquet_bytes, min_ingested_at_ms, max_ingested_at_ms) = pending.iter().try_fold(
@@ -4373,6 +6781,7 @@ impl DeltaTable {
             let table_name = telemetry_table_name(&self.url);
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
+            let table_uuid = snapshot.table_configuration().metadata().id().to_owned();
             let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
             let mut transaction = snapshot
                 .transaction(self.committer(), &self.engine)?
@@ -4382,6 +6791,7 @@ impl DeltaTable {
             if !pending.is_empty() {
                 transaction = transaction.with_blind_append();
             }
+            let mut deferred_directories = std::collections::BTreeSet::new();
             for append in &pending {
                 if append.table.url != self.url || canonical != *append.schema {
                     bail!("table or schema changed while file was open; file remains uncommitted");
@@ -4392,13 +6802,25 @@ impl DeltaTable {
                     .strip_prefix(&self.root)?
                     .to_str()
                     .context("invalid data file path")?;
+                if append.table.local_directory_sync_policy == crate::LocalDirectorySyncPolicy::BeforeCommit
+                    && self.url.scheme() == "file"
+                {
+                    for dir in append.file.path.ancestors().skip(1) {
+                        if !deferred_directories.insert(dir) || dir == self.root {
+                            break;
+                        }
+                    }
+                }
                 let url = self.staged_url(relative)?;
-                let modified = i64::try_from(
-                    fs::metadata(&append.file.path)?
-                        .modified()?
-                        .duration_since(UNIX_EPOCH)?
-                        .as_millis(),
-                )?;
+                let modified = match append.remote_modified {
+                    Some(modified) => modified,
+                    None => i64::try_from(
+                        fs::metadata(&append.file.path)?
+                            .modified()?
+                            .duration_since(UNIX_EPOCH)?
+                            .as_millis(),
+                    )?,
+                };
                 let metadata =
                     DataFileMetadata::new(FileMeta::new(url, modified, append.file.bytes), append.stats.clone());
                 transaction.add_files(build_add_file_metadata(metadata, &append.context)?);
@@ -4417,6 +6839,16 @@ impl DeltaTable {
             if let Some((app_id, version)) = identity {
                 transaction = transaction.with_transaction_id(app_id.to_owned(), version);
             }
+            if !deferred_directories.is_empty() {
+                // Reverse component order puts every child before its parent.
+                crate::telemetry::publication_phase("sync", || {
+                    deferred_directories.into_iter().rev().try_for_each(sync_directory)
+                })
+                .inspect_err(|_| {
+                    evidence.fail(PublicationReason::SyncFailed);
+                    crate::telemetry::mark_terminal_commit_incomplete();
+                })?;
+            }
             if let Some(publication_fence) = &self.publication_fence {
                 publication_fence
                     .check_before_commit(&PublicationFenceContext {
@@ -4425,6 +6857,7 @@ impl DeltaTable {
                         proposed_version,
                         file_count: files.len(),
                     })
+                    .inspect_err(|_| evidence.fail(PublicationReason::Fenced))
                     .map_err(anyhow::Error::new)?;
             }
             let identifiable = identity.is_some()
@@ -4432,10 +6865,24 @@ impl DeltaTable {
                     .iter()
                     .zip(&pending_indices)
                     .all(|(append, index)| append.publication.is_some() || group_pending_indices.contains(index));
-            let reconcile = || -> Result<Option<u64>> {
-                let latest = self
-                    .snapshot()
-                    .context("unknown publication outcome; reconciliation failed")?;
+            if !identifiable {
+                evidence.mark(PublicationReason::Unidentifiable);
+                crate::telemetry::mark_terminal_commit_incomplete();
+            }
+            let submitted = group_transaction_ids
+                .iter()
+                .map(|(id, v, _)| (id.as_str(), *v))
+                .chain(
+                    pending
+                        .iter()
+                        .filter_map(|a| a.publication.as_ref().map(|(id, v)| (id.as_str(), *v))),
+                )
+                .chain(identity)
+                .collect::<Vec<_>>();
+            let reconcile = |evidence: &mut PublicationEvidence| -> Result<Option<u64>> {
+                let (latest, latest_lineage) =
+                    crate::telemetry::publication_phase("snapshot", || self.snapshot_with_lineage())
+                        .context("unknown publication outcome; reconciliation failed")?;
                 Self::validate_retention(&latest)?;
                 let mut ids = pending
                     .iter()
@@ -4457,9 +6904,17 @@ impl DeltaTable {
                 let mut group_committed = 0;
                 let group_total = group_transaction_ids.len();
                 let mut all_committed = true;
+                let versions = crate::telemetry::publication_phase("lookup", || {
+                    self.publication_versions(
+                        &latest,
+                        latest_lineage,
+                        &ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                    )
+                })?;
                 for (id, version, is_group) in ids {
-                    match latest.get_app_id_version(id, &self.engine)? {
+                    match versions[id] {
                         Some(previous) if previous > version => {
+                            evidence.fail(PublicationReason::Fenced);
                             bail!("publication transaction fenced by newer application version")
                         }
                         Some(previous) if previous == version => {
@@ -4471,6 +6926,7 @@ impl DeltaTable {
                     }
                 }
                 if group_committed != 0 && group_committed != group_total {
+                    evidence.fail(PublicationReason::PartialGroup);
                     return Err(anyhow::Error::new(PartialPublicationGroup {
                         committed: group_committed,
                         total: group_total,
@@ -4480,7 +6936,9 @@ impl DeltaTable {
                     return Ok(None);
                 }
                 // Visibility is not proof of local durability after an I/O error.
-                self.sync_replayed_local_state(latest.version())?;
+                crate::telemetry::publication_phase("sync", || self.sync_replayed_local_state(latest.version()))
+                    .inspect_err(|_| evidence.fail(PublicationReason::SyncFailed))?;
+                evidence.fail(PublicationReason::Reconciled);
                 crate::telemetry::ambiguous_commit_reconciled(&table_id, table_name.as_deref(), started.elapsed());
                 Ok(Some(latest.version()))
             };
@@ -4489,9 +6947,22 @@ impl DeltaTable {
                 .zip(&pending_indices)
                 .map(|(append, index)| (*index, append.observation()))
                 .collect();
-            match transaction.commit(&self.engine) {
+            match crate::telemetry::publication_phase("commit", || transaction.commit(&self.engine)) {
                 Ok(CommitResult::Committed(commit)) => {
-                    sync_directory(&self.root)?;
+                    crate::telemetry::publication_phase("sync", || sync_directory(&self.root)).inspect_err(|_| {
+                        evidence.fail(PublicationReason::SyncFailed);
+                        crate::telemetry::mark_terminal_commit_incomplete();
+                    })?;
+                    let version = commit.commit_version();
+                    crate::telemetry::record_terminal_commit(&table_id, version, rows, files_count, parquet_bytes);
+                    for &(id, v) in &submitted {
+                        evidence
+                            .outcomes
+                            .insert((id.to_owned(), v), PublicationOutcome::CommittedNow(version));
+                    }
+                    if let Ok(mut cache) = self.publication_cache.lock() {
+                        cache.remember(table_uuid, version, submitted.iter().map(|&(id, v)| (id.to_owned(), v)));
+                    }
                     crate::telemetry::data_commit(
                         commit.commit_version(),
                         rows,
@@ -4511,41 +6982,82 @@ impl DeltaTable {
                         committed_file_observations,
                     ));
                 }
-                Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
+                Ok(CommitResult::Conflicted(_)) => {
+                    evidence.mark(PublicationReason::Conflict);
+                    crate::telemetry::mark_terminal_commit_incomplete();
+                    observation.event("conflict");
+                }
                 Ok(CommitResult::Retryable(retry)) => {
+                    evidence.mark(PublicationReason::RetryableIo);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
                     if !identifiable {
                         bail!("uncertain publication without retry identity: {}", retry.error);
                     }
-                    if let Some(version) = reconcile()? {
+                    if let Some(version) = reconcile(evidence)? {
                         observation.finish("reconciled");
                         return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                 }
                 Err(error) => {
+                    evidence.mark(PublicationReason::Error);
+                    crate::telemetry::mark_terminal_commit_incomplete();
                     // Kernel can surface post-publication I/O as Err, not only Retryable.
                     // A proven transaction is success; an unreadable outcome stays an error.
-                    if identifiable && let Some(version) = reconcile()? {
+                    if identifiable && let Some(version) = reconcile(evidence)? {
                         observation.finish("reconciled");
                         return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                     return Err(error.into());
                 }
             }
-            if started.elapsed() > Duration::from_secs(10) {
+            if started.elapsed() > self.commit_budget {
                 break;
             }
             collision_backoff(attempt);
         }
         observation.finish("exhausted");
-        bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")
+        bail!(
+            "Delta publication collision/retry budget exhausted ({} attempts / {} seconds)",
+            self.commit_attempts,
+            self.commit_budget.as_secs()
+        )
+    }
+}
+
+/// Valid only after alignment to this file's snapshot schema. Never retains batch data.
+struct FileMapping {
+    projection: Vec<usize>,
+    evaluator: Arc<dyn delta_kernel::ExpressionEvaluator>,
+}
+
+impl FileMapping {
+    fn new(schema: &SchemaRef, context: &BoundWriteContext, engine: &LocalEngine) -> Result<Self> {
+        let logical: arrow::datatypes::Schema = context.logical_data_schema().as_ref().try_into_arrow()?;
+        let projection = logical
+            .fields()
+            .iter()
+            .map(|field| schema.index_of(field.name()))
+            .collect::<std::result::Result<_, _>>()?;
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            Arc::clone(context.logical_data_schema()),
+            context.logical_to_physical(),
+            Arc::clone(context.physical_data_schema()).into(),
+        )?;
+        Ok(Self { projection, evaluator })
+    }
+
+    fn physical_batch(&self, aligned: &RecordBatch) -> Result<RecordBatch> {
+        let data = ArrowEngineData::new(aligned.project(&self.projection)?);
+        Ok(self.evaluator.evaluate(&data)?.try_into_record_batch()?)
     }
 }
 
 /// Streaming Delta data file. `finish` closes, syncs, and commits it.
 pub struct DeltaFileWriter {
+    mapping: Option<FileMapping>,
     table: Arc<DeltaTable>,
     pub(crate) schema: SchemaRef,
     pub(crate) context: BoundWriteContext,
@@ -4555,7 +7067,7 @@ pub struct DeltaFileWriter {
     publication: Option<(String, i64)>,
     ingested_at_ms: Option<i64>,
     partition_values: BTreeMap<String, Option<String>>,
-    sorter: Option<crate::layout::FileSortBuffer>,
+    sorter: Option<PublicationSorter>,
     accepted_rows: usize,
     accepted_input_bytes: u64,
     /// Batches are already canonical: validate instead of normalizing again.
@@ -4593,6 +7105,7 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 /// exist.
 #[derive(Debug)]
 pub struct AppendResult {
+    pub evidence: Arc<PublicationEvidence>,
     pub version: u64,
     pub file: CompletedFile,
     pub commit_duration: Option<Duration>,
@@ -4608,12 +7121,15 @@ pub struct FileStageTimings {
     pub upload: Option<Duration>,
 }
 
-/// A durable Parquet file that is not yet visible in a Delta snapshot.
+/// A finished Parquet file not yet visible in a Delta snapshot. Local file contents
+/// are durable; `before_commit` defers directory-entry durability until publication.
 pub struct StagedAppend {
     pub(crate) table: Arc<DeltaTable>,
+    group_definition: Option<Arc<StagedDefinition>>,
     pub(crate) schema: SchemaRef,
     context: BoundWriteContext,
     pub(crate) file: CompletedFile,
+    remote_modified: Option<i64>,
     pub(crate) stats: StructArray,
     pub(crate) publication: Option<(String, i64)>,
     pub(crate) ingested_at_ms: Option<i64>,
@@ -4650,6 +7166,14 @@ impl StagedAppend {
         }
     }
 
+    fn claim_reclaim_for(&self, table: &DeltaTable) -> Option<String> {
+        if self.table.url != table.url {
+            return None;
+        }
+        let relative = self.file.path.strip_prefix(&table.root).ok()?.to_str()?;
+        self.claim_reclaim().then(|| relative.to_owned())
+    }
+
     /// Claim a never-submitted file for deletion. False keeps the file.
     fn claim_reclaim(&self) -> bool {
         self.stage_state
@@ -4666,19 +7190,60 @@ impl StagedAppend {
 /// Return a batch whose Arrow memory charge is the memory the sort buffer actually retains.
 ///
 /// IPC-decoded and sliced columns share a parent allocation, so `get_array_memory_size`
-/// charges that allocation once per column. When the charge exceeds twice the logical
+/// charges that allocation once per column. When the charge exceeds the configured multiple of logical
 /// slice bytes, copy rows into fresh buffers: the parent is released instead of retained
 /// and the unchanged sort-budget guard then measures real memory. Batches built with
 /// their own buffers are retained without a copy.
-fn owned_for_sort(batch: RecordBatch) -> Result<RecordBatch> {
+fn owned_for_sort(batch: RecordBatch, detach_ratio: usize, kernel: DetachKernel) -> Result<RecordBatch> {
     let charged = u64::try_from(batch.get_array_memory_size()).context("Arrow memory charge exceeds u64")?;
     let logical = crate::record_batch_logical_bytes(&batch)?;
-    if charged <= logical.saturating_mul(2) {
+    if charged <= logical.saturating_mul(u64::try_from(detach_ratio)?) {
         return Ok(batch);
     }
     let rows = u32::try_from(batch.num_rows()).context("sorted batch row count exceeds u32")?;
+    if kernel == DetachKernel::BulkFlat {
+        use arrow::array::{ArrayRef, AsArray, UInt32Array};
+        use arrow::datatypes::DataType;
+        let mut indices = None;
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|col| -> Result<ArrayRef> {
+                if col.null_count() == 0 {
+                    match col.data_type() {
+                        DataType::Utf8 => return bulk_byte_slice(col.as_string::<i32>()),
+                        DataType::LargeUtf8 => return bulk_byte_slice(col.as_string::<i64>()),
+                        DataType::Binary => return bulk_byte_slice(col.as_binary::<i32>()),
+                        DataType::LargeBinary => return bulk_byte_slice(col.as_binary::<i64>()),
+                        _ => {}
+                    }
+                }
+                let indices = indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
+                Ok(arrow::compute::take(col.as_ref(), indices, None)?)
+            })
+            .collect::<Result<_>>()?;
+        return Ok(RecordBatch::try_new(batch.schema(), columns)?);
+    }
     let indices = arrow::array::UInt32Array::from_iter_values(0..rows);
     Ok(arrow::compute::take_record_batch(&batch, &indices)?)
+}
+
+fn bulk_byte_slice<T: arrow::datatypes::ByteArrayType>(
+    array: &arrow::array::GenericByteArray<T>,
+) -> Result<arrow::array::ArrayRef> {
+    use arrow::datatypes::ArrowNativeType;
+    let offsets = array.value_offsets();
+    let first = offsets[0];
+    let end = offsets[offsets.len() - 1].as_usize();
+    // Match take's exact Vec capacities: even a rounded allocation can change a budgeted file boundary.
+    let mut rebased = Vec::with_capacity(offsets.len());
+    rebased.extend(offsets.iter().map(|&offset| offset - first));
+    let values = array.value_data()[first.as_usize()..end].to_vec();
+    Ok(Arc::new(arrow::array::GenericByteArray::<T>::try_new(
+        arrow::buffer::OffsetBuffer::new(rebased.into()),
+        values.into(),
+        None,
+    )?))
 }
 
 impl StagedAppend {
@@ -4716,88 +7281,107 @@ async fn upload_staged_output(
             upload_started.elapsed()
         }
         UploadMode::BufferedMultipart => {
-            let upload_started = Instant::now();
-            use futures::StreamExt as _;
-            use tokio::io::AsyncReadExt as _;
-
-            anyhow::ensure!(buffer_capacity > 0, "multipart buffer capacity must be positive");
-            anyhow::ensure!(
-                request_concurrency > 0,
-                "multipart request concurrency must be positive"
-            );
-
-            let mut source = tokio::fs::File::open(&source_path)
+            let source = tokio::fs::File::open(&source_path)
                 .await
                 .context("open completed Parquet output for upload")?;
-            let mut upload = store
-                .put_multipart_opts(&destination, object_store::PutMultipartOptions::default())
-                .await
-                .context("start completed Parquet multipart upload")?;
-            let mut pending = futures::stream::FuturesUnordered::new();
-            let mut copied = 0_u64;
-            let mut eof = false;
-            let mut upload_error = None;
-
-            while !eof && upload_error.is_none() {
-                while pending.len() < request_concurrency && !eof && upload_error.is_none() {
-                    let mut buffer = vec![0; buffer_capacity];
-                    let mut filled = 0;
-                    while filled < buffer.len() {
-                        match source.read(&mut buffer[filled..]).await {
-                            Ok(0) => {
-                                eof = true;
-                                break;
-                            }
-                            Ok(bytes_read) => filled += bytes_read,
-                            Err(error) => {
-                                upload_error = Some(
-                                    anyhow::Error::new(error)
-                                        .context("read completed Parquet output for multipart upload"),
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    if filled == 0 {
-                        break;
-                    }
-                    copied = match copied.checked_add(filled as u64) {
-                        Some(bytes) => bytes,
-                        None => {
-                            upload_error = Some(anyhow::anyhow!("multipart source length overflow"));
-                            break;
-                        }
-                    };
-                    buffer.truncate(filled);
-                    pending.push(upload.put_part(buffer.into()));
-                }
-                if let Some(Err(error)) = pending.next().await {
-                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                }
-            }
-            while let Some(result) = pending.next().await {
-                if upload_error.is_none()
-                    && let Err(error) = result
-                {
-                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                }
-            }
-            if let Some(error) = upload_error {
-                return Err(abort_multipart_after_failure(&mut upload, error).await);
-            }
-            if copied != expected_bytes {
-                let error =
-                    anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
-                return Err(abort_multipart_after_failure(&mut upload, error).await);
-            }
-            if let Err(error) = upload.complete().await {
-                let error = anyhow::Error::new(error).context("complete completed Parquet multipart upload");
-                return Err(abort_multipart_after_failure(&mut upload, error).await);
-            }
-            upload_started.elapsed()
+            upload_multipart(
+                store,
+                destination,
+                source,
+                async { Ok(expected_bytes) },
+                buffer_capacity,
+                request_concurrency,
+            )
+            .await?
         }
     };
     Ok(upload_duration)
+}
+
+async fn upload_multipart(
+    store: Arc<dyn ObjectStore>,
+    destination: object_store::path::Path,
+    mut source: impl tokio::io::AsyncRead + Unpin,
+    expected: impl std::future::Future<Output = Result<u64>>,
+    buffer_capacity: usize,
+    request_concurrency: usize,
+) -> Result<Duration> {
+    use futures::StreamExt as _;
+    use tokio::io::AsyncReadExt as _;
+    anyhow::ensure!(
+        buffer_capacity > 0 && request_concurrency > 0,
+        "multipart capacity and request concurrency must be positive"
+    );
+    let upload_started = Instant::now();
+    let mut upload = store
+        .put_multipart_opts(&destination, object_store::PutMultipartOptions::default())
+        .await
+        .context("start completed Parquet multipart upload")?;
+    let mut pending = futures::stream::FuturesUnordered::new();
+    let mut copied = 0_u64;
+    let mut eof = false;
+    let mut upload_error = None;
+
+    while !eof && upload_error.is_none() {
+        while pending.len() < request_concurrency && !eof && upload_error.is_none() {
+            let mut buffer = vec![0; buffer_capacity];
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match source.read(&mut buffer[filled..]).await {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(bytes_read) => filled += bytes_read,
+                    Err(error) => {
+                        upload_error = Some(
+                            anyhow::Error::new(error).context("read completed Parquet output for multipart upload"),
+                        );
+                        break;
+                    }
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            copied = match copied.checked_add(filled as u64) {
+                Some(bytes) => bytes,
+                None => {
+                    upload_error = Some(anyhow::anyhow!("multipart source length overflow"));
+                    break;
+                }
+            };
+            buffer.truncate(filled);
+            pending.push(upload.put_part(buffer.into()));
+        }
+        if let Some(Err(error)) = pending.next().await {
+            upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
+        }
+    }
+    while let Some(result) = pending.next().await {
+        if upload_error.is_none()
+            && let Err(error) = result
+        {
+            upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
+        }
+    }
+    if let Some(error) = upload_error {
+        return Err(abort_multipart_after_failure(&mut upload, error).await);
+    }
+    let expected_bytes = match expected.await {
+        Ok(size) => size,
+        Err(error) => return Err(abort_multipart_after_failure(&mut upload, error).await),
+    };
+    if copied != expected_bytes {
+        let error = anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
+        return Err(abort_multipart_after_failure(&mut upload, error).await);
+    }
+    if let Err(error) = upload.complete().await {
+        let error = anyhow::Error::new(error).context("complete completed Parquet multipart upload");
+        return Err(abort_multipart_after_failure(&mut upload, error).await);
+    }
+
+    Ok(upload_started.elapsed())
 }
 
 async fn abort_multipart_after_failure(
@@ -4818,6 +7402,9 @@ impl DeltaFileWriter {
     pub fn discard_empty(self) -> Result<()> {
         if self.accepted_rows != 0 {
             bail!("cannot discard a writer that accepted rows");
+        }
+        if self.parquet.durable_handle.is_none() {
+            return Ok(());
         }
         let path = self.parquet.path.clone();
         drop(self);
@@ -4862,10 +7449,17 @@ impl DeltaFileWriter {
     /// # Errors
     /// Rejects incompatible batches and returns write/statistics errors.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_bound(batch, None).await
+    }
+
+    async fn write_bound(&mut self, batch: &RecordBatch, proof: Option<&GeneratedIngestion>) -> Result<()> {
         if self.failed {
             bail!("Delta file previously failed; refusing further writes");
         }
-        let result = self.write_batch(batch).await;
+        let result = match self.prepare_batch(batch, proof) {
+            Ok(prepared) => self.encode_batch(prepared).await,
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.failed = true;
         }
@@ -4884,35 +7478,52 @@ impl DeltaFileWriter {
         self.accepted_input_bytes
     }
 
-    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    fn prepare_batch(&mut self, batch: &RecordBatch, proof: Option<&GeneratedIngestion>) -> Result<PreparedWrite> {
         let build_started = Instant::now();
         let input_bytes = record_batch_logical_bytes(batch)?;
         let mut batch = if self.canonical_input {
             normalize::canonical_batch(batch)?
         } else {
-            normalize::batch(batch)?
+            normalize::batch_with_kernel(batch, runtime_config()?.timestamp_kernel)?
         };
-        for (name, expected) in &self.partition_values {
-            if let Ok(index) = batch.schema().index_of(name) {
-                for row in 0..batch.num_rows() {
-                    let actual = crate::partition::value(batch.column(index).as_ref(), row)?;
-                    if actual != *expected {
+        if let Some(GeneratedIngestion(value)) = proof {
+            let field_schema = batch.schema();
+            let field = field_schema.field_with_name(INGESTION_PARTITION)?;
+            anyhow::ensure!(
+                self.partition_values.len() == 1
+                    && self
+                        .partition_values
+                        .get(INGESTION_PARTITION)
+                        .and_then(Option::as_deref)
+                        == Some(value.as_ref())
+                    && field.data_type() == &arrow::datatypes::DataType::Utf8
+                    && !field.is_nullable(),
+                "generated partition proof differs from bound write context"
+            );
+            crate::telemetry::partition_binding("proven_constant");
+        } else if !self.partition_values.is_empty() {
+            if runtime_config()?.generated_partition_binding == crate::GeneratedPartitionBinding::ProvenConstant {
+                crate::telemetry::partition_binding("fallback_revalidate_rows");
+            }
+            for (name, expected) in &self.partition_values {
+                if let Ok(index) = batch.schema().index_of(name) {
+                    if !crate::partition::all_rows_equal(batch.column(index), expected)? {
                         bail!("batch partition value differs from bound write context");
                     }
+                } else {
+                    let mut fields = batch.schema().fields().to_vec();
+                    fields.push(Arc::new(arrow::datatypes::Field::new(
+                        name,
+                        arrow::datatypes::DataType::Utf8,
+                        expected.is_none(),
+                    )));
+                    let mut columns = batch.columns().to_vec();
+                    columns.push(Arc::new(arrow::array::StringArray::from(vec![
+                        expected.as_deref();
+                        batch.num_rows()
+                    ])));
+                    batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
                 }
-            } else {
-                let mut fields = batch.schema().fields().to_vec();
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    name,
-                    arrow::datatypes::DataType::Utf8,
-                    expected.is_none(),
-                )));
-                let mut columns = batch.columns().to_vec();
-                columns.push(Arc::new(arrow::array::StringArray::from(vec![
-                    expected.as_deref();
-                    batch.num_rows()
-                ])));
-                batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
             }
         }
         if self.schema.field_with_name(INGESTION_PARTITION).is_ok()
@@ -4936,20 +7547,10 @@ impl DeltaFileWriter {
             batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
         }
         let normalized = normalize::align(&batch, Arc::clone(&self.schema))?;
-        let data_schema: arrow::datatypes::Schema = self.context.logical_data_schema().as_ref().try_into_arrow()?;
-        let projection = data_schema
-            .fields()
-            .iter()
-            .map(|field| normalized.schema().index_of(field.name()))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let normalized = normalized.project(&projection)?;
-        let data = ArrowEngineData::new(normalized);
-        let evaluator = self.table.engine.evaluation_handler().new_expression_evaluator(
-            Arc::clone(self.context.logical_data_schema()),
-            self.context.logical_to_physical(),
-            Arc::clone(self.context.physical_data_schema()).into(),
-        )?;
-        let physical = evaluator.evaluate(&data)?.try_into_record_batch()?;
+        let physical = match &self.mapping {
+            Some(mapping) => mapping.physical_batch(&normalized)?,
+            None => FileMapping::new(&self.schema, &self.context, &self.table.engine)?.physical_batch(&normalized)?,
+        };
         let rows = self
             .accepted_rows
             .checked_add(batch.num_rows())
@@ -4960,21 +7561,36 @@ impl DeltaFileWriter {
             .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
         self.stage_timings.build += build_started.elapsed();
-        if let Some(sorter) = &mut self.sorter {
+        let encode = if let Some(sorter) = &mut self.sorter {
             let sort_started = Instant::now();
-            let physical = owned_for_sort(physical)?;
+            let runtime = runtime_config()?;
+            let physical = owned_for_sort(physical, runtime.layout_detach_ratio, runtime.layout_detach_kernel)?;
+            let encode = sorter.admit(&physical)?;
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
-            if !sorter.try_push(&physical)? {
-                bail!(
-                    "publication exceeds sorted-file budget; split upstream into independently identified publications"
-                );
-            }
+            encode.then_some(physical)
         } else {
+            Some(physical)
+        };
+        Ok(PreparedWrite {
+            encode,
+            batch_rows: batch.num_rows(),
+            input_bytes,
+            rows,
+            bytes,
+        })
+    }
+
+    async fn encode_batch(&mut self, prepared: PreparedWrite) -> Result<()> {
+        let PreparedWrite {
+            encode,
+            batch_rows,
+            input_bytes,
+            rows,
+            bytes,
+        } = prepared;
+        if let Some(physical) = encode {
             let encode_started = Instant::now();
-            let result = self
-                .parquet
-                .write_accounted(&physical, batch.num_rows(), input_bytes)
-                .await;
+            let result = self.parquet.write_accounted(&physical, batch_rows, input_bytes).await;
             self.stage_timings.encode += encode_started.elapsed();
             result?;
         }
@@ -4991,9 +7607,9 @@ impl DeltaFileWriter {
         if self.failed {
             bail!("Delta file previously failed; refusing to commit its partial data");
         }
-        if let Some(sorter) = self.sorter.take() {
+        if let Some(sorter) = self.sorter.take().and_then(PublicationSorter::into_buffer) {
             let sort_started = Instant::now();
-            let sorted = sorter.finish();
+            let sorted = crate::delta_io::run_cpu_async(move || sorter.finish()).await?;
             self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
             let sorted = sorted?;
             let encode_started = Instant::now();
@@ -5005,61 +7621,75 @@ impl DeltaFileWriter {
             result?;
         }
         let encode_started = Instant::now();
-        let file_result = self.parquet.finish().await;
+        let file_result = self.parquet.finish_with_upload().await;
         self.stage_timings.encode += encode_started.elapsed();
-        let file = file_result?;
+        let (file, streaming_upload) = file_result?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
-        let executor = shared_executor()?;
         self.table.check_publication_async().await?;
-        let upload_slot = if self.table.url.scheme() == "file" {
-            None
+        let (file, remote_modified) = if let Some(duration) = streaming_upload {
+            self.stage_timings.encode = self.stage_timings.encode.saturating_sub(duration);
+            self.stage_timings.upload = Some(duration);
+            (
+                file,
+                Some(i64::try_from(
+                    std::time::SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+                )?),
+            )
         } else {
-            Some(executor.upload_slot().await?)
-        };
-        let table = Arc::clone(&self.table);
-        let (file, prepared, upload_slot) = executor
-            .spawn_blocking(move || {
-                let prepared = table.prepare_upload(&file);
-                (file, prepared, upload_slot)
-            })
-            .await
-            .context("stage upload preparation worker failed")?;
-        if let Some(path) = prepared? {
-            self.table.check_publication_async().await?;
-            let config = runtime_config()?;
-            let upload_mode = config.upload_mode;
-            let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
-            let upload_request_concurrency = config.upload_request_concurrency;
+            let executor = shared_executor()?;
+            let upload_slot = if self.table.url.scheme() == "file" {
+                None
+            } else {
+                Some(executor.upload_slot().await?)
+            };
             let table = Arc::clone(&self.table);
-            let store = Arc::clone(&table.store);
-            let source_path = file.path.clone();
-            let expected_bytes = file.bytes;
-            let upload_duration = spawn_shared_io(async move {
-                let _table = table;
-                let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
-                upload_staged_output(
-                    store,
-                    path,
-                    source_path,
-                    expected_bytes,
-                    upload_mode,
-                    upload_buffer_capacity,
-                    upload_request_concurrency,
-                )
+            let (file, prepared, upload_slot) = executor
+                .spawn_blocking(move || {
+                    let prepared = table.prepare_upload(&file);
+                    (file, prepared, upload_slot)
+                })
                 .await
-            })
-            .context("start stage upload task")?
-            .await
-            .context("stage upload task failed")?
-            .context("stage upload failed")?;
-            self.stage_timings.upload = Some(upload_duration);
-        }
+                .context("stage upload preparation worker failed")?;
+            if let Some(path) = prepared? {
+                self.table.check_publication_async().await?;
+                let config = runtime_config()?;
+                let upload_mode = config.upload_mode;
+                let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
+                let upload_request_concurrency = config.upload_request_concurrency;
+                let table = Arc::clone(&self.table);
+                let store = Arc::clone(&table.store);
+                let source_path = file.path.clone();
+                let expected_bytes = file.bytes;
+                let upload_duration = spawn_shared_io(async move {
+                    let _table = table;
+                    let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
+                    upload_staged_output(
+                        store,
+                        path,
+                        source_path,
+                        expected_bytes,
+                        upload_mode,
+                        upload_buffer_capacity,
+                        upload_request_concurrency,
+                    )
+                    .await
+                })
+                .context("start stage upload task")?
+                .await
+                .context("stage upload task failed")?
+                .context("stage upload failed")?;
+                self.stage_timings.upload = Some(upload_duration);
+            }
+            (file, None)
+        };
         self.table.check_publication_async().await?;
         Ok(StagedAppend {
             table: self.table,
+            group_definition: None,
             schema: self.schema,
             context: self.context,
             file,
+            remote_modified,
             stats,
             publication: self.publication,
             ingested_at_ms: self.ingested_at_ms,
@@ -5077,9 +7707,10 @@ impl DeltaFileWriter {
         // Kernel is synchronous. This offload is bounded by the caller's open files;
         // the collector uses the dedicated, bounded coordinator instead.
         tokio::task::spawn_blocking(move || {
-            let (version, commit_duration, file_observations) =
+            let (version, commit_duration, file_observations, evidence) =
                 append.table.commit_files_timed(std::slice::from_ref(&append))?;
             Ok(AppendResult {
+                evidence: Arc::new(evidence),
                 version,
                 file: append.file,
                 commit_duration,
@@ -5197,7 +7828,16 @@ mod layout_readback_tests {
     #[test]
     fn layout_readback_resolves_both_aliases_and_preserves_schema_auto() -> Result<()> {
         let aliases = PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES;
-        let values = ["false", "customer_id,value", "value", "256", "3145728", "32", "8"];
+        let values = [
+            "false",
+            "customer_id,value",
+            "customer_id:descending:first,value:ascending:last",
+            "value",
+            "256",
+            "3145728",
+            "32",
+            "8",
+        ];
         let resolve = |environment: &BTreeMap<&str, &str>| {
             process_writer_properties_from(None, |name| Ok(environment.get(name).map(|value| (*value).to_owned())))
         };
@@ -5215,8 +7855,16 @@ mod layout_readback_tests {
         assert_eq!(layout, layout_startup_config(&resolve(&collector)?)?);
         assert_eq!(layout["table_properties_override"], true);
         let config = &layout["process_policy"];
+        assert_eq!(config["sort_execution"], "concatenate");
         assert_eq!(config["enabled"], false);
         assert_eq!(config["sort_columns"], serde_json::json!(["customer_id", "value"]));
+        assert_eq!(
+            config["sort_options"],
+            serde_json::json!([
+                {"column":"customer_id","direction":"descending","nulls":"first"},
+                {"column":"value","direction":"ascending","nulls":"last"}
+            ])
+        );
         assert_eq!(config["bloom_columns"], serde_json::json!(["value"]));
         assert_eq!(config["max_rows"], 256);
         assert_eq!(config["max_input_bytes"], 3_145_728);
@@ -5260,6 +7908,7 @@ mod layout_readback_tests {
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", ",id"),
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,x"),
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,,y"),
+            ("ARROWCOL_COLLECTOR_SORT_OPTIONS", "customer_id:ascending:middle"),
             ("ARROWCOL_COLLECTOR_BLOOM_COLUMNS", "x,x"),
         ] {
             let process = process_writer_properties_from(None, |key| Ok((key == name).then(|| value.to_owned())))?;
@@ -5279,6 +7928,7 @@ mod layout_readback_tests {
         ]));
         let process = BTreeMap::from([
             ("arrowcol.layout.enabled".into(), "true".into()),
+            ("arrowcol.layout.sortColumns".into(), String::new()),
             ("arrowcol.layout.maxRows".into(), "128".into()),
             ("arrowcol.layout.rowGroupRows".into(), "64".into()),
         ]);
@@ -5289,27 +7939,77 @@ mod layout_readback_tests {
             ("arrowcol.layout.sortColumns".into(), "value".into()),
             ("arrowcol.layout.bloomColumns".into(), String::new()),
         ]);
+        assert!(
+            collector_publication_layout(
+                &schema,
+                &arrowcol_props::resolve(&BTreeMap::new(), &process)?,
+                SortExecution::StreamUnordered
+            )?
+            .is_some()
+        );
         let resolved = arrowcol_props::resolve(&table, &process)?;
         let enabled = publication_layout(&schema, &resolved)?.is_some();
-        let readback = LayoutReadback::new(Arc::clone(&schema), &resolved, &table, enabled)?;
+        assert!(collector_publication_layout(&schema, &resolved, SortExecution::StreamUnordered).is_err());
+        let readback = LayoutReadback::new(
+            Arc::clone(&schema),
+            &resolved,
+            &table,
+            enabled,
+            SortExecution::VerifyOrder,
+        )?;
         let parquet: crate::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
             "max_row_group_rows": 3,
             "data_page_row_count_limit": 1,
-            "columns": {"customer_id": {"bloom_filter_enabled": true}}
+            "writer_version": "v2",
+            "max_row_group_bytes": 2048,
+            "write_batch_size": 5,
+            "offset_index_enabled": true,
+            "column_index_truncate_length": 32,
+            "statistics_truncate_length": 64,
+            "columns": {"customer_id": {
+                "encoding":"delta_byte_array", "dictionary_enabled":true, "dictionary_page_size_limit":1024,
+                "data_page_size_limit":2048, "statistics":"chunk", "write_page_header_statistics":false,
+                "bloom_filter_enabled":true, "bloom_filter_fpp":0.1, "bloom_filter_ndv":512,
+                "data_page_v2_compression_ratio_threshold":1.2
+            }}
         }))?;
         let url = Url::parse("file:///safe/catalog/schema/events/")?;
-        let event = readback.event(&url, &parquet)?;
+        let event = readback.test_event(&url, &parquet)?;
         assert_eq!(event["table_name"], "catalog.schema.events");
         assert_eq!(
             event["table_id"],
             format!("{:x}", sha2::Sha256::digest(url.as_str().as_bytes()))
         );
+        assert_eq!(event["config"]["sort_execution"], "verify_order");
         assert_eq!(event["applied"], true);
         assert_eq!(event["config"]["max_rows"], 7);
         assert_eq!(event["config"]["sort_columns"], serde_json::json!(["value"]));
         assert_eq!(event["config"]["bloom_columns"], serde_json::json!(["customer_id"]));
         assert_eq!(event["config"]["row_group_rows"], 3);
         assert_eq!(event["config"]["page_rows"], 1);
+        let unlimited: crate::writer::ParquetWriterConfig =
+            serde_json::from_value(serde_json::json!({"max_row_group_rows": "unlimited"}))?;
+        let uncapped = readback.test_event(&url, &unlimited)?;
+        assert_eq!(uncapped["applied"], true);
+        assert!(uncapped["config"]["row_group_rows"].is_null());
+        assert!(uncapped["parquet_properties"]["max_row_group_rows"].is_null());
+        assert_eq!(
+            event["parquet_column_options"]["customer_id"],
+            serde_json::json!({
+                "encoding":"delta_byte_array", "dictionary_enabled":true, "dictionary_page_size_limit":1024,
+                "data_page_size_limit":2048, "statistics":"chunk", "write_page_header_statistics":false,
+                "bloom_filter_enabled":true, "bloom_filter_fpp":0.1, "bloom_filter_ndv":512,
+                "data_page_v2_compression_ratio_threshold":1.2
+            })
+        );
+        assert_eq!(event["parquet_column_options"]["value"]["bloom_filter_enabled"], false);
+        assert_eq!(
+            event["parquet_properties"],
+            serde_json::json!({
+                "writer_version":"v2", "max_row_group_rows":3, "data_page_row_count_limit":1, "max_row_group_bytes":2048, "write_batch_size":5,
+                "offset_index_enabled":true, "column_index_truncate_length":32, "statistics_truncate_length":64
+            })
+        );
         assert_eq!(
             event["precedence"],
             serde_json::json!(["table_properties", "process_policy", "registry_defaults"])
@@ -5319,11 +8019,39 @@ mod layout_readback_tests {
                 .as_array()
                 .is_some_and(|keys| { keys.contains(&serde_json::json!("arrowcol.layout.maxRows")) })
         );
+        for (codec, level) in [
+            ("uncompressed", None),
+            ("snappy", None),
+            ("lz4", None),
+            ("lz4_raw", None),
+            ("gzip", Some(6)),
+            ("brotli", Some(1)),
+            ("zstd", Some(3)),
+        ] {
+            let mut defaults = serde_json::json!({"compression":codec});
+            if let Some(level) = level {
+                defaults["compression_level"] = serde_json::json!(level);
+            }
+            let policy = serde_json::from_value(serde_json::json!({
+                "defaults": defaults,
+                "columns":{"customer_id":{"compression":"gzip","compression_level":5}}
+            }))?;
+            let event = readback.test_event(&url, &policy)?;
+            assert_eq!(
+                event["parquet_columns"]["value"],
+                serde_json::json!({"compression":codec,"compression_level":level})
+            );
+            assert_eq!(
+                event["parquet_columns"]["customer_id"],
+                serde_json::json!({"compression":"gzip","compression_level":5})
+            );
+        }
         table.insert("arrowcol.layout.enabled".into(), "false".into());
         let resolved = arrowcol_props::resolve(&table, &process)?;
         assert!(publication_layout(&schema, &resolved)?.is_none());
-        let disabled = LayoutReadback::new(schema, &resolved, &table, false)?;
-        let event = disabled.event(&url, &parquet)?;
+        assert!(collector_publication_layout(&schema, &resolved, SortExecution::VerifyOrder).is_err());
+        let disabled = LayoutReadback::new(schema, &resolved, &table, false, SortExecution::Concatenate)?;
+        let event = disabled.test_event(&url, &parquet)?;
         assert_eq!(event["applied"], false);
         assert_eq!(event["config"]["enabled"], false);
         for name in [

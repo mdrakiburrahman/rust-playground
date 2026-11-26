@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { ChildProcess, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import { closeSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, symlink, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { createServer, request as createHttpRequest } from 'node:http';
 import { connect as createTcpConnection } from 'node:net';
 import os from 'node:os';
@@ -15,16 +15,28 @@ import { run_tree } from '../../infra/azure/bootstrap.js';
 import { tableFromArrays, tableToIPC } from 'apache-arrow';
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import { collectDataFlow } from './dataflow-verdict.js';
+import { localDispositionSuffix } from './local-failed-disposition.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
+  acquireAksSubmitterLock, assertLaunchLedgersSettled,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  aksDispositionMessage, assertCanonicalAksLaunchWorkspace, isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  aksDispositionMessage, isExactExitedLegacyServer, recordLegacyAksDisposition, resolveAksReceiptLedger, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
   id: '123e4567-e89b-42d3-a456-426614174000',
   config_sha256: createHash('sha256').update('{"platform":{"kind":"local"}}').digest('hex'),
   state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
+});
+
+test('AKS history pin cannot be silently ignored in local or preflight-only mode', async () => {
+  const pin = 'a'.repeat(64);
+  for (const args of [
+    ['--mode', 'local', '--aks-history-sha256', pin],
+    ['--mode', 'aks', '--aks-history-sha256', 'not-a-digest'],
+    ['--mode', 'aks', '--aks-history-sha256', pin, '--aks-history-sha256', pin],
+    ['--mode', 'aks', '--preflight-only', '--aks-history-sha256', pin],
+  ]) await assert.rejects(main(args), /--aks-history-sha256 requires/);
 });
 
 async function bindLocalReceipt(deadline: OatLauncherDeadline): Promise<void> {
@@ -171,6 +183,82 @@ async function passingMainFixture(options: Parameters<typeof ownedBuildFixture>[
   }));
   return { ...fixture, stateRoot, receiptRoot, configPath };
 }
+
+test('launcher marker in state is recovered without moving it', { skip: process.platform !== 'linux', timeout: 30_000 }, async () => {
+  const fixture = await passingMainFixture({ initialState: 'failed' });
+  const previousExitCode = process.exitCode;
+  const previousPath = process.env.PATH;
+  try {
+    const config = JSON.parse(await readFile(fixture.configPath, 'utf8'));
+    config.platform.compose_project = 'arrowcol-oat-historical-parity';
+    await writeFile(fixture.configPath, JSON.stringify(config));
+    await writeFile(path.join(fixture.directory, 'package.json'), '{"type":"commonjs"}');
+    const build = await fixture.runner(['cargo'], 0, process.cwd());
+    const launcher = pathToFileURL(fileURLToPath(new URL('./launch.ts', import.meta.url))).href;
+    const script = `
+      import { main } from ${JSON.stringify(launcher)};
+      const runner = async (command) => command[0] === 'git'
+        ? { returncode: 0, stdout: command[1] === 'rev-parse' ? ${JSON.stringify(fixture.sha)} : '', stderr: '' }
+        : { returncode: 0, stdout: ${JSON.stringify(build.stdout)}, stderr: '' };
+      await main(['--deadline-seconds', '10', '--no-viewer', '--config', ${JSON.stringify(fixture.configPath)}], runner, undefined, ${JSON.stringify(fixture.receiptRoot)});
+    `;
+    const outputPath = path.join(fixture.directory, 'launcher-output.log');
+    const output = openSync(outputPath, 'w');
+    let launch: ReturnType<typeof spawnSync>;
+    try {
+      launch = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], { stdio: ['ignore', output, output], timeout: 20_000 });
+    } finally {
+      closeSync(output);
+    }
+    const diagnostics = await readFile(outputPath, 'utf8');
+    assert.ifError(launch.error);
+    assert.equal(launch.signal, null, diagnostics);
+    assert.equal(launch.status, 1, diagnostics);
+    const [receiptName] = await readdir(fixture.receiptRoot);
+    assert.ok(receiptName);
+    const receiptPath = path.join(fixture.receiptRoot, receiptName);
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+    assert.equal(receipt.run_state, 'failed', diagnostics + JSON.stringify(receipt));
+    assert.equal(receipt.cleanup_state, 'unsettled');
+    const [markerName] = await readdir(fixture.stateRoot);
+    assert.ok(markerName?.startsWith('.arrowcol-oat-owner-'));
+    const markerPath = path.join(fixture.stateRoot, markerName);
+    const marker = JSON.parse(await readFile(markerPath, 'utf8'));
+    assert.equal(await processStartTicks(marker.ownerPid), undefined);
+    assert.equal(await processStartTicks(marker.serverPid), marker.serverStartTicks);
+    await fixture.stop();
+    assert.equal(await processStartTicks(marker.serverPid), undefined);
+
+    const cell = '22222222-2222-4222-8222-222222222222';
+    const table = tableFromArrays({
+      run_id: [cell], mode: ['local'], status: ['failed'], table: ['sqlserver_active_sessions'],
+      evidence_json: [JSON.stringify({ overload_guard: { run_id: cell }, rows: { delta_committed: null } })],
+    });
+    await writeFile(path.join(fixture.directory, 'results.parquet'), writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream'))));
+    const project = `arrowcol-oat-hi-${cell.replace(/-/g, '')}`;
+    await writeFile(path.join(fixture.directory, 'run.log'), `${receipt.run_id} ${project} synthetic cleanup failure`);
+    const tools = path.join(fixture.directory, 'tools');
+    await mkdir(tools);
+    for (const command of ['docker', 'ss']) await writeFile(path.join(tools, command), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    process.env.PATH = `${tools}:${previousPath ?? ''}`;
+    process.exitCode = undefined;
+    const otherMarker = path.join(fixture.stateRoot, '.arrowcol-oat-owner-999999.json');
+    await writeFile(otherMarker, '{}');
+    await assert.rejects(main(['--recover-failed-local', receipt.invocation_id, markerPath], undefined, undefined, fixture.receiptRoot), /unresolved cell or owner/);
+    await unlink(otherMarker);
+    await main(['--recover-failed-local', receipt.invocation_id, markerPath], undefined, undefined, fixture.receiptRoot);
+    const disposition = JSON.parse(await readFile(receiptPath + localDispositionSuffix, 'utf8'));
+    assert.equal(disposition.marker_path, markerPath);
+    assert.deepEqual(await readdir(fixture.stateRoot), [markerName]);
+    assert.deepEqual(JSON.parse(await readFile(markerPath, 'utf8')), marker);
+  } finally {
+    process.exitCode = previousExitCode;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test('owned server starts the exact successful Cargo artifact, not a stale prebuilt path', async () => {
   const fixture = await ownedBuildFixture();
@@ -1155,19 +1243,211 @@ test('owned controller crash requires exact current custody without inventing te
   }
 });
 
-test('AKS benchmark rejects a linked worktree with an empty launcher ledger', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-checkout-'));
+async function linkedWorktreeFixture() {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'oat-aks-checkout-')));
   const canonical = path.join(root, 'canonical');
   const linked = path.join(root, 'linked');
-  const git = (...args: string[]) => execFileSync('git', args, { stdio: 'pipe' });
+  const ledger = path.join(canonical, 'out', 'arrowcol-oat', 'deadline-receipts');
+  const git = (...args: string[]) => execFileSync('git', args, { encoding: 'utf8', stdio: 'pipe' }).trim();
+  const commit = (workspace: string, message: string) => git('-C', workspace, '-c', 'user.name=OAT fixture',
+    '-c', 'user.email=oat@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', message);
+  git('init', canonical);
+  commit(canonical, 'fixture');
+  git('-C', canonical, 'worktree', 'add', '--detach', linked);
+  await mkdir(ledger, { recursive: true });
+  return { root, canonical, linked, ledger, git, commit };
+}
+
+test('AKS linked worktrees resolve the primary ledger, whose pending receipt blocks them, and keep their own source SHA', async () => {
+  const fixture = await linkedWorktreeFixture();
+  const worktreeLedger = path.join(fixture.linked, 'out', 'arrowcol-oat', 'deadline-receipts');
+  let deadline: OatLauncherDeadline | undefined;
   try {
-    git('init', canonical);
-    git('-C', canonical, '-c', 'user.name=OAT fixture', '-c', 'user.email=oat@example.invalid',
-      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'fixture');
-    git('-C', canonical, 'worktree', 'add', '--detach', linked);
-    await assertCanonicalAksLaunchWorkspace(canonical);
-    await assert.rejects(assertCanonicalAksLaunchWorkspace(linked), /primary checkout that owns the launcher receipt ledger/);
+    assert.deepEqual(await resolveAksReceiptLedger(fixture.canonical), { root: fixture.ledger });
+    const ledger = await resolveAksReceiptLedger(fixture.linked);
+    assert.deepEqual(ledger, { root: fixture.ledger, worktreeRoot: worktreeLedger });
+    deadline = await OatLauncherDeadline.create(undefined, performance.now(), ledger.root);
+    const submitted_config_body = '{"platform":{"kind":"aks"}}';
+    await deadline.setSubmissionBinding({
+      submitted_config_body, source_config_sha256: 'a'.repeat(64),
+      submitted_config_sha256: createHash('sha256').update(submitted_config_body).digest('hex'),
+    });
+    await deadline.markCreationPending('http://127.0.0.1:8088/');
+    assert.equal(path.dirname(deadline.receiptPath), fixture.ledger);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(ledger.root), /Unsettled AKS launcher receipt/);
+    await assert.rejects(stat(worktreeLedger), { code: 'ENOENT' });
+    await assertNoUnsettledDeadlineReceipts(worktreeLedger);
+
+    fixture.commit(fixture.linked, 'candidate');
+    const candidate = fixture.git('-C', fixture.linked, 'rev-parse', 'HEAD');
+    assert.notEqual(candidate, fixture.git('-C', fixture.canonical, 'rev-parse', 'HEAD'));
+    const build = await buildOwnedServer(fixture.linked, async (command: string[], _timeout: number, cwd?: string) => command[0] === 'git'
+      ? { returncode: 0, stdout: execFileSync('git', command.slice(1), { cwd, encoding: 'utf8' }), stderr: '' }
+      : { returncode: 0, stderr: '', stdout: JSON.stringify({
+        reason: 'compiler-artifact', manifest_path: path.join(fixture.linked, 'projects/arrowcol-oat-rust/Cargo.toml'),
+        target: { name: 'arrowcol-oat-rust', kind: ['bin'] }, executable: process.execPath,
+      }) });
+    assert.equal(build.gitSha, candidate);
   } finally {
+    deadline?.dispose();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('AKS receipt ledger binding rejects unverifiable worktree ownership', async () => {
+  const fixture = await linkedWorktreeFixture();
+  const rejects = (workspace: string, reason: RegExp) => assert.rejects(resolveAksReceiptLedger(workspace),
+    (error: Error) => /verified linked worktree of it/.test(error.message) && reason.test(error.message));
+  try {
+    const plain = path.join(fixture.root, 'plain');
+    await mkdir(plain);
+    await rejects(plain, /neither a checkout directory nor a worktree file/);
+
+    const forged = path.join(fixture.root, 'forged');
+    await mkdir(forged);
+    await writeFile(path.join(forged, '.git'), `gitdir: ${path.join(fixture.canonical, '.git', 'worktrees', 'linked')}\n`);
+    await rejects(forged, /back-pointer/);
+
+    const bare = path.join(fixture.root, 'bare', '.git');
+    fixture.git('clone', '--bare', fixture.canonical, bare);
+    const bareLinked = path.join(fixture.root, 'bare-linked');
+    fixture.git('-C', bare, 'worktree', 'add', '--detach', bareLinked);
+    await rejects(bareLinked, /Git (metadata could not be read|does not report)/);
+
+    const unregistered = path.join(fixture.root, 'unregistered');
+    fixture.git('-C', fixture.canonical, 'worktree', 'add', '--detach', unregistered);
+    await rm(path.join(fixture.canonical, '.git', 'worktrees', 'unregistered'), { recursive: true });
+    await rejects(unregistered, /worktrees.unregistered is not a directory/);
+
+    await rm(fixture.ledger, { recursive: true });
+    await rejects(fixture.linked, /deadline-receipts is not a directory/);
+    const replacement = path.join(fixture.root, 'replacement-ledger');
+    await mkdir(replacement);
+    await symlink(replacement, fixture.ledger);
+    await rejects(fixture.linked, /deadline-receipts is not a directory/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('linked-worktree AKS launches refuse pending local receipts in either ledger read-only, with zero cancel requests', async () => {
+  const fixture = await linkedWorktreeFixture();
+  const ledger = await resolveAksReceiptLedger(fixture.linked);
+  const worktreeLedger = ledger.worktreeRoot;
+  assert.ok(worktreeLedger);
+  const runIds = ['123e4567-e89b-42d3-a456-426614174021', '123e4567-e89b-42d3-a456-426614174022'];
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    const runId = runIds.find((id) => request.method === 'GET' && request.url === `/runs/${id}`);
+    if (!runId) return void response.writeHead(404).end();
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ ...status('succeeded'), id: runId }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const deadlines: OatLauncherDeadline[] = [];
+  const pendingLocalRun = async (root: string, runId: string) => {
+    // Its wall-clock deadline has passed but no overrun is recorded, so a scan that persists overrun changes it.
+    const deadline = await OatLauncherDeadline.create(600, performance.now(), root, Date.now() - 700_000);
+    deadlines.push(deadline);
+    await bindLocalReceipt(deadline);
+    await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
+    await deadline.recordRunStarted({ ...status('running'), id: runId });
+    deadline.dispose();
+    return deadline.receiptPath;
+  };
+  const snapshot = async () => Object.fromEntries(await Promise.all([ledger.root, worktreeLedger].map(async (root) => {
+    const names = (await readdir(root).catch(() => [])).sort();
+    return [root, await Promise.all(names.map(async (name) => [name, await readFile(path.join(root, name), 'utf8')]))];
+  })));
+  const refusal = /Unsettled launcher receipt .*; refusing AKS launch from a linked worktree without modifying it/;
+  try {
+    const canonicalReceipt = await pendingLocalRun(ledger.root, runIds[0]);
+    let before = await snapshot();
+    await assert.rejects(assertLaunchLedgersSettled(ledger.root, worktreeLedger),
+      (error: Error) => refusal.test(error.message) && error.message.includes(canonicalReceipt));
+    assert.deepEqual(await snapshot(), before);
+
+    const worktreeReceipt = await pendingLocalRun(worktreeLedger, runIds[1]);
+    before = await snapshot();
+    await assert.rejects(assertLaunchLedgersSettled(ledger.root, worktreeLedger),
+      (error: Error) => refusal.test(error.message) && error.message.includes(worktreeReceipt));
+    assert.deepEqual(await snapshot(), before);
+    assert.equal(requests.length, 0, requests.join(', '));
+    assert.equal(JSON.parse(await readFile(canonicalReceipt, 'utf8')).overrun, false);
+
+    // The primary checkout's own launch still reconciles its local receipt, which proves the run was reachable.
+    await assertLaunchLedgersSettled(ledger.root);
+    assert.ok(requests.length > 0 && requests.every((request) => request.includes(runIds[0])), requests.join(', '));
+    assert.equal(JSON.parse(await readFile(canonicalReceipt, 'utf8')).cleanup_state, 'confirmed');
+  } finally {
+    for (const deadline of deadlines) deadline.dispose();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('AKS submitter lock admits one launcher per ledger until it releases or is killed, not on a group signal', { skip: process.platform !== 'linux', timeout: 60_000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-submitter-'));
+  const ledger = path.join(root, 'out', 'arrowcol-oat', 'deadline-receipts');
+  const held = /Another AKS launcher holds the submitter lock/;
+  let holder: ChildProcess | undefined;
+  try {
+    const first = await acquireAksSubmitterLock(ledger);
+    assert.equal(first.path, `${ledger}.aks-submitter.lock`);
+    first.assertHeld();
+    await assert.rejects(acquireAksSubmitterLock(ledger), held);
+    await first.release();
+    assert.throws(() => first.assertHeld(), /no longer held/);
+
+    const launcher = pathToFileURL(fileURLToPath(new URL('./launch.ts', import.meta.url))).href;
+    holder = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import { acquireAksSubmitterLock } from ${JSON.stringify(launcher)};
+      const lock = await acquireAksSubmitterLock(${JSON.stringify(ledger)});
+      process.on('SIGINT', () => setTimeout(() => {
+        try { lock.assertHeld(); console.log('still-held'); } catch { console.log('lost'); }
+        console.log('held-check');
+      }, 300));
+      console.log('locked');
+      setInterval(() => {}, 1000);
+    `], { stdio: ['ignore', 'pipe', 'inherit'], detached: true });
+    let output = '';
+    holder.stdout!.setEncoding('utf8');
+    holder.stdout!.on('data', (chunk: string) => { output += chunk; });
+    const printed = (text: string) => new Promise<void>((resolve, reject) => {
+      const check = () => { if (output.includes(text)) { holder!.stdout!.off('data', check); resolve(); } };
+      holder!.once('exit', (code) => reject(new Error(`lock holder exited early with ${code}`)));
+      holder!.stdout!.on('data', check);
+      check();
+    });
+    await printed('locked');
+    await assert.rejects(acquireAksSubmitterLock(ledger), held);
+    process.kill(-holder.pid!, 'SIGINT');
+    await printed('held-check');
+    assert.match(output, /still-held/);
+    await assert.rejects(acquireAksSubmitterLock(ledger), held);
+    holder.removeAllListeners('exit');
+    const exited = once(holder, 'exit');
+    holder.kill('SIGKILL');
+    await exited;
+
+    let next: Awaited<ReturnType<typeof acquireAksSubmitterLock>> | undefined;
+    for (let attempt = 0; !next; attempt++) {
+      try {
+        next = await acquireAksSubmitterLock(ledger);
+      } catch (error) {
+        if (attempt >= 50 || !(error instanceof Error && held.test(error.message))) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    await next.release();
+  } finally {
+    if (holder && holder.exitCode === null && holder.signalCode === null) holder.kill('SIGKILL');
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -1375,6 +1655,29 @@ test('owned main rechecks supplementary eligibility after cancellation during ma
     assert.ok(diagnostics.some(([message]) => /Supplementary owned-run identity skipped/.test(String(message))));
   } finally {
     releaseMarker();
+    process.exitCode = previousExitCode;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('unsettled owned server is unreferenced but retained for recovery', { skip: process.platform !== 'linux' }, async (t) => {
+  const fixture = await passingMainFixture({ configHash: '0'.repeat(64) });
+  const previousExitCode = process.exitCode;
+  const original = ChildProcess.prototype.unref;
+  let unrefs = 0;
+  t.mock.method(ChildProcess.prototype, 'unref', function (this: ChildProcess) {
+    unrefs++;
+    return original.call(this);
+  });
+  try {
+    process.exitCode = undefined;
+    await main(['--deadline-seconds', '10', '--no-viewer', '--config', fixture.configPath],
+      fixture.runner, undefined, fixture.receiptRoot);
+    assert.equal(process.exitCode, 1);
+    assert.equal(unrefs, 1);
+    assert.equal((await readdir(fixture.stateRoot)).length, 1);
+  } finally {
     process.exitCode = previousExitCode;
     await fixture.stop();
     await rm(fixture.directory, { recursive: true, force: true });
@@ -1965,6 +2268,30 @@ test('local recovery and cleanup resolve relative state beside the owned server,
   }
 });
 
+test('local status polling retries transient timeouts without resubmitting the run', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-poll-timeout-'));
+  const configPath = path.join(directory, 'config.json');
+  await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
+  const calls: string[] = [];
+  let polls = 0;
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push((init?.method ?? 'GET') + ' ' + url.pathname);
+    if (init?.method === 'POST') return Response.json(status('running'), { status: 202 });
+    if (++polls <= 2) throw new DOMException('synthetic timeout', 'TimeoutError');
+    return Response.json(status('succeeded'));
+  };
+  t.mock.method(console, 'error', () => {});
+  try {
+    const result = await launchOat(configPath, undefined, 1, fetcher, () => {}, 'local', () => '127.0.0.1');
+    assert.equal(result.state, 'succeeded');
+    assert.equal(calls.filter(call => call === 'POST /runs').length, 1);
+    assert.equal(polls, 3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('local interruption requests cancellation and waits for the server to finish cleanup', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cancel-'));
   const configPath = path.join(directory, 'oat.json');
@@ -2222,6 +2549,45 @@ test('expired original monotonic deadline is not reset and prevents POST /runs',
   } finally {
     deadline.dispose();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('lost AKS submitter lock refuses before POST /runs and settles the receipt', async (t) => {
+  for (const lostAfterPublication of [false, true]) {
+    await t.test(lostAfterPublication ? 'after creation pending' : 'before creation pending', async () => {
+      const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-lost-submitter-lock-'));
+      const configPath = path.join(directory, 'config.json');
+      await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
+      const deadline = await OatLauncherDeadline.create(600, performance.now(), path.join(directory, 'receipts'));
+      let checks = 0;
+      const lock = {
+        assertHeld() {
+          if (++checks > (lostAfterPublication ? 1 : 0)) throw new Error('AKS submitter lock test is no longer held');
+        },
+      };
+      let posts = 0;
+      const fetcher: typeof fetch = async () => {
+        posts++;
+        throw new Error('POST must not start without the submitter lock');
+      };
+      try {
+        await assert.rejects(
+          launchOat(configPath, 'http://127.0.0.1:8088', 1, fetcher, () => {}, 'local', () => '127.0.0.1',
+            undefined, undefined, undefined, deadline, undefined, lock),
+          /no longer held/,
+        );
+        const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as {
+          creation_state: string; run_state: string; cleanup_state: string;
+        };
+        assert.equal(posts, 0);
+        assert.equal(receipt.creation_state, lostAfterPublication ? 'rejected' : 'not_started');
+        assert.equal(receipt.run_state, 'not_started');
+        assert.equal(receipt.cleanup_state, 'confirmed');
+      } finally {
+        deadline.dispose();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
   }
 });
 

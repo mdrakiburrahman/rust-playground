@@ -417,7 +417,19 @@ fn collision_retry_retains_submitted_stage() -> Result<()> {
     seed(&table)?;
     let raced = stage(&table, 3, Some("raced"))?;
     fence.armed.store(true, Ordering::SeqCst);
-    assert_eq!(table.commit_files_with_transaction(&[raced], "outer", 0)?, 3);
+    let (head, evidence) = table.commit_files_with_transaction_evidence(&[raced], "outer", 0)?;
+    assert_eq!(head, 3);
+    assert!(!evidence.clean);
+    assert!(evidence.reasons.contains(&arrow_deltalake::PublicationReason::Conflict));
+    assert!(evidence.reasons.contains(&arrow_deltalake::PublicationReason::Retry));
+    assert_eq!(
+        evidence.outcomes[&("raced".into(), 0)],
+        arrow_deltalake::PublicationOutcome::Unknown(arrow_deltalake::PublicationReason::NoCommitProvenance)
+    );
+    assert_eq!(
+        evidence.outcomes[&("outer".into(), 0)],
+        arrow_deltalake::PublicationOutcome::CommittedNow(head)
+    );
     assert_eq!(adds_in(root.path(), 2)?, 0);
     assert_eq!(adds_in(root.path(), 3)?, 0);
     assert_eq!(table.lookup_txn("raced")?, Some(0));

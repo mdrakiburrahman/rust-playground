@@ -131,6 +131,7 @@ fn emit_effective_config(config: &RouterConfig, log_filter_source: &str) {
             "max_table_entries": config.routing.max_table_entries,
             "max_oldest_buffer_age_ms": config.routing.max_oldest_buffer_age_ms,
             "hard_pressure_bps": config.routing.hard_pressure_bps,
+            "excluded_admission_gauges": config.routing.excluded_admission_gauges,
             "warmup_ms": config.routing.warmup_ms,
             "minimum_warmup_bps": config.routing.minimum_warmup_bps,
             "lease_ttl_ms": config.routing.lease_ttl_ms,

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { tableFromIPC } from 'apache-arrow';
 import { readParquet } from 'parquet-wasm';
-import { canonical_json, parse_xml, type Azure, type HttpReceipt } from '../../infra/azure/bootstrap.js';
+import { canonical_json, HttpFailure, parse_xml, type Azure, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 
 type Json = Record<string, unknown>;
 export interface DeltaActiveFile {
@@ -90,6 +90,7 @@ const MAX_OBJECTS = 20_000;
 const MAX_ACTIONS = 1_000_000;
 const MAX_PAGES = 100;
 const MAX_VERSIONS = 20_000;
+export const DELTA_READ_CONCURRENCY = 4;
 const HASH = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^[A-Za-z0-9-]{1,128}$/;
 const ETAG = /^"[^"\r\n]+"$/;
@@ -257,17 +258,32 @@ function normalizeArrow(value: any): any {
   if (Array.isArray(value)) return value.map(normalizeArrow);
   return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, normalizeArrow(val)]));
 }
-async function capture(azure: Azure, relativePath: string, assertCurrent: () => Promise<void>, historyAfter?: number):
+async function capture(azure: Azure, relativePath: string, assertCurrent: () => Promise<void>, historyAfter?: number,
+  deadlineUnixMs = Date.now() + 35_000):
   Promise<{ reference: DeltaReplayReference; commits: Map<number, Json[]> }> {
+  requireThat(Number.isSafeInteger(deadlineUnixMs) && deadlineUnixMs > 0, 'invalid Delta read deadline');
+  const checkDeadline = () => requireThat(Date.now() < deadlineUnixMs, 'Delta read shared deadline expired');
+  const bounded = async <T>(action: () => Promise<T>): Promise<T> => {
+    checkDeadline();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([action(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ReplayError('Delta read shared deadline expired')), deadlineUnixMs - Date.now());
+      })]);
+      checkDeadline();
+      return result;
+    } finally { if (timer !== undefined) clearTimeout(timer); }
+  };
+  const guarded = async () => { await bounded(assertCurrent); checkDeadline(); };
   const bound = binding(azure, relativePath), prefix = bound.table_root + '/_delta_log/';
   const absenceObservations: DeltaAbsenceObservation[] = [];
   let bytesRead = 0, actionCount = 0;
   const invoke = async (name: string, query?: Record<string, string>, headers: Record<string, string> = {}) => {
-    await assertCurrent();
+    await guarded();
     let receipt: HttpReceipt | undefined;
-    const [bytes, responseHeaders] = await azure.blob('GET', bound.container, name, query, undefined, headers,
-      false, true, value => { receipt = value; });
-    await assertCurrent();
+    const [bytes, responseHeaders] = await bounded(() => azure.blob('GET', bound.container, name, query, undefined, headers,
+      false, true, value => { receipt = value; }));
+    await guarded();
     requireThat(receipt && [200, 206].includes(receipt.status) && bytes, 'storage GET has no positive complete response');
     const h = Object.fromEntries(Object.entries(responseHeaders).map(([key, val]) => [key.toLowerCase(), val]));
     if (receipt.status === 206) {
@@ -341,7 +357,12 @@ async function capture(azure: Azure, relativePath: string, assertCurrent: () => 
     const entry = byName.get(prefix + name);
     requireThat(entry && entry.bytes > 0 && entry.bytes <= MAX_OBJECT_BYTES, 'required Delta history/object is missing or oversized');
     const response = await invoke(entry.name, undefined,
-      { 'If-Match': entry.etag, Range: `bytes=0-${MAX_OBJECT_BYTES}` });
+      { 'If-Match': entry.etag, Range: `bytes=0-${MAX_OBJECT_BYTES}` }).catch((error: unknown) => {
+        // Unlike numbered Delta log objects, the checkpoint pointer can be rewritten after listing.
+        if (name === '_last_checkpoint' && error instanceof HttpFailure && error.code === 412)
+          throw new ReplayError('Delta listing changed during replay');
+        throw error;
+      });
     requireThat(response.headers.etag === entry.etag && ETAG.test(response.headers.etag), 'Delta object ETag changed or is not strong');
     requireThat(response.bytes.length === entry.bytes, 'incomplete Delta object');
     objects.set(entry.name, { ...entry, sha256: hash(response.bytes) });
@@ -386,16 +407,24 @@ async function capture(azure: Azure, relativePath: string, assertCurrent: () => 
   const start = checkpointVersion === null ? 0 : checkpointVersion + 1;
   const historyStart = historyAfter === undefined ? start : Math.min(start, historyAfter + 1);
   requireThat(latest - historyStart < MAX_VERSIONS, 'Delta history version limit exceeded');
-  for (let version = historyStart; version <= latest; version++) {
-    const name = json.get(version);
-    requireThat(name, 'contiguous JSON history is missing');
-    const lines = (await get(name)).toString('utf8').trim().split('\n');
-    requireThat(lines.length > 0, 'empty Delta commit');
-    actionCount += lines.length;
-    requireThat(actionCount <= MAX_ACTIONS, 'Delta action limit exceeded');
-    const actions = lines.map(line => object(JSON.parse(line), 'Delta JSON action'));
-    commits.set(version, actions);
-    if (version >= start) apply(state, actions);
+  for (let first = historyStart; first <= latest; first += DELTA_READ_CONCURRENCY) {
+    checkDeadline();
+    const batch = await Promise.all(Array.from({ length: Math.min(DELTA_READ_CONCURRENCY, latest - first + 1) },
+      async (_, offset) => {
+        const version = first + offset, name = json.get(version);
+        requireThat(name, 'contiguous JSON history is missing');
+        return { version, bytes: await get(name) };
+      }));
+    for (const { version, bytes } of batch) {
+      checkDeadline();
+      const lines = bytes.toString('utf8').trim().split('\n');
+      requireThat(lines.length > 0, 'empty Delta commit');
+      actionCount += lines.length;
+      requireThat(actionCount <= MAX_ACTIONS, 'Delta action limit exceeded');
+      const actions = lines.map(line => object(JSON.parse(line), 'Delta JSON action'));
+      commits.set(version, actions);
+      if (version >= start) apply(state, actions);
+    }
   }
   requireThat(state.tableId && state.protocol && state.metadataHash, 'Delta replay lacks metadata/protocol');
   const after = await inventory();
@@ -408,13 +437,45 @@ async function capture(azure: Azure, relativePath: string, assertCurrent: () => 
       source_objects: [...objects.values()].sort((a, b) => a.name.localeCompare(b.name)),
       inventory_sha256: hash(canonical_json(before)), reference_sha256: '' } };
   reference.provenance.reference_sha256 = fingerprint(reference);
+  checkDeadline();
   return { reference, commits };
 }
 
 /** Fresh replay or two authoritative empty-prefix observations; errors never manufacture absence or zero rows. */
 export async function readDeltaReference(azure: Azure, relativePath: string,
-  assertCurrent: () => Promise<void>): Promise<DeltaReplayReference> {
-  return (await capture(azure, relativePath, assertCurrent)).reference;
+  assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000): Promise<DeltaReplayReference> {
+  return (await capture(azure, relativePath, assertCurrent, undefined, deadlineUnixMs)).reference;
+}
+
+export async function readFrozenDeltaCommits(azure: Azure, baseline: DeltaReplayReference,
+  terminal: DeltaReplayReference, assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000):
+  Promise<Array<{ version: number; rows: number; files: number; parquet_bytes: number }>> {
+  requireThat(terminal.observation === 'table' && baseline.table_root === terminal.table_root, 'frozen Delta table is unavailable');
+  const after = baseline.observation === 'table' ? baseline.version : -1;
+  const snapshot = await capture(azure, terminal.table_root, assertCurrent, after, deadlineUnixMs);
+  const current = snapshot.reference;
+  requireThat(current.observation === 'table' && current.table_id === terminal.table_id && current.version === terminal.version &&
+    same(current.active_files, terminal.active_files) && current.row_count === terminal.row_count &&
+    same(current.provenance.source_objects, terminal.provenance.source_objects),
+  'frozen Delta source changed during terminal summary verification');
+  const result: Array<{ version: number; rows: number; files: number; parquet_bytes: number }> = [];
+  for (const [version, actions] of snapshot.commits) {
+    if (version <= after) continue;
+    let rows = 0, files = 0, parquet_bytes = 0;
+    for (const action of actions) {
+      if (action.remove && object(action.remove, 'terminal remove').dataChange === true)
+        throw new ReplayError('Data-changing removal cannot authenticate terminal collector commits');
+      if (!action.add) continue;
+      const add = object(action.add, 'terminal add');
+      if (add.dataChange !== true) continue;
+      const file = addFile(add);
+      requireThat(file.num_records !== null, 'terminal commit row statistics are unavailable');
+      rows += file.num_records!; files++; parquet_bytes += file.size;
+      requireThat([rows, files, parquet_bytes].every(Number.isSafeInteger), 'terminal commit total overflow');
+    }
+    if (files) result.push({ version, rows, files, parquet_bytes });
+  }
+  return result;
 }
 
 export interface DeltaAddWindow {
@@ -428,13 +489,16 @@ export interface DeltaAddWindow {
   window_commits: number;
   first_version: number | null;
   last_version: number | null;
+  commits: DeltaAddCommit[];
 }
+
+export interface DeltaAddCommit { version: number; timestamp: number; rows: number; files: number; bytes: number }
 
 export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: number, endUnixMs: number): DeltaAddWindow {
   requireThat(Number.isSafeInteger(startUnixMs) && Number.isSafeInteger(endUnixMs) && startUnixMs < endUnixMs,
     'invalid Delta measurement window');
   const result: DeltaAddWindow = { total_rows: 0, total_files: 0, total_bytes: 0, total_commits: 0,
-    window_rows: 0, window_files: 0, window_bytes: 0, window_commits: 0, first_version: null, last_version: null };
+    window_rows: 0, window_files: 0, window_bytes: 0, window_commits: 0, first_version: null, last_version: null, commits: [] };
   for (const [version, actions] of [...commits].sort(([a], [b]) => a - b)) {
     const records = (key: string): Json[] => actions.flatMap(action => {
       const value = action[key];
@@ -459,6 +523,7 @@ export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: nu
       bytes = sum([bytes, file.size], 'commit bytes');
     }
     if (!files) continue;
+    result.commits.push({ version, timestamp, rows, files, bytes });
     result.total_rows = sum([result.total_rows, rows], 'total Delta Add rows');
     result.total_files = sum([result.total_files, files], 'total Delta Add files');
     result.total_bytes = sum([result.total_bytes, bytes], 'total Delta Add bytes');
@@ -475,20 +540,22 @@ export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: nu
   return result;
 }
 
+const DELTA_SNAPSHOT_ATTEMPTS = 10;
+
 export async function readDeltaAddWindow(azure: Azure, relativePath: string, startUnixMs: number, endUnixMs: number,
-  assertCurrent: () => Promise<void>): Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
+  assertCurrent: () => Promise<void>, deadlineUnixMs = Date.now() + 35_000):
+  Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
   let snapshot: Awaited<ReturnType<typeof capture>> | undefined;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 1; !snapshot; attempt++) {
     try {
-      snapshot = await capture(azure, relativePath, assertCurrent, -1);
-      break;
+      snapshot = await capture(azure, relativePath, assertCurrent, -1, deadlineUnixMs);
     } catch (error) {
-      if (!(error instanceof ReplayError) || error.message !== 'Delta listing changed during replay' || attempt === 2) throw error;
-      await assertCurrent();
-      await new Promise<void>(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+      if (!(error instanceof ReplayError) || error.message !== 'Delta listing changed during replay' ||
+          attempt >= DELTA_SNAPSHOT_ATTEMPTS) throw error;
+      requireThat(Date.now() + 1000 * attempt < deadlineUnixMs, 'Delta read shared deadline expired');
+      await new Promise<void>(resolve => setTimeout(resolve, 1000 * attempt));
     }
   }
-  if (!snapshot) throw new ReplayError('Delta capture did not produce a stable snapshot');
   const { reference, commits } = snapshot;
   if (reference.observation !== 'table' || reference.row_count === null)
     throw new ReplayError('Delta table or complete active-file row statistics are unavailable');
@@ -496,6 +563,79 @@ export async function readDeltaAddWindow(azure: Azure, relativePath: string, sta
   if (adds.total_rows !== reference.row_count)
     throw new ReplayError('Delta Add row totals do not reconcile with the final active-file snapshot');
   return { ...adds, delta_version: reference.version, active_rows: reference.row_count };
+}
+
+export interface WriterCommitRecord { version: number; finished_at_unix_ms: number; rows: number; files: number; table_id: string }
+
+export interface CanonicalDeltaWindow {
+  rows: number; files: number; bytes: number; commits: number; first_version: number; last_version: number;
+}
+
+const WRITER_COMMIT_PREFIX = 'arrowcol_data_commit ';
+
+// Producer: arrow_deltalake::telemetry::data_commit, emitted after the writer's durability barrier.
+export function collectWriterCommitRecords(logText: string, into: Map<number, WriterCommitRecord>): void {
+  for (const line of logText.split(/\r?\n/)) {
+    if (!line.startsWith(WRITER_COMMIT_PREFIX)) continue;
+    let payload: unknown;
+    try { payload = JSON.parse(line.slice(WRITER_COMMIT_PREFIX.length)); }
+    catch { throw new ReplayError('writer commit record is not valid JSON'); }
+    const event = object(payload, 'writer commit record');
+    requireThat(event.schema_version === 1, 'writer commit record has an unsupported schema');
+    requireThat(event.outcome === 'committed', 'writer reported an ambiguous Delta commit; canonical rows are unknown');
+    const record: WriterCommitRecord = {
+      version: integer(event.delta_version, 'writer commit version'),
+      finished_at_unix_ms: integer(event.finished_at_unix_ms, 'writer commit finish time'),
+      rows: integer(event.rows, 'writer commit rows'), files: integer(event.files, 'writer commit files'),
+      table_id: text(event.table_id, 'writer commit table id'),
+    };
+    const previous = into.get(record.version);
+    if (previous) {
+      requireThat(same(previous, record), 'conflicting writer commit records for one Delta version');
+      continue;
+    }
+    const table = into.values().next().value?.table_id;
+    requireThat(table === undefined || table === record.table_id, 'writer commit records span more than one table');
+    into.set(record.version, record);
+  }
+}
+
+// Canonical durable rows: Delta Add commits whose writer finish time is in [start, end). Every Delta Add commit from the
+// last one finishing before the window through the first one finishing at or after it must have a matching record.
+export function canonicalDeltaWindow(adds: readonly DeltaAddCommit[], records: ReadonlyMap<number, WriterCommitRecord>,
+  startUnixMs: number, endUnixMs: number): CanonicalDeltaWindow {
+  requireThat(Number.isSafeInteger(startUnixMs) && Number.isSafeInteger(endUnixMs) && startUnixMs < endUnixMs,
+    'invalid canonical measurement window');
+  const sorted = [...adds].sort((a, b) => a.version - b.version);
+  const byVersion = new Map(sorted.map(commit => [commit.version, commit]));
+  const lastVersion = sorted.at(-1)?.version ?? -1;
+  let previousFinish = 0;
+  for (const record of [...records.values()].sort((a, b) => a.version - b.version)) {
+    if (record.version > lastVersion) continue;
+    const add = byVersion.get(record.version);
+    requireThat(add && add.rows === record.rows && add.files === record.files,
+      'writer commit record does not match its Delta Add commit');
+    requireThat(record.finished_at_unix_ms >= previousFinish, 'writer commit finish times are not monotonic by Delta version');
+    previousFinish = record.finished_at_unix_ms;
+  }
+  let first = -1, end = sorted.length;
+  for (let index = 0; index < sorted.length; index++) {
+    const record = records.get(sorted[index]!.version);
+    if (first < 0) {
+      if (!record || record.finished_at_unix_ms < startUnixMs) continue;
+      requireThat(index === 0 || records.has(sorted[index - 1]!.version), 'writer commit records do not cover the measurement start');
+      first = index;
+    } else requireThat(record, 'writer commit records do not cover the measurement window');
+    if (record.finished_at_unix_ms >= endUnixMs) { end = index; break; }
+  }
+  requireThat(first >= 0 && end > first, 'no writer commit record finished inside the measurement window');
+  const window = sorted.slice(first, end);
+  return {
+    rows: sum(window.map(commit => commit.rows), 'canonical rows'),
+    files: sum(window.map(commit => commit.files), 'canonical files'),
+    bytes: sum(window.map(commit => commit.bytes), 'canonical bytes'),
+    commits: window.length, first_version: window[0]!.version, last_version: window.at(-1)!.version,
+  };
 }
 
 export function parseDeltaReplayReference(input: unknown, azure: Azure, relativePath: string): DeltaReplayReference {
@@ -694,7 +834,8 @@ function checkCreation(actions: Json[]): void {
 }
 
 export async function verifyDeltaPreservation(azure: Azure, baseline: DeltaReplayReference, terminal: DeltaReplayReference,
-  assertCurrent: () => Promise<void>, retentionPolicy?: DeltaRetentionPolicy): Promise<DeltaPreservationResult> {
+  assertCurrent: () => Promise<void>, retentionPolicy?: DeltaRetentionPolicy,
+  deadlineUnixMs = Date.now() + 35_000): Promise<DeltaPreservationResult> {
   let current: DeltaReplayReference | null = null;
   try {
     baseline = parseDeltaReplayReference(baseline, azure, baseline.table_root);
@@ -703,7 +844,7 @@ export async function verifyDeltaPreservation(azure: Azure, baseline: DeltaRepla
       baseline.table_id !== terminal.table_id || terminal.version < baseline.version))
       throw new ReplayError('terminal table ID/version does not extend baseline', 'failed');
     const captured = await capture(azure, baseline.table_root, assertCurrent,
-      baseline.observation === 'table' ? baseline.version : -1);
+      baseline.observation === 'table' ? baseline.version : -1, deadlineUnixMs);
     current = captured.reference;
     if (terminal.observation === 'observed_absent') {
       requireThat(current.observation === 'observed_absent', 'table appeared after an absent terminal reference; terminal preservation is unproven');

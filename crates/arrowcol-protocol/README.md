@@ -11,6 +11,7 @@ Versioned, storage-independent contracts for Arrow routers and dataflow collecto
 | Coordination | Instance lifecycle, table leases, publication fencing, and bounded pressure measurements |
 | Errors | Validated messages, stable categories/codes, explicit retryability; no receipt IDs or receipt status API |
 | Capabilities | Delta publication, lease fencing, pressure reporting, and durable payload storage |
+| Flight isolation | Strict lowercase `l0`–`l5`; only the default `l5` runs normal publication. Lower levels are diagnostic, not delivery acknowledgements. |
 | Validation | `npx --no-install nx run arrowcol-protocol:verify` |
 
 Metadata parsing rejects missing, malformed, oversized, control-bearing,

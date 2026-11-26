@@ -2,16 +2,20 @@
 
 | Interface | Effect | Timing |
 | --- | --- | --- |
-| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata | Startup |
-| `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
-| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files` | Startup |
+| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters and their position, pages, row groups, explicit `"unlimited"` limits, sorting metadata, `skip_arrow_metadata`, `coerce_types`, sequential-only `content_defined_chunking` | Startup |
+| `ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS` | Creation-only Delta statistics selection: a JSON array of column paths (`delta.dataSkippingStatsColumns`) or an integer `-1`/`1..` (`delta.dataSkippingNumIndexedCols`). Existing table metadata must match the request | Table creation |
+| `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `adaptive_policy_refresh_interval` (default `0s`: table writer policy is re-read per batch), `coalesce_publications` | Startup |
+| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files`, `commit_attempts`, `commit_budget_secs`, `snapshot_list_mode` (`full` default; `from_checkpoint` bounds object-store log LISTs to the cached checkpoint floor) | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
 | `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | Stream/RSS/buffered limits, pressure/heartbeat intervals and registration TTL; no identities/endpoints | Startup |
 | `ARROWCOL_COLLECTOR_CATALOG_CONFIG` | Remote catalog `maximum_cache_age`; rejects memory catalog | Startup |
-| `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout` and `command_timeout` for receiver/exporter; rejects other backends | Startup |
+| `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout`, `command_timeout`, `pool_max_size` (default `0`: one connection per lease lookup; at most `1024`) and `pool_acquire_timeout` (default `5s`, at most `600s`, used only when pooled) for receiver/exporter; rejects other backends | Startup |
 | `ARROWCOL_COLLECTOR_EXPORTER_CONFIG` | Exporter `authority_timeout` | Startup |
 | `ARROWCOL_COLLECTOR_RUNTIME_WORKERS`, `BLOCKING_WORKERS`, `UPLOAD_LIMIT`, `TASK_LIMIT`, `READ_AHEAD`, `BATCH_ROWS`, `CPU_WORKERS` | Independently bounded Delta async, blocking, upload, Kernel task, scan and dedicated CPU resources; each suffix uses the full `ARROWCOL_COLLECTOR_` prefix | Startup |
+| `ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH` | Strict `true`/`false`; default `false`. Reuses arrays when a coalesced publication has only the internally generated ingestion partition. Supplied or multiple partition columns retain the normal grouping path. | Startup |
 | Cargo feature `allocator-mimalloc` | Opt-in mimalloc allocator for the collector binary; system allocator remains default | Rebuild |
+| `ARROWCOL_COLLECTOR_MALLOC_CONFIG` | Strict JSON of glibc malloc tunables (`arena_max`, `arena_test`, `mmap_threshold`, `mmap_max`, `trim_threshold`, `top_pad`, `mxfast`, `tcache_count`, `tcache_max`, `tcache_unsorted_limit`, `hugetlb`). The collector re-executes itself once with the matching `GLIBC_TUNABLES` and reads back `process.glibc_malloc`. Rejected by mimalloc builds and outside Linux glibc | Process start |
+| `ARROWCOL_COLLECTOR_MIMALLOC_CONFIG` | Strict JSON of mimalloc v3 options (`collector.mimalloc.*` in the OAT tunables reference). The collector re-executes itself once with the matching `MIMALLOC_*` variables, runs a `MIMALLOC_VERBOSE=1` probe of itself and reads back `process.mimalloc` and `process.mimalloc_options`. Rejected by system-allocator builds and outside Unix | Process start |
 | `RUSTFLAGS="-C target-cpu=native"` | Host-specific compiler ISA optimization; not a Cargo feature or per-cell runtime setting | Rebuild |
 
 JSON collector overrides preserve unspecified pipeline YAML values. Unknown
@@ -23,8 +27,8 @@ Pressure overrides also accept `heartbeat_interval` and `registration_ttl`.
 Resolved TTL must exceed heartbeat and fit the millisecond lease clock; all
 control-plane durations must be positive and clock-representable. These
 overrides cannot change identities, endpoints, authentication or fencing.
-Readback includes safe catalog/routing backend names and resolved timeouts,
-never backend addresses or credentials.
+Readback includes safe catalog/routing backend names, resolved timeouts and the
+routing pool size, never backend addresses or credentials.
 
 Example (workload-dependent, not a universal performance recommendation):
 
@@ -49,6 +53,20 @@ Row-group byte and page limits are estimates, not process-memory ceilings.
 Disabling offset indexes requires `statistics: "none"` or `"chunk"` on every
 physical column; page statistics force offset indexes in Parquet 58.4, so
 conflicting requests fail instead of silently ignoring the setting.
+`max_row_group_rows`, `max_row_group_bytes`, `column_index_truncate_length`
+and `statistics_truncate_length` accept a positive integer or the string
+`"unlimited"` (upstream `None`); omitting a field keeps the Parquet 58.4
+default, and explicit `null` is rejected. Under an applied layout, an unlimited
+`max_row_group_rows` overrides the layout's cap and reads back as
+`row_group_rows: null`. `bloom_filter_position` is `after_row_group` (default) or `end`.
+`skip_arrow_metadata: true` is accepted only when the physical schema has no
+metadata and every field round-trips through the Parquet schema unchanged.
+`coerce_types: true` is accepted only when coercion leaves the physical
+schema unchanged. `content_defined_chunking` takes `min_chunk_size > 0`,
+`max_chunk_size > min_chunk_size` and `norm_level`, which must leave 1..63
+effective CDC mask bits; it requires the sequential writer
+(`parquet_column_workers=1`, `parquet_encode_mode=column_waves`). These new
+fields reject explicit `null`.
 
 Cross-publication coalescing is disabled by default. When enabled, replay IDs
 and all output files form one indivisible Delta commit unit. Already committed
@@ -145,3 +163,10 @@ Native-CPU binaries must run only on compatible CPUs. Jemalloc was considered;
 this build offers one opt-in alternative allocator rather than introducing two
 native allocator dependencies without comparative workload evidence. No
 allocator, compression or concurrency setting is claimed universally faster.
+
+The system allocator can be tuned without a rebuild. In the `stage_bench`
+allocator comparison (4 groups of 64 batches, 121-byte strings), glibc with
+`{"arena_max":1,"mmap_threshold":33554432,"trim_threshold":4294967295,"top_pad":268435456}`
+roughly halved CPU seconds per million rows, cut minor faults about fivefold
+against default glibc, and matched or beat mimalloc. These results are
+workload-dependent, and a single arena can contend at higher worker counts.

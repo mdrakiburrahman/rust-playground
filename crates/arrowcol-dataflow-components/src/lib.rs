@@ -18,6 +18,7 @@ mod config;
 mod envelope;
 mod exporter;
 mod flight_exporter;
+mod isolation;
 mod metrics;
 mod receiver;
 mod routing;
@@ -38,11 +39,12 @@ pub use exporter::{ARROW_DELTALAKE_EXPORTER, ARROW_DELTALAKE_EXPORTER_URN, Gener
 pub use flight_exporter::{
     ARROW_FLIGHT_EXPORTER, ARROW_FLIGHT_EXPORTER_URN, ArrowFlightExporter, FlightExporterConfig, ForwardRegistration,
 };
+pub use isolation::isolation_stage_snapshot;
 pub use metrics::{
     DashboardCapabilities, DashboardPressure, FlushReason, NativeQuiverCapability, PipelineStage, RuntimeMetrics,
     StageMetrics, TableVersionStatus, global_metrics, process_instance_id, process_instance_key,
 };
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};
-pub use shutdown::{RoutingShutdown, finish_routing_shutdown};
+pub use shutdown::{RoutingShutdown, finish_routing_shutdown, terminal_publication_evidence};
 pub use topology::observe_validated_topology;

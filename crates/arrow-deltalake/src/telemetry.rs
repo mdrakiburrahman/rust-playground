@@ -3,7 +3,8 @@
 use delta_kernel::metrics::{CommitFailureReason, MetricEvent, MetricsReporter};
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::{KeyValue, global};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Attach this reporter using Kernel's `WithMetricsReporterLayer` to the process's
@@ -196,6 +197,9 @@ impl MetricsReporter for KernelReporter {
 struct PublicationMetrics {
     events: Counter<u64>,
     duration: Histogram<f64>,
+    commit_lock: Histogram<f64>,
+    phase: Histogram<f64>,
+    binding_batches: Counter<u64>,
     committed_rows: Counter<u64>,
     committed_files: Counter<u64>,
     committed_input_bytes: Counter<u64>,
@@ -209,12 +213,163 @@ fn publications() -> &'static PublicationMetrics {
         PublicationMetrics {
             events: meter.u64_counter("delta.publication.events").build(),
             duration: meter.f64_histogram("delta.publication.duration").with_unit("s").build(),
+            commit_lock: meter
+                .f64_histogram("delta.publication.commit_lock.duration")
+                .with_unit("s")
+                .build(),
+            phase: meter
+                .f64_histogram("delta.publication.phase.duration")
+                .with_unit("s")
+                .build(),
+            binding_batches: meter.u64_counter("delta.partition.binding.batches").build(),
             committed_rows: meter.u64_counter("delta.commit.rows").build(),
             committed_files: meter.u64_counter("delta.commit.files").build(),
             committed_input_bytes: meter.u64_counter("delta.commit.input_bytes").with_unit("By").build(),
             committed_bytes: meter.u64_counter("delta.commit.parquet_bytes").with_unit("By").build(),
         }
     })
+}
+
+pub(crate) fn partition_binding(path: &'static str) {
+    publications().binding_batches.add(1, &[KeyValue::new("path", path)]);
+}
+
+const MAX_TERMINAL_COMMITS: usize = 100_000;
+const MAX_TERMINAL_PUBLICATIONS: usize = 100_000;
+
+#[derive(Clone, Debug, serde::Serialize)]
+/// A directly observed physical Delta commit for terminal reconciliation.
+pub struct TerminalCommit {
+    /// SHA-256 of the writer's normalized table URL.
+    pub table_id: String,
+    /// Exact committed Delta version.
+    pub version: u64,
+    /// Number of rows added by this commit.
+    pub rows: u64,
+    /// Number of files added by this commit.
+    pub files: u64,
+    /// Total Parquet bytes added by this commit.
+    pub parquet_bytes: u64,
+}
+
+#[derive(Default)]
+struct TerminalCommits {
+    commits: Vec<TerminalCommit>,
+    publications: Vec<Arc<crate::PublicationEvidence>>,
+    publication_ids: HashSet<usize>,
+    incomplete: bool,
+    overflow: bool,
+}
+
+static TERMINAL_COMMITS: OnceLock<Mutex<TerminalCommits>> = OnceLock::new();
+
+fn terminal_commits() -> &'static Mutex<TerminalCommits> {
+    TERMINAL_COMMITS.get_or_init(|| Mutex::new(TerminalCommits::default()))
+}
+
+/// Marks process-lifetime commit attribution as unsuitable for a completeness proof.
+pub fn mark_terminal_commit_incomplete() {
+    if let Ok(mut evidence) = terminal_commits().lock() {
+        evidence.incomplete = true;
+    }
+}
+
+pub(crate) fn record_terminal_publication_evidence(publication: Arc<crate::PublicationEvidence>) {
+    if let Ok(mut evidence) = terminal_commits().lock() {
+        let has_unknown = publication
+            .outcomes
+            .values()
+            .any(|outcome| matches!(outcome, crate::PublicationOutcome::Unknown(_)));
+        if !publication.clean || publication.outcomes.is_empty() || has_unknown {
+            evidence.incomplete = true;
+        }
+        let identity = Arc::as_ptr(&publication) as usize;
+        if !evidence.publication_ids.insert(identity) {
+            return;
+        }
+        if evidence.publications.len() == MAX_TERMINAL_PUBLICATIONS {
+            evidence.incomplete = true;
+            evidence.overflow = true;
+        } else if !evidence.overflow {
+            evidence.publications.push(publication);
+        }
+    }
+}
+
+/// Returns exact app identities and whole-call outcomes, or none if they cannot be complete.
+#[must_use]
+pub fn terminal_publication_snapshot() -> Option<(bool, Vec<serde_json::Value>)> {
+    let evidence = terminal_commits().lock().ok()?;
+    if evidence.overflow {
+        return None;
+    }
+    let mut incomplete = evidence.incomplete;
+    let publications = evidence
+        .publications
+        .iter()
+        .map(|publication| {
+            let outcomes = publication
+                .outcomes
+                .iter()
+                .map(|((app_id, app_version), outcome)| {
+                    let (status, delta_version, reason) = match outcome {
+                        crate::PublicationOutcome::CommittedNow(version) => ("committed_now", Some(*version), None),
+                        crate::PublicationOutcome::AlreadyCommitted(version) => {
+                            ("already_committed", Some(*version), None)
+                        }
+                        crate::PublicationOutcome::Unknown(reason) => ("unknown", None, Some(*reason)),
+                    };
+                    serde_json::json!({
+                        "app_id": app_id,
+                        "app_version": app_version,
+                        "status": status,
+                        "delta_version": delta_version,
+                        "reason": reason
+                    })
+                })
+                .collect::<Vec<_>>();
+            let has_unknown = publication
+                .outcomes
+                .values()
+                .any(|outcome| matches!(outcome, crate::PublicationOutcome::Unknown(_)));
+            if !publication.clean || outcomes.is_empty() || has_unknown {
+                incomplete = true;
+            }
+            serde_json::json!({
+                "clean": publication.clean,
+                "reasons": publication.reasons.iter().collect::<Vec<_>>(),
+                "outcomes": outcomes
+            })
+        })
+        .collect();
+    Some((incomplete, publications))
+}
+
+/// Returns the retained process-lifetime commit facts, or none if they cannot be complete.
+#[must_use]
+pub fn terminal_commit_snapshot() -> Option<(bool, Vec<TerminalCommit>)> {
+    let evidence = terminal_commits().lock().ok()?;
+    if evidence.overflow {
+        return None;
+    }
+    Some((evidence.incomplete, evidence.commits.clone()))
+}
+
+pub(crate) fn record_terminal_commit(table_id: &str, version: u64, rows: u64, files: u64, parquet_bytes: u64) {
+    if let Ok(mut evidence) = terminal_commits().lock() {
+        if evidence.commits.len() == MAX_TERMINAL_COMMITS {
+            evidence.incomplete = true;
+            evidence.overflow = true;
+        } else if !evidence.overflow {
+            evidence.commits.push(TerminalCommit {
+                table_id: table_id.to_owned(),
+                version,
+                rows,
+                files,
+                parquet_bytes,
+            });
+        }
+    }
 }
 
 /// Counts only newly committed AddFiles after the local durability barrier.
@@ -257,6 +412,7 @@ pub(crate) fn data_commit(
 }
 
 pub(crate) fn ambiguous_commit_reconciled(table_id: &str, table_name: Option<&str>, elapsed: Duration) {
+    mark_terminal_commit_incomplete();
     publication_event("commit_attribution_uncertain");
     let event = ambiguous_commit_event(table_id, table_name, elapsed);
     eprintln!("arrowcol_data_commit {event}");
@@ -290,6 +446,48 @@ pub(crate) fn publication_event(outcome: &'static str) {
     publications().events.add(1, &[KeyValue::new("outcome", outcome)]);
 }
 
+pub(crate) fn publication_phase<T>(phase: &'static str, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = operation();
+    publications()
+        .phase
+        .record(started.elapsed().as_secs_f64(), &[KeyValue::new("phase", phase)]);
+    result
+}
+
+/// Declare before the guard: reverse drop order releases the lock before recording metrics.
+pub(crate) struct PublicationLockTimer {
+    requested: Instant,
+    acquired: Option<Instant>,
+}
+
+impl PublicationLockTimer {
+    pub(crate) fn start() -> Self {
+        Self {
+            requested: Instant::now(),
+            acquired: None,
+        }
+    }
+
+    pub(crate) fn acquired(&mut self) {
+        self.acquired = Some(Instant::now());
+    }
+}
+
+impl Drop for PublicationLockTimer {
+    fn drop(&mut self) {
+        let released = Instant::now();
+        let metrics = &publications().commit_lock;
+        let acquired = self.acquired.unwrap_or(released);
+        metrics.record(
+            (acquired - self.requested).as_secs_f64(),
+            &[KeyValue::new("phase", "wait")],
+        );
+        if self.acquired.is_some() {
+            metrics.record((released - acquired).as_secs_f64(), &[KeyValue::new("phase", "hold")]);
+        }
+    }
+}
 pub(crate) struct PublicationObservation {
     started: Instant,
     outcome: &'static str,

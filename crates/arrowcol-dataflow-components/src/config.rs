@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
-use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
+use arrowcol_protocol::{IsolationLevel, PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use arrowcol_tunables::AgeFlushPolicy;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,84 @@ static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 mod override_tests {
     use super::*;
+
+    #[test]
+    fn receiver_isolation_defaults_to_full_path_and_reports_resolved_level() -> Result<(), serde_json::Error> {
+        let mut input = serde_json::json!({
+            "listening_addr":"127.0.0.1:8815", "admin_listening_addr":"127.0.0.1:8816",
+            "catalog":{"type":"memory"}, "routing":{"type":"memory"},
+            "registration":{"instance_key":"test", "flight_endpoint":"127.0.0.1:8815"}
+        });
+        let config: FlightReceiverConfig = serde_json::from_value(input.clone())?;
+        assert_eq!(config.effective_config_json()["isolation_level"], "l5");
+        input["isolation_level"] = serde_json::json!("l1");
+        let config: FlightReceiverConfig = serde_json::from_value(input.clone())?;
+        assert_eq!(config.effective_config_json()["isolation_level"], "l1");
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({"l1": null}),
+            serde_json::json!("L1"),
+        ] {
+            input["isolation_level"] = invalid;
+            assert!(serde_json::from_value::<FlightReceiverConfig>(input.clone()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn commit_projection_preserves_yaml_and_reaches_table_options() -> Result<(), String> {
+        use arrow_deltalake::{
+            CheckpointMode, PreflightLookupMode, SnapshotCacheMode, SnapshotListMode, TxnLookupMode,
+        };
+
+        let yaml: CommitConfig = serde_json::from_value(serde_json::json!({"snapshot_cache_mode":"checkpoint_aware"}))
+            .map_err(|error| error.to_string())?;
+        for (name, mode) in [
+            ("external", CheckpointMode::External),
+            ("inline", CheckpointMode::Inline),
+            ("async", CheckpointMode::Async),
+        ] {
+            let settings = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"commit":{"checkpoint_mode":name,"checkpoint_interval":17,"txn_lookup_mode":"incremental",
+                    "preflight_lookup_mode":"grouped","snapshot_list_mode":"from_checkpoint","stage_snapshot_mode":"per_group","commit_attempts":3,"commit_budget_secs":2}}
+            }))
+            .map_err(|error| error.to_string())?;
+            let environment = settings
+                .environment_for(arrowcol_tunables::ComponentRole::Collector)
+                .map_err(|error| error.to_string())?;
+            let merged = merge_config(&yaml, &environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"], None)?;
+            let options = merged.build()?;
+            assert_eq!(options.snapshot_cache_mode, SnapshotCacheMode::CheckpointAware);
+            assert_eq!(options.checkpoint_mode, mode);
+            assert_eq!(options.checkpoint_interval, 17);
+            assert_eq!(options.txn_lookup_mode, TxnLookupMode::Incremental);
+            assert_eq!(options.preflight_lookup_mode, PreflightLookupMode::Grouped);
+            assert_eq!(options.snapshot_list_mode, SnapshotListMode::FromCheckpoint);
+            assert_eq!(
+                options.stage_snapshot_mode,
+                arrow_deltalake::StageSnapshotMode::PerGroup
+            );
+            assert_eq!(options.commit_attempts, 3);
+            assert_eq!(options.commit_budget, Duration::from_secs(2));
+        }
+        let defaults = CommitConfig::default().build()?;
+        assert_eq!(
+            (defaults.commit_attempts, defaults.commit_budget),
+            (8, Duration::from_secs(10))
+        );
+        for raw in [
+            serde_json::json!({"checkpoint_interval": 0}),
+            serde_json::json!({"checkpoint_interval": 100_001}),
+            serde_json::json!({"commit_attempts": 0}),
+            serde_json::json!({"commit_attempts": 1_001}),
+            serde_json::json!({"commit_budget_secs": 0}),
+            serde_json::json!({"commit_budget_secs": 3_601}),
+        ] {
+            let raw = raw.to_string();
+            assert!(merge_config(&yaml, &raw, None)?.build().is_err(), "{raw}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn receiver_compression_projects_typed_oat_json_into_actual_runtime_limits() -> Result<(), String> {
@@ -80,6 +158,123 @@ mod override_tests {
         assert!(merge_config(&config, r#"{"age_flush_policy":"drain_forever"}"#, None).is_err());
         assert!(merge_config(&config, r#"{"age_flush_policy":true}"#, None).is_err());
         Ok(())
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn large_byte_capacities_round_trip_through_oat_and_runtime_validation() -> Result<(), String> {
+        let values = serde_json::json!({
+            "global_capacity":{"bytes":6_000_000_000_u64},
+            "per_table_capacity":{"bytes":5_000_000_000_u64}
+        });
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"batching":values}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        let config = merge_config(
+            &FileBatchConfig::default(),
+            &environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"],
+            None,
+        )?;
+        config.validate()?;
+        assert_eq!(config.global_capacity.bytes, 6_000_000_000);
+        assert_eq!(config.per_table_capacity.bytes, 5_000_000_000);
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"batching":{"global_capacity":{"bytes":invalid}}}
+                }))
+                .is_err()
+            );
+        }
+
+        let oversized = format!(
+            r#"{{"global_capacity":{{"bytes":{}}}}}"#,
+            arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES + 1
+        );
+        assert!(
+            merge_config(&FileBatchConfig::default(), &oversized, None)?
+                .validate()
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_policy_refresh_interval_validates_the_merged_config() {
+        let config = FileBatchConfig::default();
+        for (value, valid) in [
+            ("\"0s\"", true),
+            ("\"30s\"", true),
+            ("\"1h\"", true),
+            ("\"61m\"", false),
+            ("\"-1s\"", false),
+            ("\"soon\"", false),
+            ("30", false),
+            ("null", false),
+        ] {
+            let json = format!(r#"{{"adaptive_policy_refresh_interval":{value}}}"#);
+            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+            assert_eq!(result.is_ok(), valid, "{json}");
+        }
+    }
+
+    #[test]
+    fn pending_commit_budget_validates_the_merged_config() {
+        let config = FileBatchConfig::default();
+        assert_eq!(config.max_pending_commit_bytes, 0);
+        let limit = arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES;
+        for (value, valid) in [
+            (limit.to_string(), true),
+            ((limit + 1).to_string(), false),
+            ("null".into(), false),
+            ("-1".into(), false),
+            ("1.5".into(), false),
+            ("\"16\"".into(), false),
+        ] {
+            let json = format!(r#"{{"max_pending_commit_bytes":{value}}}"#);
+            let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+            assert_eq!(result.is_ok(), valid, "{json}");
+        }
+    }
+
+    #[test]
+    fn stage_file_concurrency_validates_the_merged_batch_policy() {
+        let config = FileBatchConfig::default();
+        assert_eq!(config.stage_file_concurrency, 1);
+        let enabled = FileBatchConfig {
+            coalesce_publications: true,
+            ..config.clone()
+        };
+        assert!(
+            merge_config(&enabled, r#"{"stage_file_concurrency":16}"#, None)
+                .and_then(|merged| merged.validate())
+                .is_ok()
+        );
+        for field in ["stage_file_concurrency", "stage_files_per_group"] {
+            for (raw, valid) in [
+                ("1", true),
+                ("16", false),
+                ("0", false),
+                ("17", false),
+                ("-1", false),
+                ("1.5", false),
+                ("\"2\"", false),
+                ("null", false),
+            ] {
+                let json = format!(r#"{{"{field}":{raw}}}"#);
+                let result = merge_config(&config, &json, None).and_then(|merged| merged.validate());
+                assert_eq!(result.is_ok(), valid, "{json}");
+            }
+        }
     }
 
     #[test]
@@ -165,10 +360,78 @@ mod override_tests {
         let effective = routing.effective_config_json();
         assert_eq!(effective["connect_timeout"], "2s");
         assert_eq!(effective["command_timeout"], "30s");
+        assert_eq!(effective["pool_max_size"], 0);
         assert!(!effective.to_string().contains("password"));
         assert!(routing.apply_override(r#"{"host":"replacement"}"#).is_err());
+        routing.apply_override(r#"{"pool_max_size":8,"pool_acquire_timeout":"2s"}"#)?;
+        routing.validate()?;
+        let effective = routing.effective_config_json();
+        assert_eq!(effective["pool_max_size"], 8);
+        assert_eq!(effective["pool_acquire_timeout"], "2s");
+        for invalid in [
+            r#"{"pool_max_size":-1}"#,
+            r#"{"pool_max_size":1.5}"#,
+            r#"{"pool_max_size":"8"}"#,
+            r#"{"pool_size":8}"#,
+        ] {
+            assert!(routing.apply_override(invalid).is_err(), "{invalid}");
+        }
+        routing.apply_override(r#"{"pool_max_size":1025}"#)?;
+        assert!(routing.validate().is_err());
+        routing.apply_override(r#"{"pool_max_size":8,"pool_acquire_timeout":"0s"}"#)?;
+        assert!(routing.validate().is_err());
+        routing.apply_override(r#"{"pool_acquire_timeout":"601s"}"#)?;
+        assert!(routing.validate().is_err());
+        routing.apply_override(r#"{"pool_max_size":0}"#)?;
+        routing.validate()?;
         routing.apply_override(r#"{"command_timeout":"0s"}"#)?;
         assert!(routing.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oat_partial_overrides_reach_the_shipped_collector_baseline() -> Result<(), String> {
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"pressure":{"heartbeat_interval":"25s","buffered_bytes_limit":3_000_000_000_u64},
+                         "batching":{"adaptive_file":{"max_input_bytes":8_388_608}}}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        for template in [
+            include_str!("../../../projects/arrowcol-dataflow-rust/config.yaml"),
+            include_str!("../../../projects/arrowcol-dataflow-rust/config.quiver.yaml"),
+        ] {
+            let expanded = otel_arrow_dfe_config::env_substitution::substitute_env_vars(template)
+                .map_err(|error| error.to_string())?;
+            let pipeline = otel_arrow_dfe_config::engine::OtelDataflowSpec::from_yaml(&expanded)
+                .map_err(|error| error.to_string())?;
+            let pipeline = serde_json::to_value(pipeline).map_err(|error| error.to_string())?;
+            let registration: RegistrationConfig = serde_json::from_value(
+                pipeline
+                    .pointer("/groups/arrowcol/pipelines/ingest/nodes/flight/config/registration")
+                    .ok_or("missing receiver registration")?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let effective: RegistrationConfig =
+                merge_config(&registration, &environment["ARROWCOL_COLLECTOR_PRESSURE_CONFIG"], None)?;
+            effective.validate()?;
+            assert_eq!(effective.heartbeat_interval, Duration::from_secs(25));
+            assert_eq!(effective.buffered_bytes_limit, 3_000_000_000);
+            let batch: FileBatchConfig = serde_json::from_value(
+                pipeline
+                    .pointer("/groups/arrowcol/pipelines/ingest/nodes/delta/config/batching")
+                    .ok_or("missing exporter batching")?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let effective: FileBatchConfig =
+                merge_config(&batch, &environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"], None)?;
+            effective.validate()?;
+            assert_eq!(effective.adaptive_file.max_input_bytes, 8_388_608);
+        }
         Ok(())
     }
 
@@ -273,6 +536,9 @@ struct RoutingOverrides {
     connect_timeout: Duration,
     #[serde(with = "humantime_serde")]
     command_timeout: Duration,
+    pool_max_size: usize,
+    #[serde(with = "humantime_serde")]
+    pool_acquire_timeout: Duration,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -343,6 +609,13 @@ fn default_command_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_pool_acquire_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+const MAX_ROUTING_POOL_SIZE: usize = 1_024;
+const MAX_ROUTING_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn default_heartbeat_interval() -> Duration {
     Duration::from_secs(5)
 }
@@ -402,6 +675,12 @@ pub struct SqlServerConnectionConfig {
     /// SQL command timeout.
     #[serde(default = "default_command_timeout", with = "humantime_serde")]
     pub command_timeout: Duration,
+    /// Maximum pooled routing connections; 0 opens one connection per operation.
+    #[serde(default)]
+    pub pool_max_size: usize,
+    /// Wait bound for a pooled routing connection when `pool_max_size > 0`.
+    #[serde(default = "default_pool_acquire_timeout", with = "humantime_serde")]
+    pub pool_acquire_timeout: Duration,
 }
 
 impl SqlServerConnectionConfig {
@@ -420,6 +699,17 @@ impl SqlServerConnectionConfig {
         }
         validate_duration("connect_timeout", self.connect_timeout)?;
         validate_duration("command_timeout", self.command_timeout)?;
+        if self.pool_max_size > MAX_ROUTING_POOL_SIZE {
+            return Err(format!("pool_max_size must be at most {MAX_ROUTING_POOL_SIZE}"));
+        }
+        if self.pool_max_size > 0 {
+            validate_duration("pool_acquire_timeout", self.pool_acquire_timeout)?;
+            if self.pool_acquire_timeout > MAX_ROUTING_POOL_ACQUIRE_TIMEOUT {
+                return Err(format!(
+                    "pool_acquire_timeout must be at most {MAX_ROUTING_POOL_ACQUIRE_TIMEOUT:?}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -561,15 +851,19 @@ impl RoutingStoreConfig {
                     &RoutingOverrides {
                         connect_timeout: connection.connect_timeout,
                         command_timeout: connection.command_timeout,
+                        pool_max_size: connection.pool_max_size,
+                        pool_acquire_timeout: connection.pool_acquire_timeout,
                     },
                     json,
                     None,
                 )?;
                 connection.connect_timeout = resolved.connect_timeout;
                 connection.command_timeout = resolved.command_timeout;
+                connection.pool_max_size = resolved.pool_max_size;
+                connection.pool_acquire_timeout = resolved.pool_acquire_timeout;
                 Ok(())
             }
-            Self::Memory | Self::Standalone => Err("routing timeout override requires SQL Server routing".to_owned()),
+            Self::Memory | Self::Standalone => Err("routing override requires SQL Server routing".to_owned()),
         }
     }
 
@@ -586,7 +880,9 @@ impl RoutingStoreConfig {
             Self::SqlServer { connection } => serde_json::json!({
                 "type": "sql_server",
                 "connect_timeout": format!("{:?}", connection.connect_timeout),
-                "command_timeout": format!("{:?}", connection.command_timeout)
+                "command_timeout": format!("{:?}", connection.command_timeout),
+                "pool_max_size": connection.pool_max_size,
+                "pool_acquire_timeout": format!("{:?}", connection.pool_acquire_timeout)
             }),
             Self::Memory => serde_json::json!({"type": "memory"}),
             Self::Standalone => serde_json::json!({"type": "standalone"}),
@@ -608,10 +904,20 @@ impl RoutingStoreConfig {
         match self {
             Self::Memory => Ok(Arc::new(MemoryRoutingStore::default())),
             Self::Standalone => Ok(Arc::clone(&*STANDALONE_ROUTING) as Arc<dyn RoutingStore>),
-            Self::SqlServer { connection } => connection
-                .routing_config()
-                .map(|config| Arc::new(SqlServerRoutingStore::new(config)) as Arc<dyn RoutingStore>)
-                .map_err(|error| error.to_string()),
+            Self::SqlServer { connection } => {
+                let config = connection.routing_config().map_err(|error| error.to_string())?;
+                let store = if connection.pool_max_size == 0 {
+                    SqlServerRoutingStore::new(config)
+                } else {
+                    let pool = config
+                        .create_pool(connection.pool_max_size, connection.pool_acquire_timeout)
+                        .map_err(|error| error.to_string())?;
+                    SqlServerRoutingStore::new(config)
+                        .with_pool(pool)
+                        .map_err(|error| error.to_string())?
+                };
+                Ok(Arc::new(store) as Arc<dyn RoutingStore>)
+            }
         }
     }
 }
@@ -802,6 +1108,9 @@ pub struct FlightReceiverConfig {
     /// Flight resource limits.
     #[serde(default)]
     pub limits: RuntimeLimitsConfig,
+    /// Flight listener and accepted-socket settings.
+    #[serde(default)]
+    pub socket: arrowcol_tunables::CollectorSocketTunables,
     /// Enables durable admission through native Quiver persistence.
     ///
     /// The topology must route this receiver into a `processor:durable_buffer`
@@ -815,10 +1124,17 @@ pub struct FlightReceiverConfig {
     /// Process CPU sampling for admission pressure; disabled by default.
     #[serde(default)]
     pub cpu_pressure: arrowcol_tunables::CpuPressureMode,
+    /// Last collector stage exercised; only the default L5 runs the normal publication path.
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
 }
 
 impl FlightReceiverConfig {
     pub(crate) fn apply_environment(&mut self) -> Result<(), String> {
+        const ISOLATION_ENV: &str = "ARROWCOL_COLLECTOR_ISOLATION_LEVEL";
+        if let Some(value) = environment_json(ISOLATION_ENV)? {
+            self.isolation_level = value.parse().map_err(|error| format!("{ISOLATION_ENV}: {error}"))?;
+        }
         const CPU_PRESSURE_ENV: &str = "ARROWCOL_COLLECTOR_CPU_PRESSURE";
         match std::env::var(CPU_PRESSURE_ENV) {
             Ok(value) => {
@@ -830,6 +1146,7 @@ impl FlightReceiverConfig {
             }
         }
         apply_json_environment(&mut self.limits, "ARROWCOL_COLLECTOR_LIMITS_CONFIG", None)?;
+        apply_json_environment(&mut self.socket, "ARROWCOL_COLLECTOR_SOCKET_CONFIG", None)?;
         apply_json_environment(
             &mut self.registration,
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
@@ -850,8 +1167,10 @@ impl FlightReceiverConfig {
 
     pub(crate) fn effective_config_json(&self) -> serde_json::Value {
         serde_json::json!({
+            "isolation_level": self.isolation_level,
             "cpu_pressure": self.cpu_pressure,
             "limits": self.limits,
+            "socket": self.socket,
             "pressure": {
                 "max_concurrent_streams": self.registration.max_concurrent_streams,
                 "rss_limit_bytes": self.registration.rss_limit_bytes,
@@ -878,6 +1197,12 @@ impl FlightReceiverConfig {
         self.routing.validate()?;
         self.registration.validate()?;
         self.limits.build().map_err(|error| error.to_string())?;
+        self.socket.validate()?;
+        if !cfg!(target_os = "linux")
+            && (self.socket.recv_buffer_bytes.is_some() || self.socket.send_buffer_bytes.is_some())
+        {
+            return Err("collector.socket buffer settings are only supported on Linux".to_owned());
+        }
         Ok(())
     }
 }
@@ -886,6 +1211,10 @@ impl FlightReceiverConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitConfig {
+    /// Strategy used to resolve prior Delta transactions.
+    pub txn_lookup_mode: arrow_deltalake::TxnLookupMode,
+    /// When a partially filled commit batch is published: after `batch_window` or as soon as the worker is idle.
+    pub trigger: arrow_deltalake::CommitTrigger,
     /// Maximum batching delay.
     #[serde(with = "humantime_serde")]
     pub batch_window: Duration,
@@ -893,15 +1222,41 @@ pub struct CommitConfig {
     pub max_files_per_commit: usize,
     /// Maximum queued and committing files per table.
     pub max_pending_files: usize,
+    /// How the table owner reuses its Delta snapshot.
+    pub snapshot_cache_mode: arrow_deltalake::SnapshotCacheMode,
+    /// How object-store snapshot refreshes list `_delta_log/`.
+    pub snapshot_list_mode: arrow_deltalake::SnapshotListMode,
+    /// Whether coalesced files bind their write schema separately or as a group.
+    pub stage_snapshot_mode: arrow_deltalake::StageSnapshotMode,
+    /// How coalesced preparation resolves prior Delta transactions.
+    pub preflight_lookup_mode: arrow_deltalake::PreflightLookupMode,
+    /// Whether the collector or an external service writes checkpoints.
+    pub checkpoint_mode: arrow_deltalake::CheckpointMode,
+    /// Commit interval for collector-owned checkpoints.
+    pub checkpoint_interval: u64,
+    /// Publication attempts per commit cohort, including the first.
+    pub commit_attempts: u32,
+    /// Elapsed publication retry budget in seconds, checked between attempts only.
+    pub commit_budget_secs: u64,
 }
 
 impl Default for CommitConfig {
     fn default() -> Self {
         let options = arrow_deltalake::commit::CommitOptions::default();
         Self {
+            txn_lookup_mode: options.txn_lookup_mode,
+            trigger: options.trigger,
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
+            snapshot_cache_mode: options.snapshot_cache_mode,
+            snapshot_list_mode: options.snapshot_list_mode,
+            stage_snapshot_mode: options.stage_snapshot_mode,
+            preflight_lookup_mode: options.preflight_lookup_mode,
+            checkpoint_mode: options.checkpoint_mode,
+            checkpoint_interval: options.checkpoint_interval,
+            commit_attempts: options.commit_attempts,
+            commit_budget_secs: options.commit_budget.as_secs(),
         }
     }
 }
@@ -909,9 +1264,19 @@ impl Default for CommitConfig {
 impl CommitConfig {
     pub(crate) fn build(&self) -> Result<arrow_deltalake::commit::CommitOptions, String> {
         let options = arrow_deltalake::commit::CommitOptions {
+            txn_lookup_mode: self.txn_lookup_mode,
+            trigger: self.trigger,
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
+            snapshot_cache_mode: self.snapshot_cache_mode,
+            snapshot_list_mode: self.snapshot_list_mode,
+            stage_snapshot_mode: self.stage_snapshot_mode,
+            preflight_lookup_mode: self.preflight_lookup_mode,
+            checkpoint_mode: self.checkpoint_mode,
+            checkpoint_interval: self.checkpoint_interval,
+            commit_attempts: self.commit_attempts,
+            commit_budget: Duration::from_secs(self.commit_budget_secs),
         };
         options.validate().map_err(|error| error.to_string())?;
         Ok(options)
@@ -974,12 +1339,12 @@ impl DeltaExporterConfig {
     }
 }
 
-/// Logical Arrow capacity retained until publication finishes.
+/// Admission limits for queued and in-flight Arrow input.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BatchCapacity {
     /// Logical Arrow bytes.
-    pub bytes: u32,
+    pub bytes: u64,
     /// Rows.
     pub rows: u32,
     /// Batches.
@@ -1007,10 +1372,20 @@ pub struct FileBatchConfig {
     /// Maximum age of the first batch in a file.
     #[serde(with = "humantime_serde")]
     pub max_age: Duration,
+    /// Minimum age of a table writer-policy readback before it is refreshed again; zero refreshes every batch.
+    #[serde(with = "humantime_serde")]
+    pub adaptive_policy_refresh_interval: Duration,
     /// Maximum simultaneous file publications.
     pub max_concurrent_flushes: usize,
+    /// Maximum sibling files staged concurrently within one coalesced publication.
+    pub stage_file_concurrency: usize,
+    /// Balanced sibling files per unsorted partition in a coalesced group.
+    pub stage_files_per_group: usize,
     /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
     pub pipeline_depth: usize,
+    /// Backend-wide logical bytes allowed to release Arrow and flush capacity after queue handoff.
+    /// Zero keeps both reservations through the durable receipt.
+    pub max_pending_commit_bytes: u64,
     /// Compressed Parquet target and estimator limits.
     pub adaptive_file: AdaptiveFileConfig,
 }
@@ -1034,8 +1409,12 @@ impl Default for FileBatchConfig {
             max_rows_per_flush: 1_000_000,
             max_batches_per_flush: 512,
             max_age: Duration::from_secs(30),
+            adaptive_policy_refresh_interval: Duration::ZERO,
             max_concurrent_flushes: 4,
+            stage_file_concurrency: 1,
+            stage_files_per_group: 1,
             pipeline_depth: 1,
+            max_pending_commit_bytes: 0,
             adaptive_file: AdaptiveFileConfig::default(),
         }
     }
@@ -1043,22 +1422,39 @@ impl Default for FileBatchConfig {
 
 impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.max_pending_commit_bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES {
+            return Err("max_pending_commit_bytes exceeds the exact byte capacity limit".to_owned());
+        }
+        if self.adaptive_policy_refresh_interval > arrowcol_tunables::MAX_ADAPTIVE_POLICY_REFRESH_INTERVAL {
+            return Err("adaptive_policy_refresh_interval must not exceed 1h".to_owned());
+        }
         let global = self.global_capacity;
         let table = self.per_table_capacity;
-        if [
-            global.bytes,
-            global.rows,
-            global.batches,
-            table.bytes,
-            table.rows,
-            table.batches,
-        ]
-        .contains(&0)
+        if !(1..=16).contains(&self.stage_file_concurrency) {
+            return Err("stage_file_concurrency must be in 1..=16".to_owned());
+        }
+        if self.stage_file_concurrency > 1 && !self.coalesce_publications {
+            return Err("stage_file_concurrency > 1 requires coalesce_publications=true".to_owned());
+        }
+        if !(1..=16).contains(&self.stage_files_per_group) {
+            return Err("stage_files_per_group must be in 1..=16".to_owned());
+        }
+        if self.stage_files_per_group > 1 && !self.coalesce_publications {
+            return Err("stage_files_per_group > 1 requires coalesce_publications=true".to_owned());
+        }
+        if [global.rows, global.batches, table.rows, table.batches].contains(&0)
+            || global.bytes == 0
+            || table.bytes == 0
+            || global.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || table.bytes > arrowcol_tunables::MAX_QUEUE_CAPACITY_BYTES
+            || [global.rows, global.batches, table.rows, table.batches]
+                .into_iter()
+                .any(|value| u64::from(value) > tokio::sync::Semaphore::MAX_PERMITS as u64)
             || table.bytes > global.bytes
             || table.rows > global.rows
             || table.batches > global.batches
             || self.max_arrow_memory_per_flush == 0
-            || self.max_arrow_memory_per_flush > u64::from(table.bytes)
+            || self.max_arrow_memory_per_flush > table.bytes
             || self.max_rows_per_flush == 0
             || self.max_rows_per_flush > u64::from(table.rows)
             || self.max_batches_per_flush == 0

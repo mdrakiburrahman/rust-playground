@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,16 +38,57 @@ test('missing and unknown AKS subcommands exit with usage instead of launching a
   }
 });
 
-test('non-AKS arguments and the injected runner pass through to the existing launcher', async () => {
-  const commands: string[][] = [];
+test('non-AKS arguments and the injected runner reach only the selected launcher', async () => {
   await assert.rejects(main(['--mode', 'invalid']), /--mode must be local or aks/);
-  await assert.rejects(main(['--mode', 'local'], async (command) => {
-    commands.push(command);
-    return command[0] === 'git'
-      ? { returncode: 0, stdout: command[1] === 'rev-parse' ? 'a'.repeat(40) : '', stderr: '' }
-      : { returncode: 1, stdout: '', stderr: 'router test build refused' };
-  }), /router test build refused/);
-  assert.ok(commands.some((command) => command[0] === 'cargo' && command[1] === 'build'));
+  const args = ['--mode', 'local'];
+  const runner = async () => { throw new Error('router must not run commands'); };
+  const refusal = new Error('injected launcher refused');
+  await assert.rejects(main(args, runner, undefined, async (actual, injected) => {
+    assert.deepEqual(actual, args);
+    assert.equal(injected, runner);
+    throw refusal;
+  }), (error: unknown) => error === refusal);
+});
+
+test('router refusal fixture cannot write outside its temporary ledger', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-router-write-scope-'));
+  try {
+    const modules = 'projects/arrowcol-oat';
+    await mkdir(path.join(root, modules), { recursive: true });
+    for (const name of ['cli.ts', 'launch.ts']) await copyFile(path.join(ROOT, modules, name), path.join(root, modules, name));
+    for (const name of (await readdir(path.join(ROOT, modules))).filter(name => name.endsWith('.ts') &&
+      !name.endsWith('.test.ts') && name !== 'cli.ts' && name !== 'launch.ts')) {
+      await symlink(path.join(ROOT, modules, name), path.join(root, modules, name));
+    }
+    for (const name of ['infra', 'node_modules', 'package.json']) await symlink(path.join(ROOT, name), path.join(root, name));
+    const config = path.join(ROOT, 'docs/experiments/arrowcol-oat/oat-config.quick.json');
+    const defaultLedger = path.join(root, 'out/arrowcol-oat/deadline-receipts');
+    await mkdir(defaultLedger, { recursive: true });
+    await writeFile(path.join(defaultLedger, 'untouched'), 'default-ledger sentinel');
+    const script = `
+      import assert from 'node:assert/strict';
+      import { main } from './projects/arrowcol-oat/cli.ts';
+      import { main as launch } from './projects/arrowcol-oat/launch.ts';
+      const runner = async command => command[0] === 'git'
+        ? {returncode:0, stdout:command[1] === 'rev-parse' ? 'a'.repeat(40) : '', stderr:''}
+        : {returncode:1, stdout:'', stderr:'router test build refused'};
+      await assert.rejects(main(['--mode','local','--config',${JSON.stringify(config)}], runner, undefined,
+        (args, run) => launch(args, run, undefined, ${JSON.stringify(path.join(root, 'receipts'))})), /router test build refused/);
+    `;
+    const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+      cwd: root, encoding: 'utf8', timeout: 30_000, env: { ...process.env, TMPDIR: root, TSX_DISABLE_CACHE: '1' },
+    });
+    assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+    assert.deepEqual(await readdir(defaultLedger), ['untouched']);
+    assert.equal(await readFile(path.join(defaultLedger, 'untouched'), 'utf8'), 'default-ledger sentinel');
+    const receipts = await readdir(path.join(root, 'receipts'));
+    assert.equal(receipts.length, 1);
+    const receipt = JSON.parse(await readFile(path.join(root, 'receipts', receipts[0]!), 'utf8'));
+    assert.equal(receipt.error, 'OAT cargo failed: router test build refused');
+    assert.equal(receipt.creation_state, 'not_started');
+    assert.equal(receipt.cleanup_state, 'confirmed');
+    assert.equal(receipt.run_id, null);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('AKS defaults prefer generated private configuration but never override explicit or local configs', async () => {

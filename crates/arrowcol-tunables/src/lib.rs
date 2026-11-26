@@ -4,14 +4,89 @@ pub use validation::{
     ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table, parse_tunable_duration,
 };
 
+pub use arrow_deltalake::PartitionGrouping;
 pub use arrow_deltalake::writer::{
     Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
     Statistics as ParquetStatistics, ValueEncoding as ParquetValueEncoding, Version as ParquetWriterVersion,
 };
+pub use arrowcol_protocol::IsolationLevel;
 pub use arrowcol_routing::AdmissionPressureGauge;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::str::FromStr;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CollectorCpuQuota {
+    Cores(f64),
+    Unlimited(UnlimitedCpuQuota),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlimitedCpuQuota {
+    Unlimited,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMemoryMetric {
+    #[default]
+    Usage,
+    WorkingSet,
+}
+
+impl ContainerMemoryMetric {
+    #[must_use]
+    pub fn is_usage(&self) -> bool {
+        *self == Self::Usage
+    }
+
+    #[must_use]
+    pub fn metric_name(self) -> &'static str {
+        match self {
+            Self::Usage => "container_memory_bytes",
+            Self::WorkingSet => "container_working_set_bytes",
+        }
+    }
+}
+
+impl CollectorCpuQuota {
+    /// # Errors
+    /// Rejects quotas below 0.01 CPU, nonfinite, oversized or sub-nanocore quotas.
+    pub fn nano_cpus(self) -> Result<u64, &'static str> {
+        match self {
+            Self::Unlimited(_) => Ok(0),
+            Self::Cores(cores) if cores.is_finite() && (0.01..=4096.0).contains(&cores) => {
+                let decimal = cores.to_string();
+                let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
+                if fraction.len() > 9 {
+                    return Err("platform.local.collector_cpu_quota supports at most nanocore precision");
+                }
+                let whole = whole
+                    .parse::<u64>()
+                    .map_err(|_| "platform.local.collector_cpu_quota is invalid")?;
+                let fraction = format!("{fraction:0<9}")
+                    .parse::<u64>()
+                    .map_err(|_| "platform.local.collector_cpu_quota is invalid")?;
+                Ok(whole * 1_000_000_000 + fraction)
+            }
+            Self::Cores(_) => Err(
+                "platform.local.collector_cpu_quota must be a decimal from 0.01 to 4096 (nanocore precision) or \"unlimited\"",
+            ),
+        }
+    }
+}
+
+/// Payload customer IDs are bounded printable identifiers, not delivery identities.
+#[must_use]
+pub fn valid_payload_customer_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +97,12 @@ pub struct Tunables {
     pub transport: Option<TransportTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrow_ipc: Option<ArrowIpcTunables>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_delta"
+    )]
+    pub delta: Option<DeltaTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,7 +119,33 @@ pub struct Tunables {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct DeltaTunables {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub target_file_size_bytes: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub checkpoint_interval: Option<u64>,
+}
+
+fn deserialize_present_delta<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<DeltaTunables>, D::Error> {
+    DeltaTunables::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientTunables {
+    pub payload_customer_id: Option<String>,
     pub corpus_rows: Option<u64>,
     pub corpus_bytes: Option<u64>,
     pub batch_rows: Option<usize>,
@@ -46,6 +153,12 @@ pub struct ClientTunables {
     pub runtime_threads: Option<usize>,
     pub data_mode: Option<DataMode>,
     pub data_profile: Option<ClientDataProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_profile: Option<ClientBuildProfileTunables>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_iter: Option<ClientSendIter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_builder: Option<ClientIdentityBuilder>,
     pub string_length_distribution: Option<ClientStringLengthDistribution>,
     pub value_variation: Option<ClientValueVariation>,
     pub guid_uniqueness: Option<ClientGuidUniqueness>,
@@ -57,6 +170,8 @@ pub struct ClientTunables {
     pub seed: Option<u64>,
     pub max_memory_bytes: Option<u64>,
     pub interval_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiesce_timeout_ms: Option<u64>,
     pub connections_per_worker: Option<usize>,
     pub pod_ordinal: Option<u32>,
     pub streams_per_worker: Option<usize>,
@@ -73,6 +188,30 @@ pub struct TransportTunables {
     pub dictionary_handling: Option<DictionaryHandling>,
     pub max_flight_data_bytes: Option<u64>,
     pub max_message_bytes: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub grpc_max_encode_bytes: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub grpc_max_decode_bytes: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub socket_send_buffer_bytes: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub socket_recv_buffer_bytes: Option<usize>,
     pub grpc_send_compression: Option<GrpcCompression>,
     pub grpc_accept_compression: Option<GrpcCompression>,
     pub max_frame_bytes: Option<u32>,
@@ -91,6 +230,8 @@ pub struct TransportTunables {
     pub tcp_keepalive_interval_ms: Option<u64>,
     pub tcp_keepalive_retries: Option<u32>,
     pub rate_limit_rps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_period_ms: Option<u64>,
     pub endpoint_concurrency_limit: Option<usize>,
     pub endpoint_buffer_size: Option<usize>,
     pub connect_retries: Option<u32>,
@@ -101,6 +242,8 @@ pub struct TransportTunables {
 #[serde(deny_unknown_fields)]
 pub struct ArrowIpcTunables {
     pub compression: Option<ArrowIpcCompression>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -213,6 +356,11 @@ pub struct CollectorTunables {
     )]
     pub shutdown_drain_timeout_seconds: Option<u32>,
     pub batching: Option<BatchingTunables>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_channel_capacity_object"
+    )]
+    pub channel_capacity: Option<ChannelCapacityTunables>,
     pub catalog: Option<CatalogTunables>,
     pub commit: Option<CommitTunables>,
     pub exporter: Option<ExporterTunables>,
@@ -221,16 +369,1104 @@ pub struct CollectorTunables {
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+    pub socket: Option<CollectorSocketTunables>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_malloc"
+    )]
+    pub malloc: Option<CollectorMallocTunables>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub mimalloc: Option<CollectorMimallocTunables>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_bool"
+    )]
+    pub thp_disabled: Option<bool>,
     pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
+    #[serde(deserialize_with = "deserialize_collector_allocator")]
+    pub allocator: Option<CollectorAllocator>,
+    #[serde(deserialize_with = "deserialize_collector_lto")]
+    pub lto: Option<CollectorLto>,
+    #[serde(deserialize_with = "deserialize_collector_codegen_units")]
+    pub codegen_units: Option<u16>,
+    #[serde(deserialize_with = "deserialize_collector_opt_level")]
+    pub opt_level: Option<CollectorOptLevel>,
+    #[serde(deserialize_with = "deserialize_collector_target_cpu")]
+    pub target_cpu: Option<CollectorTargetCpu>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_isolation_level"
+    )]
+    pub isolation_level: Option<IsolationLevel>,
+}
+
+fn deserialize_isolation_level<'de, D: Deserializer<'de>>(d: D) -> Result<Option<IsolationLevel>, D::Error> {
+    IsolationLevel::deserialize(d).map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorAllocator {
+    #[default]
+    System,
+    Mimalloc,
+}
+impl CollectorAllocator {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Mimalloc => "mimalloc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorLto {
+    #[default]
+    Off,
+    #[serde(rename = "thin-local")]
+    ThinLocal,
+    Thin,
+    Fat,
+}
+impl CollectorLto {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ThinLocal => "thin-local",
+            Self::Thin => "thin",
+            Self::Fat => "fat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub enum CollectorOptLevel {
+    #[serde(rename = "2")]
+    O2,
+    #[default]
+    #[serde(rename = "3")]
+    O3,
+}
+impl CollectorOptLevel {
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::O2 => 2,
+            Self::O3 => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub enum CollectorTargetCpu {
+    #[default]
+    #[serde(rename = "generic")]
+    Generic,
+    #[serde(rename = "x86-64-v2")]
+    X86_64V2,
+    #[serde(rename = "x86-64-v3")]
+    X86_64V3,
+    #[serde(rename = "x86-64-v4")]
+    X86_64V4,
+}
+impl CollectorTargetCpu {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::X86_64V2 => "x86-64-v2",
+            Self::X86_64V3 => "x86-64-v3",
+            Self::X86_64V4 => "x86-64-v4",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientBuildProfile {
+    pub lto: CollectorLto,
+    pub codegen_units: u16,
+    pub opt_level: CollectorOptLevel,
+    pub target_cpu: CollectorTargetCpu,
+}
+impl Default for ClientBuildProfile {
+    fn default() -> Self {
+        Self {
+            lto: CollectorLto::Off,
+            codegen_units: 16,
+            opt_level: CollectorOptLevel::O3,
+            target_cpu: CollectorTargetCpu::Generic,
+        }
+    }
+}
+impl ClientBuildProfile {
+    pub fn canonical_key(self) -> String {
+        format!(
+            "lto={};codegen_units={};opt_level={};target_cpu={}",
+            self.lto.as_str(),
+            self.codegen_units,
+            self.opt_level.as_u8(),
+            self.target_cpu.as_str()
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientBuildProfileTunables {
+    #[serde(default, deserialize_with = "deserialize_client_build_lto")]
+    pub lto: Option<CollectorLto>,
+    #[serde(default, deserialize_with = "deserialize_client_build_codegen_units")]
+    pub codegen_units: Option<u16>,
+    #[serde(default, deserialize_with = "deserialize_client_build_opt_level")]
+    pub opt_level: Option<CollectorOptLevel>,
+    #[serde(default, deserialize_with = "deserialize_client_build_target_cpu")]
+    pub target_cpu: Option<CollectorTargetCpu>,
+}
+impl ClientBuildProfileTunables {
+    pub fn build_profile(&self) -> ClientBuildProfile {
+        ClientBuildProfile {
+            lto: self.lto.unwrap_or_default(),
+            codegen_units: self.codegen_units.unwrap_or(16),
+            opt_level: self.opt_level.unwrap_or_default(),
+            target_cpu: self.target_cpu.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CollectorCpuFeatureRequirement {
+    isa_feature: &'static str,
+    cpuinfo_tokens: &'static [&'static str],
+    minimum_level: u8,
+}
+
+const X86_64_FEATURES: &[CollectorCpuFeatureRequirement] = &[
+    CollectorCpuFeatureRequirement {
+        isa_feature: "CX16",
+        cpuinfo_tokens: &["cx16"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "LAHF/SAHF",
+        cpuinfo_tokens: &["lahf_lm"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "POPCNT",
+        cpuinfo_tokens: &["popcnt"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSE3",
+        cpuinfo_tokens: &["pni", "sse3"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSSE3",
+        cpuinfo_tokens: &["ssse3"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSE4.1",
+        cpuinfo_tokens: &["sse4_1"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "SSE4.2",
+        cpuinfo_tokens: &["sse4_2"],
+        minimum_level: 2,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX",
+        cpuinfo_tokens: &["avx"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX2",
+        cpuinfo_tokens: &["avx2"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "F16C",
+        cpuinfo_tokens: &["f16c"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "BMI1",
+        cpuinfo_tokens: &["bmi1"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "BMI2",
+        cpuinfo_tokens: &["bmi2"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "FMA",
+        cpuinfo_tokens: &["fma"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "LZCNT",
+        cpuinfo_tokens: &["abm"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "MOVBE",
+        cpuinfo_tokens: &["movbe"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "XSAVE",
+        cpuinfo_tokens: &["xsave"],
+        minimum_level: 3,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512F",
+        cpuinfo_tokens: &["avx512f"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512BW",
+        cpuinfo_tokens: &["avx512bw"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512CD",
+        cpuinfo_tokens: &["avx512cd"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512DQ",
+        cpuinfo_tokens: &["avx512dq"],
+        minimum_level: 4,
+    },
+    CollectorCpuFeatureRequirement {
+        isa_feature: "AVX-512VL",
+        cpuinfo_tokens: &["avx512vl"],
+        minimum_level: 4,
+    },
+];
+
+/// Verifies host CPU flags against a supported collector target ISA.
+///
+/// # Errors
+/// Returns an error when the target is unsupported or required CPU flags are missing.
+pub fn verify_collector_target_cpu_flags(target_cpu: &str, cpu_info: &str, field: &str) -> Result<(), String> {
+    let target_level = match target_cpu {
+        "generic" => return Ok(()),
+        "x86-64-v2" => 2,
+        "x86-64-v3" => 3,
+        "x86-64-v4" => 4,
+        _ => return Err(format!("{field} uses unsupported collector target CPU {target_cpu}")),
+    };
+    let flags = cpu_info
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim() == "flags").then_some(value)
+        })
+        .ok_or_else(|| format!("{field} cannot find host CPU flags"))?;
+    let flags = flags.split_whitespace().collect::<std::collections::HashSet<_>>();
+    if flags.is_empty() {
+        return Err(format!("{field} found empty host CPU flags"));
+    }
+    let missing = X86_64_FEATURES
+        .iter()
+        .filter(|feature| {
+            feature.minimum_level <= target_level && !feature.cpuinfo_tokens.iter().any(|token| flags.contains(*token))
+        })
+        .map(|feature| {
+            format!(
+                "{} (cpuinfo token: {})",
+                feature.isa_feature,
+                feature.cpuinfo_tokens.join(" or ")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{field} {target_cpu} requires unavailable ISA features: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the Rust target features required by the selected CPU profile.
+///
+/// # Errors
+///
+/// Returns an error when the requested CPU profile is unsupported.
+pub fn required_rust_target_features(target_cpu: &str) -> Result<&'static [&'static str], String> {
+    const V2: &[&str] = &["cmpxchg16b", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2"];
+    const V3: &[&str] = &[
+        "cmpxchg16b",
+        "popcnt",
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+        "avx",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "xsave",
+    ];
+    const V4: &[&str] = &[
+        "cmpxchg16b",
+        "popcnt",
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+        "avx",
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "xsave",
+        "avx512f",
+        "avx512bw",
+        "avx512cd",
+        "avx512dq",
+        "avx512vl",
+    ];
+    match target_cpu {
+        "generic" => Ok(&[]),
+        "x86-64-v2" => Ok(V2),
+        "x86-64-v3" => Ok(V3),
+        "x86-64-v4" => Ok(V4),
+        _ => Err(format!("unsupported target CPU {target_cpu}")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectorBuildProfile {
+    pub allocator: CollectorAllocator,
+    pub lto: CollectorLto,
+    pub codegen_units: u16,
+    pub opt_level: CollectorOptLevel,
+    pub target_cpu: CollectorTargetCpu,
+}
+impl Default for CollectorBuildProfile {
+    fn default() -> Self {
+        Self {
+            allocator: CollectorAllocator::System,
+            lto: CollectorLto::Off,
+            codegen_units: 16,
+            opt_level: CollectorOptLevel::O3,
+            target_cpu: CollectorTargetCpu::Generic,
+        }
+    }
+}
+impl CollectorBuildProfile {
+    pub fn canonical_key(self) -> String {
+        format!(
+            "allocator={};lto={};codegen_units={};opt_level={};target_cpu={}",
+            self.allocator.as_str(),
+            self.lto.as_str(),
+            self.codegen_units,
+            self.opt_level.as_u8(),
+            self.target_cpu.as_str()
+        )
+    }
+}
+impl CollectorTunables {
+    pub fn has_build_profile(&self) -> bool {
+        self.allocator.is_some()
+            || self.lto.is_some()
+            || self.codegen_units.is_some()
+            || self.opt_level.is_some()
+            || self.target_cpu.is_some()
+    }
+    pub fn build_profile(&self) -> CollectorBuildProfile {
+        CollectorBuildProfile {
+            allocator: self.allocator.unwrap_or_default(),
+            lto: self.lto.unwrap_or_default(),
+            codegen_units: self.codegen_units.unwrap_or(16),
+            opt_level: self.opt_level.unwrap_or_default(),
+            target_cpu: self.target_cpu.unwrap_or_default(),
+        }
+    }
+}
+
+fn deserialize_profile_enum<'de, D, T>(
+    deserializer: D,
+    field: &'static str,
+    allowed: &'static str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)
+        .map_err(|_| D::Error::custom(format!("{field} must be {allowed}")))?;
+    value.map_or(Ok(None), |value| {
+        parse(&value)
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("{field} must be {allowed}")))
+    })
+}
+fn deserialize_collector_allocator<'de, D>(d: D) -> Result<Option<CollectorAllocator>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(d, "collector.allocator", "system or mimalloc", |v| match v {
+        "system" => Some(CollectorAllocator::System),
+        "mimalloc" => Some(CollectorAllocator::Mimalloc),
+        _ => None,
+    })
+}
+fn deserialize_collector_lto<'de, D>(d: D) -> Result<Option<CollectorLto>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(d, "collector.lto", "off, thin-local, thin or fat", |v| match v {
+        "off" => Some(CollectorLto::Off),
+        "thin-local" => Some(CollectorLto::ThinLocal),
+        "thin" => Some(CollectorLto::Thin),
+        "fat" => Some(CollectorLto::Fat),
+        _ => None,
+    })
+}
+fn deserialize_collector_codegen_units<'de, D>(d: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u16>::deserialize(d).map_err(|_| D::Error::custom("collector.codegen_units must be an integer in 1..=256"))
+}
+fn deserialize_collector_opt_level<'de, D>(d: D) -> Result<Option<CollectorOptLevel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let level =
+        Option::<u8>::deserialize(d).map_err(|_| D::Error::custom("collector.opt_level must be integer 2 or 3"))?;
+    level.map_or(Ok(None), |v| match v {
+        2 => Ok(Some(CollectorOptLevel::O2)),
+        3 => Ok(Some(CollectorOptLevel::O3)),
+        _ => Err(D::Error::custom("collector.opt_level must be integer 2 or 3")),
+    })
+}
+fn deserialize_collector_target_cpu<'de, D>(d: D) -> Result<Option<CollectorTargetCpu>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(
+        d,
+        "collector.target_cpu",
+        "generic, x86-64-v2, x86-64-v3 or x86-64-v4",
+        |v| match v {
+            "generic" => Some(CollectorTargetCpu::Generic),
+            "x86-64-v2" => Some(CollectorTargetCpu::X86_64V2),
+            "x86-64-v3" => Some(CollectorTargetCpu::X86_64V3),
+            "x86-64-v4" => Some(CollectorTargetCpu::X86_64V4),
+            _ => None,
+        },
+    )
+}
+
+fn deserialize_client_build_lto<'de, D>(d: D) -> Result<Option<CollectorLto>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(
+        d,
+        "client.build_profile.lto",
+        "off, thin-local, thin or fat",
+        |value| match value {
+            "off" => Some(CollectorLto::Off),
+            "thin-local" => Some(CollectorLto::ThinLocal),
+            "thin" => Some(CollectorLto::Thin),
+            "fat" => Some(CollectorLto::Fat),
+            _ => None,
+        },
+    )
+}
+fn deserialize_client_build_codegen_units<'de, D>(d: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u16>::deserialize(d)
+        .map_err(|_| D::Error::custom("client.build_profile.codegen_units must be an integer in 1..=256"))?;
+    value.map_or(Ok(None), |value| match value {
+        1..=256 => Ok(Some(value)),
+        _ => Err(D::Error::custom(
+            "client.build_profile.codegen_units must be an integer in 1..=256",
+        )),
+    })
+}
+fn deserialize_client_build_opt_level<'de, D>(d: D) -> Result<Option<CollectorOptLevel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u8>::deserialize(d)
+        .map_err(|_| D::Error::custom("client.build_profile.opt_level must be integer 2 or 3"))?;
+    value.map_or(Ok(None), |value| match value {
+        2 => Ok(Some(CollectorOptLevel::O2)),
+        3 => Ok(Some(CollectorOptLevel::O3)),
+        _ => Err(D::Error::custom(
+            "client.build_profile.opt_level must be integer 2 or 3",
+        )),
+    })
+}
+fn deserialize_client_build_target_cpu<'de, D>(d: D) -> Result<Option<CollectorTargetCpu>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_profile_enum(
+        d,
+        "client.build_profile.target_cpu",
+        "generic, x86-64-v2, x86-64-v3 or x86-64-v4",
+        |value| match value {
+            "generic" => Some(CollectorTargetCpu::Generic),
+            "x86-64-v2" => Some(CollectorTargetCpu::X86_64V2),
+            "x86-64-v3" => Some(CollectorTargetCpu::X86_64V3),
+            "x86-64-v4" => Some(CollectorTargetCpu::X86_64V4),
+            _ => None,
+        },
+    )
+}
+
+fn deserialize_channel_capacity_object<'de, D>(deserializer: D) -> Result<Option<ChannelCapacityTunables>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ChannelCapacityTunables::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.starts_with("collector.channel_capacity.") {
+                serde::de::Error::custom(message)
+            } else {
+                serde::de::Error::custom("collector.channel_capacity must be an object with supported capacity fields")
+            }
+        })
+}
+
+macro_rules! channel_capacity_deserializer {
+    ($function:ident, $field:literal) => {
+        fn $function<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            usize::deserialize(deserializer).map(Some).map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "collector.channel_capacity.{} must be a non-negative integer",
+                    $field
+                ))
+            })
+        }
+    };
+}
+
+channel_capacity_deserializer!(deserialize_control_node, "control_node");
+channel_capacity_deserializer!(deserialize_control_pipeline, "control_pipeline");
+channel_capacity_deserializer!(deserialize_control_completion, "control_completion");
+channel_capacity_deserializer!(deserialize_pdata, "pdata");
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelCapacityTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_control_node"
+    )]
+    pub control_node: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_control_pipeline"
+    )]
+    pub control_pipeline: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_control_completion"
+    )]
+    pub control_completion: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_pdata")]
+    pub pdata: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorUploadTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_staging_mode"
+    )]
+    pub staging_mode: Option<arrow_deltalake::StagingMode>,
     pub mode: Option<CollectorUploadMode>,
     pub buffer_capacity_bytes: Option<usize>,
     pub request_concurrency: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorSocketTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub recv_buffer_bytes: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub send_buffer_bytes: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_bool"
+    )]
+    pub tcp_nodelay: Option<bool>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_stream_window_bytes: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_connection_window_bytes: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u32"
+    )]
+    pub h2_max_frame_bytes: Option<u32>,
+}
+
+fn deserialize_present_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
+}
+
+impl CollectorSocketTunables {
+    /// Validates listener buffer requests before they reach the OS.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid buffer size.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("collector.socket.recv_buffer_bytes", self.recv_buffer_bytes),
+            ("collector.socket.send_buffer_bytes", self.send_buffer_bytes),
+        ] {
+            if let Some(value) = value
+                && !(1..=1_073_741_823).contains(&value)
+            {
+                return Err(format!("{name} must be in 1..=1073741823"));
+            }
+        }
+        for (name, value, min, max) in [
+            ("h2_stream_window_bytes", self.h2_stream_window_bytes, 65_535, 64 << 20),
+            (
+                "h2_connection_window_bytes",
+                self.h2_connection_window_bytes,
+                65_535,
+                256 << 20,
+            ),
+            ("h2_max_frame_bytes", self.h2_max_frame_bytes, 16_384, 1 << 20),
+        ] {
+            if value.is_some_and(|bytes| !(min..=max).contains(&bytes)) {
+                return Err(format!("collector.socket.{name} must be in {min}..={max}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_present_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
+}
+
+/// `glibc.malloc.hugetlb` modes. glibc's explicit huge-page-size values are not exposed.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GlibcMallocHugetlb {
+    Disabled,
+    Transparent,
+    Hugetlbfs,
+}
+
+impl GlibcMallocHugetlb {
+    #[must_use]
+    pub const fn glibc_value(self) -> u64 {
+        match self {
+            Self::Disabled => 0,
+            Self::Transparent => 1,
+            Self::Hugetlbfs => 2,
+        }
+    }
+}
+
+/// glibc malloc tunables applied through `GLIBC_TUNABLES` at collector process startup.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorMallocTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub arena_max: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub arena_test: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub mmap_threshold: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub mmap_max: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub trim_threshold: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub top_pad: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub mxfast: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub tcache_count: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub tcache_max: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub tcache_unsorted_limit: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_hugetlb"
+    )]
+    pub hugetlb: Option<GlibcMallocHugetlb>,
+}
+
+impl CollectorMallocTunables {
+    /// Rejects values glibc would silently ignore. The bounds are glibc's own limits for 64-bit
+    /// targets, except `arena_max`, `arena_test` and `top_pad`, which are capped to keep a typo from
+    /// reaching the allocator.
+    ///
+    /// # Errors
+    /// Returns an error for an empty section or an out-of-range value.
+    pub fn validate(&self) -> Result<(), String> {
+        if self == &Self::default() {
+            return Err("collector.malloc must set at least one glibc malloc tunable".to_owned());
+        }
+        for (name, value, range) in [
+            ("arena_max", self.arena_max, 1..=4_096),
+            ("arena_test", self.arena_test, 1..=4_096),
+            ("mmap_threshold", self.mmap_threshold, 0..=33_554_432),
+            ("mmap_max", self.mmap_max, 0..=2_147_483_647),
+            ("top_pad", self.top_pad, 0..=1_073_741_824),
+            ("mxfast", self.mxfast, 0..=160),
+            ("tcache_count", self.tcache_count, 0..=65_535),
+            ("tcache_max", self.tcache_max, 0..=1_032),
+        ] {
+            if let Some(value) = value
+                && !range.contains(&value)
+            {
+                return Err(format!(
+                    "collector.malloc.{name} must be in {}..={}",
+                    range.start(),
+                    range.end()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Renders the configured fields as `glibc.malloc.<name>=<value>` entries in a fixed order.
+    #[must_use]
+    pub fn glibc_tunables(&self) -> Vec<String> {
+        [
+            ("arena_max", self.arena_max),
+            ("arena_test", self.arena_test),
+            ("mmap_threshold", self.mmap_threshold),
+            ("mmap_max", self.mmap_max),
+            ("trim_threshold", self.trim_threshold),
+            ("top_pad", self.top_pad),
+            ("mxfast", self.mxfast),
+            ("tcache_count", self.tcache_count),
+            ("tcache_max", self.tcache_max),
+            ("tcache_unsorted_limit", self.tcache_unsorted_limit),
+            ("hugetlb", self.hugetlb.map(GlibcMallocHugetlb::glibc_value)),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| format!("glibc.malloc.{name}={value}")))
+        .collect()
+    }
+}
+
+fn deserialize_present_malloc<'de, D>(deserializer: D) -> Result<Option<CollectorMallocTunables>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CollectorMallocTunables::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_hugetlb<'de, D>(deserializer: D) -> Result<Option<GlibcMallocHugetlb>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    GlibcMallocHugetlb::deserialize(deserializer).map(Some)
+}
+
+/// mimalloc `arena_eager_commit` modes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MimallocArenaEagerCommit {
+    Never,
+    Always,
+    OnOvercommit,
+}
+
+/// mimalloc `page_commit_on_demand` modes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MimallocPageCommit {
+    Eager,
+    OnDemand,
+    OnDemandUnlessOvercommit,
+}
+
+/// mimalloc `page_reclaim_on_free` modes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MimallocPageReclaim {
+    Disabled,
+    OwnHeap,
+    AnyHeap,
+}
+
+/// Options of the bundled mimalloc v3 that the collector sets through `MIMALLOC_*` at process startup.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorMimallocTunables {
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub purge_delay_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub purge_decommits: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub arena_eager_commit: Option<MimallocArenaEagerCommit>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub allow_large_os_pages: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub reserve_huge_os_pages: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub reserve_os_memory_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub arena_reserve_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub arena_purge_mult: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub minimal_purge_size_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_commit_on_demand: Option<MimallocPageCommit>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_max_candidates: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_full_retain: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub generic_collect: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_reclaim_on_free: Option<MimallocPageReclaim>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_max_reclaim: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub page_cross_thread_max_reclaim: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub use_numa_nodes: Option<i64>,
+}
+
+/// One configured mimalloc option: the OAT field, mimalloc's option name and its value in mimalloc units.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MimallocOption {
+    pub field: &'static str,
+    pub name: &'static str,
+    pub value: i64,
+    pub kib: bool,
+}
+
+impl MimallocOption {
+    /// The `MIMALLOC_*` environment variable mimalloc reads for this option.
+    #[must_use]
+    pub fn environment_name(&self) -> String {
+        format!("MIMALLOC_{}", self.name.to_ascii_uppercase())
+    }
+
+    /// Size options take an explicit `KiB` suffix; mimalloc reads a bare number as bytes.
+    #[must_use]
+    pub fn environment_value(&self) -> String {
+        if self.kib {
+            format!("{}KiB", self.value)
+        } else {
+            self.value.to_string()
+        }
+    }
+}
+
+impl CollectorMimallocTunables {
+    /// Rejects values mimalloc would clamp, ignore or treat as a different mode.
+    ///
+    /// # Errors
+    /// Returns an error for an empty section or an out-of-range value.
+    pub fn validate(&self) -> Result<(), String> {
+        if self == &Self::default() {
+            return Err("collector.mimalloc must set at least one mimalloc option".to_owned());
+        }
+        for (name, value, range) in [
+            ("purge_delay_ms", self.purge_delay_ms, -1..=600_000),
+            ("reserve_huge_os_pages", self.reserve_huge_os_pages, 0..=1_024),
+            ("reserve_os_memory_kib", self.reserve_os_memory_kib, 0..=268_435_456),
+            ("arena_reserve_kib", self.arena_reserve_kib, 0..=268_435_456),
+            ("arena_purge_mult", self.arena_purge_mult, 0..=1_000),
+            ("minimal_purge_size_kib", self.minimal_purge_size_kib, 0..=1_048_576),
+            ("page_max_candidates", self.page_max_candidates, 1..=256),
+            ("page_full_retain", self.page_full_retain, -1..=32),
+            ("generic_collect", self.generic_collect, 1..=1_000_000),
+            ("page_max_reclaim", self.page_max_reclaim, -1..=65_535),
+            (
+                "page_cross_thread_max_reclaim",
+                self.page_cross_thread_max_reclaim,
+                -1..=65_535,
+            ),
+            ("use_numa_nodes", self.use_numa_nodes, 0..=1_024),
+        ] {
+            if let Some(value) = value
+                && !range.contains(&value)
+            {
+                return Err(format!(
+                    "collector.mimalloc.{name} must be in {}..={}",
+                    range.start(),
+                    range.end()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured options in a fixed order, in the units mimalloc reports them.
+    #[must_use]
+    pub fn mimalloc_options(&self) -> Vec<MimallocOption> {
+        [
+            ("purge_delay_ms", "purge_delay", self.purge_delay_ms, false),
+            (
+                "purge_decommits",
+                "purge_decommits",
+                self.purge_decommits.map(i64::from),
+                false,
+            ),
+            (
+                "arena_eager_commit",
+                "arena_eager_commit",
+                self.arena_eager_commit.map(|mode| match mode {
+                    MimallocArenaEagerCommit::Never => 0,
+                    MimallocArenaEagerCommit::Always => 1,
+                    MimallocArenaEagerCommit::OnOvercommit => 2,
+                }),
+                false,
+            ),
+            (
+                "allow_large_os_pages",
+                "allow_large_os_pages",
+                self.allow_large_os_pages.map(i64::from),
+                false,
+            ),
+            (
+                "reserve_huge_os_pages",
+                "reserve_huge_os_pages",
+                self.reserve_huge_os_pages,
+                false,
+            ),
+            (
+                "reserve_os_memory_kib",
+                "reserve_os_memory",
+                self.reserve_os_memory_kib,
+                true,
+            ),
+            ("arena_reserve_kib", "arena_reserve", self.arena_reserve_kib, true),
+            ("arena_purge_mult", "arena_purge_mult", self.arena_purge_mult, false),
+            (
+                "minimal_purge_size_kib",
+                "minimal_purge_size",
+                self.minimal_purge_size_kib,
+                true,
+            ),
+            (
+                "page_commit_on_demand",
+                "page_commit_on_demand",
+                self.page_commit_on_demand.map(|mode| match mode {
+                    MimallocPageCommit::Eager => 0,
+                    MimallocPageCommit::OnDemand => 1,
+                    MimallocPageCommit::OnDemandUnlessOvercommit => 2,
+                }),
+                false,
+            ),
+            (
+                "page_max_candidates",
+                "page_max_candidates",
+                self.page_max_candidates,
+                false,
+            ),
+            ("page_full_retain", "page_full_retain", self.page_full_retain, false),
+            ("generic_collect", "generic_collect", self.generic_collect, false),
+            (
+                "page_reclaim_on_free",
+                "page_reclaim_on_free",
+                self.page_reclaim_on_free.map(|mode| match mode {
+                    MimallocPageReclaim::Disabled => -1,
+                    MimallocPageReclaim::OwnHeap => 0,
+                    MimallocPageReclaim::AnyHeap => 1,
+                }),
+                false,
+            ),
+            ("page_max_reclaim", "page_max_reclaim", self.page_max_reclaim, false),
+            (
+                "page_cross_thread_max_reclaim",
+                "page_cross_thread_max_reclaim",
+                self.page_cross_thread_max_reclaim,
+                false,
+            ),
+            ("use_numa_nodes", "use_numa_nodes", self.use_numa_nodes, false),
+        ]
+        .into_iter()
+        .filter_map(|(field, name, value, kib)| {
+            value.map(|value| MimallocOption {
+                field,
+                name,
+                value,
+                kib,
+            })
+        })
+        .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -244,6 +1480,8 @@ pub struct CatalogTunables {
 pub struct RoutingTunables {
     pub connect_timeout: Option<String>,
     pub command_timeout: Option<String>,
+    pub pool_max_size: Option<usize>,
+    pub pool_acquire_timeout: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -252,10 +1490,20 @@ pub struct ExporterTunables {
     pub authority_timeout: Option<String>,
 }
 
+/// Largest exact JSON byte budget that also fits a Tokio semaphore on this target.
+pub const MAX_QUEUE_CAPACITY_BYTES: u64 = if ((usize::MAX >> 3) as u64) < 9_007_199_254_740_991 {
+    (usize::MAX >> 3) as u64
+} else {
+    9_007_199_254_740_991
+};
+
+/// Longest accepted interval between table writer-policy readbacks.
+pub const MAX_ADAPTIVE_POLICY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueCapacityTunables {
-    pub bytes: Option<u32>,
+    pub bytes: Option<u64>,
     pub rows: Option<u32>,
     pub batches: Option<u32>,
 }
@@ -293,24 +1541,134 @@ pub struct BatchingTunables {
     pub max_rows_per_flush: Option<u64>,
     pub max_batches_per_flush: Option<u64>,
     pub max_age: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_policy_refresh_interval: Option<String>,
     pub max_concurrent_flushes: Option<usize>,
     pub pipeline_depth: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_pending_commit_bytes"
+    )]
+    pub max_pending_commit_bytes: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stage_file_concurrency"
+    )]
+    pub stage_file_concurrency: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stage_files_per_group"
+    )]
+    pub stage_files_per_group: Option<usize>,
     pub adaptive_file: Option<AdaptiveFileTunables>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_txn_lookup_mode"
+    )]
+    pub txn_lookup_mode: Option<arrow_deltalake::TxnLookupMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_commit_trigger"
+    )]
+    pub trigger: Option<arrow_deltalake::CommitTrigger>,
     pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_delta_stats_columns"
+    )]
+    pub delta_stats_columns: Option<Vec<String>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_delta_stats_num_indexed_cols"
+    )]
+    pub delta_stats_num_indexed_cols: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub snapshot_cache_mode: Option<arrow_deltalake::SnapshotCacheMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub snapshot_list_mode: Option<arrow_deltalake::SnapshotListMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub stage_snapshot_mode: Option<arrow_deltalake::StageSnapshotMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub preflight_lookup_mode: Option<arrow_deltalake::PreflightLookupMode>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub checkpoint_mode: Option<arrow_deltalake::CheckpointMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub checkpoint_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present")]
+    pub commit_attempts: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_u64"
+    )]
+    pub commit_budget_secs: Option<u64>,
+}
+
+fn deserialize_present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+fn deserialize_txn_lookup_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::TxnLookupMode>, D::Error> {
+    arrow_deltalake::TxnLookupMode::deserialize(d).map(Some)
+}
+
+fn deserialize_commit_trigger<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CommitTrigger>, D::Error> {
+    arrow_deltalake::CommitTrigger::deserialize(d).map(Some)
+}
+
+fn deserialize_delta_stats_columns<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.commit.delta_stats_columns must be an array of column paths"))
+}
+
+fn deserialize_delta_stats_num_indexed_cols<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    i32::deserialize(deserializer).map(Some).map_err(|_| {
+        serde::de::Error::custom("collector.commit.delta_stats_num_indexed_cols must be an integer (-1 or positive)")
+    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_detach_ratio"
+    )]
+    pub detach_ratio: Option<u8>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_detach_kernel"
+    )]
+    pub detach_kernel: Option<arrow_deltalake::layout::DetachKernel>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_sort_execution"
+    )]
+    pub sort_execution: Option<arrow_deltalake::layout::SortExecution>,
     pub enabled: Option<bool>,
     pub sort_columns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_options: Option<Vec<arrow_deltalake::layout::SortKeyOptions>>,
     pub bloom_columns: Option<Vec<String>>,
     pub max_rows: Option<usize>,
     pub max_input_bytes: Option<usize>,
@@ -326,12 +1684,40 @@ pub struct LimitsTunables {
     pub max_metadata_bytes: Option<usize>,
     pub max_schema_bytes: Option<usize>,
     pub max_message_bytes: Option<usize>,
+    #[serde(
+        deserialize_with = "deserialize_batch_channel_capacity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub batch_channel_capacity: Option<usize>,
+    #[serde(
+        deserialize_with = "deserialize_put_result_channel_capacity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub put_result_channel_capacity: Option<usize>,
     pub max_stream_duration: Option<String>,
     pub admission_timeout: Option<String>,
     pub max_ddl_bytes: Option<usize>,
 }
+
+macro_rules! receiver_channel_deserializer {
+    ($function:ident, $field:literal) => {
+        fn $function<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            usize::deserialize(deserializer).map(Some).map_err(|_| {
+                serde::de::Error::custom(concat!(
+                    "collector.limits.",
+                    $field,
+                    " must be a non-negative integer"
+                ))
+            })
+        }
+    };
+}
+
+receiver_channel_deserializer!(deserialize_batch_channel_capacity, "batch_channel_capacity");
+receiver_channel_deserializer!(deserialize_put_result_channel_capacity, "put_result_channel_capacity");
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -349,13 +1735,220 @@ pub struct PressureTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_timestamp_kernel"
+    )]
+    pub timestamp_kernel: Option<arrow_deltalake::TimestampKernel>,
     pub workers: Option<usize>,
     pub blocking_workers: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub blocking_fs_reserve: Option<usize>,
     pub upload_limit: Option<usize>,
     pub task_limit: Option<usize>,
     pub read_ahead: Option<usize>,
     pub batch_rows: Option<usize>,
     pub cpu_workers: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cpu_dispatch"
+    )]
+    pub cpu_dispatch: Option<arrow_deltalake::CpuDispatch>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_local_directory_sync_policy"
+    )]
+    pub local_directory_sync_policy: Option<arrow_deltalake::LocalDirectorySyncPolicy>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cpu_placement"
+    )]
+    pub cpu_placement: Option<arrow_deltalake::CpuPlacement>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_parquet_column_workers"
+    )]
+    pub parquet_column_workers: Option<u8>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_parquet_encode_mode"
+    )]
+    pub parquet_encode_mode: Option<arrow_deltalake::ParquetEncodeMode>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub cpu_queue_jobs: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_partition_grouping"
+    )]
+    pub partition_grouping: Option<PartitionGrouping>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub event_interval: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub global_queue_interval: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub thread_stack_size: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub thread_keep_alive_ms: Option<usize>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_usize"
+    )]
+    pub cpu_thread_stack_size: Option<usize>,
+    pub generated_partition_fast_path: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_binding")]
+    pub generated_partition_binding: Option<arrow_deltalake::GeneratedPartitionBinding>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_file_mapping_cache"
+    )]
+    pub file_mapping_cache: Option<bool>,
+}
+
+fn deserialize_detach_ratio<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)
+        .map_err(|err| serde::de::Error::custom(format!("collector.layout.detach_ratio: {err}")))?;
+    Ok(Some(value))
+}
+
+fn deserialize_present_partition_grouping<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PartitionGrouping>, D::Error> {
+    PartitionGrouping::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("collector.runtime.partition_grouping: {error}")))
+}
+
+fn deserialize_mode<'de, D, T>(d: D, path: &str) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw = String::deserialize(d)
+        .map_err(|_| <D::Error as serde::de::Error>::custom(format!("{path} must be a string")))?;
+    serde_json::from_value(serde_json::Value::String(raw))
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("{path}: {error}")))
+}
+
+fn deserialize_cpu_dispatch<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CpuDispatch>, D::Error> {
+    deserialize_mode(d, "collector.runtime.cpu_dispatch")
+}
+
+fn deserialize_local_directory_sync_policy<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::LocalDirectorySyncPolicy>, D::Error> {
+    deserialize_mode(d, "collector.runtime.local_directory_sync_policy")
+}
+
+fn deserialize_parquet_encode_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::ParquetEncodeMode>, D::Error> {
+    deserialize_mode(d, "collector.runtime.parquet_encode_mode")
+}
+
+fn deserialize_staging_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::StagingMode>, D::Error> {
+    deserialize_mode(d, "collector.upload.staging_mode")
+}
+
+fn deserialize_cpu_placement<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::CpuPlacement>, D::Error> {
+    deserialize_mode(d, "collector.runtime.cpu_placement")
+}
+
+fn deserialize_pending_commit_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(d).map(Some).map_err(|_| {
+        serde::de::Error::custom("collector.batching.max_pending_commit_bytes must be an unsigned integer")
+    })
+}
+
+fn deserialize_stage_file_concurrency<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.batching.stage_file_concurrency must be an integer in 1..=16"))
+}
+
+fn deserialize_stage_files_per_group<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.batching.stage_files_per_group must be an integer in 1..=16"))
+}
+
+fn deserialize_timestamp_kernel<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::TimestampKernel>, D::Error> {
+    deserialize_mode(d, "collector.runtime.timestamp_kernel")
+}
+
+fn deserialize_binding<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<arrow_deltalake::GeneratedPartitionBinding>, D::Error> {
+    arrow_deltalake::GeneratedPartitionBinding::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("collector.runtime.generated_partition_binding: {error}")))
+}
+
+fn deserialize_present_sort_execution<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<arrow_deltalake::layout::SortExecution>, D::Error> {
+    arrow_deltalake::layout::SortExecution::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("collector.layout.sort_execution: {error}")))
+}
+
+fn deserialize_detach_kernel<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<arrow_deltalake::layout::DetachKernel>, D::Error> {
+    deserialize_mode(d, "collector.layout.detach_kernel")
+}
+
+fn deserialize_present_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    usize::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_file_mapping_cache<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(d)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.runtime.file_mapping_cache must be a boolean"))
+}
+
+fn deserialize_parquet_column_workers<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u8::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("collector.runtime.parquet_column_workers must be an unsigned integer"))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -388,12 +1981,26 @@ pub enum ClientDataProfile {
     Realistic,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSendIter {
+    CloneVec,
+    ArcCursor,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientStringLengthDistribution {
     #[default]
     Fixed,
     Uniform,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIdentityBuilder {
+    FormattedRows,
+    DirectUtf8,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -489,6 +2096,7 @@ pub struct MaintenanceTunables {
     pub parquet_writer: Option<ParquetWriterConfig>,
     pub optimize_upload_mode: Option<MaintenanceUploadMode>,
     pub optimize_upload_buffer_bytes: Option<usize>,
+    pub optimize_upload_concurrency: Option<usize>,
     pub interval_secs: Option<u64>,
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,
@@ -502,6 +2110,7 @@ pub struct MaintenanceTunables {
     pub catalog_rpc_timeout_secs: Option<u64>,
     pub catalog_max_decoding_message_bytes: Option<usize>,
     pub input_read_strategy: Option<MaintenanceInputReadStrategy>,
+    pub input_prefetch_files: Option<u8>,
     pub granularity: Option<MaintenanceGranularity>,
     pub purge_retention_secs: Option<u64>,
     pub anchor_ms: Option<i64>,
@@ -514,6 +2123,8 @@ pub struct MaintenanceTunables {
     pub vacuum_max_listed_files: Option<usize>,
     pub layout_enabled: Option<bool>,
     pub layout_sort_columns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_sort_options: Option<Vec<arrow_deltalake::layout::SortKeyOptions>>,
     pub layout_bloom_columns: Option<Vec<String>>,
     pub layout_max_rows: Option<usize>,
     pub layout_max_input_bytes: Option<usize>,
@@ -521,6 +2132,7 @@ pub struct MaintenanceTunables {
     pub layout_page_rows: Option<usize>,
     pub max_files_per_bin: Option<usize>,
     pub max_bins_per_commit: Option<usize>,
+    pub bin_concurrency: Option<usize>,
     pub max_actions_per_commit: Option<usize>,
     pub max_plan_bytes: Option<usize>,
     pub max_decoded_bytes_per_bin: Option<u64>,

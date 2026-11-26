@@ -2,7 +2,7 @@ import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
 import { assertCampaignEnvironment, CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, compareAndSwapRunInventory, hasVerifiedUnsettledDrain,
   CUSTODY_CLEANUP_STEPS, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import type { CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
-import { withCleanupDeadline } from './aks-cleanup-budget.js';
+import { ADMISSION_STOP_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, CleanupDeadlineExpiredError, drainBudgetMs, withCleanupDeadline } from './aks-cleanup-budget.js';
 import { DEFAULT_EFFECTIVE_STOP_BUDGETS, parseEffectiveStopBudgets } from './stop-budgets.js';
 
 export const CELL_CLEANUP_SELECTORS = {
@@ -111,9 +111,10 @@ function mark(inventory: RunInventory, selector: CellCleanupSelector, state: 'ru
   if (name) {
     const step = next.cleanup[name];
     const deadline = step.deadline_unix_ms ??
-      (selector === 'stop_admission' ? Date.now() + 60_000 :
+      (selector === 'stop_admission' ? Date.now() + ADMISSION_STOP_BUDGET_MS :
         selector === 'stop_maintenance' ? Date.now() + maintenanceStopTimeoutMs(inventory) :
-          selector === 'bounded_drain' || selector === 'terminal_capture' ? Date.now() + 120_000 : null);
+          selector === 'bounded_drain' ? Date.now() + drainBudgetMs(inventory) :
+            selector === 'terminal_capture' ? Date.now() + TERMINAL_CAPTURE_BUDGET_MS : null);
     next.cleanup[name] = { ...step, state, reason_code: null, deadline_unix_ms: deadline };
   }
   return next;
@@ -240,7 +241,12 @@ async function executeCellCleanupStepGuarded(store: CampaignStore, input: unknow
     if (saved.value.inventory) validateCampaignState({ ...current.state, runInventory: saved.value.inventory });
     if (saved.value.phase === 'running') {
       const recover = providers[selector]?.recover;
-      if (!recover) throw new Error('Cleanup effect outcome UNKNOWN; no recovery provider, never replay.');
+      if (!recover) {
+        const name = field(selector), deadline = name && current.state.runInventory!.cleanup[name].deadline_unix_ms;
+        if (deadline !== null && deadline !== undefined && Date.now() >= deadline)
+          throw new CleanupDeadlineExpiredError('Cleanup effect outcome UNKNOWN; deadline expired and no recovery provider, never replay.');
+        throw new Error('Cleanup effect outcome UNKNOWN; no recovery provider, never replay.');
+      }
       current = await compareAndSwapRunInventory(store, current, current.state.runInventory!, assertCurrent);
       effectEtag = current.etag;
       await assertCurrent();

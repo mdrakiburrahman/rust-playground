@@ -50,6 +50,7 @@ fn run_config(config: &str, generation: Option<&str>, root: Option<&str>, valida
 fn validation_exits_through_metrics_shutdown_hook() -> TestResult<()> {
     let output = run(None, None, true)?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("arrowcol_shutdown"));
     Ok(())
 }
 

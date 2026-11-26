@@ -19,7 +19,37 @@ static STARTUP_TOPOLOGY: OnceLock<Option<DirectCollector>> = OnceLock::new();
 pub fn observe_validated_topology(spec: &OtelDataflowSpec) -> Result<(), &'static str> {
     STARTUP_TOPOLOGY
         .set(direct_collector(spec))
-        .map_err(|_| "collector topology was already observed")
+        .map_err(|_| "collector topology was already observed")?;
+    let mut engine = serde_json::json!({
+        "shutdown_drain_timeout_seconds": spec.engine.shutdown_drain_timeout_seconds.get()
+    });
+    if let Some(capacity) = resolved_channel_capacity(spec) {
+        engine["channel_capacity"] = capacity;
+    }
+    eprintln!("df_engine_effective_config {}", serde_json::json!({"engine":engine}));
+    Ok(())
+}
+
+fn resolved_channel_capacity(spec: &OtelDataflowSpec) -> Option<serde_json::Value> {
+    if spec.engine.http_admin.is_some()
+        || !spec.engine.controller.is_empty()
+        || spec.engine.observability != Default::default()
+        || !spec.topics.is_empty()
+        || spec.groups.len() != 1
+    {
+        return None;
+    }
+    let (_, pipelines, _) = spec.resolve().into_parts();
+    let [pipeline] = pipelines.as_slice() else {
+        return None;
+    };
+    let capacity = &pipeline.policies.channel_capacity;
+    Some(serde_json::json!({
+        "control_node": capacity.control.node,
+        "control_pipeline": capacity.control.pipeline,
+        "control_completion": capacity.control.completion,
+        "pdata": capacity.pdata,
+    }))
 }
 
 pub(crate) fn is_direct_collector(pipeline: &PipelineContext, node: &NodeId) -> bool {
@@ -94,6 +124,41 @@ groups:
           - from: ingress
             to: sink
 ";
+
+    #[test]
+    fn channel_capacity_reports_resolved_immutable_pipeline_policy() -> anyhow::Result<()> {
+        let yaml = DIRECT.replace(
+            "        nodes:",
+            "        policies:\n          channel_capacity:\n            control:\n              node: 11\n              pipeline: 12\n              completion: 13\n            pdata: 14\n        nodes:",
+        );
+        let spec = OtelDataflowSpec::from_yaml(&yaml)?;
+        assert_eq!(
+            resolved_channel_capacity(&spec),
+            Some(serde_json::json!({
+                "control_node":11, "control_pipeline":12, "control_completion":13, "pdata":14
+            }))
+        );
+        let mut multiple = spec.clone();
+        let group = multiple
+            .groups
+            .values_mut()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing group"))?;
+        let pipeline = group
+            .pipelines
+            .values()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing pipeline"))?
+            .clone();
+        group.add_pipeline("other".into(), pipeline)?;
+        assert!(resolved_channel_capacity(&multiple).is_none());
+        let mutable = yaml.replace(
+            "groups:",
+            "engine:\n  http_admin:\n    bind_address: '127.0.0.1:8080'\ngroups:",
+        );
+        assert!(resolved_channel_capacity(&OtelDataflowSpec::from_yaml(&mutable)?).is_none());
+        Ok(())
+    }
 
     #[test]
     fn only_a_single_immutable_direct_pipeline_is_attested() -> anyhow::Result<()> {

@@ -37,6 +37,7 @@ use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::OtapPayload;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -44,7 +45,9 @@ use tonic::transport::Server;
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
 use crate::envelope::ArrowcolBatchEnvelope;
-use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
+use crate::metrics::{
+    DurableStream, PendingTracker, PressureDiagnosticSample, RuntimeMetrics, global_metrics, process_instance_id,
+};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
 /// DFE URN for arbitrary Arrow Flight ingress.
@@ -441,6 +444,16 @@ struct ArrowFlightReceiver {
     direct_topology: bool,
 }
 
+#[async_trait]
+impl arrowcol_flight::DiagnosticBatchSink for crate::isolation::IsolationSink {
+    async fn accept(&self, batch: RecordBatch) -> RuntimeResult<()> {
+        self.accept(batch).await.map_err(|error| {
+            tracing::error!(error = %error, "collector diagnostic stage failed");
+            RuntimeError::internal()
+        })
+    }
+}
+
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
     let mut config: FlightReceiverConfig = parse_config(value)?;
     config.apply_environment().map_err(config_error)?;
@@ -464,11 +477,13 @@ fn create_receiver(
     metrics
         .configure_cpu_pressure(config.cpu_pressure)
         .map_err(config_error)?;
+    let mut effective_config = config.effective_config_json();
+    effective_config["dfe_worker_concurrency"] = serde_json::json!(pipeline.num_cores());
     eprintln!(
         "arrowcol_effective_config {}",
         serde_json::json!({
             "component": "receiver",
-            "config": config.effective_config_json()
+            "config": effective_config
         })
     );
     tracing::info!(
@@ -562,6 +577,17 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
         let admission_trait: Arc<dyn BatchAdmission> = Arc::clone(&admission) as Arc<dyn BatchAdmission>;
         let drain = DrainController::new();
         let ddl_handler: Arc<dyn FlightSqlDdlHandler> = ddl;
+        let level = self.config.isolation_level;
+        let sink: Option<Arc<dyn arrowcol_flight::DiagnosticBatchSink>> = match level {
+            arrowcol_protocol::IsolationLevel::L2
+            | arrowcol_protocol::IsolationLevel::L3
+            | arrowcol_protocol::IsolationLevel::L4 => {
+                Some(Arc::new(crate::isolation::IsolationSink::new(level).map_err(
+                    |error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error.to_string()),
+                )?))
+            }
+            _ => None,
+        };
         let service = ArrowColFlightService::new(
             ImplementationPool::Dataflow,
             catalog,
@@ -572,6 +598,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             admission_trait,
             limits.clone(),
         )
+        .and_then(|service| service.with_isolation(level, sink))
         .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error.to_string()))?
         .with_ddl_handler(ddl_handler)
         .with_drain_controller(drain.clone());
@@ -581,6 +608,14 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Connect, error))?;
 
         let flight_listener = effect_handler.tcp_listener(self.config.listening_addr)?;
+        if let Some(actual) = configure_flight_listener(&flight_listener, &self.config.socket)
+            .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error))?
+        {
+            eprintln!(
+                "arrowcol_effective_config {}",
+                serde_json::json!({"socket_buffer_effective":actual})
+            );
+        }
         let admin_listener = effect_handler.tcp_listener(self.config.admin_listening_addr)?;
         let shutdown = CancellationToken::new();
         let registration_shutdown = shutdown.child_token();
@@ -592,13 +627,30 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             registration_shutdown,
         ));
         let flight_shutdown = shutdown.child_token();
+        let socket = self.config.socket.clone();
         let mut flight = tokio::spawn(async move {
+            let mut reported = false;
+            let incoming = TcpListenerStream::new(flight_listener).map(move |result| {
+                result.and_then(|stream| {
+                    let (stream, actual) = configure_flight_socket(stream, socket.tcp_nodelay)?;
+                    if let Some(actual) = actual
+                        && !reported
+                    {
+                        eprintln!(
+                            "arrowcol_effective_config {}",
+                            serde_json::json!({"socket_effective":{"tcp_nodelay":actual,"scope":"accepted_flight_socket"}})
+                        );
+                        reported = true;
+                    }
+                    Ok(stream)
+                })
+            });
             Server::builder()
+                .initial_stream_window_size(socket.h2_stream_window_bytes)
+                .initial_connection_window_size(socket.h2_connection_window_bytes)
+                .max_frame_size(socket.h2_max_frame_bytes)
                 .add_service(service.into_tonic_service())
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(flight_listener),
-                    flight_shutdown.cancelled_owned(),
-                )
+                .serve_with_incoming_shutdown(incoming, flight_shutdown.cancelled_owned())
                 .await
         });
         let admin_shutdown = shutdown.child_token();
@@ -681,6 +733,71 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             }
         }
     }
+}
+
+fn configure_flight_listener(
+    listener: &tokio::net::TcpListener,
+    config: &arrowcol_tunables::CollectorSocketTunables,
+) -> Result<Option<serde_json::Value>, String> {
+    if config.recv_buffer_bytes.is_none() && config.send_buffer_bytes.is_none() {
+        return Ok(None);
+    }
+    if !cfg!(target_os = "linux") {
+        return Err("collector.socket buffer settings are only supported on Linux".to_owned());
+    }
+    config.validate()?;
+    let socket = socket2::SockRef::from(listener);
+    let mut actual = serde_json::json!({"scope":"linux_flight_listener"});
+    for (name, requested) in [
+        ("recv_buffer_bytes", config.recv_buffer_bytes),
+        ("send_buffer_bytes", config.send_buffer_bytes),
+    ] {
+        let Some(requested) = requested else { continue };
+        let field = format!("collector.socket.{name}");
+        let observed = if name == "recv_buffer_bytes" {
+            socket
+                .set_recv_buffer_size(requested)
+                .map_err(|error| format!("{field}: {error}"))?;
+            socket.recv_buffer_size().map_err(|error| format!("{field}: {error}"))?
+        } else {
+            socket
+                .set_send_buffer_size(requested)
+                .map_err(|error| format!("{field}: {error}"))?;
+            socket.send_buffer_size().map_err(|error| format!("{field}: {error}"))?
+        };
+        verify_linux_buffer_size(&field, requested, observed)?;
+        actual[name] = serde_json::json!(observed);
+    }
+    Ok(Some(actual))
+}
+
+fn verify_linux_buffer_size(field: &str, requested: usize, observed: usize) -> Result<(), String> {
+    let expected = requested.checked_mul(2).ok_or_else(|| {
+        format!("{field}: requested {requested} bytes overflows Linux reporting; observed {observed} bytes")
+    })?;
+    if observed != expected {
+        return Err(format!(
+            "{field}: requested {requested} bytes, observed {observed} bytes; expected exactly {expected} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn configure_flight_socket(
+    stream: tokio::net::TcpStream,
+    tcp_nodelay: Option<bool>,
+) -> std::io::Result<(tokio::net::TcpStream, Option<bool>)> {
+    let Some(requested) = tcp_nodelay else {
+        return Ok((stream, None));
+    };
+    stream.set_nodelay(requested)?;
+    let actual = stream.nodelay()?;
+    if actual != requested {
+        return Err(std::io::Error::other(
+            "accepted Flight socket TCP_NODELAY differs from requested value",
+        ));
+    }
+    Ok((stream, Some(actual)))
 }
 
 fn correlation_id(call_data: &CallData) -> Option<u64> {
@@ -926,7 +1043,17 @@ fn admin_router(state: AdminState) -> Router {
         .route("/v1/capabilities", get(admin_capabilities))
         .route("/v1/pressure", get(admin_pressure))
         .route("/metrics", get(admin_metrics))
+        .route("/v1/isolation", get(admin_isolation))
         .with_state(state)
+}
+
+async fn admin_isolation() -> Response {
+    let ingress = arrowcol_flight::isolation_ingress_snapshot();
+    let physical = crate::isolation::isolation_stage_snapshot();
+    if ingress.is_none() && physical.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(serde_json::json!({"ingress":ingress,"physical":physical})).into_response()
 }
 
 #[derive(Serialize)]
@@ -976,14 +1103,45 @@ async fn admin_capabilities(State(state): State<AdminState>) -> impl IntoRespons
 }
 
 async fn admin_pressure(State(state): State<AdminState>) -> Response {
-    match state.metrics.pressure() {
-        Ok(mut pressure) => {
-            if state.direct_topology && state.metrics.ready() {
-                pressure.resolved_buffering_mode = "memory_only";
-            }
-            Json(pressure).into_response()
+    let mut diagnostic = PressureDiagnosticSample::start();
+    let handler_started = diagnostic.as_ref().map(|_| Instant::now());
+    let span = tracing::Span::current();
+    let blocking_submitted = diagnostic.as_ref().map(|_| Instant::now());
+    pressure_task_response(tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), blocking_submitted) {
+            diagnostic.record_blocking_queue(started.elapsed());
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        let response = match state.metrics.pressure_for_admin(diagnostic.as_mut()) {
+            Ok(mut pressure) => {
+                if state.direct_topology && state.metrics.ready() {
+                    pressure.resolved_buffering_mode = "memory_only";
+                }
+                let serialization_started = diagnostic.as_ref().map(|_| Instant::now());
+                let response = Json(pressure).into_response();
+                if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), serialization_started) {
+                    diagnostic.record_serialization(started.elapsed());
+                }
+                response
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if let (Some(mut diagnostic), Some(started)) = (diagnostic, handler_started) {
+            diagnostic.record_handler_total(started.elapsed());
+            diagnostic.finish();
+        }
+        response
+    }))
+    .await
+}
+
+async fn pressure_task_response(task: tokio::task::JoinHandle<Response>) -> Response {
+    match task.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "pressure snapshot task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1027,6 +1185,69 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn pressure_response_matches_direct_snapshot() -> anyhow::Result<()> {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        metrics.set_healthy(true);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
+        metrics.set_accepting(true);
+        let state = AdminState {
+            metrics: Arc::clone(&metrics),
+            max_request_bytes: 4096,
+            direct_topology: true,
+        };
+        let mut snapshot = metrics.pressure_for_admin(None).map_err(anyhow::Error::msg)?;
+        snapshot.resolved_buffering_mode = "memory_only";
+        let mut expected = serde_json::to_value(snapshot)?;
+        let response = admin_pressure(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        let mut actual: serde_json::Value = serde_json::from_slice(&body)?;
+        for value in [&mut expected, &mut actual] {
+            value
+                .as_object_mut()
+                .expect("pressure object")
+                .remove("actual_rss_bytes");
+            let rich = value["rich"].as_object_mut().expect("rich pressure object");
+            rich.remove("observed_at_unix_ms");
+            rich.remove("rss_bytes");
+        }
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pressure_task_runs_off_runtime_thread_and_handles_join_failures() {
+        let runtime_thread = std::thread::current().id();
+        let response = pressure_task_response(tokio::task::spawn_blocking(move || {
+            assert_ne!(std::thread::current().id(), runtime_thread);
+            StatusCode::NO_CONTENT.into_response()
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = pressure_task_response(tokio::task::spawn_blocking(|| -> Response {
+            panic!("pressure task failed");
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let task = tokio::spawn(async { std::future::pending::<Response>().await });
+        task.abort();
+        assert_eq!(
+            pressure_task_response(task).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     use std::sync::Mutex;
 
     use anyhow::Result;
@@ -1051,6 +1272,56 @@ pub(crate) mod tests {
     use tonic::metadata::MetadataValue;
 
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_flight_socket_applies_tcp_nodelay() -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let _client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (stream, _) = listener.accept().await?;
+        let (stream, observed) = configure_flight_socket(stream, Some(true))?;
+        assert_eq!(observed, Some(true));
+        assert!(stream.nodelay()?);
+        let (stream, observed) = configure_flight_socket(stream, None)?;
+        assert_eq!(observed, None);
+        assert!(stream.nodelay()?);
+        let (stream, observed) = configure_flight_socket(stream, Some(false))?;
+        assert_eq!(observed, Some(false));
+        assert!(!stream.nodelay()?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn flight_listener_buffers_reach_accepted_socket() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = arrowcol_tunables::CollectorSocketTunables {
+            recv_buffer_bytes: Some(32_768),
+            send_buffer_bytes: Some(32_768),
+            ..Default::default()
+        };
+        let actual = configure_flight_listener(&listener, &config)?.ok_or("missing listener readback")?;
+        let _client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (stream, _) = listener.accept().await?;
+        let socket = socket2::SockRef::from(&stream);
+        assert_eq!(
+            socket.recv_buffer_size()?,
+            actual["recv_buffer_bytes"].as_u64().ok_or("missing receive readback")? as usize
+        );
+        assert_eq!(
+            socket.send_buffer_size()?,
+            actual["send_buffer_bytes"].as_u64().ok_or("missing send readback")? as usize
+        );
+        assert!(verify_linux_buffer_size("collector.socket.recv_buffer_bytes", 32_768, 65_536).is_ok());
+        for observed in [32_768, 65_535, 65_537] {
+            let error = verify_linux_buffer_size("collector.socket.recv_buffer_bytes", 32_768, observed)
+                .err()
+                .ok_or("clamped value was accepted")?;
+            assert!(error.contains("collector.socket.recv_buffer_bytes"));
+            assert!(error.contains("requested 32768 bytes"));
+            assert!(error.contains(&format!("observed {observed} bytes")));
+        }
+        Ok(())
+    }
 
     pub(crate) struct CaptureSender {
         pub(crate) sent: Mutex<Vec<(u64, OtapPdata)>>,
@@ -1080,6 +1351,15 @@ pub(crate) mod tests {
     impl PdataSender for FailingSender {
         async fn send(&self, _correlation_id: u64, _pdata: OtapPdata) -> Result<(), PdataSendError> {
             Err(self.0)
+        }
+    }
+
+    struct FullChannelSender(flume::Sender<()>);
+
+    #[async_trait]
+    impl PdataSender for FullChannelSender {
+        async fn send(&self, _correlation_id: u64, _pdata: OtapPdata) -> Result<(), PdataSendError> {
+            self.0.send_async(()).await.map_err(|_| PdataSendError::Closed)
         }
     }
 
@@ -1314,20 +1594,23 @@ pub(crate) mod tests {
     /// Guarantees: The cancelled send removes its pending pressure entry instead of blocking drain forever.
     #[tokio::test]
     async fn cancelled_backpressured_send_releases_pending_pressure() {
-        let gate = Arc::new(Semaphore::new(0));
+        let (sender, receiver) = flume::bounded(1);
+        sender.send(()).expect("fill channel");
         let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
         metrics.configure_receiver(1, 1_000_000, 1_000_000, 100, 10, 1);
         metrics.configure_exporter(1);
+        metrics.configure_publication_backlog(1).expect("backlog capacity");
+        let pending = Arc::new(PendingTracker::new(Arc::clone(&metrics)));
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = Arc::clone(&semaphore).acquire_owned().await.expect("permit");
         let envelope = envelope();
         metrics.stream_started(&envelope.table);
+        let before = metrics.pressure().expect("pressure before admission");
+        let before_backlog = metrics.publication_backlog_snapshot();
+        let before_capacity = metrics.prometheus();
         let mut lifecycle = DfeStreamLifecycle {
-            sender: Arc::new(CaptureSender {
-                sent: Mutex::new(Vec::new()),
-                gate: Some(gate),
-            }),
-            pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
+            sender: Arc::new(FullChannelSender(sender)),
+            pending: Arc::clone(&pending),
             metrics: Arc::clone(&metrics),
             envelope,
             client_send_observation: None,
@@ -1336,10 +1619,53 @@ pub(crate) mod tests {
             durable: None,
         };
 
-        let send = lifecycle.push_batch(batch());
-        assert!(tokio::time::timeout(Duration::from_millis(20), send).await.is_err());
+        let mut send = Box::pin(lifecycle.push_batch(batch()));
+        assert!(futures::poll!(&mut send).is_pending());
+        assert_eq!(pending.pending_ids().len(), 1);
+        let during = metrics.pressure().expect("pressure during admission");
+        assert!(during.rich.buffered_bytes.current().get() > 0);
+        assert!(during.rich.buffered_rows.current().get() > 0);
+        assert_eq!(during.rich.buffered_batches.current().get(), 1);
+        drop(send);
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.pending_ids().is_empty());
         let pressure = metrics.pressure().expect("pressure");
-        assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+        assert_eq!(
+            pressure.rich.buffered_bytes.current(),
+            before.rich.buffered_bytes.current()
+        );
+        assert_eq!(
+            pressure.rich.buffered_rows.current(),
+            before.rich.buffered_rows.current()
+        );
+        assert_eq!(
+            pressure.rich.buffered_batches.current(),
+            before.rich.buffered_batches.current()
+        );
+        assert_eq!(pressure.rich.oldest_buffer_age_ms, before.rich.oldest_buffer_age_ms);
+        let table = &pressure.rich.tables[0];
+        let before_table = &before.rich.tables[0];
+        assert_eq!(table.buffered_bytes, before_table.buffered_bytes);
+        assert_eq!(table.buffered_rows, before_table.buffered_rows);
+        assert_eq!(table.buffered_batches, before_table.buffered_batches);
+        assert_eq!(table.oldest_buffer_age_ms, before_table.oldest_buffer_age_ms);
+        let backlog = metrics.publication_backlog_snapshot();
+        assert_eq!(backlog.available, before_backlog.available);
+        assert_eq!(backlog.publications, before_backlog.publications);
+        assert_eq!(backlog.rows, before_backlog.rows);
+        assert_eq!(backlog.logical_bytes, before_backlog.logical_bytes);
+        assert_eq!(backlog.oldest_age, before_backlog.oldest_age);
+        let capacity = metrics.prometheus();
+        for scope in ["global", "table"] {
+            for resource in ["bytes", "rows", "batches"] {
+                let prefix =
+                    format!("arrowcol_exporter_capacity_reserved{{scope=\"{scope}\",resource=\"{resource}\"}} ");
+                let line = capacity.lines().find(|line| line.starts_with(&prefix));
+                assert_eq!(line, before_capacity.lines().find(|line| line.starts_with(&prefix)));
+                assert!(line.is_some(), "missing capacity evidence: {prefix}");
+            }
+        }
         Box::new(lifecycle).abort(StreamAbortReason::ClientCancelled).await;
     }
 

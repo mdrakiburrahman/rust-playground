@@ -10,6 +10,7 @@ import { PublisherControl, READY } from '../../infra/azure/publisher_control.js'
 import type { Metadata } from '../../infra/azure/authority.js';
 import type { LiveStamp, SetupOptions, SetupResult } from './aks-types.js';
 import { renderStampConfig } from './aks-stamp.js';
+import { AKS_COLLECTOR_BUILD_PROFILE, collectorBuildProfileHash } from './collector-build-profile.js';
 import { generatePrivateInputs, renderBootstrapEnv, validateRuntime, writePrivateFile, type RuntimeConfig } from './runtime.js';
 import { DEFAULT_EFFECTIVE_STOP_BUDGETS } from './stop-budgets.js';
 
@@ -254,12 +255,16 @@ export async function setup(
   if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(tag)) throw new Error('--tag must be a valid lowercase container tag.');
   const imageOptions = { env: bootstrapEnvPath, azureEnv: bootstrapEnvPath, stampConfig: stampConfigPath,
     registry: config.registry, federated: true, tag, runtimeConfig: resolve(directory, 'runtime.publish.json') };
+  const profile = AKS_COLLECTOR_BUILD_PROFILE;
+  const profileHash = collectorBuildProfileHash(profile);
+  const profiled = (images: RuntimeConfig['images']) => validateRuntime({ ...draft, images,
+    collectorBuildProfileHash: profileHash, collectorBuildImages: { [profileHash]: images.dataflow } });
   const imagesApi = await import('./publish-images.js');
   let runtime: RuntimeConfig;
   let clientImage: string;
   try {
-    const published = await imagesApi.readPublishedImages({ ...imageOptions, revision, maintenance: options.maintenance }, runner);
-    runtime = validateRuntime({ ...draft, images: published.images });
+    const published = await imagesApi.readPublishedImages({ ...imageOptions, revision, maintenance: options.maintenance, profile }, runner);
+    runtime = profiled(published.images);
     clientImage = published.client;
     console.log(`Reusing ${options.maintenance ? 'six' : 'five'} revision-verified images for ${revision}.`);
   } catch (error) {
@@ -267,11 +272,11 @@ export async function setup(
     if (options.skipImages) throw new Error(`Revision-pinned images are missing; run \`${setupCommand}\` without --skip-images.`, { cause: error });
     try {
       await writePrivateFile(imageOptions.runtimeConfig, `${JSON.stringify(validateRuntime(draft, true), null, 2)}\n`);
-      await imagesApi.buildLocalImages({ revision, maintenance: options.maintenance }, runner);
-      await imagesApi.publishImages(imageOptions, runner);
+      await imagesApi.buildLocalImages({ revision, maintenance: options.maintenance, profile }, runner);
+      await imagesApi.publishImages({ ...imageOptions, profile }, runner);
       await imagesApi.publishClientImage(imageOptions, runner);
-      const verified = await imagesApi.readPublishedImages({ ...imageOptions, revision, maintenance: options.maintenance }, runner);
-      runtime = validateRuntime({ ...draft, images: verified.images });
+      const verified = await imagesApi.readPublishedImages({ ...imageOptions, revision, maintenance: options.maintenance, profile }, runner);
+      runtime = profiled(verified.images);
       clientImage = verified.client;
     } finally { await rm(imageOptions.runtimeConfig, { force: true }); }
   }

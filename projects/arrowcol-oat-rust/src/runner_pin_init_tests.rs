@@ -75,6 +75,9 @@ mod pin_init_tests {
             router_yaml: Some(serde_yaml::to_string(&router)?),
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
+            maintenance_cell_baseline: Vec::new(),
+            stopped_collector_logs: None,
+            shutdown_inputs: None,
         };
         Ok((config, platform, runtime))
     }
@@ -93,6 +96,88 @@ mod pin_init_tests {
             .env("PIN_INIT_PROBE_ROOT", root)
             .env("PIN_INIT_PROBE_MODE", mode);
         Ok(command)
+    }
+
+    #[test]
+    fn fresh_initializer_receives_only_explicit_delta_stats_selection() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("pin-stats-env-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let (mut config, platform, _) = fixture(&root)?;
+        let absent = run_table_initializer_cloud_env(&config, &platform, RUN)?;
+        assert!(!absent.as_array().context("initializer environment")?.iter()
+            .any(|entry| entry["name"] == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS"));
+        for columns in [json!([]), json!(["replica_id"])] {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "collector": {"commit": {"delta_stats_columns": columns}}
+            }))?;
+            let actual = run_table_initializer_cloud_env(&config, &platform, RUN)?;
+            let field = actual.as_array().context("initializer environment")?.iter()
+                .find(|entry| entry["name"] == "ARROWCOL_COLLECTOR_DELTA_STATS_COLUMNS")
+                .context("missing creation-time stats policy")?;
+            assert_eq!(field["value"], columns.to_string());
+        }
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a built arrowcol-loadgen binary; creates empty local tables without load"]
+    async fn local_setup_initializer_commits_only_explicit_delta_stats_metadata() -> Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
+        let table = "sqlserver_availability_replica_states";
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for partitioned in [false, true] {
+            for (key, selection) in [
+                (None, None),
+                (Some("delta_stats_columns"), Some(json!([]))),
+                (Some("delta_stats_columns"), Some(json!(["customer_id"]))),
+                (Some("delta_stats_num_indexed_cols"), Some(json!(-1))),
+            ] {
+                let root = std::env::temp_dir().join(format!("local-stats-init-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&root)?;
+                let mut commit = json!({});
+                if let (Some(key), Some(selection)) = (key, &selection) {
+                    commit[key] = selection.clone();
+                }
+                config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                    "collector": {"commit":commit, "runtime":{"parquet_column_workers":4}}
+                }))?;
+                let arguments = local_initializer_args(table, &root, partitioned)?;
+                let mut initialize = local_table_initializer_command(&config, &workspace, arguments.clone())?;
+                assert!(!initialize.as_std().get_envs()
+                    .any(|(name, _)| name == "ARROWCOL_PARQUET_COLUMN_WORKERS"));
+                let output = initialize.output().await?;
+                ensure!(output.status.success(), "local creation failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                let table_root = root.join("telemetry/sqlserver").join(table);
+                let path = table_root.join("_delta_log/00000000000000000000.json");
+                let original = fs::read(&path)?;
+                let log = std::str::from_utf8(&original)?;
+                let actions = log.lines().map(serde_json::from_str::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let metadata = actions.iter().find_map(|action| action.get("metaData")).context("committed metadata missing")?;
+                let properties = &metadata["configuration"];
+                if let Some(selection) = &selection {
+                    ensure!(delta_stats_properties_match(selection, properties), "local committed stats selection differs");
+                    let text = String::from_utf8(output.stderr)?;
+                    config.tables = vec![table.to_owned()];
+                    assert_eq!(collector_delta_stats_records(&config, &text)?.len(), 1);
+                } else {
+                    assert!(properties.get("delta.dataSkippingStatsColumns").is_none());
+                    assert!(properties.get("delta.dataSkippingNumIndexedCols").is_none());
+                }
+                assert_eq!(metadata["partitionColumns"].as_array().context("partition columns missing")?.len(),
+                    usize::from(partitioned));
+                assert_eq!(fs::read_dir(table_root.join("_delta_log"))?.count(), 1);
+                let retry = local_table_initializer_command(&config, &workspace, arguments)?.output().await?;
+                assert!(!retry.status.success());
+                assert_eq!(fs::read(&path)?, original);
+                fs::remove_dir_all(&root)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -495,6 +580,44 @@ mod pin_init_tests {
             return Ok(());
         };
         match std::env::var("PIN_INIT_PROBE_MODE")?.as_str() {
+            "maintenance-admission" => {
+                let (_, platform, _) = fixture(&root)?;
+                let config: OatConfig = serde_json::from_slice(&fs::read(
+                    std::env::var("MAINTENANCE_PROBE_CONFIG")?
+                )?)?;
+                ensure!(config.campaign_profile.is_none() && maintenance_enabled(&config));
+                ensure!(config.tables.as_slice() == ["sqlserver_active_sessions"]);
+                let result = verify_maintenance_stop_budget_before_admission(&config, &platform).await;
+                if std::env::var("MAINTENANCE_EXPECT_MISSING")?.as_str() == "true" {
+                    let error = result.err().context("absent original table evidence was admitted")?;
+                    ensure!(error.to_string() ==
+                        "maintenance omitted effective per-table operationTimeout before load admission");
+                    println!("ORIGINAL_README_ADMISSION_FAILURE={error}");
+                } else {
+                    result?;
+                    let text = fs::read_to_string(std::env::var("MAINTENANCE_PRODUCER_LOG")?)?;
+                    let actual = maintenance_table_evidence(&config, &text)?;
+                    let table = canonical_dmv_table_name(&config.tables[0])?;
+                    println!("ACTUAL_MAINTENANCE_OPERATION_TIMEOUT={}",
+                        actual["tables"][&table]["table_policy"]["arrowcol.maintenance.operationTimeout"]);
+                    for invalid in [Value::Null, json!(0), json!("900000"), json!(true), json!(1_200_000)] {
+                        let mut changed = String::new();
+                        for line in text.lines() {
+                            if let Some(raw) = line.strip_prefix("arrowcol_maintenance_table_config ") {
+                                let mut event: Value = serde_json::from_str(raw)?;
+                                event["config"]["table_policy"]["arrowcol.maintenance.operationTimeout"] = invalid.clone();
+                                changed.push_str(&format!("arrowcol_maintenance_table_config {event}\n"));
+                            } else {
+                                changed.push_str(&format!("{line}\n"));
+                            }
+                        }
+                        ensure!(maintenance_table_evidence(&config, &changed).is_err(),
+                            "invalid or unsafe actual timeout evidence was admitted: {invalid}");
+                    }
+                    ensure!(maintenance_table_evidence(&config, "").is_err());
+                    println!("MISSING_MALFORMED_AND_UNSAFE_READBACK_REJECTIONS=6");
+                }
+            }
             "emit" => {
                 let (config, mut platform, _) = fixture(&root)?;
                 let result = run_aks_pin_setup_job(

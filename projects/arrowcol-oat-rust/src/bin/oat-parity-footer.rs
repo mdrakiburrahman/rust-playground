@@ -1,0 +1,172 @@
+use std::{fs::File, path::Path};
+
+use anyhow::{Context, Result, bail};
+use parquet::{
+    arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+    basic::Compression,
+    file::{
+        metadata::{PageIndexPolicy, ParquetMetaDataReader},
+        page_index::column_index::ColumnIndexMetaData,
+        reader::{FileReader, SerializedFileReader},
+    },
+};
+
+fn inspect(path: &Path) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .parse_and_finish(&file)
+        .context("reading footer and page indexes")?;
+    let column_indexes = metadata.column_index().context("missing column indexes")?;
+    let offset_indexes = metadata.offset_index().context("missing offset indexes")?;
+    let reader = SerializedFileReader::new(file).context("opening page reader")?;
+    if metadata.num_row_groups() == 0 {
+        bail!("file has no row groups");
+    }
+    for (group_index, group) in metadata.row_groups().iter().enumerate() {
+        if group.num_columns() == 0 {
+            bail!("row group has no column chunks");
+        }
+        let columns = column_indexes
+            .get(group_index)
+            .context("missing row-group column index")?;
+        let offsets = offset_indexes
+            .get(group_index)
+            .context("missing row-group offset index")?;
+        if columns.len() != group.num_columns() || offsets.len() != group.num_columns() {
+            bail!("page index column count differs");
+        }
+        let group_reader = reader.get_row_group(group_index)?;
+        for (column_index, column) in group.columns().iter().enumerate() {
+            if column.compression() != Compression::UNCOMPRESSED {
+                bail!("row group {group_index} column {column_index} is compressed");
+            }
+            if column.dictionary_page_offset().is_none() {
+                bail!("row group {group_index} column {column_index} has no dictionary page");
+            }
+            let index = &columns[column_index];
+            if matches!(index, ColumnIndexMetaData::NONE)
+                || index.num_pages() == 0
+                || index.num_pages() as usize != offsets[column_index].page_locations().len()
+            {
+                bail!("row group {group_index} column {column_index} lacks page statistics");
+            }
+            let mut pages = group_reader.get_column_page_reader(column_index)?;
+            if !matches!(
+                pages.get_next_page()?,
+                Some(parquet::column::page::Page::DictionaryPage { .. })
+            ) {
+                bail!("row group {group_index} column {column_index} dictionary page is invalid");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode(path: &Path) -> Result<u64> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        .with_batch_size(8192)
+        .build()?;
+    reader.into_iter().try_fold(0_u64, |total, batch| {
+        let rows = u64::try_from(batch?.num_rows())?;
+        total.checked_add(rows).context("decoded row count overflow")
+    })
+}
+
+fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    let mode = args
+        .next()
+        .context("expected --active or --decode and a Parquet file path")?;
+    let path = args.next().context("expected one Parquet file path")?;
+    if args.next().is_some() {
+        bail!("expected one Parquet file path");
+    }
+    match mode.to_str() {
+        Some("--active") => inspect(Path::new(&path))?,
+        Some("--decode") => {}
+        _ => bail!("expected --active or --decode"),
+    }
+    let rows = decode(Path::new(&path))?;
+    println!("{rows}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::Arc};
+
+    use arrow::{
+        array::{Int32Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+    use parquet::{
+        arrow::ArrowWriter,
+        file::properties::{EnabledStatistics, WriterProperties},
+        schema::types::ColumnPath,
+    };
+
+    use super::*;
+
+    fn fixture(
+        compression: Compression,
+        dictionary: bool,
+        statistics: EnabledStatistics,
+        second_codec: Option<Compression>,
+    ) -> Result<std::path::PathBuf> {
+        let path = std::env::temp_dir().join(format!("parity-footer-{}.parquet", uuid::Uuid::new_v4()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new("second", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1, 2])),
+                Arc::new(Int32Array::from(vec![2, 3, 2, 3])),
+            ],
+        )?;
+        let mut props = WriterProperties::builder()
+            .set_compression(compression)
+            .set_dictionary_enabled(dictionary)
+            .set_statistics_enabled(statistics);
+        if let Some(codec) = second_codec {
+            props = props.set_column_compression(ColumnPath::from("second"), codec);
+        }
+        let mut writer = ArrowWriter::try_new(File::create(&path)?, schema, Some(props.build()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(path)
+    }
+
+    #[test]
+    fn requires_dictionary_and_page_statistics() -> Result<()> {
+        for (compression, dictionary, statistics, valid) in [
+            (Compression::UNCOMPRESSED, true, EnabledStatistics::Page, true),
+            (
+                Compression::ZSTD(Default::default()),
+                true,
+                EnabledStatistics::Page,
+                false,
+            ),
+            (Compression::UNCOMPRESSED, false, EnabledStatistics::Page, false),
+            (Compression::UNCOMPRESSED, true, EnabledStatistics::Chunk, false),
+            (Compression::UNCOMPRESSED, true, EnabledStatistics::None, false),
+        ] {
+            let path = fixture(compression, dictionary, statistics, None)?;
+            assert_eq!(inspect(&path).is_ok(), valid);
+            assert_eq!(decode(&path)?, 4);
+            fs::remove_file(path)?;
+        }
+        let path = fixture(
+            Compression::UNCOMPRESSED,
+            true,
+            EnabledStatistics::Page,
+            Some(Compression::ZSTD(Default::default())),
+        )?;
+        assert!(inspect(&path).is_err());
+        fs::remove_file(path)?;
+        Ok(())
+    }
+}

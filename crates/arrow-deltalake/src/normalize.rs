@@ -15,6 +15,8 @@ pub const ORIGINAL_TYPE: &str = "arrow_lake.original_type";
 /// Reserved suffix for an exact epoch-nanosecond timestamp companion.
 pub const NANOS_SUFFIX: &str = "__unix_nanos";
 
+use crate::TimestampKernel;
+
 fn target_type(ty: &DataType) -> Result<DataType> {
     Ok(match ty {
         DataType::Dictionary(_, value) => target_type(value)?,
@@ -138,8 +140,8 @@ fn timestamp_unit(ty: &DataType) -> Option<&TimeUnit> {
     }
 }
 
-fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<ArrayRef>> {
-    let mut output = Vec::new();
+fn normalized_columns(fields: &Fields, columns: &[ArrayRef], kernel: TimestampKernel) -> Result<Vec<ArrayRef>> {
+    let mut output: Vec<ArrayRef> = Vec::new();
     for (field, column) in fields.iter().zip(columns) {
         if let Some(unit) = timestamp_unit(field.data_type()) {
             let decoded = match column.data_type() {
@@ -157,6 +159,24 @@ fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<Array
                 TimeUnit::Microsecond => 1_000,
                 TimeUnit::Nanosecond => 1,
             };
+            if kernel == TimestampKernel::FusedChecked {
+                let mut nanos = Vec::with_capacity(values.len());
+                let mut micros = Vec::with_capacity(values.len());
+                for value in values {
+                    // A null slot's backing value is unspecified; never check it for overflow.
+                    let n = value
+                        .unwrap_or_default()
+                        .checked_mul(multiplier)
+                        .context("epoch nanoseconds overflow")?;
+                    nanos.push(n);
+                    micros.push(n.div_euclid(1_000));
+                }
+                output.push(Arc::new(
+                    TimestampMicrosecondArray::new(micros.into(), values.nulls().cloned()).with_timezone("UTC"),
+                ));
+                output.push(Arc::new(Int64Array::new(nanos.into(), values.nulls().cloned())));
+                continue;
+            }
             let nanos = values
                 .iter()
                 .map(|v| {
@@ -171,12 +191,12 @@ fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<Array
             )?);
             output.push(Arc::new(Int64Array::from(nanos)));
         } else {
-            output.push(normalized_array(column)?);
+            output.push(normalized_array(column, kernel)?);
         }
 
-        fn normalized_array(column: &ArrayRef) -> Result<ArrayRef> {
+        fn normalized_array(column: &ArrayRef, kernel: TimestampKernel) -> Result<ArrayRef> {
             match column.data_type() {
-                DataType::Dictionary(_, value) => normalized_array(&cast(column, value)?),
+                DataType::Dictionary(_, value) => normalized_array(&cast(column, value)?, kernel),
                 DataType::Struct(fields) => {
                     let value = column
                         .as_any()
@@ -184,7 +204,7 @@ fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<Array
                         .context("expected struct")?;
                     Ok(Arc::new(StructArray::try_new(
                         normalized_fields(fields)?,
-                        normalized_columns(fields, value.columns())?,
+                        normalized_columns(fields, value.columns(), kernel)?,
                         value.nulls().cloned(),
                     )?))
                 }
@@ -198,7 +218,7 @@ fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<Array
                     Ok(Arc::new(ListArray::try_new(
                         target,
                         list.offsets().clone(),
-                        normalized_array(list.values())?,
+                        normalized_array(list.values(), kernel)?,
                         list.nulls().cloned(),
                     )?))
                 }
@@ -218,7 +238,7 @@ fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<Array
                     };
                     let entries = StructArray::try_new(
                         fields.clone(),
-                        normalized_columns(map.entries().fields(), map.entries().columns())?,
+                        normalized_columns(map.entries().fields(), map.entries().columns(), kernel)?,
                         map.entries().nulls().cloned(),
                     )?;
                     Ok(Arc::new(MapArray::try_new(
@@ -241,9 +261,13 @@ fn normalized_columns(fields: &Fields, columns: &[ArrayRef]) -> Result<Vec<Array
 /// # Errors
 /// Returns unsupported-type, overflow, conversion, and schema errors.
 pub fn batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    batch_with_kernel(batch, TimestampKernel::Reference)
+}
+
+pub(crate) fn batch_with_kernel(batch: &RecordBatch, kernel: TimestampKernel) -> Result<RecordBatch> {
     RecordBatch::try_new(
         schema(batch.schema_ref())?,
-        normalized_columns(batch.schema_ref().fields(), batch.columns())?,
+        normalized_columns(batch.schema_ref().fields(), batch.columns(), kernel)?,
     )
     .context("normalize Arrow batch for Delta")
 }
@@ -444,5 +468,49 @@ fn check_nested_companions(column: &ArrayRef) -> Result<()> {
             check_companions(map.entries().fields(), map.entries().columns())
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn checked_kernel_matches_reference_for_nested_sliced_timestamps() -> Result<()> {
+        let integers = Int64Array::from(vec![Some(5), None, Some(-1001), Some(0), Some(1111)]).slice(1, 4);
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            let column = cast(&integers, &DataType::Timestamp(unit, Some("UTC".into())))?;
+            let time = Arc::new(Field::new("time", column.data_type().clone(), true));
+            let nested = StructArray::try_new(vec![time].into(), vec![column], None)?;
+            let input = RecordBatch::try_from_iter([("nested", Arc::new(nested) as ArrayRef)])?;
+            assert_eq!(
+                batch_with_kernel(&input, TimestampKernel::FusedChecked)?,
+                batch(&input)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_kernel_matches_reference_on_epoch_overflow() -> Result<()> {
+        for value in [i64::MIN, i64::MAX] {
+            let column: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![value]));
+            let input = RecordBatch::try_from_iter([("time", column)])?;
+            for kernel in [TimestampKernel::Reference, TimestampKernel::FusedChecked] {
+                assert_eq!(
+                    batch_with_kernel(&input, kernel)
+                        .err()
+                        .context("accepted overflow")?
+                        .to_string(),
+                    "epoch nanoseconds overflow"
+                );
+            }
+        }
+        Ok(())
     }
 }

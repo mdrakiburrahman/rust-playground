@@ -25,15 +25,29 @@ pub mod commit;
 pub mod delta;
 #[cfg(feature = "delta")]
 mod delta_io;
+pub mod delta_stats;
 #[cfg(feature = "delta")]
 pub use delta_io::{DeltaRuntimeConfig, runtime_config};
+pub mod footer;
 pub mod layout;
 #[cfg(feature = "delta")]
 pub mod maintenance;
 #[cfg(feature = "delta")]
 pub mod normalize;
 #[cfg(feature = "delta")]
+mod parallel_writer;
+#[cfg(feature = "delta")]
 mod partition;
+#[cfg(feature = "delta")]
+mod pipelined_writer;
+#[cfg(feature = "delta")]
+mod publication_evidence;
+#[cfg(feature = "delta")]
+mod publication_lookup;
+#[cfg(feature = "delta")]
+mod streaming_columns;
+#[cfg(feature = "delta")]
+pub use publication_evidence::{PublicationEvidence, PublicationOutcome, PublicationReason};
 #[cfg(feature = "delta")]
 pub mod publisher;
 #[cfg(feature = "delta")]
@@ -42,6 +56,399 @@ pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;
 pub mod writer;
+
+/// Strategy for resolving transaction identities before Delta publication.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxnLookupMode {
+    PerId,
+    #[default]
+    Batched,
+    BatchedCached,
+    /// Maintains a complete in-memory transaction index advanced from new log tails.
+    Incremental,
+}
+
+impl<'de> serde::Deserialize<'de> for TxnLookupMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str =
+            "collector.commit.txn_lookup_mode must be per_id, batched, batched_cached, or incremental";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_id") => Ok(Self::PerId),
+            Ok("batched") => Ok(Self::Batched),
+            Ok("batched_cached") => Ok(Self::BatchedCached),
+            Ok("incremental") => Ok(Self::Incremental),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// How the commit owner refreshes its cached Delta snapshot between commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCacheMode {
+    /// Reuses local snapshots only while the log holds plain commit JSON.
+    #[default]
+    JsonOnly,
+    /// Also reuses snapshots across checkpoints, and on object stores.
+    CheckpointAware,
+}
+
+impl<'de> serde::Deserialize<'de> for SnapshotCacheMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.snapshot_cache_mode must be json_only or checkpoint_aware";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("json_only") => Ok(Self::JsonOnly),
+            Ok("checkpoint_aware") => Ok(Self::CheckpointAware),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// How an object-store snapshot refresh lists `_delta_log/` to certify its cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotListMode {
+    /// Lists the whole log on every refresh.
+    #[default]
+    Full,
+    /// Lists from the cached checkpoint version; entries below it are not observed.
+    FromCheckpoint,
+}
+
+impl<'de> serde::Deserialize<'de> for SnapshotListMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.snapshot_list_mode must be full or from_checkpoint";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("full") => Ok(Self::Full),
+            Ok("from_checkpoint") => Ok(Self::FromCheckpoint),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// How coalesced preparation binds output files to the table schema.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageSnapshotMode {
+    #[default]
+    PerFile,
+    PerGroup,
+}
+
+impl<'de> serde::Deserialize<'de> for StageSnapshotMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_file") => Ok(Self::PerFile),
+            Ok("per_group") => Ok(Self::PerGroup),
+            _ => Err(serde::de::Error::custom(
+                "collector.commit.stage_snapshot_mode must be per_file or per_group",
+            )),
+        }
+    }
+}
+
+/// How coalesced preparation resolves the prior Delta transactions of its entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightLookupMode {
+    /// One Kernel transaction lookup per entry.
+    #[default]
+    PerEntry,
+    /// One `txn_lookup_mode` lookup per group; custom-partitioned tables stay per entry.
+    Grouped,
+}
+
+impl<'de> serde::Deserialize<'de> for PreflightLookupMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.preflight_lookup_mode must be per_entry or grouped";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("per_entry") => Ok(Self::PerEntry),
+            Ok("grouped") => Ok(Self::Grouped),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// Who writes Delta checkpoints for a collector-owned table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointMode {
+    /// Leaves checkpoints to the maintenance service.
+    #[default]
+    External,
+    /// Checkpoints on the commit thread after every interval of commits.
+    Inline,
+    /// Checkpoints on a dedicated thread, coalescing requests while one runs.
+    Async,
+}
+
+impl<'de> serde::Deserialize<'de> for CheckpointMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &str = "collector.commit.checkpoint_mode must be external, inline, or async";
+        match String::deserialize(deserializer).as_deref() {
+            Ok("external") => Ok(Self::External),
+            Ok("inline") => Ok(Self::Inline),
+            Ok("async") => Ok(Self::Async),
+            _ => Err(serde::de::Error::custom(EXPECTED)),
+        }
+    }
+}
+
+/// When the Delta commit worker publishes a partially filled batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitTrigger {
+    /// Wait up to `batch_window` for more files unless forced or full.
+    #[default]
+    Window,
+    /// Commit everything already queued as soon as the worker is idle.
+    Eager,
+}
+
+impl<'de> serde::Deserialize<'de> for CommitTrigger {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer).as_deref() {
+            Ok("window") => Ok(Self::Window),
+            Ok("eager") => Ok(Self::Eager),
+            _ => Err(serde::de::Error::custom(
+                "collector.commit.trigger must be window or eager",
+            )),
+        }
+    }
+}
+
+/// Remote Parquet staging strategy; local Delta tables always fsync their data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum StagingMode {
+    #[default]
+    LocalFsync,
+    Streaming,
+}
+
+impl StagingMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFsync => "local_fsync",
+            Self::Streaming => "streaming",
+        }
+    }
+}
+
+impl TryFrom<String> for StagingMode {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "local_fsync" => Ok(Self::LocalFsync),
+            "streaming" => Ok(Self::Streaming),
+            _ => Err("staging_mode must be local_fsync or streaming"),
+        }
+    }
+}
+
+/// Local directory durability policy; file contents remain fsynced in both modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum LocalDirectorySyncPolicy {
+    /// Sync each output directory chain while staging the file.
+    #[default]
+    PerFile,
+    /// Sync unique output directory chains immediately before publishing a commit.
+    BeforeCommit,
+}
+
+impl LocalDirectorySyncPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PerFile => "per_file",
+            Self::BeforeCommit => "before_commit",
+        }
+    }
+}
+
+impl TryFrom<String> for LocalDirectorySyncPolicy {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "per_file" => Ok(Self::PerFile),
+            "before_commit" => Ok(Self::BeforeCommit),
+            _ => Err("local_directory_sync_policy must be per_file or before_commit"),
+        }
+    }
+}
+
+/// Scheduling of Parquet column encoders; one column worker stays sequential.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum ParquetEncodeMode {
+    #[default]
+    ColumnWaves,
+    ColumnPipeline,
+}
+
+impl ParquetEncodeMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ColumnWaves => "column_waves",
+            Self::ColumnPipeline => "column_pipeline",
+        }
+    }
+}
+
+impl TryFrom<String> for ParquetEncodeMode {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "column_waves" => Ok(Self::ColumnWaves),
+            "column_pipeline" => Ok(Self::ColumnPipeline),
+            _ => Err("expected column_waves or column_pipeline"),
+        }
+    }
+}
+
+/// Queue discipline for the dedicated CPU workers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum CpuDispatch {
+    #[default]
+    SharedFifo,
+    BoundedShards,
+}
+
+impl CpuDispatch {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedFifo => "shared_fifo",
+            Self::BoundedShards => "bounded_shards",
+        }
+    }
+}
+
+impl TryFrom<String> for CpuDispatch {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "shared_fifo" => Ok(Self::SharedFifo),
+            "bounded_shards" => Ok(Self::BoundedShards),
+            _ => Err("expected shared_fifo or bounded_shards"),
+        }
+    }
+}
+
+/// Affinity policy for CPU workers, independent of the I/O runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum CpuPlacement {
+    #[default]
+    Os,
+    CompactAllowed,
+    ScatterAllowed,
+    PhysicalFirst,
+}
+
+impl CpuPlacement {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::CompactAllowed => "compact_allowed",
+            Self::ScatterAllowed => "scatter_allowed",
+            Self::PhysicalFirst => "physical_first",
+        }
+    }
+}
+
+impl TryFrom<String> for CpuPlacement {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "os" => Ok(Self::Os),
+            "compact_allowed" => Ok(Self::CompactAllowed),
+            "scatter_allowed" => Ok(Self::ScatterAllowed),
+            "physical_first" => Ok(Self::PhysicalFirst),
+            _ => Err("expected os, compact_allowed, scatter_allowed or physical_first"),
+        }
+    }
+}
+
+/// How the writer groups rows by their Delta partition values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum PartitionGrouping {
+    #[default]
+    ScalarMap,
+    TypedRuns,
+}
+
+impl TryFrom<String> for PartitionGrouping {
+    type Error = &'static str;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "scalar_map" => Ok(Self::ScalarMap),
+            "typed_runs" => Ok(Self::TypedRuns),
+            _ => Err("expected scalar_map or typed_runs"),
+        }
+    }
+}
+
+impl PartitionGrouping {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScalarMap => "scalar_map",
+            Self::TypedRuns => "typed_runs",
+        }
+    }
+}
+
+/// Writer-side validation of a bound ingestion partition (independent of grouping).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(try_from = "String", rename_all = "snake_case")]
+pub enum GeneratedPartitionBinding {
+    #[default]
+    RevalidateRows,
+    ProvenConstant,
+}
+
+impl GeneratedPartitionBinding {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RevalidateRows => "revalidate_rows",
+            Self::ProvenConstant => "proven_constant",
+        }
+    }
+}
+
+impl TryFrom<String> for GeneratedPartitionBinding {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: String) -> Result<Self> {
+        match raw.as_str() {
+            "revalidate_rows" => Ok(Self::RevalidateRows),
+            "proven_constant" => Ok(Self::ProvenConstant),
+            _ => {
+                anyhow::bail!("generated_partition_binding must be 'revalidate_rows' or 'proven_constant', got {raw:?}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "delta")]
+use parallel_writer::ParallelArrowWriter;
+#[cfg(feature = "delta")]
+use pipelined_writer::PipelinedArrowWriter;
+#[cfg(feature = "delta")]
+use streaming_columns::StreamingColumnWriter;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
@@ -61,6 +468,7 @@ pub struct CompletedFileObservation {
 /// A completed, durable Parquet file. It is not necessarily committed to Delta.
 #[derive(Debug)]
 pub struct CompletedFile {
+    /// Table-root-relative identity anchored at the staging root. Streamed remote objects have no local file here.
     pub path: PathBuf,
     pub rows: usize,
     /// Logical Arrow bytes accepted before Parquet encoding.
@@ -83,11 +491,25 @@ impl CompletedFile {
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
 pub struct ParquetFileWriter {
-    writer: Option<AsyncArrowWriter<tokio::fs::File>>,
-    durable_handle: File,
+    #[cfg(feature = "delta")]
+    properties: WriterProperties,
+    writer: Option<FileWriter>,
+    durable_handle: Option<File>,
     path: PathBuf,
     rows: usize,
     input_bytes: u64,
+}
+
+enum FileWriter {
+    Sequential(AsyncArrowWriter<tokio::fs::File>),
+    #[cfg(feature = "delta")]
+    Parallel(ParallelArrowWriter<File>),
+    #[cfg(feature = "delta")]
+    Pipelined(PipelinedArrowWriter<File>),
+    #[cfg(feature = "delta")]
+    Streaming(AsyncArrowWriter<delta::streaming_sink::StreamingSink>),
+    #[cfg(feature = "delta")]
+    StreamingColumns(StreamingColumnWriter),
 }
 
 impl ParquetFileWriter {
@@ -108,29 +530,146 @@ impl ParquetFileWriter {
         schema: SchemaRef,
         properties: Option<WriterProperties>,
     ) -> Result<Self> {
+        Self::create_inner(path.as_ref(), schema, properties, false)
+    }
+
+    /// Opt into a schema-neutral footer declaration for level-bearing codecs (Delta ingestion and its evidence fixture).
+    ///
+    /// # Errors
+    /// Returns file creation, writer policy or Parquet schema errors.
+    pub fn create_with_codec_evidence(
+        path: impl AsRef<Path>,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+    ) -> Result<Self> {
+        Self::create_inner(path.as_ref(), schema, properties, true)
+    }
+
+    fn create_inner(
+        path: &Path,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+        declare_levels: bool,
+    ) -> Result<Self> {
+        let properties = Self::effective_properties(&schema, properties, declare_levels)?;
+        Self::open_local(path, schema, properties)
+    }
+
+    fn effective_properties(
+        schema: &SchemaRef,
+        properties: Option<WriterProperties>,
+        declare_levels: bool,
+    ) -> Result<WriterProperties> {
         let properties = writer::process_config()?.writer_properties(
-            &schema,
+            schema,
             properties.clone(),
-            &writer::sorting_from_properties(&schema, properties.as_ref())?,
+            &writer::sorting_from_properties(schema, properties.as_ref())?,
         )?;
-        let path = path.as_ref().to_path_buf();
+        if declare_levels {
+            let physical = parquet::arrow::ArrowSchemaConverter::new()
+                .with_coerce_types(properties.coerce_types())
+                .convert(schema)?;
+            footer::stamp(&physical, properties)
+        } else {
+            Ok(properties)
+        }
+    }
+
+    fn open_local(path: &Path, schema: SchemaRef, properties: WriterProperties) -> Result<Self> {
+        let path = path.to_path_buf();
+        let parquet_config = writer::process_config()?;
         let durable_handle = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
-        let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, Some(properties))?;
+        #[cfg(feature = "delta")]
+        let effective = properties.clone();
+        #[cfg(feature = "delta")]
+        let writer = {
+            let config = delta_io::runtime_config()?;
+            let column_workers = config.parquet_column_workers;
+            if config.parquet_encode_mode == ParquetEncodeMode::ColumnPipeline {
+                FileWriter::Pipelined(PipelinedArrowWriter::try_new_with_options(
+                    durable_handle.try_clone()?,
+                    schema,
+                    properties,
+                    column_workers,
+                    parquet_config.skip_arrow_metadata(),
+                )?)
+            } else if column_workers > 1 {
+                FileWriter::Parallel(ParallelArrowWriter::try_new_with_options(
+                    durable_handle.try_clone()?,
+                    schema,
+                    properties,
+                    column_workers,
+                    parquet_config.skip_arrow_metadata(),
+                )?)
+            } else {
+                let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+                FileWriter::Sequential(AsyncArrowWriter::try_new_with_options(
+                    output,
+                    schema,
+                    parquet_config.arrow_writer_options(properties),
+                )?)
+            }
+        };
+        #[cfg(not(feature = "delta"))]
+        let writer = {
+            let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+            FileWriter::Sequential(AsyncArrowWriter::try_new_with_options(
+                output,
+                schema,
+                parquet_config.arrow_writer_options(properties),
+            )?)
+        };
         Ok(Self {
             writer: Some(writer),
-            durable_handle,
+            #[cfg(feature = "delta")]
+            properties: effective,
+            durable_handle: Some(durable_handle),
             path,
             rows: 0,
             input_bytes: 0,
         })
     }
 
-    /// Append a batch without retaining it in memory.
+    #[cfg(feature = "delta")]
+    fn streaming(
+        path: PathBuf,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+        sink: delta::streaming_sink::StreamingSink,
+    ) -> Result<Self> {
+        let properties = Self::effective_properties(&schema, properties, true)?;
+        let config = delta_io::runtime_config()?;
+        let parquet_config = writer::process_config()?;
+        let writer = if config.parquet_encode_mode == ParquetEncodeMode::ColumnPipeline {
+            FileWriter::StreamingColumns(StreamingColumnWriter::try_new(
+                sink,
+                schema,
+                properties.clone(),
+                config.parquet_column_workers,
+                parquet_config.skip_arrow_metadata(),
+            )?)
+        } else {
+            FileWriter::Streaming(AsyncArrowWriter::try_new_with_options(
+                sink,
+                schema,
+                parquet_config.arrow_writer_options(properties.clone()),
+            )?)
+        };
+        Ok(Self {
+            properties,
+            writer: Some(writer),
+            durable_handle: None,
+            path,
+            rows: 0,
+            input_bytes: 0,
+        })
+    }
+
+    /// Append a batch. Column-pipeline mode retains a bounded window of Arrow slices.
     ///
     /// # Errors
     /// Returns byte-accounting, schema, or file-write errors.
@@ -159,25 +698,55 @@ impl ParquetFileWriter {
             .context("input Arrow byte count overflow")?;
         #[cfg(feature = "delta")]
         {
-            let mut writer = self
+            let writer = self
                 .writer
                 .take()
                 .context("Parquet writer unavailable after interrupted write")?;
-            let batch = batch.clone();
-            let (writer, result) = delta_io::run_cpu_future(async move {
-                let result = writer.write(&batch).await;
-                (writer, result)
-            })
-            .await?;
-            self.writer = Some(writer);
-            result?;
+            match writer {
+                FileWriter::Sequential(mut writer) => {
+                    let batch = batch.clone();
+                    let (writer, result) = delta_io::run_cpu_future(async move {
+                        let result = writer.write(&batch).await;
+                        (writer, result)
+                    })
+                    .await?;
+                    self.writer = Some(FileWriter::Sequential(writer));
+                    result?;
+                }
+                FileWriter::Streaming(mut writer) => {
+                    let batch = batch.clone();
+                    let (writer, result) = delta_io::run_cpu_future(async move {
+                        let result = writer.write(&batch).await;
+                        (writer, result)
+                    })
+                    .await?;
+                    self.writer = Some(FileWriter::Streaming(writer));
+                    result?;
+                }
+                FileWriter::Parallel(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::Parallel(writer));
+                    result?;
+                }
+                FileWriter::Pipelined(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::Pipelined(writer));
+                    result?;
+                }
+                FileWriter::StreamingColumns(mut writer) => {
+                    let result = writer.write(batch).await;
+                    self.writer = Some(FileWriter::StreamingColumns(writer));
+                    result?;
+                }
+            }
         }
         #[cfg(not(feature = "delta"))]
-        self.writer
-            .as_mut()
-            .context("Parquet writer unavailable")?
-            .write(batch)
-            .await?;
+        match self.writer.take().context("Parquet writer unavailable")? {
+            FileWriter::Sequential(mut writer) => {
+                writer.write(batch).await?;
+                self.writer = Some(FileWriter::Sequential(writer));
+            }
+        }
         self.rows = rows;
         self.input_bytes = input_bytes;
         Ok(())
@@ -188,28 +757,82 @@ impl ParquetFileWriter {
     /// # Errors
     /// Returns close, metadata, or synchronization errors.
     pub async fn finish(self) -> Result<CompletedFile> {
-        let writer = self
-            .writer
-            .context("Parquet writer unavailable after interrupted write")?;
-        #[cfg(feature = "delta")]
-        delta_io::run_cpu_future(async move { writer.close().await }).await??;
-        #[cfg(not(feature = "delta"))]
-        writer.close().await?;
-        let durable_handle = tokio::fs::File::from_std(self.durable_handle);
+        Ok(self.finish_with_upload().await?.0)
+    }
+
+    async fn finish_with_upload(self) -> Result<(CompletedFile, Option<std::time::Duration>)> {
+        let Self {
+            writer,
+            durable_handle,
+            path,
+            rows,
+            input_bytes,
+            ..
+        } = self;
+        match writer.context("Parquet writer unavailable after interrupted write")? {
+            FileWriter::Sequential(writer) => {
+                #[cfg(feature = "delta")]
+                delta_io::run_cpu_future(async move { writer.close().await }).await??;
+                #[cfg(not(feature = "delta"))]
+                writer.close().await?;
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::Streaming(mut writer) => {
+                let (bytes, duration) = delta_io::run_cpu_future(async move {
+                    writer.finish().await?;
+                    Ok::<_, anyhow::Error>(writer.into_inner().observation())
+                })
+                .await??;
+                return Ok((
+                    CompletedFile {
+                        path,
+                        rows,
+                        input_bytes,
+                        bytes,
+                    },
+                    Some(duration),
+                ));
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::Parallel(writer) => {
+                drop(writer.finish().await?);
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::Pipelined(writer) => {
+                drop(writer.finish().await?);
+            }
+            #[cfg(feature = "delta")]
+            FileWriter::StreamingColumns(writer) => {
+                let (bytes, duration) = writer.finish().await?;
+                return Ok((
+                    CompletedFile {
+                        path,
+                        rows,
+                        input_bytes,
+                        bytes,
+                    },
+                    Some(duration),
+                ));
+            }
+        }
+        let durable_handle =
+            tokio::fs::File::from_std(durable_handle.context("local writer missing durability handle")?);
         durable_handle.sync_all().await?;
         let bytes = durable_handle.metadata().await?.len();
-        let parent = self
-            .path
+        let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         tokio::fs::File::open(parent).await?.sync_all().await?;
-        Ok(CompletedFile {
-            path: self.path,
-            rows: self.rows,
-            input_bytes: self.input_bytes,
-            bytes,
-        })
+        Ok((
+            CompletedFile {
+                path,
+                rows,
+                input_bytes,
+                bytes,
+            },
+            None,
+        ))
     }
 }
 
@@ -292,6 +915,19 @@ pub(crate) mod sync_hook {
     static FAIL: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+    type SyncGate = (PathBuf, tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+    static GATES: Mutex<Vec<SyncGate>> = Mutex::new(Vec::new());
+
+    pub(crate) fn pause_next(path: PathBuf) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        GATES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path, entered, wait));
+        (ready, release)
+    }
+
     pub(crate) fn fail_on(path: &Path) {
         FAIL.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -319,6 +955,17 @@ pub(crate) mod sync_hook {
     }
 
     pub(super) fn observe(path: &Path) -> anyhow::Result<()> {
+        let gate = {
+            let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);
+            gates
+                .iter()
+                .position(|(p, _, _)| p == path)
+                .map(|i| gates.swap_remove(i))
+        };
+        if let Some((_, entered, wait)) = gate {
+            let _ = entered.send(());
+            let _ = wait.recv();
+        }
         if FAIL
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -333,4 +980,13 @@ pub(crate) mod sync_hook {
             .push(path.to_owned());
         Ok(())
     }
+}
+
+/// Timestamp conversion used for raw Delta inputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampKernel {
+    #[default]
+    Reference,
+    FusedChecked,
 }

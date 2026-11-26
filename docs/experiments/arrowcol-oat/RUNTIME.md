@@ -40,7 +40,15 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 | Local inputs | New per-cell project/network/SQL and Kusto volumes, private app/migrator/HMAC files; no retained SQL volume or Azure environment file is used. Compose auto `.env` loading is disabled. Images/build cache and host resources remain shared. |
 | `platform.local.snapshot_root` | Optional absolute directory, outside generated state and not its ancestor. Opt-in export; default `null` retains automatic cleanup without exporting. Never point it at public website storage: snapshots contain real payloads. |
 | Stop/export/cleanup | Stop owned ingress first, then stop and wait for `delta-maintenance`, record its sanitized outcome, and only then SIGTERM collectors; stop catalog and dependencies afterward. `collector_stop_grace_seconds` (30..=3600, default 300) is applied to local collectors and AKS `terminationGracePeriodSeconds` and is read back before measurement. Other local stop phases retain a 300 s ceiling; the overall local deadline includes collector grace, all three other phase ceilings, and 120 s margin. Each collector records SIGTERM-to-exit seconds, committed rows/commits completed after SIGTERM, Quiver bundles drained/force-dropped, log completeness, and exit code. A zero drained count derived only from matched shutdown start/complete records is labelled `inferred`, not `observed`. Maintenance uses the retained pre-client baseline through drain: typed `stale_plan` retries and sanitized operation failures are separate. Raw exit 1 is preserved but never alone establishes `maintenance_operation_failure`; missing records or an unproved exit cause remain UNKNOWN. Exit 0 and intentional SIGTERM/143 for a previously running writer remain accepted; exit 2, 137, OOM and every other nonzero exit still fail. An AKS terminated state missed before pod deletion yields `exit_outcome.status=unavailable` and a null exit code, never an assumed success. Stop failure retains owned resources for recovery rather than attempting destructive cleanup. In snapshot mode, copy/verify/sync snapshot and provenance before owned stack/volume/state deletion. |
+| Local screen evidence | After stopped-snapshot export, local OAT reads `<snapshot_root>/<run_id>/<table>/table/_delta_log`, selects collector receipts by `finished_at` in `[start,end)`, matches window totals and each receipted version's data-change Adds, and checks unreceipted in-span versions. Only a reconciled result populates `evidence_json.durable_commits.delta_log_reconciliation.csv` and `screen_v1`; mismatches fail the row, while unavailable evidence leaves screen metrics null with a reason. |
+| Commit-rate resolution | Commit windows and reconciled local `screen_v1` report `window_commit_count`, `max_commit_rows`, `rate_resolution_rows_per_second` (largest commit divided by window seconds), and `slope_rows_per_second` (least-squares cumulative committed rows against finish time). No commits leaves the maximum, resolution and slope null; fewer than three commits or identical finish times leaves slope null. Unavailable evidence has all four fields null. The slope orders equal finish times by Delta version. |
 | Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
+
+Client quiescence is capped at 86,400,000 ms and must be at least the request
+timeout and strictly less than collector stop grace. The client stop grace is
+the quiesce timeout rounded up to seconds plus 10 seconds. Separately, campaign
+cleanup bounds its collector drain step to 120 seconds; increasing the pod's
+termination grace does not increase that custody deadline.
 
 Local teardown includes the maintenance Compose profile only when maintenance
 was enabled for the cell; other profiles remain excluded.
@@ -114,7 +122,8 @@ const config = JSON.parse(fs.readFileSync("docs/experiments/arrowcol-oat/oat-con
 Object.assign(config.platform, {
   compose_project: "oat-smoke", compose_state_root: `${root}/state`,
   local: { bind_host: process.env.OAT_DOCKER_BIND_HOST ?? null,
-    endpoint_host: process.env.OAT_DOCKER_ENDPOINT_HOST ?? null, snapshot_root: `${root}/snapshots` }
+    endpoint_host: process.env.OAT_DOCKER_ENDPOINT_HOST ?? null, snapshot_root: `${root}/snapshots`,
+    collector_memory_limit_bytes: config.platform.local.collector_memory_limit_bytes }
 });
 Object.assign(config, {
   tables: ["sqlserver_active_sessions"], replica_counts: [1], dfe_worker_concurrency: [1],
@@ -126,8 +135,13 @@ Object.assign(config, {
 });
 fs.writeFileSync(`${root}/config.json`, JSON.stringify(config), { flag: "wx" });
 '
-npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode local
+npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode local 2>&1 | tee "$OAT_SMOKE_ROOT/run.log"
 ```
+
+The overload guard is enabled by default and needs a finite collector cap, so the
+recipe keeps the example's `platform.local.collector_memory_limit_bytes` (4 GiB);
+without it the run fails before stack services start. `run.log` keeps the full
+console transcript beside the results.
 
 The one-second measurement still follows image/stack startup, trusted immutable
 pin initialization, whole-fleet preflight/QAP setup and the schedule lead.
@@ -198,7 +212,9 @@ largest pool; the legacy collector pool is not implicitly selected or relabelled
 | Setting | Resolution |
 | --- | --- |
 | `collector.*` | `auto` derives DFE, runtime, blocking and encoder/writer CPU workers from the selected Ready node's available whole cores, respecting existing consumer maxima. Positive numeric overrides remain supported. |
-| `client.*` | `auto` resolves independently for every Ready client node: worker/runtime threads, connection/stream counts, rows, concurrency and corpus/memory budgets. |
+| `client.*` | `auto` resolves independently for every Ready client node: worker/runtime threads, connection/stream counts, rows and corpus/memory budgets. |
+| Client concurrency | Remove top-level `dmv_concurrency` and `tunables.client.streams_per_worker` from the base. Fleet sizing uses `streams_per_worker` per worker; alternatively set it to `0` and supply `client.dmv_concurrency` as `auto` or 1–64. Both omitted at the resolved client level fall back to 4 streams per worker. |
+| Concurrency evidence | Per-client `concurrency_readback` verifies workers, streams per worker, source and their configured slot product against the consumer. The resource evidence key `requested_concurrency_per_process` is a legacy alias of `requested_concurrency_per_worker`, not a process-wide slot count. |
 | Pod budget | Observed node allocatable minus existing nonterminal pod requests, including DaemonSets, minus reserved runtime/support-service room. Collector reservation includes SQL, router, catalog, maintenance and setup jobs; clients retain additional headroom. |
 | Placement | One integrated collector pod plus existing support topology on the explicit collector pool/node. One DMV pod per client node, pinned by pool and hostname with the role selector/taint toleration retained. Only observed `amd64` nodes are admitted for the existing images. |
 | Evidence | Per-client and per-pool completed/admitted rows/s, node/pool/SKU allocation and collector/client allocatable CPU/memory totals. Client completion rates are neither attempted/offered rates nor collector-committed rates. The ranking remains exactly `ranking_metrics.committed_rows_per_second`, reconciled from collector commits before shutdown. Missing ranking evidence stays null. |

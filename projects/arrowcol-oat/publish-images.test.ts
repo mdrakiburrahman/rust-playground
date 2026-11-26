@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
 import {
   buildLocalImages, MissingPublishedImagesError, publishClientImage, publishImages, publishViewer, readPublishedImages,
 } from './publish-images.js';
+import { parseCollectorBuildProfile } from './collector-build-profile.js';
 import { validateRuntime } from './runtime.js';
 
 const client = '00000000-0000-0000-0000-000000000002';
@@ -57,7 +59,7 @@ Try running 'az acr check-health -n arrowcollector99999 --yes' to diagnose this 
 `;
 
 type Fault = 'identity' | 'digest' | 'architecture' | 'missing-tag' | 'missing-digest' | 'older-tags' | 'tag-still-present' | 'unknown-not-found' | 'empty-registry' |
-  'registry-absent' | 'auth' | 'dns' | 'timeout' | 'throttle' | 'server' | 'provenance' | 'local-provenance' | 'published-missing';
+  'registry-absent' | 'auth' | 'dns' | 'timeout' | 'throttle' | 'server' | 'provenance' | 'client-provenance' | 'dataflow-provenance' | 'local-provenance' | 'published-missing';
 
 function mock(registry: string, fault?: Fault) {
   const calls: string[][] = [];
@@ -77,7 +79,9 @@ function mock(registry: string, fault?: Fault) {
         const repo = reference.startsWith(`${registry}.azurecr.io/`) ? reference.split('/').at(-1)!.split(':')[0] : '';
         stdout = JSON.stringify({
           Os: 'linux', Architecture: fault === 'architecture' ? 'arm64' : 'amd64',
-          Config: { Labels: { 'org.opencontainers.image.revision': fault === 'provenance' || (fault === 'local-provenance' && !repo) ? subscription : revision } },
+          Config: { Labels: { 'org.opencontainers.image.revision': fault === 'provenance' || (fault === 'local-provenance' && !repo) ||
+            (fault === 'client-provenance' && repo === 'arrowcol-oat-client') ||
+            (fault === 'dataflow-provenance' && repo === 'arrowcol-dataflow-rust') ? subscription : revision } },
           ...(repo ? { RepoDigests: [`${registry}.azurecr.io/${repo}@${digest}`] } : {}),
         });
       } else stdout = fault === 'architecture' ? 'linux/arm64' : 'linux/amd64';
@@ -241,6 +245,25 @@ test('builds all five local images for linux/amd64 with the full revision label'
   await assert.rejects(buildLocalImages({ revision }, dirtyRunner), /Commit the source changes/);
 });
 
+test('passes the source revision as a build argument for every local image', async () => {
+  for (const profile of [undefined, {
+    allocator: 'mimalloc', lto: 'thin', codegen_units: 8, opt_level: 2, target_cpu: 'generic',
+  } as const]) {
+    const calls: string[][] = [];
+    const runner: typeof run_tree = async command => {
+      if (command[0] === 'git') return { returncode: 0, stdout: command[1] === 'rev-parse' ? revision : '', stderr: '' };
+      calls.push(command);
+      return { returncode: 0, stdout: '', stderr: '' };
+    };
+    await buildLocalImages({ revision, profile, maintenance: true }, runner);
+    assert.equal(calls.length, 6);
+    for (const command of calls) {
+      const index = command.indexOf(`VCS_REF=${revision}`);
+      assert.ok(index > 0 && command[index - 1] === '--build-arg');
+    }
+  }
+});
+
 test('publishes the revision-proven client image as a digest-pinned ACR reference', async t => {
   const options = fixture(t);
   const m = mock(options.registry);
@@ -279,6 +302,36 @@ test('publishes the static viewer to the stamped root website through the federa
   assert.equal(fs.existsSync(m.cache()), false);
 });
 
+test('builds the collector image at its canonical profile-hash tag', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry);
+  const profile = { allocator: 'mimalloc', lto: 'thin-local', codegen_units: 8, opt_level: 2, target_cpu: 'x86-64-v3' } as const;
+  const hash = createHash('sha256').update('allocator=mimalloc;lto=thin-local;codegen_units=8;opt_level=2;target_cpu=x86-64-v3').digest('hex');
+  await buildLocalImages({ revision, profile }, m.runner);
+  const collector = m.calls.find(command => command[0] === 'docker' && command[1] === 'buildx' && command.includes('projects/arrowcol-dataflow-rust/Dockerfile'));
+  assert.ok(collector);
+  assert.equal(collector[collector.indexOf('--tag') + 1], 'arrowcol-oat/dataflow:profile-' + hash);
+  for (const argument of ['PROFILE_HASH=' + hash, 'BUILD_ALLOCATOR=mimalloc', 'BUILD_LTO=thin-local',
+    'BUILD_CODEGEN_UNITS=8', 'BUILD_OPT_LEVEL=2', 'BUILD_TARGET_CPU=x86-64-v3',
+    'org.opencontainers.image.profile=' + hash]) assert.ok(collector.includes(argument), argument);
+});
+
+test('rejects explicit null build-profile fields while preserving omitted defaults', () => {
+  const defaults = {
+    allocator: 'system', lto: 'off', codegen_units: 16, opt_level: 3, target_cpu: 'generic',
+  } as const;
+  assert.equal(parseCollectorBuildProfile({}), undefined);
+  assert.deepEqual(parseCollectorBuildProfile({ lto: 'off' }), defaults);
+  assert.deepEqual(parseCollectorBuildProfile({ lto: 'thin-local' }), { ...defaults, lto: 'thin-local' });
+  assert.deepEqual(parseCollectorBuildProfile({ allocator: 'mimalloc' }), { ...defaults, allocator: 'mimalloc' });
+  for (const field of ['allocator', 'lto', 'codegen_units', 'opt_level', 'target_cpu'] as const) {
+    assert.throws(
+      () => parseCollectorBuildProfile({ [field]: null }),
+      error => error instanceof Error && error.message === `collector.${field} must not be null`,
+    );
+  }
+});
+
 test('opt-in maintenance verifies a sixth immutable revision, while legacy setup still uses five', async t => {
   const options = fixture(t);
   const m = mock(options.registry);
@@ -310,6 +363,15 @@ test('published image provenance mismatch fails without building or pushing', as
   const m = mock(options.registry, 'provenance');
   await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), /revision provenance does not match/);
   assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+});
+test('client and collector revisions are independently checked against the source revision', async t => {
+  const options = fixture(t);
+  for (const [fault, role] of [['client-provenance', 'client'], ['dataflow-provenance', 'dataflow']] as const) {
+    const m = mock(options.registry, fault);
+    await assert.rejects(readPublishedImages({ ...options, revision }, m.runner),
+      new RegExp(`Published ${role} image revision provenance does not match`));
+    assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+  }
 });
 
 test('existing repositories with only older revision tags return exactly the missing roles before metadata lookup', async t => {

@@ -1,0 +1,22 @@
+# A manifest index only; each referenced lane is a complete Darwin Config.
+experiments:
+  - name: client-encode
+    config: experiments/darwin/client-encode.yaml
+  - name: router-sql
+    config: experiments/darwin/router-sql.yaml
+  - name: flight-envelope
+    config: experiments/darwin/flight-envelope.yaml
+  - name: layout-sort
+    config: experiments/darwin/layout-sort.yaml
+  - name: parquet-encode
+    config: experiments/darwin/parquet-encode.yaml
+  - name: commit-pipeline
+    config: experiments/darwin/commit-pipeline.yaml
+  - name: maintenance-active
+    config: experiments/darwin/maintenance-active.yaml
+  - name: maintenance-idle
+    config: experiments/darwin/maintenance-idle.yaml
+  - name: throughput-config
+    config: experiments/darwin/throughput-config.yaml
+  - name: compression-config
+    config: experiments/darwin/compression-config.yaml

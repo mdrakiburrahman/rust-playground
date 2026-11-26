@@ -9,7 +9,7 @@ import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   createBlobCampaignStore,
   armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
-  validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
+  validateCampaignState, validateInitialRunInventory, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
   CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
 import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
 import { newScaleTrialReceipt, SCALE_RESTORE_TIMEOUT_MS, type ScaleStep } from './aks-scale.js';
@@ -71,6 +71,7 @@ const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
     schema_version: 1, campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: state.runInventory?.fencing_token ?? state.fencingToken,
     orchestration_run_id: orchestrationRunId, cell_run_id: cellRunId, load_admission: state.runInventory?.load_admission ?? 'not_authorized',
     planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
+    drain_budget: { budget_ms: 120_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 },
     namespace: { name: namespace, uid: observed ? 'c0ffee00-0000-4000-8000-000000000009' : null, owner_token: state.ownerId },
     resources: names.map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: observed ? uids[index]! : null, absence: null, role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance', state: stateName })),
@@ -126,6 +127,33 @@ test('Rust RunInventory timing fields are strictly parsed and legacy inventory c
   legacyStore.current = { state: validateCampaignState({ ...legacyStarted, runInventory: legacy }), etag: 'legacy-etag' };
   await assert.rejects(armCampaign(legacyStore, ownerId, legacyStarted.fencingToken, legacyStarted.startedAtMs),
     /without a new-cell duration and maintenance stop budget/);
+});
+
+test('drain budget is strict, immutable, and included in lifetime admission', async () => {
+  const store = await seed(), started = (await store.read())!.state;
+  const drain_budget = { budget_ms: 240_000, collector_grace_ms: 300_000, pre_stop_capture_margin_ms: 30_000 };
+  const planned = { ...inventoryFor(started), drain_budget };
+  for (const bad of [ { ...drain_budget, budget_ms: 270_001 }, { ...drain_budget, budget_ms: 0 },
+    { ...drain_budget, budget_ms: 1.5 }, { ...drain_budget, budget_ms: '120000' }, { ...drain_budget, extra: true } ])
+    await assert.rejects(publishRunInventory(store, { ...planned, drain_budget: bad }, started.startedAtMs), /drain_budget/);
+  await publishRunInventory(store, planned, started.startedAtMs);
+  await assert.rejects(publishRunInventory(store, { ...planned, drain_budget: { ...drain_budget, budget_ms: 100_000 } }, started.startedAtMs), /immutable/);
+  const assessment = assessCellLifetimeBudget(10_000_000, 60_000, 1_200_000, undefined, drain_budget.budget_ms);
+  assert.equal(assessment.status, 'unknown');
+  if (assessment.status === 'unknown') assert.equal(assessment.required_ms, 1_680_000);
+});
+
+test('new inventory requires drain budget while persisted legacy inventory remains recoverable and immutable', async () => {
+  const store = await seed(), started = (await store.read())!.state;
+  const planned = inventoryFor(started), { drain_budget: _budget, ...legacy } = planned;
+  assert.throws(() => validateInitialRunInventory(legacy, campaignId, ownerId), /Initial RunInventory requires drain_budget/);
+  assert.deepEqual(validateInitialRunInventory(planned, campaignId, ownerId).drain_budget, planned.drain_budget);
+  await assert.rejects(publishRunInventory(store, legacy, started.startedAtMs), /Initial RunInventory requires drain_budget/);
+  assert.equal((await store.read())!.state.runInventory, undefined);
+  store.current = { state: validateCampaignState({ ...started, runInventory: legacy }), etag: 'legacy-etag' };
+  await publishRunInventory(store, { ...legacy, load_admission: 'authorization_pending' }, started.startedAtMs);
+  assert.equal((await store.read())!.state.runInventory!.drain_budget, undefined);
+  await assert.rejects(publishRunInventory(store, { ...planned, load_admission: 'authorization_pending' }, started.startedAtMs), /immutable/);
 });
 
 test('bounded lifetime arithmetic admits equality and rejects a one-millisecond shortfall', async () => {

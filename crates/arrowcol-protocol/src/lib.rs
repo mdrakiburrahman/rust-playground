@@ -13,12 +13,16 @@ mod error;
 mod fingerprint;
 mod identity;
 mod ids;
+mod isolation;
 mod lease;
 mod lifecycle;
 mod measurement;
 mod metadata;
 mod pressure;
 mod protocol;
+
+/// Teardown failure kind emitted when dataflow shutdown leaves work undrained.
+pub const DATAFLOW_DRAIN_INCOMPLETE: &str = "dataflow_drain_incomplete";
 
 /// gRPC metadata key set to `true` only when a delivery was rejected before admission.
 pub const NOT_ADMITTED_METADATA_KEY: &str = "arrowcol-not-admitted";
@@ -38,6 +42,7 @@ pub use identity::{
     TableIdentity, TableName,
 };
 pub use ids::{CollectorInstanceId, IdParseError, LeaseId, PublicationId};
+pub use isolation::IsolationLevel;
 pub use lease::{FencingToken, LeaseError, PublicationFence, TableLease, TableLeaseSuccessorError};
 pub use lifecycle::{CollectorInstanceStatus, InstanceLifecycleState, InstanceStatusError, InstanceTransitionError};
 pub use measurement::{

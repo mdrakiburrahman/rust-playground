@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::{
-    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
-    PublicationFenceError, object_store_for_url,
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, InitialDeltaProperties, PublicationFence,
+    PublicationFenceContext, PublicationFenceError, object_store_for_url,
 };
 use arrow_deltalake::publisher::{MutationRetries, PublisherSession};
 use arrowcol_protocol::{CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis};
@@ -9,7 +9,7 @@ use arrowcol_routing::{
     LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest,
 };
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,25 +19,33 @@ use uuid::Uuid;
 const DATABASE: &str = "arrowcol";
 const MIGRATOR_USERNAME: &str = "arrowcol_migrator";
 
+#[derive(Serialize)]
+struct RegisteredRunTableReceipt<'a, P: Serialize> {
+    kind: &'static str,
+    run_id: &'a str,
+    table: String,
+    location: &'a str,
+    provider: &'a str,
+    schema_version: u64,
+    schema_fingerprint: String,
+    catalog_table_count: usize,
+    properties: &'a P,
+}
+
 #[derive(Debug, Parser)]
+#[command(group(clap::ArgGroup::new("registration").args(["register_only_config", "register_maintenance_only_config"])))]
 struct Cli {
-    #[arg(
-        long,
-        required_unless_present = "register_only_config",
-        conflicts_with = "register_only_config"
-    )]
+    #[arg(long, required_unless_present = "registration", conflicts_with = "registration")]
     config: Option<PathBuf>,
-    #[arg(
-        long,
-        required_unless_present = "register_only_config",
-        conflicts_with = "register_only_config"
-    )]
+    #[arg(long, required_unless_present = "registration", conflicts_with = "registration")]
     migrator_password_file: Option<PathBuf>,
     #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
     register_only_config: Option<PathBuf>,
-    #[arg(long, requires = "register_only_config")]
+    #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
+    register_maintenance_only_config: Option<PathBuf>,
+    #[arg(long, requires = "registration")]
     edge_secret_file: Option<PathBuf>,
-    #[arg(long, requires = "register_only_config")]
+    #[arg(long, requires = "registration")]
     internal_secret_file: Option<PathBuf>,
 }
 
@@ -71,6 +79,8 @@ struct PinInitConfig {
 struct RunTableInitialization {
     delta_root: String,
     table: String,
+    #[serde(default)]
+    delta_properties: InitialDeltaProperties,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,13 +103,15 @@ struct SqlServerConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(path) = cli.register_only_config {
+    let maintenance_registration = cli.register_maintenance_only_config.is_some();
+    if let Some(path) = cli.register_only_config.or(cli.register_maintenance_only_config) {
         let config: RegisterOnlyConfig = serde_json::from_slice(
             &std::fs::read(&path).with_context(|| format!("read catalog registration config {}", path.display()))?,
         )
         .context("parse catalog registration config")?;
         let receipt = register_run_table(
             &config,
+            maintenance_registration,
             &cli.edge_secret_file
                 .context("catalog registration requires the client edge signing key")?,
             &cli.internal_secret_file
@@ -161,19 +173,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn validate_register_only_config(config: &RegisterOnlyConfig) -> Result<Url> {
+fn validate_register_only_config(config: &RegisterOnlyConfig, maintenance_registration: bool) -> Result<Url> {
     let run_id = Uuid::parse_str(&config.run_id).context("registration requires a UUID run_id")?;
     let root = Url::parse(&config.delta_root).context("parse registration Delta root")?;
     if config.schema_version != 1
         || run_id.to_string() != config.run_id
-        || config.table != HOT_RUN_TABLE
+        || (!maintenance_registration && config.table != HOT_RUN_TABLE)
         || !matches!(root.scheme(), "abfss" | "file")
         || root.password().is_some()
         || root.query().is_some()
         || root.fragment().is_some()
         || !root.path().ends_with(&format!("/runs/{run_id}/dataflow"))
     {
-        bail!("catalog registration requires the exact canonical hot table and run-scoped Dataflow root");
+        bail!("catalog registration requires the selected canonical table contract and run-scoped Dataflow root");
     }
     for endpoint in [&config.endpoint, &config.catalog_endpoint] {
         let endpoint = Url::parse(endpoint).context("parse registration service endpoint")?;
@@ -193,10 +205,11 @@ fn validate_register_only_config(config: &RegisterOnlyConfig) -> Result<Url> {
 
 async fn register_run_table(
     config: &RegisterOnlyConfig,
+    maintenance_registration: bool,
     edge_secret_file: &std::path::Path,
     internal_secret_file: &std::path::Path,
 ) -> Result<serde_json::Value> {
-    let expected_location = validate_register_only_config(config)?;
+    let expected_location = validate_register_only_config(config, maintenance_registration)?;
     let completion =
         collector_chain::dmv::register_table_authenticated(&config.endpoint, &config.table, edge_secret_file)
             .await
@@ -233,16 +246,17 @@ async fn register_run_table(
     {
         bail!("catalog registration readback does not prove the exact canonical schema at the run-scoped location");
     }
-    Ok(serde_json::json!({
-        "kind": "oat_run_table_registered",
-        "run_id": config.run_id,
-        "table": head.identity().to_string(),
-        "location": table.location,
-        "provider": table.provider,
-        "schema_version": completion.schema_version().get(),
-        "schema_fingerprint": completion.schema_fingerprint().to_string(),
-        "catalog_table_count": snapshot.len(),
-    }))
+    Ok(serde_json::to_value(RegisteredRunTableReceipt {
+        kind: "oat_run_table_registered",
+        run_id: &config.run_id,
+        table: head.identity().to_string(),
+        location: &table.location,
+        provider: &table.provider,
+        schema_version: completion.schema_version().get(),
+        schema_fingerprint: completion.schema_fingerprint().to_string(),
+        catalog_table_count: snapshot.len(),
+        properties: &table.properties,
+    })?)
 }
 
 fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
@@ -318,6 +332,7 @@ fn validate_run_table_initialization(run_table: Option<&RunTableInitialization>,
     let Some(run_table) = run_table else {
         return Ok(());
     };
+    run_table.delta_properties.properties()?;
     let root = Url::parse(&run_table.delta_root).context("parse run-scoped table initialization root")?;
     let expected_suffix = format!("/runs/{run_id}/dataflow");
     if root.scheme() != "abfss"
@@ -368,8 +383,9 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
     });
     let init_url = url.clone();
     let init_session = Arc::clone(&session);
+    let properties = run_table.delta_properties.clone();
     let initialization = tokio::task::spawn_blocking(move || {
-        DeltaTable::initialize_fresh_url_with_session(
+        DeltaTable::initialize_fresh_url_with_session_and_properties(
             init_url,
             schema,
             vec![INGESTION_PARTITION.to_owned()],
@@ -379,6 +395,7 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
                 store,
                 mutation_retries: MutationRetries::Disabled,
             },
+            &properties,
         )
     })
     .await
@@ -419,6 +436,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registration_receipt_preserves_actual_snapshot_properties_including_unrequested_keys() -> Result<()> {
+        let mut actual = InitialDeltaProperties {
+            target_file_size_bytes: Some(67108864),
+            checkpoint_interval: Some(17),
+        }
+        .properties()?;
+        actual.insert("delta.dataSkippingStatsColumns".to_owned(), "sample".to_owned());
+        for properties in [actual, Default::default()] {
+            let receipt = serde_json::to_value(RegisteredRunTableReceipt {
+                kind: "oat_run_table_registered",
+                run_id: "00000000-0000-0000-0000-000000000001",
+                table: HOT_RUN_TABLE.to_owned(),
+                location: "file:///runs/00000000-0000-0000-0000-000000000001/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states",
+                provider: "delta",
+                schema_version: 1,
+                schema_fingerprint: "fixture".to_owned(),
+                catalog_table_count: 1,
+                properties: &properties,
+            })?;
+            assert_eq!(receipt["properties"], serde_json::to_value(properties)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn readme_maintenance_registration_has_a_separate_authenticated_mode() -> Result<()> {
+        let args = [
+            "pin-init",
+            "--register-maintenance-only-config",
+            "register.json",
+            "--edge-secret-file",
+            "edge",
+            "--internal-secret-file",
+            "internal",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
+        assert!(Cli::try_parse_from(&args[..5]).is_err());
+        let mut conflicting = args.to_vec();
+        conflicting.extend(["--register-only-config", "hot-table.json"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn register_only_mode_is_run_bound_and_does_not_require_migrator_credentials() -> Result<()> {
         let run_id = "00000000-0000-0000-0000-000000000001";
         let mut config = RegisterOnlyConfig {
@@ -429,15 +490,34 @@ mod tests {
             endpoint: "http://router:50050".to_owned(),
             catalog_endpoint: "http://catalog:8817".to_owned(),
         };
-        validate_register_only_config(&config)?;
+        validate_register_only_config(&config, false)?;
         config.endpoint = "http://user:password@router:50050".to_owned();
-        assert!(validate_register_only_config(&config).is_err());
+        assert!(validate_register_only_config(&config, false).is_err());
         config.endpoint = "http://router:50050".to_owned();
         config.run_id = "00000000-0000-0000-0000-000000000002".to_owned();
-        assert!(validate_register_only_config(&config).is_err());
+        assert!(validate_register_only_config(&config, false).is_err());
         config.run_id = run_id.to_owned();
         config.table = "telemetry.sqlserver.sqlserver_wait_stats".to_owned();
-        assert!(validate_register_only_config(&config).is_err());
+        assert!(validate_register_only_config(&config, false).is_err());
+        validate_register_only_config(&config, true)?;
+        config.table = "telemetry.sqlserver.sqlserver_active_sessions".to_owned();
+        let location = validate_register_only_config(&config, true)?;
+        assert!(
+            location
+                .path()
+                .trim_end_matches('/')
+                .ends_with("/telemetry/sqlserver/sqlserver_active_sessions")
+        );
+        for table in ["sqlserver_active_sessions", "telemetry.sqlserver.unknown_table"] {
+            config.table = table.to_owned();
+            assert!(validate_register_only_config(&config, true).is_err());
+        }
+        config.table = "telemetry.sqlserver.sqlserver_active_sessions".to_owned();
+        config.delta_root = "file:///tmp/shared/dataflow".to_owned();
+        assert!(validate_register_only_config(&config, true).is_err());
+        config.delta_root = format!("file:///tmp/oat/runs/{run_id}/dataflow");
+        config.catalog_endpoint = "http://user:password@catalog:8817".to_owned();
+        assert!(validate_register_only_config(&config, true).is_err());
         let args = [
             "pin-init",
             "--register-only-config",
@@ -498,6 +578,34 @@ mod tests {
     }
 
     #[test]
+    fn pin_init_literal_properties_are_optional_strict_and_validated_before_admission() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let base = serde_json::json!({
+            "delta_root": format!("abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"),
+            "table": HOT_RUN_TABLE
+        });
+        let default: RunTableInitialization = serde_json::from_value(base.clone())?;
+        assert!(default.delta_properties.properties()?.is_empty());
+        let mut configured = base.clone();
+        configured["delta_properties"] =
+            serde_json::json!({"target_file_size_bytes":67108864,"checkpoint_interval":17});
+        let parsed: RunTableInitialization = serde_json::from_value(configured.clone())?;
+        validate_run_table_initialization(Some(&parsed), run_id)?;
+        let properties = parsed.delta_properties.properties()?;
+        assert_eq!(properties["delta.targetFileSize"], "67108864");
+        assert_eq!(properties["delta.checkpointInterval"], "17");
+        for field in ["target_file_size_bytes", "checkpoint_interval"] {
+            let mut invalid = configured.clone();
+            invalid["delta_properties"][field] = serde_json::json!(0);
+            let parsed: RunTableInitialization = serde_json::from_value(invalid)?;
+            assert!(validate_run_table_initialization(Some(&parsed), run_id).is_err());
+        }
+        configured["delta_properties"]["unsupported"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RunTableInitialization>(configured).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn pin_init_config_requires_matching_digest_and_validated_table_identities() -> Result<()> {
         let valid = config()?;
         assert_eq!(validate_config(&valid)?.len(), 1);
@@ -507,6 +615,7 @@ mod tests {
                 "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"
             ),
             table: HOT_RUN_TABLE.to_owned(),
+            delta_properties: InitialDeltaProperties::default(),
         };
         validate_run_table_initialization(Some(&valid_run_table), run_id)?;
         let mut wrong_table = valid_run_table;

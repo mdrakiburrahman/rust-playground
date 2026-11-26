@@ -7,6 +7,7 @@ import { readDeltaReference, parseDeltaReplayReference, verifyDeltaPreservation,
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { create_namespace_deletion_journal } from '../../infra/azure/aks-namespace-custody.js';
 import { find_run_fic_record, plan_run_fic } from '../../infra/azure/run_fic.js';
+import { cleanupBudget } from './aks-cleanup-budget.js';
 
 const digest = (value: unknown) => createHash('sha256').update(canonical_json(value)).digest('hex');
 function object(value: unknown): Record<string, unknown> {
@@ -167,14 +168,14 @@ async function verifyPriorCells(azure: Azure, state: CampaignState, authority: C
     if (verified.status !== 'preserved') throw new Error('Prior-cell fresh preservation is ' + verified.status + ': ' + verified.reason);
   }
 }
-async function readBlob(azure: Azure, blob: string, guard: () => Promise<void>) {
+export async function readBlob(azure: Azure, blob: string, guard: () => Promise<void>) {
   await guard();
   const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, blob, undefined, undefined, {}, true, true);
   if (bytes === null) return undefined;
   if (bytes.length > 16_777_216 || !strong(headers.etag)) throw new Error('Preservation Blob is unbounded or lacks a strong version.');
   return { value: object(JSON.parse(bytes.toString()) as unknown), etag: headers.etag };
 }
-async function immutableBlob(azure: Azure, blob: string, value: unknown, guard: () => Promise<void>) {
+export async function immutableBlob(azure: Azure, blob: string, value: unknown, guard: () => Promise<void>) {
   await guard();
   try {
     const [, headers] = await azure.blob('PUT', azure.c.checkpoints, blob, undefined, canonical_json(value),
@@ -269,7 +270,7 @@ function validateOrigin(value: Record<string, unknown>, inventory: RunInventory)
   if (value.schema_version !== 1 || canonical_json(value.origin) !== canonical_json(origin(inventory)))
     throw new Error('Preservation reference belongs to another immutable original run/namespace.');
 }
-function baselineDelta(value: Record<string, unknown>, inventory: RunInventory, azure: Azure,
+export function baselineDelta(value: Record<string, unknown>, inventory: RunInventory, azure: Azure,
   phase: 'pre_load' | 'terminal_after_writers_stopped' = 'pre_load') {
   validateOrigin(value, inventory);
   if (value.observed_phase !== phase || phase === 'pre_load' &&
@@ -333,6 +334,7 @@ export async function captureCellBaseline(store: CampaignStore, azure: Azure, in
 
 export async function captureTerminalData(store: CampaignStore, azure: Azure, authority: CleanupMutationAuthority,
   assertWritersStopped: () => Promise<void>): Promise<void> {
+  const deltaDeadline = Math.min(Date.now() + 35_000, cleanupBudget(authority)?.deadlineUnixMs ?? Infinity);
   const current = await store.read();
   if (!current?.state.runInventory) throw new Error('Terminal data capture requires exact durable inventory.');
   const inventory = current.state.runInventory;
@@ -341,14 +343,14 @@ export async function captureTerminalData(store: CampaignStore, azure: Azure, au
       inventory.cleanup.stop_maintenance.state !== 'complete') throw new Error('Freeze terminal Delta only after writer and maintenance stops.');
   await assertWritersStopped();
   const before = await readBlob(azure, cellBlob(inventory, 'delta-before'), authority.assertCurrent);
-  if (!before) throw new Error('The exact original pre-load Delta reference is absent.');
+  if (!before) { await authority.assertCurrent(); return; }
   const initial = baselineDelta(before.value, inventory, azure), blob = cellBlob(inventory, 'delta-terminal');
   const existing = await readBlob(azure, blob, authority.assertCurrent);
   if (existing) {
     if (existing.value.baseline_etag !== before.etag) throw new Error('Terminal reference is not paired with the immutable original baseline.');
     baselineDelta(existing.value, inventory, azure, 'terminal_after_writers_stopped'); return;
   }
-  const delta = await readDeltaReference(azure, initial.table_root, authority.assertCurrent);
+  const delta = await readDeltaReference(azure, initial.table_root, authority.assertCurrent, deltaDeadline);
   if (initial.observation === 'table' && (delta.observation !== 'table' || delta.table_id !== initial.table_id ||
       delta.version < initial.version) || delta.observation === 'table' && delta.row_count === null)
     throw new Error('Terminal Delta identity/version/row coverage is UNKNOWN or regressed.');

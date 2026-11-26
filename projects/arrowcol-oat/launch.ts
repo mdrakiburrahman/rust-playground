@@ -4,13 +4,17 @@ import { constants, existsSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readlink, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { assertLocalFailedDisposition, localDispositionSuffix, localQuarantineDispositions, recordLocalFailedDisposition, reconcileAndQuarantineLocalFailedReceipt } from './local-failed-disposition.js';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
 import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { collectorBuildProfileHash, parseCollectorBuildProfile } from './collector-build-profile.js';
+import { validateWriterGapTunables } from './writer-tunables.js';
+import { assertHistoryPin, assertSettledHistory, handoverDestination, importSettledHistory } from './aks-settled-history.js';
 
 export interface OatRunStatus {
   id: string;
@@ -55,10 +59,11 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const launcherDeadlineReceiptRoot = resolve(workspaceRoot, 'out/arrowcol-oat/deadline-receipts');
+const launcherDeadlineReceiptPath = 'out/arrowcol-oat/deadline-receipts';
+const launcherDeadlineReceiptRoot = resolve(workspaceRoot, launcherDeadlineReceiptPath);
 const launcherDeadlineMaxSeconds = 600;
 const localCancellationCleanupMs = 10 * 60 * 1000;
-const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds', '--aks-history-sha256']);
 
 export class OatCliError extends Error {
   readonly exitCode = 2;
@@ -69,7 +74,7 @@ export function cliExitCode(error: unknown): number {
 }
 
 function validateArguments(args: string[]): void {
-  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only']);
+  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only', '--diagnostic-prelaunch-only']);
   let positionalConfig = false;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
@@ -99,7 +104,14 @@ Options:
   --viewer-only        Serve existing local results without running a benchmark
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
+  --import-aks-history <bundle-path> <reviewed-sha256>
+                       Import settled history once, without launching or recovering work
+  --aks-history-sha256 <reviewed-sha256>
+                       Require the installed, destination-bound AKS history at admission
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  --recover-failed-local <invocation-id> <ownership-marker-path>
+  --reconcile-failed-local <invocation-id> <ownership-marker-path>
+                       Quarantine verified failed local evidence without ranking it
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
                        Post-load evidence must be no more than 60 minutes old.
@@ -511,6 +523,47 @@ function isLauncherTerminalObservation(value: unknown): value is LauncherTermina
     typeof status.progress === 'string' && typeof status.result_count === 'number' &&
     (status.error === null || typeof status.error === 'string') &&
     (status.config_sha256 === null || typeof status.config_sha256 === 'string');
+}
+
+export function validateSettledHistoryReceipt(value: unknown, stamp: string, subscription: string): { invocationId: string; runId: string | null } {
+  if (!isLauncherDeadlineReceipt(value) || !legacyUuid.test(value.invocation_id) ||
+      value.cleanup_state !== 'confirmed' || value.config_binding_error !== null ||
+      !Number.isSafeInteger(value.started_at_unix_ms) || value.started_at_unix_ms <= 0 ||
+      !Number.isFinite(value.started_at_monotonic_ms) || value.started_at_monotonic_ms < 0 ||
+      value.cancellation_attempts < 0) throw new Error('Invalid or unsettled historical receipt');
+  for (const timestamp of [value.deadline_at_unix_ms, value.cleanup_deadline_at_unix_ms, value.overrun_at_unix_ms]) {
+    if (timestamp !== null && (!Number.isSafeInteger(timestamp) || timestamp < value.started_at_unix_ms)) {
+      throw new Error('Invalid original historical deadline');
+    }
+    if ((value.deadline_seconds === null) !== (value.deadline_at_unix_ms === null) ||
+        (value.deadline_seconds === null) !== (value.deadline_at_monotonic_ms === null) ||
+        (value.deadline_seconds !== null && (!Number.isSafeInteger(value.deadline_seconds) || value.deadline_seconds <= 0 ||
+          value.deadline_at_unix_ms !== value.started_at_unix_ms + value.deadline_seconds * 1000 ||
+          value.deadline_at_monotonic_ms !== value.started_at_monotonic_ms + value.deadline_seconds * 1000))) {
+      throw new Error('Invalid original historical deadline binding');
+    }
+  }
+  if (value.submitted_config_body !== null) {
+    const config: unknown = JSON.parse(value.submitted_config_body);
+    if (!isRecord(config) || !isRecord(config.platform) || config.platform.kind !== 'aks' ||
+        config.stamp !== stamp || (config.subscriptionId !== undefined && config.subscriptionId !== subscription)) {
+      throw new Error('Historical receipt belongs to a different stamp or platform');
+    }
+  }
+  const noEffect = value.creation_state === 'not_started' && value.run_state === 'not_started' &&
+    value.run_id === null && value.server_url === null && value.server_pid == null &&
+    value.server_start_ticks == null && value.server_executable == null && value.terminal_observation == null &&
+    value.cancellation_attempts === 0 && value.last_cancel_result === null;
+  const observed = value.terminal_observation;
+  const terminal = value.creation_state === 'accepted' && value.submitted_config_body !== null &&
+    value.run_id !== null && legacyUuid.test(value.run_id) && observed != null &&
+    Number.isSafeInteger(observed.status.finished_at_unix_ms) &&
+    observed.status.finished_at_unix_ms! >= value.started_at_unix_ms &&
+    observed.observed_at_unix_ms >= observed.status.finished_at_unix_ms! &&
+    ['succeeded', 'failed', 'cancelled'].includes(value.run_state) &&
+    (value.run_state !== 'failed' || hasConfirmedAksFailure(observed.status));
+  if (!noEffect && !terminal) throw new Error('Historical admission is active, uncertain or lacks terminal cleanup proof');
+  return { invocationId: value.invocation_id, runId: value.run_id };
 }
 
 function isLocalOatServerUrl(value: string): boolean {
@@ -1085,25 +1138,195 @@ async function syncLegacyReceiptDirectory(path: string): Promise<void> {
   }
 }
 
-export async function assertCanonicalAksLaunchWorkspace(root: string): Promise<void> {
-  const metadata = await lstat(resolve(root, '.git')).catch((error: unknown) => {
+export interface AksReceiptLedger {
+  root: string;
+  worktreeRoot?: string;
+}
+
+function ledgerOwnershipError(workspace: string, reason: string): Error {
+  return new Error(
+    `AKS benchmark submission requires the primary checkout, or a verified linked worktree of it, to own the launcher receipt ledger; refusing workspace ${workspace}: ${reason}`,
+  );
+}
+
+async function assertOwnedCanonicalEntry(path: string, kind: 'directory' | 'file', uid: number, workspace: string): Promise<void> {
+  const metadata = await lstat(path).catch(() => undefined);
+  if (!metadata || !(kind === 'directory' ? metadata.isDirectory() : metadata.isFile()) || metadata.uid !== uid ||
+      await realpath(path).catch(() => undefined) !== path) {
+    throw ledgerOwnershipError(workspace, `${path} is not a ${kind} owned by uid ${uid} at its canonical path`);
+  }
+}
+
+export async function resolveAksReceiptLedger(
+  workspace: string, receiptRoot = resolve(workspace, launcherDeadlineReceiptPath),
+): Promise<AksReceiptLedger> {
+  const dotGit = await lstat(resolve(workspace, '.git')).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
     throw error;
   });
-  if (!metadata?.isDirectory()) {
-    throw new Error(
-      `AKS benchmark submission requires the primary checkout that owns the launcher receipt ledger; refusing workspace ${root}`,
-    );
+  if (dotGit?.isDirectory()) return { root: receiptRoot };
+  if (!dotGit?.isFile()) throw ledgerOwnershipError(workspace, '.git is neither a checkout directory nor a worktree file');
+  const root = await realpath(workspace);
+  const uid = process.getuid?.() ?? dotGit.uid;
+  await assertOwnedCanonicalEntry(root, 'directory', uid, workspace);
+  await assertOwnedCanonicalEntry(join(root, '.git'), 'file', uid, workspace);
+  const pointer = /^gitdir: ([^\n]+)\n?$/.exec(await readFile(join(root, '.git'), 'utf8'))?.[1];
+  if (!pointer) throw ledgerOwnershipError(workspace, 'malformed .git file');
+  const adminDir = resolve(root, pointer);
+  const commonDir = dirname(dirname(adminDir));
+  const primary = dirname(commonDir);
+  if (basename(dirname(adminDir)) !== 'worktrees' || basename(commonDir) !== '.git') {
+    throw ledgerOwnershipError(workspace, 'gitdir is not a linked worktree of a non-bare checkout');
+  }
+  for (const directory of [adminDir, commonDir, primary]) await assertOwnedCanonicalEntry(directory, 'directory', uid, workspace);
+  const backPointer = (await readFile(join(adminDir, 'gitdir'), 'utf8').catch(() => '')).trimEnd();
+  if (!backPointer || await realpath(resolve(adminDir, backPointer)).catch(() => undefined) !== join(root, '.git')) {
+    throw ledgerOwnershipError(workspace, 'worktree gitdir back-pointer does not name this workspace');
+  }
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+  const git = (cwd: string, ...args: string[]): string => execFileSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'],
+  }).trimEnd();
+  let reported: string[];
+  try {
+    reported = [
+      git(root, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir', '--show-toplevel'),
+      git(primary, 'rev-parse', '--path-format=absolute', '--is-bare-repository', '--git-dir', '--show-toplevel'),
+      git(primary, 'worktree', 'list', '--porcelain', '-z'),
+    ];
+  } catch {
+    throw ledgerOwnershipError(workspace, 'Git metadata could not be read (linked worktrees require Git 2.36 or newer)');
+  }
+  if (reported[0] !== [adminDir, commonDir, root].join('\n') || reported[1] !== ['false', commonDir, primary].join('\n') ||
+      !reported[2]!.split('\0\0').map(entry => entry.split('\0'))
+        .some(fields => fields[0] === `worktree ${root}` && !fields.some(field => field.startsWith('prunable')))) {
+    throw ledgerOwnershipError(workspace, 'Git does not report this workspace as a registered worktree of the primary checkout');
+  }
+  if (resolve(receiptRoot) !== resolve(workspace, launcherDeadlineReceiptPath)) return { root: receiptRoot };
+  const canonical = join(primary, launcherDeadlineReceiptPath);
+  await assertOwnedCanonicalEntry(canonical, 'directory', uid, workspace);
+  return { root: canonical, worktreeRoot: resolve(workspace, launcherDeadlineReceiptPath) };
+}
+
+async function diagnosticTransitionReceiptRoot(): Promise<string | undefined> {
+  const stateRoot = resolve(workspaceRoot, '../../..');
+  if (resolve(stateRoot, 'pressure-diagnostic-v2/trusted/runtime') !== workspaceRoot ||
+      !stateRoot.endsWith(`${sep}.darwin`)) return undefined;
+  if (process.env.OAT_DARWIN_PARITY_PRECHECK !== '1') {
+    throw new Error('Transition runtime is restricted to diagnostic parity');
+  }
+  const originalTrusted = resolve(stateRoot, 'pressure-diagnostic/trusted');
+  const originalRuntime = resolve(originalTrusted, 'runtime');
+  const receiptRoot = resolve(originalRuntime, 'out/arrowcol-oat/deadline-receipts');
+  for (const path of [workspaceRoot, originalTrusted, originalRuntime, receiptRoot]) {
+    if (await realpath(path) !== path) throw new Error('Diagnostic transition path is not canonical');
+  }
+  const revision = '86eb8ebe07d876c925e027c0c656a69917269f22';
+  const manifest: unknown = JSON.parse((await readLegacyRegularFile(resolve(originalTrusted, 'manifest.json'))).toString('utf8'));
+  const producer: unknown = JSON.parse((await readLegacyRegularFile(resolve(originalTrusted, 'producer.json'))).toString('utf8'));
+  if (!isRecord(manifest) || manifest.commit !== revision || !isRecord(producer) || producer.revision !== revision) {
+    throw new Error('Original diagnostic freeze does not match the reviewed producer');
+  }
+  const git = (...args: string[]) => execFileSync('git', ['-C', originalRuntime, ...args], { encoding: 'utf8' }).trimEnd();
+  if (git('rev-parse', '--show-toplevel') !== originalRuntime || git('rev-parse', 'HEAD') !== revision ||
+      git('status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none') ||
+      git('submodule', 'status', '--recursive').split('\n').some(line => line && !line.startsWith(' '))) {
+    throw new Error('Original diagnostic producer is not clean at the frozen revision');
+  }
+  const originalReceipt = resolve(receiptRoot, '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json');
+  await readLegacyRegularFile(originalReceipt);
+  await readLegacyRegularFile(originalReceipt + localDispositionSuffix);
+  return receiptRoot;
+}
+
+async function readOperatorFile(path: string, maximumBytes: number): Promise<Buffer> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size === 0 || info.size > maximumBytes) throw new Error(`Invalid operator evidence file: ${path}`);
+    return await file.readFile();
+  } finally {
+    await file.close();
+  }
+}
+
+function validOperatorTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+async function assertOperatorQuarantineRecords(receiptRoot: string, activeReceiptNames: string[]): Promise<void> {
+  const quarantineRoot = resolve(dirname(receiptRoot), 'operator-quarantine');
+  const entries = await readdir(quarantineRoot, { withFileTypes: true }).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !legacyUuid.test(entry.name)) throw new Error('Unexpected operator-quarantine entry');
+    const id = entry.name;
+    const directory = resolve(quarantineRoot, id);
+    const receiptBytes = await readOperatorFile(join(directory, `${id}.json`), 1024 * 1024);
+    const recordBytes = await readOperatorFile(join(directory, 'operator-reconciliation.json'), 1024 * 1024);
+    const receipt: unknown = JSON.parse(receiptBytes.toString('utf8'));
+    const record: unknown = JSON.parse(recordBytes.toString('utf8'));
+    if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== id || receipt.creation_state !== 'accepted' ||
+        receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' || !isRecord(record) || record.version !== 1 ||
+        record.authorized_by !== 'coordinator f0767c48 (ArrowCollector tunability Project)' ||
+        !localQuarantineDispositions.some(disposition => disposition === record.disposition) || record.invocation_id !== id ||
+        record.run_id !== receipt.run_id ||
+        !validOperatorTimestamp(record.authorized_at_utc) || typeof record.reason !== 'string' || record.reason.length === 0 ||
+        record.receipt_sha256 !== sha256Bytes(receiptBytes) || activeReceiptNames.includes(`${id}.json`)) {
+      throw new Error(`Invalid operator reconciliation for ${id}`);
+    }
+    const checks = record.custody_checks;
+    if (!isRecord(checks) || !isRecord(checks.server_pid) || checks.server_pid.absent !== true ||
+        !validOperatorTimestamp(checks.server_pid.checked_at_utc) || typeof checks.server_pid.output !== 'string' ||
+        !isRecord(checks.owner_pid) || checks.owner_pid.absent !== true ||
+        !validOperatorTimestamp(checks.owner_pid.checked_at_utc) || typeof checks.owner_pid.output !== 'string' ||
+        !isRecord(checks.port) || checks.port.listening !== false || !validOperatorTimestamp(checks.port.checked_at_utc) ||
+        typeof checks.port.output !== 'string' || !Array.isArray(checks.docker) || checks.docker.length < 7 ||
+        checks.docker.some(check => !isRecord(check) || !validOperatorTimestamp(check.checked_at_utc) ||
+          typeof check.output !== 'string' || check.output.trim().length !== 0 || !Array.isArray(check.args))) {
+      throw new Error(`Operator reconciliation lacks a complete zero-resource custody proof for ${id}`);
+    }
+    const archived = record.archived_evidence_files;
+    if (!Array.isArray(archived)) throw new Error(`Operator reconciliation archive list is invalid for ${id}`);
+    const kinds = new Set<string>();
+    for (const item of archived) {
+      if (!isRecord(item) || typeof item.name !== 'string' || typeof item.path !== 'string' ||
+          !item.path.startsWith('evidence/') || item.path.split(/[\\/]/).some(part => part === '..') ||
+          typeof item.sha256 !== 'string' || !legacySha256.test(item.sha256)) {
+        throw new Error(`Operator reconciliation archive entry is invalid for ${id}`);
+      }
+      const archivedPath = resolve(directory, item.path);
+      if (!relative(directory, archivedPath) || relative(directory, archivedPath).startsWith('..')) {
+        throw new Error(`Operator archive path escapes quarantine for ${id}`);
+      }
+      const archivedBytes = await readOperatorFile(archivedPath, 64 * 1024 * 1024);
+      if (sha256Bytes(archivedBytes) !== item.sha256) throw new Error(`Operator archive digest mismatch for ${id}`);
+      kinds.add(item.name);
+    }
+    if (!['result', 'run_log', 'owner_marker'].every(kind => kinds.has(kind))) {
+      throw new Error(`Operator reconciliation archive is incomplete for ${id}`);
+    }
   }
 }
 
 export async function assertNoUnsettledDeadlineReceipts(
   root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
+  requiredLocalDisposition?: string, reconcileLocal = true, readOnlyRefusal = 'diagnostic transition',
 ): Promise<void> {
+  if (!reconcileLocal) writeReceipt = async () => {};
   const names: string[] = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
     throw error;
   });
+  await assertOperatorQuarantineRecords(root, names);
+  if (requiredLocalDisposition &&
+      (!names.includes(requiredLocalDisposition) || !names.includes(requiredLocalDisposition + localDispositionSuffix))) {
+    throw new Error('Required diagnostic cleanup proof is missing from the canonical ledger');
+  }
   const admittedDispositions = new Set<string>();
   for (const name of names.filter((entry) => entry.endsWith(legacyDispositionSuffix))) {
     const originalName = name.slice(0, -legacyDispositionSuffix.length);
@@ -1116,12 +1339,25 @@ export async function assertNoUnsettledDeadlineReceipts(
     await syncLegacyReceiptDirectory(resolve(root, name));
     admittedDispositions.add(originalName);
   }
+  for (const name of names.filter((entry) => entry.endsWith(localDispositionSuffix))) {
+    const originalName = name.slice(0, -localDispositionSuffix.length);
+    if (!originalName.endsWith('.json') || !names.includes(originalName) || admittedDispositions.has(originalName)) {
+      throw new Error('Orphaned or conflicting local failure disposition');
+    }
+    const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(root, originalName))).toString('utf8'));
+    if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
+    await assertLocalFailedDisposition(resolve(root, originalName), resolve(root, name));
+    admittedDispositions.add(originalName);
+  }
   for (const name of names.filter((entry) => entry.endsWith('.json'))) {
     if (admittedDispositions.has(name)) continue;
     const path = resolve(root, name);
     const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (!reconcileLocal) {
+      throw new Error(`Unsettled launcher receipt ${path}; refusing ${readOnlyRefusal} without modifying it`);
+    }
     if (deadline.submittedPlatform === 'aks') {
       throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
     }
@@ -1143,6 +1379,83 @@ export async function assertNoUnsettledDeadlineReceipts(
       throw new Error(`Launcher deadline receipt ${path} remains unsettled; refusing another run`);
     }
   }
+}
+
+// A linked-worktree AKS launch and a diagnostic transition only check ledgers: any unsettled receipt in either
+// ledger refuses the launch without writing a receipt or cancelling the run it describes.
+export async function assertLaunchLedgersSettled(
+  receiptRoot: string, worktreeReceiptRoot?: string, transitionRoot?: string,
+): Promise<void> {
+  const readOnly = transitionRoot !== undefined || worktreeReceiptRoot !== undefined;
+  const refusal = transitionRoot !== undefined ? 'diagnostic transition' : 'AKS launch from a linked worktree';
+  if (worktreeReceiptRoot !== undefined) {
+    await assertNoUnsettledDeadlineReceipts(worktreeReceiptRoot, undefined, undefined, undefined, false, refusal);
+  }
+  await assertNoUnsettledDeadlineReceipts(receiptRoot, undefined, undefined,
+    transitionRoot !== undefined ? '89fdefa5-855d-46ea-93ea-481fd77cbd2e.json' : undefined, !readOnly, refusal);
+}
+
+export interface AksSubmitterLock {
+  readonly path: string;
+  assertHeld(): void;
+  release(): Promise<void>;
+}
+
+// Serializes AKS launchers that share one canonical ledger, from the ledger scan through receipt publication and
+// the rest of the launcher's lifetime. The kernel lock is held by a flock(1) child in its own session whose stdin
+// is this process's pipe, so terminal signals do not release it, while launcher exit or kill does.
+export async function acquireAksSubmitterLock(receiptRoot: string): Promise<AksSubmitterLock> {
+  const path = `${resolve(receiptRoot)}.aks-submitter.lock`;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const existing = await lstat(path).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (existing && !existing.isFile()) throw new Error(`AKS submitter lock ${path} is not a regular file; refusing to launch`);
+  const child = spawn('flock', ['--nonblock', '--conflict-exit-code', '75', path, 'sh', '-c', 'echo held && exec cat >/dev/null'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
+  });
+  let stderr = '';
+  child.stdin.on('error', () => {});
+  child.stderr.setEncoding('utf8').on('data', (chunk: string) => { if (stderr.length < 4096) stderr += chunk; });
+  let exited = false;
+  let released = false;
+  const exit = new Promise<void>((resolveExit) => child.once('close', () => { exited = true; resolveExit(); }));
+  await new Promise<void>((resolveHeld, reject) => {
+    let stdout = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk;
+      if (stdout.includes('held')) resolveHeld();
+    });
+    child.once('error', (error: NodeJS.ErrnoException) => {
+      reject(error.code === 'ENOENT'
+        ? new Error('AKS launch requires util-linux flock for the submitter lock; refusing to launch')
+        : new Error(`Could not take the AKS submitter lock ${path}; refusing to launch`, { cause: error }));
+    });
+    child.once('exit', (code, signal) => {
+      reject(code === 75
+        ? new Error(`Another AKS launcher holds the submitter lock ${path}; refusing to launch`)
+        : new Error(`AKS submitter lock ${path} failed (exit ${code ?? signal}): ${stderr.trim()}; refusing to launch`));
+    });
+  });
+  child.unref();
+  for (const stream of [child.stdin, child.stdout, child.stderr]) (stream as unknown as { unref(): void }).unref();
+  return {
+    path,
+    assertHeld() {
+      if (released || exited || child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(`AKS submitter lock ${path} is no longer held; refusing to publish a launcher receipt`);
+      }
+    },
+    async release() {
+      released = true;
+      child.ref();
+      for (const stream of [child.stdin, child.stdout, child.stderr]) (stream as unknown as { ref(): void }).ref();
+      child.stdin.end();
+      await exit;
+    },
+  };
 }
 
 
@@ -1426,6 +1739,19 @@ async function stopMarkedServer(marker: LocalRunMarker): Promise<void> {
   }
 }
 
+async function hasUnsettledLocalReceipt(runId: string): Promise<boolean> {
+  const names = await readdir(launcherDeadlineReceiptRoot).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const name of names.filter(entry => entry.endsWith('.json'))) {
+    const value: unknown = JSON.parse((await readLegacyRegularFile(resolve(launcherDeadlineReceiptRoot, name))).toString('utf8'));
+    if (isLauncherDeadlineReceipt(value) && value.run_id === runId &&
+        (value.cleanup_state === 'pending' || value.cleanup_state === 'unsettled')) return true;
+  }
+  return false;
+}
+
 async function removeStaleLocalMarkers(config: Record<string, unknown>): Promise<void> {
   const root = localStateRoot(config);
   const files = await readdir(root).catch((error: unknown) => {
@@ -1441,7 +1767,7 @@ async function removeStaleLocalMarkers(config: Record<string, unknown>): Promise
         await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
       throw new Error(`Refusing to remove ownership marker for active local run ${marker.runId}`);
     }
-    await unlink(markerPath);
+    if (!await hasUnsettledLocalReceipt(marker.runId)) await unlink(markerPath);
   }
 }
 async function recoverInterruptedLocalRuns(
@@ -1482,13 +1808,13 @@ async function recoverInterruptedLocalRuns(
         throw new Error('Local OAT recovery did not confirm cleanup for run ' + marker.runId + ': ' + (status.error ?? status.state));
       }
       await stopMarkedServer(marker);
-      await unlink(markerPath);
+      if (!await hasUnsettledLocalReceipt(marker.runId)) await unlink(markerPath);
     } else if (cleanupRunId === undefined) {
       const cellRuns = files.filter((entry) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry));
       if (cellRuns.length) {
         throw new Error('Interrupted OAT server is gone; clean each local cell with --cleanup-local <cell-run-uuid>. Remaining cells: ' + cellRuns.join(', '));
       }
-      await unlink(markerPath);
+      if (!await hasUnsettledLocalReceipt(marker.runId)) await unlink(markerPath);
     }
   }
   return explicitlyCleanedProjects;
@@ -1515,6 +1841,18 @@ export async function readOatConfigForMode(
   if (!isRecord(parsed)) throw new Error('OAT config must be a JSON object');
   parseDataFlowVerdictPolicy(parsed.dataflow_verdict_policy);
   const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
+  const tunables = isRecord(parsed.tunables) ? parsed.tunables : {};
+  validateWriterGapTunables(tunables);
+  const collectorProfile = parseCollectorBuildProfile(tunables.collector);
+  if (collectorProfile) {
+    const profileHash = collectorBuildProfileHash(collectorProfile);
+    if (platform.collector_build_profile_hash !== undefined && platform.collector_build_profile_hash !== profileHash) {
+      throw new Error('platform.collector_build_profile_hash does not match tunables.collector build profile');
+    }
+    platform.collector_build_profile_hash = profileHash;
+  } else if (Object.hasOwn(platform, 'collector_build_profile_hash')) {
+    throw new Error('platform.collector_build_profile_hash requires an explicit tunables.collector build profile');
+  }
   if (mode === 'local' && isRecord(platform.local)) {
     const local = { ...platform.local };
     if (local.bind_host == null || local.endpoint_host == null) {
@@ -1672,6 +2010,7 @@ export async function launchOat(
   onRunFinished?: (status: OatRunStatus) => void | Promise<void>,
   deadline?: OatLauncherDeadline,
   submission?: SubmittedOatConfig,
+  submitterLock?: Pick<AksSubmitterLock, 'assertHeld'>,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -1689,6 +2028,14 @@ export async function launchOat(
   if (!isRecord(config)) throw new Error('OAT config must be a JSON object');
   const binding = submission ?? bindSubmittedConfig(config, sourceBytes!);
   if (deadline) await deadline.setSubmissionBinding(binding);
+  const assertSubmitterLock = async (published: boolean): Promise<void> => {
+    try {
+      submitterLock?.assertHeld();
+    } catch (error) {
+      if (deadline) await (published ? deadline.markCreationRejected(error) : deadline.markNoRun(error));
+      throw error;
+    }
+  };
 
   if (deadline) {
     if (deadline.isExpired()) {
@@ -1696,6 +2043,7 @@ export async function launchOat(
       await deadline.markNoRun(new Error('launcher-start deadline expired before run creation'));
       throw new Error(`Launcher-start deadline expired before OAT run creation; receipt: ${deadline.receiptPath}`);
     }
+    await assertSubmitterLock(false);
     await deadline.markCreationPending(server.href);
     if (deadline.isExpired()) {
       await deadline.markOverrun();
@@ -1704,6 +2052,7 @@ export async function launchOat(
       throw error;
     }
   }
+  await assertSubmitterLock(deadline !== undefined);
 
   let startResponse: Response;
   try {
@@ -1743,6 +2092,7 @@ export async function launchOat(
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
   let cancellationRequested = false;
   let cancellationObserved = false;
+  let consecutivePollTimeouts = 0;
   let resolveCancellationStarted!: () => void;
   const cancellationStarted = new Promise<void>((resolveStarted) => { resolveCancellationStarted = resolveStarted; });
   const runSignal = deadline
@@ -1816,9 +2166,20 @@ export async function launchOat(
           break;
         }
       }
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
-        signal: AbortSignal.timeout(30_000),
-      });
+      let response: Response;
+      try {
+        response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (error) {
+        if (mode === 'local' && error instanceof DOMException && error.name === 'TimeoutError'
+            && !cancellationRequested && !deadline?.isExpired() && ++consecutivePollTimeouts <= 3) {
+          console.error(`[oat] Run status poll timed out; retrying owned run ${ownedRunId} (${consecutivePollTimeouts}/3)`);
+          continue;
+        }
+        throw error;
+      }
+      consecutivePollTimeouts = 0;
       const next = await readStatus(response, 'poll OAT run', ownedRunId);
       if ((deadline || submission) && next.config_sha256 !== binding.submitted_config_sha256) {
         bindingFailure = new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`);
@@ -1901,6 +2262,8 @@ export async function main(
   collect: typeof collectDataFlow = collectDataFlow,
   onOwnedRun?: OatOwnedRunObserver,
   signal?: AbortSignal,
+  recordLocalFailure: typeof recordLocalFailedDisposition = recordLocalFailedDisposition,
+  reconcileLocalFailure: typeof reconcileAndQuarantineLocalFailedReceipt = reconcileAndQuarantineLocalFailedReceipt,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
@@ -1908,12 +2271,44 @@ export async function main(
     console.log(cliUsage);
     return;
   }
+  if (args[0] === '--reconcile-failed-local') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--reconcile-failed-local requires exactly an invocation ID and the preserved ownership marker');
+    }
+    if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
+    const record = await reconcileLocalFailure(receiptRoot, args[1], resolve(args[2]));
+    console.log(`Reconciled ${String(record.invocation_id)} as ${String(record.disposition)}.`);
+    return;
+  }
+  if (args[0] === '--recover-failed-local') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--recover-failed-local requires exactly an invocation ID and the preserved ownership marker');
+    }
+    if (!legacyUuid.test(args[1])) throw new OatCliError('Invalid local invocation ID');
+    const original: unknown = JSON.parse((await readLegacyRegularFile(resolve(receiptRoot, `${args[1]}.json`))).toString('utf8'));
+    if (!isLauncherDeadlineReceipt(original)) throw new Error('Invalid original local launcher receipt');
+    await recordLocalFailure(receiptRoot, args[1], resolve(args[2]));
+    console.log('Recorded verified local cleanup; the original failure remains unranked.');
+    return;
+  }
   if (args[0] === '--recover-failed-aks') {
     if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
       throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
     }
-    const kind = await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
+    const ledger = receiptRoot === launcherDeadlineReceiptRoot ? (await resolveAksReceiptLedger(workspaceRoot)).root : receiptRoot;
+    const kind = await recordLegacyAksDisposition(ledger, args[1], args[2]);
     console.log(aksDispositionMessage(kind));
+    return;
+  }
+  if (args[0] === '--import-aks-history') {
+    if (args.length !== 3 || !args[1] || !args[2]) throw new OatCliError('--import-aks-history requires exactly a bundle path and its reviewed SHA-256');
+    const ledger = receiptRoot === launcherDeadlineReceiptRoot ? (await resolveAksReceiptLedger(workspaceRoot)).root : receiptRoot;
+    const destination = await handoverDestination(workspaceRoot, ledger);
+    const lock = await acquireAksSubmitterLock(ledger);
+    try {
+      await importSettledHistory(resolve(args[1]), args[2], destination, validateSettledHistoryReceipt, () => lock.assertHeld());
+      console.log(`Installed immutable settled AKS history ${args[2]}; no run submitted.`);
+    } finally { await lock.release(); }
     return;
   }
   validateArguments(args);
@@ -1927,6 +2322,11 @@ export async function main(
   const requestedMode = option('--mode');
   if (requestedMode !== undefined && requestedMode !== 'local' && requestedMode !== 'aks') {
     throw new OatCliError('--mode must be local or aks');
+  }
+  const historySha = option('--aks-history-sha256');
+  if (historySha !== undefined && (requestedMode !== 'aks' || !/^[0-9a-f]{64}$/.test(historySha) ||
+      args.filter(arg => arg === '--aks-history-sha256').length !== 1)) {
+    throw new OatCliError('--aks-history-sha256 requires --mode aks and exactly one reviewed SHA-256');
   }
   const requestedServerUrl = option('--server');
   const deadlineOptionCount = args.filter((argument) => argument === '--deadline-seconds').length;
@@ -1944,6 +2344,12 @@ export async function main(
   const viewerOnly = args.includes('--viewer-only');
   const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  if (historySha && preflightOnly) throw new OatCliError('--aks-history-sha256 requires an admission, not --preflight-only');
+  const prelaunchOnly = args.includes('--diagnostic-prelaunch-only');
+  const diagnosticParity = process.env.OAT_DARWIN_PARITY_PRECHECK === '1';
+  if (prelaunchOnly && (!diagnosticParity || requestedMode === 'aks' || viewerOnly || preflightOnly || cleanupRunId !== undefined)) {
+    throw new OatCliError('Diagnostic prelaunch requires local diagnostic parity and cannot be combined with viewer, preflight, or cleanup options');
+  }
   if (deadlineSeconds !== undefined && (requestedMode === 'aks' || viewerOnly || !noViewer)) {
     throw new OatCliError('--deadline-seconds requires a local benchmark run with --no-viewer');
   }
@@ -1956,7 +2362,10 @@ export async function main(
   if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only') || deadlineSeconds !== undefined)) {
     throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
   }
-  if (requestedMode === 'aks' && !preflightOnly) await assertCanonicalAksLaunchWorkspace(workspaceRoot);
+  let aksWorktreeReceiptRoot: string | undefined;
+  if (requestedMode === 'aks' && !preflightOnly) {
+    ({ root: receiptRoot, worktreeRoot: aksWorktreeReceiptRoot } = await resolveAksReceiptLedger(workspaceRoot, receiptRoot));
+  }
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
@@ -2013,7 +2422,36 @@ export async function main(
     }
     config.subscriptionId = subscriptionId;
   }
-  await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const transitionRoot = await diagnosticTransitionReceiptRoot();
+  if (transitionRoot && aksWorktreeReceiptRoot) {
+    throw new Error('Diagnostic transition runtime cannot launch AKS from a linked worktree of another checkout');
+  }
+  if (transitionRoot) receiptRoot = transitionRoot;
+  const submitterLock = mode === 'aks' ? await acquireAksSubmitterLock(receiptRoot) : undefined;
+  if (mode === 'aks') {
+    try {
+      await assertHistoryPin(receiptRoot, historySha);
+      if (historySha) await assertSettledHistory(receiptRoot, await handoverDestination(workspaceRoot, receiptRoot),
+        validateSettledHistoryReceipt, historySha, String(config.stamp), String(config.subscriptionId));
+    } catch (error) {
+      await submitterLock?.release();
+      throw error;
+    }
+  }
+  if (diagnosticParity && mode === 'local' && !transitionRoot) {
+    const names = await readdir(receiptRoot).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+      throw error;
+    });
+    if (names.length !== 0) throw new Error('Fresh diagnostic requires an empty launcher receipt ledger');
+  } else {
+    await assertLaunchLedgersSettled(receiptRoot, aksWorktreeReceiptRoot, transitionRoot);
+  }
+  if (prelaunchOnly) {
+    console.log('Diagnostic ledger prelaunch gate passed; no workload started.');
+    return;
+  }
+  submitterLock?.assertHeld();
   const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
     if (deadline.isExpired()) {
@@ -2031,7 +2469,7 @@ export async function main(
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, undefined, undefined, deadline, submission),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, undefined, undefined, deadline, submission, submitterLock),
           config, mode, undefined, runner, network, warnings, collect,
         );
         if (interrupt?.signal) {
@@ -2177,7 +2615,7 @@ export async function main(
         runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };
       const code = await reportDataFlowRun(
-        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, onRunStarted, onRunFinished, deadline, submission),
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, onRunStarted, onRunFinished, deadline, submission, submitterLock),
         config, mode, server.gitSha, runner, network, warnings, collect,
       );
       if (interrupt?.signal) {
@@ -2202,6 +2640,7 @@ export async function main(
         async () => {
           if (deadline && deadline.cleanupState !== 'confirmed') {
             console.error(`[oat] Preserving OAT server for unresolved run receipt ${deadline.receiptPath}`);
+            server.child.unref();
             return;
           }
           await stopLocalServer(server.child);

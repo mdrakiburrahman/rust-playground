@@ -8,8 +8,10 @@
     "kustomize_overlay": null,
     "local": {
       "bind_host": null,
+      "setup_timeout_ms": 1260000,
       "endpoint_host": null,
-      "snapshot_root": null
+      "snapshot_root": null,
+      "collector_memory_limit_bytes": 4294967296
     }
   },
   "stamp": null,
@@ -28,7 +30,6 @@
   "dfe_pod_selector": "app=arrowcol",
   "arrowcol_endpoint": "http://router:50050",
   "router_metrics_endpoint": "http://127.0.0.1:15050/metrics",
-  "dmv_client_binary": "target/debug/arrowcol-dmv",
   "edge_secret_file": "/run/secrets/edge-hmac",
   "tables": [
     "sqlserver_wait_stats",

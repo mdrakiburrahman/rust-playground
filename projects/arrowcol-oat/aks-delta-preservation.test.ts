@@ -3,15 +3,69 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { Bool, Field, Int32, Int64, List, Struct, Table, Utf8, tableToIPC, vectorFromArray } from 'apache-arrow';
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
-import type { Azure, HttpReceipt } from '../../infra/azure/bootstrap.js';
+import { HttpFailure, type Azure, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 import {
-  parseDeltaReplayReference, readDeltaAddWindow, readDeltaReference, verifyDeltaPreservation,
+  DELTA_READ_CONCURRENCY, parseDeltaReplayReference, readDeltaAddWindow, readDeltaReference, verifyDeltaPreservation,
   type DeltaReplayReference, type DeltaRetentionPolicy,
 } from './aks-delta-preservation.js';
 
 type Json = Record<string, any>;
 const root = 'planned/hot-table', prefix = root + '/_delta_log/';
 const guard = async () => {};
+
+test('Delta history reads are capped and replayed in version order despite out-of-order responses', async () => {
+  const s = new Storage().put(0, { protocol: legacyProtocol }, { metaData: meta() }, info('CREATE TABLE'));
+  for (let version = 1; version <= DELTA_READ_CONCURRENCY * 2; version++)
+    s.put(version, info('WRITE'), add(`part-${version}.parquet`));
+  const original = s.azure.blob.bind(s.azure);
+  let active = 0, peak = 0;
+  s.azure.blob = async (...args: Parameters<Azure['blob']>) => {
+    if (args[3]) return original(...args);
+    active++; peak = Math.max(peak, active);
+    try {
+      await new Promise<void>(resolve => setTimeout(resolve, Number(args[2]?.slice(-6, -5)) % 2 ? 1 : 5));
+      return await original(...args);
+    } finally { active--; }
+  };
+  const value = await readDeltaReference(s.azure, root, guard);
+  assert.equal(value.observation, 'table');
+  if (value.observation !== 'table') assert.fail('actual table required');
+  assert.equal(value.row_count, DELTA_READ_CONCURRENCY * 2 * 10);
+  assert.equal(value.version, DELTA_READ_CONCURRENCY * 2);
+  assert.ok(peak > 1);
+  assert.ok(peak <= DELTA_READ_CONCURRENCY);
+});
+
+test('one Delta deadline spans every batch; expiry never starts a fresh batch or returns measured rows', async t => {
+  const s = new Storage().put(0, { protocol: legacyProtocol }, { metaData: meta() }, info('CREATE TABLE'));
+  for (let version = 1; version <= DELTA_READ_CONCURRENCY * 4; version++)
+    s.put(version, info('WRITE'), add(`part-${version}.parquet`));
+  let now = 1_000_000;
+  t.mock.method(Date, 'now', () => now);
+  s.beforeGet = () => { now += 10; };
+  await assert.rejects(readDeltaReference(s.azure, root, guard, now + DELTA_READ_CONCURRENCY * 10 + 1),
+    /Delta read shared deadline expired/);
+  assert.equal(s.calls.filter(call => !call.query).length, DELTA_READ_CONCURRENCY + 1);
+  assert.equal(s.listCount, 1, 'expired replay must not produce a final positive listing');
+});
+
+test('a hung Delta GET expires at the shared deadline without manufacturing absence', async () => {
+  let calls = 0;
+  const azure = { c: { account: 'arrowcollector00000', data: 'data', table_prefix: 'planned' },
+    blob: async () => { calls++; return new Promise<never>(() => {}); } } as unknown as Azure;
+  await assert.rejects(readDeltaReference(azure, root, guard, Date.now() + 30), /Delta read shared deadline expired/);
+  assert.equal(calls, 1);
+});
+
+test('Delta deadline expiry is typed unknown preservation, never a zero-row or absent snapshot', async () => {
+  const s = new Storage().put(0, { protocol: legacyProtocol }, { metaData: meta() }, info('CREATE TABLE'), add('part.parquet'));
+  const before = await readDeltaReference(s.azure, root, guard);
+  s.azure.blob = async () => new Promise<never>(() => {});
+  const result = await verifyDeltaPreservation(s.azure, before, before, guard, undefined, Date.now() + 30);
+  assert.equal(result.status, 'unknown');
+  assert.equal(result.current, null);
+  assert.match(result.reason!, /Delta read shared deadline expired/);
+});
 const meta = (id = '11111111-1111-4111-8111-111111111111') => ({ id, format: { provider: 'parquet' },
   schemaString: '{"type":"struct","fields":[{"name":"__arrowcol_ingestion","type":"string","nullable":true,"metadata":{}}]}',
   partitionColumns: ['__arrowcol_ingestion'], configuration: { 'delta.enableDeletionVectors': 'false' } });
@@ -123,6 +177,32 @@ test('Delta Add window retries one append that races its initial snapshot', asyn
   assert.equal(result.window_rows, 60);
   assert.equal(result.window_commits, 3);
   assert.equal(result.active_rows, 60);
+});
+
+test('Delta Add window retries a conditional GET that loses to a concurrent checkpoint rewrite', async () => {
+  const s = new Storage().seed(add('seed.parquet', 10));
+  s.put(1, info('INSERT'), add('first.parquet', 20));
+  const pointer = prefix + '_last_checkpoint';
+  s.objects.set(prefix + '00000000000000000000.checkpoint.parquet',
+    checkpoint([{ protocol: legacyProtocol }, { metaData: meta() }, add('seed.parquet', 10)]));
+  s.objects.set(pointer, Buffer.from('{"version":0,"size":3}'));
+  let pointerReads = 0;
+  s.beforeGet = name => {
+    if (name === pointer && ++pointerReads === 1) {
+      s.objects.set(pointer, Buffer.from('{"version":0,"size":3}\n'));
+      throw new HttpFailure(412, 'HTTP 412: condition not met');
+    }
+  };
+  const result = await readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard);
+  assert.equal(pointerReads, 2);
+  assert.equal(result.window_rows, 30);
+  let immutableReads = 0;
+  s.beforeGet = name => {
+    if (name === prefix + '00000000000000000001.json' && ++immutableReads === 1)
+      throw new HttpFailure(412, 'immutable commit changed');
+  };
+  await assert.rejects(readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard), /immutable commit changed/);
+  assert.equal(immutableReads, 1);
 });
 
 test('fresh replay preserves explicit zero only for measured empty active-file sets; references round trip strictly', async () => {

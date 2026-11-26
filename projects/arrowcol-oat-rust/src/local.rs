@@ -24,15 +24,52 @@ pub(crate) fn endpoint_host(host: &str) -> Result<String> {
     match &parsed {
         url::Host::Ipv4(address) => ensure!(
             !address.is_unspecified() && !address.is_multicast(),
-            "invalid endpoint address"
+            "platform.local.endpoint_host must be unicast; use the Docker bridge gateway IP, not a wildcard"
         ),
         url::Host::Ipv6(address) => ensure!(
             !address.is_unspecified() && !address.is_multicast(),
-            "invalid endpoint address"
+            "platform.local.endpoint_host must be unicast; use the Docker bridge gateway IP, not a wildcard"
         ),
         url::Host::Domain(_) => {}
     }
     Ok(parsed.to_string())
+}
+
+pub(crate) fn validate_container_endpoints(
+    containerized: bool,
+    host_network: bool,
+    bind_host: Option<IpAddr>,
+    endpoint: Option<&str>,
+) -> Result<()> {
+    if let Some(endpoint) = endpoint {
+        endpoint_host(endpoint)?;
+    }
+    if !containerized || host_network {
+        return Ok(());
+    }
+    ensure!(
+        !bind_host.is_some_and(|address| address.is_unspecified()) || endpoint.is_some(),
+        "containerized wildcard bind requires a concrete platform.local.endpoint_host; set platform.local.bind_host and platform.local.endpoint_host to the Docker bridge gateway IP"
+    );
+    let bind_is_loopback = bind_host
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .is_loopback();
+    let endpoint_is_loopback = match endpoint {
+        Some(host) => match url::Host::parse(&endpoint_host(host)?)? {
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+            url::Host::Domain(domain) => {
+                let domain = domain.trim_end_matches('.');
+                domain.eq_ignore_ascii_case("localhost") || domain.to_ascii_lowercase().ends_with(".localhost")
+            }
+        },
+        None => bind_is_loopback,
+    };
+    ensure!(
+        !bind_is_loopback && !endpoint_is_loopback,
+        "containerized harness cannot reach Docker host loopback; set platform.local.bind_host and platform.local.endpoint_host to the Docker bridge gateway IP"
+    );
+    Ok(())
 }
 
 pub(crate) fn published_endpoint(binding: &str, host: Option<&str>, daemon: &str, path: &str) -> Result<String> {
@@ -303,6 +340,7 @@ fn snapshot_proof(root: &Path, files: &[SnapshotFile]) -> Result<Value> {
         }
     }
     let mut rows = 0_u64;
+    let mut footer = arrow_deltalake::footer::FooterEvidence::default();
     for (path, expected_size) in referenced {
         let file = files
             .iter()
@@ -310,6 +348,9 @@ fn snapshot_proof(root: &Path, files: &[SnapshotFile]) -> Result<Value> {
             .context("snapshot is missing a historical Delta payload")?;
         ensure!(file.size == expected_size, "Delta Add size differs from copied payload");
         let builder = ParquetRecordBatchReaderBuilder::try_new(regular_file(&root.join(&path))?)?;
+        if active.contains(&path) {
+            footer.observe(builder.metadata())?;
+        }
         let footer_rows = u64::try_from(builder.metadata().file_metadata().num_rows())?;
         let mut decoded_rows = 0_u64;
         for batch in builder.build()? {
@@ -328,7 +369,7 @@ fn snapshot_proof(root: &Path, files: &[SnapshotFile]) -> Result<Value> {
     ensure!(rows > 0, "snapshot contains no committed active rows");
     Ok(json!({
         "latestVersion": logs.last_key_value().context("missing Delta version")?.0,
-        "rowCount": rows,
+        "rowCount": rows, "active_parquet_footer": footer,
         "schemaString": schema.context("snapshot has no Delta schema")?,
     }))
 }
@@ -444,6 +485,7 @@ pub(crate) fn export_stopped(
             &json!({
                 "schema_version": 1, "run_id": run_id, "table": table,
                 "latestVersion": proof["latestVersion"], "rowCount": proof["rowCount"],
+                "active_parquet_footer": proof["active_parquet_footer"],
                 "schemaString": proof["schemaString"], "files": files, "writers": writers,
                 "semantics": "last committed stopped snapshot; not proof all admitted rows flushed"
             }),
@@ -505,6 +547,7 @@ pub(crate) fn stopped_snapshot_references(destination: &Path, run_id: &str, tabl
                 "run_id": run_id, "table": table, "manifest": format!("{run_id}/{relative}"),
                 "manifest_sha256": sha256, "table_version": version, "row_count": rows,
                 "source": "verified_stopped_snapshot_manifest",
+                "active_parquet_footer": manifest["active_parquet_footer"],
             }),
         );
     }
@@ -529,6 +572,67 @@ where
 mod tests {
     use super::*;
     use anyhow::bail;
+
+    #[test]
+    fn container_loopback_is_rejected_but_host_native_and_gateway_work() -> Result<()> {
+        let gateway = "172.17.0.1".parse()?;
+        let loopback = "127.0.0.1".parse()?;
+        let wildcard_v4 = "0.0.0.0".parse::<IpAddr>()?;
+        let wildcard_v6 = "::".parse::<IpAddr>()?;
+        for (bind, endpoint) in [
+            (None, None),
+            (Some(loopback), Some("172.17.0.1")),
+            (Some(gateway), Some("localhost")),
+            (Some(gateway), Some("[::1]")),
+        ] {
+            let error = validate_container_endpoints(true, false, bind, endpoint)
+                .err()
+                .context("container loopback was accepted")?
+                .to_string();
+            assert!(error.contains("platform.local.bind_host") && error.contains("platform.local.endpoint_host"));
+            assert!(error.contains("gateway"));
+        }
+        for bind in [wildcard_v4, wildcard_v6] {
+            let error = validate_container_endpoints(true, false, Some(bind), None)
+                .err()
+                .context("container wildcard bind without an advertised endpoint was accepted")?
+                .to_string();
+            assert!(error.contains("wildcard bind requires a concrete"));
+            assert!(error.contains("platform.local.bind_host") && error.contains("platform.local.endpoint_host"));
+        }
+        for endpoint in ["0.0.0.0", "::"] {
+            let error = validate_container_endpoints(true, false, Some(gateway), Some(endpoint))
+                .err()
+                .context("wildcard advertised endpoint was accepted")?
+                .to_string();
+            assert!(error.contains("platform.local.endpoint_host"));
+            assert!(error.contains("unicast"));
+        }
+        validate_container_endpoints(false, false, None, None)?;
+        validate_container_endpoints(false, false, Some(wildcard_v4), Some("172.17.0.1"))?;
+        validate_container_endpoints(true, true, None, None)?;
+        validate_container_endpoints(true, true, Some(wildcard_v4), None)?;
+        assert!(validate_container_endpoints(true, true, Some(wildcard_v4), Some("0.0.0.0")).is_err());
+        validate_container_endpoints(true, false, Some(gateway), Some("172.17.0.1"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_wildcard_bind_uses_concrete_advertised_gateway() -> Result<()> {
+        let gateway = "172.17.0.1";
+        for bind in ["0.0.0.0", "::"] {
+            validate_container_endpoints(true, false, Some(bind.parse()?), Some(gateway))?;
+        }
+        assert_eq!(
+            published_endpoint("0.0.0.0:1234", Some(gateway), "unix:///var/run/docker.sock", "/readyz")?,
+            "http://172.17.0.1:1234/readyz"
+        );
+        for endpoint in ["0.0.0.0", "::"] {
+            assert!(endpoint_host(endpoint).is_err());
+            assert!(validate_container_endpoints(true, false, Some(gateway.parse()?), Some(endpoint)).is_err());
+        }
+        Ok(())
+    }
 
     struct Fixture(PathBuf);
 
@@ -596,9 +700,14 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
         assert_eq!(manifest["rowCount"], 2);
         assert_eq!(manifest["latestVersion"], 1);
+        let footer = &manifest["active_parquet_footer"];
+        assert_eq!(footer["files"], 1); // exclude the removed Add
+        assert_eq!(footer["files_missing_writer_declaration"], 1);
+        assert_eq!(footer["samples"][0]["writer_declaration_present"], false);
         let references = stopped_snapshot_references(&destination, &run, &tables)?;
         assert_eq!(references[&tables[0]]["table_version"], 1);
         assert_eq!(references[&tables[0]]["row_count"], 2);
+        assert_eq!(references[&tables[0]]["active_parquet_footer"], *footer);
         assert_eq!(
             references[&tables[0]]["manifest_sha256"],
             file_digest(&root.join("manifest.json"))?.1
