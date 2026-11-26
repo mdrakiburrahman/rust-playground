@@ -2,6 +2,20 @@ import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
+const fixedScaleMetrics = new Set([
+  'avg_cpu_percent',
+  'data_size_used_mb',
+  'data_size_allocated_mb',
+  'log_size_used_mb',
+  'log_size_allocated_mb',
+  'persistent_version_store_size_mb',
+  'online_index_version_store_size_mb',
+  'memory_size_mb',
+  'virtual_memory_committed_mb',
+  'file_size_mb',
+  'file_max_size_mb',
+]);
+
 export function dmvDefinitions(source: string): Map<string, string> {
   const definitions = new Map<string, string>();
   const sql = source.replace(/^\s*--[^\n]*$/gm, '').trim();
@@ -17,10 +31,11 @@ export function dmvDefinitions(source: string): Map<string, string> {
       const [, name, type] = field;
       if (seen.has(name)) throw new Error(`Duplicate public DMV column ${table}.${name}`);
       seen.add(name);
-      return name === 'customer_id' ? `${name} ${type} NOT NULL` : `${name} ${type === 'DOUBLE' ? 'DECIMAL(38,12)' : type}`;
+      const payloadType = type === 'DOUBLE' && fixedScaleMetrics.has(name) ? 'DECIMAL(38,12)' : type;
+      return `${name} ${payloadType}${name === 'customer_id' ? ' NOT NULL' : ''}`;
     });
     if (!seen.has('customer_id')) throw new Error(`Public DMV ${table} is missing customer_id`);
-    definitions.set(table, `CREATE TABLE telemetry.sqlserver_dmv.${table} (\n    ${columns.join(',\n    ')}\n) USING DELTA;\n`);
+    definitions.set(table, `CREATE TABLE telemetry.sqlserver_dmv_v2.${table} (\n    ${columns.join(',\n    ')}\n) USING DELTA;\n`);
   }
   if (definitions.size === 0) throw new Error('The public SQL Server fixture has no tables');
   return definitions;

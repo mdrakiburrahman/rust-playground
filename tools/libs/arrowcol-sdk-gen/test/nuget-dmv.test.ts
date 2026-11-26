@@ -7,7 +7,7 @@ test('derive a distinct, nullable DMV contract preserving field order and exact 
   const source = readFileSync('projects/loadtest/schemas/sqlserver.sql', 'utf8');
   const definitions = dmvDefinitions(source);
   assert.equal(definitions.size, 32);
-  assert.equal(definitions.get('sqlserver_cpu_utilization'), `CREATE TABLE telemetry.sqlserver_dmv.sqlserver_cpu_utilization (
+  assert.equal(definitions.get('sqlserver_cpu_utilization'), `CREATE TABLE telemetry.sqlserver_dmv_v2.sqlserver_cpu_utilization (
     customer_id STRING NOT NULL,
     sample_time_utc TIMESTAMP,
     process_sample_time_utc TIMESTAMP,
@@ -18,6 +18,10 @@ test('derive a distinct, nullable DMV contract preserving field order and exact 
     idle_cpu_percent INT
 ) USING DELTA;
 `);
+  for (const kind of ['common', 'detailed']) {
+    assert.match(definitions.get(`sqlserver_performance_counters_${kind}`) ?? '', /^\s+cntr_value DOUBLE,$/m);
+  }
+  assert.match(definitions.get('sqlserver_missing_indexes') ?? '', /^\s+avg_total_user_cost DOUBLE,$/m);
 });
 
 test('reject unexpected fixture shapes rather than inventing a contract', () => {

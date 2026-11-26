@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using Arrowcol.Client;
-using Arrowcol.Telemetry.SqlserverDmv;
+using Arrowcol.Telemetry.SqlserverDmvV2;
 
 var assembly = typeof(ArrowcolContract).Assembly;
 var library = NativeLibrary.Load("arrowcol_sdk_ffi", assembly, null);
@@ -34,9 +34,15 @@ var measured = new SqlserverCpuUtilization
     SampleTimeUtc = 1700000000123456,
 };
 var unmeasured = new SqlserverCpuUtilization { CustomerId = "package-null" };
-if (SqlserverCpuUtilization.Descriptor.FullName != "arrowcol.telemetry.sqlserver_dmv.SqlserverCpuUtilization" ||
+if (SqlserverCpuUtilization.Descriptor.FullName != "arrowcol.telemetry.sqlserver_dmv_v2.SqlserverCpuUtilization" ||
     !measured.HasAvgCpuPercent || unmeasured.HasAvgCpuPercent || unmeasured.HasSampleTimeUtc)
     throw new InvalidOperationException("The generated DMV model does not preserve payload presence.");
+
+var counter = new SqlserverPerformanceCountersCommon
+{
+    CustomerId = "package-counter",
+    CntrValue = Math.BitIncrement(1.0),
+};
 
 if (args.Length != 0)
 {
@@ -45,4 +51,9 @@ if (args.Length != 0)
     await stream.PushAsync(unmeasured);
     await stream.FlushAsync();
     await stream.CloseAsync();
+
+    var counters = ArrowcolContract.Load(Path.Combine(output, "arrow-contracts", "sqlserver_performance_counters_common"));
+    await using var counterStream = await ArrowcolStream<SqlserverPerformanceCountersCommon>.ConnectAsync(args[0], counters);
+    await counterStream.PushAsync(counter);
+    await counterStream.CloseAsync();
 }

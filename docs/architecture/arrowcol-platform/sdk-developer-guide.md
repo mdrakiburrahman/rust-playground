@@ -74,31 +74,33 @@ on Windows x64 or Linux x64 (glibc 2.34+). For custom schemas use a separate
 generated `Models.csproj` and its `contract/` directory. No Rust toolchain is
 needed by consumers.
 
-Starting with `0.1.0-alpha.2`, the same package includes SQL Server DMV types
-under `Arrowcol.Telemetry.SqlserverDmv` and the following build/publish assets:
+`0.1.0-alpha.3` includes SQL Server DMV types under
+`Arrowcol.Telemetry.SqlserverDmvV2` and the following build/publish assets:
 
 | Output | Use |
 | --- | --- |
 | `arrow-contracts/<dataset>/` | Load with `ArrowcolContract.Load(Path.Combine(AppContext.BaseDirectory, "arrow-contracts", dataset))`. |
 | `arrow-ddl/` | Mount read-only as the local catalog's `--ddl-dir`. Use the shared Delta warehouse and matching ingestion layout above. |
 
-The packaged `telemetry.sqlserver_dmv` v1 family is separate from the load
-benchmark's `telemetry.sqlserver` v1. It preserves fixture field order, requires
-`customer_id`, and permits absent payloads. Metrics represented as `DOUBLE`
-in the benchmark are `DECIMAL(38,12)` here; supply invariant decimal strings
-without rounding (UTC timestamps are epoch microseconds).
+The packaged `telemetry.sqlserver_dmv_v2` family starts at registry version 1.
+It is separate from `alpha.2`'s `telemetry.sqlserver_dmv` and the load
+benchmark's `telemetry.sqlserver`. It preserves fixture field order, requires
+`customer_id`, and permits absent payloads. Selected fixed-scale metrics are
+`DECIMAL(38,12)` (supply invariant decimal strings without rounding); counters
+and other approximate metrics stay binary64 `DOUBLE`. UTC timestamps use
+epoch microseconds.
 
 | Producer command | Requirements / result |
 | --- | --- |
-| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-pack -- --package-version 0.1.0-alpha.2` | Linux x64 devcontainer, .NET 8 SDK, `x86_64-pc-windows-gnu` Rust target and MinGW POSIX linker; generates DMV assets from public fixtures and outputs `.nupkg` under `target/arrowcol-nuget/` |
-| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-publish -- --package-version 0.1.0-alpha.2` | Explicit upload of a previously packed version. Supply the Azure Artifacts NuGet v3 `NUGET_URL` and packaging-write `NUGET_PAT` using private devbox settings or the ignored `.env`; do not commit them. The publishing identity needs feed publisher access. |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-pack -- --package-version 0.1.0-alpha.3` | Linux x64 devcontainer, .NET 8 SDK, `x86_64-pc-windows-gnu` Rust target and MinGW POSIX linker; generates DMV assets from public fixtures and outputs `.nupkg` under `target/arrowcol-nuget/` |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-publish -- --package-version 0.1.0-alpha.3` | Explicit upload of a previously packed version. Supply the Azure Artifacts NuGet v3 `NUGET_URL` and packaging-write `NUGET_PAT` using private devbox settings or the ignored `.env`; do not commit them. The publishing identity needs feed publisher access. |
 
 With an authorized NuGet source configured, check the package's native ABI and
 packaged DMV model and contract on the current RID:
 
 ```bash
 dotnet build examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj \
-  --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.2
+  --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.3
 dotnet target/arrowcol-nuget/smoke/bin/NuGetSmoke/debug/NuGetSmoke.dll
 ```
 
