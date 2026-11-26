@@ -5,6 +5,24 @@
   "sourceRoot": "tools/libs/arrowcol-sdk-gen/src",
   "tags": ["scope:tools", "type:automation"],
   "targets": {
+    "nuget-pack": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/nuget.ts pack",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    },
+    "nuget-publish": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/nuget.ts publish",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    },
     "clean": {
       "executor": "nx:run-commands",
       "cache": false,

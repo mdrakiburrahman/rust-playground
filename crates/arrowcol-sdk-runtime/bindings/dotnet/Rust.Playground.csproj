@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <PackageId>Rust.Playground</PackageId>
+    <AssemblyName>Arrowcol.Sdk</AssemblyName>
+    <Description>Typed ArrowCol Flight SDK for .NET with native Linux and Windows x64 runtimes.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/mdrakiburrahman/rust-playground</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.29.3" />
+    <None Include="$(ArrowcolLinuxNative)" Pack="true" PackagePath="runtimes/linux-x64/native/libarrowcol_sdk_ffi.so" />
+    <None Include="$(ArrowcolWindowsNative)" Pack="true" PackagePath="runtimes/win-x64/native/arrowcol_sdk_ffi.dll" />
+  </ItemGroup>
+  <Target Name="RequireNativePackageInputs" BeforeTargets="Pack">
+    <Error Condition="!Exists('$(ArrowcolLinuxNative)')" Text="A Linux x64 ArrowCol native runtime is required." />
+    <Error Condition="!Exists('$(ArrowcolWindowsNative)')" Text="A Windows x64 ArrowCol native runtime is required." />
+  </Target>
+</Project>
