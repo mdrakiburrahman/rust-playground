@@ -11,7 +11,8 @@ import { Azure, Config, load_env, ROOT, run_tree } from '../../infra/azure/boots
 import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
-import { readDeltaAddWindow } from './aks-delta-preservation.js';
+import { canonicalDeltaWindow, collectWriterCommitRecords, readDeltaAddWindow, type CanonicalDeltaWindow,
+  type WriterCommitRecord } from './aks-delta-preservation.js';
 
 const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
 const namespacePrefix = 'arrow-collector-';
@@ -353,7 +354,7 @@ async function waitJob(config: Config, namespace: string, name: string, timeoutM
   }, 5000);
 }
 
-interface WriterIdentity { uid: string; restartCounts: number[] }
+interface WriterIdentity { name: string; uid: string; restartCounts: number[] }
 
 async function readWriter(config: Config, namespace: string): Promise<WriterIdentity | undefined> {
   const output = await kubectl(config, ['get', 'pods', '-n', namespace, '-l', 'app=arrowcol', '-o', 'json'], 'Read writer pod');
@@ -365,8 +366,9 @@ async function readWriter(config: Config, namespace: string): Promise<WriterIden
   if (status.phase !== 'Running' || !Array.isArray(status.containerStatuses)) return undefined;
   const containers = status.containerStatuses.map(value => requireRecord(value, 'Writer container status'));
   if (!containers.length || containers.some(container => container.ready !== true)) return undefined;
-  if (typeof metadata.uid !== 'string') throw new Error('Writer pod UID is missing.');
-  return { uid: metadata.uid, restartCounts: containers.map(container => argNumber(container.restartCount, 'Writer restart count')) };
+  if (typeof metadata.uid !== 'string' || typeof metadata.name !== 'string') throw new Error('Writer pod identity is missing.');
+  return { name: metadata.name, uid: metadata.uid,
+    restartCounts: containers.map(container => argNumber(container.restartCount, 'Writer restart count')) };
 }
 
 async function waitWriter(config: Config, namespace: string): Promise<WriterIdentity> {
@@ -559,10 +561,12 @@ async function waitForReadyLoad(config: Config, namespace: string, writer: Write
   }, 5000);
 }
 
-async function waitForLoad(config: Config, namespace: string, writer: WriterIdentity, timeoutMs: number): Promise<void> {
+async function waitForLoad(config: Config, namespace: string, writer: WriterIdentity, timeoutMs: number,
+  onTick: () => Promise<void>): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await assertWriterStable(config, namespace, writer);
+    await onTick();
     const job = await getObject(config, 'job', namespace, 'direct-load-confirmwide');
     if (job) {
       const status = isRecord(job.status) ? job.status : {};
@@ -614,6 +618,14 @@ interface BenchmarkReport {
   measurement_start_unix_ms: number;
   measurement_end_unix_ms: number;
   measurement_seconds: number;
+  canonical_rows: number;
+  canonical_rows_per_second: number;
+  canonical_files: number;
+  canonical_bytes: number;
+  canonical_delta_commits: number;
+  canonical_first_delta_version: number;
+  canonical_last_delta_version: number;
+  writer_commit_records: number;
   committed_rows: number;
   committed_rows_per_second: number;
   committed_files: number;
@@ -760,6 +772,8 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   let measurementStart = 0;
   let measurementEnd = 0;
   let metrics: Awaited<ReturnType<typeof readDeltaAddWindow>> | undefined;
+  let canonical: CanonicalDeltaWindow | undefined;
+  const writerCommits = new Map<number, WriterCommitRecord>();
   let podPlacement: BenchmarkReport['pod_placement'] = [];
   console.log('Run ' + runId + ': namespace ' + namespace + '; report ' + reportPath);
   try {
@@ -810,26 +824,58 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await verifyRegistration(config, namespace, runId, deltaRoot);
       await assertWriterStable(config, namespace, writer);
     });
-    await runStage('load and Delta reconciliation', 30 * 60_000, async () => {
+    await runStage('load and Delta reconciliation', 45 * 60_000, async () => {
       if (!writer || !namespaceUid) throw new Error('Writer or owned namespace readiness was not established.');
+      const loadWriter = writer, ownedUid = namespaceUid;
       await applyStage(config, namespace, renderedPath, 'load');
-      await waitForReadyLoad(config, namespace, writer);
+      await waitForReadyLoad(config, namespace, loadWriter);
       podPlacement = await readBenchmarkPlacement(config, namespace);
       await writePrivateFile(resolve(runDir, 'pod-placement.json'), `${JSON.stringify(podPlacement, null, 2)}\n`);
+      let logsReadAt: number | undefined;
+      const sampleWriterCommits = async (required: boolean) => {
+        const startedAt = Date.now();
+        const since = logsReadAt === undefined ? [] : [`--since=${Math.ceil((startedAt - logsReadAt) / 1000) + 30}s`];
+        let output: string;
+        try {
+          output = await kubectl(config, ['logs', `pod/${loadWriter.name}`, '-c', 'dataflow', '-n', namespace, ...since],
+            'Read writer commit records', 120);
+        } catch (error) {
+          if (required) throw error;
+          console.warn('Writer log sample unavailable; the next read will cover this interval. Missing commit evidence fails reconciliation.');
+          return;
+        }
+        collectWriterCommitRecords(output, writerCommits);
+        logsReadAt = startedAt;
+      };
+      await sampleWriterCommits(true);
       const scheduleStart = Date.now() + 130_000;
       if (scheduleStart - Date.now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
       await kubectl(config, ['patch', 'configmap', 'direct-schedule-confirmwide', '-n', namespace, '--type', 'merge',
         '-p', JSON.stringify({ data: { start: String(scheduleStart) } })], 'Schedule benchmark load');
       measurementStart = scheduleStart + 60_000;
       measurementEnd = measurementStart + measurementSeconds * 1000;
-      await waitForLoad(config, namespace, writer, 22 * 60_000);
+      await waitForLoad(config, namespace, loadWriter, 22 * 60_000, () => sampleWriterCommits(false));
       podPlacement = await readBenchmarkPlacement(config, namespace);
-      await assertWriterStable(config, namespace, writer);
-      await verifyNamespace(config, namespace, runId, owner, namespaceUid);
+      await assertWriterStable(config, namespace, loadWriter);
+      await verifyNamespace(config, namespace, runId, owner, ownedUid);
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
-      metrics = await readDeltaAddWindow(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
-        async () => { await verifyNamespace(config, namespace, runId, owner, namespaceUid); });
-      if (metrics.window_rows <= 0 || metrics.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
+      let verifiedAt = 0;
+      const window = await readDeltaAddWindow(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
+        async () => {
+          if (Date.now() - verifiedAt < 20_000) return;
+          await verifyNamespace(config, namespace, runId, owner, ownedUid);
+          verifiedAt = Date.now();
+        }, Date.now() + 20 * 60_000);
+      await verifyNamespace(config, namespace, runId, owner, ownedUid);
+      await assertWriterStable(config, namespace, loadWriter);
+      await sampleWriterCommits(true);
+      await writePrivateFile(resolve(runDir, 'writer-commits.json'), `${JSON.stringify({
+        measurement_start_unix_ms: measurementStart, measurement_end_unix_ms: measurementEnd, delta_adds: window.commits,
+        writer_records: [...writerCommits.values()].sort((a, b) => a.version - b.version),
+      })}\n`);
+      if (window.window_rows <= 0 || window.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
+      canonical = canonicalDeltaWindow(window.commits, writerCommits, measurementStart, measurementEnd);
+      metrics = window;
     });
   } catch (error) {
     primaryError = error;
@@ -873,7 +919,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     catch (error) { rememberCleanupError(error); }
   }
 
-  const report: BenchmarkReport | undefined = metrics && writer ? {
+  const report: BenchmarkReport | undefined = metrics && canonical && writer ? {
     schema_version: 1,
     run_id: runId,
     tested_at_utc: new Date().toISOString(),
@@ -883,6 +929,14 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     measurement_start_unix_ms: measurementStart,
     measurement_end_unix_ms: measurementEnd,
     measurement_seconds: measurementSeconds,
+    canonical_rows: canonical.rows,
+    canonical_rows_per_second: canonical.rows / measurementSeconds,
+    canonical_files: canonical.files,
+    canonical_bytes: canonical.bytes,
+    canonical_delta_commits: canonical.commits,
+    canonical_first_delta_version: canonical.first_version,
+    canonical_last_delta_version: canonical.last_version,
+    writer_commit_records: writerCommits.size,
     committed_rows: metrics.window_rows,
     committed_rows_per_second: metrics.window_rows / measurementSeconds,
     committed_files: metrics.window_files,
@@ -934,9 +988,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     if (positionals[0] !== 'run') throw new Error('Choose check or run.');
     if (values.mode !== 'full' && values.mode !== 'smoke') throw new Error('--mode must be full or smoke.');
     const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode });
-    console.log('PASS ' + report.committed_rows_per_second.toFixed(2) + ' committed rows/s; ' + report.committed_rows +
-      ' rows in ' + report.measurement_seconds + ' seconds; Delta v' + report.first_delta_version + '-v' + report.last_delta_version +
-      '; report ' + resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', report.run_id.replaceAll('-', ''), 'report.json'));
+    console.log('PASS ' + report.canonical_rows_per_second.toFixed(2) + ' canonical durable rows/s; ' + report.canonical_rows +
+      ' rows in ' + report.measurement_seconds + ' seconds; Delta v' + report.canonical_first_delta_version + '-v' +
+      report.canonical_last_delta_version + '; commit-timestamp window ' + report.committed_rows_per_second.toFixed(2) +
+      ' rows/s; report ' + resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', report.run_id.replaceAll('-', ''), 'report.json'));
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

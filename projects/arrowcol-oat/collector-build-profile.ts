@@ -11,6 +11,9 @@ export type CollectorBuildProfile = {
 const defaults: CollectorBuildProfile = {
   allocator: 'system', lto: 'off', codegen_units: 16, opt_level: 3, target_cpu: 'generic',
 };
+export const AKS_COLLECTOR_BUILD_PROFILE: CollectorBuildProfile = {
+  allocator: 'mimalloc', lto: 'fat', codegen_units: 1, opt_level: 3, target_cpu: 'x86-64-v4',
+};
 const fields = Object.keys(defaults) as Array<keyof CollectorBuildProfile>;
 
 export function parseCollectorBuildProfile(value: unknown): CollectorBuildProfile | undefined {

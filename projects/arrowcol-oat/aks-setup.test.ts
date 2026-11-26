@@ -5,12 +5,14 @@ import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
 import { discoverLiveStamp, main, setup as runSetup } from './aks-setup.js';
+import { AKS_COLLECTOR_BUILD_PROFILE, collectorBuildProfileHash } from './collector-build-profile.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 const clientId = '00000000-0000-0000-0000-000000000002';
 const generation = '00000000-0000-0000-0000-000000000003';
 const revision = '0123456789abcdef0123456789abcdef01234567';
 const digest = `sha256:${'a'.repeat(64)}`;
+const profileHash = collectorBuildProfileHash(AKS_COLLECTOR_BUILD_PROFILE);
 const token = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
 const tagFormImageMissing = `WARNING: Command group 'acr manifest' is in preview and under development. Reference and support levels: https://aka.ms/CLI_refstatus
 ERROR: 2026-11-10 03:20:12.297874 Error: the specified tag does not exist. Correlation ID: 7c9221a5-5f81-4cca-8000-4dcab1f95660.
@@ -90,7 +92,7 @@ function fake(options: {
     else if (text.startsWith('az acr repository show-tags')) {
       const repository = command[command.indexOf('--repository') + 1]!;
       stdout = JSON.stringify(!published && options.olderTags ? [`oat-${'f'.repeat(40)}`] :
-        !published && missingMetadata.has(repository) ? [] : [`oat-${revision}`]);
+        !published && missingMetadata.has(repository) ? [] : [`oat-${revision}`, `oat-${revision}-p${profileHash}`]);
     }
     else if (text.startsWith('az storage blob upload')) {
       assert.equal(command[command.indexOf('--container-name') + 1], '$web');
@@ -132,7 +134,8 @@ function fake(options: {
       const repository = reference.startsWith('arrowcollector89152.azurecr.io/') ? reference.split('/').at(-1)!.split(':')[0] : '';
       stdout = JSON.stringify({
         Os: 'linux', Architecture: 'amd64',
-        Config: { Labels: { 'org.opencontainers.image.revision': options.badProvenance ? subscription : revision } },
+        Config: { Labels: { 'org.opencontainers.image.revision': options.badProvenance ? subscription : revision,
+          'org.opencontainers.image.profile': profileHash } },
         RepoDigests: repository ? [`arrowcollector89152.azurecr.io/${repository}@${digest}`] : [],
       });
     } else if (text.startsWith('docker buildx build') || text.startsWith('docker tag') || text.startsWith('docker pull')) {
@@ -280,8 +283,14 @@ test('missing revision images build and publish all five once, then verify every
   assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 5);
   assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'pull').length, 5);
   for (const command of m.calls.filter(c => c[0] === 'docker' && c[1] === 'push')) {
-    assert.ok(command.at(-1)!.endsWith(`:oat-${revision}`));
+    assert.match(command.at(-1)!, new RegExp(`:oat-${revision}(?:-p${profileHash})?$`));
   }
+  const dataflowBuild = m.calls.find(c => c[0] === 'docker' && c[1] === 'buildx' && c.includes('projects/arrowcol-dataflow-rust/Dockerfile'))!;
+  for (const arg of ['BUILD_ALLOCATOR=mimalloc', 'BUILD_LTO=fat', 'BUILD_CODEGEN_UNITS=1', 'BUILD_OPT_LEVEL=3', 'BUILD_TARGET_CPU=x86-64-v4'])
+    assert.ok(dataflowBuild.includes(arg), arg);
+  const runtime = JSON.parse(await readFile(result.runtimeConfigPath, 'utf8'));
+  assert.equal(runtime.collectorBuildProfileHash, profileHash);
+  assert.deepEqual(runtime.collectorBuildImages, { [profileHash]: runtime.images.dataflow });
   assert.ok(Object.values(result.images).every(image => image.endsWith(`@${digest}`)));
   await assert.rejects(readFile(resolve(output, 'runtime.publish.json')), { code: 'ENOENT' });
 });

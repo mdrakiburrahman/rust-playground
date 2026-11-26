@@ -6257,7 +6257,10 @@ async fn run_clients_inner(
     require_single_scale_out_collector(config, replicas)?;
     let mut evidence = CellEvidence::default();
     let mut prepared_guard = if config.overload_guard.enabled {
-        let timeout = if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        // AKS readback needs sequential kubectl calls and a port-forward before the guard's own read deadline starts.
+        let timeout = if platform.kind() == crate::config::OatMode::Aks
+            || config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
+        {
             Duration::from_secs(30)
         } else {
             Duration::from_secs(5)

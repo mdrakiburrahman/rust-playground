@@ -3217,6 +3217,7 @@ mod downstream_runner_tests {
         InitTimeout,
         PinInitFailed,
         GuardUnavailable,
+        SlowGuardReadback,
         ObservationUnavailable,
         ObservationInvalidJson,
         InitBindingRejected,
@@ -3278,7 +3279,7 @@ mod downstream_runner_tests {
             self.endpoint.clone()
         }
         fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
-            matches!(self.fault, Fault::GuardUnavailable).then(|| ResourceSamplerSource::Local {
+            matches!(self.fault, Fault::GuardUnavailable | Fault::SlowGuardReadback).then(|| ResourceSamplerSource::Local {
                 run_id: "stack-fixture".to_owned(),
                 environment: HashMap::new(),
                 collector_metrics_url: Some(format!("{}/metrics", self.endpoint)),
@@ -3485,6 +3486,9 @@ mod downstream_runner_tests {
             }])
         }
         async fn process_logs_for_role(&self, _: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+            if matches!(self.fault, Fault::SlowGuardReadback) {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
             if matches!(self.fault, Fault::GuardUnavailable) && role == ComponentRole::Collector {
                 let text = concat!(
                     "arrowcol_effective_config ",
@@ -3736,6 +3740,29 @@ mod downstream_runner_tests {
         assert!(report.failure.as_deref().is_some_and(|reason| reason.contains("protection unavailable")));
         assert_eq!(report.evidence.overload_guard.as_ref().map(|guard| &guard["status"]), Some(&json!("unavailable")));
         assert!(report.evidence.overload_stop.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aks_guard_admission_outlasts_slow_kubectl_readback() -> Result<()> {
+        tokio::time::pause();
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.aks.quick.json"
+        ))?;
+        let mut platform = FaultPlatform {
+            kind: crate::config::OatMode::Aks, fault: Fault::SlowGuardReadback,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+            pin_init_calls: 0, qap_initialization_calls: 0, client_fleet_prepared: false,
+            client_schedule_wait_seconds: None, unresolved: false,
+            arm_attempts: 0, arm_started: None,
+            delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
+            cancellations: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut pinning = PinningReport::default();
+        let report = run_clients_inner(&config, "aks-guard", &config.tables, &mut platform, &mut pinning, 1).await?;
+        let guard = report.evidence.overload_guard.context("missing overload guard evidence")?;
+        assert_eq!(guard["error"], "readback_error", "{guard}");
         Ok(())
     }
 

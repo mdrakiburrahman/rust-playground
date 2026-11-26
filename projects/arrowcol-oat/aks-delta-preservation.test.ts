@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { Bool, Field, Int32, Int64, List, Struct, Table, Utf8, tableToIPC, vectorFromArray } from 'apache-arrow';
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
-import type { Azure, HttpReceipt } from '../../infra/azure/bootstrap.js';
+import { HttpFailure, type Azure, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 import {
   DELTA_READ_CONCURRENCY, parseDeltaReplayReference, readDeltaAddWindow, readDeltaReference, verifyDeltaPreservation,
   type DeltaReplayReference, type DeltaRetentionPolicy,
@@ -177,6 +177,32 @@ test('Delta Add window retries one append that races its initial snapshot', asyn
   assert.equal(result.window_rows, 60);
   assert.equal(result.window_commits, 3);
   assert.equal(result.active_rows, 60);
+});
+
+test('Delta Add window retries a conditional GET that loses to a concurrent checkpoint rewrite', async () => {
+  const s = new Storage().seed(add('seed.parquet', 10));
+  s.put(1, info('INSERT'), add('first.parquet', 20));
+  const pointer = prefix + '_last_checkpoint';
+  s.objects.set(prefix + '00000000000000000000.checkpoint.parquet',
+    checkpoint([{ protocol: legacyProtocol }, { metaData: meta() }, add('seed.parquet', 10)]));
+  s.objects.set(pointer, Buffer.from('{"version":0,"size":3}'));
+  let pointerReads = 0;
+  s.beforeGet = name => {
+    if (name === pointer && ++pointerReads === 1) {
+      s.objects.set(pointer, Buffer.from('{"version":0,"size":3}\n'));
+      throw new HttpFailure(412, 'HTTP 412: condition not met');
+    }
+  };
+  const result = await readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard);
+  assert.equal(pointerReads, 2);
+  assert.equal(result.window_rows, 30);
+  let immutableReads = 0;
+  s.beforeGet = name => {
+    if (name === prefix + '00000000000000000001.json' && ++immutableReads === 1)
+      throw new HttpFailure(412, 'immutable commit changed');
+  };
+  await assert.rejects(readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard), /immutable commit changed/);
+  assert.equal(immutableReads, 1);
 });
 
 test('fresh replay preserves explicit zero only for measured empty active-file sets; references round trip strictly', async () => {
