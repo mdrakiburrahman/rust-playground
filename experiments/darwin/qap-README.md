@@ -10,6 +10,8 @@
 | Type check | `npx --no-install tsc --project experiments/darwin/qap-tsconfig.json` |
 | Run | Commit a clean tree, then `npx --no-install tsx experiments/darwin/qap-run.ts /absolute/path/to/darwin out/qap-screening-001`. Requires bootstrap-synced `COPILOT_GITHUB_TOKEN`; never put it in arguments. |
 | Evidence | Private ignored output: `result.json`, `receipts.jsonl`, `best-screening-plan.json`, `run.json`, `darwin.log`, and Darwin `state/`. Do not publish raw logs. |
+| Verified run | [`qap-run-proof.json`](qap-run-proof.json): four completed real Darwin iterations, five accepted distinct plans; screening score25→95.625. Database program refs were reconciled with actual Git blobs and evaluator receipts. |
+| Proposed matrix | [`qap-proposed-matrix.json`](qap-proposed-matrix.json): real evolved eight-proposal matrix for the parent to qualify, **not an Azure winner**. Original baseline seed remains unchanged. |
 | Limits | Four iterations, serial evaluator, 16 total evaluations, 180s agent/30s evaluator, 20 minute outer wall budget. Refuses runs inside the campaign's final hour (2026-11-27 12:00Z onward). No automatic retries. |
 
 For Enterprise Cloud credentials, set `COPILOT_GH_HOST` to the token's issuing
