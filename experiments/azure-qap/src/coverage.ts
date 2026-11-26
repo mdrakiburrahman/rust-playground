@@ -1,10 +1,17 @@
+/**
+ * Controller-clock bounds from complete, strongly consistent Delta-log prefix listings:
+ * prior absent-prefix request START through first present-prefix request END.
+ */
+export interface DeltaCommitBounds { lowerMs: number; upperMs: number }
+
 export interface CoverageCohort {
   version: number;
   rows: number;
   files: number;
   bytes: number;
-  /** Producer clock, also used by the measurement window. */
+  /** Producer-clock writer ACK; never substituted for a missing commit bound. */
   finishedAtMs: number;
+  commitBounds?: DeltaCommitBounds;
 }
 
 /** Reconstructed cumulative inventory, including metadata-only versions and warmup. */
@@ -64,11 +71,14 @@ export interface CoverageInput {
   cohorts: readonly CoverageCohort[];
   sourceSnapshots: readonly SourceSnapshot[];
   observations: readonly CoverageObservation[];
+  /** Controller clock when commitBounds are present; producer clock in the legacy writer-ACK mode. */
   warmupStartMs: number;
   measurementStartMs: number;
   measurementEndMs: number;
   producerStoppedAtMs: number;
-  /** Absolute producer/controller clock uncertainty, measured independently; null means unknown. */
+  /** Required only to report the separate producer-clock rate when using controller-clock commit bounds. */
+  producerMeasurementWindow?: { startMs: number; endMs: number };
+  /** Absolute producer/controller uncertainty; ignored for controller-only commitBounds, null means unknown. */
   clockErrorMs: number | null;
   sourceFinalized: boolean;
   /** False for any remove or non-dataChange add, even when the final active inventory happens to match. */
@@ -88,6 +98,7 @@ export interface CertifiedWatermark {
 }
 export interface CohortCoverage extends CoverageCohort {
   measured: boolean;
+  measurementMembership: 'inside' | 'outside' | 'boundary-uncertain' | 'unknown';
   proven: boolean;
   certifiedAtMs: number | null;
   watermarkVersion: number | null;
@@ -105,18 +116,23 @@ export interface CoverageResult {
   reasons: string[];
   scope: 'whole-source row/file/version inventory coverage; not content equality or producer identity';
   source: {
+    measurementBasis: 'canonical-writer-finish' | 'durable-delta-log-visibility-bounds';
     measuredRows: number;
     durationMs: number;
     rowsPerSecond: number;
     steadyStateRowsPerSecond: number | null;
     meetsTarget: boolean;
     postStopRows: number;
+    canonicalProducer: { measuredRows: number; durationMs: number; rowsPerSecond: number } | null;
+    boundaryUncertain: { cohorts: number; rows: number };
+    missingCommitBounds: { cohorts: number; rows: number };
   };
   cohorts: CohortCoverage[];
   censored: { cohorts: number; rows: number; files: number };
   latency: {
     weighting: 'cohort';
     method: 'nearest-rank interval bounds; proven measured cohorts only';
+    anchor: 'writer-acknowledgement' | 'durable-delta-log-visibility';
     clockErrorMs: number | null;
     count: number;
     p50: LatencyBounds | null;
@@ -186,6 +202,12 @@ function validate(input: CoverageInput): void {
   for (const field of ['warmupStartMs', 'measurementStartMs', 'measurementEndMs', 'producerStoppedAtMs'] as const)
     number(input[field], field);
   if (input.measurementEndMs <= input.measurementStartMs) throw new TypeError('Invalid measurement window');
+  if (input.producerMeasurementWindow) {
+    number(input.producerMeasurementWindow.startMs, 'producerMeasurementWindow.startMs');
+    number(input.producerMeasurementWindow.endMs, 'producerMeasurementWindow.endMs');
+    if (input.producerMeasurementWindow.endMs <= input.producerMeasurementWindow.startMs)
+      throw new TypeError('Invalid producer measurement window');
+  }
   if (input.clockErrorMs !== null && input.clockErrorMs !== undefined) number(input.clockErrorMs, 'clockErrorMs');
   boolean(input.sourceFinalized, 'sourceFinalized');
   boolean(input.sourceAppendOnly, 'sourceAppendOnly');
@@ -206,7 +228,17 @@ function validate(input: CoverageInput): void {
       seen.add(entry.version);
     }
   }
-  for (const cohort of input.cohorts) number(cohort.finishedAtMs, 'finishedAtMs');
+  let priorBounds: DeltaCommitBounds | undefined;
+  for (const cohort of [...input.cohorts].sort((a, b) => a.version - b.version)) {
+    number(cohort.finishedAtMs, 'finishedAtMs');
+    if (cohort.commitBounds === undefined) continue;
+    number(cohort.commitBounds.lowerMs, 'commitBounds.lowerMs');
+    number(cohort.commitBounds.upperMs, 'commitBounds.upperMs');
+    if (cohort.commitBounds.lowerMs > cohort.commitBounds.upperMs) throw new TypeError('Reversed commit bounds');
+    if (priorBounds && (cohort.commitBounds.lowerMs < priorBounds.lowerMs || cohort.commitBounds.upperMs < priorBounds.upperMs))
+      throw new TypeError('Commit bounds violate monotonic source prefixes');
+    priorBounds = cohort.commitBounds;
+  }
   for (const snapshot of input.sourceSnapshots) {
     number(snapshot.maxFileBytes, 'maxFileBytes', true);
     number(snapshot.removeCount, 'removeCount', true);
@@ -273,12 +305,19 @@ function trend(points: readonly BacklogPoint[]): { slope: number | null; upper: 
     upper: boundDenominator > 0 ? numeratorUpper / boundDenominator : null };
 }
 
-/** No I/O. Malformed values throw; missing proof and legitimate benchmark misses are reportable results. */
+/**
+ * No I/O. Any commitBounds select controller-only timing and require bounds for every source cohort.
+ * Only intervals wholly within [measurementStartMs, measurementEndMs) count toward that source rate.
+ * With no bounds, legacy writer-ACK timing is unchanged. Malformed evidence throws; missing proof is a miss.
+ */
 export function analyzeCoverage(input: CoverageInput): CoverageResult {
   validate(input);
   const reasons = new Set<string>();
   const fail = (reason: string): void => { reasons.add(reason); };
   const cohorts = [...input.cohorts].sort((a, b) => a.version - b.version);
+  const commitBoundMode = cohorts.some(cohort => cohort.commitBounds !== undefined);
+  const missingCommitBounds = commitBoundMode ? cohorts.filter(cohort => cohort.commitBounds === undefined) : [];
+  if (missingCommitBounds.length) fail('COMMIT_BOUNDS_INCOMPLETE');
   const snapshots = [...input.sourceSnapshots].sort((a, b) => a.version - b.version);
   const byVersion = new Map(cohorts.map(cohort => [cohort.version, cohort]));
   const inventory = new Map<number, SourceSnapshot>();
@@ -320,13 +359,30 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   if (input.measurementStartMs - input.warmupStartMs !== 60_000) fail('WARMUP_NOT_60_SECONDS');
   if (input.producerStoppedAtMs !== input.measurementEndMs) fail('PRODUCER_STOP_NOT_MEASUREMENT_END');
   const clockKnown = input.clockErrorMs !== null && input.clockErrorMs !== undefined;
-  const clockErrorMs = input.clockErrorMs ?? 0;
-  if (!clockKnown) fail('CLOCK_BOUND_MISSING');
-  const measured = cohorts.filter(cohort => cohort.finishedAtMs > input.measurementStartMs &&
-    cohort.finishedAtMs <= input.measurementEndMs);
-  const steadyCohorts = measured.filter(cohort => cohort.finishedAtMs > input.policy.steadyStateStartMs);
+  const clockErrorMs = commitBoundMode ? 0 : input.clockErrorMs ?? 0;
+  if (!commitBoundMode && !clockKnown) fail('CLOCK_BOUND_MISSING');
+  const membership = (cohort: CoverageCohort, startMs: number, endMs: number): CohortCoverage['measurementMembership'] => {
+    if (!commitBoundMode) return cohort.finishedAtMs > startMs && cohort.finishedAtMs <= endMs ? 'inside' : 'outside';
+    const bounds = cohort.commitBounds;
+    if (!bounds) return 'unknown';
+    if (bounds.lowerMs >= startMs && bounds.upperMs < endMs) return 'inside';
+    if (bounds.upperMs < startMs || bounds.lowerMs >= endMs) return 'outside';
+    return 'boundary-uncertain';
+  };
+  const measured = cohorts.filter(cohort => membership(cohort, input.measurementStartMs, input.measurementEndMs) === 'inside');
+  const boundaryUncertain = cohorts.filter(cohort =>
+    membership(cohort, input.measurementStartMs, input.measurementEndMs) === 'boundary-uncertain');
+  const steadyCohorts = measured.filter(cohort => membership(cohort, input.policy.steadyStateStartMs, input.measurementEndMs) === 'inside');
   const measuredRows = sum(measured, 'rows');
   const rowsPerSecond = measuredRows * 1000 / durationMs;
+  const producerWindow = input.producerMeasurementWindow ?? (commitBoundMode ? undefined :
+    { startMs: input.measurementStartMs, endMs: input.measurementEndMs });
+  const canonicalRows = producerWindow ? sum(cohorts.filter(cohort =>
+    cohort.finishedAtMs > producerWindow.startMs && cohort.finishedAtMs <= producerWindow.endMs), 'rows') : null;
+  const canonicalProducer = producerWindow && canonicalRows !== null ? {
+    measuredRows: canonicalRows, durationMs: producerWindow.endMs - producerWindow.startMs,
+    rowsPerSecond: canonicalRows * 1000 / (producerWindow.endMs - producerWindow.startMs),
+  } : null;
   const steadyDurationMs = input.measurementEndMs - input.policy.steadyStateStartMs;
   const steadySourceRate = steadyDurationMs > 0 ? sum(steadyCohorts, 'rows') * 1000 / steadyDurationMs : null;
   const meetsTarget = rowsPerSecond >= targetRowsPerSecond && steadySourceRate !== null && steadySourceRate >= targetRowsPerSecond;
@@ -381,19 +437,23 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
     const proof = watermarks.find(watermark => watermark.version >= cohort.version && inventory.has(cohort.version));
     const prior = proof && watermarks.filter(watermark => watermark.version < cohort.version &&
       watermark.endedAtMs <= proof.startedAtMs).at(-1);
-    const upperMs = proof ? proof.endedAtMs - cohort.finishedAtMs + clockErrorMs : null;
-    if (clockKnown && upperMs !== null && upperMs < 0) fail(`CLOCK_OR_COHORT_TIME_INCONSISTENT: version ${cohort.version}`);
-    return { ...cohort, measured: measured.includes(cohort), proven: Boolean(proof),
+    const origin = commitBoundMode ? cohort.commitBounds : clockKnown ?
+      { lowerMs: cohort.finishedAtMs - clockErrorMs, upperMs: cohort.finishedAtMs + clockErrorMs } : undefined;
+    const upperMs = proof && origin ? proof.endedAtMs - origin.lowerMs : null;
+    if (upperMs !== null && upperMs < 0) fail(`CLOCK_OR_COHORT_TIME_INCONSISTENT: version ${cohort.version}`);
+    return { ...cohort, measured: measured.includes(cohort),
+      measurementMembership: membership(cohort, input.measurementStartMs, input.measurementEndMs), proven: Boolean(proof),
       certifiedAtMs: proof?.endedAtMs ?? null, watermarkVersion: proof?.version ?? null,
-      latency: clockKnown && upperMs !== null && upperMs >= 0 ? {
-        lowerMs: Math.max(0, (prior?.startedAtMs ?? cohort.finishedAtMs) - cohort.finishedAtMs - clockErrorMs), upperMs,
+      latency: origin && upperMs !== null && upperMs >= 0 ? {
+        lowerMs: Math.max(0, (prior?.startedAtMs ?? origin.upperMs) - origin.upperMs), upperMs,
       } : null };
   });
   const censored = coverage.filter(cohort => cohort.measured && !cohort.proven);
   if (censored.length) fail('MEASURED_COHORTS_CENSORED');
   const latencies = coverage.filter(cohort => cohort.measured).flatMap(cohort => cohort.latency ? [cohort.latency] : []);
   if (!latencies.length) fail('NO_BOUNDED_MEASURED_LATENCY');
-  const steady = clockKnown && steadyDurationMs > 0 ? watermarks.filter(watermark => watermark.startedAtMs - clockErrorMs >= input.policy.steadyStateStartMs &&
+  const timingAvailable = commitBoundMode || clockKnown;
+  const steady = timingAvailable && steadyDurationMs > 0 ? watermarks.filter(watermark => watermark.startedAtMs - clockErrorMs >= input.policy.steadyStateStartMs &&
     watermark.endedAtMs + clockErrorMs <= input.measurementEndMs) : [];
   const first = steady.at(0), last = steady.at(-1);
   const distinctVersions = new Set(steady.map(watermark => watermark.version)).size;
@@ -414,11 +474,15 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   if (acceleratedRate === null || steadySourceRate === null ||
       acceleratedRate + input.policy.maxSteadyStateDeficitRowsPerSecond < steadySourceRate)
     steadyFail('STEADY_STATE_ACCELERATION_BELOW_SOURCE');
-  const sourceRowsAt = (time: number): number => sum(cohorts.filter(cohort => cohort.finishedAtMs <= time), 'rows');
+  const sourceRowsAt = (time: number, bound: 'definite' | 'possible'): number => sum(cohorts.filter(cohort => {
+    if (!commitBoundMode) return cohort.finishedAtMs <= time;
+    if (!cohort.commitBounds) return bound === 'possible';
+    return (bound === 'definite' ? cohort.commitBounds.upperMs : cohort.commitBounds.lowerMs) <= time;
+  }), 'rows');
   const backlog = steady.map((watermark): BacklogPoint => ({
     startedAtMs: watermark.startedAtMs - clockErrorMs, endedAtMs: watermark.endedAtMs + clockErrorMs, version: watermark.version,
-    lowerRows: Math.max(0, sourceRowsAt(watermark.startedAtMs - clockErrorMs) - watermark.rows),
-    upperRows: Math.max(0, sourceRowsAt(watermark.endedAtMs + clockErrorMs) - watermark.rows),
+    lowerRows: Math.max(0, sourceRowsAt(watermark.startedAtMs - clockErrorMs, 'definite') - watermark.rows),
+    upperRows: Math.max(0, sourceRowsAt(watermark.endedAtMs + clockErrorMs, 'possible') - watermark.rows),
   }));
   const slopes = trend(backlog);
   const increase = backlog.length > 1 ? backlog.at(-1)!.upperRows - backlog[0].lowerRows : null;
@@ -442,10 +506,16 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   return {
     qualified: reasons.size === 0, reasons: [...reasons],
     scope: 'whole-source row/file/version inventory coverage; not content equality or producer identity',
-    source: { measuredRows, durationMs, rowsPerSecond, steadyStateRowsPerSecond: steadySourceRate, meetsTarget,
-      postStopRows: sum(cohorts.filter(cohort => cohort.finishedAtMs > input.producerStoppedAtMs), 'rows') },
+    source: { measurementBasis: commitBoundMode ? 'durable-delta-log-visibility-bounds' : 'canonical-writer-finish',
+      measuredRows, durationMs, rowsPerSecond, steadyStateRowsPerSecond: steadySourceRate, meetsTarget,
+      postStopRows: sum(cohorts.filter(cohort => commitBoundMode ?
+        cohort.commitBounds !== undefined && cohort.commitBounds.lowerMs >= input.producerStoppedAtMs :
+        cohort.finishedAtMs > input.producerStoppedAtMs), 'rows'),
+      canonicalProducer, boundaryUncertain: { cohorts: boundaryUncertain.length, rows: sum(boundaryUncertain, 'rows') },
+      missingCommitBounds: { cohorts: missingCommitBounds.length, rows: sum(missingCommitBounds, 'rows') } },
     cohorts: coverage, censored: { cohorts: censored.length, rows: sum(censored, 'rows'), files: sum(censored, 'files') },
     latency: { weighting: 'cohort', method: 'nearest-rank interval bounds; proven measured cohorts only',
+      anchor: commitBoundMode ? 'durable-delta-log-visibility' : 'writer-acknowledgement',
       clockErrorMs: input.clockErrorMs ?? null, count: latencies.length,
       p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), p99: percentile(latencies, 0.99) },
     watermarks, observations: { rejected, partial, missingProvenance, maxPollingGapMs,
@@ -456,10 +526,10 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
       backlogSlopeUpperRowsPerSecond: slopes.upper, backlogIncreaseUpperRows: increase, keepsUp },
     terminalParity: { matched: terminalMatched, version: terminal?.version ?? null, rows: terminal?.rows ?? null,
       files: terminal?.files ?? null, certifiedAtMs: terminalProof?.endedAtMs ?? null },
-    drain: { complete: terminalMatched, postStopCertification: terminalProof && clockKnown ?
+    drain: { complete: terminalMatched, postStopCertification: terminalProof && timingAvailable ?
       terminalProof.endedAtMs - clockErrorMs > input.producerStoppedAtMs ? true :
         terminalProof.endedAtMs + clockErrorMs <= input.producerStoppedAtMs ? false : null : null,
-      lateness: terminalProof && clockKnown ? {
+      lateness: terminalProof && timingAvailable ? {
         lowerMs: Math.max(0, (lastNonTerminal?.startedAtMs ?? input.producerStoppedAtMs) - input.producerStoppedAtMs - clockErrorMs),
         upperMs: Math.max(0, terminalProof.endedAtMs - input.producerStoppedAtMs + clockErrorMs),
       } : null, lastObservedAtMs: observations.at(-1)?.endedAtMs ?? null },

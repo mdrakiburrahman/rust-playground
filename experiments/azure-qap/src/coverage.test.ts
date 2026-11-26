@@ -27,6 +27,15 @@ function trace(rowsPerCommit = 120_000_000): CoverageInput {
       maxBacklogGrowthRowsPerSecond: 0, maxBacklogIncreaseRows: 0 } };
 }
 
+function boundedTrace(rowsPerCommit = 120_000_000, halfWidthMs = 20): CoverageInput {
+  const input = trace(rowsPerCommit);
+  input.clockErrorMs = null;
+  input.producerMeasurementWindow = { startMs: input.measurementStartMs, endMs: input.measurementEndMs };
+  input.cohorts = input.cohorts.map(cohort => ({ ...cohort,
+    commitBounds: { lowerMs: Math.max(0, cohort.finishedAtMs - halfWidthMs), upperMs: cohort.finishedAtMs + halfWidthMs } }));
+  return input;
+}
+
 function rejects(input: CoverageInput, reason: RegExp): ReturnType<typeof analyzeCoverage> {
   const result = analyzeCoverage(input);
   assert.equal(result.qualified, false);
@@ -258,4 +267,105 @@ test('a short smoke with no acceleration reports censored evidence and an empty 
   assert.deepEqual(result.censored, { cohorts: 6, rows: 720_000_000, files: 6 });
   assert.equal(result.terminalParity.matched, false);
   assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+});
+
+test('complete controller-clock commit bounds qualify without producer clock assumptions or writer-ACK anchoring', () => {
+  const input = boundedTrace();
+  input.cohorts = input.cohorts.map(cohort => ({ ...cohort, finishedAtMs: cohort.finishedAtMs + 9_000_000 }));
+  input.producerMeasurementWindow = { startMs: 9_060_000, endMs: 9_660_000 };
+  const before = JSON.stringify(input);
+  const result = analyzeCoverage(input);
+  assert.equal(result.qualified, true, result.reasons.join('; '));
+  assert.equal(result.latency.anchor, 'durable-delta-log-visibility');
+  assert.equal(result.latency.clockErrorMs, null);
+  assert.deepEqual(result.latency.p95, { lowerMs: 0, upperMs: 130 });
+  assert.equal(result.source.measurementBasis, 'durable-delta-log-visibility-bounds');
+  assert.equal(result.source.rowsPerSecond, 11_800_000);
+  assert.equal(result.source.canonicalProducer!.rowsPerSecond, 12_000_000);
+  assert.equal(result.terminalParity.matched, true);
+  assert.equal(JSON.stringify(input), before);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  input.clockErrorMs = 3_600_000;
+  assert.deepEqual(analyzeCoverage(input).latency.p95, result.latency.p95, 'producer uncertainty is irrelevant to controller-only bounds');
+  assert.equal(analyzeCoverage(input).qualified, true);
+});
+
+test('bounded source qualification excludes boundary uncertainty even when the canonical producer rate meets target', () => {
+  const result = rejects(boundedTrace(106_000_000), /^SOURCE_RATE_BELOW_TARGET$/);
+  assert.equal(result.source.canonicalProducer!.rowsPerSecond, 10_600_000);
+  assert.ok(result.source.rowsPerSecond < 10_600_000);
+  assert.equal(result.source.measuredRows, 59 * 106_000_000);
+  assert.deepEqual(result.source.boundaryUncertain, { cohorts: 2, rows: 212_000_000 });
+  assert.equal(result.terminalParity.matched, true);
+  assert.equal(result.censored.cohorts, 0);
+});
+
+test('physical source membership includes the start but requires the entire interval strictly before the end', () => {
+  const input = boundedTrace();
+  input.cohorts = input.cohorts.map(cohort => cohort.version === 6 ?
+    { ...cohort, commitBounds: { lowerMs: 60_000, upperMs: 60_000 } } : cohort.version === 66 ?
+      { ...cohort, commitBounds: { lowerMs: 659_000, upperMs: 660_000 } } : cohort);
+  const result = analyzeCoverage(input);
+  assert.equal(result.cohorts.find(cohort => cohort.version === 6)!.measurementMembership, 'inside');
+  assert.equal(result.cohorts.at(-1)!.measurementMembership, 'boundary-uncertain');
+  assert.equal(result.cohorts.at(-1)!.measured, false);
+  assert.equal(result.source.measuredRows, 60 * 120_000_000);
+  assert.deepEqual(result.source.boundaryUncertain, { cohorts: 1, rows: 120_000_000 });
+});
+
+test('physical latency uses commit upper for its lower bound and commit lower for its upper bound', () => {
+  const input = boundedTrace();
+  input.observations = [...input.observations, observation(input.sourceSnapshots[65], 660_070)];
+  const result = analyzeCoverage(input);
+  assert.deepEqual(result.cohorts.at(-1)!.latency, { lowerMs: 40, upperMs: 130 });
+  assert.deepEqual(result.drain.lateness, { lowerMs: 60, upperMs: 110 });
+});
+
+test('listing uncertainty widens latency and definite/possible backlog rather than fabricating a commit instant', () => {
+  const precise = analyzeCoverage(boundedTrace());
+  const uncertain = rejects(boundedTrace(120_000_000, 20_000), /STEADY_STATE_BACKLOG_GROWING_OR_UNBOUNDED/);
+  assert.equal(precise.steadyState.backlog[0].upperRows, 0);
+  assert.equal(uncertain.steadyState.backlog[0].lowerRows, 0);
+  assert.ok(uncertain.steadyState.backlog[0].upperRows >= 120_000_000);
+  assert.ok(uncertain.latency.p95!.upperMs > precise.latency.p95!.upperMs);
+});
+
+test('partial bounds never qualify or substitute writer ACKs even with a supplied producer clock bound', () => {
+  for (const clockErrorMs of [null, 0]) {
+    const input = boundedTrace();
+    input.clockErrorMs = clockErrorMs;
+    input.cohorts = input.cohorts.map(cohort => cohort.version === 32 ? { ...cohort, commitBounds: undefined } : cohort);
+    const result = rejects(input, /COMMIT_BOUNDS_INCOMPLETE/);
+    assert.deepEqual(result.source.missingCommitBounds, { cohorts: 1, rows: 120_000_000 });
+    const missing = result.cohorts.find(cohort => cohort.version === 32)!;
+    assert.equal(missing.measurementMembership, 'unknown');
+    assert.equal(missing.latency, null);
+    assert.equal(missing.proven, true, 'row inventory proof is distinct from physical commit timing');
+  }
+});
+
+test('bounded mode does not invent a canonical producer window or credit a post-stop-only acceleration drain', () => {
+  const input = boundedTrace();
+  input.producerMeasurementWindow = undefined;
+  const result = analyzeCoverage(input);
+  assert.equal(result.qualified, true, result.reasons.join('; '));
+  assert.equal(result.source.canonicalProducer, null);
+  input.observations = [observation(input.sourceSnapshots.at(-1)!, 720_000)];
+  const drained = rejects(input, /STEADY_STATE_WATERMARKS_INSUFFICIENT/);
+  assert.equal(drained.terminalParity.matched, true);
+  assert.equal(drained.steadyState.acceleratedRowsPerSecondLower, null);
+  assert.deepEqual(drained.drain.lateness, { lowerMs: 0, upperMs: 60_010 });
+});
+
+test('malformed and nonmonotonic physical bounds are rejected instead of repaired', () => {
+  for (const bounds of [
+    { lowerMs: Number.NaN, upperMs: 10_020 },
+    { lowerMs: 10_020, upperMs: 9_980 },
+    { lowerMs: 0, upperMs: 1 },
+    { lowerMs: 9_000, upperMs: 20_020 },
+  ]) {
+    const input = boundedTrace();
+    input.cohorts = input.cohorts.map(cohort => cohort.version === 2 ? { ...cohort, commitBounds: bounds } : cohort);
+    assert.throws(() => analyzeCoverage(input), /Invalid commitBounds|Reversed commit bounds|monotonic source prefixes/);
+  }
 });
