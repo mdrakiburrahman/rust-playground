@@ -233,3 +233,25 @@ test('valid incomplete evidence returns a miss while malformed intervals, counte
   invalid.clockErrorMs = Number.NaN;
   assert.throws(() => analyzeCoverage(invalid), /Invalid clockErrorMs/);
 });
+
+test('a short smoke with no acceleration reports censored evidence and an empty declared steady interval without throwing', () => {
+  const input = trace();
+  input.measurementEndMs = 120_000;
+  input.producerStoppedAtMs = 120_000;
+  input.cohorts = input.cohorts.slice(0, 12);
+  input.sourceSnapshots = input.sourceSnapshots.slice(0, 13);
+  input.terminalSource = { version: 12, rows: 1_440_000_000, files: 12 };
+  input.observations = input.observations.slice(0, 12).map(value => ({ ...value, provenance: undefined,
+    before: { ...value.before, completionPercent: 0, acceleratedRows: 0, pendingFiles: 1 },
+    after: { ...value.after, completionPercent: 0, acceleratedRows: 0, pendingFiles: 1 } }));
+  const result = rejects(input, /STEADY_STATE_WINDOW_EMPTY/);
+  assert.ok(result.reasons.includes('MEASUREMENT_DURATION_NOT_600_SECONDS'));
+  assert.equal(result.source.steadyStateRowsPerSecond, null);
+  assert.equal(result.steadyState.acceleratedRowsPerSecondLower, null);
+  assert.equal(result.steadyState.keepsUp, false);
+  assert.equal(result.watermarks.length, 0);
+  assert.equal(result.latency.p95, null);
+  assert.deepEqual(result.censored, { cohorts: 6, rows: 720_000_000, files: 6 });
+  assert.equal(result.terminalParity.matched, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+});

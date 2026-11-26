@@ -106,7 +106,7 @@ export interface CoverageResult {
     measuredRows: number;
     durationMs: number;
     rowsPerSecond: number;
-    steadyStateRowsPerSecond: number;
+    steadyStateRowsPerSecond: number | null;
     meetsTarget: boolean;
     postStopRows: number;
   };
@@ -191,9 +191,9 @@ function validate(input: CoverageInput): void {
     'maxObservationGapMs', 'maxSteadyStateDeficitRowsPerSecond', 'maxBacklogGrowthRowsPerSecond',
     'maxBacklogIncreaseRows'] as const) number(input.policy[field], `policy.${field}`);
   number(input.policy.minCompleteWatermarks, 'minCompleteWatermarks', true, 3);
-  if (input.policy.steadyStateStartMs < input.measurementStartMs ||
-      input.policy.steadyStateStartMs >= input.measurementEndMs || input.policy.maxObservationGapMs <= 0 ||
-      input.policy.boundaryToleranceMs > (input.measurementEndMs - input.policy.steadyStateStartMs) / 4)
+  const steadyDurationMs = input.measurementEndMs - input.policy.steadyStateStartMs;
+  if (input.policy.steadyStateStartMs < input.measurementStartMs || input.policy.maxObservationGapMs <= 0 ||
+      (steadyDurationMs > 0 && input.policy.boundaryToleranceMs > steadyDurationMs / 4))
     throw new TypeError('Invalid steady-state policy');
   for (const [name, entries] of [['cohorts', input.cohorts], ['sourceSnapshots', input.sourceSnapshots]] as const) {
     const seen = new Set<number>();
@@ -323,11 +323,12 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   const steadyCohorts = measured.filter(cohort => cohort.finishedAtMs > input.policy.steadyStateStartMs);
   const measuredRows = sum(measured, 'rows');
   const rowsPerSecond = measuredRows * 1000 / durationMs;
-  const steadySourceRate = sum(steadyCohorts, 'rows') * 1000 /
-    (input.measurementEndMs - input.policy.steadyStateStartMs);
-  const meetsTarget = rowsPerSecond >= targetRowsPerSecond && steadySourceRate >= targetRowsPerSecond;
+  const steadyDurationMs = input.measurementEndMs - input.policy.steadyStateStartMs;
+  const steadySourceRate = steadyDurationMs > 0 ? sum(steadyCohorts, 'rows') * 1000 / steadyDurationMs : null;
+  const meetsTarget = rowsPerSecond >= targetRowsPerSecond && steadySourceRate !== null && steadySourceRate >= targetRowsPerSecond;
   if (rowsPerSecond < targetRowsPerSecond) fail('SOURCE_RATE_BELOW_TARGET');
-  if (steadySourceRate < targetRowsPerSecond) fail('SOURCE_STEADY_STATE_RATE_BELOW_TARGET');
+  if (steadySourceRate === null) fail('STEADY_STATE_WINDOW_EMPTY');
+  else if (steadySourceRate < targetRowsPerSecond) fail('SOURCE_STEADY_STATE_RATE_BELOW_TARGET');
 
   const observations = input.observations.map((value, index) => ({ ...value, index }))
     .sort((a, b) => a.endedAtMs - b.endedAtMs || a.startedAtMs - b.startedAtMs);
@@ -388,7 +389,7 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   if (censored.length) fail('MEASURED_COHORTS_CENSORED');
   const latencies = coverage.filter(cohort => cohort.measured).flatMap(cohort => cohort.latency ? [cohort.latency] : []);
   if (!latencies.length) fail('NO_BOUNDED_MEASURED_LATENCY');
-  const steady = clockKnown ? watermarks.filter(watermark => watermark.startedAtMs - clockErrorMs >= input.policy.steadyStateStartMs &&
+  const steady = clockKnown && steadyDurationMs > 0 ? watermarks.filter(watermark => watermark.startedAtMs - clockErrorMs >= input.policy.steadyStateStartMs &&
     watermark.endedAtMs + clockErrorMs <= input.measurementEndMs) : [];
   const first = steady.at(0), last = steady.at(-1);
   const distinctVersions = new Set(steady.map(watermark => watermark.version)).size;
@@ -406,7 +407,8 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   const coveredDurationMs = first && last ? last.endedAtMs - first.startedAtMs + 2 * clockErrorMs : null;
   const acceleratedRows = first && last ? last.rows - first.rows : 0;
   const acceleratedRate = coveredDurationMs && coveredDurationMs > 0 ? acceleratedRows * 1000 / coveredDurationMs : null;
-  if (acceleratedRate === null || acceleratedRate + input.policy.maxSteadyStateDeficitRowsPerSecond < steadySourceRate)
+  if (acceleratedRate === null || steadySourceRate === null ||
+      acceleratedRate + input.policy.maxSteadyStateDeficitRowsPerSecond < steadySourceRate)
     steadyFail('STEADY_STATE_ACCELERATION_BELOW_SOURCE');
   const sourceRowsAt = (time: number): number => sum(cohorts.filter(cohort => cohort.finishedAtMs <= time), 'rows');
   const backlog = steady.map((watermark): BacklogPoint => ({
