@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, linkSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assessLiveObservation, canonical, parseCandidateText, parsePlan, parseProposal, proposalHash, qapCapacity, screen, type Proposal } from "./qap-contract.js";
+import { assessLiveObservation, canonical, parseCandidateText, parsePlan, parseProposal, proposalHash, qapCapacity, screen, sha256, type Proposal } from "./qap-contract.js";
 import { loadCandidate } from "./qap-evaluator.js";
 
 const fixed = (cores: 4 | 8 | 16 | 32, nodes: number): Proposal => ({
@@ -115,4 +116,57 @@ test("trusted live adapter refuses missing latency, forged bindings, partial cov
   assert.throws(() => assessLiveObservation({ ...good, minWindowDurableRowsPerSecond: Infinity }, proposal, workload));
   assert.throws(() => assessLiveObservation({ ...good, exactTerminalParity: "true" }, proposal, workload));
   assert.throws(() => assessLiveObservation({ ...good, evidencePath: "/private" }, proposal, workload), /field/);
+});
+
+test("absolute trusted evaluator emits zero for mutations and refuses tampered scoring or exhausted budgets", () => {
+  const root = join(process.cwd(), "out", `qap-test-${randomUUID()}`);
+  const source = join(root, "source");
+  const trusted = join(root, "trusted");
+  mkdirSync(join(source, ".git"), { recursive: true });
+  mkdirSync(trusted);
+  try {
+    execFileSync("npx", ["--no-install", "tsc", "--ignoreConfig", "--target", "ES2022",
+      "--module", "NodeNext", "--moduleResolution", "NodeNext", "--strict", "--skipLibCheck",
+      "--types", "node", "--rootDir", "experiments/darwin", "--outDir", trusted,
+      "experiments/darwin/qap-contract.ts", "experiments/darwin/qap-evaluator.ts"],
+    { timeout: 60_000, stdio: "pipe" });
+    writeFileSync(join(source, "candidate.json"), `${canonical(plan())}\n`);
+    const receiptFile = join(root, "receipts.jsonl");
+    writeFileSync(receiptFile, "");
+    const files = Object.fromEntries(["qap-contract.js", "qap-evaluator.js"].map((name) =>
+      [name, sha256(readFileSync(join(trusted, name)))]));
+    const manifestPath = join(trusted, "manifest.json");
+    const manifest = { schemaVersion: 1, files, receiptFile, deadlineMs: Date.now() + 60_000,
+      maxEvaluations: 16, sourceCommit: "a".repeat(40) };
+    writeFileSync(manifestPath, canonical(manifest));
+    const invoke = () => spawnSync(process.execPath, [join(trusted, "qap-evaluator.js"), manifestPath],
+      { cwd: source, encoding: "utf8", timeout: 10_000 });
+    const first = invoke();
+    assert.equal(first.status, 0, first.stderr);
+    const receipt = JSON.parse(first.stdout.trim().slice(8));
+    assert.equal(receipt.kind, "screening");
+    assert.equal(receipt.qualified, false);
+    assert.equal(receipt.valid, 1);
+    assert.equal(receipt.freshPrivateCases, 24);
+    const second = JSON.parse(invoke().stdout.trim().slice(8));
+    assert.notEqual(receipt.privateCaseNonceSha256, second.privateCaseNonceSha256);
+    writeFileSync(join(source, "workload.json"), "{}");
+    const invalid = invoke();
+    assert.equal(invalid.status, 0);
+    assert.equal(JSON.parse(invalid.stdout.trim().slice(8)).combined_score, 0);
+    rmSync(join(source, "workload.json"));
+    writeFileSync(manifestPath, canonical({ ...manifest, deadlineMs: 0 }));
+    const expired = invoke();
+    assert.notEqual(expired.status, 0);
+    assert.equal(expired.stdout, "");
+    writeFileSync(manifestPath, canonical(manifest));
+    writeFileSync(receiptFile, "{}\n".repeat(16));
+    assert.notEqual(invoke().status, 0);
+    writeFileSync(receiptFile, "");
+    writeFileSync(join(trusted, "qap-contract.js"), `${readFileSync(join(trusted, "qap-contract.js"), "utf8")}\n`);
+    const tampered = invoke();
+    assert.notEqual(tampered.status, 0);
+    assert.equal(tampered.stdout, "");
+    assert.equal(readFileSync(receiptFile, "utf8"), "");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

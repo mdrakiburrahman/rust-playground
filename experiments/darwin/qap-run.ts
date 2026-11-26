@@ -1,6 +1,6 @@
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { parseEnv } from "node:util";
 import { fileURLToPath } from "node:url";
 import { canonical, parseCandidateText, sha256 } from "./qap-contract.js";
@@ -50,7 +50,7 @@ export async function main(args: string[]) {
   run("git", ["-c", "user.name=QAP screening", "-c", "user.email=qap-screening@localhost",
     "commit", "--quiet", "-m", `Sanitized candidate seed from ${sourceCommit}`], source);
   const seedCommit = run("git", ["rev-parse", "HEAD"], source);
-  run("npx", ["--no-install", "tsc", "--target", "ES2022", "--module", "NodeNext",
+  run("npx", ["--no-install", "tsc", "--ignoreConfig", "--target", "ES2022", "--module", "NodeNext",
     "--moduleResolution", "NodeNext", "--strict", "--skipLibCheck", "--types", "node",
     "--rootDir", "experiments/darwin", "--outDir", trusted,
     "experiments/darwin/qap-contract.ts", "experiments/darwin/qap-evaluator.ts"], repo);
