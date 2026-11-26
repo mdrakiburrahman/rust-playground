@@ -71,6 +71,8 @@ export interface CoverageInput {
   /** Absolute producer/controller clock uncertainty, measured independently; null means unknown. */
   clockErrorMs: number | null;
   sourceFinalized: boolean;
+  /** False for any remove or non-dataChange add, even when the final active inventory happens to match. */
+  sourceAppendOnly: boolean;
   terminalSource?: { version: number; rows: number; files: number };
   policy: CoveragePolicy;
 }
@@ -186,6 +188,7 @@ function validate(input: CoverageInput): void {
   if (input.measurementEndMs <= input.measurementStartMs) throw new TypeError('Invalid measurement window');
   if (input.clockErrorMs !== null && input.clockErrorMs !== undefined) number(input.clockErrorMs, 'clockErrorMs');
   boolean(input.sourceFinalized, 'sourceFinalized');
+  boolean(input.sourceAppendOnly, 'sourceAppendOnly');
   for (const [field, value] of Object.entries(input.policy)) number(value, `policy.${field}`);
   for (const field of ['steadyStateStartMs', 'minCompleteWatermarks', 'boundaryToleranceMs',
     'maxObservationGapMs', 'maxSteadyStateDeficitRowsPerSecond', 'maxBacklogGrowthRowsPerSecond',
@@ -279,7 +282,7 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
   const snapshots = [...input.sourceSnapshots].sort((a, b) => a.version - b.version);
   const byVersion = new Map(cohorts.map(cohort => [cohort.version, cohort]));
   const inventory = new Map<number, SourceSnapshot>();
-  let prefixValid = true;
+  let prefixValid = input.sourceAppendOnly;
   let previous = { version: -1, rows: 0, files: 0, bytes: 0, maxFileBytes: 0 };
   for (const snapshot of snapshots) {
     const cohort = byVersion.get(snapshot.version);
@@ -307,6 +310,7 @@ export function analyzeCoverage(input: CoverageInput): CoverageResult {
     if (!snapshots.some(snapshot => snapshot.version === cohort.version)) fail(`SOURCE_COHORT_WITHOUT_VERSION: ${cohort.version}`);
   if (!snapshots.length) fail('SOURCE_INVENTORY_MISSING');
   if (!input.sourceFinalized) fail('SOURCE_NOT_FINALIZED');
+  if (!input.sourceAppendOnly) fail('SOURCE_NOT_APPEND_ONLY');
   const terminal = input.terminalSource;
   const lastSnapshot = snapshots.at(-1);
   if (!terminal || !lastSnapshot || terminal.version !== lastSnapshot.version || terminal.rows !== lastSnapshot.rows ||

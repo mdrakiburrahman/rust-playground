@@ -20,7 +20,8 @@ function trace(rowsPerCommit = 120_000_000): CoverageInput {
   return { cohorts, sourceSnapshots,
     observations: sourceSnapshots.slice(1).map(snapshot => observation(snapshot, snapshot.version * 10_000 + 100)),
     warmupStartMs: 0, measurementStartMs: 60_000, measurementEndMs: 660_000, producerStoppedAtMs: 660_000,
-    clockErrorMs: 5, sourceFinalized: true, terminalSource: { version: 66, rows: 66 * rowsPerCommit, files: 66 },
+    clockErrorMs: 5, sourceFinalized: true, sourceAppendOnly: true,
+    terminalSource: { version: 66, rows: 66 * rowsPerCommit, files: 66 },
     policy: { steadyStateStartMs: 180_000, minCompleteWatermarks: 3, boundaryToleranceMs: 10_500,
       maxObservationGapMs: 10_100, maxSteadyStateDeficitRowsPerSecond: 1000,
       maxBacklogGrowthRowsPerSecond: 0, maxBacklogIncreaseRows: 0 } };
@@ -121,6 +122,9 @@ test('oversized files, removes, and incomplete inventory invalidate subsequent w
     const result = rejects(input, /SOURCE_FILE_OVERSIZED|SOURCE_NOT_APPEND_ONLY|SOURCE_INVENTORY_INCOMPLETE/);
     assert.equal(result.terminalParity.matched, false);
   }
+  const rewritten = trace();
+  rewritten.sourceAppendOnly = false;
+  assert.equal(rejects(rewritten, /SOURCE_NOT_APPEND_ONLY/).watermarks.length, 0);
 });
 
 test('post-stop-only drain establishes terminal inventory parity but never steady-state keeping up', () => {
