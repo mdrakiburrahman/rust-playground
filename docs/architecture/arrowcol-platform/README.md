@@ -20,6 +20,7 @@ There is no Direct collector, SQL catalog, Hive Metastore, client durable receip
 | [Routing](routing.md) | Metadata, trust boundary, pressure, ownership, fencing |
 | [Catalog](catalog.md) | Supported DDL, remote catalog commits, exact schema admission |
 | [Storage](storage.md) | Bounded DFE buffers, Parquet/Delta controls, persistence limits |
+| [Collector write path](collector-write-path.md) | Receive to Delta commit stages and the settings the throughput benchmark changed |
 | [Observability](observability.md) | Router and DFE metrics, Arrow/OTEL dashboards |
 | [Lakehouse loadtest](../loadtest/README.md) | DFE, local/Azure storage, maintenance, tenant forks, Kusto, and validation |
 

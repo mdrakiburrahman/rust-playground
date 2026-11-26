@@ -12,6 +12,7 @@ export const DOCUMENTS = [
   'docs/architecture/arrowcol-platform/delivery-guarantees.md',
   'docs/architecture/arrowcol-platform/sdk-generation.md',
   'docs/architecture/arrowcol-platform/storage.md',
+  'docs/architecture/arrowcol-platform/collector-write-path.md',
   'docs/architecture/arrowcol-platform/observability.md',
   'docs/architecture/loadtest/README.md',
   'infra/azure/README.md',
