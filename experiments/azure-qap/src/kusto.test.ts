@@ -67,6 +67,8 @@ test('printed KQL is the exact, quoted command set the demo runs', () => {
     `.create-or-alter external table ['qap_r1_optimize'] kind=delta (h@'${SOURCE}')`);
   assert.match(kql.policy('qap_r1_optimize', 'principal'),
     /^\.alter external table \['qap_r1_optimize'\] policy query_acceleration '\{"IsEnabled":true,"Hot":"7\.00:00:00",.*"ManagedIdentity":"principal"\}'$/);
+  assert.match(kql.policy('qap_r1_optimize', 'principal'), /"MaxAge":"00:05:00"/);
+  assert.doesNotMatch(kql.policy('qap_r1_optimize', 'principal'), /MaxAgeOverride/);
   assert.equal(kql.drop('t'), `.drop external table ['t'] ifexists`);
   assert.equal(kql.details('t'), `.show external table ['t'] details`);
   assert.match(kql.extents('t'), /^external_table\("t"\)\n\| summarize Rows=count\(\) by Partition=__arrowcol_ingestion, Extent=tostring\(extent_id\(\)\)/);
@@ -166,6 +168,20 @@ test('successful warning details reach the Kusto observer rather than being sile
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0]!.StatusCode, -2133196383);
   assert.match(String(warnings[0]!.Payload), /catalog is uninitialized/);
+});
+
+test('evidence query retains the complete response, request identity and bounded query options', async () => {
+  const response = v2(['Rows'], [[5]]);
+  const { kusto, calls } = fakeKusto(() => response);
+  const evidence = await kusto.queryEvidence('external_table("t") | count', signal);
+  assert.deepEqual(evidence.response, response);
+  assert.ok(evidence.startedAtMs <= evidence.endedAtMs);
+  assert.equal(evidence.clientRequestId, calls[0]!.headers['x-ms-client-request-id']);
+  assert.deepEqual(JSON.parse(calls[0]!.body.properties!), {
+    Options: { query_results_cache_max_age: '00:00:00', servertimeout: '00:00:15' },
+  });
+  const partial = fakeKusto(() => v2(['Rows'], [[5]], 1));
+  await assert.rejects(partial.kusto.queryEvidence('external_table("t") | count', signal), /error status/);
 });
 
 test('create waits out 403s while the managed identity grant propagates', async () => {

@@ -1,0 +1,1 @@
+{"proposals":[{"cluster":{"autoscale":{"enabled":true,"maxNodes":4,"minNodes":2},"coresPerNode":4,"nodes":2},"queryAccelerationCapacity":null}],"schemaVersion":1}

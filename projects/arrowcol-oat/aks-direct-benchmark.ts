@@ -13,6 +13,7 @@ import { capturedGeneration } from './aks-setup.js';
 import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.js';
 import { canonicalDeltaWindow, collectWriterCommitRecords, readDeltaAddWindow, type CanonicalDeltaWindow,
   type WriterCommitRecord } from './aks-delta-preservation.js';
+import { DirectQapObserver, captureWriterShutdown, clockErrorBound } from './aks-qap-observer.js';
 
 const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
 const namespacePrefix = 'arrow-collector-';
@@ -221,54 +222,25 @@ async function readWorkloadPodsOnPool(config: Config, pool: string): Promise<str
   return blockers;
 }
 
-async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise<void> {
-  const blockers = await readWorkloadPodsOnPool(config, pool);
-  if (blockers.length) throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`);
-}
-
-async function scalePoolToZero(config: Config, pool: string): Promise<void> {
+export async function attemptEmptyPoolScale(pool: string, actions: {
+  disableAutoscaler: () => Promise<unknown>;
+  readBlockers: () => Promise<string[]>;
+  scale: () => Promise<unknown>;
+  restoreAutoscaler: () => Promise<unknown>;
+}): Promise<string[]> {
   let blockers: string[] = [];
-  const label = `${pool} safe scale-down`;
-  let decision: 'drained' | 'scale';
-  try {
-    decision = await waitUntil(label, 25 * 60_000, async () => {
-      const current = await readPool(config, pool);
-      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
-        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
-      }
-      const nodes = await poolNodeCount(config, pool);
-      blockers = nodes === 0 ? [] : await readWorkloadPodsOnPool(config, pool);
-      const state = poolCleanupDecision(nodes, current.count, blockers);
-      return state === 'wait' ? undefined : state;
-    }, 30_000);
-  } catch (error) {
-    if (error instanceof Error && error.message === `${label} timed out.` && blockers.length) {
-      throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`, { cause: error });
-    }
-    throw error;
-  }
-  if (decision === 'drained') return;
-  await assertNoWorkloadPodsOnPool(config, pool);
   let scaleError: Error | undefined;
   try {
-    await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
-      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--disable-cluster-autoscaler', '--only-show-errors', '--output', 'none'],
-    `Temporarily disable ${pool} autoscaling`, 600);
-    await assertNoWorkloadPodsOnPool(config, pool);
-    await command(['az', 'aks', 'nodepool', 'scale', '--subscription', config.subscription,
-      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--node-count', '0', '--only-show-errors', '--output', 'none'], `Scale ${pool} to zero`, 600);
+    await actions.disableAutoscaler();
+    blockers = await actions.readBlockers();
+    if (blockers.length === 0) await actions.scale();
   } catch (error) {
     scaleError = error instanceof Error ? error : new Error(String(error));
   }
 
   let restoreError: Error | undefined;
   try {
-    await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
-      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--enable-cluster-autoscaler', '--min-count', '0', '--max-count', '1',
-      '--only-show-errors', '--output', 'none'], `Restore ${pool} autoscaling min 0/max 1`, 600);
+    await actions.restoreAutoscaler();
   } catch (error) {
     restoreError = error instanceof Error ? error : new Error(String(error));
   }
@@ -276,6 +248,43 @@ async function scalePoolToZero(config: Config, pool: string): Promise<void> {
   if (scaleError && restoreError) throw new AggregateError([scaleError, restoreError], `${pool} scale-down and autoscaler restoration both failed.`);
   if (restoreError) throw restoreError;
   if (scaleError) throw scaleError;
+  return blockers;
+}
+
+async function scalePoolToZero(config: Config, pool: string): Promise<void> {
+  const label = `${pool} safe scale-down`;
+  const poolArgs = ['--subscription', config.subscription, '--resource-group', config.group,
+    '--cluster-name', config.cluster, '--name', pool, '--only-show-errors', '--output', 'none'];
+  let blockers: string[] = [];
+  try {
+    await waitUntil(label, 25 * 60_000, async () => {
+      const current = await readPool(config, pool);
+      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
+        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
+      }
+      const nodes = await poolNodeCount(config, pool);
+      blockers = nodes === 0 ? [] : await readWorkloadPodsOnPool(config, pool);
+      const state = poolCleanupDecision(nodes, current.count, blockers);
+      if (state === 'drained') return true;
+      if (state === 'wait') return undefined;
+      blockers = await attemptEmptyPoolScale(pool, {
+        disableAutoscaler: () => command(['az', 'aks', 'nodepool', 'update', ...poolArgs, '--disable-cluster-autoscaler'],
+          `Temporarily disable ${pool} autoscaling`, 600),
+        readBlockers: () => readWorkloadPodsOnPool(config, pool),
+        scale: () => command(['az', 'aks', 'nodepool', 'scale', ...poolArgs, '--node-count', '0'], `Scale ${pool} to zero`, 600),
+        restoreAutoscaler: () => command(['az', 'aks', 'nodepool', 'update', ...poolArgs, '--enable-cluster-autoscaler',
+          '--min-count', '0', '--max-count', '1'], `Restore ${pool} autoscaling min 0/max 1`, 600),
+      });
+      if (blockers.length === 0) return true;
+      console.warn(`${pool} autoscaling restored after pods appeared; waiting for natural drain: ${blockers.join(', ')}.`);
+      return undefined;
+    }, 30_000);
+  } catch (error) {
+    if (error instanceof Error && error.message === `${label} timed out.` && blockers.length) {
+      throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 export function errorMessages(error: Error): string[] {
@@ -610,6 +619,7 @@ async function deleteOwnedNamespace(config: Config, namespace: string, runId: st
 
 interface BenchmarkReport {
   schema_version: 1;
+  benchmark_revision?: string;
   run_id: string;
   tested_at_utc: string;
   delta_root: string;
@@ -641,6 +651,13 @@ interface BenchmarkReport {
   namespace_removed: boolean;
   run_fic_removed: boolean;
   workload_pools_at_zero: boolean;
+  qap?: {
+    observation_count: number;
+    terminal_state_ready: boolean;
+    table_removed: boolean;
+    clock_error_bound_ms: number | null;
+    evidence_file: string;
+  };
 }
 
 async function ensureFreshRunDirectory(runDir: string): Promise<void> {
@@ -704,7 +721,15 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string 
   }
 }
 
-async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string; mode: 'full' | 'smoke' }): Promise<BenchmarkReport> {
+async function executeRun(options: { envFile: string; stampConfigPath: string; runId?: string;
+  mode: 'full' | 'smoke'; qap?: boolean }): Promise<BenchmarkReport> {
+  let benchmarkRevision: string | undefined;
+  if (options.qap) {
+    if ((await command(['git', 'status', '--porcelain', '--untracked-files=normal'], 'Verify committed QAP harness')).trim())
+      throw new Error('QAP runs require a committed, unchanged harness revision.');
+    benchmarkRevision = (await command(['git', 'rev-parse', 'HEAD'], 'Read QAP harness revision')).trim();
+    if (!/^[a-f0-9]{40,64}$/.test(benchmarkRevision)) throw new Error('QAP harness revision is unavailable.');
+  }
   const runId = (options.runId ?? randomUUID()).toLowerCase();
   const measurementSeconds = options.mode === 'smoke' ? 60 : 600;
   if (!uuidPattern.test(runId)) throw new Error('--run-id must be a UUID. Generate a new UUID for every run.');
@@ -775,6 +800,24 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   let canonical: CanonicalDeltaWindow | undefined;
   const writerCommits = new Map<number, WriterCommitRecord>();
   let podPlacement: BenchmarkReport['pod_placement'] = [];
+  let qap: DirectQapObserver | undefined;
+  let qapTerminalReady = false;
+  let qapTableRemoved = false;
+  const observeClock = async (loadWriter: WriterIdentity): Promise<void> => {
+    if (!qap) return;
+    const startedAtMs = Date.now();
+    try {
+      const output = await kubectl(config, ['exec', loadWriter.name, '-c', 'dataflow', '-n', namespace, '--',
+        'date', '+%s%3N'], 'Observe producer clock', 30);
+      const endedAtMs = Date.now();
+      if (!/^\d{13}$/.test(output)) throw new Error('Producer clock was not a millisecond Unix timestamp.');
+      qap.clocks.push({ startedAtMs, endedAtMs, producerAtMs: Number(output) });
+    } catch (error) {
+      console.warn('Producer clock bound unavailable; latency will remain unqualified.');
+      await writePrivateFile(resolve(runDir, 'qap-clock-error.txt'),
+        config.redact(error instanceof Error ? error.message : String(error)) + '\n');
+    }
+  };
   console.log('Run ' + runId + ': namespace ' + namespace + '; report ' + reportPath);
   try {
     await runStage('AKS preflight', 5 * 60_000, async () => {
@@ -824,6 +867,10 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await verifyRegistration(config, namespace, runId, deltaRoot);
       await assertWriterStable(config, namespace, writer);
     });
+    if (options.qap) {
+      qap = new DirectQapObserver(new Azure(config, 90), runId, runDir);
+      await runStage('create owned QAP table', 3 * 60_000, () => qap!.create(`${deltaRoot}/${tablePath}`));
+    }
     await runStage('load and Delta reconciliation', 45 * 60_000, async () => {
       if (!writer || !namespaceUid) throw new Error('Writer or owned namespace readiness was not established.');
       const loadWriter = writer, ownedUid = namespaceUid;
@@ -848,16 +895,45 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         logsReadAt = startedAt;
       };
       await sampleWriterCommits(true);
+      await observeClock(loadWriter);
       const scheduleStart = Date.now() + 130_000;
       if (scheduleStart - Date.now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
       await kubectl(config, ['patch', 'configmap', 'direct-schedule-confirmwide', '-n', namespace, '--type', 'merge',
         '-p', JSON.stringify({ data: { start: String(scheduleStart) } })], 'Schedule benchmark load');
       measurementStart = scheduleStart + 60_000;
       measurementEnd = measurementStart + measurementSeconds * 1000;
-      await waitForLoad(config, namespace, loadWriter, 22 * 60_000, () => sampleWriterCommits(false));
+      await waitForLoad(config, namespace, loadWriter, 22 * 60_000, async () => {
+        await sampleWriterCommits(false);
+        if (qap) await qap.sample();
+      });
+      await observeClock(loadWriter);
       podPlacement = await readBenchmarkPlacement(config, namespace);
       await assertWriterStable(config, namespace, loadWriter);
       await verifyNamespace(config, namespace, runId, owner, ownedUid);
+      let writerStoppedAtMs: number | undefined;
+      if (qap) {
+        await sampleWriterCommits(true);
+        if (logsReadAt === undefined) throw new Error('No successful writer log read to anchor shutdown capture.');
+        const followSince = Math.ceil((Date.now() - logsReadAt) / 1000) + 30;
+        const finalLogs = await captureWriterShutdown(['kubectl', '--context', config.cluster, 'logs',
+          `pod/${loadWriter.name}`, '-c', 'dataflow', '-n', namespace, `--since=${followSince}s`, '--follow=true'], async () => {
+          await verifyNamespace(config, namespace, runId, owner, ownedUid);
+          await assertWriterStable(config, namespace, loadWriter);
+          const deployment = requireRecord(await getObject(config, 'deployment', namespace, 'arrowcol'), 'Writer deployment');
+          const metadata = requireRecord(deployment.metadata, 'Writer deployment metadata');
+          if (typeof metadata.resourceVersion !== 'string') throw new Error('Writer resource version is unavailable.');
+          await kubectl(config, ['scale', 'deployment/arrowcol', '-n', namespace, '--replicas=0',
+            '--current-replicas=1', `--resource-version=${metadata.resourceVersion}`], 'Stop the post-window writer');
+          await waitUntil('post-window writer termination', 6 * 60_000, async () =>
+            await getObject(config, 'pod', namespace, loadWriter.name) ? undefined : true, 1000);
+        });
+        collectWriterCommitRecords(finalLogs, writerCommits);
+        writerStoppedAtMs = Date.now();
+        await qap.finishSourceSampling();
+        await writePrivateFile(resolve(runDir, 'qap-writer-stop.json'), JSON.stringify({
+          writerUid: loadWriter.uid, writerStoppedAtMs, finalRecords: writerCommits.size,
+        }) + '\n');
+      }
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
       let verifiedAt = 0;
       const window = await readDeltaAddWindow(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
@@ -867,8 +943,10 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
           verifiedAt = Date.now();
         }, Date.now() + 20 * 60_000);
       await verifyNamespace(config, namespace, runId, owner, ownedUid);
-      await assertWriterStable(config, namespace, loadWriter);
-      await sampleWriterCommits(true);
+      if (!qap) {
+        await assertWriterStable(config, namespace, loadWriter);
+        await sampleWriterCommits(true);
+      }
       await writePrivateFile(resolve(runDir, 'writer-commits.json'), `${JSON.stringify({
         measurement_start_unix_ms: measurementStart, measurement_end_unix_ms: measurementEnd, delta_adds: window.commits,
         writer_records: [...writerCommits.values()].sort((a, b) => a.version - b.version),
@@ -876,11 +954,30 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       if (window.window_rows <= 0 || window.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
       canonical = canonicalDeltaWindow(window.commits, writerCommits, measurementStart, measurementEnd);
       metrics = window;
+      if (qap) {
+        await writePrivateFile(resolve(runDir, 'qap-source.json'), JSON.stringify({
+          measurementStartMs: measurementStart, measurementEndMs: measurementEnd,
+          inputStoppedAtMs: measurementEnd,
+          warmupMs: 60_000, steadyStateStartMs: measurementStart + 120_000,
+          source: window, writerRecords: [...writerCommits.values()], clocks: qap.clocks, writerStoppedAtMs,
+          sourceVisibility: qap.sourceVisibility,
+          benchmarkRevision, manifestSha256: manifestSha,
+        }) + '\n');
+        qapTerminalReady = await qap.drain({ version: window.delta_version, rows: window.active_rows },
+          options.mode === 'smoke' ? 5 * 60_000 : 15 * 60_000);
+        await qap.captureMetrics(measurementStart - 60_000, Date.now());
+      }
     });
   } catch (error) {
     primaryError = error;
   } finally {
     const rememberCleanupError = (error: unknown) => cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+    if (qap) {
+      try {
+        await runStage('cleanup owned QAP table', 3 * 60_000, () => qap!.close());
+        qapTableRemoved = true;
+      } catch (error) { rememberCleanupError(error); }
+    }
     try {
       await runStage('cleanup owned namespace', 12 * 60_000, async () => {
         if (!kubeAuthReady) throw new Error('AKS API access was not established; namespace ownership cannot be verified.');
@@ -921,6 +1018,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
 
   const report: BenchmarkReport | undefined = metrics && canonical && writer ? {
     schema_version: 1,
+    ...(benchmarkRevision ? { benchmark_revision: benchmarkRevision } : {}),
     run_id: runId,
     tested_at_utc: new Date().toISOString(),
     delta_root: deltaRoot,
@@ -952,6 +1050,11 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     namespace_removed: namespaceRemoved,
     run_fic_removed: ficRemoved,
     workload_pools_at_zero: poolsAtZero,
+    ...(qap ? { qap: {
+      observation_count: qap.observations.length, terminal_state_ready: qapTerminalReady,
+      table_removed: qapTableRemoved, clock_error_bound_ms: clockErrorBound(qap.clocks),
+      evidence_file: 'qap-observations.jsonl',
+    } } : {}),
   } : undefined;
   if (report) await writePrivateFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   if (primaryError || cleanupErrors.length || !report || !namespaceRemoved || !ficRemoved || !poolsAtZero) {
@@ -971,27 +1074,30 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       'stamp-config': { type: 'string', default: resolve(ROOT, 'infra/azure/stamp.yaml') },
       'run-id': { type: 'string' },
       mode: { type: 'string', default: 'full' },
+      qap: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     } });
     if (values.help) {
       console.log('Usage: npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts check [--env-file PATH] [--stamp-config YAML]');
-      console.log('       npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run [--mode full|smoke] [--env-file PATH] [--stamp-config YAML] [--run-id UUID]');
+      console.log('       npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run [--mode full|smoke] [--qap] [--env-file PATH] [--stamp-config YAML] [--run-id UUID]');
       return 0;
     }
     if (positionals.length !== 1) throw new Error('Choose check or run.');
     const inputs = { envFile: resolve(values['env-file']!), stampConfigPath: resolve(values['stamp-config']!) };
     if (positionals[0] === 'check') {
-      if (values.mode !== 'full' || values['run-id']) throw new Error('check does not accept --mode or --run-id.');
+      if (values.mode !== 'full' || values['run-id'] || values.qap) throw new Error('check does not accept --mode, --qap or --run-id.');
       await executeCheck(inputs);
       return 0;
     }
     if (positionals[0] !== 'run') throw new Error('Choose check or run.');
     if (values.mode !== 'full' && values.mode !== 'smoke') throw new Error('--mode must be full or smoke.');
-    const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode });
+    const report = await executeRun({ ...inputs, runId: values['run-id'], mode: values.mode, qap: values.qap });
     console.log('PASS ' + report.canonical_rows_per_second.toFixed(2) + ' canonical durable rows/s; ' + report.canonical_rows +
       ' rows in ' + report.measurement_seconds + ' seconds; Delta v' + report.canonical_first_delta_version + '-v' +
       report.canonical_last_delta_version + '; commit-timestamp window ' + report.committed_rows_per_second.toFixed(2) +
       ' rows/s; report ' + resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', report.run_id.replaceAll('-', ''), 'report.json'));
+    if (report.qap) console.log('QAP evidence collected; terminal state ready=' + report.qap.terminal_state_ready +
+      '. This is not an accelerated-throughput or latency qualification; score the cohort evidence separately.');
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
