@@ -281,12 +281,13 @@ test('Explorer context override retains root exclusions before browser-only excl
 
 interface PublishWorkflow {
   concurrency?: {
-    'cancel-in-progress'?: boolean;
+    'cancel-in-progress'?: boolean | string;
     group?: string;
   };
   jobs: Record<string, {
     if?: string;
     needs?: string;
+    uses?: string;
     permissions?: Record<string, string>;
     strategy?: {
       'fail-fast'?: boolean;
@@ -304,6 +305,9 @@ interface PublishWorkflow {
       branches: string[];
       paths: string[];
     };
+    workflow_dispatch?: {
+      inputs?: Record<string, { type: string; default: boolean }>;
+    };
   };
   permissions?: Record<string, string>;
 }
@@ -316,7 +320,7 @@ test('publish workflow discovers, smokes, publishes, and verifies the matrix wit
     ),
   ) as PublishWorkflow;
   assert.deepEqual(workflow.permissions, { contents: 'read' });
-  assert.equal(workflow.concurrency?.['cancel-in-progress'], true);
+  assert.equal(workflow.concurrency?.['cancel-in-progress'], '${{ !inputs.windows_only }}');
   assert.equal(workflow.jobs.publish?.needs, 'plan');
   assert.equal(workflow.jobs.publish?.permissions?.contents, 'read');
   assert.equal(workflow.jobs.publish?.permissions?.packages, 'write');
@@ -355,6 +359,17 @@ test('publish workflow discovers, smokes, publishes, and verifies the matrix wit
   assert(paths.has('submodules/otel-arrow/**'));
   assert(paths.has('tools/libs/rust-playground-build/**'));
   assert(paths.has('tools/scripts/**'));
+});
+
+test('Windows-only dispatch bypasses the image matrix and invokes the reusable publisher', () => {
+  const workflow = parse(readFileSync(join(workspace, '.github/workflows/publish-images.yml'), 'utf8')) as PublishWorkflow;
+  const input = workflow.on.workflow_dispatch?.inputs?.windows_only;
+  assert.equal(input?.type, 'boolean');
+  assert.equal(input?.default, false);
+  assert.equal(workflow.jobs['arrowcol-windows']?.if, "github.event_name == 'workflow_dispatch' && inputs.windows_only");
+  assert.equal(workflow.jobs['arrowcol-windows']?.uses, './.github/workflows/publish-arrowcol-windows.yml');
+  assert.deepEqual(workflow.jobs['arrowcol-windows']?.permissions, { contents: 'write' });
+  assert.equal(workflow.jobs.plan?.if, "github.event_name != 'workflow_dispatch' || inputs.windows_only == false");
 });
 
 test('catalog image stays Rust-only with an unprivileged healthchecked runtime', () => {
