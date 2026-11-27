@@ -4,8 +4,8 @@ pub use crate::delta_io::spawn_shared_io;
 use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executor};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
-    CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
-    sync_directory, sync_directory_chain, sync_file,
+    CompletedFile, CompletedFileObservation, ParquetFileWriter, create_durable_local_root, normalize,
+    record_batch_logical_bytes, sync_directory, sync_directory_chain, sync_file,
 };
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
@@ -2797,10 +2797,7 @@ impl DeltaTable {
             let path = url
                 .to_file_path()
                 .map_err(|()| anyhow::anyhow!("invalid local table URL"))?;
-            fs::create_dir_all(&path)?;
-            let path = fs::canonicalize(path)?;
-            sync_ancestors(&path)?;
-            path
+            create_durable_local_root(&path)?
         } else {
             // Staging is intentionally retained after ambiguous failures, never
             // automatically removed on drop. VACUUM LITE cannot see these files.
@@ -3079,9 +3076,7 @@ impl DeltaTable {
         publication_fence: Option<Arc<dyn PublicationFence>>,
         reuse_snapshots: bool,
     ) -> Result<Arc<Self>> {
-        fs::create_dir_all(root.as_ref())?;
-        let root = fs::canonicalize(root)?;
-        sync_ancestors(&root)?;
+        let root = create_durable_local_root(root.as_ref())?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)

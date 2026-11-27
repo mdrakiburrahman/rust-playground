@@ -49,10 +49,12 @@ struct Args {
 fn stdin_shutdown() -> io::Result<tokio::sync::oneshot::Receiver<io::Result<()>>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     // Do not block runtime shutdown if a signal wins while stdin is open.
-    std::thread::Builder::new().name("catalog-stdin".into()).spawn(move || {
-        let result = io::copy(&mut io::stdin().lock(), &mut io::sink()).map(|_| ());
-        let _ = sender.send(result);
-    })?;
+    std::thread::Builder::new()
+        .name("catalog-stdin".into())
+        .spawn(move || {
+            let result = io::copy(&mut io::stdin().lock(), &mut io::sink()).map(|_| ());
+            let _ = sender.send(result);
+        })?;
     Ok(receiver)
 }
 

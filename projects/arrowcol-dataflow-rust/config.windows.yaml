@@ -28,7 +28,7 @@ groups:
                 type: remote
                 endpoint: 'http://127.0.0.1:8817'
               routing:
-                type: memory
+                type: standalone
               registration:
                 instance_key: arrowcol-windows-local
                 flight_endpoint: "127.0.0.1:32310"
@@ -49,7 +49,7 @@ groups:
             config:
               base_path: "${env:ARROWCOL_DELTA_ROOT}"
               routing:
-                type: memory
+                type: standalone
               commit:
                 batch_window: 100ms
                 max_files_per_commit: 1

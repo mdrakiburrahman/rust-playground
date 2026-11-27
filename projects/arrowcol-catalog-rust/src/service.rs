@@ -1540,7 +1540,7 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
-    std::fs::File::open(path.parent().context("index has no parent")?)?.sync_all()?;
+    arrow_deltalake::sync_directory(path.parent().context("index has no parent")?)?;
     Ok(())
 }
 

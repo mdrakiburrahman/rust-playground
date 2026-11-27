@@ -58,6 +58,18 @@ async function ready(url: string): Promise<boolean> {
   }
 }
 
+function assertListenerOwner(child: ChildProcess, ports: number[]) {
+  assert.ok(child.pid && child.exitCode === null, 'expected a running owned service');
+  const listeners = run('netstat.exe', ['-ano', '-p', 'TCP']).split('\n')
+    .map(line => line.trim().split(/\s+/))
+    .filter(([protocol, , remote]) => protocol === 'TCP' && (remote === '0.0.0.0:0' || remote === '[::]:0'));
+  for (const port of ports) {
+    const matching = listeners.filter(([, address]) => address.endsWith(`:${port}`));
+    assert.deepEqual(matching.map(([, address, , , pid]) => [address, Number(pid)]),
+      [[`127.0.0.1:${port}`, child.pid]], `listener ${port} must belong only to the owned loopback service`);
+  }
+}
+
 async function checkExit(exit: Promise<number | null>, service: string) {
   const timeout = new AbortController();
   try {
@@ -77,7 +89,8 @@ async function smoke(build: string, archive: string, sourceSha: string) {
     const ddl = join(root, 'arrow-ddl');
     const warehouse = join(root, 'warehouse with spaces');
     const key = join(root, 'identity.key');
-    await Promise.all([staging, extracted, ddl, warehouse].map(path => mkdir(path)));
+    const state = join(root, 'catalog');
+    await Promise.all([staging, extracted, ddl, warehouse, state].map(path => mkdir(path)));
     await writeFile(key, randomBytes(32).toString('hex'), { flag: 'wx' });
     await writeFile(join(ddl, 'windows_probe.sql'),
       'CREATE TABLE arrowcol.fixture.windows_probe (id BIGINT NOT NULL) USING DELTA\n');
@@ -104,18 +117,20 @@ async function smoke(build: string, archive: string, sourceSha: string) {
       ARROWCOL_PARTITION_GRANULARITY: 'hour',
     };
     const catalog = launch(join(extracted, executables[0]), [
-      '--listen', '127.0.0.1:8817', '--state-dir', join(root, 'catalog'), '--ddl-dir', ddl,
+      '--listen', '127.0.0.1:8817', '--state-dir', state, '--ddl-dir', ddl,
       '--warehouse-root', pathToFileURL(warehouse).href, '--ingestion-layout', '--shutdown-on-stdin-eof',
     ], env);
     processes.push(catalog.child);
     await waitUntilReady(catalog.child, async () => spawnSync(join(extracted, executables[0]),
       ['--listen', '127.0.0.1:8817', '--healthcheck'], { env, timeout: 4000, windowsHide: true }).status === 0);
+    assertListenerOwner(catalog.child, [8817]);
     const collector = launch(join(extracted, executables[1]), [
       '--config', join(extracted, configName),
     ], env);
     processes.push(collector.child);
     await waitUntilReady(collector.child, async () =>
       await ready('http://127.0.0.1:32311/readyz') && await ready('http://127.0.0.1:32312/api/v1/status'));
+    assertListenerOwner(collector.child, [32310, 32311, 32312]);
     run(join(build, 'examples', 'windows-runtime-probe.exe'), [], env);
     const drain = await fetch('http://127.0.0.1:32312/api/v1/groups/shutdown?wait=false&timeout_secs=60', {
       method: 'POST', signal: AbortSignal.timeout(5000),
@@ -140,7 +155,7 @@ async function smoke(build: string, archive: string, sourceSha: string) {
     assert.equal(minValues.id, 41);
     assert.equal(maxValues.id, 42);
     assert.equal((await readFile(join(table, decodeURIComponent(path)))).subarray(0, 4).toString(), 'PAR1');
-    console.log('Signed catalog, Flight ingestion, ordered graceful drain and two committed Delta rows verified');
+    console.log('Signed DDL accepted, unsigned DDL rejected, and Flight rows committed to Delta after ordered graceful drain');
     console.log(`${archive}: sha256:${await sha256(archive)}`);
   } finally {
     for (const child of processes.reverse()) {
@@ -161,28 +176,36 @@ function publishRelease(repo: string, archive: string, name: string, sourceSha: 
   const gh = (...args: string[]) => run('gh', args);
   const find = () => (JSON.parse(gh('api', '--paginate', '--slurp', `${releases}?per_page=100`)) as Release[][])
     .flat().find(release => release.tag_name === tag);
-  const note = `${managed}\nCurrent asset: \`${name}\`\n\nSource: \`${sourceSha}\`\n\nZIP SHA-256: \`${digest}\`\n`;
+  const note = (sha: string) => `${managed}\nCurrent asset: \`${name}\`\n\nSource: \`${sourceSha}\`\n\nZIP SHA-256: \`${sha}\`\n`;
   let release = find();
   if (!release) {
     gh('release', 'create', tag, '--repo', repo, '--target', sourceSha, '--title', releaseTitle,
-      '--notes', note, '--draft', '--latest=false');
+      '--notes', note(digest), '--draft', '--latest=false');
     release = find();
   }
   assert.ok(release?.name === releaseTitle && release.body?.startsWith(`${managed}\n`),
     `Refusing to modify an unmanaged ${tag} release`);
   const id = release.id;
   const assets = () => (JSON.parse(gh('api', '--paginate', '--slurp', `${releases}/${id}/assets?per_page=100`)) as Asset[][]).flat();
-  if (!assets().some(asset => asset.name === name)) gh('release', 'upload', tag, archive, '--repo', repo);
+  const existing = assets().find(asset => asset.name === name);
+  if (existing?.state === 'starter') gh('api', '--method', 'DELETE', `${releases}/assets/${existing.id}`);
+  if (!existing || existing.state === 'starter') gh('release', 'upload', tag, archive, '--repo', repo);
   const all = assets();
   const current = all.find(asset => asset.name === name);
-  assert.ok(current?.state === 'uploaded' && current.digest === `sha256:${digest}`,
+  assert.ok(current?.state === 'uploaded' && current.digest && /^sha256:[a-f0-9]{64}$/.test(current.digest),
     'GitHub did not confirm the candidate asset SHA-256; previous download was not removed');
-  gh('release', 'edit', tag, '--repo', repo, '--notes', note, '--draft=false', '--latest=false');
+  const approvedDigest = current.digest.slice('sha256:'.length);
+  const alreadyPublished = !release.draft && release.body?.trimEnd() === note(approvedDigest).trimEnd();
+  assert.ok(approvedDigest === digest || alreadyPublished,
+    'Candidate ZIP differs from the GitHub asset; previous download was not removed');
+  if (!alreadyPublished) {
+    gh('release', 'edit', tag, '--repo', repo, '--notes', note(approvedDigest), '--draft=false', '--latest=false');
+  }
   for (const old of all) {
     if (old.id !== current.id && ownedAsset.test(old.name)) gh('api', '--method', 'DELETE', `${releases}/assets/${old.id}`);
   }
   assert.deepEqual(assets().filter(asset => ownedAsset.test(asset.name)).map(asset => asset.id), [current.id]);
-  console.log(`Published ${current.browser_download_url} (sha256:${digest})`);
+  console.log(`Published ${current.browser_download_url} (sha256:${approvedDigest})`);
 }
 
 async function main() {
