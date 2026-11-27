@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { ROOT } from '../../infra/azure/bootstrap.js';
-import { assertRenderedManifest, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry, verifyBenchmarkPlacement } from './aks-direct-benchmark.js';
+import { assertRenderedManifest, attemptEmptyPoolScale, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry, verifyBenchmarkPlacement } from './aks-direct-benchmark.js';
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));
@@ -23,6 +23,32 @@ test('pool cleanup waits for natural drain while any non-DaemonSet pod remains',
   for (const phase of ['Running', 'Pending', 'Failed']) {
     assert.equal(poolCleanupDecision(1, 1, poolBlockingPods([{ ...job, status: { phase } }])), 'wait');
   }
+});
+
+test('a pod scheduled during autoscaler disable prevents scaling and restores autoscaling before retry', async () => {
+  const calls: string[] = [];
+  let blockers = ['kube-system/system-job (Succeeded)'];
+  const actions = {
+    disableAutoscaler: async () => { calls.push('disable'); },
+    readBlockers: async () => { calls.push('read'); return blockers; },
+    scale: async () => { calls.push('scale'); },
+    restoreAutoscaler: async () => { calls.push('restore'); },
+  };
+  assert.deepEqual(await attemptEmptyPoolScale('benche64', actions), blockers);
+  assert.deepEqual(calls, ['disable', 'read', 'restore']);
+  blockers = [];
+  assert.deepEqual(await attemptEmptyPoolScale('benche64', actions), []);
+  assert.deepEqual(calls.slice(3), ['disable', 'read', 'scale', 'restore']);
+});
+
+test('an autoscaler restore failure is not treated as a retryable pod race', async () => {
+  const failure = new Error('autoscaler restore failed');
+  await assert.rejects(attemptEmptyPoolScale('benche64', {
+    disableAutoscaler: async () => {},
+    readBlockers: async () => ['kube-system/system-job (Succeeded)'],
+    scale: async () => { assert.fail('must not scale with a pod present'); },
+    restoreAutoscaler: async () => { throw failure; },
+  }), error => error === failure);
 });
 
 test('cleanup errors include nested pool blockers', () => {

@@ -222,54 +222,25 @@ async function readWorkloadPodsOnPool(config: Config, pool: string): Promise<str
   return blockers;
 }
 
-async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise<void> {
-  const blockers = await readWorkloadPodsOnPool(config, pool);
-  if (blockers.length) throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`);
-}
-
-async function scalePoolToZero(config: Config, pool: string): Promise<void> {
+export async function attemptEmptyPoolScale(pool: string, actions: {
+  disableAutoscaler: () => Promise<unknown>;
+  readBlockers: () => Promise<string[]>;
+  scale: () => Promise<unknown>;
+  restoreAutoscaler: () => Promise<unknown>;
+}): Promise<string[]> {
   let blockers: string[] = [];
-  const label = `${pool} safe scale-down`;
-  let decision: 'drained' | 'scale';
-  try {
-    decision = await waitUntil(label, 25 * 60_000, async () => {
-      const current = await readPool(config, pool);
-      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
-        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
-      }
-      const nodes = await poolNodeCount(config, pool);
-      blockers = nodes === 0 ? [] : await readWorkloadPodsOnPool(config, pool);
-      const state = poolCleanupDecision(nodes, current.count, blockers);
-      return state === 'wait' ? undefined : state;
-    }, 30_000);
-  } catch (error) {
-    if (error instanceof Error && error.message === `${label} timed out.` && blockers.length) {
-      throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`, { cause: error });
-    }
-    throw error;
-  }
-  if (decision === 'drained') return;
-  await assertNoWorkloadPodsOnPool(config, pool);
   let scaleError: Error | undefined;
   try {
-    await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
-      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--disable-cluster-autoscaler', '--only-show-errors', '--output', 'none'],
-    `Temporarily disable ${pool} autoscaling`, 600);
-    await assertNoWorkloadPodsOnPool(config, pool);
-    await command(['az', 'aks', 'nodepool', 'scale', '--subscription', config.subscription,
-      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--node-count', '0', '--only-show-errors', '--output', 'none'], `Scale ${pool} to zero`, 600);
+    await actions.disableAutoscaler();
+    blockers = await actions.readBlockers();
+    if (blockers.length === 0) await actions.scale();
   } catch (error) {
     scaleError = error instanceof Error ? error : new Error(String(error));
   }
 
   let restoreError: Error | undefined;
   try {
-    await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
-      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-      '--enable-cluster-autoscaler', '--min-count', '0', '--max-count', '1',
-      '--only-show-errors', '--output', 'none'], `Restore ${pool} autoscaling min 0/max 1`, 600);
+    await actions.restoreAutoscaler();
   } catch (error) {
     restoreError = error instanceof Error ? error : new Error(String(error));
   }
@@ -277,6 +248,43 @@ async function scalePoolToZero(config: Config, pool: string): Promise<void> {
   if (scaleError && restoreError) throw new AggregateError([scaleError, restoreError], `${pool} scale-down and autoscaler restoration both failed.`);
   if (restoreError) throw restoreError;
   if (scaleError) throw scaleError;
+  return blockers;
+}
+
+async function scalePoolToZero(config: Config, pool: string): Promise<void> {
+  const label = `${pool} safe scale-down`;
+  const poolArgs = ['--subscription', config.subscription, '--resource-group', config.group,
+    '--cluster-name', config.cluster, '--name', pool, '--only-show-errors', '--output', 'none'];
+  let blockers: string[] = [];
+  try {
+    await waitUntil(label, 25 * 60_000, async () => {
+      const current = await readPool(config, pool);
+      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
+        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
+      }
+      const nodes = await poolNodeCount(config, pool);
+      blockers = nodes === 0 ? [] : await readWorkloadPodsOnPool(config, pool);
+      const state = poolCleanupDecision(nodes, current.count, blockers);
+      if (state === 'drained') return true;
+      if (state === 'wait') return undefined;
+      blockers = await attemptEmptyPoolScale(pool, {
+        disableAutoscaler: () => command(['az', 'aks', 'nodepool', 'update', ...poolArgs, '--disable-cluster-autoscaler'],
+          `Temporarily disable ${pool} autoscaling`, 600),
+        readBlockers: () => readWorkloadPodsOnPool(config, pool),
+        scale: () => command(['az', 'aks', 'nodepool', 'scale', ...poolArgs, '--node-count', '0'], `Scale ${pool} to zero`, 600),
+        restoreAutoscaler: () => command(['az', 'aks', 'nodepool', 'update', ...poolArgs, '--enable-cluster-autoscaler',
+          '--min-count', '0', '--max-count', '1'], `Restore ${pool} autoscaling min 0/max 1`, 600),
+      });
+      if (blockers.length === 0) return true;
+      console.warn(`${pool} autoscaling restored after pods appeared; waiting for natural drain: ${blockers.join(', ')}.`);
+      return undefined;
+    }, 30_000);
+  } catch (error) {
+    if (error instanceof Error && error.message === `${label} timed out.` && blockers.length) {
+      throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 export function errorMessages(error: Error): string[] {
