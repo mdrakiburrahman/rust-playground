@@ -43,8 +43,8 @@ Run only against an authorized idle sandbox with no other writer, preserve
 the original receipt outside the devcontainer, and reserve time for restoration.
 By default the controller limits actual and maximum topology to 64 engine vCPUs
 and eight nodes, with a QAP cap of 100. For an authorized large trial only,
-`snapshot --expanded-fixed-e32` binds the opt-in to the receipt: up to 12 fixed
-`Standard_E32ads_v5` nodes (384 engine vCPUs), and a QAP cap up to 256 that
+`snapshot --expanded-fixed-e32` binds the opt-in to the receipt: up to 16 fixed
+`Standard_E32ads_v5` nodes (512 engine vCPUs), and a QAP cap up to 256 that
 cannot exceed the trial's engine vCPUs. This does not grant Azure quota.
 The controller checks the live supported SKUs, campaign ownership, QAP
 pressure and unchanged idle background inventory before mutations. Do not

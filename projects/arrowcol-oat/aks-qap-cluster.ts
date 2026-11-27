@@ -89,8 +89,9 @@ export function validateClusterProfile(value: unknown, expanded = false): Cluste
   keys(scale, ['enabled', 'minimum', 'maximum'], 'Autoscale');
   if (typeof scale.enabled !== 'boolean') throw new Error('Autoscale enabled must be boolean.');
   const minimum = integer(scale.minimum, 'minimum'), maximum = integer(scale.maximum, 'maximum');
-  const maxNodes = expanded && sku === 'Standard_E32ads_v5' && !scale.enabled ? 12 : 8;
-  const maxCores = maxNodes === 12 ? 384 : 64;
+  const expandedFixedE32 = expanded && sku === 'Standard_E32ads_v5' && !scale.enabled;
+  const maxNodes = expandedFixedE32 ? 16 : 8;
+  const maxCores = expandedFixedE32 ? 512 : 64;
   if (minimum < 2 || maximum > maxNodes || minimum > nodes || nodes > maximum || maximum * CORES[sku] > maxCores)
     throw new Error(`Profile exceeds ${maxCores} engine vCPUs / ${maxNodes} nodes or has invalid node bounds.`);
   if (!scale.enabled && (minimum !== nodes || maximum !== nodes)) throw new Error('Fixed profiles must pin both bounds to nodes.');
