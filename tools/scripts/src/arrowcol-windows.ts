@@ -18,8 +18,8 @@ const configName = 'config.windows.yaml';
 const payload = [...executables, configName] as const;
 const manifestName = 'manifest.json';
 
-function run(program: string, args: string[], env = process.env): string {
-  const result = spawnSync(program, args, { encoding: 'utf8', env, timeout: 120_000, windowsHide: true });
+function run(program: string, args: string[], env = process.env, input?: string): string {
+  const result = spawnSync(program, args, { encoding: 'utf8', env, input, timeout: 120_000, windowsHide: true });
   if (result.error) throw result.error;
   assert.equal(result.status, 0, `${program} ${args.join(' ')} failed: ${result.stderr}\n${result.stdout}`);
   return result.stdout.trim();
@@ -169,37 +169,52 @@ async function smoke(build: string, archive: string, sourceSha: string) {
 }
 
 interface Asset { id: number; name: string; state: string; digest: string | null; browser_download_url: string }
-interface Release { id: number; tag_name: string; name: string; body: string | null; draft: boolean }
+interface Release { id: number; tag_name: string; name: string; body: string | null; draft: boolean; upload_url: string }
 
-function publishRelease(repo: string, archive: string, name: string, sourceSha: string, digest: string) {
+async function publishRelease(repo: string, archive: string, name: string, sourceSha: string, digest: string) {
   const releases = `repos/${repo}/releases`;
   const gh = (...args: string[]) => run('gh', args);
-  const find = () => (JSON.parse(gh('api', '--paginate', '--slurp', `${releases}?per_page=100`)) as Release[][])
-    .flat().find(release => release.tag_name === tag);
+  const writeRelease = (method: 'POST' | 'PATCH', endpoint: string, fields: object): Release =>
+    JSON.parse(run('gh', ['api', '--method', method, endpoint, '--input', '-'], process.env, JSON.stringify(fields)));
   const note = (sha: string) => `${managed}\nCurrent asset: \`${name}\`\n\nSource: \`${sourceSha}\`\n\nZIP SHA-256: \`${sha}\`\n`;
-  let release = find();
-  if (!release) {
-    gh('release', 'create', tag, '--repo', repo, '--target', sourceSha, '--title', releaseTitle,
-      '--notes', note(digest), '--draft', '--latest=false');
-    release = find();
-  }
-  assert.ok(release?.name === releaseTitle && release.body?.startsWith(`${managed}\n`),
+  const matching = (JSON.parse(gh('api', '--paginate', '--slurp', `${releases}?per_page=100`)) as Release[][])
+    .flat().filter(release => release.tag_name === tag);
+  assert.ok(matching.length <= 1, `Multiple releases use ${tag}; refusing to publish`);
+  const release = matching[0] ?? writeRelease('POST', releases, {
+    tag_name: tag, target_commitish: sourceSha, name: releaseTitle, body: note(digest), draft: true, make_latest: 'false',
+  });
+  const body = (value: Release) => value.body?.replaceAll('\r\n', '\n').trimEnd();
+  assert.ok(release.tag_name === tag && release.name === releaseTitle && body(release)?.startsWith(`${managed}\n`),
     `Refusing to modify an unmanaged ${tag} release`);
   const id = release.id;
+  assert.ok(Number.isSafeInteger(id) && id > 0, 'GitHub did not confirm the release ID');
   const assets = () => (JSON.parse(gh('api', '--paginate', '--slurp', `${releases}/${id}/assets?per_page=100`)) as Asset[][]).flat();
   const existing = assets().find(asset => asset.name === name);
-  if (existing?.state === 'starter') gh('api', '--method', 'DELETE', `${releases}/assets/${existing.id}`);
-  if (!existing || existing.state === 'starter') gh('release', 'upload', tag, archive, '--repo', repo);
+  if (!existing || existing.state === 'starter') {
+    const uploadUrl = `https://uploads.github.com/${releases}/${id}/assets`;
+    assert.equal(release.upload_url, `${uploadUrl}{?name,label}`, 'Unexpected release upload URL');
+    const token = process.env.GH_TOKEN;
+    assert.ok(token, 'GH_TOKEN is required to upload a release asset');
+    if (existing) gh('api', '--method', 'DELETE', `${releases}/assets/${existing.id}`);
+    const response = await fetch(`${uploadUrl}?name=${encodeURIComponent(name)}`, {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(120_000),
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/zip' },
+      body: new Uint8Array(await readFile(archive)),
+    });
+    assert.equal(response.status, 201, `GitHub rejected the asset upload: ${response.status} ${await response.text()}`);
+  }
   const all = assets();
   const current = all.find(asset => asset.name === name);
   assert.ok(current?.state === 'uploaded' && current.digest && /^sha256:[a-f0-9]{64}$/.test(current.digest),
     'GitHub did not confirm the candidate asset SHA-256; previous download was not removed');
   const approvedDigest = current.digest.slice('sha256:'.length);
-  const alreadyPublished = !release.draft && release.body?.trimEnd() === note(approvedDigest).trimEnd();
+  const alreadyPublished = !release.draft && body(release) === note(approvedDigest).trimEnd();
   assert.ok(approvedDigest === digest || alreadyPublished,
     'Candidate ZIP differs from the GitHub asset; previous download was not removed');
   if (!alreadyPublished) {
-    gh('release', 'edit', tag, '--repo', repo, '--notes', note(approvedDigest), '--draft=false', '--latest=false');
+    const published = writeRelease('PATCH', `${releases}/${id}`, { body: note(approvedDigest), draft: false, make_latest: 'false' });
+    assert.ok(published.id === id && published.tag_name === tag && !published.draft &&
+      body(published) === note(approvedDigest).trimEnd(), 'GitHub did not confirm the new release receipt');
   }
   for (const old of all) {
     if (old.id !== current.id && ownedAsset.test(old.name)) gh('api', '--method', 'DELETE', `${releases}/assets/${old.id}`);
@@ -224,7 +239,7 @@ async function main() {
     const repo = process.env.GITHUB_REPOSITORY;
     assert.ok(process.env.GITHUB_ACTIONS === 'true' && repo === 'mdrakiburrahman/rust-playground',
       'Release writes are only supported by the upstream GitHub Actions workflow');
-    publishRelease(repo, archive, name, sourceSha, await sha256(archive));
+    await publishRelease(repo, archive, name, sourceSha, await sha256(archive));
   }
 }
 

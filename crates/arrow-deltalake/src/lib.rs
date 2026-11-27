@@ -203,13 +203,13 @@ impl ParquetFileWriter {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        #[cfg(not(windows))]
-        tokio::fs::File::open(parent).await?.sync_all().await?;
         #[cfg(windows)]
         {
             let parent = parent.to_owned();
             tokio::task::spawn_blocking(move || sync_directory(&parent)).await??;
         }
+        #[cfg(not(windows))]
+        tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok(CompletedFile {
             path: self.path,
             rows: self.rows,
