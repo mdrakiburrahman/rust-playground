@@ -278,18 +278,20 @@ export function resourceTrace(observations: unknown[], startMs: number, endMs: n
         maximum: valid.length ? Math.max(...valid.map(point => Number(point.maximum))) : null });
       if (name === 'InstanceCount' && locations.size === 1 && locations.has('canadacentral') &&
           !reasons.includes('CLUSTER_TRACE_INCOMPLETE')) {
-        const sku = scoped(clusters)[0]?.profile.sku;
+        const profile = scoped(clusters)[0]?.profile;
+        const sku = profile?.sku;
         const cores = /^Standard_E(4|8|16|32)ads_v5$/.exec(sku ?? '')?.[1];
         const fullStart = Math.ceil(startMs / 60_000) * 60_000, fullEnd = Math.floor(endMs / 60_000) * 60_000;
         const fullPoints = valid.filter(point => {
           const at = Date.parse(String(point.timeStamp));
           return at >= fullStart && at < fullEnd;
         });
-        if (cores && scoped(clusters).every(sample => sample.profile.sku === sku) &&
+        if (cores && profile && scoped(clusters).every(sample => sample.profile.sku === sku &&
+            sample.profile.autoscale.maximum === profile.autoscale.maximum) &&
             fullPoints.length > 0 && fullPoints.length === (fullEnd - fullStart) / 60_000 &&
             fullPoints.every((point, index) => Date.parse(String(point.timeStamp)) === fullStart + index * 60_000 &&
               Number(point.average) >= 2 && Number(point.average) <= Number(point.maximum) &&
-              Number(point.maximum) <= Math.min(8, 64 / Number(cores)))) {
+              Number(point.maximum) <= profile.autoscale.maximum)) {
           const nodeSeconds = fullPoints.reduce((sum, point) => sum + Number(point.average) * 60, 0);
           const usdPerVcpuHour = 0.182;
           engineCost = { startMs: fullStart, endMs: fullEnd, nodeSeconds, usdPerVcpuHour,

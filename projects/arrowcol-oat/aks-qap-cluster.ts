@@ -57,6 +57,7 @@ export interface BackgroundAttestation {
 }
 export interface Receipt {
   schemaVersion: 1 | 2;
+  expanded?: true;
   owner: string;
   clusterId: string;
   deadlineMs: number;
@@ -78,7 +79,7 @@ function keys(row: Row, expected: string[], name: string): void {
   if (Object.keys(row).sort().join(',') !== expected.sort().join(',')) throw new Error(`${name} has unexpected fields.`);
 }
 
-export function validateClusterProfile(value: unknown): ClusterProfile {
+export function validateClusterProfile(value: unknown, expanded = false): ClusterProfile {
   const row = object(value);
   keys(row, ['sku', 'nodes', 'autoscale'], 'Cluster profile');
   if (typeof row.sku !== 'string' || !Object.hasOwn(CORES, row.sku)) throw new Error('Unsupported benchmark SKU.');
@@ -88,8 +89,10 @@ export function validateClusterProfile(value: unknown): ClusterProfile {
   keys(scale, ['enabled', 'minimum', 'maximum'], 'Autoscale');
   if (typeof scale.enabled !== 'boolean') throw new Error('Autoscale enabled must be boolean.');
   const minimum = integer(scale.minimum, 'minimum'), maximum = integer(scale.maximum, 'maximum');
-  if (minimum < 2 || maximum > 8 || minimum > nodes || nodes > maximum || maximum * CORES[sku] > 64)
-    throw new Error('Profile exceeds 64 engine vCPUs / 8 nodes or has invalid node bounds.');
+  const maxNodes = expanded && sku === 'Standard_E32ads_v5' && !scale.enabled ? 12 : 8;
+  const maxCores = maxNodes === 12 ? 384 : 64;
+  if (minimum < 2 || maximum > maxNodes || minimum > nodes || nodes > maximum || maximum * CORES[sku] > maxCores)
+    throw new Error(`Profile exceeds ${maxCores} engine vCPUs / ${maxNodes} nodes or has invalid node bounds.`);
   if (!scale.enabled && (minimum !== nodes || maximum !== nodes)) throw new Error('Fixed profiles must pin both bounds to nodes.');
   return { sku, nodes, autoscale: { enabled: scale.enabled, minimum, maximum } };
 }
@@ -98,7 +101,7 @@ export function profileFromCluster(value: unknown): ClusterProfile {
   const cluster = object(value), sku = object(cluster.sku), properties = object(cluster.properties);
   const scale = object(properties.optimizedAutoscale);
   return validateClusterProfile({ sku: sku.name, nodes: sku.capacity,
-    autoscale: { enabled: scale.isEnabled, minimum: scale.minimum, maximum: scale.maximum } });
+    autoscale: { enabled: scale.isEnabled, minimum: scale.minimum, maximum: scale.maximum } }, true);
 }
 
 export function profileMatches(actual: ClusterProfile, desired: ClusterProfile, allowAutoscaleMovement: boolean): boolean {
@@ -145,18 +148,19 @@ function single(value: unknown): Row {
   return result[0]!;
 }
 
-export function validateQapCapacity(value: unknown): QapCapacity {
+export function validateQapCapacity(value: unknown, expanded = false): QapCapacity {
   const policy = object(value);
   keys(policy, ['ClusterMaximumConcurrentOperations', 'CoreUtilizationCoefficient'], 'QueryAccelerationCapacity');
   const cap = integer(policy.ClusterMaximumConcurrentOperations, 'ClusterMaximumConcurrentOperations');
   const coefficient = policy.CoreUtilizationCoefficient;
-  if (cap < 1 || cap > 100 || typeof coefficient !== 'number' || !Number.isFinite(coefficient) ||
-      coefficient < 0.1 || coefficient > 1) throw new Error('QueryAccelerationCapacity requires cap 1..100 and coefficient 0.1..1.');
+  const maxCap = expanded ? 256 : 100;
+  if (cap < 1 || cap > maxCap || typeof coefficient !== 'number' || !Number.isFinite(coefficient) ||
+      coefficient < 0.1 || coefficient > 1) throw new Error(`QueryAccelerationCapacity requires cap 1..${maxCap} and coefficient 0.1..1.`);
   return { ClusterMaximumConcurrentOperations: cap, CoreUtilizationCoefficient: coefficient };
 }
 
-export function qapPolicy(value: unknown): QapCapacity {
-  return validateQapCapacity(dynamic(single(value).Policy).QueryAccelerationCapacity);
+export function qapPolicy(value: unknown, expanded = false): QapCapacity {
+  return validateQapCapacity(dynamic(single(value).Policy).QueryAccelerationCapacity, expanded);
 }
 
 export function effectiveQapCapacity(value: unknown): Row {
@@ -287,13 +291,15 @@ export function validateReceipt(value: unknown, clusterId: string): Receipt {
   object(receipt.initial.tags);
   qapPolicy(receipt.initialCapacityPolicy);
   for (const mutation of receipt.mutations) {
-    validateClusterProfile(mutation.profile);
+    validateClusterProfile(mutation.profile, receipt.expanded);
     if (!['apply', 'restore'].includes(mutation.kind) ||
         !['intent', 'accepted', 'verified', 'uncertain'].includes(mutation.state) ||
         !Number.isFinite(Date.parse(mutation.submittedAt))) throw new Error('Invalid cluster mutation receipt.');
   }
   if (receipt.mutations.slice(0, -1).some(mutation => mutation.state !== 'verified'))
     throw new Error('A cluster mutation was appended before the previous intent was reconciled.');
+  if (receipt.expanded !== undefined && (receipt.expanded !== true || receipt.schemaVersion !== 2))
+    throw new Error('Expanded trials require an explicitly opted-in version 2 receipt.');
   if (receipt.schemaVersion === 2) {
     if (!receipt.background || !Array.isArray(receipt.policyMutations)) throw new Error('Version 2 background attestation is required.');
     validateBackground(receipt.background);
@@ -304,12 +310,12 @@ export function validateReceipt(value: unknown, clusterId: string): Receipt {
   if (receipt.policyMutations?.slice(0, -1).some(mutation => !['verified', 'not-submitted'].includes(mutation.state)))
     throw new Error('A capacity mutation was appended before the previous intent was reconciled.');
   for (const mutation of receipt.policyMutations ?? []) {
-    validateQapCapacity(mutation.before);
-    validateQapCapacity(mutation.desired);
+    validateQapCapacity(mutation.before, receipt.expanded);
+    validateQapCapacity(mutation.desired, receipt.expanded);
     if (!['apply', 'restore'].includes(mutation.kind) ||
         !['intent', 'accepted', 'verified', 'uncertain', 'not-submitted'].includes(mutation.state) ||
         !Number.isFinite(Date.parse(mutation.submittedAt)) || canonical(mutation.before) !== canonical(expected) ||
-        canonical(qapPolicy(mutation.beforePolicy)) !== canonical(mutation.before))
+        canonical(qapPolicy(mutation.beforePolicy, receipt.expanded)) !== canonical(mutation.before))
       throw new Error('Invalid capacity policy mutation receipt.');
     expected = mutation.state === 'not-submitted' ? mutation.before : mutation.desired;
   }
@@ -354,19 +360,19 @@ async function reconcilePolicy(receipt: Receipt, io: ControllerIO): Promise<unkn
     latest.readback = live;
     latest.effective = effectiveQapCapacity(await io.management('.show capacity'));
     latest.observedAt = new Date(io.now()).toISOString();
-    latest.state = canonical(qapPolicy(live)) === canonical(expected) ? 'verified' : 'uncertain';
+    latest.state = canonical(qapPolicy(live, receipt.expanded)) === canonical(expected) ? 'verified' : 'uncertain';
     await io.save(receipt);
     if (latest.state !== 'verified')
       throw new Error('Capacity policy outcome remains uncertain or changed; intent retained, never resubmit.');
   }
-  if (canonical(qapPolicy(live)) !== canonical(expected))
+  if (canonical(qapPolicy(live, receipt.expanded)) !== canonical(expected))
     throw new Error('QueryAccelerationCapacity changed outside the campaign; refusing overwrite.');
   return live;
 }
 
 async function changeCapacity(receipt: Receipt, desired: QapCapacity, kind: 'apply' | 'restore', io: ControllerIO): Promise<void> {
-  validateQapCapacity(desired);
-  const beforePolicy = await reconcilePolicy(receipt, io), before = qapPolicy(beforePolicy);
+  validateQapCapacity(desired, receipt.expanded);
+  const beforePolicy = await reconcilePolicy(receipt, io), before = qapPolicy(beforePolicy, receipt.expanded);
   if (canonical(before) === canonical(desired)) {
     effectiveQapCapacity(await io.management('.show capacity'));
     return;
@@ -380,7 +386,7 @@ async function changeCapacity(receipt: Receipt, desired: QapCapacity, kind: 'app
   await io.save(receipt);
   // Kusto has no capacity-policy compare-and-swap. Recheck the owned part, and merge only that part.
   try {
-    const guarded = qapPolicy(await io.management('.show cluster policy capacity'));
+    const guarded = qapPolicy(await io.management('.show cluster policy capacity'), receipt.expanded);
     if (canonical(guarded) !== canonical(before)) throw new Error('QueryAccelerationCapacity changed before submission.');
   } catch (error) {
     mutation.state = 'not-submitted';
@@ -453,7 +459,7 @@ async function changeCluster(receipt: Receipt, cluster: Row, profile: ClusterPro
 
 export async function clusterStatus(receipt: Receipt, io: ControllerIO): Promise<Row> {
   const cluster = await io.readCluster(), tags = object(cluster.tags), properties = object(cluster.properties);
-  const capacity = qapPolicy(await io.management('.show cluster policy capacity'));
+  const capacity = qapPolicy(await io.management('.show cluster policy capacity'), receipt.expanded);
   const effective = effectiveQapCapacity(await io.management('.show capacity'));
   const policyRestored = canonical(capacity) === canonical(qapPolicy(receipt.initialCapacityPolicy)) &&
     !(receipt.policyMutations ?? []).some(mutation => !['verified', 'not-submitted'].includes(mutation.state));
@@ -488,9 +494,13 @@ export async function controlCluster(command: 'apply' | 'restore', receipt: Rece
     requireReserve(receipt, io);
     if ((!options.profile && !options.capacity) || !options.observations || !observedQapPressure(options.observations))
       throw new Error('Apply requires a sanitized profile/capacity and sustained measured QAP pressure.');
-    const profile = options.profile ? validateClusterProfile(options.profile) : actual;
+    const profile = options.profile ? validateClusterProfile(options.profile, receipt.expanded) : actual;
     requestedProfile = profile;
-    const capacity = options.capacity ? validateQapCapacity(options.capacity) : undefined;
+    const capacity = options.capacity ? validateQapCapacity(options.capacity, receipt.expanded) : undefined;
+    if (capacity && capacity.ClusterMaximumConcurrentOperations > 100 &&
+        (profile.sku !== 'Standard_E32ads_v5' || profile.autoscale.enabled ||
+          capacity.ClusterMaximumConcurrentOperations > profile.nodes * CORES[profile.sku]))
+      throw new Error('Expanded QAP cap must fit the fixed E32ads_v5 trial topology.');
     await reconcilePolicy(receipt, io);
     requireSameBackground(receipt.background, await io.background());
     const available = await io.availableSkus();
@@ -519,7 +529,7 @@ export async function controlCluster(command: 'apply' | 'restore', receipt: Rece
     if (!status.restored) throw new Error('Restoration readback is incomplete; ownership/policy receipts require reconciliation.');
     receipt.restoredAt = new Date(io.now()).toISOString();
   } else if (!status.owned || status.state !== 'Running' || status.provisioningState !== 'Succeeded' ||
-      !profileMatches(validateClusterProfile(status.profile), requestedProfile, true) ||
+      !profileMatches(validateClusterProfile(status.profile, receipt.expanded), requestedProfile, true) ||
       canonical(status.capacity) !== canonical(expectedPolicy(receipt))) {
     throw new Error('Final campaign readback differs from the owned profile or capacity policy.');
   }
@@ -531,6 +541,7 @@ async function main(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     'env-file': { type: 'string' }, 'stamp-config': { type: 'string' }, receipt: { type: 'string' },
     profile: { type: 'string' }, capacity: { type: 'string' }, pressure: { type: 'string' }, deadline: { type: 'string' },
+    'expanded-fixed-e32': { type: 'boolean' },
   } });
   if (positionals.length !== 1 || !['snapshot', 'apply', 'restore', 'status'].includes(positionals[0]!) ||
       !values.receipt || !values['env-file'] || !values['stamp-config'])
@@ -544,6 +555,8 @@ async function main(argv: string[]): Promise<void> {
     return monitors.get(database)!.management(command, AbortSignal.timeout(60_000));
   };
   const file = resolve(values.receipt), command = positionals[0]!;
+  if (values['expanded-fixed-e32'] && command !== 'snapshot')
+    throw new Error('--expanded-fixed-e32 must be bound at snapshot time.');
   const io: ControllerIO = {
     readCluster: async () => {
       const cluster = object(await azure.arm('GET', c.cluster_id)), tags = object(cluster.tags);
@@ -575,7 +588,8 @@ async function main(argv: string[]): Promise<void> {
     if (canonical(current) !== canonical(cluster) ||
         canonical(qapPolicy(await io.management('.show cluster policy capacity'))) !== canonical(qapPolicy(initialCapacityPolicy)))
       throw new Error('Cluster or capacity policy changed during snapshot.');
-    const receipt: Receipt = { schemaVersion: 2, owner: randomUUID(), clusterId: c.cluster_id, deadlineMs,
+    const receipt: Receipt = { schemaVersion: 2, ...(values['expanded-fixed-e32'] ? { expanded: true } : {}),
+      owner: randomUUID(), clusterId: c.cluster_id, deadlineMs,
       initial: cluster, initialProfile: profileFromCluster(cluster), mutations: [], policyMutations: [],
       initialCapacityPolicy, background };
     validateReceipt(receipt, c.cluster_id);

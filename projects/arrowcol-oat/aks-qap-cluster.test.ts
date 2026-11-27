@@ -209,6 +209,29 @@ test('policy-only apply conditionally claims ownership; restore reverts QAP befo
   assert.ok(receipt.restoredAt);
 });
 
+test('expanded receipt admits the bounded fixed E32 trial and restores the original policy and topology', async () => {
+  const { state, receipt, io } = harness();
+  const sku = 'Standard_E32ads_v5' as const;
+  const profile = { sku, nodes: 12, autoscale: { enabled: false, minimum: 12, maximum: 12 } };
+  const capacity = { ClusterMaximumConcurrentOperations: 256, CoreUtilizationCoefficient: 0.5 };
+  io.availableSkus = async () => [{ sku: { name: sku } }];
+  const options = { profile, capacity, observations: saturated };
+  await assert.rejects(controlCluster('apply', receipt, options, io), /exceeds/);
+  receipt.expanded = true;
+  await assert.rejects(controlCluster('apply', receipt, { ...options, profile: {
+    ...profile, autoscale: { ...profile.autoscale, enabled: true },
+  } }, io), /exceeds/);
+  assert.throws(() => validateClusterProfile({
+    ...profile, nodes: 13, autoscale: { enabled: false, minimum: 13, maximum: 13 },
+  }, true), /exceeds/);
+  assert.equal(state.patches.length, 0);
+  const applied = await controlCluster('apply', receipt, options, io);
+  assert.deepEqual(applied.profile, profile);
+  assert.deepEqual(applied.capacity, capacity);
+  assert.equal((await controlCluster('restore', receipt, {}, io)).restored, true);
+  assert.deepEqual(state.patches.at(-1)!.policy, baseline);
+});
+
 test('lost or partial successful policy responses reconcile exact live policy with no second submission', async () => {
   for (const outcome of ['lost-applied', 'partial-applied'] as const) {
     const { state, receipt, io } = harness();
