@@ -31,16 +31,28 @@ on:
       - tools/scripts/**
       - tsconfig.json
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build and publish only the ArrowCol Windows x64 runtime
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-images-${{ github.ref }}
-  cancel-in-progress: true
+  group: publish-images-${{ github.ref }}${{ inputs.windows_only && '-windows-only' || '' }}
+  cancel-in-progress: ${{ !inputs.windows_only }}
 
 jobs:
+  arrowcol-windows:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_only
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-arrowcol-windows.yml
+
   plan:
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_only == false
     name: Discover publishable runtime images
     runs-on: ubuntu-24.04
     timeout-minutes: 10

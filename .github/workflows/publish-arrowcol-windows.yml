@@ -1,0 +1,76 @@
+name: Publish ArrowCol Windows runtime
+
+on:
+  workflow_call:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-arrowcol-windows.yml
+      - .github/workflows/publish-images.yml
+      - .gitmodules
+      - .cargo/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - package.json
+      - package-lock.json
+      - crates/**
+      - projects/arrowcol-catalog-rust/**
+      - projects/arrowcol-dataflow-rust/**
+      - submodules/otel-arrow
+      - tools/scripts/src/arrowcol-windows.ts
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build, smoke and publish Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    concurrency:
+      group: arrowcol-windows-latest
+      cancel-in-progress: false
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Set up pinned build tools
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip' -OutFile $zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '57EA59E9F551AD8D71FFAA9B5CFBE0CA1F4E720972A1DB7EC2D12AB44BFF9383') {
+            throw 'Unexpected protoc archive checksum'
+          }
+          $protoc = Join-Path $env:RUNNER_TEMP 'protoc'
+          Expand-Archive $zip $protoc
+          Join-Path $protoc 'bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Restore bounded Cargo download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: windows-arrowcol-crates-1.96.1-v1
+      - name: Build only the native runtime and smoke client
+        run: cargo +1.96.1 build --locked --release --target x86_64-pc-windows-msvc --package arrowcol-catalog-rust --package arrowcol-dataflow-rust --bins --example windows-runtime-probe
+      - run: npm ci
+      - name: Package and smoke the extracted Windows bundle
+        run: npx --no-install tsx tools/scripts/src/arrowcol-windows.ts smoke target/x86_64-pc-windows-msvc/release
+      - name: Publish verified Windows bundle
+        if: github.repository == 'mdrakiburrahman/rust-playground'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npx --no-install tsx tools/scripts/src/arrowcol-windows.ts publish target/x86_64-pc-windows-msvc/release

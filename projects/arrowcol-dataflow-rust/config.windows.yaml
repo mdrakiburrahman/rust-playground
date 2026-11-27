@@ -1,0 +1,62 @@
+version: otel_dataflow/v1
+engine:
+  shutdown_drain_timeout_seconds: 60
+  http_admin:
+    bind_address: '127.0.0.1:32312'
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  arrowcol:
+    pipelines:
+      ingest:
+        policies:
+          channel_capacity:
+            control:
+              node: 16
+              pipeline: 16
+            pdata: 2
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "127.0.0.1:32310"
+              admin_listening_addr: "127.0.0.1:32311"
+              catalog:
+                type: remote
+                endpoint: 'http://127.0.0.1:8817'
+              routing:
+                type: memory
+              registration:
+                instance_key: arrowcol-windows-local
+                flight_endpoint: "127.0.0.1:32310"
+                max_concurrent_streams: 2
+                heartbeat_interval: 1s
+                pressure_interval: 1s
+                registration_ttl: 5s
+                rss_limit_bytes: 2147483648
+                buffered_bytes_limit: 1048576
+                buffered_rows_limit: 10000
+                buffered_batches_limit: 16
+              limits:
+                batch_channel_capacity: 1
+                admission_timeout: 2s
+                max_stream_duration: 10s
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: "${env:ARROWCOL_DELTA_ROOT}"
+              routing:
+                type: memory
+              commit:
+                batch_window: 100ms
+                max_files_per_commit: 1
+                max_pending_files: 2
+              batching:
+                max_age: 5s
+              authority_timeout: 1s
+        connections:
+          - from: flight
+            to: delta

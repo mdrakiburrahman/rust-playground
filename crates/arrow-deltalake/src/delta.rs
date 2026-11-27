@@ -2723,6 +2723,10 @@ impl DeltaTable {
     /// # Errors
     /// Returns storage, authority or ownership errors.
     pub fn open_uri_with_fence(root: &str, publication_fence: Arc<dyn PublicationFence>) -> Result<Arc<Self>> {
+        // A Windows drive letter also parses as a URL scheme.
+        if Path::new(root).is_absolute() {
+            return Self::open_with_fence(root, publication_fence);
+        }
         match Url::parse(root) {
             Ok(url) if url.scheme() != "file" => Self::open_connection(
                 url,
