@@ -236,7 +236,7 @@ export function resourceTrace(observations: unknown[], startMs: number, endMs: n
     for (const value of observations) {
       const row = object(value);
       if (row.cluster) {
-        locations.add(String(object(row.cluster).location));
+        locations.add(String(object(row.cluster).location).trim().toLowerCase().replace(/\s+/g, ''));
         clusters.push({ startedAtMs: integer(row.startedAtMs, 'Cluster sample start'),
           atMs: integer(row.endedAtMs, 'Cluster sample end'), profile: profileFromCluster(row.cluster) });
       }

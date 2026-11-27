@@ -106,7 +106,7 @@ test('missing warmup absence, mismatched writer records and incomplete replay ca
 test('resource qualification requires the actual QAP resource, bounded cluster trace and complete metric window', () => {
   const observations = Array.from({ length: 21 }, (_, index) => ({
     startedAtMs: index * 30_000, endedAtMs: index * 30_000 + 1,
-    cluster: { location: 'canadacentral', sku: { name: 'Standard_E4ads_v5', capacity: 2 }, properties: {
+    cluster: { location: 'Canada Central', sku: { name: 'Standard_E4ads_v5', capacity: 2 }, properties: {
       state: 'Running', provisioningState: 'Succeeded', optimizedAutoscale: { isEnabled: true, minimum: 2, maximum: 4 },
     } },
     capacity: { Tables: [{ Columns: ['Resource', 'Total', 'Consumed'].map(ColumnName => ({ ColumnName })),
