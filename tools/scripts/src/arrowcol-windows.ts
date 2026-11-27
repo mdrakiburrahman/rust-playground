@@ -31,7 +31,10 @@ async function sha256(path: string): Promise<string> {
 
 function launch(program: string, args: string[], env: NodeJS.ProcessEnv) {
   const child = spawn(program, args, { env, windowsHide: true, stdio: ['pipe', 'inherit', 'inherit'] });
-  const exit = once(child, 'close').then(([code]: [number | null, NodeJS.Signals | null]) => code);
+  const exit = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
   // Observe spawn failure even if it occurs before a readiness probe is run.
   void exit.catch(() => {});
   return { child, exit };
