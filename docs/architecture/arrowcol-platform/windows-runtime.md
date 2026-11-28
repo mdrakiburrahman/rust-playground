@@ -3,8 +3,9 @@
 The [Windows release](https://github.com/mdrakiburrahman/rust-playground/releases/tag/arrowcol-windows-latest)
 contains one current Windows x64 ZIP with `arrowcol-catalog-rust.exe`,
 `arrowcol-dataflow-rust.exe` the canonical `config.windows.yaml` and `manifest.json`. The executables use the static
-MSVC CRT. The separate `Rust.Playground` .NET package publishes `arrow-ddl/`
-and producer contracts; it does not contain the servers.
+MSVC CRT. From `0.1.0-alpha.4` the `Rust.Playground` .NET package also carries
+both executables, verified against this manifest when packed, so .NET consumers
+need not repackage them.
 
 | Operation | Contract |
 | --- | --- |
@@ -25,3 +26,20 @@ API do not authenticate local callers; a local peer able to reach the admin
 listener can request shutdown. Catalog request signing does not secure those
 endpoints. Never bind any of the four ports to a non-loopback interface or
 include the key value in arguments, logs or release assets.
+
+## Packaged .NET supervisor
+
+RID-less and `win-*` builds copy the runtime to `<output>/arrowcol-runtime/`:
+the two executables, `config.sdk.yaml` (`config.windows.yaml` with admission
+limits widened for one collector serving every DMV table) and `runtime.json`
+(the `sourceSha` and each file's SHA-256). `WindowsLocalRuntime.StartAsync`
+applies the contract above under one service-owned `Root`:
+
+| Step | Behaviour |
+| --- | --- |
+| Own | Takes an exclusive `Root/owner.lock`, rejects reparse points and refuses to start while any of the four ports is in use |
+| Verify | Hashes and holds open each runtime file against `runtime.json`; a mismatch throws `InvalidDataException` |
+| Prepare | Creates `state/`, `ddl/`, `contracts/`, `logs/` and `delta/`, an ACL-protected `identity.key`, and one DDL file per catalog table. Compiles missing contracts into `contracts/`. |
+| Start | Starts the catalog and then the collector in a kill-on-close job object, each after the previous one is ready. A crash of the owning process takes both down. |
+| Run | `Endpoint` is the Flight URI and `DeltaRoot` the warehouse. `Completion` faults if either process exits unexpectedly. |
+| Stop | `StopAsync` drains as above, bounded by `DrainTimeout`, and throws `ArrowcolException` unless both exit 0 |

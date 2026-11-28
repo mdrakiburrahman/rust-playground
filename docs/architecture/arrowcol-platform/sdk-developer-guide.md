@@ -74,13 +74,46 @@ on Windows x64 or Linux x64 (glibc 2.34+). For custom schemas use a separate
 generated `Models.csproj` and its `contract/` directory. No Rust toolchain is
 needed by consumers.
 
-`0.1.0-alpha.3` includes SQL Server DMV types under
-`Arrowcol.Telemetry.SqlserverDmvV2` and the following build/publish assets:
+`0.1.0-alpha.4` includes SQL Server DMV types under
+`Arrowcol.Telemetry.SqlserverDmvV2`, the generic `Arrowcol.Dmv` runtime and
+the following build/publish assets:
 
 | Output | Use |
 | --- | --- |
+| `arrowcol-dmv-catalog.json` | The public DMV catalog; load with `DmvCatalog.LoadPackaged()`. |
 | `arrow-contracts/<dataset>/` | Load with `ArrowcolContract.Load(Path.Combine(AppContext.BaseDirectory, "arrow-contracts", dataset))`. |
 | `arrow-ddl/` | Mount read-only as the local catalog's `--ddl-dir`. Use the shared Delta warehouse and matching ingestion layout above. |
+| `arrowcol-runtime/` | The [Windows runtime](windows-runtime.md) for RID-less and `win-*` builds; set `ArrowcolCopyWindowsRuntime=false` to omit it. |
+
+The catalog source is
+[`dmv-catalog.json`](../../../tools/libs/arrowcol-sdk-gen/catalog/dmv-catalog.json).
+Its views, columns and projections come from public SQL Server documentation
+or released SQL Server 2025 metadata, recorded per entry as `provenance`.
+
+| Family | Tables | Contents |
+| --- | --- | --- |
+| `sqlserver_dmv_v2` | 32 | The existing schema-only fixture tables, unchanged |
+| `dmv` | 82 | One `telemetry.dmv.<view>` per view, with source, projection, `TOP`/`ORDER BY`, watermark, interval and `targets` (`sqlserver`, `sqldb_single_database`, `sqldb_elastic_pool`, `sqlmi`) |
+| `sqldb_single_database`, `sqldb_elastic_pool`, `sqlmi` | 25 | Explicit PaaS queries over public views |
+
+| `Arrowcol.Dmv` API | Behaviour |
+| --- | --- |
+| `DmvCatalog.LoadPackaged()`, `ForTarget(target)`, `Get(id)`, `With(datasets)` | Load and select datasets. `Collectable` datasets have a `Query` or `Source`. |
+| `DmvCatalog.DescribeAsync(connection, family, target, views)` | Describes views from server metadata with an explicit, bounded projection (`DmvViewSpec`: `Top` 1000, `OrderBy`, `Watermark`, `Exclude`, `Columns`). Absent views are omitted. Results carry provenance `runtime`; keep them and their compiled contracts machine-local. |
+| `DmvWriter.CollectAsync(connection, dataset, options)` | Runs the dataset's projection and streams it. A view the engine does not expose writes nothing, columns it lacks are null, and an `Optional` dataset that fails with a SQL error is skipped. |
+| `DmvWriter.WriteAsync(reader, dataset, options)` | Streams any `DbDataReader` into the dataset's contract. Columns match by name, case-insensitively and then ignoring underscores. `customer_id` and `Constants` are filled in, and `sample_time_utc` defaults to the read time. |
+| `DmvWriteOptions(endpoint, customerId)` | Batches of at most 1024 rows or 8 MiB. Each batch gets 3 attempts on a fresh stream. `Continuous` (the default) drops a batch that still fails and continues; otherwise the write throws. `Watermarks` keep incremental sources moving. |
+| `WindowsLocalRuntime.StartAsync(new(root) { Catalog = catalog })` | Starts and owns the packaged catalog and collector, then serves `Endpoint`, `Catalog` and `DeltaRoot`. |
+
+```csharp
+var catalog = DmvCatalog.LoadPackaged()
+    .With(await DmvCatalog.DescribeAsync(sql, "dmv", "sqlserver", [new DmvViewSpec("dm_os_wait_stats")]));
+await using var runtime = await WindowsLocalRuntime.StartAsync(new(@"C:\ProgramData\MyAgent\arrowcol") { Catalog = catalog });
+var options = new DmvWriteOptions(runtime.Endpoint, customerId);
+foreach (var dataset in runtime.Catalog.ForTarget("sqlserver").Where(dataset => dataset.Collectable))
+    await DmvWriter.CollectAsync(sql, dataset, options);
+await runtime.StopAsync();
+```
 
 The packaged `telemetry.sqlserver_dmv_v2` family starts at registry version 1.
 It is separate from `alpha.2`'s `telemetry.sqlserver_dmv` and the load
@@ -92,17 +125,24 @@ epoch microseconds.
 
 | Producer command | Requirements / result |
 | --- | --- |
-| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-pack -- --package-version 0.1.0-alpha.3` | Linux x64 devcontainer, .NET 8 SDK, `x86_64-pc-windows-gnu` Rust target and MinGW POSIX linker; generates DMV assets from public fixtures and outputs `.nupkg` under `target/arrowcol-nuget/` |
-| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-publish -- --package-version 0.1.0-alpha.3` | Explicit upload of a previously packed version. Supply the Azure Artifacts NuGet v3 `NUGET_URL` and packaging-write `NUGET_PAT` using private devbox settings or the ignored `.env`; do not commit them. The publishing identity needs feed publisher access. |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-pack -- --package-version 0.1.0-alpha.4` | Linux x64 devcontainer, .NET 8 SDK, `x86_64-pc-windows-gnu` Rust target, MinGW POSIX linker and an authenticated `gh`; generates DMV assets from the public catalog, downloads and verifies the `arrowcol-windows-latest` runtime (or `--windows-runtime <zip>`) and outputs `.nupkg` under `target/arrowcol-nuget/` |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-test` | Runs the .NET binding tests on Linux x64; set `ARROWCOL_TEST_SQLSERVER` to an ADO.NET connection string to include the SQL Server tests |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-publish -- --package-version 0.1.0-alpha.4` | Explicit upload of a previously packed version. Supply the Azure Artifacts NuGet v3 `NUGET_URL` and packaging-write `NUGET_PAT` using private devbox settings or the ignored `.env`; do not commit them. The publishing identity needs feed publisher access. |
 
 With an authorized NuGet source configured, check the package's native ABI and
 packaged DMV model and contract on the current RID:
 
 ```bash
 dotnet build examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj \
-  --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.3
+  --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.4
 dotnet target/arrowcol-nuget/smoke/bin/NuGetSmoke/debug/NuGetSmoke.dll
 ```
+
+[`dmv-runtime-smoke`](../../../examples/arrowcol-stream/csharp/dmv-runtime-smoke/Program.cs)
+checks the Windows runtime from cold start: tamper rejection, single ownership,
+writes, drain, Delta row counts, crash cleanup and warm restart. Publish it for
+`win-x64` and run it on Windows. Set `ARROWCOL_SMOKE_SQLSERVER` to also
+describe and collect live views.
 
 ## Minimal application APIs
 
