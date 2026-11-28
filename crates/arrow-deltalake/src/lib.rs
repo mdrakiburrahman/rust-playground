@@ -823,6 +823,12 @@ impl ParquetFileWriter {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        #[cfg(windows)]
+        {
+            let parent = parent.to_owned();
+            tokio::task::spawn_blocking(move || sync_directory(&parent)).await??;
+        }
+        #[cfg(not(windows))]
         tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok((
             CompletedFile {
@@ -857,11 +863,27 @@ pub fn record_batch_logical_bytes(batch: &RecordBatch) -> Result<u64> {
     })
 }
 
-#[cfg(feature = "delta")]
-pub(crate) fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(test)]
+/// Flush a local directory after updating its entries.
+///
+/// # Errors
+/// Returns errors opening the directory or flushing its metadata.
+pub fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(all(test, feature = "delta"))]
     sync_hook::observe(path)?;
-    File::open(path)
+    #[cfg(not(windows))]
+    let directory = File::open(path);
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Win32 requires backup semantics to open a directory and write access to flush it.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    directory
         .with_context(|| format!("open directory {}", path.display()))?
         .sync_all()
         .with_context(|| format!("fsync directory {}", path.display()))?;
@@ -872,8 +894,11 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 pub(crate) fn sync_file(path: &Path) -> Result<()> {
     #[cfg(test)]
     sync_hook::observe(path)?;
-    File::open(path)
-        .with_context(|| format!("open file {}", path.display()))?
+    #[cfg(not(windows))]
+    let file = File::open(path);
+    #[cfg(windows)]
+    let file = OpenOptions::new().read(true).write(true).open(path);
+    file.with_context(|| format!("open file {}", path.display()))?
         .sync_all()
         .with_context(|| format!("fsync file {}", path.display()))?;
     Ok(())
@@ -898,11 +923,28 @@ pub(crate) fn sync_directory_chain(leaf: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Synchronize a canonical directory and all of its ancestors, making a newly
-/// created nested table root durable even when existing entries were not yet synced.
 #[cfg(feature = "delta")]
-pub(crate) fn sync_ancestors(path: &Path) -> Result<()> {
-    path.ancestors().try_for_each(sync_directory)
+pub(crate) fn create_durable_local_root(path: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let existing_ancestor = {
+        let mut directory = path;
+        while !directory.try_exists()? {
+            directory = directory
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+        }
+        directory.canonicalize()?
+    };
+    std::fs::create_dir_all(path)?;
+    let root = path.canonicalize()?;
+    #[cfg(not(windows))]
+    root.ancestors().try_for_each(sync_directory)?;
+    // Windows flush handles require write access. Flush newly created entries,
+    // not trusted system ancestors outside the service's provisioned root.
+    #[cfg(windows)]
+    sync_directory_chain(&root, &existing_ancestor)?;
+    Ok(root)
 }
 
 /// Test-only fsync observation and fault injection, keyed by exact path so parallel

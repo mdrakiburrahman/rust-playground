@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{io, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
@@ -41,6 +41,28 @@ struct Args {
     ingestion_layout: bool,
     #[arg(long)]
     healthcheck: bool,
+    /// Drain and exit when the owner closes redirected stdin.
+    #[arg(long)]
+    shutdown_on_stdin_eof: bool,
+}
+
+fn stdin_shutdown() -> io::Result<tokio::sync::oneshot::Receiver<io::Result<()>>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // Do not block runtime shutdown if a signal wins while stdin is open.
+    std::thread::Builder::new()
+        .name("catalog-stdin".into())
+        .spawn(move || {
+            let result = io::copy(&mut io::stdin().lock(), &mut io::sink()).map(|_| ());
+            let _ = sender.send(result);
+        })?;
+    Ok(receiver)
+}
+
+async fn wait_for_stdin(stdin: Option<tokio::sync::oneshot::Receiver<io::Result<()>>>) -> io::Result<()> {
+    match stdin {
+        Some(receiver) => receiver.await.map_err(io::Error::other)?,
+        None => std::future::pending().await,
+    }
 }
 
 #[tokio::main]
@@ -112,6 +134,7 @@ async fn main() -> Result<()> {
     tracing::info!(listen = %args.listen, "catalog Flight SQL and CES ready");
     let shutdown_service = service.clone();
     let (signal_sender, signal_receiver) = tokio::sync::oneshot::channel();
+    let stdin = args.shutdown_on_stdin_eof.then(stdin_shutdown).transpose()?;
     tonic::transport::Server::builder()
         .add_service(
             FlightServiceServer::new(service.flight_service_with_ddl_identity(ddl_identity_policy.clone()))
@@ -128,9 +151,13 @@ async fn main() -> Result<()> {
             let signal = tokio::select! {
                 result = tokio::signal::ctrl_c() => result,
                 _ = terminate.recv() => Ok(()),
+                result = wait_for_stdin(stdin) => result,
             };
             #[cfg(not(unix))]
-            let signal = tokio::signal::ctrl_c().await;
+            let signal = tokio::select! {
+                result = tokio::signal::ctrl_c() => result,
+                result = wait_for_stdin(stdin) => result,
+            };
             tracing::info!("catalog draining Flight SQL and CES");
             shutdown_service.shutdown_watch_streams();
             let _ = signal_sender.send(signal);

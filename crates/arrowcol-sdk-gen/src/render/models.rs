@@ -6,7 +6,7 @@ use crate::{ArtifactBundle, SdkGenError, SdkGenResult};
 pub(super) fn render(
     context: &RenderContext<'_>,
     bundle: &ArtifactBundle,
-    cpp_source: &[u8],
+    cpp_source: Option<&[u8]>,
 ) -> SdkGenResult<BTreeMap<PathBuf, Vec<u8>>> {
     let mut files = BTreeMap::new();
     let proto = bundle
@@ -36,6 +36,32 @@ pub(super) fn render(
             .collect::<Vec<_>>()
             .join(".")
     );
+    let csharp = serde_json::json!({ "name": name, "root": "models/csharp", "message": cs_message });
+    files.insert(
+        "models/csharp/Models.csproj".into(),
+        format!(
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework><Nullable>enable</Nullable>
+    <PackageId>{name}</PackageId><AssemblyName>{name}</AssemblyName><Version>{version}.0.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.29.3" />
+    <PackageReference Include="Grpc.Tools" Version="2.67.0" PrivateAssets="All" />
+    <Protobuf Include="contract/schema.proto;contract/options.proto" ProtoRoot="contract" GrpcServices="None" />
+    <None Update="contract/**/*" Pack="true" PackagePath="contentFiles/any/any/contracts/{table}/v{version}/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
+"#,
+            version = context.schema.version(),
+            table = context.schema.table_id(),
+        )
+        .into_bytes(),
+    );
+    write_language_assets(&mut files, bundle, "csharp", &name, &message, &csharp)?;
+    let Some(cpp_source) = cpp_source else {
+        return Ok(files);
+    };
     let cpp_package = std::str::from_utf8(cpp_source)
         .map_err(|error| SdkGenError::Artifact(error.to_string()))?
         .lines()
@@ -87,27 +113,6 @@ pub(super) fn render(
         .into_bytes(),
     );
     files.insert(
-        "models/csharp/Models.csproj".into(),
-        format!(
-            r#"<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework><Nullable>enable</Nullable>
-    <PackageId>{name}</PackageId><AssemblyName>{name}</AssemblyName><Version>{version}.0.0</Version>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="Google.Protobuf" Version="3.29.3" />
-    <PackageReference Include="Grpc.Tools" Version="2.67.0" PrivateAssets="All" />
-    <Protobuf Include="contract/schema.proto;contract/options.proto" ProtoRoot="contract" GrpcServices="None" />
-    <None Update="contract/**/*" Pack="true" PackagePath="contentFiles/any/any/contracts/{table}/v{version}/%(RecursiveDir)%(Filename)%(Extension)" />
-  </ItemGroup>
-</Project>
-"#,
-            version = context.schema.version(),
-            table = context.schema.table_id(),
-        )
-        .into_bytes(),
-    );
-    files.insert(
         PathBuf::from(format!("models/cpp/model/{cpp_file}.proto")),
         cpp_source.to_vec(),
     );
@@ -127,33 +132,6 @@ target_link_libraries({name} PUBLIC protobuf::libprotobuf)
         )
         .into_bytes(),
     );
-    let mut contract = BTreeMap::from([
-        ("manifest.json".to_owned(), bundle.manifest().to_vec()),
-        ("schema.arrow".to_owned(), bundle.arrow_schema().to_vec()),
-        ("descriptor.pb".to_owned(), bundle.protobuf_descriptor().to_vec()),
-        ("schema.proto".to_owned(), bundle.protobuf_source().to_vec()),
-    ]);
-    contract.extend(
-        bundle
-            .protobuf_imports()
-            .iter()
-            .map(|(path, bytes)| (path.clone(), bytes.clone())),
-    );
-    for language in ["rust", "csharp", "cpp"] {
-        for (path, bytes) in &contract {
-            files.insert(
-                PathBuf::from(format!("models/{language}/contract/{path}")),
-                bytes.clone(),
-            );
-        }
-        files.insert(
-            PathBuf::from(format!("models/{language}/README.md")),
-            format!("# {name}\n\nStandard protobuf models for `{message}`, contract version {}.\n\n\
-                This package contains its exact language-neutral contract under `contract/` and does not depend on the Arrowcol SDK. \
-                Optional DDL properties are recorded in the protobuf options; this package does not enforce policies.\n",
-                context.schema.version()).into_bytes(),
-        );
-    }
     let manifest = serde_json::json!({
         "formatVersion": 1,
         "tableId": context.schema.table_id().to_string(),
@@ -162,15 +140,54 @@ target_link_libraries({name} PUBLIC protobuf::libprotobuf)
         "protobufMessage": message,
         "languages": {
             "rust": { "name": name, "root": "models/rust", "message": event },
-            "csharp": { "name": name, "root": "models/csharp", "message": cs_message },
+            "csharp": csharp,
             "cpp": { "name": name, "root": "models/cpp", "message": cpp_message, "header": format!("{cpp_file}.pb.h") }
         }
     });
-    for language in ["rust", "cpp", "csharp"] {
-        files.insert(
-            PathBuf::from(format!("models/{language}/package.json")),
-            serde_json::to_vec_pretty(&manifest["languages"][language])?,
+    for language in ["rust", "cpp"] {
+        write_language_assets(
+            &mut files,
+            bundle,
+            language,
+            &name,
+            &message,
+            &manifest["languages"][language],
+        )?;
+    }
+
+    fn write_language_assets(
+        files: &mut BTreeMap<PathBuf, Vec<u8>>,
+        bundle: &ArtifactBundle,
+        language: &str,
+        name: &str,
+        message: &str,
+        package: &serde_json::Value,
+    ) -> SdkGenResult<()> {
+        let root = PathBuf::from("models").join(language);
+        let contract = root.join("contract");
+        for (path, bytes) in [
+            ("manifest.json", bundle.manifest()),
+            ("schema.arrow", bundle.arrow_schema()),
+            ("descriptor.pb", bundle.protobuf_descriptor()),
+            ("schema.proto", bundle.protobuf_source()),
+        ] {
+            files.insert(contract.join(path), bytes.to_vec());
+        }
+        files.extend(
+            bundle
+                .protobuf_imports()
+                .iter()
+                .map(|(path, bytes)| (contract.join(path), bytes.clone())),
         );
+        files.insert(
+            root.join("README.md"),
+            format!("# {name}\n\nStandard protobuf models for `{message}`, contract version {}.\n\n\
+                This package contains its exact language-neutral contract under `contract/` and does not depend on the Arrowcol SDK. \
+                Optional DDL properties are recorded in the protobuf options; this package does not enforce policies.\n",
+                bundle.schema().version()).into_bytes(),
+        );
+        files.insert(root.join("package.json"), serde_json::to_vec_pretty(package)?);
+        Ok(())
     }
     files.insert("models/manifest.json".into(), serde_json::to_vec_pretty(&manifest)?);
     Ok(files)

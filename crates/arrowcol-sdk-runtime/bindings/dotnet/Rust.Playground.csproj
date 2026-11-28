@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <PackageId>Rust.Playground</PackageId>
+    <AssemblyName>Arrowcol.Sdk</AssemblyName>
+    <Description>Typed ArrowCol Flight SDK and SQL Server DMV models for .NET with native Linux and Windows x64 runtimes.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/mdrakiburrahman/rust-playground</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.29.3" />
+    <PackageReference Include="Grpc.Tools" Version="2.67.0" PrivateAssets="All" />
+    <Protobuf Include="$(ArrowcolDmvRoot)/models/*.proto" ProtoRoot="$(ArrowcolDmvRoot)/models" GrpcServices="None"
+              Condition="'$(ArrowcolDmvRoot)' != ''" />
+    <None Include="$(ArrowcolDmvRoot)/assets/**/*" Pack="true" PackagePath="dmv/%(RecursiveDir)%(Filename)%(Extension)"
+          Condition="'$(ArrowcolDmvRoot)' != ''" />
+    <None Update="Rust.Playground.targets" Pack="true" PackagePath="buildTransitive/Rust.Playground.targets" />
+    <None Include="$(ArrowcolLinuxNative)" Pack="true" PackagePath="runtimes/linux-x64/native/libarrowcol_sdk_ffi.so" />
+    <None Include="$(ArrowcolWindowsNative)" Pack="true" PackagePath="runtimes/win-x64/native/arrowcol_sdk_ffi.dll" />
+  </ItemGroup>
+  <Target Name="RequireNativePackageInputs" BeforeTargets="Pack">
+    <Error Condition="!Exists('$(ArrowcolLinuxNative)')" Text="A Linux x64 ArrowCol native runtime is required." />
+    <Error Condition="!Exists('$(ArrowcolWindowsNative)')" Text="A Windows x64 ArrowCol native runtime is required." />
+    <Error Condition="!Exists('$(ArrowcolDmvRoot)/assets/arrow-ddl') Or !Exists('$(ArrowcolDmvRoot)/assets/arrow-contracts')" Text="Generate the SQL Server DMV package inputs with the nuget-pack target." />
+  </Target>
+</Project>

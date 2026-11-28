@@ -17,10 +17,10 @@ so it also works in applications that do not use Arrowcol. Rust models include
 protobuf reflection metadata. C++ and C# share a schema-independent native Rust
 library. The neutral bundle is available as a separate download for other tools.
 
-Distributions are immutable **source archives with Cargo, .NET and CMake project
-manifests**. Use the local project/path references below and build native SDK
-binaries for the application's OS/architecture. Identical SDK source produces
-identical SDK package digests across contracts; contract/model digests change
+Contract workflow distributions are immutable **source archives with Cargo, .NET and
+CMake project manifests**. Use the local project/path references below and build
+native SDK binaries for the application's OS/architecture, or use the C# NuGet
+runtime below. SDK digests are stable across contracts; contract/model digests change
 independently. `packages.json` records the standalone neutral bundle digest.
 
 Applications construct protobuf events; the SDK validates them, builds Arrow
@@ -56,6 +56,53 @@ extract the complete developer archive, retaining its `sdk/` tree:
 The protobuf-backed stream API supports **flat scalar fields**.
 For nested or collection schemas, use the generated Rust or TypeScript Arrow
 builders. Those schemas include a neutral bundle and a stream capability note.
+
+### Local catalog seed
+
+| Command or setting | Requirements / result |
+| --- | --- |
+| `arrowcol-sdk-gen catalog seed --endpoint http://127.0.0.1:8817 --out target/dmv-contracts` | Registers 32 public DMV tables. Repeat `--ddl <file>` instead for one managed `CREATE TABLE` per file. |
+| Catalog image | Use `--entrypoint /usr/local/bin/arrowcol-sdk-gen` and mount output inside the tool's working directory. |
+| Output and reruns | Reports the v1 fingerprint and writes `models/csharp` per table. Exact definitions are reused; schema drift is rejected. Each table commits separately. Keep private DDL and its output local. |
+| Signed admission | Set `ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE` for the catalog, seed tool, and collector. |
+| Local Delta | Give both services the same writable warehouse path. With catalog `--ingestion-layout`, set collector `ARROWCOL_PARTITION_GRANULARITY` to `minute`, `hour`, or `day`, or admitted rows cannot commit. |
+
+### C# NuGet runtime
+
+Reference `Rust.Playground` from your approved Azure Artifacts source for .NET 8
+on Windows x64 or Linux x64 (glibc 2.34+). For custom schemas use a separate
+generated `Models.csproj` and its `contract/` directory. No Rust toolchain is
+needed by consumers.
+
+`0.1.0-alpha.3` includes SQL Server DMV types under
+`Arrowcol.Telemetry.SqlserverDmvV2` and the following build/publish assets:
+
+| Output | Use |
+| --- | --- |
+| `arrow-contracts/<dataset>/` | Load with `ArrowcolContract.Load(Path.Combine(AppContext.BaseDirectory, "arrow-contracts", dataset))`. |
+| `arrow-ddl/` | Mount read-only as the local catalog's `--ddl-dir`. Use the shared Delta warehouse and matching ingestion layout above. |
+
+The packaged `telemetry.sqlserver_dmv_v2` family starts at registry version 1.
+It is separate from `alpha.2`'s `telemetry.sqlserver_dmv` and the load
+benchmark's `telemetry.sqlserver`. It preserves fixture field order, requires
+`customer_id`, and permits absent payloads. Selected fixed-scale metrics are
+`DECIMAL(38,12)` (supply invariant decimal strings without rounding); counters
+and other approximate metrics stay binary64 `DOUBLE`. UTC timestamps use
+epoch microseconds.
+
+| Producer command | Requirements / result |
+| --- | --- |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-pack -- --package-version 0.1.0-alpha.3` | Linux x64 devcontainer, .NET 8 SDK, `x86_64-pc-windows-gnu` Rust target and MinGW POSIX linker; generates DMV assets from public fixtures and outputs `.nupkg` under `target/arrowcol-nuget/` |
+| `npx --no-install nx run arrowcol-sdk-gen-tool:nuget-publish -- --package-version 0.1.0-alpha.3` | Explicit upload of a previously packed version. Supply the Azure Artifacts NuGet v3 `NUGET_URL` and packaging-write `NUGET_PAT` using private devbox settings or the ignored `.env`; do not commit them. The publishing identity needs feed publisher access. |
+
+With an authorized NuGet source configured, check the package's native ABI and
+packaged DMV model and contract on the current RID:
+
+```bash
+dotnet build examples/arrowcol-stream/csharp/nuget-smoke/NuGetSmoke.csproj \
+  --artifacts-path target/arrowcol-nuget/smoke -p:ArrowcolPackageVersion=0.1.0-alpha.3
+dotnet target/arrowcol-nuget/smoke/bin/NuGetSmoke/debug/NuGetSmoke.dll
+```
 
 ## Minimal application APIs
 

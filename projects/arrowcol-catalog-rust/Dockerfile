@@ -14,9 +14,9 @@ RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo
     --mount=type=cache,id=rust-playground-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=rust-playground-target,target=/workspace/target,sharing=locked \
     CARGO_TARGET_DIR=/workspace/target cargo build --locked --release \
-      --package arrowcol-catalog-rust \
-    && install --mode=0555 /workspace/target/release/arrowcol-catalog-rust /usr/local/bin/arrowcol-catalog-rust \
-    && strip /usr/local/bin/arrowcol-catalog-rust
+      --package arrowcol-catalog-rust --package arrowcol-sdk-gen \
+    && install --mode=0555 /workspace/target/release/arrowcol-catalog-rust /workspace/target/release/arrowcol-sdk-gen /usr/local/bin/ \
+    && strip /usr/local/bin/arrowcol-catalog-rust /usr/local/bin/arrowcol-sdk-gen
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 ARG VCS_REF=local
@@ -35,7 +35,7 @@ RUN apt-get update \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --no-log-init --home-dir /nonexistent --shell /usr/sbin/nologin app \
     && install -d --owner app --group app --mode 0700 /var/lib/arrowcol-catalog-azure /data/catalog /data/warehouse
-COPY --from=builder --chmod=0555 /usr/local/bin/arrowcol-catalog-rust /usr/local/bin/arrowcol-catalog-rust
+COPY --from=builder --chmod=0555 /usr/local/bin/arrowcol-catalog-rust /usr/local/bin/arrowcol-sdk-gen /usr/local/bin/
 USER 10001:10001
 ENV AZURE_CONFIG_DIR=/var/lib/arrowcol-catalog-azure
 STOPSIGNAL SIGTERM

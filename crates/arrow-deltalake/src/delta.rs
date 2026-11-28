@@ -6,8 +6,8 @@ use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executo
 use crate::layout::{DetachKernel, PublicationSorter, SortExecution};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
-    CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
-    sync_directory, sync_directory_chain, sync_file,
+    CompletedFile, CompletedFileObservation, ParquetFileWriter, create_durable_local_root, normalize,
+    record_batch_logical_bytes, sync_directory, sync_directory_chain, sync_file,
 };
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
@@ -4544,6 +4544,10 @@ impl DeltaTable {
     /// # Errors
     /// Returns storage, authority or ownership errors.
     pub fn open_uri_with_fence(root: &str, publication_fence: Arc<dyn PublicationFence>) -> Result<Arc<Self>> {
+        // A Windows drive letter also parses as a URL scheme.
+        if Path::new(root).is_absolute() {
+            return Self::open_with_fence(root, publication_fence);
+        }
         match Url::parse(root) {
             Ok(url) if url.scheme() != "file" => Self::open_connection(
                 url,
@@ -4614,10 +4618,7 @@ impl DeltaTable {
             let path = url
                 .to_file_path()
                 .map_err(|()| anyhow::anyhow!("invalid local table URL"))?;
-            fs::create_dir_all(&path)?;
-            let path = fs::canonicalize(path)?;
-            sync_ancestors(&path)?;
-            path
+            create_durable_local_root(&path)?
         } else {
             // Staging is intentionally retained after ambiguous failures, never
             // automatically removed on drop. VACUUM LITE cannot see these files.
@@ -4936,9 +4937,7 @@ impl DeltaTable {
         publication_fence: Option<Arc<dyn PublicationFence>>,
         reuse_snapshots: bool,
     ) -> Result<Arc<Self>> {
-        fs::create_dir_all(root.as_ref())?;
-        let root = fs::canonicalize(root)?;
-        sync_ancestors(&root)?;
+        let root = create_durable_local_root(root.as_ref())?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)

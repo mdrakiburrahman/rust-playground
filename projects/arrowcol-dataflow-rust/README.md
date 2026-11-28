@@ -104,6 +104,9 @@ and is not qualification evidence for the remote-catalog topology. Use the
 loadtest workflow for DFE/catalog integration; live qualification must be
 rerun against the migrated services before claiming a pass.
 
+For the native bundle and service lifecycle, see the
+[Windows runtime guide](../../docs/architecture/arrowcol-platform/windows-runtime.md).
+
 ## Endpoints
 
 | Endpoint | Purpose |

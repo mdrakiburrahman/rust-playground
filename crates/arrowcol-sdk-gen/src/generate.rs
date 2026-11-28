@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::{
     ArtifactBundle, SafeOutputPath, SdkGenError, SdkGenResult,
     path::validate_relative_generated_path,
-    render::{RenderedSdk, render_sdk},
+    render::{RenderedSdk, render_csharp_models, render_sdk},
 };
 
 /// Result of deterministic SDK generation or checking.
@@ -38,6 +38,15 @@ pub fn generate_sdk(bundle: &ArtifactBundle, output: &SafeOutputPath) -> SdkGenR
     let rendered = render_sdk(bundle)?;
     replace_directory(output, &rendered.files)?;
     Ok(result(output, &rendered))
+}
+
+/// Generates the independent C# protobuf models and exact contract, without language SDK toolchains.
+///
+/// # Errors
+///
+/// Returns an error for unsupported fields, invalid artifacts, unsafe paths, or filesystem failures.
+pub fn generate_csharp_models(bundle: &ArtifactBundle, output: &SafeOutputPath) -> SdkGenResult<()> {
+    replace_directory(output, &render_csharp_models(bundle)?)
 }
 
 /// Renders the canonical SDK file set without writing it.
