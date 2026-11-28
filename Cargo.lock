@@ -1093,6 +1093,7 @@ dependencies = [
 name = "arrowcol-sdk-ffi"
 version = "0.1.0"
 dependencies = [
+ "arrowcol-catalog",
  "arrowcol-sdk-runtime",
  "prost 0.14.4",
  "prost-reflect",

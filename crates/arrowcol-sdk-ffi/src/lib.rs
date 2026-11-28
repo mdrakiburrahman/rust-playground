@@ -1,11 +1,15 @@
 //! Narrow C ABI implementation shared by generated table adapters.
 //! Callers serialize access to a handle. All pointers must remain valid for the duration of a call.
+use arrowcol_catalog::{
+    CatalogSchemaVersion, DdlCommand, DdlParser, SchemaVersion, deterministic_table_id, generate_descriptor_artifacts,
+};
 use arrowcol_sdk_runtime::{ArrowcolContract, ArrowcolStream, Contract, Error, GeneratedStream, Result, StreamOptions};
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
 };
 
 trait Producer: Send {
@@ -269,6 +273,46 @@ pub unsafe extern "C" fn arrowcol_open(
             *output = Box::into_raw(handle).cast();
         }
         Ok(())
+    })
+}
+
+/// Compiles one CREATE TABLE statement into the canonical contract files the catalog derives
+/// from the same DDL: `manifest.json`, `schema.arrow` and `descriptor.pb`, written to `output`.
+///
+/// # Safety
+/// `ddl` and `output` must be NUL-terminated UTF-8 strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arrowcol_compile_contract(ddl: *const c_char, output: *const c_char) -> *mut c_char {
+    boundary(|| {
+        if ddl.is_null() || output.is_null() {
+            return Err(Error::invalid("null compile argument"));
+        }
+        let text = |ptr| unsafe { CStr::from_ptr(ptr) }.to_str().map_err(Error::invalid);
+        let DdlCommand::CreateTable(create) = DdlParser::new("UTC").parse(text(ddl)?).map_err(Error::invalid)? else {
+            return Err(Error::invalid(
+                "contract compilation requires one CREATE TABLE statement",
+            ));
+        };
+        let schema = CatalogSchemaVersion::new(
+            deterministic_table_id(create.identity()),
+            create.identity().clone(),
+            SchemaVersion::FIRST,
+            create.fields().to_vec(),
+            create.canonical_ddl(),
+        )
+        .and_then(|schema| schema.with_metadata(create.metadata().clone()))
+        .map_err(Error::invalid)?;
+        let artifacts = generate_descriptor_artifacts(&schema).map_err(Error::invalid)?;
+        let output = Path::new(text(output)?);
+        std::fs::create_dir_all(output).map_err(Error::invalid)?;
+        for (name, bytes) in [
+            ("manifest.json", artifacts.manifest()),
+            ("schema.arrow", artifacts.arrow_schema()),
+            ("descriptor.pb", artifacts.protobuf_descriptor()),
+        ] {
+            std::fs::write(output.join(name), bytes).map_err(Error::invalid)?;
+        }
+        ArrowcolContract::load(output).map(|_| ())
     })
 }
 

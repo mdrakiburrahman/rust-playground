@@ -9,6 +9,7 @@ publish = false
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
+arrowcol-catalog = { path = "../arrowcol-catalog" }
 arrowcol-sdk-runtime = { path = "../arrowcol-sdk-runtime" }
 prost = "0.14"
 prost-reflect = "0.16"
