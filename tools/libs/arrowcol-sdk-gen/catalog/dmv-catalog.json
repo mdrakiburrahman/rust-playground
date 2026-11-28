@@ -1,0 +1,614 @@
+{
+  "version": 1,
+  "sources": {
+    "sql-server-2025": "sys.all_columns of Microsoft SQL Server 2025 (RTM-CU11) 17.0.5065.9, image mcr.microsoft.com/mssql/server@sha256:05644dad1266ca3d445d1e8f6d2ebb9a6a03df9a39376e0f7b48917356dca9d9",
+    "sql-docs": "https://github.com/MicrosoftDocs/sql-docs/tree/ec5c1800da9b33e6198052f756a7666e4813c245/docs/relational-databases/system-dynamic-management-objects/"
+  },
+  "identity": ["source_server_name STRING", "source_database_name STRING", "source_resource_id STRING", "source_tenant_id STRING"],
+  "families": {
+    "sqldb_single_database": ["active_sessions", "cpu_utilization", "database_properties", "database_storage_utilization", "memory_utilization", "performance_counters_common", "performance_counters_detailed", "storage_io", "wait_stats"],
+    "sqldb_elastic_pool": ["active_sessions", "cpu_utilization", "memory_utilization", "performance_counters_common", "performance_counters_detailed", "storage_io", "wait_stats"],
+    "sqlmi": ["active_sessions", "cpu_utilization", "database_properties", "database_storage_utilization", "memory_utilization", "performance_counters_common", "performance_counters_detailed", "storage_io", "wait_stats"]
+  },
+  "views": [
+    {
+      "view": "dm_audit_actions",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["action_id STRING", "name STRING", "class_desc STRING", "covering_action_name STRING", "parent_class_desc STRING", "covering_parent_action_name STRING", "configuration_level STRING", "containing_group_name STRING", "action_in_log BOOLEAN"]
+    },
+    {
+      "view": "dm_audit_class_type_map",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["class_type STRING", "class_type_desc STRING", "securable_class_desc STRING"]
+    },
+    {
+      "view": "dm_broker_queue_monitors",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "queue_id INT", "state STRING", "last_empty_rowset_time TIMESTAMP", "last_activated_time TIMESTAMP", "tasks_waiting INT"]
+    },
+    {
+      "view": "dm_clr_properties",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "value STRING"]
+    },
+    {
+      "view": "dm_clr_tasks",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["state STRING", "abort_state STRING", "type STRING", "affinity_count INT", "forced_yield_count INT"]
+    },
+    {
+      "view": "dm_database_backup_lineage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["backup_file_id STRING", "logical_database_id STRING", "backup_start_date TIMESTAMP", "backup_finish_date TIMESTAMP", "backup_type STRING", "database_allocated_storage_mb DECIMAL(38,12)"]
+    },
+    {
+      "view": "dm_database_backups",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["backup_file_id STRING", "logical_database_id STRING", "backup_start_date TIMESTAMP", "backup_finish_date TIMESTAMP", "backup_type STRING", "in_retention BOOLEAN"]
+    },
+    {
+      "view": "dm_database_encryption_keys",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "encryption_state INT", "create_date TIMESTAMP", "regenerate_date TIMESTAMP", "modify_date TIMESTAMP", "set_date TIMESTAMP", "opened_date TIMESTAMP", "key_algorithm STRING", "key_length INT", "encryptor_type STRING", "percent_complete DOUBLE", "encryption_state_desc STRING", "encryption_scan_state INT", "encryption_scan_state_desc STRING", "encryption_scan_modify_date TIMESTAMP"]
+    },
+    {
+      "view": "dm_database_external_policy_actions",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["sql_action_id INT", "action_namespace STRING", "action_type STRING", "action_provider_string STRING"]
+    },
+    {
+      "view": "dm_database_replica_states",
+      "interval": "00:05:00",
+      "provenance": ["sql-docs:sys-dm-database-replica-states-azure-sql-database.md"],
+      "targets": ["sqldb_single_database"],
+      "columns": ["database_id INT", "group_id STRING", "replica_id STRING", "group_database_id STRING", "is_local BOOLEAN", "is_primary_replica BOOLEAN", "synchronization_state SMALLINT", "synchronization_state_desc STRING", "is_commit_participant BOOLEAN", "synchronization_health SMALLINT", "synchronization_health_desc STRING", "database_state SMALLINT", "database_state_desc STRING", "is_suspended BOOLEAN", "suspend_reason SMALLINT", "suspend_reason_desc STRING", "recovery_lsn DECIMAL(38,12)", "truncation_lsn DECIMAL(38,12)", "last_sent_lsn DECIMAL(38,12)", "last_sent_time TIMESTAMP", "last_received_lsn DECIMAL(38,12)", "last_received_time TIMESTAMP", "last_hardened_lsn DECIMAL(38,12)", "last_hardened_time TIMESTAMP", "last_redone_lsn DECIMAL(38,12)", "last_redone_time TIMESTAMP", "log_send_queue_size BIGINT", "log_send_rate BIGINT", "redo_queue_size BIGINT", "redo_rate BIGINT", "filestream_send_rate BIGINT", "end_of_log_lsn DECIMAL(38,12)", "last_commit_lsn DECIMAL(38,12)", "last_commit_time TIMESTAMP", "low_water_mark_for_ghosts BIGINT", "secondary_lag_seconds BIGINT", "quorum_commit_lsn DECIMAL(38,12)", "quorum_commit_time TIMESTAMP"]
+    },
+    {
+      "view": "dm_db_file_space_usage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "file_id SMALLINT", "filegroup_id SMALLINT", "total_page_count BIGINT", "allocated_extent_page_count BIGINT", "unallocated_extent_page_count BIGINT", "version_store_reserved_page_count BIGINT", "user_object_reserved_page_count BIGINT", "internal_object_reserved_page_count BIGINT", "mixed_extent_page_count BIGINT", "modified_extent_page_count BIGINT"]
+    },
+    {
+      "view": "dm_db_index_usage_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id SMALLINT", "object_id INT", "index_id INT", "user_seeks BIGINT", "user_scans BIGINT", "user_lookups BIGINT", "user_updates BIGINT", "last_user_seek TIMESTAMP", "last_user_scan TIMESTAMP", "last_user_lookup TIMESTAMP", "last_user_update TIMESTAMP", "system_seeks BIGINT", "system_scans BIGINT", "system_lookups BIGINT", "system_updates BIGINT", "last_system_seek TIMESTAMP", "last_system_scan TIMESTAMP", "last_system_lookup TIMESTAMP", "last_system_update TIMESTAMP"]
+    },
+    {
+      "view": "dm_db_log_space_usage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "total_log_size_in_bytes BIGINT", "used_log_space_in_bytes BIGINT", "used_log_space_in_percent DOUBLE", "log_space_in_bytes_since_last_backup BIGINT"]
+    },
+    {
+      "view": "dm_db_partition_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["partition_id BIGINT", "object_id INT", "index_id INT", "partition_number INT", "in_row_data_page_count BIGINT", "in_row_used_page_count BIGINT", "in_row_reserved_page_count BIGINT", "lob_used_page_count BIGINT", "lob_reserved_page_count BIGINT", "row_overflow_used_page_count BIGINT", "row_overflow_reserved_page_count BIGINT", "used_page_count BIGINT", "reserved_page_count BIGINT", "row_count BIGINT"]
+    },
+    {
+      "view": "dm_db_persisted_sku_features",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["feature_name STRING", "feature_id INT"]
+    },
+    {
+      "view": "dm_db_session_space_usage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["session_id SMALLINT", "database_id INT", "user_objects_alloc_page_count BIGINT", "user_objects_dealloc_page_count BIGINT", "internal_objects_alloc_page_count BIGINT", "internal_objects_dealloc_page_count BIGINT", "user_objects_deferred_dealloc_page_count BIGINT"]
+    },
+    {
+      "view": "dm_db_task_space_usage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["is_remote_task BOOLEAN", "session_id SMALLINT", "request_id INT", "exec_context_id INT", "database_id INT", "user_objects_alloc_page_count BIGINT", "user_objects_dealloc_page_count BIGINT", "internal_objects_alloc_page_count BIGINT", "internal_objects_dealloc_page_count BIGINT"]
+    },
+    {
+      "view": "dm_db_uncontained_entities",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["entity_class INT", "class_desc STRING", "major_id INT", "statement_line_number INT", "statement_offset_begin INT", "statement_offset_end INT", "statement_type STRING", "feature_name STRING", "feature_type_name STRING"],
+      "aliases": {
+        "entity_class": "class"
+      }
+    },
+    {
+      "view": "dm_db_xtp_checkpoint_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["last_lsn_processed DECIMAL(38,12)", "end_of_log_lsn DECIMAL(38,12)", "bytes_to_end_of_log BIGINT", "log_consumption_rate BIGINT", "active_scan_time_in_ms BIGINT", "total_wait_time_in_ms BIGINT", "waits_for_io_count BIGINT", "io_wait_time_in_ms BIGINT", "waits_for_new_log_count BIGINT", "new_log_wait_time_in_ms BIGINT", "idle_attempts_count BIGINT", "tx_segments_dispatched_count BIGINT", "segment_bytes_dispatched BIGINT", "bytes_serialized BIGINT", "serializer_user_time_in_ms BIGINT", "serializer_kernel_time_in_ms BIGINT", "xtp_log_bytes_consumed BIGINT", "checkpoints_closed BIGINT", "last_closed_checkpoint_ts BIGINT", "hardened_recovery_lsn DECIMAL(38,12)", "hardened_root_file_guid STRING", "hardened_root_file_watermark BIGINT", "hardened_truncation_lsn DECIMAL(38,12)", "log_bytes_since_last_close BIGINT", "time_since_last_close_in_ms BIGINT", "current_checkpoint_id BIGINT", "current_checkpoint_segment_count BIGINT", "recovery_lsn_candidate DECIMAL(38,12)", "outstanding_checkpoint_count BIGINT", "closing_checkpoint_id BIGINT", "recovery_checkpoint_id BIGINT", "recovery_checkpoint_ts BIGINT", "bootstrap_recovery_lsn DECIMAL(38,12)", "bootstrap_root_file_guid STRING", "internal_error_code BIGINT", "tail_cache_page_count BIGINT", "tail_cache_max_page_count BIGINT", "tail_cache_min_needed_lsn DECIMAL(38,12)", "merge_outstanding_merges BIGINT", "merge_stats_number_of_merges BIGINT", "merge_stats_log_blocks_merged BIGINT", "merge_stats_bytes_merged BIGINT", "merge_stats_user_time BIGINT", "merge_stats_kernel_time BIGINT", "bytes_of_large_data_serialized BIGINT", "closed_checkpoint_epoch_value BIGINT", "db_in_checkpoint_only_mode BOOLEAN"]
+    },
+    {
+      "view": "dm_db_xtp_gc_cycle_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["cycle_id BIGINT", "ticks_at_cycle_start BIGINT", "ticks_at_cycle_end BIGINT", "node_id INT", "base_generation BIGINT", "xacts_copied_to_local BIGINT", "xacts_in_gen_0 BIGINT", "xacts_in_gen_1 BIGINT", "xacts_in_gen_2 BIGINT", "xacts_in_gen_3 BIGINT", "xacts_in_gen_4 BIGINT", "xacts_in_gen_5 BIGINT", "xacts_in_gen_6 BIGINT", "xacts_in_gen_7 BIGINT", "xacts_in_gen_8 BIGINT", "xacts_in_gen_9 BIGINT", "xacts_in_gen_10 BIGINT", "xacts_in_gen_11 BIGINT", "xacts_in_gen_12 BIGINT", "xacts_in_gen_13 BIGINT", "xacts_in_gen_14 BIGINT", "xacts_in_gen_15 BIGINT"],
+      "top": 1000,
+      "watermark": "cycle_id"
+    },
+    {
+      "view": "dm_db_xtp_index_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["object_id INT", "xtp_object_id INT", "index_id INT", "scans_started BIGINT", "scans_retries BIGINT", "rows_returned BIGINT", "rows_touched BIGINT", "rows_expiring BIGINT", "rows_expired BIGINT", "rows_expired_removed BIGINT", "phantom_scans_started BIGINT", "phantom_scans_retries BIGINT", "phantom_rows_touched BIGINT", "phantom_expiring_rows_encountered BIGINT", "phantom_expired_removed_rows_encountered BIGINT", "phantom_expired_rows_removed BIGINT"]
+    },
+    {
+      "view": "dm_db_xtp_memory_consumers",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["memory_consumer_id BIGINT", "memory_consumer_type INT", "memory_consumer_type_desc STRING", "memory_consumer_desc STRING", "object_id INT", "xtp_object_id INT", "index_id INT", "allocated_bytes BIGINT", "used_bytes BIGINT", "allocation_count BIGINT", "partition_count INT", "sizeclass_count INT", "min_sizeclass INT", "max_sizeclass INT"]
+    },
+    {
+      "view": "dm_db_xtp_nonclustered_index_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["object_id INT", "xtp_object_id INT", "index_id INT", "delta_pages BIGINT", "internal_pages BIGINT", "leaf_pages BIGINT", "outstanding_retired_nodes BIGINT", "page_update_count BIGINT", "page_update_retry_count BIGINT", "page_consolidation_count BIGINT", "page_consolidation_retry_count BIGINT", "page_split_count BIGINT", "page_split_retry_count BIGINT", "key_split_count BIGINT", "key_split_retry_count BIGINT", "page_merge_count BIGINT", "page_merge_retry_count BIGINT", "key_merge_count BIGINT", "key_merge_retry_count BIGINT", "uses_key_normalization BOOLEAN"]
+    },
+    {
+      "view": "dm_dist_requests",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["session_id SMALLINT", "dist_statement_id STRING", "dist_client_id STRING"]
+    },
+    {
+      "view": "dm_elastic_pool_resource_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-docs:sys-dm-elastic-pool-resource-stats-azure-sql-database.md"],
+      "targets": ["sqldb_single_database"],
+      "columns": ["end_time TIMESTAMP", "avg_cpu_percent DECIMAL(38,12)", "avg_data_io_percent DECIMAL(38,12)", "avg_log_write_percent DECIMAL(38,12)", "avg_storage_percent DECIMAL(38,12)", "max_worker_percent DECIMAL(38,12)", "max_session_percent DECIMAL(38,12)", "avg_instance_memory_percent DECIMAL(38,12)", "avg_instance_cpu_percent DECIMAL(38,12)", "avg_edtu_percent DECIMAL(38,12)", "instance_vcores DECIMAL(38,12)", "used_storage_mb BIGINT", "allocated_storage_mb BIGINT", "storage_limit_mb BIGINT", "used_storage_percent DECIMAL(38,12)", "allocated_storage_percent DECIMAL(38,12)"],
+      "top": 1000,
+      "watermark": "end_time"
+    },
+    {
+      "view": "dm_exec_background_job_queue_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["queue_max_len INT", "enqueued_count INT", "started_count INT", "ended_count INT", "failed_lock_count INT", "failed_other_count INT", "failed_giveup_count INT", "enqueue_failed_full_count INT", "enqueue_failed_duplicate_count INT", "elapsed_avg_ms INT", "elapsed_max_ms INT"]
+    },
+    {
+      "view": "dm_exec_cached_plans",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["cacheobjtype STRING", "objtype STRING", "pool_id INT", "plan_count BIGINT", "size_in_bytes BIGINT", "usecounts BIGINT", "refcounts BIGINT", "single_use_plan_count BIGINT"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, cacheobjtype, objtype, pool_id, COUNT_BIG(*) AS plan_count, SUM(CAST(size_in_bytes AS bigint)) AS size_in_bytes, SUM(CAST(usecounts AS bigint)) AS usecounts, SUM(CAST(refcounts AS bigint)) AS refcounts, SUM(CASE WHEN usecounts = 1 THEN CAST(1 AS bigint) ELSE 0 END) AS single_use_plan_count FROM sys.dm_exec_cached_plans GROUP BY cacheobjtype, objtype, pool_id"
+    },
+    {
+      "view": "dm_exec_procedure_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025", "sql-docs:sys-dm-exec-procedure-stats-transact-sql.md"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "object_id INT", "type STRING", "type_desc STRING", "cached_time TIMESTAMP", "last_execution_time TIMESTAMP", "execution_count BIGINT", "total_worker_time BIGINT", "last_worker_time BIGINT", "min_worker_time BIGINT", "max_worker_time BIGINT", "total_physical_reads BIGINT", "last_physical_reads BIGINT", "min_physical_reads BIGINT", "max_physical_reads BIGINT", "total_logical_writes BIGINT", "last_logical_writes BIGINT", "min_logical_writes BIGINT", "max_logical_writes BIGINT", "total_logical_reads BIGINT", "last_logical_reads BIGINT", "min_logical_reads BIGINT", "max_logical_reads BIGINT", "total_elapsed_time BIGINT", "last_elapsed_time BIGINT", "min_elapsed_time BIGINT", "max_elapsed_time BIGINT", "total_spills BIGINT", "last_spills BIGINT", "min_spills BIGINT", "max_spills BIGINT", "total_num_physical_reads BIGINT", "last_num_physical_reads BIGINT", "min_num_physical_reads BIGINT", "max_num_physical_reads BIGINT", "total_page_server_reads BIGINT", "last_page_server_reads BIGINT", "min_page_server_reads BIGINT", "max_page_server_reads BIGINT", "total_num_page_server_reads BIGINT", "last_num_page_server_reads BIGINT", "min_num_page_server_reads BIGINT", "max_num_page_server_reads BIGINT", "total_version_reads BIGINT", "last_version_reads BIGINT", "min_version_reads BIGINT", "max_version_reads BIGINT"]
+    },
+    {
+      "view": "dm_exec_query_optimizer_info",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["counter STRING", "occurrence BIGINT", "value DOUBLE"]
+    },
+    {
+      "view": "dm_exec_query_optimizer_memory_gateways",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["pool_id INT", "name STRING", "max_count INT", "active_count INT", "waiter_count INT", "threshold_factor BIGINT", "threshold BIGINT", "is_active BOOLEAN"]
+    },
+    {
+      "view": "dm_exec_query_profiles",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["session_id SMALLINT", "request_id INT", "physical_operator_name STRING", "node_id INT", "thread_id INT", "row_count BIGINT", "rewind_count BIGINT", "rebind_count BIGINT", "end_of_scan_count BIGINT", "estimate_row_count BIGINT", "first_active_time BIGINT", "last_active_time BIGINT", "open_time BIGINT", "first_row_time BIGINT", "last_row_time BIGINT", "close_time BIGINT", "elapsed_time_ms BIGINT", "cpu_time_ms BIGINT", "database_id SMALLINT", "object_id INT", "index_id INT", "scan_count BIGINT", "logical_read_count BIGINT", "physical_read_count BIGINT", "read_ahead_count BIGINT", "write_page_count BIGINT", "lob_logical_read_count BIGINT", "lob_physical_read_count BIGINT", "lob_read_ahead_count BIGINT", "segment_read_count INT", "segment_skip_count INT", "actual_read_row_count BIGINT", "estimated_read_row_count BIGINT", "page_server_read_count BIGINT", "page_server_read_ahead_count BIGINT", "lob_page_server_read_count BIGINT", "lob_page_server_read_ahead_count BIGINT", "row_requalification_count BIGINT"]
+    },
+    {
+      "view": "dm_exec_query_resource_semaphores",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["resource_semaphore_id SMALLINT", "target_memory_kb BIGINT", "max_target_memory_kb BIGINT", "total_memory_kb BIGINT", "available_memory_kb BIGINT", "granted_memory_kb BIGINT", "used_memory_kb BIGINT", "grantee_count INT", "waiter_count INT", "timeout_error_count BIGINT", "forced_grant_count BIGINT", "pool_id INT"]
+    },
+    {
+      "view": "dm_exec_query_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025", "sql-docs:sys-dm-exec-query-stats-transact-sql.md"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["statement_start_offset INT", "statement_end_offset INT", "plan_generation_num BIGINT", "creation_time TIMESTAMP", "last_execution_time TIMESTAMP", "execution_count BIGINT", "total_worker_time BIGINT", "last_worker_time BIGINT", "min_worker_time BIGINT", "max_worker_time BIGINT", "total_physical_reads BIGINT", "last_physical_reads BIGINT", "min_physical_reads BIGINT", "max_physical_reads BIGINT", "total_logical_writes BIGINT", "last_logical_writes BIGINT", "min_logical_writes BIGINT", "max_logical_writes BIGINT", "total_logical_reads BIGINT", "last_logical_reads BIGINT", "min_logical_reads BIGINT", "max_logical_reads BIGINT", "total_clr_time BIGINT", "last_clr_time BIGINT", "min_clr_time BIGINT", "max_clr_time BIGINT", "total_elapsed_time BIGINT", "last_elapsed_time BIGINT", "min_elapsed_time BIGINT", "max_elapsed_time BIGINT", "total_rows BIGINT", "last_rows BIGINT", "min_rows BIGINT", "max_rows BIGINT", "statement_context_id BIGINT", "total_dop BIGINT", "last_dop BIGINT", "min_dop BIGINT", "max_dop BIGINT", "total_grant_kb BIGINT", "last_grant_kb BIGINT", "min_grant_kb BIGINT", "max_grant_kb BIGINT", "total_used_grant_kb BIGINT", "last_used_grant_kb BIGINT", "min_used_grant_kb BIGINT", "max_used_grant_kb BIGINT", "total_ideal_grant_kb BIGINT", "last_ideal_grant_kb BIGINT", "min_ideal_grant_kb BIGINT", "max_ideal_grant_kb BIGINT", "total_reserved_threads BIGINT", "last_reserved_threads BIGINT", "min_reserved_threads BIGINT", "max_reserved_threads BIGINT", "total_used_threads BIGINT", "last_used_threads BIGINT", "min_used_threads BIGINT", "max_used_threads BIGINT", "total_columnstore_segment_reads BIGINT", "last_columnstore_segment_reads BIGINT", "min_columnstore_segment_reads BIGINT", "max_columnstore_segment_reads BIGINT", "total_columnstore_segment_skips BIGINT", "last_columnstore_segment_skips BIGINT", "min_columnstore_segment_skips BIGINT", "max_columnstore_segment_skips BIGINT", "total_spills BIGINT", "last_spills BIGINT", "min_spills BIGINT", "max_spills BIGINT", "total_num_physical_reads BIGINT", "last_num_physical_reads BIGINT", "min_num_physical_reads BIGINT", "max_num_physical_reads BIGINT", "total_page_server_reads BIGINT", "last_page_server_reads BIGINT", "min_page_server_reads BIGINT", "max_page_server_reads BIGINT", "total_num_page_server_reads BIGINT", "last_num_page_server_reads BIGINT", "min_num_page_server_reads BIGINT", "max_num_page_server_reads BIGINT", "total_version_reads BIGINT", "last_version_reads BIGINT", "min_version_reads BIGINT", "max_version_reads BIGINT"],
+      "top": 1000,
+      "orderBy": "total_worker_time DESC"
+    },
+    {
+      "view": "dm_exec_query_transformation_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "promise_total BIGINT", "promise_avg DOUBLE", "promised BIGINT", "built_substitute BIGINT", "succeeded BIGINT"]
+    },
+    {
+      "view": "dm_exec_session_wait_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["session_id SMALLINT", "wait_type STRING", "waiting_tasks_count BIGINT", "wait_time_ms BIGINT", "max_wait_time_ms BIGINT", "signal_wait_time_ms BIGINT"]
+    },
+    {
+      "view": "dm_exec_trigger_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025", "sql-docs:sys-dm-exec-trigger-stats-transact-sql.md"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "object_id INT", "type STRING", "type_desc STRING", "cached_time TIMESTAMP", "last_execution_time TIMESTAMP", "execution_count BIGINT", "total_worker_time BIGINT", "last_worker_time BIGINT", "min_worker_time BIGINT", "max_worker_time BIGINT", "total_physical_reads BIGINT", "last_physical_reads BIGINT", "min_physical_reads BIGINT", "max_physical_reads BIGINT", "total_logical_writes BIGINT", "last_logical_writes BIGINT", "min_logical_writes BIGINT", "max_logical_writes BIGINT", "total_logical_reads BIGINT", "last_logical_reads BIGINT", "min_logical_reads BIGINT", "max_logical_reads BIGINT", "total_elapsed_time BIGINT", "last_elapsed_time BIGINT", "min_elapsed_time BIGINT", "max_elapsed_time BIGINT", "total_spills BIGINT", "last_spills BIGINT", "min_spills BIGINT", "max_spills BIGINT", "total_num_physical_reads BIGINT", "last_num_physical_reads BIGINT", "min_num_physical_reads BIGINT", "max_num_physical_reads BIGINT", "total_page_server_reads BIGINT", "last_page_server_reads BIGINT", "min_page_server_reads BIGINT", "max_page_server_reads BIGINT", "total_num_page_server_reads BIGINT", "last_num_page_server_reads BIGINT", "min_num_page_server_reads BIGINT", "max_num_page_server_reads BIGINT", "total_version_reads BIGINT", "last_version_reads BIGINT", "min_version_reads BIGINT", "max_version_reads BIGINT"]
+    },
+    {
+      "view": "dm_exec_valid_use_hints",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING"]
+    },
+    {
+      "view": "dm_external_data_processed",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["type STRING", "data_processed_mb BIGINT"]
+    },
+    {
+      "view": "dm_fts_memory_pools",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["pool_id INT", "buffer_size INT", "min_buffer_limit INT", "max_buffer_limit INT", "buffer_count INT"],
+      "optional": true
+    },
+    {
+      "view": "dm_io_network_traffic_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["snapshot_time TIMESTAMP", "network_protocol SMALLINT", "network_protocol_desc STRING", "count_sends BIGINT", "count_receives BIGINT", "send_bytes BIGINT", "receive_bytes BIGINT", "max_send_bytes BIGINT", "max_receive_bytes BIGINT", "min_send_bytes BIGINT", "min_receive_bytes BIGINT"],
+      "top": 1000,
+      "watermark": "snapshot_time"
+    },
+    {
+      "view": "dm_os_buffer_descriptors",
+      "interval": "00:15:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "file_id INT", "page_type STRING", "page_level INT", "is_modified BOOLEAN", "numa_node INT", "is_in_bpool_extension BOOLEAN", "page_count BIGINT", "row_count BIGINT", "free_space_in_bytes BIGINT", "read_microsec BIGINT"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, database_id, file_id, page_type, page_level, is_modified, numa_node, is_in_bpool_extension, COUNT_BIG(*) AS page_count, SUM(CAST(row_count AS bigint)) AS row_count, SUM(CAST(free_space_in_bytes AS bigint)) AS free_space_in_bytes, SUM(CAST(read_microsec AS bigint)) AS read_microsec FROM sys.dm_os_buffer_descriptors GROUP BY database_id, file_id, page_type, page_level, is_modified, numa_node, is_in_bpool_extension"
+    },
+    {
+      "view": "dm_os_dispatcher_pools",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["type STRING", "name STRING", "dispatcher_count INT", "dispatcher_ideal_count INT", "dispatcher_timeout_ms INT", "dispatcher_waiting_count INT", "queue_length INT"]
+    },
+    {
+      "view": "dm_os_dispatchers",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["state STRING", "wait_duration BIGINT", "current_item_duration BIGINT", "items_processed BIGINT", "fade_end_time INT"]
+    },
+    {
+      "view": "dm_os_hosts",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["type STRING", "name STRING", "enqueued_tasks_count INT", "active_tasks_count INT", "completed_ios_count INT", "completed_ios_in_bytes BIGINT", "active_ios_count INT"]
+    },
+    {
+      "view": "dm_os_latch_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["latch_class STRING", "waiting_requests_count BIGINT", "wait_time_ms BIGINT", "max_wait_time_ms BIGINT"]
+    },
+    {
+      "view": "dm_os_memory_broker_clerks",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["clerk_name STRING", "total_kb BIGINT", "simulated_kb BIGINT", "simulation_benefit DOUBLE", "internal_benefit DOUBLE", "external_benefit DOUBLE", "value_of_memory DOUBLE", "periodic_freed_kb BIGINT", "internal_freed_kb BIGINT"]
+    },
+    {
+      "view": "dm_os_memory_brokers",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["pool_id INT", "memory_broker_type STRING", "allocations_kb BIGINT", "allocations_kb_per_sec BIGINT", "predicted_allocations_kb BIGINT", "target_allocations_kb BIGINT", "future_allocations_kb BIGINT", "overall_limit_kb BIGINT", "last_notification STRING"]
+    },
+    {
+      "view": "dm_os_memory_cache_clock_hands",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "type STRING", "clock_hand STRING", "clock_status STRING", "rounds_count BIGINT", "removed_all_rounds_count BIGINT", "updated_last_round_count BIGINT", "removed_last_round_count BIGINT", "last_tick_time BIGINT", "round_start_time BIGINT", "last_round_start_time BIGINT", "entries_visited_all_rounds_count BIGINT", "inuse_all_rounds_count BIGINT", "pinned_all_rounds_count BIGINT", "do_not_remove_all_rounds_count BIGINT", "invisible_all_rounds_count BIGINT", "different_pool_all_rounds_count BIGINT"]
+    },
+    {
+      "view": "dm_os_memory_cache_counters",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "type STRING", "pages_kb BIGINT", "pages_in_use_kb BIGINT", "entries_count BIGINT", "entries_in_use_count BIGINT", "extended_properties STRING"]
+    },
+    {
+      "view": "dm_os_memory_cache_entries",
+      "interval": "00:15:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "type STRING", "pool_id INT", "entry_count BIGINT", "in_use_count BIGINT", "dirty_count BIGINT", "disk_ios_count BIGINT", "context_switches_count BIGINT", "original_cost BIGINT", "current_cost BIGINT", "pages_kb BIGINT", "use_count BIGINT"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, name, type, pool_id, COUNT_BIG(*) AS entry_count, SUM(CAST(in_use_count AS bigint)) AS in_use_count, SUM(CASE WHEN is_dirty = 1 THEN CAST(1 AS bigint) ELSE 0 END) AS dirty_count, SUM(CAST(disk_ios_count AS bigint)) AS disk_ios_count, SUM(CAST(context_switches_count AS bigint)) AS context_switches_count, SUM(CAST(original_cost AS bigint)) AS original_cost, SUM(CAST(current_cost AS bigint)) AS current_cost, SUM(CAST(pages_kb AS bigint)) AS pages_kb, SUM(CAST(use_count AS bigint)) AS use_count FROM sys.dm_os_memory_cache_entries GROUP BY name, type, pool_id"
+    },
+    {
+      "view": "dm_os_memory_cache_hash_tables",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "type STRING", "table_level INT", "buckets_count INT", "buckets_in_use_count INT", "buckets_min_length INT", "buckets_max_length INT", "buckets_avg_length INT", "buckets_max_length_ever INT", "hits_count BIGINT", "misses_count BIGINT", "buckets_avg_scan_hit_length INT", "buckets_avg_scan_miss_length INT"]
+    },
+    {
+      "view": "dm_os_memory_health_history",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["snapshot_time TIMESTAMP", "severity_level SMALLINT", "severity_level_desc STRING", "allocation_potential_memory_mb INT", "reclaimable_cache_memory_mb INT", "out_of_memory_event_count INT", "memgrant_timeout_count INT", "memgrant_waiter_count INT"],
+      "top": 1000,
+      "watermark": "snapshot_time"
+    },
+    {
+      "view": "dm_os_memory_node_access_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["local_node INT", "remote_node INT", "page_class STRING", "read_count BIGINT", "write_count BIGINT"]
+    },
+    {
+      "view": "dm_os_memory_nodes",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["memory_node_id SMALLINT", "virtual_address_space_reserved_kb BIGINT", "virtual_address_space_committed_kb BIGINT", "locked_page_allocations_kb BIGINT", "pages_kb BIGINT", "shared_memory_reserved_kb BIGINT", "shared_memory_committed_kb BIGINT", "cpu_affinity_mask BIGINT", "online_scheduler_mask BIGINT", "processor_group SMALLINT", "foreign_committed_kb BIGINT", "target_kb BIGINT"]
+    },
+    {
+      "view": "dm_os_memory_objects",
+      "interval": "00:15:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["type STRING", "memory_node_id SMALLINT", "partition_type_desc STRING", "object_count BIGINT", "pages_in_bytes BIGINT", "bytes_used BIGINT", "max_pages_in_bytes BIGINT", "waiting_tasks_count BIGINT", "exclusive_access_count BIGINT", "max_contention_factor DOUBLE"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, type, memory_node_id, partition_type_desc, COUNT_BIG(*) AS object_count, SUM(CAST(pages_in_bytes AS bigint)) AS pages_in_bytes, SUM(CAST(bytes_used AS bigint)) AS bytes_used, MAX(max_pages_in_bytes) AS max_pages_in_bytes, SUM(CAST(waiting_tasks_count AS bigint)) AS waiting_tasks_count, SUM(CAST(exclusive_access_count AS bigint)) AS exclusive_access_count, MAX(CAST(contention_factor AS float)) AS max_contention_factor FROM sys.dm_os_memory_objects GROUP BY type, memory_node_id, partition_type_desc"
+    },
+    {
+      "view": "dm_os_memory_pools",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["pool_id INT", "type STRING", "name STRING", "max_free_entries_count BIGINT", "free_entries_count BIGINT", "removed_in_all_rounds_count BIGINT"]
+    },
+    {
+      "view": "dm_os_nodes",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["node_id SMALLINT", "node_state_desc STRING", "memory_node_id SMALLINT", "cpu_affinity_mask BIGINT", "online_scheduler_count SMALLINT", "idle_scheduler_count SMALLINT", "active_worker_count INT", "avg_load_balance INT", "timer_task_affinity_mask BIGINT", "permanent_task_affinity_mask BIGINT", "resource_monitor_state BOOLEAN", "online_scheduler_mask BIGINT", "processor_group SMALLINT", "cpu_count INT", "cached_tasks BIGINT", "cached_tasks_reused BIGINT", "cached_tasks_removed BIGINT"]
+    },
+    {
+      "view": "dm_os_ring_buffers",
+      "interval": "00:15:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["ring_buffer_type STRING", "ring_buffer_group STRING", "record_count BIGINT", "min_timestamp BIGINT", "max_timestamp BIGINT", "min_create_time TIMESTAMP", "max_create_time TIMESTAMP"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, ring_buffer_type, ring_buffer_group, COUNT_BIG(*) AS record_count, MIN([timestamp]) AS min_timestamp, MAX([timestamp]) AS max_timestamp, MIN(create_time) AS min_create_time, MAX(create_time) AS max_create_time FROM sys.dm_os_ring_buffers GROUP BY ring_buffer_type, ring_buffer_group"
+    },
+    {
+      "view": "dm_os_spinlock_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "collisions BIGINT", "spins BIGINT", "spins_per_collision DOUBLE", "sleep_time BIGINT", "backoffs BIGINT"]
+    },
+    {
+      "view": "dm_os_stacks",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["frame_count BIGINT", "stack_count BIGINT", "max_frame_index INT"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, COUNT_BIG(*) AS frame_count, COUNT_BIG(DISTINCT stack_address) AS stack_count, MAX(frame_index) AS max_frame_index FROM sys.dm_os_stacks"
+    },
+    {
+      "view": "dm_os_tasks",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["task_state STRING", "context_switches_count INT", "pending_io_count INT", "pending_io_byte_count BIGINT", "pending_io_byte_average INT", "scheduler_id INT", "session_id SMALLINT", "exec_context_id INT", "request_id INT"]
+    },
+    {
+      "view": "dm_os_threads",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["started_by_sqlservr BOOLEAN", "os_thread_id INT", "status INT", "creation_time TIMESTAMP", "kernel_time BIGINT", "usermode_time BIGINT", "stack_bytes_committed INT", "stack_bytes_used INT", "affinity BIGINT", "priority INT", "locale INT", "is_impersonating INT", "is_waiting_on_loader_lock INT", "processor_group SMALLINT", "description STRING"]
+    },
+    {
+      "view": "dm_os_waiting_tasks",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["session_id SMALLINT", "exec_context_id INT", "wait_duration_ms BIGINT", "wait_type STRING", "blocking_session_id SMALLINT", "blocking_exec_context_id INT"]
+    },
+    {
+      "view": "dm_os_worker_local_storage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["worker_count BIGINT", "comp_exec_ctxt_present_count BIGINT", "ec_present_count BIGINT", "broker_present_count BIGINT", "task_proxy_present_count BIGINT", "msqlxact_present_count BIGINT", "sql_prof_present_count BIGINT", "stack_checker_present_count BIGINT", "host_task_present_count BIGINT", "sni_error_present_count BIGINT", "queryscan_present_count BIGINT", "diag_present_count BIGINT", "query_driver_present_count BIGINT", "federatedxact_present_count BIGINT", "filestream_present_count BIGINT", "qe_cc_present_count BIGINT", "xtp_present_count BIGINT", "gq_present_count BIGINT", "extensibility_ctxt_present_count BIGINT", "performance_counters_present_count BIGINT"],
+      "query": "SELECT SYSUTCDATETIME() AS sample_time_utc, COUNT_BIG(*) AS worker_count, SUM(CASE WHEN comp_exec_ctxt_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS comp_exec_ctxt_present_count, SUM(CASE WHEN ec_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS ec_present_count, SUM(CASE WHEN broker_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS broker_present_count, SUM(CASE WHEN task_proxy_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS task_proxy_present_count, SUM(CASE WHEN msqlxact_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS msqlxact_present_count, SUM(CASE WHEN sql_prof_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS sql_prof_present_count, SUM(CASE WHEN stack_checker_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS stack_checker_present_count, SUM(CASE WHEN host_task_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS host_task_present_count, SUM(CASE WHEN sni_error_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS sni_error_present_count, SUM(CASE WHEN queryscan_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS queryscan_present_count, SUM(CASE WHEN diag_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS diag_present_count, SUM(CASE WHEN query_driver_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS query_driver_present_count, SUM(CASE WHEN federatedxact_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS federatedxact_present_count, SUM(CASE WHEN filestream_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS filestream_present_count, SUM(CASE WHEN qe_cc_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS qe_cc_present_count, SUM(CASE WHEN xtp_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS xtp_present_count, SUM(CASE WHEN gq_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS gq_present_count, SUM(CASE WHEN extensibility_ctxt_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS extensibility_ctxt_present_count, SUM(CASE WHEN performance_counters_address IS NULL THEN CAST(0 AS bigint) ELSE 1 END) AS performance_counters_present_count FROM sys.dm_os_worker_local_storage"
+    },
+    {
+      "view": "dm_os_workers",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["status INT", "is_preemptive BOOLEAN", "is_fiber BOOLEAN", "is_sick BOOLEAN", "is_in_cc_exception BOOLEAN", "is_fatal_exception BOOLEAN", "is_inside_catch BOOLEAN", "is_in_polling_io_completion_routine BOOLEAN", "context_switch_count INT", "pending_io_count INT", "pending_io_byte_count BIGINT", "pending_io_byte_average INT", "wait_started_ms_ticks BIGINT", "wait_resumed_ms_ticks BIGINT", "task_bound_ms_ticks BIGINT", "worker_created_ms_ticks BIGINT", "exception_num INT", "exception_severity INT", "affinity BIGINT", "state STRING", "start_quantum BIGINT", "end_quantum BIGINT", "last_wait_type STRING", "return_code INT", "quantum_used BIGINT", "max_quantum BIGINT", "boost_count INT", "tasks_processed_count INT", "processor_group SMALLINT", "worker_migration_count INT", "spinlock_wait_time_ms BIGINT", "spinlock_max_wait_time_ms BIGINT", "spinlock_wait_count BIGINT", "cpu_used BIGINT"]
+    },
+    {
+      "view": "dm_resource_governor_resource_pools_history_ex",
+      "interval": "00:05:00",
+      "provenance": ["sql-docs:sys-dm-resource-governor-resource-pools-history-ex-azure-sql-database.md"],
+      "targets": ["sqldb_single_database"],
+      "columns": ["pool_id INT", "name STRING", "snapshot_time TIMESTAMP", "duration_ms INT", "statistics_start_time TIMESTAMP", "active_session_count INT", "active_worker_count INT", "delta_cpu_usage_ms INT", "delta_cpu_usage_preemptive_ms INT", "used_data_space_kb BIGINT", "allocated_disk_space_kb BIGINT", "target_memory_kb BIGINT", "used_memory_kb BIGINT", "cache_memory_kb BIGINT", "compile_memory_kb BIGINT", "active_memgrant_count BIGINT", "active_memgrant_kb BIGINT", "used_memgrant_kb BIGINT", "delta_memgrant_timeout_count INT", "delta_memgrant_waiter_count INT", "delta_out_of_memory_count INT", "delta_read_io_queued INT", "delta_read_io_issued INT", "delta_read_io_completed INT", "delta_read_io_throttled INT", "delta_read_bytes BIGINT", "delta_read_io_stall_ms INT", "delta_read_io_stall_queued_ms INT", "delta_write_io_queued INT", "delta_write_io_issued INT", "delta_write_io_completed INT", "delta_write_io_throttled INT", "delta_write_bytes BIGINT", "delta_write_io_stall_ms INT", "delta_write_io_stall_queued_ms INT", "delta_io_issue_delay_ms INT", "max_iops_per_volume INT", "max_memory_kb BIGINT", "max_log_rate_kb BIGINT", "max_data_space_kb BIGINT", "max_session INT", "max_worker INT", "min_cpu_percent INT", "max_cpu_percent INT", "cap_cpu_percent INT", "min_vcores DECIMAL(38,12)", "max_vcores DECIMAL(38,12)", "cap_vcores DECIMAL(38,12)", "instance_cpu_count INT", "instance_cpu_percent DECIMAL(38,12)", "instance_vcores DECIMAL(38,12)", "delta_log_bytes_used DECIMAL(38,12)", "avg_login_rate_percent DECIMAL(38,12)", "delta_vcores_used DECIMAL(38,12)", "cap_vcores_used_percent DECIMAL(38,12)", "instance_vcores_used_percent DECIMAL(38,12)", "avg_data_io_percent DECIMAL(38,12)", "avg_log_write_percent DECIMAL(38,12)", "avg_storage_percent DECIMAL(38,12)", "avg_allocated_storage_percent DECIMAL(38,12)", "max_worker_percent DECIMAL(38,12)", "max_session_percent DECIMAL(38,12)", "active_outbound_connection_worker_count INT", "max_outbound_connection_worker INT", "max_outbound_connection_worker_percent DECIMAL(38,12)"],
+      "top": 1000,
+      "watermark": "snapshot_time"
+    },
+    {
+      "view": "dm_resource_governor_workload_groups_history_ex",
+      "interval": "00:05:00",
+      "provenance": ["sql-docs:sys-dm-resource-governor-workload-groups-history-ex-azure-sql-database.md"],
+      "targets": ["sqldb_single_database"],
+      "columns": ["pool_id INT", "group_id INT", "name STRING", "snapshot_time TIMESTAMP", "duration_ms INT", "active_worker_count INT", "active_request_count INT", "active_session_count INT", "total_request_count BIGINT", "delta_request_count INT", "total_cpu_usage_ms BIGINT", "delta_cpu_usage_ms INT", "delta_cpu_usage_preemptive_ms INT", "delta_reads_reduced_memgrant_count INT", "reads_throttled INT", "delta_reads_queued INT", "delta_reads_issued INT", "delta_reads_completed INT", "delta_read_bytes BIGINT", "delta_read_stall_ms INT", "delta_read_stall_queued_ms INT", "delta_writes_queued INT", "delta_writes_issued INT", "delta_writes_completed INT", "delta_writes_bytes BIGINT", "delta_write_stall_ms INT", "delta_background_writes INT", "delta_background_write_bytes BIGINT", "delta_log_bytes_used BIGINT", "delta_log_temp_db_bytes_used BIGINT", "delta_query_optimizations BIGINT", "delta_suboptimal_plan_generations BIGINT", "max_memory_grant_kb BIGINT", "max_request_cpu_msec BIGINT", "max_concurrent_request INT", "max_io INT", "max_global_io INT", "max_queued_io INT", "max_log_rate_kb BIGINT", "max_session INT", "max_worker INT", "active_outbound_connection_worker_count INT", "max_outbound_connection_worker INT", "max_outbound_connection_worker_percent DECIMAL(38,12)"],
+      "top": 1000,
+      "watermark": "snapshot_time"
+    },
+    {
+      "view": "dm_server_external_policy_actions",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["sql_action_id INT", "action_namespace STRING", "action_type STRING", "action_provider_string STRING"]
+    },
+    {
+      "view": "dm_tran_active_snapshot_database_transactions",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["transaction_id BIGINT", "transaction_sequence_num BIGINT", "commit_sequence_num BIGINT", "session_id INT", "is_snapshot BOOLEAN", "first_snapshot_sequence_num BIGINT", "max_version_chain_traversed INT", "average_version_chain_traversed DOUBLE", "elapsed_time_seconds BIGINT"]
+    },
+    {
+      "view": "dm_tran_active_transactions",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["transaction_id BIGINT", "name STRING", "transaction_begin_time TIMESTAMP", "transaction_type INT", "transaction_uow STRING", "transaction_state INT", "transaction_status INT", "transaction_status2 INT", "dtc_state INT", "dtc_status INT", "dtc_isolation_level INT"]
+    },
+    {
+      "view": "dm_tran_current_transaction",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["transaction_id BIGINT", "transaction_sequence_num BIGINT", "transaction_is_snapshot BOOLEAN", "first_snapshot_sequence_num BIGINT", "last_transaction_sequence_num BIGINT", "first_useful_sequence_num BIGINT"]
+    },
+    {
+      "view": "dm_tran_locks",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["resource_type STRING", "resource_subtype STRING", "resource_database_id INT", "resource_associated_entity_id BIGINT", "resource_lock_partition INT", "request_mode STRING", "request_type STRING", "request_status STRING", "request_reference_count SMALLINT", "request_lifetime INT", "request_session_id INT", "request_exec_context_id INT", "request_request_id INT", "request_owner_type STRING", "request_owner_id BIGINT", "request_owner_guid STRING", "request_owner_lockspace_id STRING"]
+    },
+    {
+      "view": "dm_tran_version_store_space_usage",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["database_id INT", "reserved_page_count BIGINT", "reserved_space_kb BIGINT"]
+    },
+    {
+      "view": "dm_xe_map_values",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "object_package_guid STRING", "map_key INT", "map_value STRING"]
+    },
+    {
+      "view": "dm_xe_object_columns",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "column_id INT", "object_name STRING", "object_package_guid STRING", "type_name STRING", "type_package_guid STRING", "column_type STRING", "column_value STRING", "capabilities INT", "capabilities_desc STRING", "description STRING"]
+    },
+    {
+      "view": "dm_xe_objects",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "object_type STRING", "package_guid STRING", "description STRING", "capabilities INT", "capabilities_desc STRING", "type_name STRING", "type_package_guid STRING", "type_size INT"]
+    },
+    {
+      "view": "dm_xe_packages",
+      "interval": "01:00:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["name STRING", "guid STRING", "description STRING", "capabilities INT", "capabilities_desc STRING", "module_guid STRING"]
+    },
+    {
+      "view": "dm_xtp_gc_queue_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["queue_id INT", "total_enqueues BIGINT", "total_dequeues BIGINT", "current_queue_depth BIGINT", "maximum_queue_depth BIGINT", "last_service_ticks BIGINT"]
+    },
+    {
+      "view": "dm_xtp_gc_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["rows_examined BIGINT", "rows_no_sweep_needed BIGINT", "rows_first_in_bucket BIGINT", "rows_first_in_bucket_removed BIGINT", "rows_marked_for_unlink BIGINT", "parallel_assist_count BIGINT", "idle_worker_count BIGINT", "sweep_scans_started BIGINT", "sweep_scan_retries BIGINT", "sweep_rows_touched BIGINT", "sweep_rows_expiring BIGINT", "sweep_rows_expired BIGINT", "sweep_rows_expired_removed BIGINT"]
+    },
+    {
+      "view": "dm_xtp_system_memory_consumers",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["memory_consumer_id BIGINT", "memory_consumer_type INT", "memory_consumer_type_desc STRING", "memory_consumer_desc STRING", "lookaside_id BIGINT", "allocated_bytes BIGINT", "used_bytes BIGINT", "allocation_count BIGINT", "partition_count INT", "sizeclass_count INT", "min_sizeclass INT", "max_sizeclass INT"]
+    },
+    {
+      "view": "dm_xtp_threads",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["thread_type INT", "thread_type_desc STRING", "retired_row_count INT", "retired_transaction_count INT"]
+    },
+    {
+      "view": "dm_xtp_transaction_stats",
+      "interval": "00:05:00",
+      "provenance": ["sql-server-2025"],
+      "targets": ["sqldb_single_database", "sqlserver"],
+      "columns": ["total_count BIGINT", "read_only_count BIGINT", "total_aborts BIGINT", "system_aborts BIGINT", "validation_failures BIGINT", "dependencies_taken BIGINT", "dependencies_failed BIGINT", "savepoint_create BIGINT", "savepoint_rollbacks BIGINT", "savepoint_refreshes BIGINT", "log_bytes_written BIGINT", "phantom_scans_started BIGINT", "phantom_scans_retries BIGINT", "phantom_rows_touched BIGINT", "phantom_rows_expiring BIGINT", "phantom_rows_expired BIGINT", "phantom_rows_expired_removed BIGINT", "scans_started BIGINT", "scans_retried BIGINT", "rows_returned BIGINT", "rows_touched BIGINT", "rows_expiring BIGINT", "rows_expired BIGINT", "rows_expired_removed BIGINT", "row_insert_attempts BIGINT", "row_update_attempts BIGINT", "row_delete_attempts BIGINT", "write_conflicts BIGINT", "unique_constraint_violations BIGINT", "drop_table_memory_attempts BIGINT", "drop_table_memory_failures BIGINT"]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Arrowcol.Sdk.Tests</AssemblyName>
+    <RootNamespace>Arrowcol.Sdk.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.1.2" />
+    <PackageReference Include="xunit.v3" Version="4.0.3" />
+    <ProjectReference Include="../dotnet/Rust.Playground.csproj" />
+    <None Include="$(ArrowcolDmvRoot)/assets/**/*" Link="%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(ArrowcolNative)" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="RequireTestInputs" BeforeTargets="Build">
+    <Error Condition="!Exists('$(ArrowcolDmvRoot)/assets/arrowcol-dmv-catalog.json') Or !Exists('$(ArrowcolNative)')"
+           Text="Run the arrowcol-sdk-gen-tool:nuget-test target, which builds the native runtime and DMV inputs." />
+  </Target>
+</Project>

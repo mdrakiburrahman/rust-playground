@@ -172,11 +172,27 @@ public sealed class ArrowcolContract
         return new ProtobufContract<T>(api);
     }
 
+    /// <summary>Binds pre-encoded protobuf rows to the contract's own descriptor set.</summary>
+    internal IArrowcolContract<byte[]> BindRaw(byte[] descriptorSet, string modelName)
+    {
+        var api = new NativeApi(
+            (string endpoint, string options, out IntPtr handle) =>
+                SharedNative.Open(endpoint, Path, descriptorSet, (nuint)descriptorSet.Length, modelName, options, out handle),
+            SharedNative.Push, SharedNative.Flush, SharedNative.Close, SharedNative.Destroy, SharedNative.FreeError);
+        return new RawContract(api);
+    }
+
     private sealed class ProtobufContract<T>(NativeApi api) : IArrowcolContract<T>
     {
         public NativeApi Native => api;
         public byte[] Encode(T value) => value is IMessage message
             ? message.ToByteArray() : throw new ArgumentException("Expected a non-null protobuf message", nameof(value));
+    }
+
+    private sealed class RawContract(NativeApi api) : IArrowcolContract<byte[]>
+    {
+        public NativeApi Native => api;
+        public byte[] Encode(byte[] value) => value ?? throw new ArgumentNullException(nameof(value));
     }
 }
 
@@ -200,4 +216,16 @@ internal static class SharedNative
     internal static extern void Destroy(IntPtr handle);
     [DllImport(Library, EntryPoint = "arrowcol_free_error", CallingConvention = CallingConvention.Cdecl)]
     internal static extern void FreeError(IntPtr error);
+    [DllImport(Library, EntryPoint = "arrowcol_compile_contract", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr CompileContract(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string ddl, [MarshalAs(UnmanagedType.LPUTF8Str)] string output);
+
+    /// <summary>Compiles one CREATE TABLE into a contract directory, which must not exist yet.</summary>
+    internal static void Compile(string ddl, string output)
+    {
+        var error = CompileContract(ddl, output);
+        if (error == IntPtr.Zero) return;
+        try { throw new ArrowcolException(Marshal.PtrToStringUTF8(error) ?? "Contract compilation failed"); }
+        finally { FreeError(error); }
+    }
 }

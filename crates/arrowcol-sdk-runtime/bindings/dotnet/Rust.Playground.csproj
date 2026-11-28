@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable>
     <PackageId>Rust.Playground</PackageId>
     <AssemblyName>Arrowcol.Sdk</AssemblyName>
-    <Description>Typed ArrowCol Flight SDK and SQL Server DMV models for .NET with native Linux and Windows x64 runtimes.</Description>
+    <Description>Typed ArrowCol Flight SDK for .NET with a declarative SQL Server DMV catalog, a catalog-driven DMV writer, SQL Server DMV models, native Linux and Windows x64 runtimes and a local Windows catalog and collector.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/mdrakiburrahman/rust-playground</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -19,10 +19,14 @@
     <None Update="Rust.Playground.targets" Pack="true" PackagePath="buildTransitive/Rust.Playground.targets" />
     <None Include="$(ArrowcolLinuxNative)" Pack="true" PackagePath="runtimes/linux-x64/native/libarrowcol_sdk_ffi.so" />
     <None Include="$(ArrowcolWindowsNative)" Pack="true" PackagePath="runtimes/win-x64/native/arrowcol_sdk_ffi.dll" />
+    <None Include="$(ArrowcolWindowsRuntime)/*" Pack="true" PackagePath="arrowcol/win-x64/"
+          Condition="'$(ArrowcolWindowsRuntime)' != ''" />
+    <InternalsVisibleTo Include="Arrowcol.Sdk.Tests" />
   </ItemGroup>
   <Target Name="RequireNativePackageInputs" BeforeTargets="Pack">
     <Error Condition="!Exists('$(ArrowcolLinuxNative)')" Text="A Linux x64 ArrowCol native runtime is required." />
     <Error Condition="!Exists('$(ArrowcolWindowsNative)')" Text="A Windows x64 ArrowCol native runtime is required." />
-    <Error Condition="!Exists('$(ArrowcolDmvRoot)/assets/arrow-ddl') Or !Exists('$(ArrowcolDmvRoot)/assets/arrow-contracts')" Text="Generate the SQL Server DMV package inputs with the nuget-pack target." />
+    <Error Condition="!Exists('$(ArrowcolDmvRoot)/assets/arrow-ddl') Or !Exists('$(ArrowcolDmvRoot)/assets/arrow-contracts') Or !Exists('$(ArrowcolDmvRoot)/assets/arrowcol-dmv-catalog.json')" Text="Generate the SQL Server DMV package inputs with the nuget-pack target." />
+    <Error Condition="!Exists('$(ArrowcolWindowsRuntime)/runtime.json')" Text="A verified ArrowCol Windows runtime is required." />
   </Target>
 </Project>

@@ -3,4 +3,8 @@
     <Content Include="$(MSBuildThisFileDirectory)../dmv/**/*" Link="%(RecursiveDir)%(Filename)%(Extension)"
              CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" />
   </ItemGroup>
+  <ItemGroup Condition="'$(ArrowcolCopyWindowsRuntime)' != 'false' And ('$(RuntimeIdentifier)' == '' Or $(RuntimeIdentifier.StartsWith('win')))">
+    <Content Include="$(MSBuildThisFileDirectory)../arrowcol/win-x64/*" Link="arrowcol-runtime/%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" />
+  </ItemGroup>
 </Project>
